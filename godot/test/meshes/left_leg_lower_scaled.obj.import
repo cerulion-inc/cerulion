@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://blksl5xsfhbu5"
+path="res://.godot/imported/left_leg_lower_scaled.obj-61ab0e23eae0e4b932350f7a151cb297.mesh"
+
+[deps]
+
+files=["res://.godot/imported/left_leg_lower_scaled.obj-61ab0e23eae0e4b932350f7a151cb297.mesh"]
+
+source_file="res://meshes/left_leg_lower_scaled.obj"
+dest_files=["res://.godot/imported/left_leg_lower_scaled.obj-61ab0e23eae0e4b932350f7a151cb297.mesh", "res://.godot/imported/left_leg_lower_scaled.obj-61ab0e23eae0e4b932350f7a151cb297.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false

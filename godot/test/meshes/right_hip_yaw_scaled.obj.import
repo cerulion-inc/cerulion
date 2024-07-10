@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://ccd1evsmew51e"
+path="res://.godot/imported/right_hip_yaw_scaled.obj-2b8482fa1898295c0e594f83c65478d0.mesh"
+
+[deps]
+
+files=["res://.godot/imported/right_hip_yaw_scaled.obj-2b8482fa1898295c0e594f83c65478d0.mesh"]
+
+source_file="res://meshes/right_hip_yaw_scaled.obj"
+dest_files=["res://.godot/imported/right_hip_yaw_scaled.obj-2b8482fa1898295c0e594f83c65478d0.mesh", "res://.godot/imported/right_hip_yaw_scaled.obj-2b8482fa1898295c0e594f83c65478d0.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false

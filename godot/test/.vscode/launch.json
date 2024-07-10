@@ -1,0 +1,15 @@
+{
+    "version": "0.0.1",
+    "configurations": [
+        {
+            "name": "Play",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "/Applications/Godot.app/Contents/MacOS/Godot",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+        }
+    ]
+}
