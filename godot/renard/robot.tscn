@@ -185,8 +185,3 @@ script = ExtResource("41_80vj2")
 [node name="Left_Forearm" type="MeshInstance3D" parent="Link/Left_Forearm"]
 mesh = ExtResource("30_2lx4y")
 surface_material_override/0 = ExtResource("5_tghrx")
-
-[node name="SphereMarker" type="Node3D" parent="."]
-
-[node name="CSGSphere3D" type="CSGSphere3D" parent="SphereMarker"]
-radius = 0.05
