@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://ixapwnd56rnd"
+path="res://.godot/imported/right_hip_abad_scaled.obj-fb904b550ee6c2a4d2fee181163d78cf.mesh"
+
+[deps]
+
+files=["res://.godot/imported/right_hip_abad_scaled.obj-fb904b550ee6c2a4d2fee181163d78cf.mesh"]
+
+source_file="res://meshes/right_hip_abad_scaled.obj"
+dest_files=["res://.godot/imported/right_hip_abad_scaled.obj-fb904b550ee6c2a4d2fee181163d78cf.mesh", "res://.godot/imported/right_hip_abad_scaled.obj-fb904b550ee6c2a4d2fee181163d78cf.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false

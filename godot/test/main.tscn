@@ -1,0 +1,38 @@
+[gd_scene load_steps=6 format=3 uid="uid://c376darhachtj"]
+
+[ext_resource type="PackedScene" uid="uid://ct4oblr05flsm" path="res://robot.tscn" id="1_4coxd"]
+[ext_resource type="PackedScene" uid="uid://d04maq6ib5dnk" path="res://UI.tscn" id="2_smmu5"]
+[ext_resource type="Texture2D" uid="uid://p5bjwlnljl2h" path="res://materials/MIT_checkerboard.png" id="3_o8ejm"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_uc7fo"]
+albedo_texture = ExtResource("3_o8ejm")
+metallic = 0.1
+metallic_specular = 1.0
+roughness = 0.49
+clearcoat_enabled = true
+refraction_enabled = true
+uv1_scale = Vector3(50, 50, 50)
+proximity_fade_enabled = true
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_3vvbf"]
+material = SubResource("StandardMaterial3D_uc7fo")
+size = Vector2(100, 100)
+
+[node name="Main" type="Node3D"]
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(1, -6.50845e-16, 1.74393e-16, 1.74393e-16, 0.5, 0.866025, -6.50845e-16, -0.866025, 0.5, 1.5, 1.5, 2.08165e-12)
+shadow_enabled = true
+
+[node name="MIT_Humanoid" parent="." instance=ExtResource("1_4coxd")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.08165e-12, 2.08165e-12, 2.08165e-12)
+
+[node name="Node3D" type="Node3D" parent="."]
+
+[node name="Camera3D" type="Camera3D" parent="Node3D"]
+transform = Transform3D(0.97353, 0.123768, -0.192149, 0.02672, 0.7733, 0.633477, 0.226993, -0.621843, 0.749523, -0.0653703, 1.18938, 0.721109)
+
+[node name="CanvasLayer" parent="." instance=ExtResource("2_smmu5")]
+
+[node name="Ground" type="MeshInstance3D" parent="."]
+mesh = SubResource("PlaneMesh_3vvbf")
