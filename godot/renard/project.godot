@@ -15,9 +15,36 @@ run/main_scene="res://main.tscn"
 config/features=PackedStringArray("4.2", "C#", "Forward Plus")
 boot_splash/bg_color=Color(1, 1, 1, 1)
 boot_splash/image="res://cerulion-assets/Logo Main Vertical For White Background.png"
-config/icon="res://icon.svg"
+config/icon="res://cerulion-assets/Logo Main Icon.svg"
 boot_splash/minimum_display_time=100
+
+[display]
+
+window/size/viewport_width=1920
+window/size/viewport_height=1080
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
 
 [dotnet]
 
 project/assembly_name="test"
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/graph_2d/plugin.cfg")
+
+[gui]
+
+theme/custom="res://temp_UI_theme.tres"
+
+[input]
+
+LeftMouseDown={
+"deadzone": 0.5,
+"events": [Object(InputEventMouseButton,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"button_mask":1,"position":Vector2(395, 8),"global_position":Vector2(403, 88),"factor":1.0,"button_index":1,"canceled":false,"pressed":true,"double_click":false,"script":null)
+]
+}
+
+[rendering]
+
+lights_and_shadows/directional_shadow/soft_shadow_filter_quality=0

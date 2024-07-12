@@ -1,3 +1,214 @@
-[gd_scene format=3 uid="uid://d04maq6ib5dnk"]
+[gd_scene load_steps=9 format=3 uid="uid://d04maq6ib5dnk"]
 
-[node name="CanvasLayer" type="CanvasLayer"]
+[ext_resource type="Script" path="res://scripts/environment/UI.cs" id="1_3vj16"]
+[ext_resource type="FontFile" uid="uid://do3wmvqkncjkf" path="res://fonts/Sora-Variable.ttf" id="1_5b2p6"]
+[ext_resource type="Script" path="res://addons/graph_2d/graph_2d.gd" id="3_lwcaj"]
+[ext_resource type="Texture2D" uid="uid://n4udxdtlpifq" path="res://cerulion-assets/Logo Main For Dark Background.png" id="3_x5aty"]
+[ext_resource type="Texture2D" uid="uid://c1k4yl0lpckqu" path="res://cerulion-assets/cerulion_gradient.tres" id="5_nt1gi"]
+[ext_resource type="Theme" uid="uid://dfdy04fs1ao2n" path="res://temp_UI_theme.tres" id="6_l0m87"]
+[ext_resource type="Texture2D" uid="uid://2pqd1f4ux6ov" path="res://cerulion-assets/Logo Dark Icon.png" id="7_8ymnw"]
+[ext_resource type="Script" path="res://WindowBase.gd" id="8_iuuj8"]
+
+[node name="UI" type="CanvasLayer"]
+script = ExtResource("1_3vj16")
+
+[node name="test" type="Control" parent="."]
+visible = false
+layout_mode = 3
+anchors_preset = 0
+offset_right = 40.0
+offset_bottom = 40.0
+
+[node name="TestText" type="Label" parent="test"]
+visible = false
+layout_mode = 1
+anchors_preset = 10
+anchor_right = 1.0
+offset_right = 1773.0
+offset_bottom = 126.0
+grow_horizontal = 2
+theme_override_fonts/font = ExtResource("1_5b2p6")
+theme_override_font_sizes/font_size = 100
+text = "InfoTextdsajkhdkjashdkjsdhskjdhsk"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="TextureRect" type="TextureRect" parent="test/TestText"]
+show_behind_parent = true
+layout_mode = 0
+offset_right = 40.0
+offset_bottom = 40.0
+texture = ExtResource("3_x5aty")
+
+[node name="TestButton" type="Button" parent="test"]
+layout_mode = 1
+anchors_preset = 7
+anchor_left = 0.5
+anchor_top = 1.0
+anchor_right = 0.5
+anchor_bottom = 1.0
+offset_left = 590.0
+offset_top = 890.0
+offset_right = 1290.0
+offset_bottom = 1040.0
+grow_horizontal = 2
+grow_vertical = 0
+theme_override_fonts/font = ExtResource("1_5b2p6")
+theme_override_font_sizes/font_size = 100
+text = "TestButton"
+
+[node name="Timer" type="Timer" parent="test"]
+
+[node name="TestWindow" type="Window" parent="test"]
+title = "TestWindow"
+initial_position = 1
+size = Vector2i(500, 500)
+visible = false
+transparent = true
+content_scale_mode = 2
+theme_override_font_sizes/title_font_size = 20
+
+[node name="Graph2D" type="Control" parent="test/TestWindow"]
+layout_mode = 3
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -250.0
+offset_top = -250.0
+offset_right = 250.0
+offset_bottom = 250.0
+grow_horizontal = 2
+grow_vertical = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+size_flags_stretch_ratio = 12.57
+script = ExtResource("3_lwcaj")
+y_label = "Test"
+background_color = Color(0, 0.381042, 0.770979, 1)
+grid_horizontal_visible = true
+grid_vertical_visible = true
+
+[node name="MenuButton" type="MenuButton" parent="test"]
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = 632.5
+offset_top = 447.5
+offset_right = 1247.5
+offset_bottom = 592.5
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_font_sizes/font_size = 100
+text = "MenuButton"
+item_count = 2
+popup/item_0/text = "EEEE1"
+popup/item_0/id = 0
+popup/item_1/text = "EEEE2"
+popup/item_1/id = 1
+
+[node name="TopBar" type="TextureRect" parent="test"]
+layout_mode = 1
+anchors_preset = 10
+anchor_right = 1.0
+offset_right = 10.0
+offset_bottom = 50.0
+grow_horizontal = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 13.39
+texture = ExtResource("5_nt1gi")
+expand_mode = 2
+
+[node name="Control" type="Control" parent="test"]
+layout_mode = 1
+anchors_preset = 9
+anchor_bottom = 1.0
+offset_right = 421.0
+grow_vertical = 2
+
+[node name="Window" type="Window" parent="test/Control"]
+position = Vector2i(0, 36)
+visible = false
+
+[node name="PanelContainer" type="PanelContainer" parent="."]
+anchors_preset = 9
+anchor_bottom = 1.0
+offset_right = 450.0
+grow_vertical = 2
+theme = ExtResource("6_l0m87")
+theme_type_variation = &"EmptyContainer"
+
+[node name="MarginContainer" type="MarginContainer" parent="PanelContainer"]
+visible = false
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 20
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 20
+
+[node name="HBoxContainer" type="HBoxContainer" parent="PanelContainer"]
+layout_mode = 2
+
+[node name="Panel" type="Panel" parent="PanelContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 9.0
+theme = ExtResource("6_l0m87")
+
+[node name="VBoxContainer" type="VBoxContainer" parent="PanelContainer/HBoxContainer/Panel"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme = ExtResource("6_l0m87")
+
+[node name="Panel" type="Panel" parent="PanelContainer/HBoxContainer/Panel/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+theme = ExtResource("6_l0m87")
+
+[node name="Panel2" type="Panel" parent="PanelContainer/HBoxContainer/Panel/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+theme = ExtResource("6_l0m87")
+
+[node name="Button" type="Button" parent="PanelContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 0.5
+icon = ExtResource("7_8ymnw")
+icon_alignment = 1
+expand_icon = true
+
+[node name="Control" type="Control" parent="PanelContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 0.25
+mouse_default_cursor_shape = 10
+
+[node name="Control2" type="Control" parent="."]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 675.0
+offset_top = 96.0
+offset_right = -950.0
+offset_bottom = -736.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("8_iuuj8")
+
+[node name="Panel" type="Panel" parent="Control2"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2

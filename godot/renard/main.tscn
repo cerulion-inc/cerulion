@@ -1,8 +1,9 @@
-[gd_scene load_steps=6 format=3 uid="uid://c376darhachtj"]
+[gd_scene load_steps=7 format=3 uid="uid://c376darhachtj"]
 
 [ext_resource type="PackedScene" uid="uid://ct4oblr05flsm" path="res://robot.tscn" id="1_4coxd"]
 [ext_resource type="Texture2D" uid="uid://c3g4lvl4s1m0" path="res://materials/floor_tiles.png" id="2_haf8n"]
 [ext_resource type="Script" path="res://scripts/environment/Camera3D.gd" id="2_rfl6k"]
+[ext_resource type="PackedScene" uid="uid://d04maq6ib5dnk" path="res://UI.tscn" id="4_qs8bb"]
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_uc7fo"]
 albedo_texture = ExtResource("2_haf8n")
@@ -33,7 +34,10 @@ skeleton = NodePath("../..")
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="Environment"]
 transform = Transform3D(1, -6.50845e-16, 1.74394e-16, 1.74393e-16, 0.5, 0.866025, -6.50845e-16, -0.866025, 0.5, 1.5, 1.5, 2.08165e-12)
 shadow_enabled = true
+shadow_blur = 0.5
 
 [node name="Camera3D" type="Camera3D" parent="Environment"]
 transform = Transform3D(0.97353, 0.123768, -0.192149, 0.02672, 0.7733, 0.633477, 0.226993, -0.621843, 0.749523, -0.0653703, 1.18938, 0.721109)
 script = ExtResource("2_rfl6k")
+
+[node name="TestUI" parent="Environment" instance=ExtResource("4_qs8bb")]
