@@ -1,23 +1,22 @@
 [gd_scene load_steps=9 format=3 uid="uid://d04maq6ib5dnk"]
 
-[ext_resource type="Script" path="res://scripts/environment/UI.cs" id="1_3vj16"]
 [ext_resource type="FontFile" uid="uid://do3wmvqkncjkf" path="res://fonts/Sora-Variable.ttf" id="1_5b2p6"]
-[ext_resource type="Script" path="res://addons/graph_2d/graph_2d.gd" id="3_lwcaj"]
 [ext_resource type="Texture2D" uid="uid://n4udxdtlpifq" path="res://cerulion-assets/Logo Main For Dark Background.png" id="3_x5aty"]
 [ext_resource type="Texture2D" uid="uid://c1k4yl0lpckqu" path="res://cerulion-assets/cerulion_gradient.tres" id="5_nt1gi"]
+[ext_resource type="Script" path="res://scripts/user_interface/PanelBase.gd" id="6_0iuvp"]
 [ext_resource type="Theme" uid="uid://dfdy04fs1ao2n" path="res://temp_UI_theme.tres" id="6_l0m87"]
+[ext_resource type="PackedScene" uid="uid://chcj7up8k8pa8" path="res://UI/line_chart/Control.tscn" id="6_mpovq"]
 [ext_resource type="Texture2D" uid="uid://2pqd1f4ux6ov" path="res://cerulion-assets/Logo Dark Icon.png" id="7_8ymnw"]
-[ext_resource type="Script" path="res://WindowBase.gd" id="8_iuuj8"]
+[ext_resource type="Script" path="res://scripts/user_interface/WindowBase.gd" id="8_8hci0"]
 
 [node name="UI" type="CanvasLayer"]
-script = ExtResource("1_3vj16")
 
 [node name="test" type="Control" parent="."]
 visible = false
 layout_mode = 3
 anchors_preset = 0
-offset_right = 40.0
-offset_bottom = 40.0
+offset_right = 450.0
+offset_bottom = 1080.0
 
 [node name="TestText" type="Label" parent="test"]
 visible = false
@@ -68,28 +67,6 @@ transparent = true
 content_scale_mode = 2
 theme_override_font_sizes/title_font_size = 20
 
-[node name="Graph2D" type="Control" parent="test/TestWindow"]
-layout_mode = 3
-anchors_preset = 8
-anchor_left = 0.5
-anchor_top = 0.5
-anchor_right = 0.5
-anchor_bottom = 0.5
-offset_left = -250.0
-offset_top = -250.0
-offset_right = 250.0
-offset_bottom = 250.0
-grow_horizontal = 2
-grow_vertical = 2
-size_flags_horizontal = 3
-size_flags_vertical = 3
-size_flags_stretch_ratio = 12.57
-script = ExtResource("3_lwcaj")
-y_label = "Test"
-background_color = Color(0, 0.381042, 0.770979, 1)
-grid_horizontal_visible = true
-grid_vertical_visible = true
-
 [node name="MenuButton" type="MenuButton" parent="test"]
 layout_mode = 1
 anchors_preset = 8
@@ -134,63 +111,181 @@ grow_vertical = 2
 position = Vector2i(0, 36)
 visible = false
 
-[node name="PanelContainer" type="PanelContainer" parent="."]
+[node name="LeftPanel" type="PanelContainer" parent="."]
 anchors_preset = 9
 anchor_bottom = 1.0
 offset_right = 450.0
 grow_vertical = 2
 theme = ExtResource("6_l0m87")
 theme_type_variation = &"EmptyContainer"
+script = ExtResource("6_0iuvp")
 
-[node name="MarginContainer" type="MarginContainer" parent="PanelContainer"]
-visible = false
+[node name="Margin" type="MarginContainer" parent="LeftPanel"]
 layout_mode = 2
-theme_override_constants/margin_left = 20
 theme_override_constants/margin_top = 20
 theme_override_constants/margin_right = 20
-theme_override_constants/margin_bottom = 20
 
-[node name="HBoxContainer" type="HBoxContainer" parent="PanelContainer"]
+[node name="ContentContainer" type="HBoxContainer" parent="LeftPanel/Margin"]
 layout_mode = 2
 
-[node name="Panel" type="Panel" parent="PanelContainer/HBoxContainer"]
+[node name="Windows" type="Panel" parent="LeftPanel/Margin/ContentContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_stretch_ratio = 9.0
 theme = ExtResource("6_l0m87")
 
-[node name="VBoxContainer" type="VBoxContainer" parent="PanelContainer/HBoxContainer/Panel"]
+[node name="GridContainer" type="GridContainer" parent="LeftPanel/Margin/ContentContainer/Windows"]
+layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_top = 50.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Control2" parent="LeftPanel/Margin/ContentContainer/Windows/GridContainer" instance=ExtResource("6_mpovq")]
+custom_minimum_size = Vector2(100, 500)
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="Control3" parent="LeftPanel/Margin/ContentContainer/Windows/GridContainer" instance=ExtResource("6_mpovq")]
+custom_minimum_size = Vector2(100, 500)
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="AddWindows" type="Button" parent="LeftPanel/Margin/ContentContainer/Windows"]
+layout_mode = 1
+anchors_preset = -1
+offset_left = 10.0
+offset_top = 10.0
+offset_right = 8.0
+offset_bottom = 8.0
+text = "Add Window"
+
+[node name="MinimizeButton" type="Button" parent="LeftPanel/Margin/ContentContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 0.0
+theme_override_constants/icon_max_width = 20
+toggle_mode = true
+icon = ExtResource("7_8ymnw")
+icon_alignment = 1
+
+[node name="ResizeButton" type="Button" parent="LeftPanel/Margin/ContentContainer"]
+custom_minimum_size = Vector2(5, 2.08165e-12)
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 0.0
+theme_override_constants/icon_max_width = 20
+toggle_mode = true
+icon_alignment = 1
+
+[node name="RightPanel" type="PanelContainer" parent="."]
+anchors_preset = 11
+anchor_left = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = -450.0
+offset_top = 2.0
+offset_bottom = 2.0
+grow_horizontal = 0
+grow_vertical = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+theme = ExtResource("6_l0m87")
+theme_type_variation = &"EmptyContainer"
+script = ExtResource("6_0iuvp")
+
+[node name="Margin" type="MarginContainer" parent="RightPanel"]
+custom_minimum_size = Vector2(250, 2.08165e-12)
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 20
+
+[node name="ContentContainer" type="HBoxContainer" parent="RightPanel/Margin"]
+layout_mode = 2
+
+[node name="ResizeButton" type="Button" parent="RightPanel/Margin/ContentContainer"]
+custom_minimum_size = Vector2(5, 2.08165e-12)
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 0.0
+theme_override_constants/icon_max_width = 20
+toggle_mode = true
+icon_alignment = 1
+
+[node name="MinimzeButton" type="Button" parent="RightPanel/Margin/ContentContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 0.0
+theme_override_constants/icon_max_width = 20
+toggle_mode = true
+icon = ExtResource("7_8ymnw")
+icon_alignment = 1
+
+[node name="Windows" type="Panel" parent="RightPanel/Margin/ContentContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 9.0
+theme = ExtResource("6_l0m87")
+
+[node name="GridContainer" type="GridContainer" parent="RightPanel/Margin/ContentContainer/Windows"]
+layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_top = 50.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Control2" parent="RightPanel/Margin/ContentContainer/Windows/GridContainer" instance=ExtResource("6_mpovq")]
+custom_minimum_size = Vector2(100, 500)
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="Control3" parent="RightPanel/Margin/ContentContainer/Windows/GridContainer" instance=ExtResource("6_mpovq")]
+custom_minimum_size = Vector2(100, 500)
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="AddWindows" type="Button" parent="RightPanel/Margin/ContentContainer/Windows"]
+layout_mode = 1
+anchors_preset = -1
+offset_left = 10.0
+offset_top = 10.0
+offset_right = 8.0
+offset_bottom = 8.0
+text = "Add Window"
+
+[node name="Control3" type="Control" parent="."]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 724.0
+offset_top = 492.0
+offset_right = -730.0
+offset_bottom = -181.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("8_8hci0")
+
+[node name="VBoxContainer" type="VBoxContainer" parent="Control3"]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
-theme = ExtResource("6_l0m87")
 
-[node name="Panel" type="Panel" parent="PanelContainer/HBoxContainer/Panel/VBoxContainer"]
+[node name="Panel2" type="Panel" parent="Control3/VBoxContainer"]
 layout_mode = 2
 size_flags_vertical = 3
-theme = ExtResource("6_l0m87")
+size_flags_stretch_ratio = 0.1
 
-[node name="Panel2" type="Panel" parent="PanelContainer/HBoxContainer/Panel/VBoxContainer"]
+[node name="Panel" type="Panel" parent="Control3/VBoxContainer"]
 layout_mode = 2
 size_flags_vertical = 3
-theme = ExtResource("6_l0m87")
-
-[node name="Button" type="Button" parent="PanelContainer/HBoxContainer"]
-layout_mode = 2
-size_flags_horizontal = 3
-size_flags_stretch_ratio = 0.5
-icon = ExtResource("7_8ymnw")
-icon_alignment = 1
-expand_icon = true
-
-[node name="Control" type="Control" parent="PanelContainer/HBoxContainer"]
-layout_mode = 2
-size_flags_horizontal = 3
-size_flags_stretch_ratio = 0.25
-mouse_default_cursor_shape = 10
 
 [node name="Control2" type="Control" parent="."]
 layout_mode = 3
@@ -203,7 +298,7 @@ offset_right = -950.0
 offset_bottom = -736.0
 grow_horizontal = 2
 grow_vertical = 2
-script = ExtResource("8_iuuj8")
+script = ExtResource("8_8hci0")
 
 [node name="Panel" type="Panel" parent="Control2"]
 layout_mode = 1
@@ -212,3 +307,7 @@ anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
+
+[connection signal="pressed" from="LeftPanel/Margin/ContentContainer/MinimizeButton" to="LeftPanel" method="_on_minimize_button_pressed"]
+[connection signal="pressed" from="LeftPanel/Margin/ContentContainer/ResizeButton" to="LeftPanel" method="_on_resize_button_pressed"]
+[connection signal="pressed" from="RightPanel/Margin/ContentContainer/MinimzeButton" to="RightPanel" method="_on_button_pressed"]

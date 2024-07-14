@@ -40,4 +40,4 @@ shadow_blur = 0.5
 transform = Transform3D(0.97353, 0.123768, -0.192149, 0.02672, 0.7733, 0.633477, 0.226993, -0.621843, 0.749523, -0.0653703, 1.18938, 0.721109)
 script = ExtResource("2_rfl6k")
 
-[node name="TestUI" parent="Environment" instance=ExtResource("4_qs8bb")]
+[node name="TestUI" parent="." instance=ExtResource("4_qs8bb")]
