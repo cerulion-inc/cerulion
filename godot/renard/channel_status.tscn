@@ -1,0 +1,116 @@
+[gd_scene load_steps=2 format=3 uid="uid://db0kxda6mmhf0"]
+
+[ext_resource type="Script" path="res://scripts/user_interface/channel_status.cs" id="1_ht1ys"]
+
+[node name="ChannelStatus" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_right = -611.0
+grow_horizontal = 2
+grow_vertical = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+script = ExtResource("1_ht1ys")
+
+[node name="ChannelStatusVBox" type="VBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="TitleBar" type="MarginContainer" parent="ChannelStatusVBox"]
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 20
+theme_override_constants/margin_bottom = 20
+
+[node name="Label" type="Label" parent="ChannelStatusVBox/TitleBar"]
+layout_mode = 2
+size_flags_vertical = 1
+text = "Channel Status"
+
+[node name="ScrollContainer" type="ScrollContainer" parent="ChannelStatusVBox"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="GridContainer" type="GridContainer" parent="ChannelStatusVBox/ScrollContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+columns = 6
+
+[node name="ChannelName" type="MarginContainer" parent="ChannelStatusVBox/ScrollContainer/GridContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 5
+
+[node name="Label" type="Label" parent="ChannelStatusVBox/ScrollContainer/GridContainer/ChannelName"]
+layout_mode = 2
+text = "Channel Name"
+horizontal_alignment = 1
+
+[node name="MsgType" type="MarginContainer" parent="ChannelStatusVBox/ScrollContainer/GridContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 5
+
+[node name="Label" type="Label" parent="ChannelStatusVBox/ScrollContainer/GridContainer/MsgType"]
+layout_mode = 2
+text = "Message Type"
+horizontal_alignment = 1
+
+[node name="NumMsgs" type="MarginContainer" parent="ChannelStatusVBox/ScrollContainer/GridContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 5
+
+[node name="Label" type="Label" parent="ChannelStatusVBox/ScrollContainer/GridContainer/NumMsgs"]
+layout_mode = 2
+text = "Num Msgs"
+horizontal_alignment = 1
+
+[node name="Hz" type="MarginContainer" parent="ChannelStatusVBox/ScrollContainer/GridContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 5
+
+[node name="Label" type="Label" parent="ChannelStatusVBox/ScrollContainer/GridContainer/Hz"]
+layout_mode = 2
+text = "Hz"
+horizontal_alignment = 1
+
+[node name="Bandwidth" type="MarginContainer" parent="ChannelStatusVBox/ScrollContainer/GridContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 5
+
+[node name="Label" type="Label" parent="ChannelStatusVBox/ScrollContainer/GridContainer/Bandwidth"]
+layout_mode = 2
+text = "Bandwidth"
+horizontal_alignment = 1
+
+[node name="Undecodable" type="MarginContainer" parent="ChannelStatusVBox/ScrollContainer/GridContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 5
+
+[node name="Label" type="Label" parent="ChannelStatusVBox/ScrollContainer/GridContainer/Undecodable"]
+layout_mode = 2
+text = "Bandwidth"
+horizontal_alignment = 1
