@@ -123,9 +123,9 @@ script = ExtResource("6_0iuvp")
 [node name="Margin" type="MarginContainer" parent="LeftPanel"]
 layout_mode = 2
 theme_override_constants/margin_top = 20
-theme_override_constants/margin_right = 20
 
 [node name="ContentContainer" type="HBoxContainer" parent="LeftPanel/Margin"]
+custom_minimum_size = Vector2(100, 2.08165e-12)
 layout_mode = 2
 
 [node name="Windows" type="Panel" parent="LeftPanel/Margin/ContentContainer"]
@@ -143,13 +143,14 @@ offset_top = 50.0
 grow_horizontal = 2
 grow_vertical = 2
 
-[node name="Control2" parent="LeftPanel/Margin/ContentContainer/Windows/GridContainer" instance=ExtResource("6_mpovq")]
-custom_minimum_size = Vector2(100, 500)
+[node name="Control3" parent="LeftPanel/Margin/ContentContainer/Windows/GridContainer" instance=ExtResource("6_mpovq")]
+visible = false
+custom_minimum_size = Vector2(2.08165e-12, 500)
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="Control3" parent="LeftPanel/Margin/ContentContainer/Windows/GridContainer" instance=ExtResource("6_mpovq")]
-custom_minimum_size = Vector2(100, 500)
+[node name="LinePlot" parent="LeftPanel/Margin/ContentContainer/Windows/GridContainer" instance=ExtResource("6_mpovq")]
+custom_minimum_size = Vector2(2.08165e-12, 500)
 layout_mode = 2
 size_flags_horizontal = 3
 
@@ -309,5 +310,6 @@ grow_horizontal = 2
 grow_vertical = 2
 
 [connection signal="pressed" from="LeftPanel/Margin/ContentContainer/MinimizeButton" to="LeftPanel" method="_on_minimize_button_pressed"]
-[connection signal="pressed" from="LeftPanel/Margin/ContentContainer/ResizeButton" to="LeftPanel" method="_on_resize_button_pressed"]
+[connection signal="button_down" from="LeftPanel/Margin/ContentContainer/ResizeButton" to="LeftPanel" method="_on_resize_button_button_down"]
+[connection signal="button_up" from="LeftPanel/Margin/ContentContainer/ResizeButton" to="LeftPanel" method="_on_resize_button_button_up"]
 [connection signal="pressed" from="RightPanel/Margin/ContentContainer/MinimzeButton" to="RightPanel" method="_on_button_pressed"]
