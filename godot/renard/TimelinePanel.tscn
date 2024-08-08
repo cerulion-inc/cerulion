@@ -1,0 +1,300 @@
+[gd_scene load_steps=8 format=3 uid="uid://75fkhyg3657x"]
+
+[ext_resource type="Theme" uid="uid://2twdcnpdxmcn" path="res://demo_theme.tres" id="1_ofufo"]
+[ext_resource type="Texture2D" uid="uid://ohkj8xswvuio" path="res://UI/textures/icons/Devider.png" id="2_hh576"]
+[ext_resource type="FontFile" uid="uid://do3wmvqkncjkf" path="res://fonts/Sora-Variable.ttf" id="3_tqcha"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_7ge35"]
+bg_color = Color(0.262745, 0.266667, 0.270588, 1)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_fbv8s"]
+bg_color = Color(0, 0.752941, 1, 1)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_kktta"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_i8lvs"]
+bg_color = Color(0.0657938, 0.667607, 0.795399, 1)
+
+[node name="TimeProgressPanel" type="Control"]
+custom_minimum_size = Vector2(1800, 100)
+layout_mode = 3
+anchors_preset = 7
+anchor_left = 0.5
+anchor_top = 1.0
+anchor_right = 0.5
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 0
+size_flags_horizontal = 3
+
+[node name="PanelContainer" type="PanelContainer" parent="."]
+custom_minimum_size = Vector2(1800, 100)
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme = ExtResource("1_ofufo")
+
+[node name="MarginContainer2" type="MarginContainer" parent="PanelContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 2
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 10
+
+[node name="VBoxContainer" type="VBoxContainer" parent="PanelContainer/MarginContainer2"]
+layout_mode = 2
+
+[node name="MarginContainer" type="MarginContainer" parent="PanelContainer/MarginContainer2/VBoxContainer"]
+layout_mode = 2
+theme_override_constants/margin_top = 2
+theme_override_constants/margin_bottom = 2
+
+[node name="TextureRect" type="TextureRect" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+texture = ExtResource("2_hh576")
+stretch_mode = 5
+
+[node name="HBoxContainer" type="HBoxContainer" parent="PanelContainer/MarginContainer2/VBoxContainer"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="PanelContainer/MarginContainer2/VBoxContainer/HBoxContainer"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_tqcha")
+text = "Time"
+
+[node name="Control" type="Control" parent="PanelContainer/MarginContainer2/VBoxContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="Button" type="Button" parent="PanelContainer/MarginContainer2/VBoxContainer/HBoxContainer"]
+layout_mode = 2
+theme = ExtResource("1_ofufo")
+text = "Reset"
+
+[node name="TextureProgressBar" type="ProgressBar" parent="PanelContainer/MarginContainer2/VBoxContainer"]
+custom_minimum_size = Vector2(2.08165e-12, 5)
+layout_mode = 2
+theme_override_styles/background = SubResource("StyleBoxFlat_7ge35")
+theme_override_styles/fill = SubResource("StyleBoxFlat_fbv8s")
+value = 69.42
+show_percentage = false
+
+[node name="MarginContainer2" type="MarginContainer" parent="PanelContainer/MarginContainer2/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+theme_override_constants/margin_top = 5
+
+[node name="HBoxContainer2" type="HBoxContainer" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="HBoxContainer" type="HBoxContainer" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2/HBoxContainer"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_tqcha")
+text = "Message Timestamp: "
+
+[node name="Label2" type="Label" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2/HBoxContainer"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_tqcha")
+text = "21803712"
+
+[node name="Control" type="Control" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="HBoxContainer2" type="HBoxContainer" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2/HBoxContainer2"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_tqcha")
+text = "Elapsed Time:"
+
+[node name="Label2" type="Label" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2/HBoxContainer2"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_tqcha")
+text = "4.20 s"
+
+[node name="Control2" type="Control" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="HBoxContainer3" type="HBoxContainer" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2/HBoxContainer3"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_tqcha")
+text = "Frequency:"
+
+[node name="Label2" type="Label" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2/HBoxContainer3"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_tqcha")
+text = "101.2 Hz"
+
+[node name="Control3" type="Control" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="HBoxContainer4" type="HBoxContainer" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2/HBoxContainer4"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_tqcha")
+text = "Bandwidth:
+"
+
+[node name="Label2" type="Label" parent="PanelContainer/MarginContainer2/VBoxContainer/MarginContainer2/HBoxContainer2/HBoxContainer4"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_tqcha")
+text = "9.23 kB/s"
+
+[node name="Panel" type="PanelContainer" parent="."]
+visible = false
+custom_minimum_size = Vector2(2.08165e-12, 100)
+layout_mode = 1
+anchors_preset = 12
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_top = -100.0
+offset_right = 249.0
+grow_horizontal = 2
+grow_vertical = 0
+theme = ExtResource("1_ofufo")
+
+[node name="VBoxContainer" type="VBoxContainer" parent="Panel"]
+layout_mode = 2
+size_flags_horizontal = 0
+
+[node name="MarginContainer" type="MarginContainer" parent="Panel/VBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+theme_override_constants/margin_top = 2
+theme_override_constants/margin_bottom = 2
+
+[node name="TextureRect" type="TextureRect" parent="Panel/VBoxContainer/MarginContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+texture = ExtResource("2_hh576")
+stretch_mode = 5
+
+[node name="HBoxContainer" type="HBoxContainer" parent="Panel/VBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+size_flags_vertical = 3
+theme_override_constants/separation = 1046
+
+[node name="Label" type="Label" parent="Panel/VBoxContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+text = "Time"
+
+[node name="Control" type="Control" parent="Panel/VBoxContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="Button" type="Button" parent="Panel/VBoxContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+text = "Reset
+"
+
+[node name="Control" type="Control" parent="Panel/VBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+
+[node name="ProgressBar" type="ProgressBar" parent="Panel/VBoxContainer/Control"]
+layout_mode = 1
+anchors_preset = 10
+anchor_right = 1.0
+offset_right = -493.0
+offset_bottom = 6.0
+grow_horizontal = 2
+theme_override_styles/background = SubResource("StyleBoxFlat_kktta")
+theme_override_styles/fill = SubResource("StyleBoxFlat_i8lvs")
+value = 69.0
+rounded = true
+show_percentage = false
+
+[node name="HBoxContainer2" type="HBoxContainer" parent="Panel/VBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+theme_override_constants/separation = 67
+
+[node name="HBoxContainer" type="HBoxContainer" parent="Panel/VBoxContainer/HBoxContainer2"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer"]
+layout_mode = 2
+text = "Test Text"
+
+[node name="Label2" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer"]
+layout_mode = 2
+text = "1023590819"
+
+[node name="HBoxContainer2" type="HBoxContainer" parent="Panel/VBoxContainer/HBoxContainer2"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer2"]
+layout_mode = 2
+text = "Test Text"
+
+[node name="Label2" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer2"]
+layout_mode = 2
+text = "1023590819"
+
+[node name="HBoxContainer3" type="HBoxContainer" parent="Panel/VBoxContainer/HBoxContainer2"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer3"]
+layout_mode = 2
+text = "Test Text"
+
+[node name="Label2" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer3"]
+layout_mode = 2
+text = "1023590819"
+
+[node name="HBoxContainer4" type="HBoxContainer" parent="Panel/VBoxContainer/HBoxContainer2"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer4"]
+layout_mode = 2
+text = "Test Text"
+
+[node name="Label2" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer4"]
+layout_mode = 2
+text = "1023590819"
+
+[node name="HBoxContainer5" type="HBoxContainer" parent="Panel/VBoxContainer/HBoxContainer2"]
+layout_mode = 2
+
+[node name="CheckButton" type="CheckButton" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer5"]
+layout_mode = 2
+
+[node name="Label" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer5"]
+layout_mode = 2
+text = "Experimental"
+
+[node name="VSeparator" type="VSeparator" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer5"]
+layout_mode = 2
+
+[node name="Label2" type="Label" parent="Panel/VBoxContainer/HBoxContainer2/HBoxContainer5"]
+layout_mode = 2
+text = "31 FPS"

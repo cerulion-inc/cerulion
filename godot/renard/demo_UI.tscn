@@ -1,0 +1,61 @@
+[gd_scene load_steps=8 format=3 uid="uid://chs2b47b86o30"]
+
+[ext_resource type="PackedScene" uid="uid://rhctw13yw5fu" path="res://topBar.tscn" id="1_v42k1"]
+[ext_resource type="PackedScene" uid="uid://casi1yccvea20" path="res://StatusPanel.tscn" id="2_ddiym"]
+[ext_resource type="PackedScene" uid="uid://c1p1yq3socmwv" path="res://ControlBar.tscn" id="3_rmnd3"]
+[ext_resource type="PackedScene" uid="uid://b872qwc81c3py" path="res://GraphPanel.tscn" id="4_d5bua"]
+[ext_resource type="PackedScene" uid="uid://dxscnjlcof7i" path="res://VisButtons.tscn" id="5_dmcbu"]
+[ext_resource type="PackedScene" uid="uid://bdpep5d4gb3hv" path="res://LeftPanel.tscn" id="6_ej6sf"]
+[ext_resource type="PackedScene" uid="uid://75fkhyg3657x" path="res://TimelinePanel.tscn" id="7_x6as5"]
+
+[node name="demoUI" type="CanvasLayer"]
+
+[node name="TopBar" parent="." instance=ExtResource("1_v42k1")]
+metadata/_edit_lock_ = true
+
+[node name="StatusPanel" parent="." instance=ExtResource("2_ddiym")]
+anchors_preset = 0
+anchor_right = 0.0
+anchor_bottom = 0.0
+offset_left = 1368.0
+offset_top = 829.0
+offset_right = 1368.0
+offset_bottom = 829.0
+grow_horizontal = 1
+grow_vertical = 1
+metadata/_edit_lock_ = true
+
+[node name="ControlBar" parent="." instance=ExtResource("3_rmnd3")]
+offset_left = 550.0
+offset_top = 60.0
+offset_right = -496.0
+offset_bottom = -964.0
+metadata/_edit_lock_ = true
+
+[node name="GraphPanel" parent="." instance=ExtResource("4_d5bua")]
+offset_left = 1480.0
+offset_top = 60.0
+offset_right = -40.0
+offset_bottom = -180.0
+metadata/_edit_lock_ = true
+
+[node name="VisButtons" parent="." instance=ExtResource("5_dmcbu")]
+offset_left = 550.0
+offset_top = 130.0
+offset_right = -497.0
+offset_bottom = -902.0
+metadata/_edit_lock_ = true
+
+[node name="LeftPanel" parent="." instance=ExtResource("6_ej6sf")]
+offset_left = 40.0
+offset_top = 60.0
+offset_right = -1430.0
+offset_bottom = -180.0
+metadata/_edit_lock_ = true
+
+[node name="TimeProgressPanel" parent="." instance=ExtResource("7_x6as5")]
+offset_left = -920.0
+offset_top = -150.0
+offset_right = 925.0
+offset_bottom = -50.0
+metadata/_edit_lock_ = true

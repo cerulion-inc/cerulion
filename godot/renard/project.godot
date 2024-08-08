@@ -31,7 +31,7 @@ project/assembly_name="test"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/easy_charts/plugin.cfg")
+enabled=PackedStringArray("res://addons/easy_charts/plugin.cfg", "res://addons/maaacks_options_menus/plugin.cfg")
 
 [gui]
 
@@ -50,6 +50,11 @@ yat_terminal_toggle={
 ]
 }
 
+[maaacks_options_menus]
+
+disable_plugin_dialogues=true
+
 [rendering]
 
 lights_and_shadows/directional_shadow/soft_shadow_filter_quality=0
+environment/defaults/default_clear_color=Color(0, 0, 0, 1)

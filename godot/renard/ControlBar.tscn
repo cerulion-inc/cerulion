@@ -1,0 +1,86 @@
+[gd_scene load_steps=11 format=3 uid="uid://c1p1yq3socmwv"]
+
+[ext_resource type="Theme" uid="uid://2twdcnpdxmcn" path="res://demo_theme.tres" id="1_7skc5"]
+[ext_resource type="Texture2D" uid="uid://fhjkyktvyyct" path="res://UI/textures/controlBar/Primary Button (24_24 px).svg" id="2_58yyo"]
+[ext_resource type="Texture2D" uid="uid://rnp72qfv30e3" path="res://UI/textures/controlBar/Text Button (no paddings).svg" id="3_cvk2s"]
+[ext_resource type="Texture2D" uid="uid://7x627jcd1pep" path="res://UI/textures/controlBar/Text Button (no paddings)-1.svg" id="4_1j8hj"]
+[ext_resource type="Texture2D" uid="uid://ckstvp5nuto24" path="res://UI/textures/controlBar/Text Button (no paddings)-2.svg" id="5_2by1u"]
+[ext_resource type="Texture2D" uid="uid://4h05ej3j8n5s" path="res://UI/textures/controlBar/Text Button (no paddings)-3.svg" id="6_pvkxg"]
+[ext_resource type="Texture2D" uid="uid://du06uaohh6lhw" path="res://UI/textures/controlBar/Text Button (no paddings)-4.svg" id="7_lx4xh"]
+[ext_resource type="Texture2D" uid="uid://bfu1fu7eu2bry" path="res://UI/textures/controlBar/Text Button (no paddings)-7.svg" id="8_n75rr"]
+[ext_resource type="Texture2D" uid="uid://buuqki7skdw01" path="res://UI/textures/controlBar/Text Button (no paddings)-5.svg" id="9_savvv"]
+[ext_resource type="Texture2D" uid="uid://bpkcue3anis1v" path="res://UI/textures/controlBar/Text Button (no paddings)-6.svg" id="10_avm2f"]
+
+[node name="ControlBar" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_right = -1046.0
+offset_bottom = -1024.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="NinePatchRect" type="NinePatchRect" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="PanelContainer" type="PanelContainer" parent="NinePatchRect"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme = ExtResource("1_7skc5")
+
+[node name="MarginContainer" type="MarginContainer" parent="NinePatchRect/PanelContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 10
+theme_override_constants/margin_top = 10
+theme_override_constants/margin_bottom = 10
+
+[node name="HBoxContainer" type="HBoxContainer" parent="NinePatchRect/PanelContainer/MarginContainer"]
+layout_mode = 2
+
+[node name="Button" type="Button" parent="NinePatchRect/PanelContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+icon = ExtResource("2_58yyo")
+icon_alignment = 1
+
+[node name="Button2" type="Button" parent="NinePatchRect/PanelContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+icon = ExtResource("3_cvk2s")
+
+[node name="Button3" type="Button" parent="NinePatchRect/PanelContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+icon = ExtResource("4_1j8hj")
+
+[node name="Button4" type="Button" parent="NinePatchRect/PanelContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+icon = ExtResource("5_2by1u")
+
+[node name="Button5" type="Button" parent="NinePatchRect/PanelContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+icon = ExtResource("6_pvkxg")
+
+[node name="Button6" type="Button" parent="NinePatchRect/PanelContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+icon = ExtResource("7_lx4xh")
+
+[node name="Button7" type="Button" parent="NinePatchRect/PanelContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+icon = ExtResource("8_n75rr")
+icon_alignment = 1
+
+[node name="Button8" type="Button" parent="NinePatchRect/PanelContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+icon = ExtResource("9_savvv")
+
+[node name="Button9" type="Button" parent="NinePatchRect/PanelContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+icon = ExtResource("10_avm2f")

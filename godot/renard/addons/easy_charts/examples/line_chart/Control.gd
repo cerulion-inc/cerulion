@@ -22,7 +22,7 @@ func _ready():
 	cp.colors.ticks = Color("#283442")
 	cp.colors.text = Color.WHITE_SMOKE
 	cp.draw_bounding_box = false
-	cp.title = "Air Quality Monitoring"
+	cp.title = ""
 	cp.x_label = "Time"
 	cp.y_label = "Sensor values"
 	cp.x_scale = 5
@@ -59,6 +59,7 @@ func _ready():
 var new_val: float = 4.5
 
 func _process(delta: float):
+	print("EEEE")
 	# This function updates the values of a function and then updates the plot
 	new_val += 5
 	
@@ -68,5 +69,5 @@ func _process(delta: float):
 	chart.queue_redraw() # This will force the Chart to be updated
 
 
-func _on_CheckButton_pressed():
-	set_process(not is_processing())
+#func _on_CheckButton_pressed():
+	#set_process(not is_processing())

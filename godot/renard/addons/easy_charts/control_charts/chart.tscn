@@ -1,8 +1,9 @@
-[gd_scene load_steps=10 format=3 uid="uid://dlwq4kmdb3bhs"]
+[gd_scene load_steps=11 format=3 uid="uid://dlwq4kmdb3bhs"]
 
 [ext_resource type="Script" path="res://addons/easy_charts/control_charts/chart.gd" id="1"]
 [ext_resource type="PackedScene" path="res://addons/easy_charts/utilities/containers/data_tooltip/data_tooltip.tscn" id="2"]
 [ext_resource type="Script" path="res://addons/easy_charts/utilities/containers/canvas/canvas.gd" id="3"]
+[ext_resource type="FontFile" uid="uid://do3wmvqkncjkf" path="res://fonts/Sora-Variable.ttf" id="3_gtjn3"]
 [ext_resource type="Script" path="res://addons/easy_charts/utilities/containers/canvas/plot_box/plot_box.gd" id="4"]
 [ext_resource type="Script" path="res://addons/easy_charts/utilities/containers/canvas/plot_box/grid_box.gd" id="5"]
 [ext_resource type="PackedScene" path="res://addons/easy_charts/utilities/containers/legend/function_legend.tscn" id="6"]
@@ -45,6 +46,7 @@ theme_override_constants/separation = 10
 
 [node name="Title" type="Label" parent="Canvas/CanvasContainer"]
 layout_mode = 2
+theme_override_fonts/font = ExtResource("3_gtjn3")
 text = "{title}"
 horizontal_alignment = 1
 
@@ -55,7 +57,7 @@ size_flags_vertical = 3
 theme_override_constants/separation = 10
 
 [node name="YLabelContainer" type="VBoxContainer" parent="Canvas/CanvasContainer/DataContainer"]
-custom_minimum_size = Vector2(50, 2.08165e-12)
+custom_minimum_size = Vector2(25, 2.08165e-12)
 layout_mode = 2
 
 [node name="SpacerTop" type="Control" parent="Canvas/CanvasContainer/DataContainer/YLabelContainer"]
@@ -77,6 +79,7 @@ offset_top = -42.0
 offset_right = 120.0
 grow_vertical = 0
 rotation = -1.5708
+theme_override_fonts/font = ExtResource("3_gtjn3")
 text = "{ylabel}"
 horizontal_alignment = 1
 
@@ -123,6 +126,7 @@ offset_bottom = 68.0
 
 [node name="XLabel" type="Label" parent="Canvas/CanvasContainer/DataContainer/PlotContainer"]
 layout_mode = 2
+theme_override_fonts/font = ExtResource("3_gtjn3")
 text = "{xlabel}"
 
 [node name="FunctionLegend" parent="Canvas/CanvasContainer/DataContainer" instance=ExtResource("6")]

@@ -1,0 +1,111 @@
+[gd_scene load_steps=4 format=3 uid="uid://casi1yccvea20"]
+
+[ext_resource type="Theme" uid="uid://2twdcnpdxmcn" path="res://demo_theme.tres" id="1_xtm1y"]
+[ext_resource type="Texture2D" uid="uid://crr6iy65uhrrn" path="res://UI/textures/status/Badge-1.png" id="2_ysgy1"]
+[ext_resource type="Texture2D" uid="uid://br1kiuk0jjok0" path="res://UI/textures/status/State=Fall.svg" id="3_p20kj"]
+
+[node name="StatusPanel" type="Control"]
+layout_mode = 3
+anchor_right = 0.105
+anchor_bottom = 0.148
+offset_right = -9.60001
+offset_bottom = -7.84
+grow_horizontal = 0
+grow_vertical = 0
+size_flags_horizontal = 3
+size_flags_vertical = 3
+
+[node name="NinePatchRect" type="NinePatchRect" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Panel" type="PanelContainer" parent="NinePatchRect"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme = ExtResource("1_xtm1y")
+
+[node name="MarginContainer" type="MarginContainer" parent="NinePatchRect/Panel"]
+layout_mode = 2
+theme_override_constants/margin_left = 10
+theme_override_constants/margin_top = 10
+theme_override_constants/margin_right = 10
+theme_override_constants/margin_bottom = 10
+
+[node name="VBoxContainer" type="VBoxContainer" parent="NinePatchRect/Panel/MarginContainer"]
+layout_mode = 2
+
+[node name="HBoxContainer" type="HBoxContainer" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="AllChecksLabel" type="Label" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+theme = ExtResource("1_xtm1y")
+text = "All Checks:"
+vertical_alignment = 1
+
+[node name="AllCheckStatus" type="TextureRect" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer/HBoxContainer"]
+layout_mode = 2
+texture = ExtResource("2_ysgy1")
+stretch_mode = 5
+
+[node name="HBoxContainer2" type="HBoxContainer" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="SensorsLabel" type="Label" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer/HBoxContainer2"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+theme = ExtResource("1_xtm1y")
+text = "Sensors:"
+vertical_alignment = 1
+
+[node name="SensorsStatus" type="TextureRect" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer/HBoxContainer2"]
+layout_mode = 2
+texture = ExtResource("2_ysgy1")
+stretch_mode = 5
+
+[node name="HBoxContainer3" type="HBoxContainer" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="SLAMLabel" type="Label" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer/HBoxContainer3"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 1
+theme = ExtResource("1_xtm1y")
+text = "SLAM:"
+vertical_alignment = 1
+
+[node name="SLAMStatus" type="TextureRect" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer/HBoxContainer3"]
+layout_mode = 2
+texture = ExtResource("3_p20kj")
+stretch_mode = 5
+
+[node name="HBoxContainer4" type="HBoxContainer" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="PlanLabel" type="Label" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer/HBoxContainer4"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+theme = ExtResource("1_xtm1y")
+text = "Plan:"
+vertical_alignment = 1
+
+[node name="PlanStatus" type="TextureRect" parent="NinePatchRect/Panel/MarginContainer/VBoxContainer/HBoxContainer4"]
+layout_mode = 2
+texture = ExtResource("3_p20kj")
+stretch_mode = 5
