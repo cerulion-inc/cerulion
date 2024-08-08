@@ -1,0 +1,72 @@
+[gd_scene format=3 uid="uid://b6xuuk5ijpxkp"]
+
+[node name="ChecksPanel" type="Control"]
+layout_mode = 3
+anchor_right = 0.143
+anchor_bottom = 0.245
+offset_right = 0.263992
+offset_bottom = 0.23999
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="NinePatchRect" type="NinePatchRect" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Panel" type="Panel" parent="NinePatchRect"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_right = -1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="CenterContainer" type="CenterContainer" parent="NinePatchRect/Panel"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="HBoxContainer" type="HBoxContainer" parent="NinePatchRect/Panel/CenterContainer"]
+layout_mode = 2
+
+[node name="VBoxContainer" type="VBoxContainer" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer"]
+layout_mode = 2
+
+[node name="AllChecksLabel" type="Label" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer/VBoxContainer"]
+layout_mode = 2
+text = "All Checks:"
+
+[node name="SensorsLabel" type="Label" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer/VBoxContainer"]
+layout_mode = 2
+text = "Sensors:"
+
+[node name="SlamLabel" type="Label" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer/VBoxContainer"]
+layout_mode = 2
+text = "SLAM:"
+
+[node name="PlanLabel" type="Label" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer/VBoxContainer"]
+layout_mode = 2
+text = "Plan:"
+
+[node name="VBoxContainer2" type="VBoxContainer" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer"]
+layout_mode = 2
+
+[node name="AllChecksStatus" type="CheckButton" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer/VBoxContainer2"]
+layout_mode = 2
+
+[node name="SensorsStatus" type="CheckButton" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer/VBoxContainer2"]
+layout_mode = 2
+
+[node name="SlamStatus" type="CheckButton" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer/VBoxContainer2"]
+layout_mode = 2
+
+[node name="PlanStatus" type="CheckButton" parent="NinePatchRect/Panel/CenterContainer/HBoxContainer/VBoxContainer2"]
+layout_mode = 2

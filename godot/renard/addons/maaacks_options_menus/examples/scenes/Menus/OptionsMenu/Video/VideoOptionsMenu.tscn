@@ -1,0 +1,10 @@
+[gd_scene load_steps=3 format=3 uid="uid://b8kb81us6g3kr"]
+
+[ext_resource type="PackedScene" uid="uid://b2numvphf2kau" path="res://addons/maaacks_options_menus/base/scenes/Menus/OptionsMenu/Video/VideoOptionsMenu.tscn" id="1_4gigb"]
+[ext_resource type="Script" path="res://addons/maaacks_options_menus/examples/scenes/Menus/OptionsMenu/Video/VideoOptionsMenu.gd" id="2_v2jlu"]
+
+[node name="Video" instance=ExtResource("1_4gigb")]
+script = ExtResource("2_v2jlu")
+
+[node name="ResolutionControl" parent="VBoxContainer" index="1"]
+option_titles = Array[String](["640 x 360", "960 x 540", "1024 x 576", "1280 x 720", "1600 x 900", "1920 x 1080", "2048 x 1152", "2560 x 1440", "3200 x 1800", "3840 x 2160", "false"])

@@ -1,0 +1,61 @@
+[gd_scene load_steps=5 format=3 uid="uid://dxscnjlcof7i"]
+
+[ext_resource type="Theme" uid="uid://2twdcnpdxmcn" path="res://demo_theme.tres" id="1_pllyv"]
+[ext_resource type="Texture2D" uid="uid://d180cthp3g8n6" path="res://UI/textures/icons/ph_cube.png" id="2_c75fm"]
+[ext_resource type="Texture2D" uid="uid://dwww3xh040rqo" path="res://UI/textures/icons/Minus.svg" id="3_7y027"]
+[ext_resource type="Texture2D" uid="uid://bpn4vkvj1wgwj" path="res://UI/textures/icons/Add.svg" id="4_mibk7"]
+
+[node name="VisButtons" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_right = -1047.0
+offset_bottom = -1032.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="HBoxContainer" type="HBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Control" type="Control" parent="HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="PanelContainer" type="PanelContainer" parent="HBoxContainer"]
+layout_mode = 2
+theme = ExtResource("1_pllyv")
+
+[node name="Button" type="Button" parent="HBoxContainer/PanelContainer"]
+layout_mode = 2
+icon = ExtResource("2_c75fm")
+
+[node name="PanelContainer2" type="PanelContainer" parent="HBoxContainer"]
+layout_mode = 2
+theme = ExtResource("1_pllyv")
+
+[node name="HBoxContainer" type="HBoxContainer" parent="HBoxContainer/PanelContainer2"]
+layout_mode = 2
+
+[node name="MarginContainer" type="MarginContainer" parent="HBoxContainer/PanelContainer2/HBoxContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 8
+theme_override_constants/margin_right = 8
+
+[node name="Button" type="Button" parent="HBoxContainer/PanelContainer2/HBoxContainer/MarginContainer"]
+layout_mode = 2
+icon = ExtResource("3_7y027")
+
+[node name="MarginContainer2" type="MarginContainer" parent="HBoxContainer/PanelContainer2/HBoxContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 8
+theme_override_constants/margin_right = 8
+
+[node name="Button2" type="Button" parent="HBoxContainer/PanelContainer2/HBoxContainer/MarginContainer2"]
+layout_mode = 2
+icon = ExtResource("4_mibk7")

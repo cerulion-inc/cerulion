@@ -1,0 +1,67 @@
+[gd_resource type="Theme" load_steps=17 format=3 uid="uid://2twdcnpdxmcn"]
+
+[ext_resource type="FontFile" uid="uid://do3wmvqkncjkf" path="res://fonts/Sora-Variable.ttf" id="1_kus6r"]
+[ext_resource type="Texture2D" uid="uid://bm8bp5upkd6ec" path="res://UI/textures/toggle/isActive_=yes.svg" id="2_l8o4l"]
+[ext_resource type="Texture2D" uid="uid://bmsm552f5e5tk" path="res://UI/textures/toggle/isActive_=no.svg" id="2_leekj"]
+[ext_resource type="Texture2D" uid="uid://pum83g4iqj3y" path="res://UI/textures/toggle/Toggle.svg" id="3_nxrvw"]
+[ext_resource type="Texture2D" uid="uid://bob4aa5v1wc3i" path="res://UI/textures/checkbox/isChecked_=Yes, State=Default.svg" id="4_cjqhg"]
+[ext_resource type="Texture2D" uid="uid://cqjxllcxu6qjn" path="res://UI/textures/checkbox/isChecked_=No, State=Default.svg" id="5_geudl"]
+[ext_resource type="Texture2D" uid="uid://dl065sgd2agig" path="res://UI/textures/checkbox/isChecked_=No, State=Focused.svg" id="6_gcvmy"]
+[ext_resource type="Texture2D" uid="uid://b84axb0yljq2j" path="res://UI/textures/checkbox/isChecked_=Yes, State=Focused.svg" id="6_go01i"]
+
+[sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_mxng0"]
+content_margin_left = 5.0
+content_margin_top = 5.0
+content_margin_right = 5.0
+content_margin_bottom = 5.0
+
+[sub_resource type="StyleBoxTexture" id="StyleBoxTexture_ndubl"]
+texture = ExtResource("2_leekj")
+
+[sub_resource type="StyleBoxTexture" id="StyleBoxTexture_btjvj"]
+texture = ExtResource("2_l8o4l")
+
+[sub_resource type="StyleBoxTexture" id="StyleBoxTexture_oea6i"]
+texture = ExtResource("6_gcvmy")
+
+[sub_resource type="StyleBoxTexture" id="StyleBoxTexture_ckcba"]
+texture = ExtResource("6_go01i")
+
+[sub_resource type="StyleBoxTexture" id="StyleBoxTexture_jikgn"]
+texture = ExtResource("5_geudl")
+
+[sub_resource type="StyleBoxTexture" id="StyleBoxTexture_3pnmb"]
+texture = ExtResource("4_cjqhg")
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_uo1bj"]
+bg_color = Color(0.0784314, 0.0823529, 0.0901961, 1)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.262745, 0.266667, 0.270588, 1)
+corner_radius_top_left = 16
+corner_radius_top_right = 16
+corner_radius_bottom_right = 16
+corner_radius_bottom_left = 16
+
+[resource]
+Button/font_sizes/font_size = 12
+Button/fonts/font = ExtResource("1_kus6r")
+Button/styles/focus = null
+Button/styles/hover = null
+Button/styles/normal = SubResource("StyleBoxEmpty_mxng0")
+CerulionCheckButton/base_type = &"CheckButton"
+CerulionCheckButton/styles/normal = SubResource("StyleBoxTexture_ndubl")
+CerulionCheckButton/styles/pressed = SubResource("StyleBoxTexture_btjvj")
+CheckBox/icons/checked = ExtResource("4_cjqhg")
+CheckBox/icons/unchecked = ExtResource("5_geudl")
+CheckBox/styles/hover = SubResource("StyleBoxTexture_oea6i")
+CheckBox/styles/hover_pressed = SubResource("StyleBoxTexture_ckcba")
+CheckBox/styles/normal = SubResource("StyleBoxTexture_jikgn")
+CheckBox/styles/pressed = SubResource("StyleBoxTexture_3pnmb")
+CheckButton/icons/checked = ExtResource("2_l8o4l")
+CheckButton/icons/unchecked = ExtResource("3_nxrvw")
+Label/font_sizes/font_size = 12
+Label/fonts/font = ExtResource("1_kus6r")
+PanelContainer/styles/panel = SubResource("StyleBoxFlat_uo1bj")

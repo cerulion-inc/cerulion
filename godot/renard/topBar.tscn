@@ -1,0 +1,71 @@
+[gd_scene load_steps=3 format=3 uid="uid://rhctw13yw5fu"]
+
+[ext_resource type="Theme" uid="uid://2twdcnpdxmcn" path="res://demo_theme.tres" id="1_5cad5"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_mm6m0"]
+bg_color = Color(0, 0, 0, 1)
+
+[node name="TopBar" type="Control"]
+layout_mode = 3
+anchors_preset = 10
+anchor_right = 1.0
+offset_bottom = 56.0
+grow_horizontal = 2
+
+[node name="Panel" type="Panel" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_styles/panel = SubResource("StyleBoxFlat_mm6m0")
+
+[node name="TopBarContainer" type="NinePatchRect" parent="Panel"]
+layout_mode = 1
+anchors_preset = 10
+anchor_right = 1.0
+offset_bottom = 50.0
+grow_horizontal = 2
+
+[node name="ButtonContainer" type="HBoxContainer" parent="Panel/TopBarContainer"]
+layout_mode = 1
+anchors_preset = -1
+anchor_top = 0.5
+anchor_right = 1.0
+anchor_bottom = 0.5
+offset_left = 10.0
+offset_top = -10.0
+offset_bottom = 10.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="File" type="Button" parent="Panel/TopBarContainer/ButtonContainer"]
+layout_mode = 2
+theme = ExtResource("1_5cad5")
+text = "File"
+
+[node name="Panels" type="Button" parent="Panel/TopBarContainer/ButtonContainer"]
+layout_mode = 2
+theme = ExtResource("1_5cad5")
+text = "Panels"
+
+[node name="Help" type="Button" parent="Panel/TopBarContainer/ButtonContainer"]
+layout_mode = 2
+theme = ExtResource("1_5cad5")
+text = "Help"
+
+[node name="About" type="Button" parent="Panel/TopBarContainer/ButtonContainer"]
+layout_mode = 2
+theme = ExtResource("1_5cad5")
+text = "About
+"
+
+[node name="HidePanelLabel" type="Label" parent="Panel/TopBarContainer/ButtonContainer"]
+layout_mode = 2
+theme = ExtResource("1_5cad5")
+text = "Hide All Panels"
+
+[node name="HidePanels" type="CheckButton" parent="Panel/TopBarContainer/ButtonContainer"]
+layout_mode = 2
+theme = ExtResource("1_5cad5")

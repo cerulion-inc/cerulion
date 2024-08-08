@@ -3,7 +3,7 @@
 [ext_resource type="Texture2D" uid="uid://c3g4lvl4s1m0" path="res://materials/floor_tiles.png" id="1_43iyk"]
 [ext_resource type="PackedScene" uid="uid://c2ks6qck5pr1x" path="res://unitree_go2.tscn" id="1_g32yk"]
 [ext_resource type="Script" path="res://scripts/environment/Camera3D.gd" id="2_2h4ed"]
-[ext_resource type="PackedScene" uid="uid://d04maq6ib5dnk" path="res://UI.tscn" id="3_r55y1"]
+[ext_resource type="PackedScene" uid="uid://chs2b47b86o30" path="res://demo_UI.tscn" id="4_diky6"]
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_uc7fo"]
 albedo_texture = ExtResource("1_43iyk")
@@ -39,5 +39,4 @@ shadow_blur = 0.5
 transform = Transform3D(0.97353, 0.123768, -0.192149, 0.02672, 0.7733, 0.633477, 0.226993, -0.621843, 0.749523, -0.0653703, 1.18938, 0.721109)
 script = ExtResource("2_2h4ed")
 
-[node name="TestUI" parent="." instance=ExtResource("3_r55y1")]
-visible = false
+[node name="demoUI" parent="." instance=ExtResource("4_diky6")]
