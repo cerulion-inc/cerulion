@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://bbs8ts4unchi6"
+path="res://.godot/imported/calf_mirror.obj-15b354bee277aecfe405a36455410b6f.mesh"
+
+[deps]
+
+files=["res://.godot/imported/calf_mirror.obj-15b354bee277aecfe405a36455410b6f.mesh"]
+
+source_file="res://meshes/UnitreeGo2/calf_mirror.obj"
+dest_files=["res://.godot/imported/calf_mirror.obj-15b354bee277aecfe405a36455410b6f.mesh", "res://.godot/imported/calf_mirror.obj-15b354bee277aecfe405a36455410b6f.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false

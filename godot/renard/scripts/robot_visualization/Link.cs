@@ -1,7 +1,7 @@
 using System.Reflection.Metadata;
 using Godot;
 
-public partial class Link : MIT_Humanoid
+public partial class Link : Node3D
 {
 	public Link() {}
 
@@ -11,6 +11,7 @@ public partial class Link : MIT_Humanoid
 									  Vector3.Right,
 									  Vector3.Up);
 	public static Basis R_world = R_godot.Transposed();
+	public Basis R_mesh = Basis.Identity;
 	public static Basis I = Basis.Identity;
 	public static Transform3D T_default = new(I, Vector3.Zero);
 
@@ -52,11 +53,19 @@ public partial class Link : MIT_Humanoid
 	
 	public Transform3D InitializeMeshTransform() {
 		mesh_T_world.Origin = mesh_pos_offset;
-		Vector3 mesh_ZYX_offset = new(mesh_rpy_offset.Z,
+		Vector3 mesh_ZYX_offset = new Vector3(mesh_rpy_offset.Z,
 									  mesh_rpy_offset.Y,
 									  mesh_rpy_offset.X);
-		mesh_T_world.Basis = Basis.FromEuler(mesh_ZYX_offset, EulerOrder.Zyx);
-		return mesh_T_world;
+		mesh_T_world = mesh_T_world.Rotated(new Vector3(0, 0, 1), mesh_rpy_offset.Z);
+		mesh_T_world = mesh_T_world.Rotated(new Vector3(0, 1, 0), mesh_rpy_offset.Y);
+		mesh_T_world = mesh_T_world.Rotated(new Vector3(1, 0, 0), mesh_rpy_offset.X);
+		mesh_T_world.Basis = mesh_T_world.Basis * R_mesh;
+		ConvertWorldTransformToGodot(ref mesh_T_godot, in mesh_T_world);
+
+		// TODO: This code  below works for the humanoid, without the converstion to the Godot frame
+		// TODO: This is a bug that needs to be fixed for the humanoid specifically.
+		// mesh_T_world.Basis = R_mesh * Basis.FromEuler(mesh_ZYX_offset, EulerOrder.Zyx);
+		return mesh_T_godot;
 	}
 
 	public Transform3D InitializeLinkTransform() {
@@ -65,7 +74,6 @@ public partial class Link : MIT_Humanoid
         ConvertWorldTransformToGodot(ref link_T_godot, in link_T_world);
 		return link_T_godot;
 	}
-
 	public Transform3D GetLinkTransform() {
 		// Rotation
 		world_R_parent = R_world * parent_node.Transform.Basis;

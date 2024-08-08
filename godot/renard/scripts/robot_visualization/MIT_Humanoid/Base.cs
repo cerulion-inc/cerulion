@@ -1,5 +1,7 @@
 using Godot;
 
+namespace MIT_Humanoid_Links
+{
 public partial class Base : Link
 {
     private void SetupParameters() {
@@ -31,4 +33,6 @@ public partial class Base : Link
 	public override void _Process(double delta) {
 		Transform = GetBaseTransform(link_T_world);
 	}
+}
+
 }

@@ -1,0 +1,141 @@
+[gd_scene load_steps=23 format=3 uid="uid://c2ks6qck5pr1x"]
+
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/Base.cs" id="1_adiv5"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/Link.cs" id="1_octrr"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/UnitreeGo2.cs" id="1_vug2h"]
+[ext_resource type="ArrayMesh" uid="uid://caaiyhkn2m30g" path="res://meshes/UnitreeGo2/trunk.obj" id="3_1dm8j"]
+[ext_resource type="Material" uid="uid://boshnxx4dvyfe" path="res://materials/aluminum.tres" id="4_5tcoy"]
+[ext_resource type="ArrayMesh" uid="uid://dcsbswxu6ewru" path="res://meshes/UnitreeGo2/hip.obj" id="6_2wfay"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/FL_Hip.cs" id="6_t8anu"]
+[ext_resource type="ArrayMesh" uid="uid://dgs2iw2yyc7tu" path="res://meshes/UnitreeGo2/thigh.obj" id="7_hohr5"]
+[ext_resource type="ArrayMesh" uid="uid://d330qnl2ka6xu" path="res://meshes/UnitreeGo2/calf.obj" id="8_mymnp"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/FL_Thigh.cs" id="8_rfaud"]
+[ext_resource type="ArrayMesh" uid="uid://bylduq4pecll3" path="res://meshes/UnitreeGo2/thigh_mirror.obj" id="9_m5v4e"]
+[ext_resource type="ArrayMesh" uid="uid://bbs8ts4unchi6" path="res://meshes/UnitreeGo2/calf_mirror.obj" id="10_3oyf4"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/FL_Calf.cs" id="10_jtvrw"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/FR_Hip.cs" id="12_me22i"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/FR_Thigh.cs" id="13_h5a78"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/FR_Calf.cs" id="15_doqmv"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/RL_Hip.cs" id="17_mkpvb"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/RL_Thigh.cs" id="18_c336y"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/RL_Calf.cs" id="19_uoqs1"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/RR_Hip.cs" id="20_3hd7i"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/RR_Thigh.cs" id="21_ufyv2"]
+[ext_resource type="Script" path="res://scripts/robot_visualization/UnitreeGo2/RR_Calf.cs" id="22_rxcmh"]
+
+[node name="UnitreeGo2" type="Node3D"]
+script = ExtResource("1_vug2h")
+
+[node name="Link" type="Node3D" parent="."]
+script = ExtResource("1_octrr")
+
+[node name="Base" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.08165e-12, 2.08165e-12, 2.08165e-12)
+script = ExtResource("1_adiv5")
+
+[node name="Base" type="MeshInstance3D" parent="Link/Base"]
+mesh = ExtResource("3_1dm8j")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="FL_Hip" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("6_t8anu")
+
+[node name="FL_Hip" type="MeshInstance3D" parent="Link/FL_Hip"]
+transform = Transform3D(1, -3.48787e-16, 3.48787e-16, 3.48787e-16, 1, -3.48787e-16, -3.48787e-16, 3.48787e-16, 1, 2.08165e-12, 2.08165e-12, 2.08165e-12)
+mesh = ExtResource("6_2wfay")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="FL_Thigh" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("8_rfaud")
+
+[node name="FL_Thigh" type="MeshInstance3D" parent="Link/FL_Thigh"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.08165e-12, 2.08165e-12, 2.08165e-12)
+rotation_order = 3
+mesh = ExtResource("7_hohr5")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="FL_Calf" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("10_jtvrw")
+
+[node name="FL_Calf" type="MeshInstance3D" parent="Link/FL_Calf"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.08165e-12, 2.08165e-12, 2.08165e-12)
+mesh = ExtResource("8_mymnp")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="FR_Hip" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("12_me22i")
+
+[node name="FR_Hip" type="MeshInstance3D" parent="Link/FR_Hip"]
+mesh = ExtResource("6_2wfay")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="FR_Thigh" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("13_h5a78")
+
+[node name="FR_Thigh" type="MeshInstance3D" parent="Link/FR_Thigh"]
+mesh = ExtResource("9_m5v4e")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="FR_Calf" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("15_doqmv")
+
+[node name="FR_Calf" type="MeshInstance3D" parent="Link/FR_Calf"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.08165e-12, 2.08165e-12, 2.08165e-12)
+mesh = ExtResource("10_3oyf4")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="RL_Hip" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("17_mkpvb")
+
+[node name="RL_Hip" type="MeshInstance3D" parent="Link/RL_Hip"]
+mesh = ExtResource("6_2wfay")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="RL_Thigh" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("18_c336y")
+
+[node name="RL_Thigh" type="MeshInstance3D" parent="Link/RL_Thigh"]
+mesh = ExtResource("7_hohr5")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="RL_Calf" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("19_uoqs1")
+
+[node name="RL_Calf" type="MeshInstance3D" parent="Link/RL_Calf"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.08165e-12, 2.08165e-12, 2.08165e-12)
+mesh = ExtResource("8_mymnp")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="RR_Hip" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("20_3hd7i")
+
+[node name="RR_Hip" type="MeshInstance3D" parent="Link/RR_Hip"]
+mesh = ExtResource("6_2wfay")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="RR_Thigh" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("21_ufyv2")
+
+[node name="RR_Thigh" type="MeshInstance3D" parent="Link/RR_Thigh"]
+mesh = ExtResource("9_m5v4e")
+surface_material_override/0 = ExtResource("4_5tcoy")
+
+[node name="RR_Calf" type="Node3D" parent="Link"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1633e-12, 4.1633e-12, 4.1633e-12)
+script = ExtResource("22_rxcmh")
+
+[node name="RR_Calf" type="MeshInstance3D" parent="Link/RR_Calf"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.08165e-12, 2.08165e-12, 2.08165e-12)
+mesh = ExtResource("10_3oyf4")
+surface_material_override/0 = ExtResource("4_5tcoy")

@@ -11,7 +11,7 @@ config_version=5
 [application]
 
 config/name="renard"
-run/main_scene="res://main.tscn"
+run/main_scene="res://demo.tscn"
 config/features=PackedStringArray("4.2", "C#", "Forward Plus")
 boot_splash/bg_color=Color(1, 1, 1, 1)
 boot_splash/image="res://cerulion-assets/Logo Main Vertical For White Background.png"
