@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://bq1keqrrdju2x"
+path="res://.godot/imported/foot.obj-9cee80cbbde07642ac9e6761bf0c448e.mesh"
+
+[deps]
+
+files=["res://.godot/imported/foot.obj-9cee80cbbde07642ac9e6761bf0c448e.mesh"]
+
+source_file="res://meshes/UnitreeGo2/foot.obj"
+dest_files=["res://.godot/imported/foot.obj-9cee80cbbde07642ac9e6761bf0c448e.mesh", "res://.godot/imported/foot.obj-9cee80cbbde07642ac9e6761bf0c448e.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false

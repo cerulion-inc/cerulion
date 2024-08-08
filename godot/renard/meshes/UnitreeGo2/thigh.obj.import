@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://dgs2iw2yyc7tu"
+path="res://.godot/imported/thigh.obj-ebbc61c53dba6a23d885eeb3e9e118f6.mesh"
+
+[deps]
+
+files=["res://.godot/imported/thigh.obj-ebbc61c53dba6a23d885eeb3e9e118f6.mesh"]
+
+source_file="res://meshes/UnitreeGo2/thigh.obj"
+dest_files=["res://.godot/imported/thigh.obj-ebbc61c53dba6a23d885eeb3e9e118f6.mesh", "res://.godot/imported/thigh.obj-ebbc61c53dba6a23d885eeb3e9e118f6.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false

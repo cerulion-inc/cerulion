@@ -5,7 +5,7 @@
 [ext_resource type="Script" path="res://scripts/environment/Camera3D.gd" id="2_rfl6k"]
 [ext_resource type="PackedScene" uid="uid://d04maq6ib5dnk" path="res://UI.tscn" id="4_qs8bb"]
 
-[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_uc7fo"]
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_oab76"]
 albedo_texture = ExtResource("2_haf8n")
 metallic = 0.1
 metallic_specular = 1.0
@@ -16,7 +16,7 @@ uv1_scale = Vector3(50, 50, 50)
 proximity_fade_enabled = true
 
 [sub_resource type="PlaneMesh" id="PlaneMesh_3vvbf"]
-material = SubResource("StandardMaterial3D_uc7fo")
+material = SubResource("StandardMaterial3D_oab76")
 size = Vector2(100, 100)
 
 [node name="Main" type="Node3D"]

@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://d330qnl2ka6xu"
+path="res://.godot/imported/calf.obj-ef9454a282f28442c757fde0525a384e.mesh"
+
+[deps]
+
+files=["res://.godot/imported/calf.obj-ef9454a282f28442c757fde0525a384e.mesh"]
+
+source_file="res://meshes/UnitreeGo2/calf.obj"
+dest_files=["res://.godot/imported/calf.obj-ef9454a282f28442c757fde0525a384e.mesh", "res://.godot/imported/calf.obj-ef9454a282f28442c757fde0525a384e.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false
