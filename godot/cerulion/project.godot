@@ -12,6 +12,8 @@ config_version=5
 
 config/name="Cerulion"
 config/features=PackedStringArray("4.3", "Forward Plus")
+boot_splash/bg_color=Color(1, 1, 1, 1)
+boot_splash/image="res://assets/textures/logo/Logo Main Icon.png"
 config/icon="res://icon.svg"
 
 [dotnet]
