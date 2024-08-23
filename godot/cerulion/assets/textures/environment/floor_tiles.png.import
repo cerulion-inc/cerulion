@@ -2,8 +2,8 @@
 
 importer="texture"
 type="CompressedTexture2D"
-uid="uid://ctcato31kfugm"
-path.s3tc="res://.godot/imported/Logo Main Icon.png-0152f4233d69cfd30540a0f5f8f02041.s3tc.ctex"
+uid="uid://cky0o16rtglmc"
+path.s3tc="res://.godot/imported/floor_tiles.png-6be1a002412457ee38c665acdd5555fc.s3tc.ctex"
 metadata={
 "imported_formats": ["s3tc_bptc"],
 "vram_texture": true
@@ -11,8 +11,8 @@ metadata={
 
 [deps]
 
-source_file="res://assets/textures/logo/Logo Main Icon.png"
-dest_files=["res://.godot/imported/Logo Main Icon.png-0152f4233d69cfd30540a0f5f8f02041.s3tc.ctex"]
+source_file="res://assets/textures/environment/floor_tiles.png"
+dest_files=["res://.godot/imported/floor_tiles.png-6be1a002412457ee38c665acdd5555fc.s3tc.ctex"]
 
 [params]
 

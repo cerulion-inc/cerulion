@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://c2vixqwqvtvrv"
+path="res://.godot/imported/thigh_mirror.obj-552836053205e42b66182c238bc24521.mesh"
+
+[deps]
+
+files=["res://.godot/imported/thigh_mirror.obj-552836053205e42b66182c238bc24521.mesh"]
+
+source_file="res://assets/meshes/robots/UnitreeGo2/thigh_mirror.obj"
+dest_files=["res://.godot/imported/thigh_mirror.obj-552836053205e42b66182c238bc24521.mesh", "res://.godot/imported/thigh_mirror.obj-552836053205e42b66182c238bc24521.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false

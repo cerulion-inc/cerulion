@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://bubniev8kq6t0"
+path="res://.godot/imported/right_hip_yaw_scaled.obj-ea5db52d01c408c32f1a955e291f9dc0.mesh"
+
+[deps]
+
+files=["res://.godot/imported/right_hip_yaw_scaled.obj-ea5db52d01c408c32f1a955e291f9dc0.mesh"]
+
+source_file="res://assets/meshes/robots/MITHumanoid/right_hip_yaw_scaled.obj"
+dest_files=["res://.godot/imported/right_hip_yaw_scaled.obj-ea5db52d01c408c32f1a955e291f9dc0.mesh", "res://.godot/imported/right_hip_yaw_scaled.obj-ea5db52d01c408c32f1a955e291f9dc0.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false
