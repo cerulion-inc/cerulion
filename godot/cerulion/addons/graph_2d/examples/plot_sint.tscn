@@ -1,0 +1,59 @@
+[gd_scene load_steps=3 format=3 uid="uid://dwuptr3eos1kt"]
+
+[ext_resource type="Script" path="res://addons/graph_2d/examples/plot_sint.gd" id="1_nl7wu"]
+[ext_resource type="Script" path="res://addons/graph_2d/graph_2d.gd" id="2_o0pag"]
+
+[node name="PlotSint" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_nl7wu")
+
+[node name="Graph2D" type="Control" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("2_o0pag")
+x_label = "t[s]"
+y_min = -2.0
+y_max = 2.0
+y_label = "y"
+grid_horizontal_visible = true
+grid_vertical_visible = true
+metadata/_edit_layout_mode = 0
+metadata/_edit_use_custom_anchors = false
+
+[node name="DrawButton" type="Button" parent="Graph2D"]
+layout_mode = 1
+anchors_preset = 5
+anchor_left = 0.5
+anchor_right = 0.5
+offset_left = -48.0
+offset_right = 48.0
+offset_bottom = 31.0
+grow_horizontal = 2
+text = "Draw Sin(x)"
+metadata/_edit_layout_mode = 0
+metadata/_edit_use_custom_anchors = false
+
+[node name="ClearButton" type="Button" parent="Graph2D"]
+layout_mode = 1
+anchors_preset = 5
+anchor_left = 0.5
+anchor_right = 0.5
+offset_left = 58.0
+offset_right = 107.0
+offset_bottom = 31.0
+grow_horizontal = 2
+text = "Clear"
+metadata/_edit_layout_mode = 0
+metadata/_edit_use_custom_anchors = false
+
+[connection signal="pressed" from="Graph2D/DrawButton" to="." method="_on_draw_button_pressed"]
+[connection signal="pressed" from="Graph2D/ClearButton" to="." method="_on_clear_button_pressed"]

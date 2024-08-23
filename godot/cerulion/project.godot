@@ -28,6 +28,10 @@ window/per_pixel_transparency/allowed=true
 
 project/assembly_name="Cerulion"
 
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/easy_charts/plugin.cfg")
+
 [gui]
 
 theme/custom="res://assets/themes/dark_mode.tres"
