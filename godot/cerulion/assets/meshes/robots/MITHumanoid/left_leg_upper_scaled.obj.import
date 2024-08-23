@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://dbl515cnt08rh"
+path="res://.godot/imported/left_leg_upper_scaled.obj-203470f9ed0be6b89855d4e867abb84a.mesh"
+
+[deps]
+
+files=["res://.godot/imported/left_leg_upper_scaled.obj-203470f9ed0be6b89855d4e867abb84a.mesh"]
+
+source_file="res://assets/meshes/robots/MITHumanoid/left_leg_upper_scaled.obj"
+dest_files=["res://.godot/imported/left_leg_upper_scaled.obj-203470f9ed0be6b89855d4e867abb84a.mesh", "res://.godot/imported/left_leg_upper_scaled.obj-203470f9ed0be6b89855d4e867abb84a.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false

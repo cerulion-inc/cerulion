@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://b2fw4kqtb2c81"
+path="res://.godot/imported/left_shoulder3_scaled.obj-42046edb0814c27013bb0c6abd7dc295.mesh"
+
+[deps]
+
+files=["res://.godot/imported/left_shoulder3_scaled.obj-42046edb0814c27013bb0c6abd7dc295.mesh"]
+
+source_file="res://assets/meshes/robots/MITHumanoid/left_shoulder3_scaled.obj"
+dest_files=["res://.godot/imported/left_shoulder3_scaled.obj-42046edb0814c27013bb0c6abd7dc295.mesh", "res://.godot/imported/left_shoulder3_scaled.obj-42046edb0814c27013bb0c6abd7dc295.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false

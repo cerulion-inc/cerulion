@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://dx8bwsspb4tkx"
+path="res://.godot/imported/left_forearm_scaled.obj-5c5e0aa71ddea482f16fd5c63e9c1974.mesh"
+
+[deps]
+
+files=["res://.godot/imported/left_forearm_scaled.obj-5c5e0aa71ddea482f16fd5c63e9c1974.mesh"]
+
+source_file="res://assets/meshes/robots/MITHumanoid/left_forearm_scaled.obj"
+dest_files=["res://.godot/imported/left_forearm_scaled.obj-5c5e0aa71ddea482f16fd5c63e9c1974.mesh", "res://.godot/imported/left_forearm_scaled.obj-5c5e0aa71ddea482f16fd5c63e9c1974.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false
