@@ -44,7 +44,10 @@ size_flags_vertical = 3
 theme_override_constants/separation = 10
 
 [node name="Title" type="Label" parent="Canvas/CanvasContainer"]
+clip_contents = true
 layout_mode = 2
+size_flags_vertical = 6
+size_flags_stretch_ratio = 0.0
 text = "{title}"
 
 [node name="DataContainer" type="HBoxContainer" parent="Canvas/CanvasContainer"]
@@ -54,15 +57,19 @@ size_flags_vertical = 3
 theme_override_constants/separation = 10
 
 [node name="Control" type="Control" parent="Canvas/CanvasContainer/DataContainer"]
-custom_minimum_size = Vector2(25, 0)
+custom_minimum_size = Vector2(30, 0)
 layout_mode = 2
+size_flags_horizontal = 0
 
 [node name="YLabel" type="Label" parent="Canvas/CanvasContainer/DataContainer/Control"]
-layout_mode = 2
-offset_left = 10.0
-offset_top = 283.0
-offset_right = 70.0
-offset_bottom = 304.0
+layout_mode = 1
+anchors_preset = 4
+anchor_top = 0.5
+anchor_bottom = 0.5
+offset_top = -10.5
+offset_right = 60.0
+offset_bottom = 10.5
+grow_vertical = 2
 text = "{ylabel}"
 horizontal_alignment = 1
 vertical_alignment = 1
@@ -107,6 +114,7 @@ offset_bottom = 26.0
 [node name="XLabel" type="Label" parent="Canvas/CanvasContainer/DataContainer/PlotContainer"]
 layout_mode = 2
 text = "{xlabel}"
+horizontal_alignment = 1
 
 [node name="FunctionLegend" parent="Canvas/CanvasContainer/DataContainer" instance=ExtResource("6")]
 unique_name_in_owner = true

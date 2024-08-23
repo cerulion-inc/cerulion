@@ -21,8 +21,9 @@ boot_splash/minimum_display_time=5
 
 [display]
 
+window/size/viewport_width=1440
+window/size/viewport_height=900
 window/subwindows/embed_subwindows=false
-window/per_pixel_transparency/allowed=true
 
 [dotnet]
 

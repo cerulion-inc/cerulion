@@ -1,13 +1,17 @@
-[gd_resource type="Theme" load_steps=6 format=3 uid="uid://ceve3jwvjaqnx"]
+[gd_resource type="Theme" load_steps=9 format=3 uid="uid://ceve3jwvjaqnx"]
 
 [ext_resource type="FontFile" uid="uid://cducsnsm62sj1" path="res://assets/fonts/Sora-Variable.ttf" id="1_4qtex"]
+[ext_resource type="Texture2D" uid="uid://bdxrxbmromyey" path="res://assets/textures/ui/dark/icons-misc/iconoir_eye.svg" id="1_sspqg"]
+[ext_resource type="Texture2D" uid="uid://cbmgw0h5ed1mf" path="res://assets/textures/ui/dark/icons-misc/mingcute_eye-close-line.svg" id="2_2ga5w"]
+
+[sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_isqno"]
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_ndjwt"]
 bg_color = Color(0.152765, 0.158807, 0.170891, 1)
-border_width_left = 2
-border_width_top = 2
-border_width_right = 2
-border_width_bottom = 2
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
 border_color = Color(0.262745, 0.266667, 0.270588, 1)
 corner_radius_top_left = 16
 corner_radius_top_right = 16
@@ -42,6 +46,10 @@ corner_radius_bottom_left = 5
 
 [resource]
 default_font = ExtResource("1_4qtex")
+IconButton_Eye/base_type = &"CheckButton"
+IconButton_Eye/icons/checked = ExtResource("1_sspqg")
+IconButton_Eye/icons/unchecked = ExtResource("2_2ga5w")
+IconButton_Eye/styles/focus = SubResource("StyleBoxEmpty_isqno")
 Label/fonts/font = ExtResource("1_4qtex")
 Panel_Grey/base_type = &"Panel"
 Panel_Grey/styles/panel = SubResource("StyleBoxFlat_ndjwt")
