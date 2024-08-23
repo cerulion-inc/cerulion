@@ -1,0 +1,70 @@
+[gd_scene load_steps=5 format=3 uid="uid://sis2wcsv5d8e"]
+
+[ext_resource type="PackedScene" uid="uid://j3h0to2ir0rs" path="res://scenes/ui/import_button.tscn" id="1_kufab"]
+[ext_resource type="PackedScene" uid="uid://c1t11mx2f8ibp" path="res://scenes/ui/status_panel.tscn" id="2_n3wof"]
+[ext_resource type="Script" path="res://scripts/ui/ImportWindow.gd" id="3_h1xhr"]
+[ext_resource type="PackedScene" uid="uid://4onc2uy3n0aa" path="res://scenes/ui/file_import_window.tscn" id="3_kyn5f"]
+
+[node name="Viewport" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="VBoxContainer" type="VBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="HBoxContainer" type="HBoxContainer" parent="VBoxContainer"]
+custom_minimum_size = Vector2(0, 40)
+layout_mode = 2
+size_flags_vertical = 0
+
+[node name="MarginContainer" type="MarginContainer" parent="VBoxContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/margin_left = 10
+theme_override_constants/margin_top = 10
+
+[node name="ImportButton" parent="VBoxContainer/HBoxContainer/MarginContainer" instance=ExtResource("1_kufab")]
+layout_mode = 2
+size_flags_horizontal = 2
+size_flags_vertical = 0
+
+[node name="MarginContainer" type="MarginContainer" parent="VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+theme_override_constants/margin_left = 10
+theme_override_constants/margin_right = 10
+theme_override_constants/margin_bottom = 10
+
+[node name="HBoxContainer" type="HBoxContainer" parent="VBoxContainer/MarginContainer"]
+layout_mode = 2
+
+[node name="StatusPanel" parent="VBoxContainer/MarginContainer/HBoxContainer" instance=ExtResource("2_n3wof")]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 1.5
+
+[node name="VisualizationSpacer" type="Control" parent="VBoxContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 8.0
+
+[node name="Window" type="Window" parent="."]
+title = "Import"
+initial_position = 2
+size = Vector2i(600, 400)
+visible = false
+script = ExtResource("3_h1xhr")
+
+[node name="FileImportWindow" parent="Window" instance=ExtResource("3_kyn5f")]
+
+[connection signal="pressed" from="VBoxContainer/HBoxContainer/MarginContainer/ImportButton" to="Window" method="_on_import_button_pressed"]
+[connection signal="close_requested" from="Window" to="Window" method="_on_close_requested"]
