@@ -1,0 +1,48 @@
+[gd_scene load_steps=3 format=3 uid="uid://br4viqfrbdlpe"]
+
+[ext_resource type="Script" path="res://addons/graph_2d/examples/single_plot.gd" id="1_qmytq"]
+[ext_resource type="Script" path="res://addons/graph_2d/graph_2d.gd" id="2_2ul57"]
+
+[node name="SinglePlot" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_qmytq")
+
+[node name="Graph2D" type="Control" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("2_2ul57")
+x_label = "Time(s)"
+y_min = -53.0
+y_max = 50.0
+y_label = "Y"
+background_color = Color(0.0941176, 0.227451, 0.4, 1)
+grid_horizontal_visible = true
+grid_vertical_visible = true
+
+[node name="AddPlot" type="Button" parent="."]
+layout_mode = 0
+offset_left = 280.0
+offset_top = 32.0
+offset_right = 393.0
+offset_bottom = 63.0
+text = "Add New Plot"
+
+[node name="RemoveAllPlots" type="Button" parent="."]
+layout_mode = 0
+offset_left = 400.0
+offset_top = 32.0
+offset_right = 537.0
+offset_bottom = 63.0
+text = "Remove All Plots"
+
+[connection signal="pressed" from="AddPlot" to="." method="_on_add_plot_pressed"]
+[connection signal="pressed" from="RemoveAllPlots" to="." method="_on_remove_all_plots_pressed"]
