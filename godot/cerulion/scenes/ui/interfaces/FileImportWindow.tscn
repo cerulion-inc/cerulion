@@ -1,6 +1,6 @@
 [gd_scene load_steps=2 format=3 uid="uid://4onc2uy3n0aa"]
 
-[ext_resource type="Script" path="res://scripts/ui/FileImportWindow.cs" id="1_43uos"]
+[ext_resource type="Script" path="res://scenes/ui/interfaces/FileImportWindow.cs" id="1_43uos"]
 
 [node name="FileImportWindow" type="Control"]
 layout_mode = 3
