@@ -1,7 +1,8 @@
-[gd_scene load_steps=5 format=3 uid="uid://c3oyeyyno6u24"]
+[gd_scene load_steps=6 format=3 uid="uid://c3oyeyyno6u24"]
 
 [ext_resource type="Texture2D" uid="uid://cky0o16rtglmc" path="res://assets/textures/environment/floor_tiles.png" id="1_iqur1"]
 [ext_resource type="Script" path="res://scripts/environment/ViewerCamera.gd" id="2_k7w8u"]
+[ext_resource type="PackedScene" uid="uid://sis2wcsv5d8e" path="res://scenes/ui/viewport.tscn" id="3_113xp"]
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_v4po0"]
 albedo_texture = ExtResource("1_iqur1")
@@ -28,3 +29,14 @@ script = ExtResource("2_k7w8u")
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="Environment"]
 transform = Transform3D(0.707107, 0.707107, 0, -0.5, 0.5, 0.707107, 0.5, -0.5, 0.707107, -1, 1, 1)
+
+[node name="UI" type="Control" parent="."]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Viewport" parent="UI" instance=ExtResource("3_113xp")]
+layout_mode = 1

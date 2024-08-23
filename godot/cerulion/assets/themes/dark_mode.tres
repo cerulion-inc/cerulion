@@ -1,3 +1,51 @@
-[gd_resource type="Theme" format=3 uid="uid://ceve3jwvjaqnx"]
+[gd_resource type="Theme" load_steps=6 format=3 uid="uid://ceve3jwvjaqnx"]
+
+[ext_resource type="FontFile" uid="uid://cducsnsm62sj1" path="res://assets/fonts/Sora-Variable.ttf" id="1_4qtex"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_ndjwt"]
+bg_color = Color(0.152765, 0.158807, 0.170891, 1)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.262745, 0.266667, 0.270588, 1)
+corner_radius_top_left = 16
+corner_radius_top_right = 16
+corner_radius_bottom_right = 16
+corner_radius_bottom_left = 16
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_8pgw0"]
+bg_color = Color(0, 0.752941, 1, 1)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.541176, 0.886275, 1, 1)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_sucib"]
+bg_color = Color(0, 0.501961, 0.709804, 1)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_7l7ig"]
+bg_color = Color(0, 0.752941, 1, 1)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
 
 [resource]
+default_font = ExtResource("1_4qtex")
+Label/fonts/font = ExtResource("1_4qtex")
+Panel_Grey/base_type = &"Panel"
+Panel_Grey/styles/panel = SubResource("StyleBoxFlat_ndjwt")
+TextButton_Blue/base_type = &"Button"
+TextButton_Blue/styles/focus = SubResource("StyleBoxFlat_8pgw0")
+TextButton_Blue/styles/hover = SubResource("StyleBoxFlat_sucib")
+TextButton_Blue/styles/normal = SubResource("StyleBoxFlat_7l7ig")

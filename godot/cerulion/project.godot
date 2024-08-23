@@ -19,9 +19,18 @@ boot_splash/image="res://assets/textures/logo/Logo Main Vertical For White Backg
 config/icon="res://assets/textures/logo/Logo Main Icon.svg"
 boot_splash/minimum_display_time=5
 
+[display]
+
+window/subwindows/embed_subwindows=false
+window/per_pixel_transparency/allowed=true
+
 [dotnet]
 
 project/assembly_name="Cerulion"
+
+[gui]
+
+theme/custom="res://assets/themes/dark_mode.tres"
 
 [rendering]
 

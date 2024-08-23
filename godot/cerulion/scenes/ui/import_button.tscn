@@ -1,0 +1,36 @@
+[gd_scene load_steps=3 format=3 uid="uid://j3h0to2ir0rs"]
+
+[ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_gsweq"]
+[ext_resource type="Texture2D" uid="uid://djqdkj5ol18mg" path="res://assets/textures/ui/light/icons-essential/Add.svg" id="2_oabg7"]
+
+[node name="ImportButton" type="Button"]
+custom_minimum_size = Vector2(75, 25)
+offset_right = 8.0
+offset_bottom = 8.0
+theme = ExtResource("1_gsweq")
+theme_type_variation = &"TextButton_Blue"
+
+[node name="CenterContainer" type="CenterContainer" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="HBoxContainer" type="HBoxContainer" parent="CenterContainer"]
+layout_mode = 2
+
+[node name="TextureRect" type="TextureRect" parent="CenterContainer/HBoxContainer"]
+layout_mode = 2
+texture = ExtResource("2_oabg7")
+expand_mode = 2
+
+[node name="Label" type="Label" parent="CenterContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 10
+theme = ExtResource("1_gsweq")
+theme_override_colors/font_color = Color(0, 0, 0, 1)
+theme_override_font_sizes/font_size = 12
+text = "Import
+"
