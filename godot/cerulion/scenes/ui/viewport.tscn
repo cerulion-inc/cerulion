@@ -62,15 +62,13 @@ size_flags_stretch_ratio = 3.0
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="Window" type="Window" parent="."]
+[node name="FileImportWindow" type="Window" parent="."]
 title = "Import"
 initial_position = 2
 size = Vector2i(600, 400)
-visible = false
 script = ExtResource("4_1h6ec")
 
-[node name="FileImportWindow" parent="Window" instance=ExtResource("5_w4y5c")]
-script = null
+[node name="FileImportWindow" parent="FileImportWindow" instance=ExtResource("5_w4y5c")]
 
-[connection signal="pressed" from="VBoxContainer/HBoxContainer/MarginContainer/ImportButton" to="Window" method="_on_import_button_pressed"]
-[connection signal="close_requested" from="Window" to="Window" method="_on_close_requested"]
+[connection signal="pressed" from="VBoxContainer/HBoxContainer/MarginContainer/ImportButton" to="FileImportWindow" method="_on_import_button_pressed"]
+[connection signal="close_requested" from="FileImportWindow" to="FileImportWindow" method="_on_close_requested"]

@@ -19,6 +19,11 @@ boot_splash/image="res://assets/textures/logo/Logo Main Vertical For White Backg
 config/icon="res://assets/textures/logo/Logo Main Icon.svg"
 boot_splash/minimum_display_time=5
 
+[autoload]
+
+RobotState="*res://scenes/globals/RobotState.gd"
+RobotParameters="*res://scenes/globals/RobotParameters.gd"
+
 [display]
 
 window/size/viewport_width=1440
@@ -31,7 +36,7 @@ project/assembly_name="Cerulion"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/easy_charts/plugin.cfg")
+enabled=PackedStringArray("res://addons/easy_charts/plugin.cfg", "res://addons/urdf_parser/plugin.cfg")
 
 [gui]
 
