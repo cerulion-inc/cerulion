@@ -45,14 +45,77 @@ func onFilesDropped(files):
 func parseURDF(urdf_file):
 	var parser = XMLParser.new()
 	parser.open(urdf_file)
-	var current_link:String = ""
-	var current_joint:String = ""
-	var urdf_dict = {}
-	var current_element_stack = []
-	var current_dict = urdf_dict
+	
+	var current_attribute = ""
+	var current_subattribute = ""
+	var is_joint = false
 	
 	while parser.read() != ERR_FILE_EOF:
+		var current_link:String = ""
+		var current_joint:String = ""
+		var link_dict:Dictionary = {
+			"inertial": {
+				"origin": {"xyz": [], "rpy": []},
+				"mass": [],
+				"inertia": {"ixx": [], "ixy": [], "ixz": [],
+							"iyy": [], "iyz": [], "izz": []},
+			},
+			"visual": {
+				"origin": {"xyz": [], "rpy": []},
+				"geometry": {"mesh": []},
+				"material": {"name": [], "color": []},
+			},
+			"collision": {
+				"origin": {"xyz": [], "rpy": []},
+				"geometry": {},
+			}
+		}
+		var joint_dict:Dictionary = {
+			"type": [],
+			"dont_collapse": [],
+			"origin": {"xyz": [], "rpy": []},
+			"parent": [],
+			"child": [],
+			"axis": [],
+		}
 		if parser.get_node_type() == XMLParser.NODE_ELEMENT:
-			pass
+			print("START" + parser.get_node_name())
+			var node_name = parser.get_node_name()
+			var attributes_dict = {}
+			for idx in range(parser.get_attribute_count()):
+				attributes_dict[parser.get_attribute_name(idx)] = parser.get_attribute_value(idx)
+			match node_name:
+				"robot":
+					RobotParameters.robot_name = attributes_dict["name"]
+				"link":
+					RobotParameters.links[attributes_dict["name"]] = {}
+					current_link = attributes_dict["name"]
+				"joint":
+					RobotParameters.joints[attributes_dict["name"]] = joint_dict
+					RobotParameters.joints[attributes_dict["name"]]["type"] = attributes_dict["type"]
+					current_joint = attributes_dict["name"]
+					is_joint = true
+				#"inertial":
+					#current_attribute = "inertial"
+				"origin":
+					if is_joint:
+						RobotParameters.joints[current_joint]["origin"] = attributes_dict
+					#else:
+						#RobotParameters.links[current_link][current_attribute]["origin"] = attributes_dict
+					
 			#print("The ", node_name, " element has the following attributes: ", attributes_dict)
-	print(urdf_dict)
+		#elif parser.get_node_type() == XMLParser.NODE_ELEMENT_END:
+			#print("END" + parser.get_node_name())
+			#match parser.get_node_name():
+				#"inertial":
+					#current_attribute = ""
+				#"visual":
+					#current_attribute = ""
+				#"collision":
+					#var test = 0
+				#"link":
+					#var test = 0
+				#"joint":
+					#var test = 0
+	#print(RobotParameters.links)
+	print(RobotParameters.joints)
