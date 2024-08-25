@@ -1,6 +1,6 @@
 extends Control
 
-@onready var window_text:Label = $VBoxContainer/Panel/Label
+@onready var window_text:Label = $VBoxContainer/Panel/MarginContainer/VBoxContainer/Label
 var filepath:String = ""
 var xml_parser:XMLParser = XMLParser.new()
 var USER_DIR:DirAccess = DirAccess.open("user://")
@@ -142,7 +142,6 @@ func parseURDF(urdf_file):
 					RobotParameters.links[current_link]["inertial"]["inertia"]["iyz"] = float(attributes_dict["iyz"])
 					RobotParameters.links[current_link]["inertial"]["inertia"]["izz"] = float(attributes_dict["izz"])
 				"mesh":
-					print(attributes_dict["filename"])
 					RobotParameters.links[current_link][current_attribute][current_subattribute]["mesh"] \
 						= attributes_dict["filename"]
 					var mesh_filepath = RobotParameters.urdf_dir + attributes_dict["filename"]
