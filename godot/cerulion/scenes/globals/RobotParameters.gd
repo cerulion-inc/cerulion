@@ -1,9 +1,10 @@
 extends Node
 
-var test_var:int = 0
 var robot_name:String = ""
 var links:Dictionary = {}
 var joints:Dictionary = {}
+var urdf_filepath:String = ""
+var urdf_dir:String = ""
 
 # Called when the node enters the scene tree for the first time.
 func _ready() -> void:

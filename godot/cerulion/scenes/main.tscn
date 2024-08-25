@@ -1,7 +1,9 @@
-[gd_scene load_steps=6 format=3 uid="uid://c3oyeyyno6u24"]
+[gd_scene load_steps=8 format=3 uid="uid://c3oyeyyno6u24"]
 
 [ext_resource type="Texture2D" uid="uid://cky0o16rtglmc" path="res://assets/textures/environment/floor_tiles.png" id="1_iqur1"]
+[ext_resource type="PackedScene" uid="uid://cfnfqbkjjq0ri" path="res://scenes/robots/robot.tscn" id="1_tsao6"]
 [ext_resource type="Script" path="res://scenes/environment/ViewerCamera.gd" id="2_pqkki"]
+[ext_resource type="Script" path="res://scenes/globals/OBJParser.gd" id="3_6si85"]
 [ext_resource type="PackedScene" uid="uid://ij2ba38exv68" path="res://scenes/ui/Viewport.tscn" id="3_113xp"]
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_v4po0"]
@@ -17,10 +19,13 @@ size = Vector2(100, 100)
 
 [node name="main" type="Node3D"]
 
+[node name="Robot" parent="." instance=ExtResource("1_tsao6")]
+
 [node name="Environment" type="Node3D" parent="."]
 
 [node name="Ground" type="MeshInstance3D" parent="Environment"]
 mesh = SubResource("PlaneMesh_nec6u")
+script = ExtResource("3_6si85")
 
 [node name="ViewerCamera" type="Camera3D" parent="Environment"]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1)

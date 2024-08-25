@@ -23,6 +23,7 @@ boot_splash/minimum_display_time=5
 
 RobotState="*res://scenes/globals/RobotState.gd"
 RobotParameters="*res://scenes/globals/RobotParameters.gd"
+Signals="*res://scenes/globals/Signals.gd"
 
 [display]
 
