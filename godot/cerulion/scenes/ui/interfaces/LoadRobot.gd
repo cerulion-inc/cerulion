@@ -49,35 +49,34 @@ func parseURDF(urdf_file):
 	var current_attribute = ""
 	var current_subattribute = ""
 	var is_joint = false
-	
-	while parser.read() != ERR_FILE_EOF:
-		var current_link:String = ""
-		var current_joint:String = ""
-		var link_dict:Dictionary = {
-			"inertial": {
-				"origin": {"xyz": [], "rpy": []},
-				"mass": [],
-				"inertia": {"ixx": [], "ixy": [], "ixz": [],
-							"iyy": [], "iyz": [], "izz": []},
-			},
-			"visual": {
-				"origin": {"xyz": [], "rpy": []},
-				"geometry": {"mesh": []},
-				"material": {"name": [], "color": []},
-			},
-			"collision": {
-				"origin": {"xyz": [], "rpy": []},
-				"geometry": {},
-			}
-		}
-		var joint_dict:Dictionary = {
-			"type": [],
-			"dont_collapse": [],
+	var current_link:String = ""
+	var current_joint:String = ""
+	var link_dict:Dictionary = {
+		"inertial": {
 			"origin": {"xyz": [], "rpy": []},
-			"parent": [],
-			"child": [],
-			"axis": [],
+			"mass": [],
+			"inertia": {"ixx": [], "ixy": [], "ixz": [],
+						"iyy": [], "iyz": [], "izz": []},
+		},
+		"visual": {
+			"origin": {"xyz": [], "rpy": []},
+			"geometry": {"mesh": []},
+			"material": {"name": [], "color": []},
+		},
+		"collision": {
+			"origin": {"xyz": [], "rpy": []},
+			"geometry": {},
 		}
+	}
+	var joint_dict:Dictionary = {
+		"type": [],
+		"dont_collapse": [],
+		"origin": {"xyz": [], "rpy": []},
+		"parent": [],
+		"child": [],
+		"axis": [],
+	}
+	while parser.read() != ERR_FILE_EOF:
 		if parser.get_node_type() == XMLParser.NODE_ELEMENT:
 			print("START" + parser.get_node_name())
 			var node_name = parser.get_node_name()
@@ -99,10 +98,10 @@ func parseURDF(urdf_file):
 					#current_attribute = "inertial"
 				"origin":
 					if is_joint:
+						RobotParameters.joints[current_joint]
 						RobotParameters.joints[current_joint]["origin"] = attributes_dict
 					#else:
 						#RobotParameters.links[current_link][current_attribute]["origin"] = attributes_dict
-					
 			#print("The ", node_name, " element has the following attributes: ", attributes_dict)
 		#elif parser.get_node_type() == XMLParser.NODE_ELEMENT_END:
 			#print("END" + parser.get_node_name())
