@@ -1,0 +1,53 @@
+[gd_scene load_steps=3 format=3 uid="uid://cw52pv0udw04y"]
+
+[ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_m8b14"]
+[ext_resource type="Script" path="res://scenes/ui/bars/TopBar.gd" id="2_w4l8x"]
+
+[node name="TopBar" type="PanelContainer"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme = ExtResource("1_m8b14")
+theme_type_variation = &"Panel_Grey_Flat"
+script = ExtResource("2_w4l8x")
+
+[node name="MarginContainer" type="MarginContainer" parent="."]
+layout_mode = 2
+theme_override_constants/margin_left = 5
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_right = 5
+theme_override_constants/margin_bottom = 5
+
+[node name="HBoxContainer" type="HBoxContainer" parent="MarginContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="Spacer" type="Control" parent="MarginContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 10.0
+
+[node name="HBoxContainer" type="HBoxContainer" parent="MarginContainer/HBoxContainer"]
+layout_mode = 2
+theme_override_constants/separation = 1
+
+[node name="DateLabel" type="Label" parent="MarginContainer/HBoxContainer/HBoxContainer"]
+layout_mode = 2
+theme = ExtResource("1_m8b14")
+theme_override_font_sizes/font_size = 12
+text = "[Date]"
+
+[node name="TimeLabel" type="Label" parent="MarginContainer/HBoxContainer/HBoxContainer"]
+layout_mode = 2
+theme = ExtResource("1_m8b14")
+theme_override_font_sizes/font_size = 12
+text = "[Time]"
+
+[node name="MeridianLabel" type="Label" parent="MarginContainer/HBoxContainer/HBoxContainer"]
+layout_mode = 2
+theme = ExtResource("1_m8b14")
+theme_override_font_sizes/font_size = 12
+text = "[AM/PM]
+"

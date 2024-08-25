@@ -1,10 +1,9 @@
-[gd_scene load_steps=6 format=3 uid="uid://ij2ba38exv68"]
+[gd_scene load_steps=5 format=3 uid="uid://ij2ba38exv68"]
 
-[ext_resource type="PackedScene" uid="uid://c4ux2atdr6mrh" path="res://scenes/ui/interfaces/ImportButton.tscn" id="2_lxgng"]
+[ext_resource type="PackedScene" uid="uid://cw52pv0udw04y" path="res://scenes/ui/bars/TopBar.tscn" id="1_dxmk5"]
 [ext_resource type="PackedScene" uid="uid://cygc4l8diees8" path="res://scenes/ui/panels/StatusPanel.tscn" id="2_n0gyd"]
 [ext_resource type="PackedScene" uid="uid://dswv0023435xr" path="res://scenes/ui/panels/PlotPanel.tscn" id="3_3b6ui"]
-[ext_resource type="Script" path="res://scenes/ui/interfaces/ImportWindow.gd" id="4_1h6ec"]
-[ext_resource type="PackedScene" uid="uid://4onc2uy3n0aa" path="res://scenes/ui/interfaces/FileImportWindow.tscn" id="5_w4y5c"]
+[ext_resource type="PackedScene" uid="uid://mt2khr0ghj73" path="res://scenes/ui/bars/BottomBar.tscn" id="4_2ek6e"]
 
 [node name="Viewport" type="Control"]
 layout_mode = 3
@@ -22,22 +21,9 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 
-[node name="HBoxContainer" type="HBoxContainer" parent="VBoxContainer"]
+[node name="TopBar" parent="VBoxContainer" instance=ExtResource("1_dxmk5")]
+custom_minimum_size = Vector2(0, 25)
 layout_mode = 2
-size_flags_vertical = 0
-
-[node name="MarginContainer" type="MarginContainer" parent="VBoxContainer/HBoxContainer"]
-layout_mode = 2
-size_flags_horizontal = 3
-theme_override_constants/margin_left = 10
-theme_override_constants/margin_top = 5
-theme_override_constants/margin_right = 10
-theme_override_constants/margin_bottom = 5
-
-[node name="ImportButton" parent="VBoxContainer/HBoxContainer/MarginContainer" instance=ExtResource("2_lxgng")]
-layout_mode = 2
-size_flags_horizontal = 0
-size_flags_vertical = 0
 
 [node name="MarginContainer" type="MarginContainer" parent="VBoxContainer"]
 layout_mode = 2
@@ -50,25 +36,20 @@ theme_override_constants/margin_bottom = 10
 layout_mode = 2
 
 [node name="StatusPanel" parent="VBoxContainer/MarginContainer/HBoxContainer" instance=ExtResource("2_n0gyd")]
+visible = false
 layout_mode = 2
 size_flags_horizontal = 3
 
 [node name="VisualizationSpacer" type="Control" parent="VBoxContainer/MarginContainer/HBoxContainer"]
+visible = false
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_stretch_ratio = 3.0
 
 [node name="PlotPanel" parent="VBoxContainer/MarginContainer/HBoxContainer" instance=ExtResource("3_3b6ui")]
+visible = false
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="FileImportWindow" type="Window" parent="."]
-title = "Import"
-initial_position = 2
-size = Vector2i(750, 400)
-script = ExtResource("4_1h6ec")
-
-[node name="FileImportWindow" parent="FileImportWindow" instance=ExtResource("5_w4y5c")]
-
-[connection signal="pressed" from="VBoxContainer/HBoxContainer/MarginContainer/ImportButton" to="FileImportWindow" method="_on_import_button_pressed"]
-[connection signal="close_requested" from="FileImportWindow" to="FileImportWindow" method="_on_close_requested"]
+[node name="BottomBar" parent="VBoxContainer" instance=ExtResource("4_2ek6e")]
+layout_mode = 2

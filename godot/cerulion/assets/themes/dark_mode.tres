@@ -1,10 +1,13 @@
-[gd_resource type="Theme" load_steps=9 format=3 uid="uid://ceve3jwvjaqnx"]
+[gd_resource type="Theme" load_steps=11 format=3 uid="uid://ceve3jwvjaqnx"]
 
 [ext_resource type="FontFile" uid="uid://cducsnsm62sj1" path="res://assets/fonts/Sora-Variable.ttf" id="1_4qtex"]
 [ext_resource type="Texture2D" uid="uid://bdxrxbmromyey" path="res://assets/textures/ui/dark/icons-misc/iconoir_eye.svg" id="1_sspqg"]
 [ext_resource type="Texture2D" uid="uid://cbmgw0h5ed1mf" path="res://assets/textures/ui/dark/icons-misc/mingcute_eye-close-line.svg" id="2_2ga5w"]
 
 [sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_isqno"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_g370h"]
+bg_color = Color(0, 0.752941, 1, 1)
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_ndjwt"]
 bg_color = Color(0.152765, 0.158807, 0.170891, 1)
@@ -17,6 +20,9 @@ corner_radius_top_left = 16
 corner_radius_top_right = 16
 corner_radius_bottom_right = 16
 corner_radius_bottom_left = 16
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_dqlas"]
+bg_color = Color(0.152941, 0.156863, 0.172549, 1)
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_8pgw0"]
 bg_color = Color(0, 0.752941, 1, 1)
@@ -53,8 +59,12 @@ IconButton_Eye/icons/unchecked = ExtResource("2_2ga5w")
 IconButton_Eye/styles/focus = SubResource("StyleBoxEmpty_isqno")
 Label/font_sizes/font_size = 24
 Label/fonts/font = ExtResource("1_4qtex")
+Panel_Blue_Flat/base_type = &"Panel"
+Panel_Blue_Flat/styles/panel = SubResource("StyleBoxFlat_g370h")
 Panel_Grey/base_type = &"Panel"
 Panel_Grey/styles/panel = SubResource("StyleBoxFlat_ndjwt")
+Panel_Grey_Flat/base_type = &"Panel"
+Panel_Grey_Flat/styles/panel = SubResource("StyleBoxFlat_dqlas")
 TextButton_Blue/base_type = &"Button"
 TextButton_Blue/styles/focus = SubResource("StyleBoxFlat_8pgw0")
 TextButton_Blue/styles/hover = SubResource("StyleBoxFlat_sucib")
