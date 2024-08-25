@@ -189,3 +189,7 @@ static func strToVec4(string := "") -> Vector4:
 		var array: Array = new_string.split(" ")
 		return Vector4(float(array[0]), float(array[1]), float(array[2]), float(array[3]))
 	return Vector4.ZERO
+
+
+func _on_import_button_pressed() -> void:
+	pass # Replace with function body.

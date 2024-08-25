@@ -1,0 +1,210 @@
+[gd_scene load_steps=14 format=3 uid="uid://mt2khr0ghj73"]
+
+[ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_3jh3l"]
+[ext_resource type="Script" path="res://scenes/ui/bars/BottomBar.gd" id="1_466hr"]
+[ext_resource type="Texture2D" uid="uid://b7jst82ahp50l" path="res://assets/textures/ui/dark/icons-essential/Flash Disk 2.svg" id="1_y8ikm"]
+[ext_resource type="Texture2D" uid="uid://bw6pmdldjor8w" path="res://assets/textures/ui/dark/icons-essential/Wifi.svg" id="3_p7yr8"]
+[ext_resource type="Texture2D" uid="uid://c3ngx1u7fh38n" path="res://assets/textures/ui/dark/icons-multimedia/Camera 1.svg" id="4_2cltf"]
+[ext_resource type="Texture2D" uid="uid://yx1swwny2hpe" path="res://assets/textures/ui/dark/icons-essential/Information Circle.svg" id="5_tkbsl"]
+[ext_resource type="Texture2D" uid="uid://qnlqs886e1h7" path="res://assets/textures/ui/dark/icons-essential/Display 1.svg" id="5_uvpqf"]
+[ext_resource type="Texture2D" uid="uid://cij2jqc8cgw30" path="res://assets/textures/ui/dark/icons-essential/FAQ Circle.svg" id="6_ax5eb"]
+[ext_resource type="Texture2D" uid="uid://cykum54gaac87" path="res://assets/textures/ui/dark/icons-multimedia/Camera 1 Hover.svg" id="6_qflke"]
+[ext_resource type="Texture2D" uid="uid://q3c5btbsdv6i" path="res://assets/textures/ui/dark/icons-essential/Information Circle Hover.svg" id="8_trdtu"]
+[ext_resource type="Texture2D" uid="uid://de6fwmtrq52wm" path="res://assets/textures/ui/dark/icons-essential/FAQ Circle Hover.svg" id="10_u0bk4"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_g8y5a"]
+bg_color = Color(0, 0.317647, 0.419608, 1)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_jjfe6"]
+bg_color = Color(0, 0.752941, 1, 1)
+
+[node name="BottomBar" type="PanelContainer"]
+custom_minimum_size = Vector2(0, 25)
+anchors_preset = 12
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_top = -25.0
+grow_horizontal = 2
+grow_vertical = 0
+theme_override_styles/panel = SubResource("StyleBoxFlat_g8y5a")
+script = ExtResource("1_466hr")
+
+[node name="HBoxContainer" type="HBoxContainer" parent="."]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="MarginContainer" type="MarginContainer" parent="HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_right = 20
+
+[node name="HBoxContainer" type="HBoxContainer" parent="HBoxContainer/MarginContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 15
+
+[node name="HBoxContainer2" type="HBoxContainer" parent="HBoxContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+theme_override_constants/separation = 15
+
+[node name="MarginContainer" type="MarginContainer" parent="HBoxContainer/MarginContainer/HBoxContainer/HBoxContainer2"]
+layout_mode = 2
+size_flags_horizontal = 6
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_bottom = 5
+
+[node name="TextureRect" type="TextureRect" parent="HBoxContainer/MarginContainer/HBoxContainer/HBoxContainer2/MarginContainer"]
+custom_minimum_size = Vector2(10, 10)
+layout_mode = 2
+size_flags_horizontal = 3
+texture = ExtResource("1_y8ikm")
+expand_mode = 3
+stretch_mode = 4
+
+[node name="RobotName" type="Label" parent="HBoxContainer/MarginContainer/HBoxContainer/HBoxContainer2"]
+layout_mode = 2
+size_flags_horizontal = 0
+theme = ExtResource("1_3jh3l")
+theme_override_colors/font_color = Color(1, 1, 1, 1)
+theme_override_font_sizes/font_size = 12
+text = "No instance"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="HBoxContainer" type="HBoxContainer" parent="HBoxContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+theme_override_constants/separation = 15
+
+[node name="MarginContainer" type="MarginContainer" parent="HBoxContainer/MarginContainer/HBoxContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 6
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_bottom = 5
+
+[node name="TextureRect" type="TextureRect" parent="HBoxContainer/MarginContainer/HBoxContainer/HBoxContainer/MarginContainer"]
+custom_minimum_size = Vector2(10, 10)
+layout_mode = 2
+size_flags_horizontal = 3
+texture = ExtResource("3_p7yr8")
+expand_mode = 3
+stretch_mode = 4
+
+[node name="NetworkName" type="Label" parent="HBoxContainer/MarginContainer/HBoxContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 4
+theme = ExtResource("1_3jh3l")
+theme_override_colors/font_color = Color(1, 1, 1, 1)
+theme_override_font_sizes/font_size = 12
+text = "[Network]"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="HBoxContainer3" type="HBoxContainer" parent="HBoxContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+theme_override_constants/separation = 15
+
+[node name="MarginContainer" type="MarginContainer" parent="HBoxContainer/MarginContainer/HBoxContainer/HBoxContainer3"]
+layout_mode = 2
+size_flags_horizontal = 6
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_bottom = 5
+
+[node name="TextureRect" type="TextureRect" parent="HBoxContainer/MarginContainer/HBoxContainer/HBoxContainer3/MarginContainer"]
+custom_minimum_size = Vector2(10, 10)
+layout_mode = 2
+size_flags_horizontal = 3
+texture = ExtResource("5_uvpqf")
+expand_mode = 3
+stretch_mode = 4
+
+[node name="OSName" type="Label" parent="HBoxContainer/MarginContainer/HBoxContainer/HBoxContainer3"]
+layout_mode = 2
+size_flags_horizontal = 4
+theme = ExtResource("1_3jh3l")
+theme_override_colors/font_color = Color(1, 1, 1, 1)
+theme_override_font_sizes/font_size = 12
+text = "[OS]"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="Spacer" type="Control" parent="HBoxContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="MarginContainer2" type="MarginContainer" parent="HBoxContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 8
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_bottom = 5
+
+[node name="ScreenshotButton" type="TextureButton" parent="HBoxContainer/MarginContainer/HBoxContainer/MarginContainer2"]
+custom_minimum_size = Vector2(15, 15)
+layout_mode = 2
+size_flags_vertical = 4
+texture_normal = ExtResource("4_2cltf")
+texture_hover = ExtResource("6_qflke")
+ignore_texture_size = true
+stretch_mode = 4
+
+[node name="MarginContainer3" type="MarginContainer" parent="HBoxContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 8
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_bottom = 5
+
+[node name="InfoButton" type="TextureButton" parent="HBoxContainer/MarginContainer/HBoxContainer/MarginContainer3"]
+custom_minimum_size = Vector2(15, 15)
+layout_mode = 2
+size_flags_vertical = 4
+texture_normal = ExtResource("5_tkbsl")
+texture_hover = ExtResource("8_trdtu")
+ignore_texture_size = true
+stretch_mode = 4
+
+[node name="MarginContainer4" type="MarginContainer" parent="HBoxContainer/MarginContainer/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 8
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_bottom = 5
+
+[node name="HelpButton" type="TextureButton" parent="HBoxContainer/MarginContainer/HBoxContainer/MarginContainer4"]
+custom_minimum_size = Vector2(15, 15)
+layout_mode = 2
+size_flags_vertical = 4
+texture_normal = ExtResource("6_ax5eb")
+texture_hover = ExtResource("10_u0bk4")
+ignore_texture_size = true
+stretch_mode = 4
+
+[node name="PanelContainer" type="PanelContainer" parent="HBoxContainer"]
+custom_minimum_size = Vector2(100, 0)
+layout_mode = 2
+size_flags_horizontal = 0
+
+[node name="Panel" type="Panel" parent="HBoxContainer/PanelContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_styles/panel = SubResource("StyleBoxFlat_jjfe6")
+
+[node name="Label2" type="Label" parent="HBoxContainer/PanelContainer/Panel"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme = ExtResource("1_3jh3l")
+theme_override_colors/font_color = Color(0, 0, 0, 1)
+theme_override_font_sizes/font_size = 12
+text = "Cerulion v0.1"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[connection signal="pressed" from="HBoxContainer/MarginContainer/HBoxContainer/MarginContainer2/ScreenshotButton" to="." method="_on_screenshot_button_pressed"]
+[connection signal="pressed" from="HBoxContainer/MarginContainer/HBoxContainer/MarginContainer3/InfoButton" to="." method="_on_info_button_pressed"]
+[connection signal="pressed" from="HBoxContainer/MarginContainer/HBoxContainer/MarginContainer4/HelpButton" to="." method="_on_help_button_pressed"]
