@@ -36,7 +36,7 @@ project/assembly_name="Cerulion"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/easy_charts/plugin.cfg", "res://addons/urdf_parser/plugin.cfg")
+enabled=PackedStringArray("res://addons/easy_charts/plugin.cfg")
 
 [gui]
 
