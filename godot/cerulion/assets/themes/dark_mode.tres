@@ -46,10 +46,12 @@ corner_radius_bottom_left = 5
 
 [resource]
 default_font = ExtResource("1_4qtex")
+default_font_size = 24
 IconButton_Eye/base_type = &"CheckButton"
 IconButton_Eye/icons/checked = ExtResource("1_sspqg")
 IconButton_Eye/icons/unchecked = ExtResource("2_2ga5w")
 IconButton_Eye/styles/focus = SubResource("StyleBoxEmpty_isqno")
+Label/font_sizes/font_size = 24
 Label/fonts/font = ExtResource("1_4qtex")
 Panel_Grey/base_type = &"Panel"
 Panel_Grey/styles/panel = SubResource("StyleBoxFlat_ndjwt")

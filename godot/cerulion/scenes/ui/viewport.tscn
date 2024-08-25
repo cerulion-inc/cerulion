@@ -65,7 +65,7 @@ size_flags_horizontal = 3
 [node name="FileImportWindow" type="Window" parent="."]
 title = "Import"
 initial_position = 2
-size = Vector2i(600, 400)
+size = Vector2i(750, 400)
 script = ExtResource("4_1h6ec")
 
 [node name="FileImportWindow" parent="FileImportWindow" instance=ExtResource("5_w4y5c")]
