@@ -1,11 +1,11 @@
 [gd_scene load_steps=9 format=3 uid="uid://c3oyeyyno6u24"]
 
-[ext_resource type="PackedScene" uid="uid://cfnfqbkjjq0ri" path="res://scenes/robots/Robot.tscn" id="1_mkboy"]
+[ext_resource type="PackedScene" uid="uid://cfnfqbkjjq0ri" path="res://scenes/robots/robot.tscn" id="1_mkboy"]
 [ext_resource type="Texture2D" uid="uid://cky0o16rtglmc" path="res://assets/textures/environment/floor_tiles.png" id="2_4gm2s"]
 [ext_resource type="Script" path="res://scenes/globals/OBJParser.gd" id="3_shkfd"]
 [ext_resource type="Script" path="res://scenes/environment/ViewerCamera.gd" id="4_n0seq"]
 [ext_resource type="PackedScene" uid="uid://c2eqprlugvdmt" path="res://scenes/environment/PointCloud.tscn" id="5_u7kli"]
-[ext_resource type="PackedScene" uid="uid://ij2ba38exv68" path="res://scenes/ui/Viewport.tscn" id="6_jvixt"]
+[ext_resource type="PackedScene" uid="uid://ij2ba38exv68" path="res://scenes/ui/viewport.tscn" id="6_jvixt"]
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_v4po0"]
 albedo_texture = ExtResource("2_4gm2s")
