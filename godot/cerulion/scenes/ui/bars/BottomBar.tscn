@@ -2,12 +2,12 @@
 
 [ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_3jh3l"]
 [ext_resource type="Script" path="res://scenes/ui/bars/BottomBar.gd" id="1_466hr"]
-[ext_resource type="Texture2D" uid="uid://b7jst82ahp50l" path="res://assets/textures/ui/dark/icons-essential/Flash Disk 2.svg" id="1_y8ikm"]
-[ext_resource type="Texture2D" uid="uid://bw6pmdldjor8w" path="res://assets/textures/ui/dark/icons-essential/Wifi.svg" id="3_p7yr8"]
+[ext_resource type="Texture2D" uid="uid://b7jst82ahp50l" path="res://assets/textures/ui/light/icons-essential/Flash Disk 2.svg" id="1_y8ikm"]
+[ext_resource type="Texture2D" uid="uid://bw6pmdldjor8w" path="res://assets/textures/ui/light/icons-essential/Wifi.svg" id="3_p7yr8"]
 [ext_resource type="Texture2D" uid="uid://c3ngx1u7fh38n" path="res://assets/textures/ui/dark/icons-multimedia/Camera 1.svg" id="4_2cltf"]
-[ext_resource type="Texture2D" uid="uid://yx1swwny2hpe" path="res://assets/textures/ui/dark/icons-essential/Information Circle.svg" id="5_tkbsl"]
-[ext_resource type="Texture2D" uid="uid://qnlqs886e1h7" path="res://assets/textures/ui/dark/icons-essential/Display 1.svg" id="5_uvpqf"]
-[ext_resource type="Texture2D" uid="uid://cij2jqc8cgw30" path="res://assets/textures/ui/dark/icons-essential/FAQ Circle.svg" id="6_ax5eb"]
+[ext_resource type="Texture2D" uid="uid://yx1swwny2hpe" path="res://assets/textures/ui/light/icons-essential/Information Circle.svg" id="5_tkbsl"]
+[ext_resource type="Texture2D" uid="uid://qnlqs886e1h7" path="res://assets/textures/ui/light/icons-essential/Display 1.svg" id="5_uvpqf"]
+[ext_resource type="Texture2D" uid="uid://cij2jqc8cgw30" path="res://assets/textures/ui/light/icons-essential/FAQ Circle.svg" id="6_ax5eb"]
 [ext_resource type="Texture2D" uid="uid://cykum54gaac87" path="res://assets/textures/ui/dark/icons-multimedia/Camera 1 Hover.svg" id="6_qflke"]
 [ext_resource type="Texture2D" uid="uid://q3c5btbsdv6i" path="res://assets/textures/ui/dark/icons-essential/Information Circle Hover.svg" id="8_trdtu"]
 [ext_resource type="Texture2D" uid="uid://de6fwmtrq52wm" path="res://assets/textures/ui/dark/icons-essential/FAQ Circle Hover.svg" id="10_u0bk4"]
@@ -146,6 +146,7 @@ theme_override_constants/margin_bottom = 5
 custom_minimum_size = Vector2(15, 15)
 layout_mode = 2
 size_flags_vertical = 4
+mouse_default_cursor_shape = 2
 texture_normal = ExtResource("4_2cltf")
 texture_hover = ExtResource("6_qflke")
 ignore_texture_size = true
@@ -161,6 +162,7 @@ theme_override_constants/margin_bottom = 5
 custom_minimum_size = Vector2(15, 15)
 layout_mode = 2
 size_flags_vertical = 4
+mouse_default_cursor_shape = 2
 texture_normal = ExtResource("5_tkbsl")
 texture_hover = ExtResource("8_trdtu")
 ignore_texture_size = true
@@ -176,6 +178,7 @@ theme_override_constants/margin_bottom = 5
 custom_minimum_size = Vector2(15, 15)
 layout_mode = 2
 size_flags_vertical = 4
+mouse_default_cursor_shape = 2
 texture_normal = ExtResource("6_ax5eb")
 texture_hover = ExtResource("10_u0bk4")
 ignore_texture_size = true

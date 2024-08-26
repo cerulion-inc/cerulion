@@ -1,0 +1,42 @@
+[gd_scene load_steps=4 format=3 uid="uid://dos4iivyp073m"]
+
+[ext_resource type="PackedScene" uid="uid://c4ux2atdr6mrh" path="res://scenes/ui/interfaces/ImportButton.tscn" id="1_ve1hn"]
+[ext_resource type="PackedScene" uid="uid://4onc2uy3n0aa" path="res://scenes/ui/interfaces/FileImportWindow.tscn" id="3_qoesl"]
+
+[sub_resource type="GDScript" id="GDScript_8fb64"]
+script/source = "extends Window
+
+@onready var import_window = $\".\"
+
+# Called when the node enters the scene tree for the first time.
+func _ready() -> void:
+	import_window.hide()
+
+func _on_close_requested() -> void:
+	import_window.hide()
+
+func _on_add_robot_button_pressed() -> void:
+	import_window.show()
+"
+
+[node name="Control" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="ImportButton" parent="." instance=ExtResource("1_ve1hn")]
+custom_minimum_size = Vector2(0, 0)
+layout_mode = 1
+
+[node name="FileImportWindow" type="Window" parent="."]
+auto_translate_mode = 1
+title = "Import robot"
+initial_position = 2
+size = Vector2i(750, 400)
+keep_title_visible = true
+script = SubResource("GDScript_8fb64")
+
+[node name="FileImportWindow" parent="FileImportWindow" instance=ExtResource("3_qoesl")]
