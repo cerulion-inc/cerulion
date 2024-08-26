@@ -2,16 +2,20 @@ extends HBoxContainer
 
 @onready var status = $PanelContainer/Status
 @onready var plots = $PanelContainer/Plots
-#@onready var controls = $PanelContainer/[]
+@onready var controls = $PanelContainer/Control
 
 var resizing_panel:bool = false
 var pos_mouse_init:Vector2
 var pos_rect_init:Rect2
+var panel_content:Array
 
 func _ready() -> void:
 	self.hide()
-	status.hide()
-	plots.hide()
+	panel_content.append(status)
+	panel_content.append(plots)
+	panel_content.append(controls)
+	for content in panel_content:
+		content.hide()
 
 func _input(event):
 	if resizing_panel:
@@ -35,18 +39,19 @@ func _on_resize_panel_content_button_gui_input(event: InputEvent) -> void:
 func _on_resize_panel_content_button_button_up() -> void:
 	resizing_panel = false
 
-
 func _on_show_statuses_button_pressed() -> void:
 	if (is_visible_in_tree()):
 		if (status.is_visible_in_tree()):
 			self.hide()
 		else:
+			for content in panel_content:
+				content.hide()
 			status.show()
-			plots.hide()
 	else:
+		for content in panel_content:
+			content.hide()
 		self.show()
 		status.show()
-		plots.hide()
 
 
 func _on_show_plots_button_pressed() -> void:
@@ -54,9 +59,26 @@ func _on_show_plots_button_pressed() -> void:
 		if (plots.is_visible_in_tree()):
 			self.hide()
 		else:
+			for content in panel_content:
+				content.hide()
 			plots.show()
-			status.hide()
 	else:
+		for content in panel_content:
+			content.hide()
 		self.show()
 		plots.show()
-		status.hide()
+
+
+func _on_show_controls_button_pressed() -> void:
+	if (is_visible_in_tree()):
+		if (controls.is_visible_in_tree()):
+			self.hide()
+		else:
+			for content in panel_content:
+				content.hide()
+			controls.show()
+	else:
+		for content in panel_content:
+			content.hide()
+		self.show()
+		controls.show()

@@ -124,7 +124,6 @@ func parseURDF(urdf_file):
 					current_subattribute = "geometry"
 				"origin":
 					if is_joint:
-						RobotParameters.joints[current_joint]
 						RobotParameters.joints[current_joint]["origin"]["xyz"] = strToVec3(attributes_dict["xyz"])
 						RobotParameters.joints[current_joint]["origin"]["rpy"] = strToVec3(attributes_dict["rpy"])
 					else:

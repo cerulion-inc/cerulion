@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://c2eqprlugvdmt"]
+
+[ext_resource type="Script" path="res://scenes/environment/PointCloud.gd" id="1_u6sw4"]
+
+[node name="PointCloud" type="Node3D"]
+script = ExtResource("1_u6sw4")

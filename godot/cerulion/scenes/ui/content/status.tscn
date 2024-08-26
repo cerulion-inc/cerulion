@@ -1,28 +1,125 @@
-[gd_scene load_steps=2 format=3 uid="uid://dvq0ubvymg322"]
+[gd_scene load_steps=5 format=3 uid="uid://dvq0ubvymg322"]
 
-[ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_7h6ac"]
+[ext_resource type="Script" path="res://scenes/ui/content/Status.gd" id="1_bmy7a"]
+[ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_u8n0i"]
+[ext_resource type="Texture2D" uid="uid://dhrlkxpjpfhxw" path="res://assets/textures/ui/dark/status/State=Pass.svg" id="2_r8i51"]
 
-[node name="Status" type="Control"]
-layout_mode = 3
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_633f7"]
+bg_color = Color(0.86683, 0.86683, 0.866829, 1)
+expand_margin_left = 5.0
+expand_margin_right = 5.0
+
+[node name="Status" type="MarginContainer"]
 anchors_preset = 15
 anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
-
-[node name="MarginContainer" type="MarginContainer" parent="."]
-layout_mode = 1
-anchors_preset = 15
-anchor_right = 1.0
-anchor_bottom = 1.0
-grow_horizontal = 2
-grow_vertical = 2
-theme_override_constants/margin_left = 20
+size_flags_horizontal = 3
+size_flags_vertical = 3
+theme_override_constants/margin_left = 15
 theme_override_constants/margin_top = 20
-theme_override_constants/margin_right = 20
-theme_override_constants/margin_bottom = 20
+theme_override_constants/margin_right = 15
+theme_override_constants/margin_bottom = 15
+script = ExtResource("1_bmy7a")
 
-[node name="Panel2" type="Panel" parent="MarginContainer"]
+[node name="VBoxContainer" type="VBoxContainer" parent="."]
 layout_mode = 2
-theme = ExtResource("1_7h6ac")
-theme_type_variation = &"Panel_Grey"
+theme_override_constants/separation = 10
+
+[node name="ChannelHeaders" type="HBoxContainer" parent="VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 0
+theme_override_constants/separation = 30
+
+[node name="ChannelLabel" type="Label" parent="VBoxContainer/ChannelHeaders"]
+custom_minimum_size = Vector2(60, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_u8n0i")
+theme_override_font_sizes/font_size = 14
+text = "Channel"
+
+[node name="StatusLabel" type="Label" parent="VBoxContainer/ChannelHeaders"]
+custom_minimum_size = Vector2(60, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_u8n0i")
+theme_override_font_sizes/font_size = 14
+text = "Status"
+
+[node name="HzLabel" type="Label" parent="VBoxContainer/ChannelHeaders"]
+custom_minimum_size = Vector2(60, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_u8n0i")
+theme_override_font_sizes/font_size = 14
+text = "Hz
+"
+
+[node name="PeriodLabel" type="Label" parent="VBoxContainer/ChannelHeaders"]
+custom_minimum_size = Vector2(60, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_u8n0i")
+theme_override_font_sizes/font_size = 14
+text = "1/Hz"
+
+[node name="BandwidthLabel" type="Label" parent="VBoxContainer/ChannelHeaders"]
+custom_minimum_size = Vector2(60, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_u8n0i")
+theme_override_font_sizes/font_size = 14
+text = "Bandwidth"
+
+[node name="PanelContainer" type="PanelContainer" parent="VBoxContainer"]
+custom_minimum_size = Vector2(0, 1)
+layout_mode = 2
+theme_override_styles/panel = SubResource("StyleBoxFlat_633f7")
+
+[node name="ChannelData" type="HBoxContainer" parent="VBoxContainer"]
+visible = false
+layout_mode = 2
+size_flags_vertical = 0
+theme_override_constants/separation = 30
+
+[node name="ChannelLabel" type="Label" parent="VBoxContainer/ChannelData"]
+custom_minimum_size = Vector2(60, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_u8n0i")
+theme_override_font_sizes/font_size = 14
+text = "[Ch. name]"
+
+[node name="Status" type="TextureRect" parent="VBoxContainer/ChannelData"]
+layout_mode = 2
+size_flags_horizontal = 3
+texture = ExtResource("2_r8i51")
+expand_mode = 3
+stretch_mode = 4
+
+[node name="HzLabel" type="Label" parent="VBoxContainer/ChannelData"]
+custom_minimum_size = Vector2(60, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_u8n0i")
+theme_override_font_sizes/font_size = 14
+text = "[Hz]
+"
+
+[node name="PeriodLabel" type="Label" parent="VBoxContainer/ChannelData"]
+custom_minimum_size = Vector2(60, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_u8n0i")
+theme_override_font_sizes/font_size = 14
+text = "[1/Hz] ms"
+
+[node name="BandwidthLabel" type="Label" parent="VBoxContainer/ChannelData"]
+custom_minimum_size = Vector2(60, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_u8n0i")
+theme_override_font_sizes/font_size = 14
+text = "[XX.XX KB/s]"

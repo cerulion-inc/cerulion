@@ -1,9 +1,7 @@
-[gd_scene load_steps=6 format=3 uid="uid://ij2ba38exv68"]
+[gd_scene load_steps=4 format=3 uid="uid://ij2ba38exv68"]
 
 [ext_resource type="PackedScene" uid="uid://cw52pv0udw04y" path="res://scenes/ui/bars/TopBar.tscn" id="1_dxmk5"]
 [ext_resource type="PackedScene" uid="uid://b3pnr2lcxddis" path="res://scenes/ui/panels/LeftPanel.tscn" id="2_6jf5f"]
-[ext_resource type="PackedScene" uid="uid://cygc4l8diees8" path="res://scenes/ui/panels/StatusPanel.tscn" id="2_n0gyd"]
-[ext_resource type="PackedScene" uid="uid://dswv0023435xr" path="res://scenes/ui/panels/PlotPanel.tscn" id="3_3b6ui"]
 [ext_resource type="PackedScene" uid="uid://mt2khr0ghj73" path="res://scenes/ui/bars/BottomBar.tscn" id="4_2ek6e"]
 
 [node name="Viewport" type="Control"]
@@ -34,22 +32,6 @@ theme_override_constants/separation = 0
 
 [node name="LeftPanel" parent="VBoxContainer/HBoxContainer" instance=ExtResource("2_6jf5f")]
 layout_mode = 2
-
-[node name="StatusPanel" parent="VBoxContainer/HBoxContainer" instance=ExtResource("2_n0gyd")]
-visible = false
-layout_mode = 2
-size_flags_horizontal = 3
-
-[node name="VisualizationSpacer" type="Control" parent="VBoxContainer/HBoxContainer"]
-visible = false
-layout_mode = 2
-size_flags_horizontal = 3
-size_flags_stretch_ratio = 3.0
-
-[node name="PlotPanel" parent="VBoxContainer/HBoxContainer" instance=ExtResource("3_3b6ui")]
-visible = false
-layout_mode = 2
-size_flags_horizontal = 3
 
 [node name="BottomBar" parent="VBoxContainer" instance=ExtResource("4_2ek6e")]
 layout_mode = 2

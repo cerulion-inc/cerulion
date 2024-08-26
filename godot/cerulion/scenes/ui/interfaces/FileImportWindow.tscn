@@ -1,7 +1,18 @@
-[gd_scene load_steps=3 format=3 uid="uid://4onc2uy3n0aa"]
+[gd_scene load_steps=4 format=3 uid="uid://4onc2uy3n0aa"]
 
 [ext_resource type="Script" path="res://scenes/ui/interfaces/LoadRobot.gd" id="1_p4b2r"]
 [ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="2_44fkj"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_c2hof"]
+content_margin_left = 5.0
+content_margin_top = 5.0
+content_margin_right = 5.0
+content_margin_bottom = 5.0
+bg_color = Color(4.33177e-06, 0.494908, 0.663063, 1)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
 
 [node name="FileImportWindow" type="Control"]
 layout_mode = 3
@@ -33,23 +44,60 @@ theme_override_constants/margin_top = 25
 
 [node name="VBoxContainer" type="VBoxContainer" parent="VBoxContainer/Panel/MarginContainer"]
 layout_mode = 2
+theme_override_constants/separation = 30
+
+[node name="VBoxContainer" type="VBoxContainer" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="Label" type="Label" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer"]
+layout_mode = 2
+theme = ExtResource("2_44fkj")
+theme_override_font_sizes/font_size = 16
+text = "Pre-loaded robots:"
+
+[node name="GridContainer" type="GridContainer" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer"]
+layout_mode = 2
+theme_override_constants/h_separation = 20
+theme_override_constants/v_separation = 20
+columns = 3
+
+[node name="UnitreeButton" type="Button" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/GridContainer"]
+layout_mode = 2
+size_flags_horizontal = 4
+theme = ExtResource("2_44fkj")
+theme_type_variation = &"FlatButton"
+theme_override_font_sizes/font_size = 20
+theme_override_styles/normal = SubResource("StyleBoxFlat_c2hof")
+text = "Unitree Go 2"
+
+[node name="MITHumanoidButton" type="Button" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/GridContainer"]
+layout_mode = 2
+size_flags_horizontal = 4
+theme = ExtResource("2_44fkj")
+theme_type_variation = &"FlatButton"
+theme_override_font_sizes/font_size = 20
+theme_override_styles/normal = SubResource("StyleBoxFlat_c2hof")
+text = "MIT Humanoid
+"
+
+[node name="CassieButton" type="Button" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/GridContainer"]
+layout_mode = 2
+size_flags_horizontal = 4
+theme = ExtResource("2_44fkj")
+theme_type_variation = &"FlatButton"
+theme_override_font_sizes/font_size = 20
+theme_override_styles/normal = SubResource("StyleBoxFlat_c2hof")
+text = "Cassie"
 
 [node name="Label" type="Label" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer"]
 layout_mode = 2
 theme = ExtResource("2_44fkj")
 theme_override_font_sizes/font_size = 16
-text = "Drag and drop .zip file with the following structure:
+text = "For custom robot, drag and drop .zip file with the following structure:
         [ROBOT].urdf
         [MESH_FOLDER]
                 [MESH_1].obj
                 [MESH_1].obj
                 ...
 		"
-
-[node name="ItemList" type="ItemList" parent="."]
-layout_mode = 1
-anchors_preset = 15
-anchor_right = 1.0
-anchor_bottom = 1.0
-grow_horizontal = 2
-grow_vertical = 2

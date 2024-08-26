@@ -57,7 +57,7 @@ size_flags_vertical = 3
 theme_override_constants/separation = 10
 
 [node name="Control" type="Control" parent="Canvas/CanvasContainer/DataContainer"]
-custom_minimum_size = Vector2(30, 0)
+custom_minimum_size = Vector2(20, 0)
 layout_mode = 2
 size_flags_horizontal = 0
 
@@ -70,6 +70,7 @@ offset_top = -10.5
 offset_right = 60.0
 offset_bottom = 10.5
 grow_vertical = 2
+theme_override_font_sizes/font_size = 14
 text = "{ylabel}"
 horizontal_alignment = 1
 vertical_alignment = 1
@@ -108,11 +109,12 @@ mouse_default_cursor_shape = 3
 layout_mode = 0
 offset_left = -67.0
 offset_top = -33.0
-offset_right = -17.0
-offset_bottom = 26.0
+offset_right = -16.0
+offset_bottom = 46.0
 
 [node name="XLabel" type="Label" parent="Canvas/CanvasContainer/DataContainer/PlotContainer"]
 layout_mode = 2
+theme_override_font_sizes/font_size = 14
 text = "{xlabel}"
 horizontal_alignment = 1
 
