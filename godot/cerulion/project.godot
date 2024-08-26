@@ -12,7 +12,7 @@ config_version=5
 
 config/name="Cerulion"
 config/version="0.1"
-run/main_scene="res://scenes/main.tscn"
+run/main_scene="res://scenes/Main.tscn"
 config/features=PackedStringArray("4.3", "C#", "Forward Plus")
 boot_splash/bg_color=Color(1, 1, 1, 1)
 boot_splash/image="res://assets/textures/logo/Logo Main Vertical For White Background.png"
@@ -25,6 +25,8 @@ RobotState="*res://scenes/globals/RobotState.gd"
 RobotParameters="*res://scenes/globals/RobotParameters.gd"
 Signals="*res://scenes/globals/Signals.gd"
 SystemInfo="*res://scenes/globals/SystemInfo.gd"
+PointCloudData="*res://scenes/globals/PointCloudData.gd"
+SensorData="*res://scenes/SensorData.gd"
 
 [display]
 
@@ -67,4 +69,4 @@ left_click={
 
 [rendering]
 
-environment/defaults/default_clear_color=Color(0.0646965, 0.0646966, 0.0646965, 1)
+environment/defaults/default_clear_color=Color(0.668629, 0.668629, 0.668629, 1)

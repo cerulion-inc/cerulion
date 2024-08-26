@@ -4,7 +4,7 @@
 [ext_resource type="Script" path="res://scenes/ui/bars/TopBar.gd" id="2_w4l8x"]
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_p4l0y"]
-bg_color = Color(0, 0.317647, 0.419608, 1)
+bg_color = Color(3.36915e-06, 0.408226, 0.534971, 1)
 
 [node name="TopBar" type="PanelContainer"]
 anchors_preset = 15

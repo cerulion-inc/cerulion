@@ -1,4 +1,4 @@
-[gd_scene load_steps=18 format=3 uid="uid://b3pnr2lcxddis"]
+[gd_scene load_steps=19 format=3 uid="uid://b3pnr2lcxddis"]
 
 [ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_p5occ"]
 [ext_resource type="Script" path="res://scenes/ui/panels/LeftPanel.gd" id="1_rwgf5"]
@@ -8,8 +8,9 @@
 [ext_resource type="Texture2D" uid="uid://d2fcrce6ra5yd" path="res://assets/textures/ui/light/icons-essential/Activity 1.svg" id="4_62q68"]
 [ext_resource type="Texture2D" uid="uid://c8ie53ey30wnl" path="res://assets/textures/ui/light/icons-essential/Filter 4.svg" id="5_ce4gt"]
 [ext_resource type="Script" path="res://scenes/ui/panels/PanelContentResize.gd" id="7_l42it"]
-[ext_resource type="PackedScene" uid="uid://bqg5xx6uspbfy" path="res://scenes/ui/content/plots.tscn" id="8_7mf2m"]
-[ext_resource type="PackedScene" uid="uid://dvq0ubvymg322" path="res://scenes/ui/content/status.tscn" id="9_i14em"]
+[ext_resource type="PackedScene" uid="uid://bqg5xx6uspbfy" path="res://scenes/ui/content/Plots.tscn" id="8_7mf2m"]
+[ext_resource type="PackedScene" uid="uid://dvq0ubvymg322" path="res://scenes/ui/content/Status.tscn" id="9_i14em"]
+[ext_resource type="PackedScene" uid="uid://b1xarn8xho0vq" path="res://scenes/ui/content/Control.tscn" id="10_tjhnn"]
 
 [sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3xl7x"]
 
@@ -112,7 +113,7 @@ icon_alignment = 1
 expand_icon = true
 
 [node name="PanelContent" type="HBoxContainer" parent="HBoxContainer"]
-custom_minimum_size = Vector2(400, 0)
+custom_minimum_size = Vector2(450, 0)
 layout_mode = 2
 size_flags_horizontal = 2
 theme_override_constants/separation = 0
@@ -128,6 +129,9 @@ theme_override_styles/panel = SubResource("StyleBoxFlat_t12p4")
 layout_mode = 2
 
 [node name="Status" parent="HBoxContainer/PanelContent/PanelContainer" instance=ExtResource("9_i14em")]
+layout_mode = 2
+
+[node name="Control" parent="HBoxContainer/PanelContent/PanelContainer" instance=ExtResource("10_tjhnn")]
 layout_mode = 2
 
 [node name="ResizePanelContentButton" type="Button" parent="HBoxContainer/PanelContent"]
@@ -151,6 +155,7 @@ size = Vector2i(800, 500)
 [connection signal="pressed" from="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer/AddRobotButton" to="." method="_on_add_robot_button_pressed"]
 [connection signal="pressed" from="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer/ShowStatusesButton" to="HBoxContainer/PanelContent" method="_on_show_statuses_button_pressed"]
 [connection signal="pressed" from="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer/ShowPlotsButton" to="HBoxContainer/PanelContent" method="_on_show_plots_button_pressed"]
+[connection signal="pressed" from="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer/ShowControlsButton" to="HBoxContainer/PanelContent" method="_on_show_controls_button_pressed"]
 [connection signal="button_up" from="HBoxContainer/PanelContent/ResizePanelContentButton" to="HBoxContainer/PanelContent" method="_on_resize_panel_content_button_button_up"]
 [connection signal="gui_input" from="HBoxContainer/PanelContent/ResizePanelContentButton" to="HBoxContainer/PanelContent" method="_on_resize_panel_content_button_gui_input"]
 [connection signal="close_requested" from="ImportWindow" to="." method="_on_import_window_close_requested"]
