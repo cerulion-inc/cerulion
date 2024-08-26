@@ -1,0 +1,15 @@
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.3
+reloadable = true
+
+[libraries]
+linux.debug.x86_64 =     "res://../../rust/cerulion_rust/target/debug/libcerulion_rust.so"
+linux.release.x86_64 =   "res://../../rust/cerulion_rust/target/release/libcerulion_rust.so"
+windows.debug.x86_64 =   "res://../../rust/cerulion_rust/target/debug/cerulion_rust.dll"
+windows.release.x86_64 = "res://../../rust/cerulion_rust/target/release/cerulion_rust.dll"
+macos.debug =            "res://../../rust/cerulion_rust/target/debug/libcerulion_rust.dylib"
+macos.release =          "res://../../rust/cerulion_rust/target/release/libcerulion_rust.dylib"
+macos.debug.arm64 =      "res://../../rust/cerulion_rust/target/debug/libcerulion_rust.dylib"
+macos.release.arm64 =    "res://../../rust/cerulion_rust/target/release/libcerulion_rust.dylib"
+
