@@ -1,4 +1,4 @@
-[gd_scene load_steps=15 format=3 uid="uid://b3pnr2lcxddis"]
+[gd_scene load_steps=18 format=3 uid="uid://b3pnr2lcxddis"]
 
 [ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_p5occ"]
 [ext_resource type="Script" path="res://scenes/ui/panels/LeftPanel.gd" id="1_rwgf5"]
@@ -7,6 +7,9 @@
 [ext_resource type="Texture2D" uid="uid://dkyemsx716jkw" path="res://assets/textures/ui/light/icons-essential/Chart.svg" id="3_jiedt"]
 [ext_resource type="Texture2D" uid="uid://d2fcrce6ra5yd" path="res://assets/textures/ui/light/icons-essential/Activity 1.svg" id="4_62q68"]
 [ext_resource type="Texture2D" uid="uid://c8ie53ey30wnl" path="res://assets/textures/ui/light/icons-essential/Filter 4.svg" id="5_ce4gt"]
+[ext_resource type="Script" path="res://scenes/ui/panels/PanelContentResize.gd" id="7_l42it"]
+[ext_resource type="PackedScene" uid="uid://bqg5xx6uspbfy" path="res://scenes/ui/content/plots.tscn" id="8_7mf2m"]
+[ext_resource type="PackedScene" uid="uid://dvq0ubvymg322" path="res://scenes/ui/content/status.tscn" id="9_i14em"]
 
 [sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3xl7x"]
 
@@ -22,6 +25,10 @@ bg_color = Color(6.49765e-07, 0.178744, 0.246977, 1)
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_6tn6o"]
 bg_color = Color(0.576649, 0.804517, 1, 1)
+corner_radius_top_left = 4
+corner_radius_top_right = 4
+corner_radius_bottom_right = 4
+corner_radius_bottom_left = 4
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_prns7"]
 bg_color = Color(0.576471, 0.803922, 1, 1)
@@ -63,6 +70,7 @@ mouse_default_cursor_shape = 2
 theme = ExtResource("1_p5occ")
 theme_type_variation = &"TextButton_Blue"
 theme_override_styles/focus = SubResource("StyleBoxEmpty_hu4w3")
+action_mode = 0
 icon = ExtResource("3_0b2rc")
 icon_alignment = 1
 expand_icon = true
@@ -74,6 +82,7 @@ size_flags_horizontal = 4
 mouse_default_cursor_shape = 2
 theme = ExtResource("1_p5occ")
 theme_type_variation = &"TextButton_Blue"
+action_mode = 0
 icon = ExtResource("3_jiedt")
 icon_alignment = 1
 expand_icon = true
@@ -85,6 +94,7 @@ size_flags_horizontal = 4
 mouse_default_cursor_shape = 2
 theme = ExtResource("1_p5occ")
 theme_type_variation = &"TextButton_Blue"
+action_mode = 0
 icon = ExtResource("4_62q68")
 icon_alignment = 1
 expand_icon = true
@@ -96,14 +106,17 @@ size_flags_horizontal = 0
 mouse_default_cursor_shape = 2
 theme = ExtResource("1_p5occ")
 theme_type_variation = &"TextButton_Blue"
+action_mode = 0
 icon = ExtResource("5_ce4gt")
 icon_alignment = 1
 expand_icon = true
 
 [node name="PanelContent" type="HBoxContainer" parent="HBoxContainer"]
-custom_minimum_size = Vector2(500, 0)
+custom_minimum_size = Vector2(400, 0)
 layout_mode = 2
+size_flags_horizontal = 2
 theme_override_constants/separation = 0
+script = ExtResource("7_l42it")
 
 [node name="PanelContainer" type="PanelContainer" parent="HBoxContainer/PanelContent"]
 layout_mode = 2
@@ -111,7 +124,13 @@ size_flags_horizontal = 3
 theme = ExtResource("1_p5occ")
 theme_override_styles/panel = SubResource("StyleBoxFlat_t12p4")
 
-[node name="Button" type="Button" parent="HBoxContainer/PanelContent"]
+[node name="Plots" parent="HBoxContainer/PanelContent/PanelContainer" instance=ExtResource("8_7mf2m")]
+layout_mode = 2
+
+[node name="Status" parent="HBoxContainer/PanelContent/PanelContainer" instance=ExtResource("9_i14em")]
+layout_mode = 2
+
+[node name="ResizePanelContentButton" type="Button" parent="HBoxContainer/PanelContent"]
 custom_minimum_size = Vector2(5, 0)
 layout_mode = 2
 size_flags_horizontal = 8
@@ -119,6 +138,8 @@ mouse_default_cursor_shape = 10
 theme_override_styles/focus = SubResource("StyleBoxEmpty_pminx")
 theme_override_styles/hover = SubResource("StyleBoxFlat_6tn6o")
 theme_override_styles/pressed = SubResource("StyleBoxFlat_prns7")
+action_mode = 0
+keep_pressed_outside = true
 
 [node name="ImportWindow" type="Window" parent="."]
 title = "Import robot"
@@ -128,5 +149,8 @@ size = Vector2i(800, 500)
 [node name="FileImportWindow" parent="ImportWindow" instance=ExtResource("2_ty8bu")]
 
 [connection signal="pressed" from="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer/AddRobotButton" to="." method="_on_add_robot_button_pressed"]
-[connection signal="pressed" from="HBoxContainer/PanelContent/Button" to="." method="_on_button_pressed"]
+[connection signal="pressed" from="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer/ShowStatusesButton" to="HBoxContainer/PanelContent" method="_on_show_statuses_button_pressed"]
+[connection signal="pressed" from="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer/ShowPlotsButton" to="HBoxContainer/PanelContent" method="_on_show_plots_button_pressed"]
+[connection signal="button_up" from="HBoxContainer/PanelContent/ResizePanelContentButton" to="HBoxContainer/PanelContent" method="_on_resize_panel_content_button_button_up"]
+[connection signal="gui_input" from="HBoxContainer/PanelContent/ResizePanelContentButton" to="HBoxContainer/PanelContent" method="_on_resize_panel_content_button_gui_input"]
 [connection signal="close_requested" from="ImportWindow" to="." method="_on_import_window_close_requested"]
