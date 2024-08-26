@@ -1,26 +1,132 @@
-[gd_scene load_steps=4 format=3 uid="uid://dos4iivyp073m"]
+[gd_scene load_steps=15 format=3 uid="uid://b3pnr2lcxddis"]
 
-[ext_resource type="Script" path="res://scenes/ui/interfaces/ImportWindow.gd" id="1_exitu"]
-[ext_resource type="PackedScene" uid="uid://c4ux2atdr6mrh" path="res://scenes/ui/interfaces/ImportButton.tscn" id="1_j26wo"]
+[ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_p5occ"]
+[ext_resource type="Script" path="res://scenes/ui/panels/LeftPanel.gd" id="1_rwgf5"]
 [ext_resource type="PackedScene" uid="uid://4onc2uy3n0aa" path="res://scenes/ui/interfaces/FileImportWindow.tscn" id="2_ty8bu"]
+[ext_resource type="Texture2D" uid="uid://djqdkj5ol18mg" path="res://assets/textures/ui/dark/icons-essential/Add.svg" id="3_0b2rc"]
+[ext_resource type="Texture2D" uid="uid://dkyemsx716jkw" path="res://assets/textures/ui/light/icons-essential/Chart.svg" id="3_jiedt"]
+[ext_resource type="Texture2D" uid="uid://d2fcrce6ra5yd" path="res://assets/textures/ui/light/icons-essential/Activity 1.svg" id="4_62q68"]
+[ext_resource type="Texture2D" uid="uid://c8ie53ey30wnl" path="res://assets/textures/ui/light/icons-essential/Filter 4.svg" id="5_ce4gt"]
 
-[node name="Control" type="Control"]
-layout_mode = 3
+[sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3xl7x"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_8poxw"]
+bg_color = Color(4.13924e-06, 0.489335, 0.638271, 1)
+
+[sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_hu4w3"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_t12p4"]
+bg_color = Color(6.49765e-07, 0.178744, 0.246977, 1)
+
+[sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_pminx"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_6tn6o"]
+bg_color = Color(0.576649, 0.804517, 1, 1)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_prns7"]
+bg_color = Color(0.576471, 0.803922, 1, 1)
+
+[node name="LeftPanel" type="PanelContainer"]
 anchors_preset = 15
 anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
+theme_override_styles/panel = SubResource("StyleBoxEmpty_3xl7x")
+script = ExtResource("1_rwgf5")
 
-[node name="ImportButton" parent="." instance=ExtResource("1_j26wo")]
-custom_minimum_size = Vector2(0, 0)
-layout_mode = 1
+[node name="HBoxContainer" type="HBoxContainer" parent="."]
+layout_mode = 2
+theme_override_constants/separation = 0
 
-[node name="FileImportWindow" type="Window" parent="."]
-auto_translate_mode = 1
-title = "Import"
+[node name="ButtonContainer" type="PanelContainer" parent="HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+theme_override_styles/panel = SubResource("StyleBoxFlat_8poxw")
+
+[node name="MarginContainer" type="MarginContainer" parent="HBoxContainer/ButtonContainer"]
+layout_mode = 2
+theme_override_constants/margin_left = 10
+theme_override_constants/margin_top = 10
+theme_override_constants/margin_right = 10
+
+[node name="VBoxContainer" type="VBoxContainer" parent="HBoxContainer/ButtonContainer/MarginContainer"]
+layout_mode = 2
+size_flags_horizontal = 0
+theme_override_constants/separation = 20
+
+[node name="AddRobotButton" type="Button" parent="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer"]
+custom_minimum_size = Vector2(40, 40)
+layout_mode = 2
+size_flags_horizontal = 4
+mouse_default_cursor_shape = 2
+theme = ExtResource("1_p5occ")
+theme_type_variation = &"TextButton_Blue"
+theme_override_styles/focus = SubResource("StyleBoxEmpty_hu4w3")
+icon = ExtResource("3_0b2rc")
+icon_alignment = 1
+expand_icon = true
+
+[node name="ShowStatusesButton" type="Button" parent="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer"]
+custom_minimum_size = Vector2(40, 40)
+layout_mode = 2
+size_flags_horizontal = 4
+mouse_default_cursor_shape = 2
+theme = ExtResource("1_p5occ")
+theme_type_variation = &"TextButton_Blue"
+icon = ExtResource("3_jiedt")
+icon_alignment = 1
+expand_icon = true
+
+[node name="ShowPlotsButton" type="Button" parent="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer"]
+custom_minimum_size = Vector2(40, 40)
+layout_mode = 2
+size_flags_horizontal = 4
+mouse_default_cursor_shape = 2
+theme = ExtResource("1_p5occ")
+theme_type_variation = &"TextButton_Blue"
+icon = ExtResource("4_62q68")
+icon_alignment = 1
+expand_icon = true
+
+[node name="ShowControlsButton" type="Button" parent="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer"]
+custom_minimum_size = Vector2(40, 40)
+layout_mode = 2
+size_flags_horizontal = 0
+mouse_default_cursor_shape = 2
+theme = ExtResource("1_p5occ")
+theme_type_variation = &"TextButton_Blue"
+icon = ExtResource("5_ce4gt")
+icon_alignment = 1
+expand_icon = true
+
+[node name="PanelContent" type="HBoxContainer" parent="HBoxContainer"]
+custom_minimum_size = Vector2(500, 0)
+layout_mode = 2
+theme_override_constants/separation = 0
+
+[node name="PanelContainer" type="PanelContainer" parent="HBoxContainer/PanelContent"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme = ExtResource("1_p5occ")
+theme_override_styles/panel = SubResource("StyleBoxFlat_t12p4")
+
+[node name="Button" type="Button" parent="HBoxContainer/PanelContent"]
+custom_minimum_size = Vector2(5, 0)
+layout_mode = 2
+size_flags_horizontal = 8
+mouse_default_cursor_shape = 10
+theme_override_styles/focus = SubResource("StyleBoxEmpty_pminx")
+theme_override_styles/hover = SubResource("StyleBoxFlat_6tn6o")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_prns7")
+
+[node name="ImportWindow" type="Window" parent="."]
+title = "Import robot"
 initial_position = 2
-size = Vector2i(750, 400)
-script = ExtResource("1_exitu")
+size = Vector2i(800, 500)
 
-[node name="FileImportWindow" parent="FileImportWindow" instance=ExtResource("2_ty8bu")]
+[node name="FileImportWindow" parent="ImportWindow" instance=ExtResource("2_ty8bu")]
+
+[connection signal="pressed" from="HBoxContainer/ButtonContainer/MarginContainer/VBoxContainer/AddRobotButton" to="." method="_on_add_robot_button_pressed"]
+[connection signal="pressed" from="HBoxContainer/PanelContent/Button" to="." method="_on_button_pressed"]
+[connection signal="close_requested" from="ImportWindow" to="." method="_on_import_window_close_requested"]

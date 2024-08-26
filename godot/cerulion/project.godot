@@ -29,7 +29,7 @@ SystemInfo="*res://scenes/globals/SystemInfo.gd"
 [display]
 
 window/size/viewport_width=1920
-window/size/viewport_height=1080
+window/size/viewport_height=1200
 window/subwindows/embed_subwindows=false
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
@@ -45,6 +45,20 @@ enabled=PackedStringArray("res://addons/easy_charts/plugin.cfg")
 [gui]
 
 theme/custom="res://assets/themes/dark_mode.tres"
+
+[importer_defaults]
+
+texture={
+"svg/scale": 10.0
+}
+
+[input]
+
+toggle_content_panel={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"resource_local_to_scene":false,"resource_name":"","device":0,"window_id":0,"command_or_control_autoremap":true,"alt_pressed":false,"shift_pressed":false,"pressed":false,"keycode":0,"physical_keycode":66,"key_label":0,"unicode":0,"location":0,"echo":false,"script":null)
+]
+}
 
 [rendering]
 

@@ -37,6 +37,7 @@ layout_mode = 2
 [node name="Label" type="Label" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer"]
 layout_mode = 2
 theme = ExtResource("2_44fkj")
+theme_override_font_sizes/font_size = 16
 text = "Drag and drop .zip file with the following structure:
         [ROBOT].urdf
         [MESH_FOLDER]

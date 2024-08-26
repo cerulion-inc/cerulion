@@ -30,25 +30,21 @@ border_width_left = 2
 border_width_top = 2
 border_width_right = 2
 border_width_bottom = 2
-border_color = Color(0.541176, 0.886275, 1, 1)
-corner_radius_top_left = 5
-corner_radius_top_right = 5
-corner_radius_bottom_right = 5
-corner_radius_bottom_left = 5
+border_color = Color(1.8049e-08, 0.142122, 0.182465, 1)
+border_blend = true
+expand_margin_left = 10.0
+expand_margin_top = 10.0
+expand_margin_right = 10.0
+expand_margin_bottom = 10.0
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_sucib"]
-bg_color = Color(0, 0.501961, 0.709804, 1)
-corner_radius_top_left = 5
-corner_radius_top_right = 5
-corner_radius_bottom_right = 5
-corner_radius_bottom_left = 5
+bg_color = Color(4.57242e-07, 0.231359, 0.338221, 1)
+expand_margin_left = 10.0
+expand_margin_top = 10.0
+expand_margin_right = 10.0
+expand_margin_bottom = 10.0
 
-[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_7l7ig"]
-bg_color = Color(0, 0.752941, 1, 1)
-corner_radius_top_left = 5
-corner_radius_top_right = 5
-corner_radius_bottom_right = 5
-corner_radius_bottom_left = 5
+[sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_ndkev"]
 
 [resource]
 default_font = ExtResource("1_4qtex")
@@ -68,4 +64,4 @@ Panel_Grey_Flat/styles/panel = SubResource("StyleBoxFlat_dqlas")
 TextButton_Blue/base_type = &"Button"
 TextButton_Blue/styles/focus = SubResource("StyleBoxFlat_8pgw0")
 TextButton_Blue/styles/hover = SubResource("StyleBoxFlat_sucib")
-TextButton_Blue/styles/normal = SubResource("StyleBoxFlat_7l7ig")
+TextButton_Blue/styles/normal = SubResource("StyleBoxEmpty_ndkev")
