@@ -14,7 +14,7 @@
   <a href="https://github.com/cerulion-inc/cerulion">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="media/logo/Logo White Icon.svg">
-    <img src="media/logo/Logo White Icon.svg" alt="Logo" width="100" height="100">
+    <img src="media/logo/Logo Main Icon.svg" alt="Logo" width="100" height="100">
     </picture>
   </a>
 
