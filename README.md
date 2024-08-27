@@ -13,8 +13,8 @@
 <div align="center">
   <a href="https://github.com/cerulion-inc/cerulion">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="media/logo/Logo White Icon.png">
-    <img src="media/logo/Logo Dark Icon.svg" alt="Logo" width="100" height="100">
+    <source media="(prefers-color-scheme: dark)" srcset="media/logo/Logo White Icon.svg">
+    <img src="media/logo/Logo White Icon.svg" alt="Logo" width="100" height="100">
     </picture>
   </a>
 
