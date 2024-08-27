@@ -50,6 +50,8 @@ func initializeTransforms() -> void:
 		if RobotState.link_transforms[key].is_root:
 			RobotState.link_nodes[key].transform = \
 				RobotState.link_transforms[key].getBaseTransformT(LinkTransform.T_default)
+			RobotState.link_nodes[key].transform.origin = Vector3(0, 1, 0)
+				
 		else:
 			RobotState.link_nodes[key].transform = \
 				RobotState.link_transforms[key].getLinkTransform(0.0)
