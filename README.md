@@ -97,6 +97,7 @@ Download the application executable from [Releases](https://github.com/cerulion-
 <!-- USAGE EXAMPLES -->
 ## Usage
 #### Loading your robot
+https://github.com/user-attachments/assets/3a858ad9-ecaa-4940-8ea5-9eb177a47a7c
 
 <!-- #### Checking communication status
 
