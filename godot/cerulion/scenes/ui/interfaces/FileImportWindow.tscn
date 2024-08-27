@@ -1,7 +1,8 @@
-[gd_scene load_steps=4 format=3 uid="uid://4onc2uy3n0aa"]
+[gd_scene load_steps=5 format=3 uid="uid://4onc2uy3n0aa"]
 
 [ext_resource type="Script" path="res://scenes/ui/interfaces/LoadRobot.gd" id="1_p4b2r"]
 [ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="2_44fkj"]
+[ext_resource type="Script" path="res://scenes/ui/interfaces/PreLoadedRobots.gd" id="3_2qsen"]
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_c2hof"]
 content_margin_left = 5.0
@@ -56,38 +57,44 @@ theme = ExtResource("2_44fkj")
 theme_override_font_sizes/font_size = 16
 text = "Pre-loaded robots:"
 
-[node name="GridContainer" type="GridContainer" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer"]
+[node name="PreLoadedRobots" type="GridContainer" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer"]
 layout_mode = 2
 theme_override_constants/h_separation = 20
 theme_override_constants/v_separation = 20
 columns = 3
+script = ExtResource("3_2qsen")
 
-[node name="UnitreeButton" type="Button" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/GridContainer"]
+[node name="UnitreeButton" type="Button" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/PreLoadedRobots"]
 layout_mode = 2
 size_flags_horizontal = 4
 theme = ExtResource("2_44fkj")
 theme_type_variation = &"FlatButton"
 theme_override_font_sizes/font_size = 20
 theme_override_styles/normal = SubResource("StyleBoxFlat_c2hof")
+action_mode = 0
 text = "Unitree Go 2"
 
-[node name="MITHumanoidButton" type="Button" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/GridContainer"]
+[node name="MITHumanoidButton" type="Button" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/PreLoadedRobots"]
+visible = false
 layout_mode = 2
 size_flags_horizontal = 4
 theme = ExtResource("2_44fkj")
 theme_type_variation = &"FlatButton"
 theme_override_font_sizes/font_size = 20
 theme_override_styles/normal = SubResource("StyleBoxFlat_c2hof")
+action_mode = 0
 text = "MIT Humanoid
 "
 
-[node name="CassieButton" type="Button" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/GridContainer"]
+[node name="CassieButton" type="Button" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/PreLoadedRobots"]
+visible = false
 layout_mode = 2
 size_flags_horizontal = 4
 theme = ExtResource("2_44fkj")
 theme_type_variation = &"FlatButton"
 theme_override_font_sizes/font_size = 20
 theme_override_styles/normal = SubResource("StyleBoxFlat_c2hof")
+action_mode = 0
 text = "Cassie"
 
 [node name="Label" type="Label" parent="VBoxContainer/Panel/MarginContainer/VBoxContainer"]
@@ -101,3 +108,5 @@ text = "For custom robot, drag and drop .zip file with the following structure:
                 [MESH_1].obj
                 ...
 		"
+
+[connection signal="pressed" from="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/PreLoadedRobots/UnitreeButton" to="VBoxContainer/Panel/MarginContainer/VBoxContainer/VBoxContainer/PreLoadedRobots" method="_on_unitree_button_pressed"]

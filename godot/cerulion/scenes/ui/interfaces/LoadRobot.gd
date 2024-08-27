@@ -6,21 +6,19 @@ var xml_parser:XMLParser = XMLParser.new()
 var USER_DIR:DirAccess = DirAccess.open("user://")
 var urdf_dir:String = ""
 var urdf_name:String = ""
+var unitree_dir:String = "res://robots/unitree_go2/"
 
 # Called when the node enters the scene tree for the first time.
 func _ready() -> void:
+	Signals.connect("LoadUnitree", loadUnitree)
 	get_viewport().files_dropped.connect(onFilesDropped)
 	if (not USER_DIR.dir_exists("robots")):
 		USER_DIR.make_dir("robots")
 
-# Called every frame. 'delta' is the elapsed time since the previous frame.
-func _process(_delta: float) -> void:
-	pass
-
 func onFilesDropped(files):
 	parseFiles(files)
 	parseURDF(RobotParameters.urdf_filepath)
-	
+
 func parseFiles(files):
 	filepath = files[0]
 	if (filepath.get_extension() != "zip"):
@@ -175,6 +173,11 @@ func parseURDF(urdf_file):
 						= float(attributes_dict["radius"])
 	Signals.emit_signal("RobotLoaded")
 
+func loadUnitree():
+	RobotParameters.urdf_dir = unitree_dir
+	RobotParameters.urdf_filepath = unitree_dir + "go2_description.urdf"
+	parseURDF(RobotParameters.urdf_filepath)
+
 static func strToVec3(string := "") -> Vector3:
 	if string:
 		var new_string: String = string
@@ -188,7 +191,3 @@ static func strToVec4(string := "") -> Vector4:
 		var array: Array = new_string.split(" ")
 		return Vector4(float(array[0]), float(array[1]), float(array[2]), float(array[3]))
 	return Vector4.ZERO
-
-
-func _on_import_button_pressed() -> void:
-	pass # Replace with function body.
