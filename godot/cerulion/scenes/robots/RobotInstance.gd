@@ -1,6 +1,5 @@
 extends Node3D
 
-var robot_dir:DirAccess
 var joints:Array
 var links:Array
 
@@ -9,7 +8,6 @@ func _ready() -> void:
 	Signals.connect("RobotLoaded", loadRobot)
 
 func loadRobot():
-	robot_dir = DirAccess.open("user://robots")
 	print(RobotParameters.joints)
 	print(RobotParameters.links)
 	joints = RobotParameters.joints.keys()

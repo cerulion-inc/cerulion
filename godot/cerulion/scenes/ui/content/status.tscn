@@ -1,8 +1,8 @@
 [gd_scene load_steps=5 format=3 uid="uid://dvq0ubvymg322"]
 
-[ext_resource type="Script" path="res://scenes/ui/content/Status.gd" id="1_bmy7a"]
-[ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="1_u8n0i"]
-[ext_resource type="Texture2D" uid="uid://dhrlkxpjpfhxw" path="res://assets/textures/ui/dark/status/State=Pass.svg" id="2_r8i51"]
+[ext_resource type="Script" path="res://scenes/ui/content/Status.gd" id="1_gejjn"]
+[ext_resource type="Theme" uid="uid://ceve3jwvjaqnx" path="res://assets/themes/dark_mode.tres" id="2_d0hvg"]
+[ext_resource type="Texture2D" uid="uid://dhrlkxpjpfhxw" path="res://assets/textures/ui/dark/status/State=Pass.svg" id="3_m2m28"]
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_633f7"]
 bg_color = Color(0.86683, 0.86683, 0.866829, 1)
@@ -21,7 +21,7 @@ theme_override_constants/margin_left = 15
 theme_override_constants/margin_top = 20
 theme_override_constants/margin_right = 15
 theme_override_constants/margin_bottom = 15
-script = ExtResource("1_bmy7a")
+script = ExtResource("1_gejjn")
 
 [node name="VBoxContainer" type="VBoxContainer" parent="."]
 layout_mode = 2
@@ -36,7 +36,7 @@ theme_override_constants/separation = 30
 custom_minimum_size = Vector2(60, 0)
 layout_mode = 2
 size_flags_horizontal = 3
-theme = ExtResource("1_u8n0i")
+theme = ExtResource("2_d0hvg")
 theme_override_font_sizes/font_size = 14
 text = "Channel"
 
@@ -44,7 +44,7 @@ text = "Channel"
 custom_minimum_size = Vector2(60, 0)
 layout_mode = 2
 size_flags_horizontal = 3
-theme = ExtResource("1_u8n0i")
+theme = ExtResource("2_d0hvg")
 theme_override_font_sizes/font_size = 14
 text = "Status"
 
@@ -52,7 +52,7 @@ text = "Status"
 custom_minimum_size = Vector2(60, 0)
 layout_mode = 2
 size_flags_horizontal = 3
-theme = ExtResource("1_u8n0i")
+theme = ExtResource("2_d0hvg")
 theme_override_font_sizes/font_size = 14
 text = "Hz
 "
@@ -61,7 +61,7 @@ text = "Hz
 custom_minimum_size = Vector2(60, 0)
 layout_mode = 2
 size_flags_horizontal = 3
-theme = ExtResource("1_u8n0i")
+theme = ExtResource("2_d0hvg")
 theme_override_font_sizes/font_size = 14
 text = "1/Hz"
 
@@ -69,7 +69,7 @@ text = "1/Hz"
 custom_minimum_size = Vector2(60, 0)
 layout_mode = 2
 size_flags_horizontal = 3
-theme = ExtResource("1_u8n0i")
+theme = ExtResource("2_d0hvg")
 theme_override_font_sizes/font_size = 14
 text = "Bandwidth"
 
@@ -88,14 +88,14 @@ theme_override_constants/separation = 30
 custom_minimum_size = Vector2(60, 0)
 layout_mode = 2
 size_flags_horizontal = 3
-theme = ExtResource("1_u8n0i")
+theme = ExtResource("2_d0hvg")
 theme_override_font_sizes/font_size = 14
 text = "[Ch. name]"
 
 [node name="Status" type="TextureRect" parent="VBoxContainer/ChannelData"]
 layout_mode = 2
 size_flags_horizontal = 3
-texture = ExtResource("2_r8i51")
+texture = ExtResource("3_m2m28")
 expand_mode = 3
 stretch_mode = 4
 
@@ -103,7 +103,7 @@ stretch_mode = 4
 custom_minimum_size = Vector2(60, 0)
 layout_mode = 2
 size_flags_horizontal = 3
-theme = ExtResource("1_u8n0i")
+theme = ExtResource("2_d0hvg")
 theme_override_font_sizes/font_size = 14
 text = "[Hz]
 "
@@ -112,7 +112,7 @@ text = "[Hz]
 custom_minimum_size = Vector2(60, 0)
 layout_mode = 2
 size_flags_horizontal = 3
-theme = ExtResource("1_u8n0i")
+theme = ExtResource("2_d0hvg")
 theme_override_font_sizes/font_size = 14
 text = "[1/Hz] ms"
 
@@ -120,6 +120,6 @@ text = "[1/Hz] ms"
 custom_minimum_size = Vector2(60, 0)
 layout_mode = 2
 size_flags_horizontal = 3
-theme = ExtResource("1_u8n0i")
+theme = ExtResource("2_d0hvg")
 theme_override_font_sizes/font_size = 14
 text = "[XX.XX KB/s]"
