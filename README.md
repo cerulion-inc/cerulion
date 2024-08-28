@@ -112,8 +112,11 @@ _For more examples, please refer to the [Documentation](https://github.com/cerul
 
 ### Built With
 [Godot Engine](https://godotengine.org)
+
 [IceOryx2](https://iceoryx.io)
+
 [Zenoh](https://zenoh.io)
+
 [LCM](http://lcm-proj.github.io/lcm/#)
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
@@ -169,6 +172,7 @@ Distributed under the MIT License. See `LICENSE.txt` for more information.
 ## Contact
 
 Lakshay Sharma - lakshay@cerulion.com
+
 Se Hwan Jeon - sehwan@cerulion.com
 
 Project Link: [https://github.com/cerulion-inc/cerulion](https://github.com/cerulion-inc/cerulion)
