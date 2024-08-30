@@ -1,7 +1,8 @@
-[gd_scene load_steps=9 format=3 uid="uid://c3oyeyyno6u24"]
+[gd_scene load_steps=10 format=3 uid="uid://c3oyeyyno6u24"]
 
 [ext_resource type="PackedScene" uid="uid://cfnfqbkjjq0ri" path="res://scenes/robots/robot.tscn" id="1_mkboy"]
 [ext_resource type="Texture2D" uid="uid://cky0o16rtglmc" path="res://assets/textures/environment/floor_tiles.png" id="2_4gm2s"]
+[ext_resource type="Script" path="res://third-party/lcm/unitree_go2_lcm/UnitreeGo2LCMSubscriber.cs" id="2_6akd5"]
 [ext_resource type="Script" path="res://scenes/globals/OBJParser.gd" id="3_shkfd"]
 [ext_resource type="Script" path="res://scenes/environment/ViewerCamera.gd" id="4_n0seq"]
 [ext_resource type="PackedScene" uid="uid://c2eqprlugvdmt" path="res://scenes/environment/PointCloud.tscn" id="5_u7kli"]
@@ -21,6 +22,9 @@ size = Vector2(100, 100)
 [node name="main" type="Node3D"]
 
 [node name="Robot" parent="." instance=ExtResource("1_mkboy")]
+
+[node name="LCMSubscriber" type="Node3D" parent="Robot"]
+script = ExtResource("2_6akd5")
 
 [node name="Environment" type="Node3D" parent="."]
 
