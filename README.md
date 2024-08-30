@@ -83,12 +83,15 @@ Drivers will need to be installed on your robot platform, but for the interface 
 
 ### Installation
 
-##### On your robot
-
-[LAKSHAY, PLEASE FILL OUT THIS SECTION]
 ##### On your computer
 
 Download the application executable from [Releases](https://github.com/cerulion-inc/cerulion/releases) for your operating system.
+
+##### On your robot
+
+Currently, we use [LCM (Lightweight Communications and Marshaling)]([url](http://lcm-proj.github.io/lcm/)) for our backend. Very soon, we will also offer IceOryx2 (intra-machine IPC) + Zenoh (inter-machine network communications) for bleeding edge improvements in latency using Rust.
+
+You can start using LCM with Python on your robot right away after a simple `pip install lcm`. However, if you want to use ROS2 with LCM, we are developing a bridge to make this easier. Your best option for now is to use [this](https://github.com/nrjl/lcm_to_ros) bidirectional message subscriber/republisher.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -125,6 +128,8 @@ _For more examples, please refer to the [Documentation](https://github.com/cerul
 ## Roadmap
 
 - [x] Release v0.1
+- [ ] Simplify LCM-ROS2 integration
+- [ ] Add ZenOryx backend (Zenoh + IceOryx/IceOryx2)
 - [ ] Dynamic content panels
 - [ ] Basic simulation capabilities
 - [ ] Basic controllers
