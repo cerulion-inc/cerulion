@@ -1,0 +1,10 @@
+package unitree_lcm;
+
+struct joint_states_t
+{
+    int64_t  tick;
+    double   q_front_left[3];
+    double   q_front_right[3]; 
+    double   q_rear_left[3];
+    double   q_rear_right[3];
+}
