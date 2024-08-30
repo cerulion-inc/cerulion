@@ -3,12 +3,12 @@ using System;
 namespace LCM.LCM
 {
 	/// <summary>
-    /// A class which listens for messages on a particular channel.
-    /// </summary>
+	/// A class which listens for messages on a particular channel.
+	/// </summary>
 	public interface LCMSubscriber
 	{
 		/// <summary>
-        /// Invoked by LCM when a message is received.
+		/// Invoked by LCM when a message is received.
 		/// 
 		/// This method is invoked from the LCM thread.
 		/// </summary>
