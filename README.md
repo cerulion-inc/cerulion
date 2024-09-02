@@ -169,7 +169,11 @@ If you have a suggestion that would make this better, please fork the repo and c
 <!-- LICENSE -->
 ## License
 
-Distributed under the MIT License. See `LICENSE.txt` for more information.
+Distributed under the GPLv3 License. See `LICENSE.txt` for more information.
+
+Cerulion is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+Cerulion is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with Cerulion. If not, see <https://www.gnu.org/licenses/>.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -202,7 +206,7 @@ Project Link: [https://github.com/cerulion-inc/cerulion](https://github.com/ceru
 [license-shield]: https://img.shields.io/github/license/cerulion-inc/cerulion.svg?style=for-the-badge
 [license-url]: https://github.com/cerulion-inc/cerulion/blob/master/LICENSE.txt
 [linkedin-shield]: https://img.shields.io/badge/-LinkedIn-black.svg?style=for-the-badge&logo=linkedin&colorB=555
-[linkedin-url]: https://linkedin.com/in/cerulion
+[linkedin-url]: https://linkedin.com/company/cerulion
 [cerulion_screenshot]: media/images/cerulion_screenshot.png
 
 <!-- BADGES -->
