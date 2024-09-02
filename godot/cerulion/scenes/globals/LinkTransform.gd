@@ -33,6 +33,8 @@ var world_p_link:Vector3 = Vector3.ZERO
 # Parent link variables
 var q:float = 0
 var parent_node:Node3D
+
+# Transform parameters
 var joint_axis:Vector3 = Vector3.ZERO
 var joint_pos_rel_parent:Vector3 = Vector3.ZERO
 var joint_rpy_rel_parent:Vector3 = Vector3.ZERO
@@ -67,10 +69,7 @@ func getLinkTransform(q_joint:float) -> Transform3D:
 	# Rotation
 	world_R_parent = world_R_godot * parent_node.transform.basis
 	parent_R_offset = Basis.from_euler(joint_ZYX_rel_parent, EULER_ORDER_ZYX)
-	if (joint_axis.dot(joint_axis) < 1e-6):
-		offset_R_joint = Basis.IDENTITY
-	else:
-		offset_R_joint = Basis(joint_axis, q_joint)
+	offset_R_joint = Basis(joint_axis, q_joint)
 	joint_R_link = Basis.from_euler(link_ZYX_rel_joint, EULER_ORDER_ZYX)
 	var world_R_link:Basis = world_R_parent * parent_R_offset \
 		* offset_R_joint * joint_R_link;
