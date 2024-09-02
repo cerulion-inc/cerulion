@@ -203,7 +203,7 @@ Project Link: [https://github.com/cerulion-inc/cerulion](https://github.com/ceru
 [stars-url]: https://github.com/cerulion-inc/cerulion/stargazers
 [issues-shield]: https://img.shields.io/github/issues/cerulion-inc/cerulion.svg?style=for-the-badge
 [issues-url]: https://github.com/cerulion-inc/cerulion/issues
-[license-shield]: https://img.shields.io/github/license/cerulion-inc/cerulion.svg?style=for-the-badge
+[license-shield]: https://img.shields.io/github/license/cerulion-inc/cerulion?style=for-the-badge
 [license-url]: https://github.com/cerulion-inc/cerulion/blob/master/LICENSE.txt
 [linkedin-shield]: https://img.shields.io/badge/-LinkedIn-black.svg?style=for-the-badge&logo=linkedin&colorB=555
 [linkedin-url]: https://linkedin.com/company/cerulion
