@@ -1,0 +1,9 @@
+[gd_scene load_steps=2 format=3 uid="uid://cnq6gnhugnh1l"]
+
+[ext_resource type="Script" path="res://scenes/communication/Subscriber.cs" id="1_v01ml"]
+
+[node name="Subscriber" type="Control"]
+layout_mode = 3
+anchors_preset = 0
+size_flags_horizontal = 0
+script = ExtResource("1_v01ml")
