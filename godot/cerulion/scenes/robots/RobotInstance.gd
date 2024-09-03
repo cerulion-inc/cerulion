@@ -24,6 +24,8 @@ func loadRobot():
 			link_transforms.link_pos_rel_joint = RobotParameters.links[l].visual.origin.xyz
 			link_transforms.mesh_rpy_offset = RobotParameters.links[l].visual.origin.rpy
 			# link_transforms.mesh_pos_offset = RobotParameters.links[l].visual.origin.xyz
+			
+			# ! TODO: R_mesh is hardcoded. I'm not sure this is always true for all exported meshes.
 			link_transforms.R_mesh = Basis(
 				Vector3(0, 1, 0),
 				Vector3(1, 0, 0),
@@ -32,18 +34,23 @@ func loadRobot():
 			RobotState.link_transforms[l] = link_transforms
 			self.add_child(link_node)
 	for j in joints:
-		if (RobotParameters.joints[j].type != "fixed"):
-			var child = RobotParameters.joints[j].child
-			RobotState.link_transforms[child].joint_axis = RobotParameters.joints[j].axis
-			RobotState.link_transforms[child].joint_pos_rel_parent = RobotParameters.joints[j].origin.xyz
-			RobotState.link_transforms[child].joint_rpy_rel_parent = RobotParameters.joints[j].origin.rpy
+		print(j)
+		var child = RobotParameters.joints[j].child
+		if (RobotState.link_transforms.has(child)):
 			RobotState.link_transforms[child].is_root = false
-			if (RobotParameters.joints[j].has("parent")):
-				RobotState.link_transforms[child].parent_node \
-					= RobotState.link_nodes[RobotParameters.joints[j].parent]
+			RobotState.link_transforms[child].parent_node = RobotState.link_nodes[RobotParameters.joints[j].parent]
+			if (RobotParameters.joints[j].type != "fixed"):
+				RobotState.link_transforms[child].joint_axis = RobotParameters.joints[j].axis
+				RobotState.link_transforms[child].joint_pos_rel_parent = RobotParameters.joints[j].origin.xyz
+				RobotState.link_transforms[child].joint_rpy_rel_parent = RobotParameters.joints[j].origin.rpy
+			else:
+				RobotState.link_transforms[child].joint_axis = Vector3(1, 0, 0)
+			
 	initializeTransforms()
 	robot_loaded = true
 
+# ! TODO: CHANGE "is_root" EXCEPTION HANDLING TO "is_floating". 
+# ! FIXED BASE ROBOTS SHOULD HAVE NO ISSUES
 func initializeTransforms() -> void:
 	for key in RobotState.link_transforms.keys():
 		(RobotState.link_nodes[key].get_child(0)).transform = \
@@ -51,7 +58,7 @@ func initializeTransforms() -> void:
 		RobotState.link_nodes[key].transform = \
 			RobotState.link_transforms[key].initializeLinkTransform()
 		if RobotState.link_transforms[key].is_root:
-			RobotState.joints[key] = PackedFloat64Array([0, 0, 0, 0, 0, 0, 0])
+			RobotState.joints[key] = PackedFloat32Array([0, 0, 0, 1, 0, 0, 0])
 			RobotState.link_nodes[key].transform = \
 				RobotState.link_transforms[key].getBaseTransformT(LinkTransform.T_default)
 			RobotState.link_nodes[key].transform.origin = Vector3(0, 1, 0)
@@ -64,11 +71,12 @@ func _physics_process(delta: float) -> void:
 	if robot_loaded:
 		for key in RobotState.link_transforms.keys():
 			if RobotState.link_transforms[key].is_root:
-				var rpy = Vector3(sin(5*time), sin(5*time), sin(5*time)) * 0.5
-				var p_base = Vector3(sin(time), cos(time), 1)
+				var q_base:PackedFloat32Array = RobotState.joints[key]
+				var base_quat:Quaternion = Quaternion(q_base[0], q_base[1], q_base[2], q_base[3]).normalized();
+				var base_pos:Vector3 = Vector3(q_base[4], q_base[5], q_base[6]);
 				RobotState.link_nodes[key].transform = \
-					RobotState.link_transforms[key].getBaseTransformRPY(rpy, p_base)
+					RobotState.link_transforms[key].getBaseTransformQuat(base_quat, base_pos)
 			else:
 				RobotState.link_nodes[key].transform = \
-					RobotState.link_transforms[key].getLinkTransform(sin(time))
+					RobotState.link_transforms[key].getLinkTransform(RobotState.joints[key]);
 		time += delta
