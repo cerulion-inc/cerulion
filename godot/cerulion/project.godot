@@ -28,10 +28,6 @@ SystemInfo="*res://scenes/globals/SystemInfo.gd"
 PointCloudData="*res://scenes/globals/PointCloudData.gd"
 SensorData="*res://scenes/globals/SensorData.gd"
 
-[debug]
-
-settings/stdout/print_fps=true
-
 [display]
 
 window/size/viewport_width=1920
@@ -75,7 +71,7 @@ left_click={
 
 2d/run_on_separate_thread=true
 3d/run_on_separate_thread=true
-common/physics_ticks_per_second=1000
+common/physics_ticks_per_second=120
 
 [rendering]
 
