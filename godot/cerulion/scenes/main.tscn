@@ -4,7 +4,7 @@
 [ext_resource type="Texture2D" uid="uid://cky0o16rtglmc" path="res://assets/textures/environment/floor_tiles.png" id="2_4gm2s"]
 [ext_resource type="Script" path="res://scenes/environment/ViewerCamera.gd" id="4_n0seq"]
 [ext_resource type="PackedScene" uid="uid://c2eqprlugvdmt" path="res://scenes/environment/PointCloud.tscn" id="5_u7kli"]
-[ext_resource type="PackedScene" uid="uid://ij2ba38exv68" path="res://scenes/ui/Viewport.tscn" id="6_jvixt"]
+[ext_resource type="PackedScene" uid="uid://ij2ba38exv68" path="res://scenes/ui/viewport.tscn" id="6_jvixt"]
 [ext_resource type="PackedScene" uid="uid://cnq6gnhugnh1l" path="res://scenes/communication/Subscriber.tscn" id="8_l7xfw"]
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_v4po0"]
