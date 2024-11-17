@@ -49,3 +49,5 @@ grow_vertical = 2
 layout_mode = 1
 
 [node name="Subscriber" parent="." instance=ExtResource("8_l7xfw")]
+
+[node name="ZenohSubscriber" type="ZenohSubscriber" parent="."]
