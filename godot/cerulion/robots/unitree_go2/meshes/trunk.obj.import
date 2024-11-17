@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://qc3eivdyl4x7"
+path="res://.godot/imported/trunk.obj-cdcb9e7c4ead623dca2d8e0e33b5825d.mesh"
+
+[deps]
+
+files=["res://.godot/imported/trunk.obj-cdcb9e7c4ead623dca2d8e0e33b5825d.mesh"]
+
+source_file="res://robots/unitree_go2/meshes/trunk.obj"
+dest_files=["res://.godot/imported/trunk.obj-cdcb9e7c4ead623dca2d8e0e33b5825d.mesh", "res://.godot/imported/trunk.obj-cdcb9e7c4ead623dca2d8e0e33b5825d.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false
