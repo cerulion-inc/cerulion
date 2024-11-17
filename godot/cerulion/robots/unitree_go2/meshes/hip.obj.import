@@ -1,0 +1,22 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://bt60c7h2d4pws"
+path="res://.godot/imported/hip.obj-590245cd2c3871cfc89e34bdf40d2cea.mesh"
+
+[deps]
+
+files=["res://.godot/imported/hip.obj-590245cd2c3871cfc89e34bdf40d2cea.mesh"]
+
+source_file="res://robots/unitree_go2/meshes/hip.obj"
+dest_files=["res://.godot/imported/hip.obj-590245cd2c3871cfc89e34bdf40d2cea.mesh", "res://.godot/imported/hip.obj-590245cd2c3871cfc89e34bdf40d2cea.mesh"]
+
+[params]
+
+generate_tangents=true
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+optimize_mesh=true
+force_disable_mesh_compression=false
