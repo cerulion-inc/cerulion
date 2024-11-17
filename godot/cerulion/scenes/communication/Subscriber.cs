@@ -35,9 +35,9 @@ public partial class Subscriber : Control
 	public override void _PhysicsProcess(double delta) {
 		if (robot_loaded) {
 			float [] test = {0, 0, 0, 1, (float)Mathf.Sin(time), (float)Mathf.Cos(time), 1};
-			joint_dict["base"] = test;
-			joint_dict["FL_hip"] = (float) Mathf.Sin(time);
-			joint_dict["FL_thigh"] = Mathf.Sin(time);
+			//joint_dict["base"] = test;
+			//joint_dict["FL_hip"] = (float) Mathf.Sin(time);
+			//joint_dict["FL_thigh"] = Mathf.Sin(time);
 			time += delta;
 			//GD.Print(joint_dict);
 		}
@@ -46,7 +46,7 @@ public partial class Subscriber : Control
 	internal class GodotSubscriber : LCM.LCM.LCMSubscriber {
 		public void MessageReceived(LCM.LCM.LCM lcm, string channel, LCM.LCM.LCMDataInputStream dins) {
 			if (channel == "JOINT_STATES") {
-				GD.Print("Joint state message received from LCM.");
+				//GD.Print("Joint state message received from LCM.");
 				unitree_lcm.joint_states_t msg = new unitree_lcm.joint_states_t(dins);
 				//! TODO: MODIFY THIS FOR MSG FORMAT FOR FLOATING BASE
 				//! TODO: PACK QUATERNION AS X Y Z W
@@ -75,6 +75,10 @@ public partial class Subscriber : Control
 				joint_dict["RR_hip"] = (float) msg.q_rear_right[0];
 				joint_dict["RR_thigh"] = (float) msg.q_rear_right[1];
 				joint_dict["RR_calf"] = (float) msg.q_rear_right[2];
+			} else if (channel == "BASE_STATE") {
+				unitree_lcm.base_state_t msg = new unitree_lcm.base_state_t(dins);
+				float[] base_state = {(float) msg.orientation[0], (float) msg.orientation[1], (float) msg.orientation[2], (float) msg.orientation[3], (float) msg.position[0], (float) msg.position[1], (float) msg.position[2]};
+				joint_dict["base"] = base_state;
 			}
 		}
 	}
