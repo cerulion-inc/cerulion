@@ -145,6 +145,8 @@ func parseURDF(urdf_file):
 					var mtl_filepath = ""
 					if (FileAccess.file_exists(mesh_filepath.trim_suffix(".obj") + ".mtl")):
 						mtl_filepath = mesh_filepath.trim_suffix(".obj") + ".mtl"
+					else:
+						print("No .mtl file found for ", mesh_filepath)
 					var obj:Mesh = ObjParse.load_obj(mesh_filepath, mtl_filepath)
 					RobotParameters.links[current_link][current_attribute][current_subattribute]["obj"] \
 						= obj
