@@ -722,12 +722,12 @@ trace stream's FORMAT and the run's COORDINATION contract.
 "recorded before the stamp existed".** That is what makes the inferred reading safe to print as a
 fact rather than a hedge.
 
-**Recording a `free_run` bag is an opt-in.** A multi-process
-`graph run --record` under `CERULION_EXECUTION_MODE=free_run` stamps `free_run`
-and records each rank's own wall-faithful timeline from the shared epoch; the
-reader re-executes such a bag PER RANK. Without the variable every bag
-`graph run --record` produces stamps `lockstep`, and that is the default.
-The variable is an execution-mode switch rather than a tuning knob; see
+**A `free_run` bag is what a multi-process `graph run --record` produces by
+default.** The reader re-executes such a bag PER RANK. A `lockstep` stamp means
+one of two things: the run opted out with `CERULION_EXECUTION_MODE=lockstep`,
+or it was a MONOLITH recording (`--single-process --record`; a monolith has no
+ranks); the `lockstep` row above covers both. The variable is an execution-mode
+switch rather than a tuning knob; see
 [`docs/multi_process.md`](multi_process.md) for the contract. All four rows
 describe current behaviour.
 
