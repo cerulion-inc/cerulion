@@ -19315,9 +19315,9 @@ impl<'a> ReadLogVerifier<'a> {
         // WHOLE-BAG `trace_has_read_outcomes`, so a stageless rank still reaches
         // this walk), which would make every single row `extra`.
         //
-        // Reachable today, not latent: `CERULION_EXECUTION_MODE=free_run` stamps
-        // the coordination key and bagd writes `read_log_capacities` whenever any
-        // rows exist.
+        // Reachable today, not latent: every multi-process run stamps the
+        // coordination key (free-run by default) and bagd
+        // writes `read_log_capacities` whenever any rows exist.
         //
         // THE SCOPE IS `rank_tables`, NOT the live stage set. Filtering by "nodes
         // this pass has stages for" would also swallow the case the check exists

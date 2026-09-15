@@ -10,9 +10,12 @@
 //!
 //! # The GLOBAL-levels crux
 //!
-//! The cross-process barrier rendezvouses every worker at every
+//! The cross-process barrier (what the `CERULION_EXECUTION_MODE=lockstep`
+//! opt-out selects; a free-run deployment, the default, maps none)
+//! rendezvouses every worker at every
 //! GLOBAL DAG-level boundary so all processes advance in lockstep (Principle
-//! #7: replay = live). Each worker therefore carries a `global_level_map`
+//! #7: replay = live). The GLOBAL levelization below is planned the same way
+//! under either mode. Each worker therefore carries a `global_level_map`
 //! defined against the ONE global levelization of the FULL graph — NOT a
 //! per-group re-levelization. The planner takes that global [`Levels`] and
 //! feeds it straight to [`derive_process_groups`], which mints each group's
@@ -102,15 +105,21 @@ pub struct WedgePagePlan {
 /// How the workers of ONE multi-process deployment coordinate
 /// their steps — the plan-field SWITCH the worker branches on.
 ///
-/// `Lockstep` is the shipped shape: every rank advances the same handed
-/// quantum per step behind the shared `MappedBarrier`. `FreeRun` is the
-/// flow-mode substrate: no barrier, no handed GATING quantum (the
-/// plan still carries `handed_quantum_ns`; the capture-plane cadence reads it
-/// on both routes), each rank on its own wall-following clock.
-/// The DEFAULT is `Lockstep` on
-/// every route; a `FreeRun` plan exists only when the
-/// supervisor was OPTED IN (`graph_cmd::resolve_run_execution_mode`), so
-/// nothing a user runs today changes behaviour.
+/// `Lockstep`: every rank advances the same handed quantum per step behind
+/// the shared `MappedBarrier`. `FreeRun`: the flow-mode substrate, no
+/// barrier, no handed GATING quantum (the plan still carries
+/// `handed_quantum_ns`; the capture-plane cadence reads it on both routes),
+/// each rank on its own wall-following clock. A SUPERVISOR run is `FreeRun`
+/// by default and `Lockstep` only under the `CERULION_EXECUTION_MODE=lockstep`
+/// opt-out (`graph_cmd::resolve_run_execution_mode`, the ONE decision point,
+/// which the supervisor stamps into every plan).
+///
+/// The `Default` derive is NOT that run default: it is the reading of an
+/// UNSTAMPED plan field (`WorkerPlan::execution_mode`'s `#[serde(default)]`);
+/// a plan the supervisor never stamped reads as the conservative barrier
+/// worker rather than as a free-running one, and the stamping itself is
+/// pinned (`stamp_execution_mode_writes_the_resolved_mode_into_every_worker`
+/// plus the mp e2e).
 ///
 /// `#[serde(rename_all = "snake_case")]` so the plan file and the bag's
 /// `coordination` stamp spell the two modes the same way (`lockstep` /
@@ -121,9 +130,10 @@ pub struct WedgePagePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
-    /// Barrier lockstep (the shipped default): a shared `MappedBarrier`
-    /// gates every global-level advance and every rank's gating clock
-    /// advances by the same handed quantum.
+    /// Barrier lockstep (the `CERULION_EXECUTION_MODE=lockstep` opt-out, and
+    /// the unstamped plan-file reading): a shared `MappedBarrier` gates every
+    /// global-level advance and every rank's gating clock advances by the
+    /// same handed quantum.
     #[default]
     Lockstep,
     /// Free-run: no barrier, no handed GATING quantum — the non-record worker
@@ -635,7 +645,10 @@ pub struct WorkerPlan {
     pub mid_level_barrier: Vec<bool>,
     /// The GLOBAL gating quantum (ns) — the tightest timing over the FULL graph,
     /// floored at [`HANDED_QUANTUM_FLOOR_NS`]. IDENTICAL across every worker
-    /// (the whole point: all workers advance their gating clocks in lockstep).
+    /// (the whole point: under the `CERULION_EXECUTION_MODE=lockstep` opt-out
+    /// all workers advance their gating clocks in lockstep; a free-run worker,
+    /// the default, follows the wall instead and reads this field for nothing
+    /// but its build line).
     pub handed_quantum_ns: u64,
     /// The iceoryx2 node name for this worker: `cerulion_{graph}_{group}`.
     /// Distinguishes co-resident workers of the same graph on one SHM root.
@@ -756,11 +769,13 @@ pub struct WorkerPlan {
     /// [`monitor_wait`](Self::monitor_wait) carries a resolved `graph run`
     /// decision; the pure planner leaves the default.
     ///
-    /// `#[serde(default)]` = `Lockstep`, and that default is the whole
-    /// mergeability argument: an OLD plan file, a plan from a supervisor that
-    /// never stamped it, and every un-opted-in run all read as the shipped
-    /// barrier-lockstep worker — the `mid_level_barrier` additive-field
-    /// precedent. The worker resolves this field ONCE into its
+    /// `#[serde(default)]` = `Lockstep` is the reading of an UNSTAMPED field:
+    /// an OLD plan file, or a plan from a supervisor that never stamped it,
+    /// reads as the conservative barrier worker (the `mid_level_barrier`
+    /// additive-field precedent). It is NOT the run default:
+    /// every supervisor run is resolved `FreeRun` unless
+    /// `CERULION_EXECUTION_MODE=lockstep` opts out, and that resolved value is
+    /// what lands here. The worker resolves this field ONCE into its
     /// `WorkerBuildPath` and branches on that at six places (clock mint,
     /// barrier open, build call, recording configuration, epoch arming, cohort
     /// leave); the supervisor branches on it too (no shared barrier is created
@@ -1985,7 +2000,9 @@ pub fn plan_deployment(
             cap_disabled: false,
             // The supervisor stamps the RESOLVED mode post-plan
             // (`graph_cmd::stamp_execution_mode`); the pure planner leaves the
-            // default, which is the shipped barrier-lockstep worker.
+            // unstamped plan-file reading (`Lockstep`); the RUN default
+            // (free-run) is the resolver's to decide, never this
+            // planner's.
             execution_mode: ExecutionMode::default(),
             // Harvesting per-topic requirements needs the IMPURE
             // full-graph build, so the pure planner leaves this empty; the
