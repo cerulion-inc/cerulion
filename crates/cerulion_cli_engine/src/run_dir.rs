@@ -542,14 +542,15 @@ pub enum GatingClock {
     /// The scheduler advances a CONTROLLED clock by the MEASURED WALL elapsed
     /// (`live_gating_quantum = Some(_)` with `gating_follows_wall`) — today's
     /// `--single-process --record` discipline, and every rank of
-    /// a FREE-RUN `--record` deployment, from a shared epoch. Jitter is
-    /// preserved, but every boundary is still recorded and re-advanceable, so
-    /// it is resim-grade.
+    /// a FREE-RUN deployment that mints trace rings (the always-on rings of a
+    /// plain run, or `--record`), from a shared epoch. Jitter is preserved,
+    /// but every boundary is still recorded and re-advanceable, so it is
+    /// resim-grade, which is what a Flashback capture of such a rank needs.
     RecordedWall,
     /// The scheduler does NOT advance the gating clock; every boundary is a
     /// CLOCK READING (`live_gating_quantum = None`, `ClockInner::Real`). Covers
     /// both `RealClock` (`--single-process`, `ros2 attach`, `node run`, and
-    /// every rank of a non-record FREE-RUN deployment) and
+    /// every rank of a `--no-rings` FREE-RUN deployment) and
     /// `ExternalClock`, which is read-only in the same sense — the scheduler
     /// never advances it either.
     Wall,
@@ -583,24 +584,27 @@ impl GatingClock {
         }
     }
 
-    /// PURE: classify a run's gating arm from the three deployment facts known
-    /// at launch plus the resolved execution mode.
+    /// PURE: classify a run's gating arm from the deployment facts known at
+    /// launch plus the resolved execution mode.
     ///
     /// One function so the CLI cannot spell the classification twice and drift:
-    /// the same three facts already decide the deployment (the mode is resolved
-    /// from that decision plus the opt-in), and the mapping is exactly the
+    /// the same facts already decide the deployment (the mode is resolved from
+    /// that decision plus the opt-in), and the mapping is exactly the
     /// `live_step` match plus the polled shape.
     ///
     /// * a SUPERVISOR run under the default LOCKSTEP execution mode builds
     ///   every worker through `build_live_deterministic_with_manager_and_barrier`,
     ///   which hands a quantum ⇒ [`Quantum`](Self::Quantum); under the
     ///   `CERULION_EXECUTION_MODE=free_run` opt-in every rank is
-    ///   on its own wall-faithful clock — a RECORDING free-run rank follows the
-    ///   wall on a controlled clock from a shared epoch ⇒
-    ///   [`RecordedWall`](Self::RecordedWall), a live one is on the read-only
-    ///   `RealClock` ⇒ [`Wall`](Self::Wall) (the mode is threaded from the ONE
-    ///   resolution `graph run` makes, so this label and the run's
-    ///   `coordination` stamp cannot disagree);
+    ///   on its own wall-faithful clock: a TRACED free-run rank (`traced`: the
+    ///   run mints its scheduler-trace rings, i.e. anything but `--no-rings`)
+    ///   follows the wall on a controlled clock from a shared epoch ⇒
+    ///   [`RecordedWall`](Self::RecordedWall), a ring-less one is on the
+    ///   read-only `RealClock` ⇒ [`Wall`](Self::Wall) (the mode is threaded
+    ///   from the ONE resolution `graph run` makes, so this label and the run's
+    ///   `coordination` stamp cannot disagree; the worker keys its
+    ///   clock discipline on the same predicate, so the label describes the
+    ///   clock the rank really ran on);
     /// * a `--time-source virtual` monolith runs the polled loop and never
     ///   reaches `live_step` ⇒ [`Polled`](Self::Polled);
     /// * a RECORDING monolith is configured `gating_follows_wall` on a
@@ -617,12 +621,13 @@ impl GatingClock {
         supervisor: bool,
         virtual_time_source: bool,
         records: bool,
+        traced: bool,
         execution_mode: crate::multiprocess::ExecutionMode,
     ) -> Self {
         if supervisor {
             match execution_mode {
                 crate::multiprocess::ExecutionMode::Lockstep => GatingClock::Quantum,
-                crate::multiprocess::ExecutionMode::FreeRun if records => GatingClock::RecordedWall,
+                crate::multiprocess::ExecutionMode::FreeRun if traced => GatingClock::RecordedWall,
                 crate::multiprocess::ExecutionMode::FreeRun => GatingClock::Wall,
             }
         } else if virtual_time_source {
@@ -1900,6 +1905,7 @@ mod tests {
                 groups,
                 false,
                 false,
+                groups,
                 crate::multiprocess::ExecutionMode::Lockstep,
             ),
             graph_yaml: graph_yaml.to_string(),
@@ -2556,40 +2562,60 @@ mod tests {
     #[test]
     fn gating_classification_covers_every_run_shape() {
         use crate::multiprocess::ExecutionMode::{FreeRun, Lockstep};
-        // (supervisor, virtual, records, execution_mode) -> arm
+        // (supervisor, virtual, records, traced, execution_mode) -> arm
         let table = [
             // A LOCKSTEP supervisor run hands every worker a quantum, whatever
             // else is true — including under `--record`, which is the
             // multi-process recording shape.
-            ((true, false, false, Lockstep), GatingClock::Quantum),
-            ((true, false, true, Lockstep), GatingClock::Quantum),
+            ((true, false, false, true, Lockstep), GatingClock::Quantum),
+            ((true, false, true, true, Lockstep), GatingClock::Quantum),
+            ((true, false, false, false, Lockstep), GatingClock::Quantum),
             // A FREE-RUN supervisor run puts every rank on its own
-            // wall-faithful clock — recording ranks follow the wall on a
-            // controlled clock from a shared epoch, live ranks read the
-            // RealClock. A classifier that took no mode would label BOTH `quantum`
-            // while the bag said `free_run`.
-            ((true, false, true, FreeRun), GatingClock::RecordedWall),
-            ((true, false, false, FreeRun), GatingClock::Wall),
+            // wall-faithful clock. The arm follows `traced`, not `records`: a
+            // TRACED rank (the plain run's always-on rings, or `--record`)
+            // follows the wall on a controlled clock from a shared epoch; only
+            // a `--no-rings` rank reads the RealClock. A classifier that took no
+            // mode would label BOTH `quantum` while the bag said `free_run`, and
+            // one keyed on `records` would label the plain run `wall` while its
+            // captures claimed `resimmable: true` on a clock nothing could
+            // re-advance.
+            (
+                (true, false, true, true, FreeRun),
+                GatingClock::RecordedWall,
+            ),
+            // THE FLASHBACK ROW: a plain free-run `graph run`, no `--record`.
+            (
+                (true, false, false, true, FreeRun),
+                GatingClock::RecordedWall,
+            ),
+            ((true, false, false, false, FreeRun), GatingClock::Wall),
             // A virtual monolith never enters the live loop at all.
-            ((false, true, false, Lockstep), GatingClock::Polled),
+            ((false, true, false, false, Lockstep), GatingClock::Polled),
             // A recording monolith runs the controlled-clock-follows-wall
-            // discipline: still recorded, still re-advanceable.
-            ((false, false, true, Lockstep), GatingClock::RecordedWall),
+            // discipline: still recorded, still re-advanceable. A monolith
+            // mints no trace ring, so `traced` is false on every monolith row.
+            (
+                (false, false, true, false, Lockstep),
+                GatingClock::RecordedWall,
+            ),
             // Everything else is the read-only arm — the plain `graph run
             // --single-process`, `ros2 attach` and `node run` shapes, and the
             // external clock, which the scheduler does not advance either.
-            ((false, false, false, Lockstep), GatingClock::Wall),
+            ((false, false, false, false, Lockstep), GatingClock::Wall),
             // The mode is a SUPERVISOR fact: `resolve_run_execution_mode` never
             // yields FreeRun on a monolith, and the classifier ignores it there
             // rather than inventing a fifth shape.
-            ((false, false, true, FreeRun), GatingClock::RecordedWall),
-            ((false, false, false, FreeRun), GatingClock::Wall),
+            (
+                (false, false, true, false, FreeRun),
+                GatingClock::RecordedWall,
+            ),
+            ((false, false, false, false, FreeRun), GatingClock::Wall),
         ];
-        for ((sup, virt, rec, mode), want) in table {
+        for ((sup, virt, rec, traced, mode), want) in table {
             assert_eq!(
-                GatingClock::classify(sup, virt, rec, mode),
+                GatingClock::classify(sup, virt, rec, traced, mode),
                 want,
-                "supervisor={sup} virtual={virt} records={rec} mode={mode:?}"
+                "supervisor={sup} virtual={virt} records={rec} traced={traced} mode={mode:?}"
             );
         }
         // The supervisor arm OUTRANKS both others — a partitioned LOCKSTEP
@@ -2597,7 +2623,7 @@ mod tests {
         // separately because it is the one precedence a reordering would
         // silently invert.
         assert_eq!(
-            GatingClock::classify(true, true, true, Lockstep),
+            GatingClock::classify(true, true, true, true, Lockstep),
             GatingClock::Quantum
         );
     }
