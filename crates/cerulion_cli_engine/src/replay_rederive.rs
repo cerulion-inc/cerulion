@@ -2144,7 +2144,6 @@ fn is_sync_head_record(read: &RecordedRead, trust: RoleTrust) -> bool {
 // value, never a positional bool pair (`RoleTrust` is a two-state enum
 // precisely so a swapped call site cannot compile).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn verify_sync(
     node: &NodeDecl,
     steps: &[RecordedStep],
