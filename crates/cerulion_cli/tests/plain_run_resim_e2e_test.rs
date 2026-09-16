@@ -580,20 +580,33 @@ fn assert_frames_match_the_fixture_oracle(bag: &Path, prefix: &str, context: &st
                  constant payload above still matches. Got {seqs:?}"
             );
         }
-        // The gating-clock stamp: nonzero and monotone. A worker's clock advances
-        // by a fixed LOGICAL quantum per step, so equal stamps on two
-        // frames of one topic are legal only if the node fired twice in a step,
-        // which a `period_ms` node cannot — hence STRICT here too.
+        // The gating-clock stamp: nonzero, never decreasing, and advancing over
+        // the capture. NOT strict pair-wise: a free-run rank's controlled clock
+        // advances ONCE per step by the measured wall elapsed and is constant
+        // within the step, so a wall-delayed step fires a `period_ms` node for
+        // every period it owes and stamps each of those frames with the SAME
+        // boundary target (measured on one Linux capture: two 0 ns deltas in
+        // 345 ticker frames, each right after a 101 ms / 110 ms step), which is
+        // exactly what a resim re-advances to. Under lockstep the quantum is
+        // the tightest period, so the burst cannot occur and the stamps are
+        // strict there by construction; the STRICT sequence check above is
+        // what catches a frame carried twice or re-stamped, in either mode.
         assert!(
             stamps.first().is_some_and(|s| *s > 0),
             "{context}: {topic} frames carry a real loan-time stamp, not a default"
         );
         for pair in stamps.windows(2) {
             assert!(
-                pair[1] > pair[0],
-                "{context}: {topic} wire timestamps advance with the gating clock. Got {stamps:?}"
+                pair[1] >= pair[0],
+                "{context}: {topic} wire timestamps never run backwards against the gating \
+                 clock. Got {stamps:?}"
             );
         }
+        assert!(
+            stamps.len() < 2 || stamps[stamps.len() - 1] > stamps[0],
+            "{context}: {topic} wire timestamps advance with the gating clock over the \
+             capture. Got {stamps:?}"
+        );
     }
     graph_frames
 }
