@@ -660,25 +660,35 @@ pub enum ReplayError {
     },
 
     /// A `coordination: free_run` bag whose recording begins
-    /// MID-RUN (its first recorded STEP_BOUNDARY is not step 0). Exit 2.
+    /// MID-RUN (its first recorded STEP_BOUNDARY is not step 0) and holds MORE
+    /// THAN ONE worker rank. Exit 2.
     ///
-    /// Resume anchors on the ONE first recorded boundary and splits
-    /// each topic's pre-anchor prefix against that single value — three
-    /// assumptions a free-run recording abolishes. Refused rather
-    /// than silently mis-anchored; per-rank anchors are not implemented.
+    /// Resume anchors on the ONE first recorded boundary, places the
+    /// clock off that single value and splits each topic's pre-anchor prefix
+    /// against it: three assumptions that hold for exactly one worker rank
+    /// (rank 0's first boundary IS the first boundary, one clock, one stamp
+    /// domain) and that a free-run recording with several ranks abolishes.
+    /// A one-rank free-run bag takes the ordinary resume; the multi-rank
+    /// shape is refused rather than silently mis-anchored, and per-rank
+    /// anchors are not implemented.
     #[error(
-        "this bag is stamped `coordination: free_run` and its recording begins MID-RUN (its \
-         first recorded STEP_BOUNDARY is step {first_step}, not step 0). A mid-run resume \
-         anchors on the ONE first recorded boundary and places the clock off that single \
-         value — which a free-run recording abolishes: its ranks keep independent boundary \
-         streams, so there is no single first boundary, k clocks cannot be placed off one \
-         value, and a frame stamp compared against it crosses per-rank clock domains. \
-         Per-rank resume anchors are not supported yet; until they land, replay from the \
-         start of this bag"
+        "this bag is stamped `coordination: free_run`, its recording begins MID-RUN (its \
+         first recorded STEP_BOUNDARY is step {first_step}, not step 0), and it holds \
+         {ranks} worker ranks. A mid-run resume anchors on the ONE first recorded boundary \
+         and places the clock off that single value, which holds for exactly one worker \
+         rank, and a free-run recording with several ranks abolishes it: each rank keeps \
+         its own boundary stream and its own clock, so there is no single first boundary, \
+         {ranks} clocks cannot be placed off one value, and a frame stamp compared against \
+         it crosses clock domains. Per-rank resume anchors are not supported yet; until \
+         they land, re-execute this bag from its start, or capture a deployment whose \
+         graph runs in ONE process group (its mid-run captures resume)"
     )]
     FreeRunResumeUnsupported {
         /// The recording's first recorded (rank-0) STEP_BOUNDARY step.
         first_step: u64,
+        /// The worker trace-manifest ranks the recording holds (always > 1
+        /// here; a one-rank recording is admitted).
+        ranks: usize,
     },
 
     /// An unexpected internal failure (panic, transport, scheduler). Exit 5.
@@ -2586,7 +2596,13 @@ mod tests {
             // replay-grade FOR THIS BINARY) — never 1 (a data violation) and
             // never 6 (a schedule divergence), which is what keeps the
             // 3 > 6 > 1 precedence untouched.
-            (ReplayError::FreeRunResumeUnsupported { first_step: 12 }, 2),
+            (
+                ReplayError::FreeRunResumeUnsupported {
+                    first_step: 12,
+                    ranks: 2,
+                },
+                2,
+            ),
             (
                 ReplayError::ToleranceInvalid {
                     reason: "bad".to_string(),
