@@ -53,7 +53,7 @@
 4 crates/cerulion_cli_engine/src/device_binding.rs
 6 crates/cerulion_cli_engine/src/discovery_ladder.rs
 18 crates/cerulion_cli_engine/src/flashback_cmd.rs
-431 crates/cerulion_cli_engine/src/graph_cmd.rs
+428 crates/cerulion_cli_engine/src/graph_cmd.rs
 1 crates/cerulion_cli_engine/src/hostname_peers.rs
 7 crates/cerulion_cli_engine/src/ipc_cleanup.rs
 4 crates/cerulion_cli_engine/src/local_harvest.rs
