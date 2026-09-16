@@ -3540,6 +3540,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 coordination,
                 roles_stamped,
                 kind_width,
+                catchup_onset,
                 trace: &trace,
                 recorded_messages: &recorded_messages,
                 rank_tables: &rank_tables,
@@ -6925,6 +6926,10 @@ struct PassInputs<'a> {
     /// because they answer different questions and disagree on exactly the bag
     /// that has no recorder attachment — see [`KindFieldWidth`].
     kind_width: KindFieldWidth,
+    /// The armed capture plane the recording ran under, if any: the
+    /// SAME onset `attach_replay_catchup_arm` hands this pass's scheduler, so
+    /// the re-derivation verifier runs the one clamp the replay runs.
+    catchup_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     trace: &'a RecordedTrace,
     recorded_messages: &'a RecordedMessages,
     rank_tables: &'a [Vec<Arc<str>>],
@@ -9114,9 +9119,16 @@ impl PassVerification {
 /// [`cerulion_core::graph::node::MacroPolicy`] carries no catch-up cap, so the
 /// DECLARED side genuinely does not state one and `effective_max_catchup`'s
 /// default is the same value the live scheduler would have used.
+///
+/// `arm_onset` is the recording's own armed plane (`read_state_arm`), the same
+/// onset `attach_replay_catchup_arm` hands the replay's scheduler, so the
+/// verifier and the replay run ONE clamp (the Period rule derives the cap per
+/// step from it, exactly as the live scheduler does). A `None` minted here
+/// would run the re-derivation unclamped against a clamped recording.
 fn node_trigger_decl(
     info: &cerulion_core::graph::NodeInfo,
     node_inputs: &[cerulion_core::graph::config::InputDef],
+    arm_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
 ) -> replay_rederive::TriggerDecl {
     use cerulion_core::graph::node::MacroPolicy;
     // Trigger-marked ∩ WIRED, from the ONE shared rule the
@@ -9132,7 +9144,7 @@ fn node_trigger_decl(
         Some(MacroPolicy::Period { period_ms }) => replay_rederive::TriggerDecl::Period {
             interval_ns: period_ms.saturating_mul(1_000_000),
             max_catchup: None,
-            catchup_cap_override: None,
+            arm_onset,
         },
         Some(MacroPolicy::Sync { window_ms }) => replay_rederive::TriggerDecl::Sync {
             window_ns: Some(window_ms.saturating_mul(1_000_000)),
@@ -9337,6 +9349,9 @@ fn prepare_pass_verification(
     // And, separately, how wide its kind field is
     // ([`KindFieldWidth`] — absent is NOT the archived arm).
     kind_width: KindFieldWidth,
+    // The armed capture plane the recording ran under, handed to the
+    // Period rule so its per-step clamp mirrors the scheduler's.
+    catchup_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, _rims) = match load_recorded_input_tables(trace) {
         Ok(v) => v,
@@ -10045,7 +10060,7 @@ fn prepare_pass_verification(
                 .map_or(&[], |n| n.inputs.as_slice());
             Some(replay_rederive::NodeDecl {
                 node_id: id.clone(),
-                trigger: node_trigger_decl(info, wired),
+                trigger: node_trigger_decl(info, wired, catchup_onset),
                 throttle_ns: info.throttle_ms().map(|ms| ms.saturating_mul(1_000_000)),
                 has_non_trigger_inputs: node_has_non_trigger_inputs(info, wired),
                 trigger_input_capacities: trigger_input_capacities(
@@ -10336,6 +10351,7 @@ fn run_rank_pass(
             &inject_topics,
             pass.roles_stamped,
             pass.kind_width,
+            pass.catchup_onset,
         )?
     };
     // The injectors are opened BEFORE the capture partitionings,

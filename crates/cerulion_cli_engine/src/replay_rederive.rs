@@ -92,7 +92,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
-use cerulion_core::scheduler::catchup_clamp::effective_max_catchup;
+use cerulion_core::scheduler::catchup_clamp::{derive_catchup_cap_override, effective_max_catchup};
 
 use crate::replay_engine::DivergenceClass;
 
@@ -336,10 +336,25 @@ pub enum TriggerDecl {
         interval_ns: u64,
         /// The declared `max_catchup`, verbatim (`None` = undeclared).
         max_catchup: Option<u32>,
-        /// The catch-up clamp override in force for this run, if any
-        /// — passed straight to
-        /// [`effective_max_catchup`], never re-implemented.
-        catchup_cap_override: Option<u32>,
+        /// The catch-up clamp's armed plane the recording ran under, if any:
+        /// the SAME onset the replay hands its own scheduler. The per-step
+        /// clamp is derived from it exactly as the live scheduler derives it
+        /// ([`derive_catchup_cap_override`] at each step, then
+        /// [`effective_max_catchup`]), never re-implemented and never
+        /// flattened to one number: the clamp is in force only from the
+        /// onset's first anchor step, and a from-start replay crosses that
+        /// step.
+        ///
+        /// A per-run `Option<u32>` here would run the re-derivation UNCLAMPED
+        /// while the recording and the replay both ran the clamp. Under
+        /// lockstep the two never disagree (the quantum is the tightest
+        /// period, so a Period node is never owed more than one fire per
+        /// step); under a free-run rank's wall-following clock a wall stall
+        /// owes several, the scheduler fires `ARMED_MAX_CATCHUP_DEFAULT` of
+        /// them, and an unclamped verifier expects them all (measured on one
+        /// Linux capture: `re-derived 6 fire(s) ... recorded 4` on a 300 ms
+        /// stall, exit 6 against a candidate that did nothing wrong).
+        arm_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     },
     /// `sync_window_ms = N` (`window_ns = Some`) or `unbounded_sync`
     /// (`window_ns = None`) over the node's `#[input(trigger)]` ports.
@@ -1396,13 +1411,14 @@ pub(crate) fn verify(
                 TriggerDecl::Period {
                     interval_ns,
                     max_catchup,
-                    catchup_cap_override,
+                    arm_onset,
                 } => {
                     verify_period(
                         node,
                         steps,
                         *interval_ns,
-                        effective_max_catchup(*max_catchup, *catchup_cap_override),
+                        *max_catchup,
+                        *arm_onset,
                         block_gated,
                         &mut report,
                     );
@@ -1587,7 +1603,8 @@ fn verify_period(
     node: &NodeDecl,
     steps: &[RecordedStep],
     interval_ns: u64,
-    cap: u32,
+    max_catchup: Option<u32>,
+    arm_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     block_gated: bool,
     report: &mut RederivationReport,
 ) {
@@ -1633,6 +1650,12 @@ fn verify_period(
         .expect("the anchor step contains a fire of this node (position() found one)");
 
     for step in &steps[anchor_idx..] {
+        // The clamp the live scheduler ran under at THIS step: the
+        // armed plane's cap from its onset step on, the declared cap always.
+        let cap = effective_max_catchup(
+            max_catchup,
+            arm_onset.and_then(|onset| derive_catchup_cap_override(onset, step.step)),
+        );
         let derived = period_step(next_fire_ns, step.clock_ns, interval_ns, cap);
         // Gated on the CAP alone, never on `fire_count > 0`: a step where the
         // re-derivation expects NO fire is exactly the step a spurious recorded
@@ -3070,7 +3093,20 @@ mod tests {
         TriggerDecl::Period {
             interval_ns,
             max_catchup,
-            catchup_cap_override: None,
+            arm_onset: None,
+        }
+    }
+
+    /// A Period node recorded under an ARMED capture plane whose first anchor
+    /// is due at `first_anchor_step`; the clamp is in force from that step on.
+    fn period_armed(interval_ns: u64, first_anchor_step: u64) -> TriggerDecl {
+        TriggerDecl::Period {
+            interval_ns,
+            max_catchup: None,
+            arm_onset: Some(cerulion_core::scheduler::catchup_clamp::ArmOnset {
+                armed: true,
+                first_anchor_step,
+            }),
         }
     }
 
@@ -3432,6 +3468,89 @@ mod tests {
         assert_eq!(f.divergence_class(), DivergenceClass::FireSchedule);
         // The rendering carries the ONE vocabulary, never a bare exit code.
         assert!(f.to_string().contains("fire-schedule divergence"), "{f}");
+    }
+
+    /// A wall stall under an ARMED plane. The wall-following clock jumps
+    /// 300 ms across one step, six deadlines are owed, and the live scheduler
+    /// fires `ARMED_MAX_CATCHUP_DEFAULT` (4) of them then skips its deadline
+    /// past the stall, so the recording holds four fires and a replay running
+    /// the same clamp produces four. The verifier must expect FOUR too.
+    ///
+    /// Three arms in one body, against a hand oracle: armed from before the
+    /// stall (clean), not armed at all (the unclamped answer: `re-derived 6,
+    /// recorded 4`, exit 6 against a candidate that did nothing wrong), and
+    /// armed only AFTER the stall step (the clamp was not yet in force, so the
+    /// same six are expected and the finding stands). The third arm is what
+    /// forbids flattening the onset to one per-run cap.
+    #[test]
+    fn a_period_stall_under_an_armed_plane_expects_the_clamped_fire_count() {
+        use cerulion_core::scheduler::catchup_clamp::ARMED_MAX_CATCHUP_DEFAULT;
+        let interval = 50 * MS;
+        assert_eq!(
+            ARMED_MAX_CATCHUP_DEFAULT, 4,
+            "the oracle below is written for a cap of 4"
+        );
+        // Steps 0 and 1 tick at the period; step 2 arrives 300 ms after step 1
+        // (owed: 100, 150, 200, 250, 300, 350 ms) and the clamp fired the first
+        // four; step 3 is back on the period, at the skipped-ahead deadline.
+        let steps = vec![
+            step(0, EPOCH, vec![fire("ticker", EPOCH)]),
+            step(1, EPOCH + interval, vec![fire("ticker", EPOCH + interval)]),
+            step(
+                2,
+                EPOCH + 7 * interval,
+                (2..6)
+                    .map(|k| fire("ticker", EPOCH + k * interval))
+                    .collect(),
+            ),
+            step(
+                3,
+                EPOCH + 8 * interval,
+                vec![fire("ticker", EPOCH + 8 * interval)],
+            ),
+        ];
+
+        // Armed from the start: the clamp explains the four fires and the
+        // skipped-ahead fourth step alike.
+        let armed = vec![node("ticker", period_armed(interval, 0))];
+        let report = verify_unrestored(&armed, &steps, &[], RoleTrust::Declined);
+        assert!(
+            report.is_clean(),
+            "the verifier must run the clamp the recording ran: {:?}",
+            report.findings
+        );
+        assert!(report.stand_downs.is_empty());
+
+        // Not armed: the six owed fires are expected, and four is a divergence.
+        let unarmed = vec![node("ticker", period(interval, None))];
+        let report = verify_unrestored(&unarmed, &steps, &[], RoleTrust::Declined);
+        assert!(!report.is_clean());
+        let f = &report.findings[0];
+        assert_eq!(
+            (f.node_id.as_str(), f.step, f.decider),
+            ("ticker", 2, Decider::Period)
+        );
+        assert!(f.to_string().contains("6 fire(s)"), "{f}");
+        assert!(f.to_string().contains("4 fire(s)"), "{f}");
+
+        // Armed only from step 3: step 2 ran unclamped, so the same six are
+        // expected there: the onset is a per-step fact, not a per-run cap.
+        let late = vec![node("ticker", period_armed(interval, 3))];
+        let report = verify_unrestored(&late, &steps, &[], RoleTrust::Declined);
+        assert!(!report.is_clean());
+        assert_eq!(report.findings[0].step, 2);
+
+        // Armed AT the stall step: the onset step is the FIRST clamped step
+        // (`>=`, as the live `cadence_due` reads it), so step 2 is clamped and
+        // the recording is clean. This is the arm a cap derived from any
+        // constant step cannot pass together with the one above.
+        let at_onset = vec![node("ticker", period_armed(interval, 2))];
+        let report = verify_unrestored(&at_onset, &steps, &[], RoleTrust::Declined);
+        assert!(
+            report.is_clean(),
+            "the onset step is itself clamped: {:?}",
+            report.findings
+        );
     }
 
     /// A Period node the recording never fired has no phase to anchor on, and
