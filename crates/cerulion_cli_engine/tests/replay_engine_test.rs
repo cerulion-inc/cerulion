@@ -12573,10 +12573,16 @@ fn write_checkpoint_bag_with_capture(
         rec.graph_yaml.as_bytes(),
     )
     .unwrap();
-    let manifest = serde_json::to_vec(&serde_json::json!({
+    let mut manifest_json = serde_json::json!({
         "rank": 0, "generation": 0, "node_ids": rec.node_ids,
-    }))
-    .unwrap();
+    });
+    // The manifest's additive `inputs` key, exactly as `write_bag`
+    // writes it: present only when the recording captured the read log, so
+    // every pre-existing checkpoint bag's manifest is byte-identical.
+    if let Some(inputs) = &rec.input_names {
+        manifest_json["inputs"] = serde_json::json!(inputs);
+    }
+    let manifest = serde_json::to_vec(&manifest_json).unwrap();
     w.write_attachment(
         "__cerulion/trace_manifest_rank0.json",
         "application/json",
@@ -22465,6 +22471,158 @@ fn a_one_rank_free_run_resume_is_trace_driven_so_a_deadline_beyond_the_suffix_ca
             .any(|v| v.topic == CP_TOPIC && matches!(v.class, ViolationClass::MissingTopic)),
         "{:?}",
         twin.violations
+    );
+}
+
+/// [`cp3_reference`] with the read log captured: the kind-6
+/// records the re-derivation verifier folds, so a resumed FREE-RUN pass of
+/// this fixture is actually JUDGED rather than declined at the census.
+fn cp3_reference_with_read_log() -> Recording {
+    record_reference_impl(
+        cp3_yaml(),
+        cp3_factories,
+        &[],
+        &[DELTA_MS; CP3_STEPS],
+        16,
+        true,
+    )
+}
+
+/// [`write_cp3_bag`] with an EXPLICIT `coordination` stamp rendered by the
+/// production writer, the same framework-section anchor under the other contract.
+fn write_stamped_cp3_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    sync_state: BTreeMap<String, u64>,
+    coordination: replay_engine::CoordinationMode,
+) -> std::path::PathBuf {
+    let mid = make_mid_run(rec, CP3_FIRST_STEP);
+    let bag = dir.path().join(name);
+    let anchor_step = CP3_FIRST_STEP - 1;
+    let mut records = Vec::new();
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        anchor_step,
+        0,
+        &anchor_blob_with_framework(CHECKPOINT_SHAPE, Some(1), &period_section(60_000_000)),
+    ));
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        anchor_step,
+        1,
+        &anchor_blob_with_framework(CHECKPOINT_SHAPE, Some(0), &period_section(40_000_000)),
+    ));
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        anchor_step,
+        2,
+        &node_anchor_blob_with_framework(
+            &FusionNode::default(),
+            &NodeFrameworkState {
+                next_fire_ns: None,
+                pending_data_count: 0,
+                sync_input_timestamps: sync_state,
+                input_service: Some(BTreeMap::new()),
+            },
+        ),
+    ));
+    write_checkpoint_bag_with_capture(
+        &mid,
+        &bag,
+        &records,
+        Some(&coverage_for_nodes(&[
+            (CP3_A, 0),
+            (CP3_B, 1),
+            (CP3_FUSION, 2),
+        ])),
+        None,
+        None,
+        Some(production_recorder_json(coordination)),
+    );
+    bag
+}
+
+#[test]
+#[serial]
+fn a_one_rank_free_run_resume_with_restored_sync_heads_is_not_mis_judged() {
+    // THE `PassRestore` GATE, end to end. The framework-section fusion anchor restores
+    // `/a`'s alignment as an UNBACKED head, a real stamp with no kind-6
+    // record, since the read that filled it happened before the recording's
+    // first retained step, and under free-run the resumed pass is judged by
+    // the re-derivation verifier. A verifier folding only the records it can
+    // see judges a map MISSING that head, finds no transversal for the
+    // recorded fusion fire, and convicts a healthy resume on its first step
+    // (exit 6). With the restored heads seeded it is CLEAN.
+    //
+    // Two anti-vacuity claims ride along: the verifier RAN (no rank-level
+    // decline and no stand-down on the fusion node: a declined verifier
+    // finds nothing for the wrong reason), and the recorded frames are read
+    // against the same hand oracle the lockstep arms use.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = cp3_reference_with_read_log();
+    assert_cp3_reference_shape(&rec);
+    assert!(
+        rec.input_names.is_some()
+            && rec
+                .trace
+                .iter()
+                .any(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step >= CP3_FIRST_STEP),
+        "precondition: the recording carries kind-6 records inside the resumed slice"
+    );
+    let bag = write_stamped_cp3_bag(
+        &dir,
+        "cp3_sync_free_run.mcap",
+        &rec,
+        [(CP3_A_TOPIC.to_string(), 30_000_000u64)]
+            .into_iter()
+            .collect(),
+        replay_engine::CoordinationMode::FreeRun,
+    );
+
+    let outcome = replay(&bag, cp3_factories, None, None).expect("mid-run replay runs");
+    assert_eq!(
+        outcome.coordination,
+        replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::FreeRun,
+            inferred: false,
+        }
+    );
+    assert_eq!(outcome.ticks_replayed, CP3_STEPS - CP3_FIRST_STEP as usize);
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "the restored alignment must be judged as the scheduler held it: {:?}",
+        outcome.trace_divergence
+    );
+    let declined: Vec<&cerulion_cli_engine::replay_engine::RederivationNote> = outcome
+        .rederivation_notes
+        .iter()
+        .filter(|n| {
+            n.kind == cerulion_cli_engine::replay_engine::RederivationNoteKind::StandDown
+                && (n.subject == "rank 0" || n.subject == CP3_FUSION)
+        })
+        .collect();
+    assert!(
+        declined.is_empty(),
+        "the verifier must JUDGE the fusion node rather than decline it: {declined:?}"
+    );
+    let resume = outcome
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_eq!(
+        resume.framework_nodes,
+        vec![CP3_A.to_string(), CP3_B.to_string(), CP3_FUSION.to_string()]
+    );
+    // The framework-section residual is unchanged by the mode: the fired node has no /a
+    // data to publish from, and nothing ELSE diverges.
+    assert!(
+        outcome
+            .violations
+            .iter()
+            .all(|v| v.topic == CP3_FUSION_TOPIC),
+        "{:?}",
+        outcome.violations
     );
 }
 

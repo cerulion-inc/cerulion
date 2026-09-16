@@ -204,6 +204,52 @@ pub enum Decider {
     ReadLog,
 }
 
+/// What a RESUMED pass RESTORED into its scheduler before the first step this
+/// module judges: the `Sync` heads `Scheduler::restore_sync_input_timestamps`
+/// minted from the anchor's framework section, per node, per input.
+///
+/// The branch this guards is reachable: `resolve_resume` admits a
+/// `coordination: free_run` bag with exactly ONE worker rank into the ordinary
+/// resume, and that pass is judged HERE (the verifier runs on every free-run
+/// pass). A restored head is UNBACKED (a real stamp with no kind-6 record
+/// behind it, since the read that filled it happened before the recording's
+/// first retained step), so a Sync rule that folded only the records it can
+/// see would judge a map MISSING those members and convict a healthy resume on
+/// its first step (arm B: no transversal on an input whose head is real). The
+/// heads are therefore SEEDED as the matcher's own: the scheduler holds them
+/// (`HeadState::Filled { backed: false }` is still a filled head to
+/// `align()`), so the verifier starts from them.
+///
+/// A from-start pass restores nothing ([`Self::none`]) and every rule runs
+/// exactly as it does without a resume; the from-start oracles are pinned on
+/// that.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PassRestore {
+    /// `node id -> (input -> wire stamp)`: what the anchor's framework section
+    /// stated as each Sync node's `sync_input_timestamps` at the anchor step.
+    sync_heads: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+impl PassRestore {
+    /// A pass that restored nothing: every from-start pass, of either mode.
+    pub(crate) const fn none() -> Self {
+        Self {
+            sync_heads: BTreeMap::new(),
+        }
+    }
+
+    /// The heads a resume plan restored (`ResumePlan::sync_input_timestamps`,
+    /// exactly what `Scheduler::restore_sync_input_timestamps` was handed).
+    pub(crate) fn from_sync_heads(sync_heads: BTreeMap<String, BTreeMap<String, u64>>) -> Self {
+        Self { sync_heads }
+    }
+
+    /// The restored heads of ONE node, if the anchor stated any.
+    fn sync_heads_for(&self, node_id: &str) -> Option<&BTreeMap<String, u64>> {
+        self.sync_heads.get(node_id)
+    }
+}
+
 /// May THIS BAG's kind-6 role bits be read as roles?
 ///
 /// A named two-state rather than a `bool`, because every consumer in this
@@ -1297,20 +1343,18 @@ pub fn conservation_breach(published: u64, drained: u64, depth: u32) -> Option<C
 /// today's corpus and would silently start believing whatever a future writer
 /// put there.
 ///
-/// There is deliberately NO "this pass restored Sync heads from a
-/// resume" input. `Scheduler::restore_sync_input_timestamps` mints UNBACKED
-/// heads (a stamp with no kind-6 record), which WOULD make the Sync rule fold
-/// a map missing their members — but this verifier runs only on FREE-RUN
-/// passes (`run_rank_pass`'s `!lockstep` block) and resume is LOCKSTEP-only
-/// (`resolve_resume` refuses a mid-run free-run bag with
-/// `FreeRunResumeUnsupported`), so no pass this fn judges ever holds a restored
-/// head. A `PassRestore` gate would pin a branch no bag can reach; if free-run
-/// resume is ever supported, that gate has to land WITH it.
+/// `restore` is what a RESUMED pass put into its scheduler before its first
+/// judged step ([`PassRestore`]). A `coordination: free_run` bag with ONE
+/// worker rank resumes and is judged here, and `Scheduler::restore_sync_input_timestamps`
+/// mints UNBACKED heads (a stamp with no kind-6 record), which would make the
+/// Sync rule fold a map missing their members: so the restored Sync heads seed
+/// the Sync rule's maps, and a from-start pass hands [`PassRestore::none`].
 pub(crate) fn verify(
     nodes: &[NodeDecl],
     steps: &[RecordedStep],
     block_edges: &[BlockEdgeObservation],
     trust: RoleTrust,
+    restore: &PassRestore,
 ) -> RederivationReport {
     let mut report = RederivationReport::default();
 
@@ -1374,6 +1418,7 @@ pub(crate) fn verify(
                         trigger_inputs,
                         block_gated,
                         trust,
+                        restore.sync_heads_for(&node.node_id),
                         &mut report,
                     );
                 }
@@ -2075,8 +2120,11 @@ fn is_sync_head_record(read: &RecordedRead, trust: RoleTrust) -> bool {
 ///   minimum-stamp inputs, the exact set a `DiscardTie` advances (the
 ///   spent-tie guard);
 /// * `restore_sync_input_timestamps`' UNBACKED heads have no record at all —
-///   and NO GUARD, because none is reachable: this verifier runs on FREE-RUN
-///   passes only and resume is LOCKSTEP-only (see [`verify`]'s doc).
+///   they are SEEDED from the pass's [`PassRestore`] instead (the maps start
+///   from the heads the scheduler was restored with), so a resumed one-rank
+///   free-run pass is judged from the state it really began in. This is a
+///   seed rather than a guard; the "g5" numeral once used for a guard here
+///   stays retired.
 ///
 /// # Residuals
 ///
@@ -2096,6 +2144,7 @@ fn is_sync_head_record(read: &RecordedRead, trust: RoleTrust) -> bool {
 // value, never a positional bool pair (`RoleTrust` is a two-state enum
 // precisely so a swapped call site cannot compile).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn verify_sync(
     node: &NodeDecl,
     steps: &[RecordedStep],
@@ -2103,6 +2152,7 @@ fn verify_sync(
     trigger_inputs: &[String],
     block_gated: bool,
     trust: RoleTrust,
+    restored: Option<&BTreeMap<String, u64>>,
     report: &mut RederivationReport,
 ) {
     // Asked BEFORE any stamp is folded: an edge carrying both sites' reads has
@@ -2195,6 +2245,25 @@ fn verify_sync(
     // for exactly the run shapes it exists to catch — every fire clears the
     // head it would have compared against.
     let mut narrow_floor: BTreeMap<String, u64> = BTreeMap::new();
+    // The heads a RESUMED pass restored
+    // before its first judged step ([`PassRestore`]). Each is a head the
+    // scheduler really holds (unbacked, but FILLED), so it seeds all three
+    // maps exactly as a drain record naming that stamp would have: the NARROW
+    // head (arm C's alignment and the narrow supply), the g4 floor (a later
+    // head-naming stamp below a restored one is the same epoch reset it is
+    // for a recorded one), and the WIDE carry (a candidate for the first
+    // step's transversal and one unit of its supply). Only this node's
+    // TRIGGER inputs: the section is keyed by the inputs the matcher aligns,
+    // and a stray key names nothing this rule folds.
+    if let Some(heads) = restored {
+        for input in trigger_inputs {
+            if let Some(&ts) = heads.get(input) {
+                narrow.insert(input.clone(), ts);
+                narrow_floor.insert(input.clone(), ts);
+                wide_carry.insert(input.clone(), vec![ts]);
+            }
+        }
+    }
 
     for step in steps {
         // Per-step WIDE evidence. `records` is the SUPPLY scale (a count, never
@@ -3064,6 +3133,191 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// [`verify`] for a FROM-START pass, the shape every from-start oracle
+    /// below was written for, restored nothing (`PassRestore::none()`), so
+    /// each of them reads exactly as it did before the gate came back.
+    fn verify_unrestored(
+        nodes: &[NodeDecl],
+        steps: &[RecordedStep],
+        block_edges: &[BlockEdgeObservation],
+        trust: RoleTrust,
+    ) -> RederivationReport {
+        verify(nodes, steps, block_edges, trust, &PassRestore::none())
+    }
+
+    // -- the PassRestore seed ------------------------------------------------
+
+    /// A Sync node with ONE restored head and the fusion shape the resume
+    /// arms replay: `cam` arrived before the recording's first retained step
+    /// (so its head is a restored stamp with NO kind-6 record), `lidar`
+    /// arrives on the first resumed step, and the recording says the node
+    /// fired there. `(cam, lidar)` is the node's declared trigger pair.
+    fn restored_cam_at(stamp: u64) -> PassRestore {
+        let mut per_input = BTreeMap::new();
+        per_input.insert("cam".to_string(), stamp);
+        let mut heads = BTreeMap::new();
+        heads.insert("fuse".to_string(), per_input);
+        PassRestore::from_sync_heads(heads)
+    }
+
+    fn fuse_node() -> NodeDecl {
+        node(
+            "fuse",
+            TriggerDecl::Sync {
+                window_ns: Some(50 * MS),
+                trigger_inputs: inputs(&["cam", "lidar"]),
+            },
+        )
+    }
+
+    fn drain_at(input: &str, at: u64) -> RecordedRead {
+        read_with_role(
+            "fuse",
+            input,
+            ReadOutcomeKind::DrainedBatch,
+            1,
+            Some(EPOCH + at),
+            ReadSiteRole::Drain,
+        )
+    }
+
+    /// The first resumed step: the recorded fire the restored head explains.
+    fn first_resumed_step_with_lidar_at(at: u64) -> Vec<RecordedStep> {
+        vec![RecordedStep {
+            step: 7,
+            clock_ns: EPOCH + 5 * MS,
+            fires: vec![fire("fuse", EPOCH + 5 * MS)],
+            reads: vec![drain_at("lidar", at)],
+        }]
+    }
+
+    #[test]
+    fn a_restored_sync_head_seeds_the_first_resumed_steps_transversal() {
+        // THE gate, and its mutant, in one body. With the seed, `cam`'s
+        // restored 1000 ms head and `lidar`'s recorded 1010 ms arrival form an
+        // in-window transversal, and the recorded fire is exactly what the
+        // scheduler did: CLEAN. Without it (a from-start pass, or the seed
+        // dropped), `cam` has no candidate at all, arm B finds no transversal
+        // for a step that fired, and a healthy resume is CONVICTED on its
+        // first step: the fold over a map missing its members that the
+        // `PassRestore` doc names.
+        let n = fuse_node();
+        let steps = first_resumed_step_with_lidar_at(1010 * MS);
+
+        let restored = verify(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed,
+            &restored_cam_at(EPOCH + 1000 * MS),
+        );
+        assert!(
+            restored.is_clean(),
+            "the restored head is a candidate and a unit of supply: {:?}",
+            restored.findings
+        );
+        assert!(
+            restored.stand_downs.is_empty(),
+            "…and nothing stood down: {:?}",
+            restored.stand_downs
+        );
+
+        let bare = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        assert_eq!(bare.findings.len(), 1, "{:?}", bare.findings);
+        let f = &bare.findings[0];
+        assert_eq!(f.node_id, "fuse");
+        assert_eq!(f.step, 7);
+        assert_eq!(f.decider, Decider::Sync);
+        assert_eq!(
+            f.expected,
+            StepFires::none(),
+            "arm B: no transversal exists without the restored head"
+        );
+    }
+
+    #[test]
+    fn a_restored_sync_head_is_the_g4_floor_for_the_stamps_that_follow() {
+        // A restored head names a stamp the publisher's epoch had reached, so a
+        // later head-naming stamp BELOW it is the same epoch reset guard g4
+        // catches between two recorded heads. With the seed the regression is
+        // seen and the node stands down; without it the 900 ms stamp is the
+        // first floor this rule ever saw, `(900, 905)` align, and the run
+        // reads clean: the difference IS the seeded floor.
+        let n = fuse_node();
+        let steps = vec![RecordedStep {
+            step: 7,
+            clock_ns: EPOCH + 5 * MS,
+            fires: vec![fire("fuse", EPOCH + 5 * MS)],
+            reads: vec![drain_at("cam", 900 * MS), drain_at("lidar", 905 * MS)],
+        }];
+
+        let restored = verify(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed,
+            &restored_cam_at(EPOCH + 1000 * MS),
+        );
+        assert_eq!(
+            restored.stand_downs,
+            vec![StandDown {
+                node_id: "fuse".to_string(),
+                decider: Decider::Sync,
+                reason: StandDownReason::SyncHeadStampRegressed,
+            }]
+        );
+        assert!(restored.is_clean(), "a stand-down is not a finding");
+
+        let bare = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        assert!(bare.is_clean() && bare.stand_downs.is_empty(), "{bare:?}");
+    }
+
+    #[test]
+    fn a_restore_naming_another_node_or_a_non_trigger_input_seeds_nothing() {
+        // The seed is keyed by NODE and folded over the node's TRIGGER inputs
+        // only: a restore that names a different node, or an input the
+        // matcher does not align, leaves the verdict exactly the unrestored
+        // one: the same arm-B finding on the same step.
+        let n = fuse_node();
+        let steps = first_resumed_step_with_lidar_at(1010 * MS);
+        let bare = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        assert_eq!(bare.findings.len(), 1);
+
+        let mut other_node = BTreeMap::new();
+        other_node.insert("other".to_string(), {
+            let mut m = BTreeMap::new();
+            m.insert("cam".to_string(), EPOCH + 1000 * MS);
+            m
+        });
+        let mut stray_input = BTreeMap::new();
+        stray_input.insert("fuse".to_string(), {
+            let mut m = BTreeMap::new();
+            m.insert("ctx".to_string(), EPOCH + 1000 * MS);
+            m
+        });
+        for (label, restore) in [
+            ("another node", PassRestore::from_sync_heads(other_node)),
+            (
+                "a non-trigger input",
+                PassRestore::from_sync_heads(stray_input),
+            ),
+            ("nothing", PassRestore::none()),
+        ] {
+            let report = verify(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed,
+                &restore,
+            );
+            assert_eq!(
+                report.findings, bare.findings,
+                "a restore naming {label} must change nothing"
+            );
+        }
+        assert_eq!(PassRestore::none(), PassRestore::default());
+    }
+
     // -- Period ------------------------------------------------------------
 
     /// The MIRROR and the whole ENGINE, driven against ONE hand-written oracle
@@ -3116,7 +3370,7 @@ mod tests {
             step(1, EPOCH + 10 * MS, vec![fire("ticker", EPOCH + 10 * MS)]),
             step(2, EPOCH + 20 * MS, vec![fire("ticker", EPOCH + 20 * MS)]),
         ];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
         assert_eq!(report.divergence_class(), None);
         assert!(report.stand_downs.is_empty());
@@ -3141,7 +3395,7 @@ mod tests {
                 ],
             ),
         ];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
     }
 
@@ -3163,7 +3417,7 @@ mod tests {
             step(1, EPOCH + 20 * MS, vec![fire("scanner", EPOCH + interval)]),
             step(2, EPOCH + 40 * MS, vec![fire("scanner", EPOCH + interval)]),
         ];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(!report.is_clean());
         assert_eq!(
             report.divergence_class(),
@@ -3187,7 +3441,7 @@ mod tests {
     fn a_period_node_that_never_fired_stands_down_instead_of_reporting_clean() {
         let nodes = vec![node("silent", period(10 * MS, None))];
         let steps = vec![step(0, EPOCH, vec![]), step(1, EPOCH + 10 * MS, vec![])];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean());
         assert_eq!(
             report.stand_downs,
@@ -3205,7 +3459,7 @@ mod tests {
     fn a_zero_interval_period_node_stands_down_rather_than_looping() {
         let nodes = vec![node("broken", period(0, None))];
         let steps = vec![step(0, EPOCH, vec![fire("broken", EPOCH)])];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean());
         assert_eq!(report.stand_downs[0].reason, StandDownReason::ZeroInterval);
     }
@@ -3240,7 +3494,7 @@ mod tests {
             depth: 4,
             published_frames: 2,
         }];
-        let report = verify(&nodes, &steps, &edges, RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &edges, RoleTrust::Declined);
         assert!(
             report.is_clean(),
             "a credit-paced producer must not diverge: {:?}",
@@ -3255,7 +3509,7 @@ mod tests {
         // ANTI-TAUTOLOGY: the identical trace with NO block edge IS a
         // divergence, so the clean verdict above is the fence doing work and
         // not a fixture that could never diverge.
-        let bare = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let bare = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(!bare.is_clean());
         assert_eq!(bare.findings[0].step, 2);
     }
@@ -3303,7 +3557,7 @@ mod tests {
             step(1, EPOCH + 5 * MS, vec![fire("relay", EPOCH + 5 * MS)]),
             step(2, EPOCH + 10 * MS, vec![fire("relay", EPOCH + 10 * MS)]),
         ];
-        let report = verify(&[n], &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&[n], &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
     }
 
@@ -3319,7 +3573,7 @@ mod tests {
             step(2, EPOCH + 20 * MS, vec![fire("relay", EPOCH + 20 * MS)]),
             step(3, EPOCH + 30 * MS, vec![]), // deferred again
         ];
-        let report = verify(&[n], &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&[n], &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
     }
 
@@ -3333,7 +3587,7 @@ mod tests {
             // 10 ms after the last fire, against a 20 ms cap.
             step(1, EPOCH + 10 * MS, vec![fire("relay", EPOCH + 10 * MS)]),
         ];
-        let report = verify(&[n], &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&[n], &steps, &[], RoleTrust::Declined);
         assert!(!report.is_clean());
         let f = &report.findings[0];
         assert_eq!(f.node_id, "relay");
@@ -3403,7 +3657,7 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(
             report.is_clean(),
             "the spread is over the stamps: {:?}",
@@ -3451,7 +3705,7 @@ mod tests {
                     ),
                 ],
             }];
-            let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+            let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
             assert_eq!(
                 report.is_clean(),
                 expect_aligned,
@@ -3493,7 +3747,7 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(!report.is_clean());
         let f = &report.findings[0];
         assert_eq!(f.node_id, "fusion");
@@ -3550,7 +3804,7 @@ mod tests {
                 )],
             },
         ];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
 
         // The same stamps under a BOUNDED 50 ms window are a divergence — the
@@ -3562,7 +3816,7 @@ mod tests {
                 trigger_inputs: inputs(&["a", "b"]),
             },
         )];
-        assert!(!verify(&bounded, &steps, &[], RoleTrust::Declined,).is_clean());
+        assert!(!verify_unrestored(&bounded, &steps, &[], RoleTrust::Declined,).is_clean());
     }
 
     /// A Sync input is stamped by its DRAIN, never by the
@@ -3628,7 +3882,7 @@ mod tests {
             fires: vec![fire("fusion", clock)],
             reads: with_body,
         }];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(
             report.is_clean(),
             "a body read is not an arrival: {:?}",
@@ -3666,7 +3920,7 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(!report.is_clean());
         assert_eq!(report.findings[0].decider, Decider::Sync);
         assert!(
@@ -3731,7 +3985,7 @@ mod tests {
             fires: vec![fire("fusion", clock), fire("fusion", clock)],
             reads: reads.clone(),
         }];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(!report.is_clean());
         let f = &report.findings[0];
         assert_eq!(f.step, 3);
@@ -3752,7 +4006,7 @@ mod tests {
                 },
             )
         }];
-        let report = verify(&throttled, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&throttled, &steps, &[], RoleTrust::Declined);
         assert!(
             report
                 .findings
@@ -3770,7 +4024,7 @@ mod tests {
             fires: vec![fire("fusion", clock)],
             reads: reads.clone(),
         }];
-        assert!(verify(&nodes, &once, &[], RoleTrust::Declined).is_clean());
+        assert!(verify_unrestored(&nodes, &once, &[], RoleTrust::Declined).is_clean());
 
         // The SAME two fires with TWO arrivals per input is CLEAN.
         // Two sets were supplied, so `tick_sync_burst` firing twice is the
@@ -3805,7 +4059,7 @@ mod tests {
                 drain("b", b + 5 * MS),
             ],
         }];
-        let clean = verify(&nodes, &burst, &[], RoleTrust::Believed);
+        let clean = verify_unrestored(&nodes, &burst, &[], RoleTrust::Believed);
         assert!(
             clean.is_clean(),
             "two arrivals per input SUPPLY two sets — the per-set burst: {clean:?}"
@@ -3874,7 +4128,7 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(
             report.findings.is_empty(),
             "an unrecoverable alignment map must not yield a verdict: {:?}",
@@ -3910,7 +4164,7 @@ mod tests {
             ],
         });
         assert!(
-            verify(&nodes, &steps, &[], RoleTrust::Declined)
+            verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined)
                 .findings
                 .is_empty(),
             "the stand-down covers the whole run, not one step"
@@ -3970,7 +4224,7 @@ mod tests {
                 ],
             },
         ];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
         assert!(
             !report
@@ -3992,7 +4246,7 @@ mod tests {
             1,
             Some(b + 900 * MS),
         );
-        assert!(!verify(&nodes, &misaligned, &[], RoleTrust::Declined,).is_clean());
+        assert!(!verify_unrestored(&nodes, &misaligned, &[], RoleTrust::Declined,).is_clean());
     }
 
     /// A trigger input whose wire stamp could not be joined stands the node
@@ -4012,7 +4266,7 @@ mod tests {
             fires: vec![],
             reads: vec![read("fusion", "a", ReadOutcomeKind::DrainedBatch, 1, None)],
         }];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean());
         assert_eq!(
             report.stand_downs[0].reason,
@@ -4048,13 +4302,13 @@ mod tests {
                 read("sink", "inp", ReadOutcomeKind::Served, 0, None),
             ],
         }];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
 
         // The anti-tautology half: drop one fire and the mismatch is caught.
         let mut short = steps.clone();
         short[0].fires.pop();
-        let bad = verify(&nodes, &short, &[], RoleTrust::Declined);
+        let bad = verify_unrestored(&nodes, &short, &[], RoleTrust::Declined);
         assert!(!bad.is_clean());
         assert_eq!(bad.findings[0].decider, Decider::FifoPop);
         assert_eq!(bad.findings[0].expected, StepFires::count(3));
@@ -4084,7 +4338,7 @@ mod tests {
                 read("sink", "inp", ReadOutcomeKind::Truncated, 1, None),
             ],
         }];
-        let report = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(
             report.is_clean(),
             "a truncation hole must not read as divergence: {:?}",
@@ -4103,7 +4357,7 @@ mod tests {
         // fixture that could never diverge either way.
         let mut healed = steps.clone();
         healed[0].reads[1].kind = ReadOutcomeKind::DrainedBatch;
-        let ok = verify(&nodes, &healed, &[], RoleTrust::Declined);
+        let ok = verify_unrestored(&nodes, &healed, &[], RoleTrust::Declined);
         assert!(ok.is_clean());
         assert!(ok.stand_downs.is_empty());
     }
@@ -4150,7 +4404,7 @@ mod tests {
                 read("sink", "inp", ReadOutcomeKind::DrainedBatch, 2, None),
             ],
         }];
-        let report = verify(&[], &steps, &edges, RoleTrust::Declined);
+        let report = verify_unrestored(&[], &steps, &edges, RoleTrust::Declined);
         assert!(report.conservation.is_empty(), "{:?}", report.conservation);
         assert!(report.is_clean());
     }
@@ -4178,7 +4432,7 @@ mod tests {
             fires: vec![],
             reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 3, None)],
         }];
-        let report = verify(&[], &steps, &edges, RoleTrust::Declined);
+        let report = verify_unrestored(&[], &steps, &edges, RoleTrust::Declined);
 
         // LOUD.
         assert_eq!(
@@ -4227,7 +4481,7 @@ mod tests {
                 read("sink", "inp", ReadOutcomeKind::Truncated, 2, None),
             ],
         }];
-        let report = verify(&[], &steps, &edges, RoleTrust::Declined);
+        let report = verify_unrestored(&[], &steps, &edges, RoleTrust::Declined);
         assert!(
             report.conservation.is_empty(),
             "a floor must not read as an under-run: {:?}",
@@ -4245,7 +4499,7 @@ mod tests {
         let mut healed = steps.clone();
         healed[0].reads.pop();
         assert_eq!(
-            verify(&[], &healed, &edges, RoleTrust::Declined).conservation[0].breach,
+            verify_unrestored(&[], &healed, &edges, RoleTrust::Declined).conservation[0].breach,
             ConservationBreach::UnderRun
         );
     }
@@ -4276,7 +4530,7 @@ mod tests {
                 read("fusion", "b", ReadOutcomeKind::DrainedBatch, 1, Some(EPOCH)),
             ],
         }];
-        let report = verify(std::slice::from_ref(&n), &quiet, &[], RoleTrust::Declined);
+        let report = verify_unrestored(std::slice::from_ref(&n), &quiet, &[], RoleTrust::Declined);
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
         assert!(report.stand_downs.contains(&StandDown {
             node_id: "fusion".to_string(),
@@ -4300,7 +4554,7 @@ mod tests {
                 ),
             ],
         }];
-        let bad = verify(&[n], &loud, &[], RoleTrust::Declined);
+        let bad = verify_unrestored(&[n], &loud, &[], RoleTrust::Declined);
         assert!(!bad.is_clean());
         assert_eq!(bad.findings[0].decider, Decider::Sync);
     }
@@ -4325,8 +4579,8 @@ mod tests {
                 ],
             ),
         ];
-        let a = verify(&nodes, &steps, &[], RoleTrust::Declined);
-        let b = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let a = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        let b = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert_eq!(a, b);
         assert_eq!(
             a.findings
@@ -4740,7 +4994,7 @@ mod tests {
             ],
         }];
 
-        let believed = verify(
+        let believed = verify_unrestored(
             std::slice::from_ref(&n),
             &corrupt_stream,
             &[],
@@ -4764,7 +5018,7 @@ mod tests {
         // ARCHIVED: the same bits, declined. The FIFO rule judges normally (one
         // drain pop, one fire), so the stand-down above really is about the
         // BELIEVED role rather than about the record's shape.
-        let archived = verify(
+        let archived = verify_unrestored(
             std::slice::from_ref(&n),
             &corrupt_stream,
             &[],
@@ -4802,7 +5056,7 @@ mod tests {
                 ),
             ],
         }];
-        let ok = verify(std::slice::from_ref(&n), &healthy, &[], RoleTrust::Believed);
+        let ok = verify_unrestored(std::slice::from_ref(&n), &healthy, &[], RoleTrust::Believed);
         assert!(
             ok.stand_downs.is_empty() && ok.is_clean(),
             "a body-role `Served` beside a drain-role batch is the ORDINARY \
@@ -4860,7 +5114,7 @@ mod tests {
             ],
         }];
 
-        let believed = verify(
+        let believed = verify_unrestored(
             std::slice::from_ref(&n),
             &body_heavy,
             &[],
@@ -4900,7 +5154,7 @@ mod tests {
         // ARCHIVED: nothing was excluded, so there is no split to report. (The
         // node stands down on the kind-inferred collision instead, which is the
         // pre-roles answer and is why `findings` is empty here.)
-        let archived = verify(
+        let archived = verify_unrestored(
             std::slice::from_ref(&n),
             &body_heavy,
             &[],
@@ -4921,7 +5175,7 @@ mod tests {
             fires: vec![fire("sink", EPOCH), fire("sink", EPOCH)],
             reads: vec![batch(ReadSiteRole::Drain), batch(ReadSiteRole::Body)],
         }];
-        let d = verify(&[n], &drain_heavy, &[], RoleTrust::Believed);
+        let d = verify_unrestored(&[n], &drain_heavy, &[], RoleTrust::Believed);
         assert_eq!(d.findings.len(), 1, "still a finding: {:?}", d.findings);
         assert!(
             d.read_site_census.is_empty(),
@@ -4983,7 +5237,7 @@ mod tests {
             ],
         }];
 
-        let stamped = verify(&nodes, &steps, &[], RoleTrust::Believed);
+        let stamped = verify_unrestored(&nodes, &steps, &[], RoleTrust::Believed);
         assert!(
             stamped.is_clean(),
             "the DRAIN stamps are 10 ms apart — aligned: {:?}",
@@ -4999,7 +5253,7 @@ mod tests {
         // for one `(node, input)` in one step is the ambiguity signature, so
         // the node stands down rather than being judged on a stamp map that
         // may not be the scheduler's.
-        let archived = verify(&nodes, &steps, &[], RoleTrust::Declined);
+        let archived = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert_eq!(
             archived
                 .stand_downs
@@ -5047,10 +5301,12 @@ mod tests {
             ],
         }];
         assert!(
-            verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed,).is_clean(),
+            verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed,)
+                .is_clean(),
             "one DRAIN pop, one fire"
         );
-        let archived = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Declined);
+        let archived =
+            verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Declined);
         assert!(
             !archived.is_clean(),
             "counting BOTH batches expects 2 pops against 1 fire"
@@ -5070,7 +5326,7 @@ mod tests {
             depth: 1,
             published_frames: 3,
         }];
-        let stamped = verify(&[], &steps, &edges, RoleTrust::Believed);
+        let stamped = verify_unrestored(&[], &steps, &edges, RoleTrust::Believed);
         assert!(
             stamped.conservation.is_empty(),
             "a two-site stream yields no credit number at all: {:?}",
@@ -5087,7 +5343,7 @@ mod tests {
         );
         // ARCHIVED: the pre-roles rule verbatim — `DrainedBatch` popped, both records,
         // so 2 drained against 3 published is 1 outstanding at depth 1: clean.
-        let archived = verify(&[], &steps, &edges, RoleTrust::Declined);
+        let archived = verify_unrestored(&[], &steps, &edges, RoleTrust::Declined);
         assert!(
             archived.conservation.is_empty() && archived.stand_downs.is_empty(),
             "the pre-roles arm counts both batches and finds nothing: {:?} {:?}",
@@ -5139,7 +5395,7 @@ mod tests {
         }];
         let n = node("n", period(10 * MS, None));
         assert_eq!(
-            declined(&verify(
+            declined(&verify_unrestored(
                 std::slice::from_ref(&n),
                 &steps,
                 &[],
@@ -5165,7 +5421,7 @@ mod tests {
             published_frames: 0,
         }];
         assert_eq!(
-            declined(&verify(
+            declined(&verify_unrestored(
                 std::slice::from_ref(&n),
                 &steps,
                 &gating,
@@ -5183,7 +5439,7 @@ mod tests {
             reads: vec![corrupt("context")],
         }];
         assert_eq!(
-            declined(&verify(
+            declined(&verify_unrestored(
                 std::slice::from_ref(&n),
                 &non_trigger,
                 &[],
@@ -5197,7 +5453,7 @@ mod tests {
         // bag makes no corruption claim (the bits were not believed), and a
         // HEALTHY believed stream makes none either.
         assert!(
-            declined(&verify(
+            declined(&verify_unrestored(
                 std::slice::from_ref(&n),
                 &non_trigger,
                 &[],
@@ -5220,7 +5476,7 @@ mod tests {
             )],
         }];
         assert!(
-            declined(&verify(
+            declined(&verify_unrestored(
                 std::slice::from_ref(&n),
                 &healthy,
                 &[],
@@ -5271,7 +5527,7 @@ mod tests {
                 fires: Vec::new(),
                 reads,
             }];
-            let report = verify(std::slice::from_ref(&consumer), &steps, &edges, trust);
+            let report = verify_unrestored(std::slice::from_ref(&consumer), &steps, &edges, trust);
             (
                 report.conservation.iter().map(|c| c.drained).next(),
                 report.conservation.iter().map(|c| c.breach).next(),
@@ -5449,7 +5705,7 @@ mod tests {
                 fires: Vec::new(),
                 reads,
             }];
-            let report = verify(decls, &steps, &edges, RoleTrust::Believed);
+            let report = verify_unrestored(decls, &steps, &edges, RoleTrust::Believed);
             (
                 report.conservation.iter().map(|c| c.drained).next(),
                 report.conservation.iter().map(|c| c.breach).next(),
@@ -5571,7 +5827,7 @@ mod tests {
             fires: Vec::new(),
             reads: separate_shape,
         }];
-        let archived = verify(
+        let archived = verify_unrestored(
             std::slice::from_ref(&data),
             &steps,
             &edges,
@@ -5654,7 +5910,7 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify(
+        let report = verify_unrestored(
             std::slice::from_ref(&sink),
             &steps,
             &edges,
@@ -5765,7 +6021,7 @@ mod tests {
                 at("lidar", EPOCH, ReadSiteRole::Drain, 1),
             ],
         }];
-        let report = verify(std::slice::from_ref(&n), &peeked, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &peeked, &[], RoleTrust::Believed);
         assert!(
             report.is_clean(),
             "THE HEADLINE: a peeked frame is not the head, so a step the \
@@ -5790,7 +6046,7 @@ mod tests {
             ],
         }];
         assert!(
-            verify(
+            verify_unrestored(
                 std::slice::from_ref(&n),
                 &promoted,
                 &[],
@@ -5813,7 +6069,8 @@ mod tests {
             ],
         }];
         assert!(
-            verify(std::slice::from_ref(&n), &single, &[], RoleTrust::Believed,).is_clean(),
+            verify_unrestored(std::slice::from_ref(&n), &single, &[], RoleTrust::Believed,)
+                .is_clean(),
             "the ordinary shape is unaffected"
         );
 
@@ -5821,7 +6078,7 @@ mod tests {
         //    two kind-inferred drain reads, and the pre-roles detector
         //    still stands them down.
         assert_eq!(
-            reasons(&verify(
+            reasons(&verify_unrestored(
                 std::slice::from_ref(&n),
                 &peeked,
                 &[],
@@ -5881,7 +6138,7 @@ mod tests {
                 at("lidar", EPOCH + 15 * MS, ReadSiteRole::Drain, 1),
             ],
         }];
-        let report = verify(std::slice::from_ref(&n), &two, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &two, &[], RoleTrust::Believed);
         assert!(
             report.is_clean(),
             "THE HEADLINE: two arrivals per input SUPPLY two sets, so a per-set \
@@ -5909,7 +6166,8 @@ mod tests {
             ],
         }];
         assert!(
-            verify(std::slice::from_ref(&n), &three, &[], RoleTrust::Believed,).is_clean(),
+            verify_unrestored(std::slice::from_ref(&n), &three, &[], RoleTrust::Believed,)
+                .is_clean(),
             "three supplied sets, three fires"
         );
 
@@ -5946,7 +6204,7 @@ mod tests {
             ],
         }];
         assert!(
-            verify(
+            verify_unrestored(
                 std::slice::from_ref(&n),
                 &peek_supplied,
                 &[],
@@ -6008,7 +6266,7 @@ mod tests {
                 at("lidar", EPOCH + 2000 * MS),
             ],
         }];
-        let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
         assert!(
             report.is_clean(),
             "the fired set (0, 20 ms) is among the candidates, so the step is \
@@ -6030,7 +6288,7 @@ mod tests {
                 at("lidar", EPOCH + 2000 * MS),
             ],
         }];
-        let bad = verify(
+        let bad = verify_unrestored(
             std::slice::from_ref(&n),
             &infeasible,
             &[],
@@ -6085,7 +6343,7 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
         assert!(!report.is_clean());
         let f = &report.findings[0];
         assert_eq!(f.step, 7);
@@ -6145,7 +6403,7 @@ mod tests {
             reads: reads.clone(),
         }];
         assert!(
-            verify(
+            verify_unrestored(
                 std::slice::from_ref(&n),
                 &at_ceiling,
                 &[],
@@ -6161,7 +6419,7 @@ mod tests {
             fires: vec![fire("fusion", EPOCH); SYNC_BURST_MAX_SETS as usize + 1],
             reads,
         }];
-        let report = verify(std::slice::from_ref(&n), &over, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &over, &[], RoleTrust::Believed);
         assert!(!report.is_clean());
         assert_eq!(
             report.findings[0].expected,
@@ -6224,7 +6482,7 @@ mod tests {
             ]
         };
 
-        let report = verify(
+        let report = verify_unrestored(
             std::slice::from_ref(&n),
             &two_steps(EPOCH + 10 * MS),
             &[],
@@ -6237,7 +6495,7 @@ mod tests {
         );
 
         // ANTI-TAUTOLOGY: carry the head and the pair STILL does not fit.
-        let bad = verify(
+        let bad = verify_unrestored(
             std::slice::from_ref(&n),
             &two_steps(EPOCH + 400 * MS),
             &[],
@@ -6290,7 +6548,7 @@ mod tests {
                 at("lidar", EPOCH, ReadSiteRole::Drain),
             ],
         }];
-        let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
         assert!(!report.is_clean(), "an aligned set owed a fire: {report:?}");
         let f = &report.findings[0];
         assert_eq!(f.step, 2);
@@ -6367,7 +6625,7 @@ mod tests {
             ]
         };
 
-        let reset = verify(
+        let reset = verify_unrestored(
             std::slice::from_ref(&n),
             &run(EPOCH + 50 * MS),
             &[],
@@ -6390,7 +6648,7 @@ mod tests {
 
         // ANTI-TAUTOLOGY: the same three steps with step 2 ASCENDING are judged,
         // and the step really would have produced a finding.
-        let judged = verify(
+        let judged = verify_unrestored(
             std::slice::from_ref(&n),
             &run(EPOCH + 300 * MS),
             &[],
@@ -6465,7 +6723,7 @@ mod tests {
             },
         ];
 
-        let widened = verify(
+        let widened = verify_unrestored(
             std::slice::from_ref(&with_context),
             &steps,
             &[],
@@ -6484,7 +6742,7 @@ mod tests {
             "and the widening is OPERATOR-VISIBLE, once per node"
         );
 
-        let narrow = verify(
+        let narrow = verify_unrestored(
             std::slice::from_ref(&trigger_only),
             &steps,
             &[],
@@ -6573,7 +6831,7 @@ mod tests {
                     )],
                 },
             ];
-            verify(
+            verify_unrestored(
                 std::slice::from_ref(&widened),
                 &steps,
                 &[],
@@ -6665,7 +6923,7 @@ mod tests {
             },
         ];
 
-        let widened = verify(
+        let widened = verify_unrestored(
             std::slice::from_ref(&with_context),
             &steps,
             &[],
@@ -6683,7 +6941,7 @@ mod tests {
             }]
         );
 
-        let narrow = verify(
+        let narrow = verify_unrestored(
             std::slice::from_ref(&trigger_only),
             &steps,
             &[],
@@ -6739,7 +6997,7 @@ mod tests {
                 drain("lidar", EPOCH + 5 * MS),
             ],
         }];
-        let stood_down = verify(
+        let stood_down = verify_unrestored(
             std::slice::from_ref(&n),
             &truncated,
             &[],
@@ -6765,7 +7023,7 @@ mod tests {
             fires: vec![fire("fusion", EPOCH)],
             reads: vec![drain("cam", EPOCH), drain("lidar", EPOCH + 5 * MS)],
         }];
-        let judged = verify(std::slice::from_ref(&n), &intact, &[], RoleTrust::Believed);
+        let judged = verify_unrestored(std::slice::from_ref(&n), &intact, &[], RoleTrust::Believed);
         assert!(judged.stand_downs.is_empty());
         assert_eq!(
             judged.carried_heads.len(),
@@ -6823,7 +7081,7 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
         assert_eq!(
             report
                 .stand_downs
@@ -6981,7 +7239,7 @@ mod tests {
             reads: reads.clone(),
         }];
         assert!(
-            verify(
+            verify_unrestored(
                 std::slice::from_ref(&n),
                 &one_fire,
                 &[],
@@ -7000,7 +7258,7 @@ mod tests {
             fires: vec![fire("fusion", EPOCH), fire("fusion", EPOCH)],
             reads,
         }];
-        let report = verify(
+        let report = verify_unrestored(
             std::slice::from_ref(&n),
             &two_fires,
             &[],
@@ -7094,7 +7352,8 @@ mod tests {
                     )],
                 },
             ];
-            let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report =
+                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
             assert!(
                 report.is_clean(),
                 "{a_records} records on `a` in one step: the carried head must be the LAST \
@@ -7196,7 +7455,8 @@ mod tests {
                         )],
                     },
                 ];
-                let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+                let report =
+                    verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
                 assert_eq!(
                 report.is_clean(),
                 clean,
@@ -7283,7 +7543,8 @@ mod tests {
                     )],
                 },
             ];
-            let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report =
+                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
             let stood_down = report
                 .stand_downs
                 .iter()
@@ -7357,7 +7618,8 @@ mod tests {
                     ),
                 ],
             }];
-            let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report =
+                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
             let room_stand_downs = report
                 .stand_downs
                 .iter()
@@ -7440,7 +7702,8 @@ mod tests {
                 fires: vec![fire("fusion", EPOCH)],
                 reads,
             }];
-            let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report =
+                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
             if convicts {
                 assert_eq!(
                     report.findings.len(),
@@ -7551,7 +7814,8 @@ mod tests {
                     reads: vec![drain("lidar", 5010 * MS, 1)],
                 },
             ];
-            let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report =
+                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
             assert!(
                 report.is_clean(),
                 "recorded_promotion={recorded_promotion}: the head beside the parked peek \
@@ -7637,7 +7901,7 @@ mod tests {
                 reads: vec![drain("lidar", 215 * MS)],
             },
         ];
-        let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
         assert!(
             report.is_clean(),
             "the spent head must not survive the step-2 fire as a phantom — {report:?}"
@@ -7649,7 +7913,7 @@ mod tests {
         let mut owed = steps.clone();
         owed[2].fires.clear();
         owed.truncate(3);
-        let report = verify(std::slice::from_ref(&n), &owed, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &owed, &[], RoleTrust::Believed);
         assert_eq!(report.findings.len(), 1, "{report:?}");
         assert_eq!(report.findings[0].step, 2);
         assert_eq!(report.findings[0].expected, StepFires::count(1));
@@ -7711,7 +7975,7 @@ mod tests {
                 reads: vec![drain("cam", 310 * MS)],
             },
         ];
-        let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
         assert!(report.is_clean(), "{report:?}");
     }
 
@@ -7836,7 +8100,7 @@ mod tests {
                 reads: vec![cam(ReadSiteRole::Body, EPOCH + 400 * MS)],
             },
         ];
-        let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
         assert_eq!(
             report
                 .findings
@@ -7910,7 +8174,7 @@ mod tests {
                 batch(100, ReadSiteRole::Body),
             ],
         }];
-        let report = verify(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
         assert_eq!(
             report.findings.len(),
             1,
@@ -7947,7 +8211,7 @@ mod tests {
             // records 1/1 and pops 2/2, so neither scale is body-heavy.
             reads: vec![batch(2, ReadSiteRole::Drain), batch(2, ReadSiteRole::Body)],
         }];
-        let report = verify(std::slice::from_ref(&n), &even, &[], RoleTrust::Believed);
+        let report = verify_unrestored(std::slice::from_ref(&n), &even, &[], RoleTrust::Believed);
         assert!(
             !report.findings.is_empty(),
             "the finding is still there to annotate"

@@ -7142,6 +7142,61 @@ fn fold_read_log_outcomes(outcomes: Vec<ReadLogOutcome>) -> ReadLogOutcome {
     }
 }
 
+/// Re-key a resume plan's restored Sync heads from the scheduler's vocabulary
+/// to the verifier's.
+///
+/// The anchor's framework section keys `sync_input_timestamps` by trigger-input
+/// TOPIC (`NodeFrameworkState::sync_input_timestamps`: "per trigger-input
+/// TOPIC"; the scheduler's `sync_heads` are keyed by the topic it aligns),
+/// while `replay_rederive` keys every read and every `NodeDecl` trigger input
+/// by INPUT NAME (the manifest's `inputs` table). Handing the verifier the
+/// topic-keyed map seeds nothing (every lookup misses) and the resumed pass
+/// is convicted on its first step exactly as if no gate existed (measured:
+/// `node 'fusion' step 7 sync alignment: re-derived 0 fire(s), recorded 1`).
+///
+/// Resolved through [`cerulion_core::graph::resolve_source`], the ONE rule the
+/// runtime, the validator and `replay_rank` already apply to an input's
+/// `source`, never a second spelling of it. A topic that names no input of its
+/// node is DROPPED with a breadcrumb rather than seeded onto a guess: it can
+/// only come from a recording whose graph disagrees with the bag's, and a
+/// missing seed is the conservative direction (the verifier can then only
+/// convict, never accept a fire it should have refused).
+fn restored_sync_heads_by_input(
+    config: &GraphConfig,
+    by_topic: &BTreeMap<String, BTreeMap<String, u64>>,
+) -> BTreeMap<String, BTreeMap<String, u64>> {
+    let mut out: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    for (node_id, heads) in by_topic {
+        let Some(node) = config.nodes.iter().find(|n| &n.id == node_id) else {
+            tracing::debug!(
+                node_id = %node_id,
+                "replay resume: the anchor restores Sync heads for a node the graph does not \
+                 declare; nothing is seeded for it"
+            );
+            continue;
+        };
+        for (topic, ts) in heads {
+            let input = node.inputs.iter().find(|input| {
+                cerulion_core::graph::resolve_source(&config.prefix, &input.source) == *topic
+            });
+            match input {
+                Some(input) => {
+                    out.entry(node_id.clone())
+                        .or_default()
+                        .insert(input.name.clone(), *ts);
+                }
+                None => tracing::debug!(
+                    node_id = %node_id,
+                    topic = %topic,
+                    "replay resume: the anchor restores a Sync head on a topic none of this \
+                     node's declared inputs is sourced from; nothing is seeded for it"
+                ),
+            }
+        }
+    }
+    out
+}
+
 /// Apply a mid-run resume anchor to a freshly built runtime.
 ///
 /// Lifted verbatim out of `run_engine` so the pass loop can call it at the one
@@ -11013,11 +11068,17 @@ fn run_rank_pass(
                 // at the pass boundary because the injection steering reads it
                 // too; below this line the trust is a named two-state.
                 replay_rederive::RoleTrust::from_stamped(pass.roles_stamped),
-                // No "resumed pass" input. This block is `!lockstep`
-                // and `resolve_resume` refuses a mid-run free-run bag, so
-                // `resume` is `None` on every pass that reaches here — a
-                // `PassRestore` gate on this call would be unreachable by
-                // construction (see `replay_rederive::verify`'s doc).
+                // What THIS pass restored. A one-rank free-run bag beginning
+                // mid-run resumes (the pass-loop block above applied its plan),
+                // and its Sync heads are UNBACKED (real stamps with no kind-6
+                // record), so the verifier must start from them or it convicts
+                // the first resumed step. A from-start pass restores nothing.
+                &resume.map_or_else(replay_rederive::PassRestore::none, |r| {
+                    replay_rederive::PassRestore::from_sync_heads(restored_sync_heads_by_input(
+                        pass.config,
+                        &r.sync_input_timestamps,
+                    ))
+                }),
             );
             for sd in &report.stand_downs {
                 // The corrupt-recording stand-down
@@ -14086,6 +14147,60 @@ impl InjectionWindow {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod restored_sync_heads_tests {
+    use super::restored_sync_heads_by_input;
+    use cerulion_core::graph::parse_graph;
+    use std::collections::BTreeMap;
+
+    /// The anchor keys a Sync node's restored heads by trigger-input TOPIC
+    /// (the scheduler's vocabulary); the verifier keys by INPUT NAME (the
+    /// manifest's). The re-keying is judged against a HAND oracle over one
+    /// graph with a relative source, an absolute source, a topic none of the
+    /// node's inputs is sourced from, and a node the graph does not declare:
+    /// the first two re-key, the last two are dropped rather than guessed.
+    #[test]
+    fn restored_heads_are_re_keyed_from_topic_to_input_name_through_resolve_source() {
+        const GRAPH: &str = "prefix: cp3\n\
+             nodes:\n\
+             \x20 - id: a_src\n\
+             \x20   type: src\n\
+             \x20   outputs:\n\
+             \x20     - name: out\n\
+             \x20       schema: geometry_msgs/Vector3\n\
+             \x20 - id: fusion\n\
+             \x20   type: fusion\n\
+             \x20   inputs:\n\
+             \x20     - name: a\n\
+             \x20       source: a_src/out\n\
+             \x20     - name: cam\n\
+             \x20       source: /ext/cam\n";
+        let config = parse_graph(GRAPH).expect("graph parses");
+
+        let mut fusion = BTreeMap::new();
+        fusion.insert("/cp3/a_src/out".to_string(), 30_000_000u64);
+        fusion.insert("/ext/cam".to_string(), 7u64);
+        fusion.insert("/cp3/nobody/out".to_string(), 1u64);
+        let mut ghost = BTreeMap::new();
+        ghost.insert("/cp3/a_src/out".to_string(), 9u64);
+        let mut by_topic = BTreeMap::new();
+        by_topic.insert("fusion".to_string(), fusion);
+        by_topic.insert("ghost".to_string(), ghost);
+
+        let mut want_fusion = BTreeMap::new();
+        want_fusion.insert("a".to_string(), 30_000_000u64);
+        want_fusion.insert("cam".to_string(), 7u64);
+        let mut want = BTreeMap::new();
+        want.insert("fusion".to_string(), want_fusion);
+
+        assert_eq!(restored_sync_heads_by_input(&config, &by_topic), want);
+        assert!(
+            restored_sync_heads_by_input(&config, &BTreeMap::new()).is_empty(),
+            "a from-start pass restores nothing"
+        );
     }
 }
 
