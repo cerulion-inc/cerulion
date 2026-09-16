@@ -23493,6 +23493,19 @@ nodes:
              captures depend on it: {}",
             &body[cfg_line..free_cfg]
         );
+        // ...nor INSIDE an `if records` block above it: from the ring hand-off
+        // to the traced config there is no `records` gate at all (the body is
+        // comment-stripped, so prose can neither satisfy nor defeat this). The
+        // guard line alone cannot see a nesting one block up.
+        let ring_handoff = body[..free_cfg]
+            .rfind("set_trace_ring_producer(")
+            .expect("the ring is handed to the runtime before the traced clock config");
+        assert!(
+            !body[ring_handoff..free_cfg].contains("if records"),
+            "the traced clock config must not sit inside an `if records` block; a plain \
+             free-run run's captures depend on it: {}",
+            &body[ring_handoff..free_cfg]
+        );
 
         // The build-path decision precedes every consumer.
         for consumer in [
