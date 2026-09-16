@@ -3571,55 +3571,56 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             if let Some(onset) = catchup_onset {
                 runtime.attach_replay_catchup_arm(onset);
             }
-            // 4a. The mid-run RESUME restore. LOCKSTEP-only by
-            //     construction — `resolve_resume` refuses a mid-run FREE-RUN bag
-            //     (`FreeRunResumeUnsupported`, exit 2: per-rank anchors are
-            //     not supported), so `resume` is always `None` on a multi-pass
-            //     run and this block is the single-pass path verbatim.
-            if pass.is_lockstep() {
-                if let Some(plan) = resume.as_ref() {
-                    match apply_resume(plan, &clock, &mut runtime, strict_state) {
-                        Ok(report) => acc.resume_report = Some(report),
-                        Err(e) => break 'passes Some((rank, e)),
-                    }
+            // 4a. The mid-run RESUME restore. Keyed on the PLAN,
+            //     not on the coordination mode: `resolve_resume` hands one back
+            //     for a lockstep bag and for a ONE-worker-rank free-run bag (the
+            //     same anchor arithmetic: rank 0's first boundary is the first
+            //     boundary either way), and refuses a MULTI-rank free-run bag by
+            //     name (`FreeRunResumeUnsupported`, exit 2), so `resume` is
+            //     always `None` on a multi-pass run and this block only ever
+            //     runs on the single pass a resume can apply to.
+            if let Some(plan) = resume.as_ref() {
+                match apply_resume(plan, &clock, &mut runtime, strict_state) {
+                    Ok(report) => acc.resume_report = Some(report),
+                    Err(e) => break 'passes Some((rank, e)),
                 }
-                // A RESUMED graph's `Period` nodes must start
-                // from the timing state the anchor was taken with, not the one a
-                // fresh build derives from its clock. Applied here because it needs
-                // the rank tables to resolve a FIRE record's `node_idx`, and still
-                // strictly before the first `step()`.
-                if let Some(plan) = resume.as_ref() {
-                    // A THREE-rung ladder, first that answers wins.
-                    //
-                    //  (i)   the framework section's own `next_fire_ns` — the
-                    //        value the scheduler actually held at the anchor;
-                    //  (ii)  the node's first recorded FIRE — the FIRE-trace rung,
-                    //        the fallback for a bag without framework sections or a node whose
-                    //        anchor states no deadline;
-                    //  (iii) `restore_period_schedule`'s phase-preserving
-                    //        re-advance, for a node neither names.
-                    //
-                    // Rung (i) OUTRANKS rung (ii) for one reason: the
-                    // trace is also what the exit-6 comparator judges against, so a
-                    // baseline read from it makes a schedule divergence at exactly
-                    // that first fire undetectable (this cost is stated at
-                    // `first_recorded_fire_times`, which names the framework section
-                    // as its replacement). A baseline read from recorded SCHEDULER
-                    // state is independent evidence, so the comparator regains that
-                    // fire. Rung (ii) exists because a bag recorded without
-                    // framework sections carries none at all, and for those the
-                    // trace baseline is exactly right.
-                    let mut baselines = match first_recorded_fire_times(&trace, &rank_tables) {
-                        Ok(baselines) => baselines,
-                        Err(e) => break 'passes Some((rank, e)),
-                    };
-                    baselines.extend(
-                        plan.period_baselines
-                            .iter()
-                            .map(|(node, ns)| (node.clone(), *ns)),
-                    );
-                    runtime.restore_period_schedule(&baselines);
-                }
+            }
+            // A RESUMED graph's `Period` nodes must start
+            // from the timing state the anchor was taken with, not the one a
+            // fresh build derives from its clock. Applied here because it needs
+            // the rank tables to resolve a FIRE record's `node_idx`, and still
+            // strictly before the first `step()`.
+            if let Some(plan) = resume.as_ref() {
+                // A THREE-rung ladder, first that answers wins.
+                //
+                //  (i)   the framework section's own `next_fire_ns`: the
+                //        value the scheduler actually held at the anchor;
+                //  (ii)  the node's first recorded FIRE: the FIRE-trace rung,
+                //        the fallback for a bag without framework sections or a node whose
+                //        anchor states no deadline;
+                //  (iii) `restore_period_schedule`'s phase-preserving
+                //        re-advance, for a node neither names.
+                //
+                // Rung (i) OUTRANKS rung (ii) for one reason: the
+                // trace is also what the exit-6 comparator judges against, so a
+                // baseline read from it makes a schedule divergence at exactly
+                // that first fire undetectable (this cost is stated at
+                // `first_recorded_fire_times`, which names the framework section
+                // as its replacement). A baseline read from recorded SCHEDULER
+                // state is independent evidence, so the comparator regains that
+                // fire. Rung (ii) exists because a bag recorded without
+                // framework sections carries none at all, and for those the
+                // trace baseline is exactly right.
+                let mut baselines = match first_recorded_fire_times(&trace, &rank_tables) {
+                    Ok(baselines) => baselines,
+                    Err(e) => break 'passes Some((rank, e)),
+                };
+                baselines.extend(
+                    plan.period_baselines
+                        .iter()
+                        .map(|(node, ns)| (node.clone(), *ns)),
+                );
+                runtime.restore_period_schedule(&baselines);
             }
             let outcome = match run_rank_pass(
                 pass,
@@ -5575,14 +5576,15 @@ fn last_step_at_target(trace: &RecordedTrace, target: u64) -> Result<u64, Replay
 /// assuming the steps are consecutive — `validate_step_boundaries` has not run
 /// yet (see the ordering note on [`resolve_resume`]).
 ///
-/// This is the RESUME path's reader, which is lockstep-only by construction
-/// (`resolve_resume` refuses a mid-run free-run bag), so rank 0's stream IS the
-/// timeline and its first target IS the epoch. It still routes that answer
-/// through [`crate::replay_rank::run_epoch_ns`] rather than reading the target
+/// This is the RESUME path's reader, which is SINGLE-RANK by construction
+/// (`resolve_resume` admits a lockstep bag or a one-worker-rank free-run bag
+/// and refuses a multi-rank free-run bag), so rank 0's stream IS the timeline
+/// and its first target IS the epoch. It still routes that answer through
+/// [`crate::replay_rank::run_epoch_ns`] rather than reading the target
 /// directly: the epoch is ONE rule (the minimum first target across the ranks
 /// that ran), and a second spelling of it here (correct today only because
 /// this path has exactly one rank) is the two-copies class, and the one that
-/// would go wrong first if the resume path ever admitted a free-run bag.
+/// would go wrong first if the resume path ever admitted a multi-rank bag.
 fn last_replayed_step(
     trace: &RecordedTrace,
     duration_bound_ns: Option<u64>,
@@ -5663,22 +5665,54 @@ fn resolve_resume(
     if first.step == 0 {
         return Ok(None); // from start: the constructor's state IS the state.
     }
-    // The mid-run RESUME gate. Everything below this
-    // line rests on THREE assumptions a free-run recording abolishes — that
+    // The MANIFEST-level refusals come first, in the order the capture judge
+    // (`cerulion_core::flashback::resim::judge_resimmable`) asks them, so a
+    // capture's `resimmable_reason` and this resim's first refusal are the SAME
+    // sentence on every shape: the state-ring ambiguity (a property of the
+    // state coverage) before anything about a particular step's records, then
+    // the rank-count gate below. `read_bag_anchors` reads only the state
+    // channel, so hoisting it above the rank tables changes no plan, only
+    // which of two refusals a malformed bag reads first (a bag fault now
+    // precedes an internal manifest-drift report, never the reverse).
+    let anchors =
+        crate::replay_state::read_bag_anchors(&recorded_messages.reader).map_err(|refusal| {
+            ReplayError::StateRestore {
+                reason: refusal.to_string(),
+            }
+        })?;
+    let arc_node_ids: Vec<Arc<str>> = node_ids.iter().map(|s| Arc::from(s.as_str())).collect();
+    let rank_tables = load_rank_tables(trace, arc_node_ids)?;
+    // The mid-run RESUME gate, narrowed to the shape it is TRUE of. Everything
+    // below this line rests on THREE assumptions: that
     // `first_recorded_boundary` (a rank-0 walk) names THE first boundary of the
-    // recording, that k clocks can be placed off that ONE value, and that a
-    // frame stamp can be compared against it (under free-run that comparison
-    // crosses per-rank clock domains). Silently mis-anchoring is the one
-    // outcome that must not happen — it produces a divergence report about an
-    // execution that never occurred — so a free-run bag beginning mid-run is
-    // REFUSED, loudly and by name.
+    // recording, that the clock can be placed off that ONE value, and that a
+    // frame stamp can be compared against it in ONE clock domain. A free-run
+    // recording with SEVERAL worker ranks abolishes all three (each rank keeps
+    // its own boundary stream and its own clock), and silently mis-anchoring
+    // is the one outcome that must not happen (it produces a divergence report
+    // about an execution that never occurred), so that shape is REFUSED,
+    // loudly and by name.
+    //
+    // A free-run recording with exactly ONE worker rank satisfies all three
+    // trivially: rank 0's first boundary IS the first boundary, there is one
+    // clock to place, and every stamp is in that clock's domain. It takes the
+    // ordinary resume below, the same code a lockstep bag takes, which is
+    // what makes the always-on Flashback capture of a one-group free-run
+    // deployment re-executable mid-run. The rank count is the WORKER trace
+    // manifests the bag carries (`load_rank_tables` yields one table per
+    // worker rank and at least one), never a graph-side guess.
     //
     // Keyed on the EXPLICIT stamp: an absent `coordination` key resolves to
     // `Lockstep` (`RecorderInfo::coordination`), so no unstamped bag can
     // reach this arm and no lockstep resume is affected.
-    if coordination == CoordinationMode::FreeRun {
+    // Ordered AFTER the state-ring refusal above on purpose: a real multi-rank
+    // capture declares several state rings and reads `MultiRingAmbiguous` here
+    // and in its own manifest alike; this arm is the backstop for the
+    // multi-rank free-run bag whose state plane declares nothing to refuse on.
+    if coordination == CoordinationMode::FreeRun && rank_tables.len() > 1 {
         return Err(ReplayError::FreeRunResumeUnsupported {
             first_step: first.step,
+            ranks: rank_tables.len(),
         });
     }
     let anchor_step = first.step - 1;
@@ -5688,8 +5722,6 @@ fn resolve_resume(
     // records over their union: which nodes the replay EXECUTES (the
     // required set), and how many frames the steps sharing the first boundary's
     // target COMMITTED (the tie-band split below).
-    let arc_node_ids: Vec<Arc<str>> = node_ids.iter().map(|s| Arc::from(s.as_str())).collect();
-    let rank_tables = load_rank_tables(trace, arc_node_ids)?;
     let fires = scan_suffix_fires(
         trace,
         &rank_tables,
@@ -5697,13 +5729,6 @@ fn resolve_resume(
         last_replayed_step(trace, duration_bound_ns)?,
         last_step_at_target(trace, anchor_clock_ns)?,
     )?;
-
-    let anchors =
-        crate::replay_state::read_bag_anchors(&recorded_messages.reader).map_err(|refusal| {
-            ReplayError::StateRestore {
-                reason: refusal.to_string(),
-            }
-        })?;
     let run_id = crate::replay_state::resolve_run_at(&anchors, anchor_step)
         .map_err(|refusal| ReplayError::StateRestore {
             reason: refusal.to_string(),
@@ -7120,8 +7145,10 @@ fn fold_read_log_outcomes(outcomes: Vec<ReadLogOutcome>) -> ReadLogOutcome {
 /// Apply a mid-run resume anchor to a freshly built runtime.
 ///
 /// Lifted verbatim out of `run_engine` so the pass loop can call it at the one
-/// place it applies (the single LOCKSTEP pass — `resolve_resume` refuses a
-/// mid-run free-run bag, so a multi-pass run never reaches it).
+/// place it applies: the single pass a resume plan exists for, a lockstep
+/// bag's, or a ONE-worker-rank free-run bag's, which resolves to the same plan
+/// by the same arithmetic. `resolve_resume` refuses a mid-run free-run bag
+/// with SEVERAL worker ranks, so a multi-pass run never reaches it.
 fn apply_resume(
     plan: &ResumePlan,
     clock: &Arc<VirtualClock>,
@@ -10161,21 +10188,34 @@ fn run_rank_pass(
     // ── clock placement ───────────────────────────────────────────────────
     //
     // LOCKSTEP from-start begins at clock 0 with build-time deadlines, exactly
-    // as it always has; LOCKSTEP resume was placed by `apply_resume`. FREE-RUN
-    // places the clock on this rank's own first recorded boundary and re-phases
-    // the `Period` schedule in the same breath — see the fn doc.
+    // as it always has; a RESUMED pass of either mode was placed by
+    // `apply_resume` (the clock at the anchor, the resume step, the state) and
+    // by the pass loop's three-rung `Period` ladder. A FREE-RUN pass with no
+    // resume places the clock on this rank's own first recorded boundary and
+    // re-phases the `Period` schedule in the same breath; see the fn doc.
+    //
+    // The resumed free-run pass is deliberately NOT re-placed here even though
+    // the values agree (a one-rank recording's `first_target_ns` IS the resume
+    // anchor's clock and its `first_step` IS the first replay step): this
+    // arm's `restore_period_schedule` is rung (ii) ALONE, and running it after
+    // the ladder would overwrite rung (i), the framework section's own
+    // `next_fire_ns`, with the trace value, which is exactly the un-seeding
+    // the ladder exists to prevent.
     if !lockstep {
-        clock.set(plan.first_target_ns());
-        let baselines = first_recorded_fire_times(pass.trace, pass.rank_tables)?;
-        runtime.restore_period_schedule(&baselines);
-        // A rank whose first recorded boundary is step `S` replays FROM ITS
-        // START at `S`, so its emitted trace records must carry the recording's
-        // step numbers rather than restarting from 0.
-        runtime.set_resume_step(plan.first_step());
+        if resume.is_none() {
+            clock.set(plan.first_target_ns());
+            let baselines = first_recorded_fire_times(pass.trace, pass.rank_tables)?;
+            runtime.restore_period_schedule(&baselines);
+            // A rank whose first recorded boundary is step `S` replays FROM ITS
+            // START at `S`, so its emitted trace records must carry the
+            // recording's step numbers rather than restarting from 0.
+            runtime.set_resume_step(plan.first_step());
+        }
         // Demote the `block` pre-fire gate from a fire
         // decider to an observation. ASKED FOR explicitly (never a default) —
         // this is the one seam that could silently disable lossless
-        // backpressure on a real robot.
+        // backpressure on a real robot. Resumed or not: it is a property of
+        // the free-run contract, not of where the clock started.
         runtime.set_block_gate_replay_bypass(true);
     }
 
@@ -10420,11 +10460,16 @@ fn run_rank_pass(
     let mut unconsumed_report: Option<(u64, String)> = None;
     // The clock's value BEFORE the first replayed step of this pass.
     let mut prev_target = match (resume, lockstep) {
-        (Some(r), true) => r.anchor_clock_ns,
-        (_, true) => 0,
-        // FREE-RUN: the clock was PLACED on this rank's first target above, so
-        // the first delta is 0 rather than a whole wall epoch.
-        (_, false) => plan.first_target_ns(),
+        // A RESUMED pass of either mode: `apply_resume` placed the clock at the
+        // anchor. (For the one-rank free-run resume this equals
+        // `plan.first_target_ns()`: the two are one number, read off the same
+        // boundary record, so the arm below would answer the same; naming the
+        // anchor keeps the resume's clock ONE value with ONE owner.)
+        (Some(r), _) => r.anchor_clock_ns,
+        (None, true) => 0,
+        // FREE-RUN from its start: the clock was PLACED on this rank's first
+        // target above, so the first delta is 0 rather than a whole wall epoch.
+        (None, false) => plan.first_target_ns(),
     };
     // The previous step's target for the 0-DELTA test, which is NOT
     // `prev_target` on the first resumed step. There `prev_target` is the resume
