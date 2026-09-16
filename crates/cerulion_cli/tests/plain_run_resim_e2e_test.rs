@@ -735,13 +735,21 @@ fn resim(root: &Path, bag: &Path, extra: &[&str], stem: &str) -> (Option<i32>, S
     (status.code(), read_file(&err_path))
 }
 
-/// The re-executed step count the resim summary reports.
+/// The re-executed step count the resim summary reports, in either wording:
+/// a bare `--resim` run's `re-executed N step(s)`, or a `--verify` run's
+/// verdict line `replay PASS: <bag> (N tick(s) replayed, ...)` (the verdict
+/// REPLACES the bare summary; arm 6 is the first caller on a `--verify` run).
 fn executed_steps(stderr: &str) -> u64 {
     stderr
         .lines()
         .find_map(|l| {
-            let rest = l.trim().strip_prefix("re-executed ")?;
-            rest.split_once(" step(s)")?.0.parse::<u64>().ok()
+            let l = l.trim();
+            if let Some(rest) = l.strip_prefix("re-executed ") {
+                return rest.split_once(" step(s)")?.0.parse::<u64>().ok();
+            }
+            let rest = l.strip_prefix("replay PASS: ")?;
+            let (_, tail) = rest.rsplit_once(" (")?;
+            tail.split_once(" tick(s) replayed")?.0.parse::<u64>().ok()
         })
         .unwrap_or_else(|| panic!("the resim summary must report its step count:\n{stderr}"))
 }
