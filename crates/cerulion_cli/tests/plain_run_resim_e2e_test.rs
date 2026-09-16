@@ -38,6 +38,14 @@
 //! 4. **NO-INERT-SHIPPING** (`a_flashback_switched_off_run_still_stamps_rings_for_a_later_attach`) —
 //!    rings are NOT gated on the Flashback kill switch, or `bag record
 //!    --run` would lose the trace on every `CERULION_FLASHBACK=off` run.
+//! 5. **THE CO-TENANT** and the D4 run-half (`a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts`,
+//!    `a_run_writes_its_window_recorder_decision_into_run_json`); see their docs.
+//! 6. **THE ONE-RANK FREE-RUN LOOP** (`a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant`):
+//!    the same run under `CERULION_EXECUTION_MODE=free_run` (the free-run
+//!    default is not on `main` yet, so the opt-in is set explicitly), a capture taken
+//!    MID-RUN, `bag play --resim all --verify` exit 0 twice with one report, and the
+//!    perturbed ticker caught at exit 1 naming its topic. The mutant is the base
+//!    commit: before the admission the same arm exits 2 by name at the resim.
 //!
 //! # What each arm alone catches
 //!
@@ -139,7 +147,8 @@
 //! one.
 //!
 //! Prerequisites:
-//! `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`
+//! `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib \
+//!  -p test_node_macro_period_perturbed_cdylib`
 
 #![cfg(unix)]
 
@@ -152,7 +161,9 @@ use std::time::{Duration, Instant};
 // The capture's coverage manifest is read back through the SAME type
 // a `--record` bag's is — that the two artifacts carry ONE document is the whole
 // point, so parsing it some other way would not check the claim.
-use cerulion_bagd::{RecordCoverage, TapSource, RECORD_COVERAGE_ATTACHMENT};
+use cerulion_bagd::{
+    RecordCoverage, TapSource, CAPTURE_RECORDER_HEALTH_ATTACHMENT, RECORD_COVERAGE_ATTACHMENT,
+};
 use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_STEP_BOUNDARY};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::TransportManager;
@@ -2140,4 +2151,305 @@ fn a_run_writes_its_window_recorder_decision_into_run_json() {
         "project rule: an absence names the cause, never another verb's flag: {none}"
     );
     stop_run(&mut run_off, &stderr_off);
+}
+
+/// The PERTURBED twin of `ticker`: the same `#[cerulion_node(period_ms = 50)]`
+/// shape and port, publishing `cmd.x = 1000.0` where the original publishes
+/// `0.0`, the CI stand-in for "rebuild the node with a changed constant".
+const PERTURBED_FIXTURE: &str = "test_node_macro_period_perturbed_cdylib";
+
+/// How many run+capture attempts arm 6 makes to obtain a LOSS-FREE capture
+/// before failing loudly. A window tap that overflowed under desk load drops
+/// frames the re-execution then reproduces, which `--verify` reports as a
+/// divergence that is the desk's and not the candidate's; the right move is a
+/// fresh attempt, never a weaker oracle (the `--record` siblings do the same).
+const LOSS_FREE_ATTEMPTS: usize = 3;
+
+/// The capture's RECORDER health (`CAPTURE_RECORDER_HEALTH_ATTACHMENT`, the
+/// run-cumulative document, so an UPPER bound on what this window lost), summed
+/// over this run's two graph topics. `None` means the attachment is absent,
+/// which on a finalized capture is a harness failure rather than health.
+fn capture_graph_topic_loss(bag: &Path, prefix: &str) -> Option<u64> {
+    let reader = cerulion_bag::BagReader::open(bag).expect("open the capture");
+    let att = reader
+        .attachment(CAPTURE_RECORDER_HEALTH_ATTACHMENT)
+        .expect("read attachments")?;
+    let raw = String::from_utf8_lossy(&att.data).into_owned();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|e| {
+        panic!("the capture's recorder health is not valid JSON ({e}):\n{raw}")
+    });
+    let topics = v["topics"].as_object().unwrap_or_else(|| {
+        panic!(
+            "the capture's recorder health carries no `topics` object; the per-topic \
+             frames_lost term cannot be read, so this guard would report health it never \
+             looked for:\n{raw}"
+        )
+    });
+    Some(
+        ["ticker/cmd", "relay/cmd"]
+            .iter()
+            .map(|suffix| {
+                topics
+                    .get(&format!("/{prefix}/{suffix}"))
+                    .map_or(0, |h| h["frames_lost"].as_u64().unwrap_or(0))
+            })
+            .sum(),
+    )
+}
+
+/// **ARM 6: THE ONE-RANK FREE-RUN LOOP (the mid-run resume).**
+///
+/// The SAME plain 1-group run as arm 1, executed under
+/// `CERULION_EXECUTION_MODE=free_run`, set EXPLICITLY here because the
+/// free-run DEFAULT is not on `main` yet (that flip rebases onto this change);
+/// on `main` the env opt-in is what selects the free-run supervisor path for a
+/// `process_groups` graph. What the capture then is: `coordination: free_run`,
+/// ONE worker rank, a recording that begins MID-RUN (the capture is taken after
+/// the worker has stepped, and the window trims the head), and a complete
+/// anchor at `S`: exactly the one-worker-rank bag `resolve_resume` admits by rank count
+/// (`FreeRunResumeUnsupported`) while the capture's own manifest claimed
+/// `resimmable: true`. For one worker rank the three assumptions that refusal
+/// named hold trivially, so the bag now takes the ordinary resume.
+///
+/// The claims, in the order the sibling arms settled on: the recorded frames
+/// match the fixture HAND ORACLE; the capture is genuinely free-run AND
+/// genuinely mid-run (a lockstep or from-start capture would pass the rest of
+/// this arm without exercising the admission) AND claims `resimmable: true`;
+/// then `bag play --resim all --verify` exits 0 TWICE with byte-identical
+/// `--report` JSON whose `resume` block names the anchor step the capture's own
+/// first boundary implies (the restore, the seed, the clock placement and the
+/// prefix skip are functions of the recording); and (the anti-tautology) the
+/// SAME capture re-executed against the PERTURBED ticker exits 1 with a
+/// `FRAME-CONTENT DIVERGENCE` naming the ticker's topic.
+///
+/// `--verify` IS driven here, unlike arm 1, and arm 1's reason for not driving
+/// it does not apply: that arm's capture may begin at step 0 with a lossy head,
+/// so the re-execution produces frames the window dropped; this arm's capture
+/// RESUMES from its anchor, so the comparison begins where the recording does.
+/// What can still break it is a tap overflow INSIDE the window on a loaded
+/// desk, which is why the capture is gated on the recorder's own loss count and
+/// retried rather than the oracle loosened (see `LOSS_FREE_ATTEMPTS`).
+///
+/// TWO mutants, both RUN: at the base tree the same arm exits 2 at leg 3 with
+/// the refusal naming the free-run stamp and the mid-run first boundary; at
+/// the admission WITHOUT the worker's clock fix (the free-run rank still on
+/// the `RealClock` "live arm"), it exits 2 at leg 3 with check 3 naming the
+/// first admitted ticker frame as matching no boundary target, the kept
+/// capture behind that verdict carried ticker frames at target+42..84 us and
+/// relay frames at target+154..222 us on every step, and its worker log said
+/// `build_path=FreeRunLive`. This arm is therefore the real-binary oracle for
+/// BOTH halves of the change: the engine's admission and the worker's clock.
+///
+/// Prerequisite beyond the file's: `cargo build -p test_node_macro_period_perturbed_cdylib`.
+#[test]
+#[serial]
+fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant() {
+    let mut last_loss = String::new();
+    for attempt in 1..=LOSS_FREE_ATTEMPTS {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let prefix = unique_prefix("plainfr");
+        build_workspace(root, &prefix);
+        let home = root.join("home");
+        let flashbacks = root.join("flashbacks");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&flashbacks).unwrap();
+
+        // ------------------------------------------------------------ leg 1
+        // The run, opted into free-run EXPLICITLY (the flip is not on main).
+        let (mut run, stderr_path) = spawn_run(
+            root,
+            &home,
+            &flashbacks,
+            &[],
+            &[("CERULION_EXECUTION_MODE", "free_run")],
+        );
+        wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
+        // THE MID-RUN RENDEZVOUS (arm 3's): a capture whose trace begins at
+        // step 0 needs no anchor and would not exercise the admission.
+        await_the_worker_has_stepped(&format!("/{prefix}/ticker/cmd"));
+        std::thread::sleep(Duration::from_secs(2));
+
+        // ------------------------------------------------------------ leg 2
+        // CAPTURE, through the operator's own verb.
+        let mut flash = ChildGuard::single_process(
+            Command::new(env!("CARGO_BIN_EXE_cerulion"))
+                .args(["flashback", "--note", "one-rank free-run probe"])
+                .current_dir(root)
+                .env_remove("CARGO_TARGET_DIR")
+                .env("CERULION_NETWORK", "off")
+                .env("CERULION_HOME", &home)
+                .env("CERULION_FLASHBACK_DIR", &flashbacks)
+                .stdout(Stdio::from(
+                    std::fs::File::create(root.join("flash.stdout")).unwrap(),
+                ))
+                .stderr(Stdio::from(
+                    std::fs::File::create(root.join("flash.stderr")).unwrap(),
+                ))
+                .spawn()
+                .expect("spawn cerulion flashback"),
+        );
+        let flash_status = flash
+            .wait_bounded(CAPTURE_COMPLETES)
+            .unwrap_or_else(|| panic!("`cerulion flashback` never returned"));
+        assert!(
+            flash_status.success(),
+            "a free-run `graph run` holds a rolling window too, so `cerulion flashback` must \
+             capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}\nrun log:\n{}",
+            read_file(&root.join("flash.stdout")),
+            read_file(&root.join("flash.stderr")),
+            read_file(&stderr_path)
+        );
+        let captures = mcaps(&flashbacks);
+        assert_eq!(
+            captures.len(),
+            1,
+            "exactly one capture in this run's own directory, got {captures:?}"
+        );
+        let capture = captures[0].clone();
+        stop_run(&mut run, &stderr_path);
+
+        // ----------------------------------------------- the loss-free gate
+        let loss = capture_graph_topic_loss(&capture, &prefix).unwrap_or_else(|| {
+            panic!("a finalized capture carries `{CAPTURE_RECORDER_HEALTH_ATTACHMENT}`")
+        });
+        if loss > 0 {
+            last_loss = format!(
+                "attempt {attempt}: the recorder reports {loss} lost frame(s) on this run's \
+                 topics: a window tap overflowed (loaded desk?), so the re-execution would \
+                 reproduce frames the capture does not hold"
+            );
+            eprintln!("{last_loss}");
+            continue;
+        }
+
+        // ------------------------------------------- the oracle, then the CLAIM
+        let foreign = assert_the_capture_accounts_for_every_topic_it_holds(&capture, &prefix);
+        let frames =
+            assert_frames_match_the_fixture_oracle(&capture, &prefix, "the free-run capture");
+        assert!(frames > 0, "a capture over a live window carries frames");
+
+        let reader = cerulion_bag::BagReader::open(&capture).expect("open the capture");
+        let recorder: serde_json::Value = serde_json::from_slice(
+            &reader
+                .attachment("__cerulion/recorder.json")
+                .expect("read the recorder identity")
+                .expect("a capture carries the recorder identity")
+                .data,
+        )
+        .expect("the recorder identity is valid JSON");
+        assert_eq!(
+            recorder["coordination"],
+            serde_json::json!("free_run"),
+            "this arm is about the FREE-RUN capture; a lockstep stamp here means the env \
+             opt-in did not reach the supervisor: {recorder}"
+        );
+        let first = first_rank0_boundary_step(&capture)
+            .expect("a capture with a trace carries a rank-0 STEP_BOUNDARY");
+        assert!(
+            first > 0,
+            "the capture must begin MID-RUN (its first rank-0 STEP_BOUNDARY is step {first}); \
+             a from-start capture needs no anchor and would not exercise the admission"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &reader
+                .attachment("__cerulion/flashback.json")
+                .expect("read the capture manifest")
+                .expect("a capture carries its own manifest")
+                .data,
+        )
+        .expect("the capture manifest is valid JSON");
+        assert_eq!(
+            manifest["anchor"]["resimmable"],
+            serde_json::json!(true),
+            "the capture judge's claim, which the resim below must honour: {manifest}"
+        );
+        drop(reader);
+
+        // ------------------------------------------------------------ leg 3
+        // RESIM with the VERDICT, twice: exit 0 and ONE report.
+        let report_a = root.join("resim_a.json");
+        let report_b = root.join("resim_b.json");
+        let (code, resim_err) = resim(
+            root,
+            &capture,
+            &["--verify", "--report", report_a.to_str().unwrap()],
+            "resim_a",
+        );
+        assert_eq!(
+            code,
+            Some(0),
+            "THE ADMISSION: a one-rank free-run capture beginning mid-run (first rank-0 \
+             boundary {first}) must resume and verify byte-exact. Exit 2 naming \
+             `coordination: free_run` is the refusal of every free-run mid-run bag itself; exit 1 is a \
+             frame the re-execution produced that the capture does not hold (foreign \
+             topics: {foreign:?}).\nstderr:\n{resim_err}"
+        );
+        assert!(
+            executed_steps(&resim_err) > 0,
+            "the resim must actually re-execute the capture's suffix:\n{resim_err}"
+        );
+        let (code_b, resim_err_b) = resim(
+            root,
+            &capture,
+            &["--verify", "--report", report_b.to_str().unwrap()],
+            "resim_b",
+        );
+        assert_eq!(
+            code_b,
+            Some(0),
+            "the second resim of the same capture:\n{resim_err_b}"
+        );
+        let report_json = read_file(&report_a);
+        assert_eq!(
+            report_json,
+            read_file(&report_b),
+            "two resims of one capture must produce ONE report"
+        );
+        let report: serde_json::Value =
+            serde_json::from_str(&report_json).expect("the report is valid JSON");
+        assert_eq!(report["passed"], serde_json::json!(true), "{report}");
+        assert_eq!(
+            report["coordination"]["mode"],
+            serde_json::json!("free_run"),
+            "the contract applied is the one the capture stamped: {report}"
+        );
+        assert_eq!(
+            report["resume"]["first_replay_step"],
+            serde_json::json!(first),
+            "the resume begins at the capture's first recorded boundary: {report}"
+        );
+        assert_eq!(
+            report["resume"]["anchor_step"],
+            serde_json::json!(first - 1),
+            "…from the anchor taken at the step before it: {report}"
+        );
+
+        // ------------------------------------------------------------ leg 4
+        // The ANTI-TAUTOLOGY: the same capture against a candidate whose ONE
+        // constant changed is a data violation naming the ticker's topic.
+        std::fs::copy(
+            fixture_cdylib(PERTURBED_FIXTURE),
+            root.join("target/debug").join(dylib_file("ticker")),
+        )
+        .expect("overwrite the ticker cdylib with the perturbed twin");
+        let (code_p, resim_err_p) = resim(root, &capture, &["--verify"], "resim_perturbed");
+        let resim_err_p = strip_ansi(&resim_err_p);
+        assert_eq!(
+            code_p,
+            Some(1),
+            "the SAME capture against a perturbed candidate must exit 1 (a data violation, \
+             never 2 and never 6):\n{resim_err_p}"
+        );
+        let ticker_topic = format!("/{prefix}/ticker/cmd");
+        assert!(
+            resim_err_p.contains("FRAME-CONTENT DIVERGENCE") && resim_err_p.contains(&ticker_topic),
+            "the verdict names the data-divergence class and the ticker's topic:\n{resim_err_p}"
+        );
+        return;
+    }
+    panic!(
+        "could not obtain a LOSS-FREE capture in {LOSS_FREE_ATTEMPTS} attempts; REFUSING to \
+         weaken the `--verify` exit-0 oracle. Last: {last_loss}"
+    );
 }
