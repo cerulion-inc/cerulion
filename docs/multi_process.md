@@ -665,7 +665,7 @@ Two properties invert with the mode, and they are the reason the stamp exists:
 | | `lockstep` | `free_run` |
 |---|---|---|
 | Per-step boundary times | EQUAL across ranks (the handed quantum) | Per-rank and wall-faithful, sharing only the GO epoch |
-| Mid-run resume | Anchors on the ONE first recorded boundary | **Refused loudly** if the recording begins mid-run: there is no single first boundary, k clocks cannot be placed off one value, and a stamp compared against it crosses per-rank clock domains. Per-rank anchors are not supported |
+| Mid-run resume | Anchors on the ONE first recorded boundary | Anchors on the recording's first recorded boundary (the same resume, from the same anchor the capture carries) when the recording holds ONE worker rank, and the resumed pass is then re-executed like any free-run bag; a recording with several worker ranks is refused by name, since per-rank anchors are not supported |
 
 **Recording a `free_run` bag is opt-in.** The reader and the per-rank
 executor handle such a bag with no switch; the recording arm is behind the execution-mode
