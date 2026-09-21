@@ -1,0 +1,55 @@
+# The Go2 keyboard teleop node crate (home: examples/go2 — the Go2 demo
+# Cerulion workspace, one crate per node). `keymap` is the pure
+# std-only key→Twist state machine; `pump` is the hardware `crossterm` terminal
+# pump + raw-mode RAII; `lib.rs` wraps them in the `#[cerulion_node(external)]`
+# KeyboardTeleop node. Portable (macOS + Linux); gilrs-free.
+[package]
+name = "keyboard_teleop"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Go2 keyboard teleop: terminal WASD to geometry_msgs/Twist, latched + auto-zero"
+
+[lib]
+# `cdylib` is the production artifact (loaded by `cerulion graph run` via
+# DylibNodeEntry). `rlib` is ADDITIONALLY emitted so the integration tests +
+# the sibling joystick crate's const-consistency dev-dep can link the crate
+# in-process; it adds nothing to the production surface.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+# Portable terminal raw-mode + key events. PINNED to 0.28 to match
+# cerulion_cli_tui/Cargo.toml (the ratatui/TUI family already vendors this
+# version). Third-party dep declared CRATE-LOCALLY (not a examples/go2 workspace
+# dep).
+crossterm = "0.28"
+# Structured logging in the hardware pump (no-TTY warn).
+tracing = "0.1"
+
+# Ctrl-C translation: raw mode disables ISIG, so the
+# terminal never turns Ctrl-C into SIGINT — the pump detects the Ctrl-C
+# KeyEvent itself and `libc::raise(SIGINT)`s explicitly so the graph's
+# existing shutdown path runs. Unix-only (Windows is not supported); already
+# in the demo dependency tree transitively, so this adds no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# `test-helpers` unlocks `cerulion_core::testing::iceoryx_test_config` +
+# `TransportManager::init_for_test` for the e2e (the teleop_mux precedent).
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+# Matches cerulion_core's own indexmap major (2.x) — `GraphRuntime::build`
+# takes `IndexMap<String, Box<dyn NodeEntry>>`.
+indexmap = "2.8"
+
+# The demo workspace mirrors the root `[workspace.lints]` table (see
+# `examples/go2/Cargo.toml`), so every member here inherits the SAME strict lints as
+# the main tree rather than sitting under no lint table at all.
+[lints]
+workspace = true

@@ -1,0 +1,61 @@
+# Teleop on the companion computer, all in one process: a Bluetooth gamepad
+# and a terminal keyboard publish velocity commands, the safety mux
+# arbitrates them, and the sport driver turns the winner into
+# unitree_api/Request on the robot's /api/sport/request DDS topic.
+#
+# Created with `cerulion graph create teleop -n go2` + `cerulion node stage`
+# for each node; the `topic:` overrides and the absolute `source:` references
+# are hand edits (a relative `node/port` source resolves to the prefix-derived
+# name, never to a `topic:` override, so the canonical /go2/cmd_vel names
+# must be spelled on both ends).
+#
+# RUN (on the companion computer, in a real terminal; the keyboard node needs
+# a TTY, which an `ssh -t` session provides):
+#
+#   export GO2_IFACE=<this computer's robot-LAN interface IP>
+#   cerulion graph run teleop --single-process
+#
+# `--single-process` keeps the two `external` input nodes, the mux and the
+# DDS writer in one process: the keyboard's raw-mode terminal and the driver's
+# one-per-process participant both want that, and there is nothing here worth
+# splitting.
+#
+# Before the first actuation read ROBOT-DAY.md section 4: the robot on a
+# stand, stood up with the vendor remote, the deadman check done inline.
+#
+# Topics (canonical, absolute; README.md "Topics"):
+#   /go2/cmd_vel/joystick  geometry_msgs/Twist  the pad (RB deadman, 20 Hz)
+#   /go2/cmd_vel/keyboard  geometry_msgs/Twist  the terminal (WASD, 10 Hz)
+#   /go2/cmd_vel           geometry_msgs/Twist  the arbitrated command (50 Hz)
+# The sport driver has no Cerulion output: its output is the DDS request.
+
+prefix: go2
+nodes:
+  - id: joystick_teleop
+    type: joystick_teleop
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Twist
+        topic: /go2/cmd_vel/joystick
+  - id: keyboard_teleop
+    type: keyboard_teleop
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Twist
+        topic: /go2/cmd_vel/keyboard
+  - id: teleop_mux
+    type: teleop_mux
+    inputs:
+      - name: joy_cmd
+        source: /go2/cmd_vel/joystick
+      - name: key_cmd
+        source: /go2/cmd_vel/keyboard
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Twist
+        topic: /go2/cmd_vel
+  - id: sport_driver
+    type: sport_driver
+    inputs:
+      - name: cmd
+        source: /go2/cmd_vel

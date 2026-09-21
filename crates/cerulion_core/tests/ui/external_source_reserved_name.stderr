@@ -1,0 +1,58 @@
+error: method names starting with `__cer_` are reserved by `#[cerulion_node_impl]` for macro-injected shims. Rename this method to something else.
+  --> tests/ui/external_source_reserved_name.rs:23:8
+   |
+23 |     fn __cer_external_source(&mut self) -> ExternalSource {
+   |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `cdylib`
+  --> tests/ui/external_source_reserved_name.rs:10:1
+   |
+10 | #[cerulion_node(external)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `debug-logging`, `fuzz-helpers`, and `test-helpers`
+   = note: using a cfg inside a attribute macro will use the cfgs from the destination crate and not the ones from the defining crate
+   = help: try referring to `cerulion_node` crate for guidance on how handle this unexpected cfg
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+   = note: this warning originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_init` found for struct `ExternalReservedName` in the current scope
+  --> tests/ui/external_source_reserved_name.rs:10:1
+   |
+10 | #[cerulion_node(external)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `ExternalReservedName`
+11 | struct ExternalReservedName {
+   | --------------------------- method `__cer_user_init` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_zero_copy_tick` found for struct `ExternalReservedName` in the current scope
+  --> tests/ui/external_source_reserved_name.rs:10:1
+   |
+10 | #[cerulion_node(external)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `ExternalReservedName`
+11 | struct ExternalReservedName {
+   | --------------------------- method `__cer_zero_copy_tick` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_shutdown` found for struct `ExternalReservedName` in the current scope
+  --> tests/ui/external_source_reserved_name.rs:10:1
+   |
+10 | #[cerulion_node(external)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+11 | struct ExternalReservedName {
+   | --------------------------- method `__cer_user_shutdown` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_external_source` found for struct `ExternalReservedName` in the current scope
+  --> tests/ui/external_source_reserved_name.rs:10:1
+   |
+10 | #[cerulion_node(external)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `ExternalReservedName`
+11 | struct ExternalReservedName {
+   | --------------------------- method `__cer_user_external_source` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

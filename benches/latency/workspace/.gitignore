@@ -1,0 +1,9 @@
+# Build artifacts only. Cargo.lock is deliberately RE-INCLUDED: the repo
+# root .gitignore ignores every non-root Cargo.lock, but this workspace's
+# lockfile is load-bearing (iceoryx2 family must stay pinned =0.9.1 in
+# lockstep with the repo lockfile — the binary<->cdylib skew class).
+/target/
+!Cargo.lock
+# Transient per-size ping-source backup made by run_workspace.sh's period
+# rewrite (restored on exit; self-healing across a killed run).
+*.orig

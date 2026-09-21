@@ -1,0 +1,20 @@
+prefix: camera_pipeline
+nodes:
+- id: sensor
+  type: sensor
+  inputs: []
+  outputs:
+  - name: image
+    schema: sensor_msgs/Image
+    max_slice_len: 1048576
+    history_size: 0
+- id: detector
+  type: detector
+  inputs:
+  - name: image
+    source: sensor/image
+  outputs:
+  - name: detection
+    schema: geometry_msgs/PoseStamped
+    max_slice_len: 4096
+    history_size: 0

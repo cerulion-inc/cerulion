@@ -1,0 +1,133 @@
+[package]
+name = "cerulion_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Cerulion command-line interface: create workspaces, build nodes, run graphs, and inspect topics"
+readme = "README.md"
+# A binary crate has no API docs for docs.rs to render; the user guide is the
+# documentation a `cargo install` user wants.
+documentation = "https://docs.cerulion.com"
+keywords = ["robotics", "cli", "zero-copy", "middleware", "cerulion"]
+categories = ["science::robotics", "command-line-utilities"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/cerulion-{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "cerulion-{ version }-{ target }/{ bin }{ binary-ext }"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cerulion"
+path = "src/main.rs"
+
+[dependencies]
+cerulion_cli_engine = { workspace = true }
+cerulion_cli_tui = { workspace = true }
+cerulion_core = { workspace = true }
+# `cerulion ros2 attach` wires the live DDS discovery backend
+# (cerulion_dds::LiveDiscovery) into the engine's pure command logic here at
+# the composition root. Path + exact version per the internal-crate policy.
+cerulion_dds = { workspace = true, features = ["jazzy"] }
+# `unstable-ext` unlocks `Arg::add` / `Command::add` — the extension
+# seam `clap_complete`'s `#[arg(add = ArgValueCandidates::new(..))]` lowers to.
+# `clap_complete/unstable-dynamic` already enables it transitively, so this line
+# is DECLARATIVE, not load-bearing: it makes the dependency explicit so a future
+# `clap_complete` change (or a drop of `unstable-dynamic`) can't silently break
+# every `add =` attribute in `cli.rs` with a confusing derive error. Same
+# explicit-contract reasoning as the `ctrlc` `termination` note below.
+clap = { version = "4", features = ["derive", "unstable-ext"] }
+tracing = "0.1"
+# NO `tracing-subscriber`: this binary installs no subscriber of its own —
+# `init_logging` (main.rs) delegates to `cerulion_core::init_logging`, which
+# owns the `env-filter` dependency and the whole filter policy.
+# `termination` makes SIGTERM + SIGHUP route to the ONE
+# `setup_ctrlc_handler` closure alongside SIGINT (Unix). This coverage was
+# already present ACCIDENTALLY: the `cfg(unix)` `cerulion_bagd` dependency
+# below enables `ctrlc`'s `termination` feature and Cargo feature-unification
+# folds it into this binary. Declaring it here makes the contract EXPLICIT —
+# un-linking bagd (or dropping its feature) can no longer silently strip the
+# `cerulion` binary's TERM/HUP handling.
+ctrlc = { version = "3", features = ["termination"] }
+# Shell tab-completion. `unstable-dynamic` is the feature that carries
+# BOTH halves of the design: `CompleteEnv` (the `COMPLETE=<shell> cerulion`
+# protocol `cerulion completions <shell>` registers) and the
+# `ArgValueCandidates` / `PathCompleter` arg extensions that feed live topic /
+# node / graph / schema / robot names into a TAB press. The AOT `clap_complete::
+# aot` generators come with the crate but are deliberately NOT used — a static
+# script cannot complete live names, and sourcing both mechanisms would have the
+# last one win. Only the dynamic engine is wired.
+clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
+
+# bagd is folded into this binary as the
+# `cerulion bagd` subcommand (`BagdArgs` + `bagd_cli_main`). Unix-gated —
+# `cerulion_bagd`'s lib is `#![cfg(unix)]` (SIGTERM lifecycle over POSIX SHM);
+# non-Unix builds carry a unit `Bagd` variant with a loud error stub.
+[target.'cfg(unix)'.dependencies]
+cerulion_bagd = { workspace = true }
+
+[dev-dependencies]
+# The moved bagd subprocess tests (tests/bagd_subprocess_test.rs)
+# spawn the REAL `cerulion` binary with the `bagd` subcommand and re-read the
+# bags with cerulion_bag's reader. Path-only (publish-cycle clean, matches the
+# cerulion_core dev-dep note below).
+cerulion_bag = { path = "../cerulion_bag" }
+# The multi-process SUPERVISOR test
+# (`tests/mp_supervisor_box_test.rs`) spawns the REAL `cerulion` binary as a
+# supervisor, reads the workers' dumped fire traces, and runs an in-process
+# monolith oracle leg. `test-helpers` unlocks `cerulion_core::testing::
+# iceoryx_test_config` + `TransportManager::init_for_test` (the isolated
+# per-test SHM transport the oracle leg builds on); the crate-root re-exports
+# it needs (`GraphRuntime`, `DylibNodeEntry`, `merge_partition_traces`,
+# `ProcessTrace`, `TraceEntry`, `VirtualClock`, `MacroPolicy`) are ungated.
+# Path-only, NOT `workspace = true` (root Cargo.toml mandate): path-only
+# dev-deps are stripped by `cargo package`, keeping the publish cycle clean.
+cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+# `#[serial]` — the iceoryx2 SHM singleton + the cross-process barrier
+# namespace make the two supervisor tests mutually exclusive. Tracks
+# `cerulion_core`'s `serial_test = "3"`.
+serial_test = "3"
+# `clean_diagnostic_tests` drives real `CapturedLog`s (whose `level`
+# is iceoryx2's `LogLevel`) through the engine's classifier and into the
+# `cerulion clean` listing, pinning capture → attribution → render end to end.
+# Same exact pin as `cerulion_cli_engine` (the lockstep contract).
+iceoryx2 = "=0.9.1"
+# The schema CLI e2e (tests/schema_cli_test.rs) pins the
+# `schema info sensor_msgs::Image` stdout hash against the generated
+# `<Image as ShmMessage>::SCHEMA_HASH` oracle. Path-only, NOT
+# `workspace = true` (root Cargo.toml mandate): path-only dev-deps are
+# stripped by `cargo package`, keeping the publish cycle clean.
+native_ros2_messages = { path = "../native_ros2_messages" }
+# Scaffold workspace + per-run plan/trace directories.
+tempfile = "3"
+# Deserialize the workers' `trace_{group}.json` dumps into a local `FlatEntry`.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Serialize the constructed `GraphConfig` into the graph YAML the supervisor
+# parses (serializing the same struct the parser reads → parse-compat by
+# construction).
+serde_yaml = "0.9"
+# Process-group signals (terminal-Ctrl-C emulation, worker-crash SIGKILL,
+# orphan `kill(pid, 0)` liveness probes) — all under `#[cfg(unix)]`.
+libc = "0.2"
+# The monolith oracle leg builds the `IndexMap<String, Box<dyn NodeEntry>>`
+# node-factory map `GraphRuntime::build_with_schema_hashes` consumes.
+indexmap = "2.8"
+# The network-gateway e2e (`tests/network_gateway_e2e_test.rs`)
+# starts an IN-PROCESS `cerulion-netd` daemon (with a counting spy egress plane)
+# so the real `cerulion graph run` subprocess routes its egress through netd (the
+# desk default) — asserting NO per-run gateway child + the connection-close
+# release on SIGINT. Path-only (publish-cycle clean, matches the notes above);
+# `default-features = false` keeps the iroh WAN plane out of the test build.
+cerulion_netd = { path = "../cerulion_netd", default-features = false }

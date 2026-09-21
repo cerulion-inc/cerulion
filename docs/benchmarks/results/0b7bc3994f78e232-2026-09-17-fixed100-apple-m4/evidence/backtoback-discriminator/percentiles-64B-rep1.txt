@@ -1,0 +1,11 @@
+# iox2_chrt0, backtoback, 64 B, rep 1 - computed from the raw .bin, which is
+# NOT in this package (retained on the measuring box at
+# <lane>/run-btb-probe/rep1/raw/iox2_chrt0_64.bin)
+samples        10000
+p50_ns           792
+p99_ns          1125
+p99_9_ns        1375
+min_ns           541
+max_ns          6334
+mean_ns          810
+over_100us         0

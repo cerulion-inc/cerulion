@@ -1,0 +1,38 @@
+error: #[on_event(output = "nope")] references an unknown output — `nope` is not declared as an `#[output]` field on the sibling `#[cerulion_node]` struct
+  --> tests/ui/on_event_output_unknown_port.rs:29:8
+   |
+29 |     fn on_promise(&mut self, _event: PromiseWithinEvent) {}
+   |        ^^^^^^^^^^
+
+error[E0599]: no method named `__cer_user_init` found for struct `OnEventUnknownOutputNode` in the current scope
+  --> tests/ui/on_event_output_unknown_port.rs:12:1
+   |
+12 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `OnEventUnknownOutputNode`
+13 | #[derive(Default)]
+14 | struct OnEventUnknownOutputNode {
+   | ------------------------------- method `__cer_user_init` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_zero_copy_tick` found for struct `OnEventUnknownOutputNode` in the current scope
+  --> tests/ui/on_event_output_unknown_port.rs:12:1
+   |
+12 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `OnEventUnknownOutputNode`
+13 | #[derive(Default)]
+14 | struct OnEventUnknownOutputNode {
+   | ------------------------------- method `__cer_zero_copy_tick` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_shutdown` found for struct `OnEventUnknownOutputNode` in the current scope
+  --> tests/ui/on_event_output_unknown_port.rs:12:1
+   |
+12 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+13 | #[derive(Default)]
+14 | struct OnEventUnknownOutputNode {
+   | ------------------------------- method `__cer_user_shutdown` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

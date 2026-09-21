@@ -1,0 +1,2484 @@
+{
+  "pass": "on",
+  "sha": "a68a2a987",
+  "date": "2026-09-16",
+  "pooled_n": [
+    10000
+  ],
+  "cells": {
+    "cerulion_workspace_split_chrt0": {
+      "64": {
+        "p50": 4067,
+        "p99": 6610,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 3923,
+        "rep_max": 4088,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "256": {
+        "p50": 3966,
+        "p99": 6625,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 3918,
+        "rep_max": 4131,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1024": {
+        "p50": 4010,
+        "p99": 7768,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 3945,
+        "rep_max": 4122,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4096": {
+        "p50": 4009,
+        "p99": 6746,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 3944,
+        "rep_max": 4066,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16384": {
+        "p50": 4017,
+        "p99": 6454,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 3978,
+        "rep_max": 4134,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "65536": {
+        "p50": 4045,
+        "p99": 6761,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 4006,
+        "rep_max": 4098,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "262144": {
+        "p50": 4035,
+        "p99": 7634,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 3985,
+        "rep_max": 4190,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1048576": {
+        "p50": 4076,
+        "p99": 7378,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 4054,
+        "rep_max": 4140,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4194304": {
+        "p50": 4329,
+        "p99": 8180,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 4238,
+        "rep_max": 4347,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16777216": {
+        "p50": 4434,
+        "p99": 10446,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 4391,
+        "rep_max": 4492,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      }
+    },
+    "cerulion_workspace_mono_chrt0": {
+      "64": {
+        "p50": 2685,
+        "p99": 9414,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2658,
+        "rep_max": 2700,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "256": {
+        "p50": 2682,
+        "p99": 9510,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2648,
+        "rep_max": 2743,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1024": {
+        "p50": 2662,
+        "p99": 9347,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2654,
+        "rep_max": 2695,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4096": {
+        "p50": 2677,
+        "p99": 9365,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2650,
+        "rep_max": 2725,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16384": {
+        "p50": 2696,
+        "p99": 9707,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2674,
+        "rep_max": 2783,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "65536": {
+        "p50": 2746,
+        "p99": 9936,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2705,
+        "rep_max": 2864,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "262144": {
+        "p50": 2709,
+        "p99": 10030,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2686,
+        "rep_max": 2859,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1048576": {
+        "p50": 2760,
+        "p99": 10736,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2688,
+        "rep_max": 2773,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4194304": {
+        "p50": 2769,
+        "p99": 11657,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2731,
+        "rep_max": 2810,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16777216": {
+        "p50": 2802,
+        "p99": 14226,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2771,
+        "rep_max": 2849,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      }
+    },
+    "iox2_chrt0": {
+      "64": {
+        "p50": 2422,
+        "p99": 3016,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 1340,
+        "rep_max": 2502,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "256": {
+        "p50": 2420,
+        "p99": 3057,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2397,
+        "rep_max": 2876,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1024": {
+        "p50": 2471,
+        "p99": 3057,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2417,
+        "rep_max": 2876,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4096": {
+        "p50": 2418,
+        "p99": 6784,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2380,
+        "rep_max": 2924,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16384": {
+        "p50": 2408,
+        "p99": 3058,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2395,
+        "rep_max": 2846,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "65536": {
+        "p50": 2439,
+        "p99": 3059,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 1367,
+        "rep_max": 2848,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "262144": {
+        "p50": 2492,
+        "p99": 3051,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2439,
+        "rep_max": 2847,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1048576": {
+        "p50": 2483,
+        "p99": 3071,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2466,
+        "rep_max": 2783,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4194304": {
+        "p50": 2829,
+        "p99": 3173,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2509,
+        "rep_max": 2906,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16777216": {
+        "p50": 2844,
+        "p99": 3207,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 2457,
+        "rep_max": 3014,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      }
+    },
+    "zenoh_shm_chrt0": {
+      "64": {
+        "p50": 509668,
+        "p99": 831363,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 420984,
+        "rep_max": 608458,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "256": {
+        "p50": 534698,
+        "p99": 741355,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 442082,
+        "rep_max": 577923,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1024": {
+        "p50": 469108,
+        "p99": 823746,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 362365,
+        "rep_max": 654899,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4096": {
+        "p50": 475261,
+        "p99": 742773,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 255574,
+        "rep_max": 546830,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16384": {
+        "p50": 413063,
+        "p99": 652321,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 351351,
+        "rep_max": 503323,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "65536": {
+        "p50": 423936,
+        "p99": 755237,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 316613,
+        "rep_max": 601794,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "262144": {
+        "p50": 539090,
+        "p99": 757593,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 477972,
+        "rep_max": 561143,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1048576": {
+        "p50": 580635,
+        "p99": 833599,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 133163,
+        "rep_max": 653652,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4194304": {
+        "p50": 542945,
+        "p99": 800297,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 490797,
+        "rep_max": 589011,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16777216": {
+        "p50": 591337,
+        "p99": 800378,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 438711,
+        "rep_max": 619007,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      }
+    },
+    "jazzy_stock_rclcpp_chrt0": {
+      "64": {
+        "p50": 311109,
+        "p99": 568168,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 181094,
+        "rep_max": 487320,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "256": {
+        "p50": 309681,
+        "p99": 556147,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 75843,
+        "rep_max": 396630,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1024": {
+        "p50": 409714,
+        "p99": 604246,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 186767,
+        "rep_max": 474274,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4096": {
+        "p50": 442228,
+        "p99": 587249,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 271820,
+        "rep_max": 462625,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16384": {
+        "p50": 464062,
+        "p99": 614180,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 360044,
+        "rep_max": 520605,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "65536": {
+        "p50": 463745,
+        "p99": 639071,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 433769,
+        "rep_max": 538291,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "262144": {
+        "p50": 483164,
+        "p99": 653168,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 363522,
+        "rep_max": 502489,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1048576": {
+        "p50": 10951634,
+        "p99": 43402264,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 10938932,
+        "rep_max": 11332391,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4194304": {
+        "p50": 12912069,
+        "p99": 35958716,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 4472020,
+        "rep_max": 12940271,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16777216": {
+        "p50": 103853928,
+        "p99": 156924061,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 102852151,
+        "rep_max": 104196430,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      }
+    },
+    "jazzy_composed_ipcon_rclcpp_chrt0": {
+      "64": {
+        "p50": 24639,
+        "p99": 31468,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 24057,
+        "rep_max": 28901,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "256": {
+        "p50": 28334,
+        "p99": 30786,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 25150,
+        "rep_max": 28547,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1024": {
+        "p50": 28475,
+        "p99": 31203,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 24159,
+        "rep_max": 29700,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4096": {
+        "p50": 28390,
+        "p99": 31218,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 24374,
+        "rep_max": 29643,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16384": {
+        "p50": 28902,
+        "p99": 32469,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 11595,
+        "rep_max": 30417,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "65536": {
+        "p50": 25850,
+        "p99": 31424,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 24955,
+        "rep_max": 29808,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "262144": {
+        "p50": 27730,
+        "p99": 42084,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 15637,
+        "rep_max": 29417,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "1048576": {
+        "p50": 29791,
+        "p99": 36988,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 13671,
+        "rep_max": 34064,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "4194304": {
+        "p50": 33631,
+        "p99": 36484,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 25015,
+        "rep_max": 34601,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      },
+      "16777216": {
+        "p50": 33415,
+        "p99": 37337,
+        "n": 10000,
+        "rep_count": 5,
+        "rep_min": 28488,
+        "rep_max": 34148,
+        "rate": "100",
+        "reps": [
+          {
+            "rep": "rep1",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep2",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep3",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep4",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          },
+          {
+            "rep": "rep5",
+            "rate": "100",
+            "p50": null,
+            "n": null
+          }
+        ]
+      }
+    }
+  },
+  "missing": [],
+  "rate_caveats": {}
+}

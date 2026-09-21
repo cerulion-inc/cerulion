@@ -1,0 +1,11 @@
+error: unknown backpressure policy `drop_newest`, expected `drop_oldest`, `block`, or `sample(ms)`
+  --> tests/ui/input_unknown_backpressure_policy.rs:11:28
+   |
+11 |     #[input(backpressure = drop_newest)]
+   |                            ^^^^^^^^^^^
+
+error: cannot find attribute `input` in this scope
+  --> tests/ui/input_unknown_backpressure_policy.rs:11:7
+   |
+11 |     #[input(backpressure = drop_newest)]
+   |       ^^^^^

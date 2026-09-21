@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "cerulion_bagd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Recorder daemon for Cerulion: taps live topics and scheduler traces into one MCAP bag"
+readme = "README.md"
+keywords = ["robotics", "mcap", "recorder", "daemon", "cerulion"]
+categories = ["science::robotics", "development-tools::debugging"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# bagd is LIB-ONLY — the recorder is the
+# `cerulion bagd` subcommand (`cerulion_cli` embeds `BagdArgs` and dispatches to
+# `bagd_cli_main`). The old standalone `[[bin]] bagd` was deleted; `graph run
+# --record` self-spawns `current_exe() bagd ...` (the supervisor
+# precedent), so writer and reader are always the SAME binary.
+
+[dependencies]
+# All transport (taps, /bagd/status publisher, trace rings) goes through
+# cerulion_core — NO direct iceoryx2 dependency (the exact-pin lockstep test
+# guards the iceoryx2 family and this crate must not perturb it). The hidden
+# `--test-iox2-config` seam calls `TransportManager::init_with_ix_config_json`,
+# which handles the opaque JSON so this crate never names an iceoryx2 type.
+cerulion_core = { workspace = true }
+# The hand-rolled zero-copy MCAP writer/reader (BagWriter / BagReader).
+cerulion_bag = { workspace = true }
+# Recomputing a served doc's recipe-3 hash requires resolving it
+# against its whole closure INCLUDING the built-in corpus — a custom type nesting
+# `geometry_msgs/Vector3` mis-hashes without Vector3's layout, and a wrong hash is a
+# FALSE REFUSAL. `cerulion_cli_engine::schema_cmd::parse_builtin_schemas` is the same
+# loop but is `pub(crate)` there AND that crate depends on this one, so importing it
+# would be a cyclic package edge. Pure generated data + `cerulion_core`; already in
+# the `cerulion` binary's tree via the CLI engine.
+native_ros2_messages = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+# features=["termination"] so SIGTERM is caught in addition to SIGINT — a
+# supervisor/systemd stop must trigger the clean final-drain + finalize.
+ctrlc = { version = "3", features = ["termination"] }
+# Mirror cerulion_core: cap release logging at info.
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# /bagd/status JSON payload.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# `--exclude` patterns must be evaluated inside
+# `discovery::plan_discovery`, on every rescan — a topic registered mid-recording
+# is exactly what discovery exists to find and therefore exactly what an operator
+# may need to exclude, so a name set resolved at arm time cannot serve. The
+# semantics must also match `cerulion_cli_engine::bag_cmd::compile_patterns`
+# byte-for-byte (one flag filters the DECLARED half there and the DISCOVERED half
+# here), which means the same crate and the same unanchored `is_match`. Adds
+# NOTHING to any shipping binary's tree: `cerulion_cli_engine` already depends on
+# both `regex` and this crate.
+regex = "1"
+
+# The SCHEMA-DEMAND rung speaks to the one per-computer
+# `cerulion-netd` over its UDS control seam, so the recorder still opens
+# no network session of its own.
+#
+# UNIX-GATED, and the gate is a COMPILE requirement rather than a preference:
+# `cerulion_netd` carries NO crate-level `#![cfg(unix)]` and imports
+# `std::os::unix::net::UnixStream` unconditionally (`client.rs`, `daemon.rs`,
+# `hygiene.rs`, `wan.rs`), so it cannot compile for a non-Unix target at all —
+# MEASURED: `use std::os::unix::net::UnixStream;` is `E0433: cannot find 'unix' in
+# 'os'` for `x86_64-pc-windows-msvc`. An UNCONDITIONAL edge would therefore drag
+# netd into a non-Unix build of THIS crate and break it. `cerulion_cli_engine`
+# gates its own netd dep for exactly this reason, beside its `cerulion_bagd` and
+# `cerulion_bag` edges.
+#
+# NOTHING needs cfg-gating in `src/`: this crate's `lib.rs` is itself
+# `#![cfg(unix)]`, so on a non-Unix target the whole crate — `schema_resolve`'s
+# demand rungs included — is compiled away and there is no arm left to degrade.
+# The loud non-Unix degradation for the recording feature as a whole already
+# lives one level up, where the CLI's Unix-gated `cerulion_bagd` edge makes
+# `--record` return "unsupported on this platform".
+#
+# `default-features = false` is LOAD-BEARING: netd's `wan` feature is default-ON
+# and cargo unifies features per package, so a defaults-on edge from this crate
+# (which IS a `default-members` entry) would drag the ~390-crate iroh tree into
+# every plain `cargo build` — exactly what the root Cargo.toml's netd exclusion
+# exists to prevent. `cerulion_cli_engine` and `cerulion_cli` already carry the
+# identical lean edge, so this adds NOTHING to the default build tree. No cycle:
+# netd's own closure is {cerulion_core, cerulion_macros, cerulion_discovery}
+# (+ the wan-only leaves), none of which depends on this crate.
+[target.'cfg(unix)'.dependencies]
+cerulion_netd = { workspace = true }
+
+[features]
+# Exposes bagd's own test seams (the `BagdConfig::fault_inject_tap_receive_after`
+# drain-fault field) AND turns on cerulion_core's `test-helpers` (the subscriber
+# fault-injection setter the seam wires to) plus cerulion_bag's (the
+# `BagWriter::fault_inject_flush_failures_for_test` seam the
+# close-the-chunk-after-a-write-error branch is reached through — bagd writes
+# over the real `FileSink`, so a flush failure has no other origin). Enabled for
+# this crate's own integration tests via the self-referencing dev-dependency
+# below (mirrors cerulion_bag's pattern); never enabled by production consumers.
+test-helpers = ["cerulion_core/test-helpers", "cerulion_bag/test-helpers"]
+
+[dev-dependencies]
+# Self-reference turns on `test-helpers` for tests/*.rs (the fault-injection
+# seam becomes visible to integration tests but NOT to downstream crates).
+cerulion_bagd = { path = ".", features = ["test-helpers"] }
+# `test-helpers` unlocks `cerulion_core::testing::{iceoryx_test_config,
+# TestTransport}` + `TransportManager::init_for_test` (the isolated per-test
+# SHM transport the integration tests build on). Enabled ONLY for this crate's
+# test/example/bench builds — the `bagd` BINARY still builds without it (the
+# `--test-iox2-config` seam uses the ALWAYS-ON production
+# `init_with_ix_config_json`, so no cfg-gating is needed).
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+# Independent read oracle: bags on disk ARE standard MCAP, so the round-trip
+# test cross-checks message count + payloads with the upstream `mcap` crate.
+# Same version/features as cerulion_bag (uncompressed bags only).
+mcap = { version = "0.25", default-features = false }
+serial_test = "3"
+tempfile = "3"
+# SIGTERM delivery (libc::kill) in the subprocess finalize test.
+libc = "0.2"
+# `#[traced_test]` pin for the pre-writer drop-oldest loud warn. no-env-filter
+# per repo memory: tracing-test's default EnvFilter scopes to the
+# test-crate-name only and would drop the warn emitted from the
+# `cerulion_bagd` LIB crate.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }

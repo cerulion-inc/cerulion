@@ -1,0 +1,230 @@
+[03:40:37Z] [+00000s] HEAD ASSERT OK ba5d75c5c226e749c9f5e8846c55c21b8bfd1035 ; iox2 bin sha16=c2bf1353305141f2
+[03:40:37Z] [+00000s] load at start: 1.16 1.64 2.11
+[03:40:37Z] [+00000s] === FULL: backtoback k=5, all 10 sizes ===
+[03:40:37Z] [+00000s] REP-BOUNDARY 1 2026-09-17T03:40:37Z load=1.16 1.64 2.11
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - native bins: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41521]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42057]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42142]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41644]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip_pong") generated 1 warning
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip") generated 1 warning
+warning: `cerulion_latency_bench` (bin "raw_iceoryx2_round_trip") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.13s
+[build] cargo build --release in benches/latency/native
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### native variant=backtoback chrt=0 rep=1 (macos) ###############
+  → raw_iceoryx2_round_trip chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep1/raw/_logs/iox2_chrt0.log, watchdog 900s)
+    ok rc=0 bins=10/10 (0s)
+
+native sweep: 1 passed, 0 failed (raw → <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep1/raw)
+[03:40:38Z] [+00001s]   rep 1 rc=0
+[03:40:38Z] [+00001s] REP-BOUNDARY 2 2026-09-17T03:40:38Z load=1.16 1.64 2.11
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - native bins: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41521]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41644]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42057]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42142]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_latency_bench` (bin "raw_iceoryx2_round_trip") generated 1 warning
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip_pong") generated 1 warning
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.13s
+[build] cargo build --release in benches/latency/native
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### native variant=backtoback chrt=0 rep=2 (macos) ###############
+  → raw_iceoryx2_round_trip chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep2/raw/_logs/iox2_chrt0.log, watchdog 900s)
+    ok rc=0 bins=10/10 (1s)
+
+native sweep: 1 passed, 0 failed (raw → <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep2/raw)
+[03:40:39Z] [+00002s]   rep 2 rc=0
+[03:40:39Z] [+00002s] REP-BOUNDARY 3 2026-09-17T03:40:39Z load=1.16 1.64 2.11
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - native bins: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41521]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42057]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42142]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41644]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip_pong") generated 1 warning
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip") generated 1 warning
+warning: `cerulion_latency_bench` (bin "raw_iceoryx2_round_trip") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.13s
+[build] cargo build --release in benches/latency/native
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### native variant=backtoback chrt=0 rep=3 (macos) ###############
+  → raw_iceoryx2_round_trip chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep3/raw/_logs/iox2_chrt0.log, watchdog 900s)
+    ok rc=0 bins=10/10 (1s)
+
+native sweep: 1 passed, 0 failed (raw → <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep3/raw)
+[03:40:39Z] [+00002s]   rep 3 rc=0
+[03:40:40Z] [+00003s] REP-BOUNDARY 4 2026-09-17T03:40:39Z load=1.16 1.64 2.11
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - native bins: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41521]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42142]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42057]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41644]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip") generated 1 warning
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip_pong") generated 1 warning
+warning: `cerulion_latency_bench` (bin "raw_iceoryx2_round_trip") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.13s
+[build] cargo build --release in benches/latency/native
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### native variant=backtoback chrt=0 rep=4 (macos) ###############
+  → raw_iceoryx2_round_trip chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep4/raw/_logs/iox2_chrt0.log, watchdog 900s)
+    ok rc=0 bins=10/10 (0s)
+
+native sweep: 1 passed, 0 failed (raw → <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep4/raw)
+[03:40:40Z] [+00003s]   rep 4 rc=0
+[03:40:40Z] [+00003s] REP-BOUNDARY 5 2026-09-17T03:40:40Z load=1.16 1.64 2.11
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - native bins: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41521]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[41644]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42142]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[42057]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_latency_bench` (bin "raw_iceoryx2_round_trip") generated 1 warning
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip") generated 1 warning
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip_pong") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.13s
+[build] cargo build --release in benches/latency/native
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### native variant=backtoback chrt=0 rep=5 (macos) ###############
+  → raw_iceoryx2_round_trip chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep5/raw/_logs/iox2_chrt0.log, watchdog 900s)
+    ok rc=0 bins=10/10 (0s)
+
+native sweep: 1 passed, 0 failed (raw → <BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full/rep5/raw)
+[03:40:41Z] [+00004s]   rep 5 rc=0
+compile_csv: aggregating 5 reps (rep1, rep2, rep3, rep4, rep5)
+run-btb-full/results_iox2_chrt0.csv: 10 rows
+compile_csv: wrote 1 CSV files
+[03:40:41Z] [+00004s] compile-csv rc=0
+[03:40:41Z] [+00004s] bins produced:       50
+[03:40:41Z] [+00004s] CPU samples:        1
+[03:40:41Z] [+00004s] DONE-BTB-full (COMPLETED rc=0)

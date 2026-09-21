@@ -1,0 +1,8 @@
+hero-stock-lockstep/  -  labeled diagnostic: lockstep split, recorder ON,
+pre-sweep, rate-mixed (100/50/50/50/100 Hz at 16 MiB).
+Build: main 68a0d6196a962237f8628cd94c9f93371703e827, binary sha16 17d52c9b1552e530.
+NOT a published row. Pre-sweep means it ran with 32,769 entries in /dev/shm
+(the stale-test-node graveyard swept at 2026-09-16T07:21:12Z); its tail carries
+that box condition. The 16 MiB k=5 median is rate-MIXED: reps 1 and 5 held
+100 Hz, reps 2-4 stepped to 50 Hz on the fixed100 ladder, so the published
+median lands on a 50 Hz rep. scrub applied recursively to run.json.

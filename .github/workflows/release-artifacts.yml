@@ -1,0 +1,733 @@
+# Release prebuilt Cerulion binaries and exercise the real install path.
+#
+# crates.io publication remains owned by release.yml. The smoke job waits for
+# that separate workflow's index publication before compiling a scaffolded node.
+#
+# A workflow_dispatch with `smoke_tag` set runs ONLY the install smoke against
+# that existing release: nothing is built or published. With it empty a
+# dispatch behaves as before (the build matrix runs; no publish, no smoke).
+name: Release artifacts
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      smoke_tag:
+        description: "Run only the install smoke against this existing release tag (vX.Y.Z); empty = normal dispatch"
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: release-artifacts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  IOX2_LOG_LEVEL: error
+  # The smoke job runs an installed `cerulion` directly, not through cargo, so
+  # it does not pick up the workspace cargo configuration. The login gate is on
+  # in every build; this is how this repository's own runs pass it without an
+  # account.
+  CERULION_LOGIN_GATE: "off"
+  # The release under test: the pushed tag, or the tag a smoke-only dispatch
+  # names. Job-level `if:` cannot read `env`, so those read `inputs.smoke_tag`.
+  TAG: ${{ inputs.smoke_tag || github.ref_name }}
+
+jobs:
+  # The ROS 2 Jazzy rmw, `librmw_cerulion.so`, built inside `ros:jazzy` so
+  # its C ABI bindings come from the real distro headers (rmw_cerulion's
+  # build.rs falls back to a vendored snapshot on a headerless host, and that
+  # fallback is never a deployable library). Each Linux target builds natively
+  # on a runner of its own architecture; the `build` job below packages the
+  # result into that target's archive, so every Linux route (archive, deb,
+  # Homebrew on Linux) ships it. macOS archives carry no rmw: ROS 2 Jazzy
+  # publishes no macOS binaries.
+  rmw:
+    name: Build rmw_cerulion ${{ matrix.target }}
+    if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-22.04
+          # Native arm64: an emulated release build of the transport crates
+          # does not fit the job timeout, and a cross build would need an
+          # arm64 sysroot for bindgen and the C++ shim inside the image.
+          - target: aarch64-unknown-linux-gnu
+            runs_on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build librmw_cerulion.so inside ros:jazzy
+        env:
+          # The same toolchain the `build` job pins for the binaries.
+          CERULION_RMW_TOOLCHAIN: 1.93.0
+        run: tools/scripts/build_rmw_jazzy.sh . "$RUNNER_TEMP/rmw"
+
+      - name: Upload rmw library and evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rmw-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/rmw/librmw_cerulion.so
+            ${{ runner.temp }}/rmw/librmw_cerulion.so.evidence.txt
+            ${{ runner.temp }}/rmw/build-env.txt
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.target }}
+    # `inputs` is only read on a dispatch, where `smoke_tag` is a real string
+    # (a push never reaches the comparison, so no null coercion is involved).
+    if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
+    # The Linux legs package the rmw library the `rmw` job built; the macOS
+    # legs wait on it too (a matrix job has one `needs`), which costs them the
+    # rmw build's wall time and nothing else.
+    needs: rmw
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runs_on: ubuntu-22.04
+          - target: x86_64-apple-darwin
+            runs_on: macos-15-intel
+          - target: aarch64-apple-darwin
+            runs_on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Tags and the workspace version must match so archives, binaries, crates,
+      # and binstall metadata all identify the same release. A prerelease tag
+      # therefore requires a matching prerelease workspace version.
+      - name: Verify workspace version and tag
+        id: version
+        run: |
+          bash tools/scripts/check_version_sync.sh
+          version=$(tools/scripts/workspace_version.sh)
+          # Citation metadata is published to users and Zenodo. The release date
+          # must not predate the tagged code or be in the future; exact equality
+          # would make tagging race unrelated merges whose commit date lies outside the release's control.
+          tag_ref_name=
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && \
+             printf '%s' "${GITHUB_REF}" | grep -q '^refs/tags/v'; then
+            tag_version=${GITHUB_REF_NAME#v}
+            if [ "$tag_version" != "$version" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${version}; bump the workspace version to match the tag or tag the workspace version"
+              exit 1
+            fi
+            tag_ref_name=$GITHUB_REF_NAME
+          fi
+          tools/scripts/check_citation_release.sh "$version" "$tag_ref_name"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust 1.93.0
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.93.0
+          targets: ${{ matrix.target }}
+
+      - name: Install aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --locked \
+            -p cerulion_cli -p cerulion_netd -p cerulion_connectd \
+            --target "$TARGET"
+          case "$TARGET" in
+            *-unknown-linux-gnu)
+              # The heap hook, an LD_PRELOAD malloc interposer the CLI
+              # auto-injects into every ros2 child when it sits beside the
+              # binaries. Linux/GNU only; libc and tracing, no build script,
+              # no ROS headers, so it builds here natively (the aarch64 leg
+              # cross-compiles it with the linker above) and needs no
+              # container, unlike the rmw.
+              cargo build --release --locked -p cerulion_heaphook --target "$TARGET"
+              ;;
+          esac
+
+      # The per-dependency license inventory that ships beside NOTICE. The
+      # binaries statically link their dependency graph, so the archive
+      # redistributes those crates and has to carry the license text and the
+      # copyright notice each of them requires. NOTICE names the components a
+      # reader is likely to care about; this is the exhaustive record beside
+      # it.
+      #
+      # The binary is behind the crate's `cli` feature, so a plain
+      # `cargo install cargo-about` builds the library and installs no binary
+      # at all. The version is pinned so an upstream release cannot change a
+      # shipped file without a commit here.
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about --version 0.9.2 --features cli
+
+      # `--fail` is what makes this a gate rather than a report: without it a
+      # crate whose license cannot be read is only a warning and the command
+      # still exits 0, which would publish an archive with a silent hole in
+      # its attribution. The four released triples are pinned in tools/release/about.toml
+      # rather than passed as `--target` here, so every runner renders the
+      # same union and no archive is short an attribution that a
+      # platform-specific dependency required.
+      - name: Generate the third-party license inventory
+        run: |
+          cargo about generate -c tools/release/about.toml --locked --fail \
+            -o THIRD-PARTY-LICENSES.md tools/release/about.hbs
+
+      - name: Download the rmw library for this target
+        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rmw-${{ matrix.target }}
+          path: ${{ runner.temp }}/rmw
+
+      # The library sits BESIDE the binaries, the layout the CLI resolves
+      # without any code change: `cerulion ros2 run` looks for
+      # `librmw_cerulion.so` in its own directory and stages a minimal ament
+      # prefix that links it, the same sibling rule `cerulion connect` uses
+      # for `cerulion-connectd`.
+      # Every Linux archive must run on glibc 2.35 (Ubuntu 22.04, the Jetson
+      # generation of robots). The runners above are 22.04, and this check keeps
+      # it that way: a binary that needs a newer symbol version fails the build.
+      - name: Verify Linux glibc compatibility
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 tools/scripts/check_release_glibc.py \
+            "target/$TARGET/release/cerulion" \
+            "target/$TARGET/release/cerulion-netd" \
+            "target/$TARGET/release/cerulion-connectd"
+
+      - name: Package archive
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          stem="cerulion-${VERSION}-${TARGET}"
+          stage="$RUNNER_TEMP/$stem"
+          archive="$RUNNER_TEMP/$stem.tar.gz"
+          mkdir -p "$stage"
+          cp "target/$TARGET/release/cerulion" "$stage/cerulion"
+          cp "target/$TARGET/release/cerulion-netd" "$stage/cerulion-netd"
+          cp "target/$TARGET/release/cerulion-connectd" "$stage/cerulion-connectd"
+          cp tools/scripts/install_rust.sh "$stage/install_rust.sh"
+          rustc -vV > "$stage/rustc-version.txt"
+          cp LICENSE README.md "$stage/"
+          cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
+          cp THIRD-PARTY-LICENSES.md "$stage/"
+          chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd
+          case "$TARGET" in
+            *-unknown-linux-gnu)
+              rmw="$RUNNER_TEMP/rmw/librmw_cerulion.so"
+              if [ ! -f "$rmw" ]; then
+                echo "::error::the rmw job left no librmw_cerulion.so for $TARGET"
+                exit 1
+              fi
+              cp "$rmw" "$stage/librmw_cerulion.so"
+              chmod +x "$stage/librmw_cerulion.so"
+              cp "target/$TARGET/release/libcerulion_heaphook.so" "$stage/libcerulion_heaphook.so"
+              chmod +x "$stage/libcerulion_heaphook.so"
+              ;;
+          esac
+          tar czf "$archive" -C "$RUNNER_TEMP" "$stem"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$RUNNER_TEMP" && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256")
+          else
+            (cd "$RUNNER_TEMP" && shasum -a 256 "$stem.tar.gz" > "$stem.tar.gz.sha256")
+          fi
+
+      - name: Check Debian package eligibility
+        id: debian
+        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          error_file="$RUNNER_TEMP/debian-version-error"
+          if debian_version=$(tools/scripts/debian_version.sh "$VERSION" 2>"$error_file"); then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+            echo "debian_version=$debian_version" >> "$GITHUB_OUTPUT"
+          else
+            reason=$(cat "$error_file")
+            echo "Debian package skipped for version $VERSION: $reason"
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package Debian archive
+        if: (startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')) && steps.debian.outputs.eligible == 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu) deb_arch=amd64 ;;
+            aarch64-unknown-linux-gnu) deb_arch=arm64 ;;
+            *) echo "::error::unsupported Linux target: $TARGET"; exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/cerulion-${VERSION}-${TARGET}.tar.gz"
+          mkdir -p "$RUNNER_TEMP/debs"
+          deb=$(tools/scripts/build_deb.sh "$archive" "$deb_arch" "$RUNNER_TEMP/debs")
+          (cd "$RUNNER_TEMP/debs" && sha256sum "$(basename "$deb")" > "$(basename "$deb").sha256")
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cerulion-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/cerulion-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
+            ${{ runner.temp }}/cerulion-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Upload Debian artifact
+        if: (startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')) && steps.debian.outputs.eligible == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cerulion-${{ steps.version.outputs.version }}-${{ matrix.target }}-deb
+          path: |
+            ${{ runner.temp }}/debs/*.deb
+            ${{ runner.temp }}/debs/*.deb.sha256
+          if-no-files-found: error
+
+  # A Linux archive or deb whose rmw does not carry ROS 2 traffic must never
+  # be published: install the deb in a clean Jazzy container and run the
+  # README's own command through it. The same check runs on a plain dispatch,
+  # so the release path can be proven without pushing a tag.
+  verify-rmw:
+    name: Verify rmw_cerulion ${{ matrix.target }}
+    if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
+    needs: build
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runs_on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Computed here rather than read off the `build` job: a matrix job's
+      # outputs come from whichever leg finishes last, and the macOS legs
+      # never set the Debian eligibility.
+      - name: Check Debian package eligibility
+        id: debian
+        run: |
+          version=$(tools/scripts/workspace_version.sh)
+          if tools/scripts/debian_version.sh "$version" >/dev/null 2>"$RUNNER_TEMP/debian-version-error"; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Debian package skipped for version $version: $(cat "$RUNNER_TEMP/debian-version-error")"
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download the Debian package for this target
+        if: steps.debian.outputs.eligible == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: cerulion-*-${{ matrix.target }}-deb
+          path: ${{ runner.temp }}/debs
+          merge-multiple: true
+
+      - name: Install the deb in ros:jazzy-ros-base and run talker, listener, rclpy identity and the hook checks
+        if: steps.debian.outputs.eligible == 'true'
+        run: |
+          set -- "$RUNNER_TEMP"/debs/*.deb
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected exactly one .deb artifact for this target"
+            exit 1
+          fi
+          tools/scripts/verify_rmw_deb.sh "$1" "$RUNNER_TEMP/rmw-verify"
+
+      - name: Upload verification logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rmw-verify-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/rmw-verify/*.txt
+            ${{ runner.temp }}/rmw-verify/*.log
+          if-no-files-found: ignore
+
+  release:
+    name: Publish GitHub Release assets
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: [build, verify-rmw]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      # Only the `cerulion-*` artifacts are release assets. The `rmw-*`
+      # library artifacts and the `rmw-verify-*` logs are build evidence, not
+      # downloads: the library ships inside the Linux archives.
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: cerulion-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release-assets
+          cat ./*.sha256 | sort > SHA256SUMS
+          prerelease=0
+          stable_prefix=${TAG%%-*}
+          if [ "$stable_prefix" != "$TAG" ] &&
+             printf '%s' "$stable_prefix" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            prerelease=1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$prerelease" -eq 1 ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease
+            fi
+            gh release upload "$TAG" ./* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            if [ "$prerelease" -eq 1 ]; then
+              gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" \
+                --title "Cerulion $TAG" \
+                --generate-notes \
+                --prerelease
+            else
+              gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" \
+                --title "Cerulion $TAG" \
+                --generate-notes
+            fi
+          fi
+          # The release channel. The installer resolves "latest stable" by
+          # reading this one line from
+          # `<repo>/releases/latest/download/stable.txt`. GitHub never marks a
+          # prerelease "latest", so writing the asset only for a stable tag is
+          # what keeps that redirect naming the newest stable release. It is
+          # uploaded after the archives so the `./*` batch above cannot pick it
+          # up on a prerelease run.
+          if [ "$prerelease" -eq 0 ]; then
+            # The installer reads this line with a strict vX.Y.Z grammar; a stable
+            # tag it would refuse must fail here, not at every install.
+            if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::tag $TAG is not of the form vX.Y.Z, so stable.txt cannot name it"
+              exit 1
+            fi
+            printf '%s\n' "$TAG" > stable.txt
+            gh release upload "$TAG" stable.txt --repo "$GITHUB_REPOSITORY" --clobber
+          fi
+
+  smoke:
+    name: Install smoke ${{ matrix.target }}
+    # After a successful publish on a tag push, or alone on a smoke-only
+    # dispatch: build and release are skipped there, and `!cancelled()` stops
+    # the skipped `needs` from skipping this job as well.
+    if: ${{ !cancelled() && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.release.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.smoke_tag != '')) }}
+    needs: release
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The aarch64-linux archive is built and checksummed but its
+          # installer path is not runtime-smoked here. The `rmw` and
+          # `verify-rmw` jobs above already run on the hosted ubuntu-24.04-arm
+          # runner (its deb is installed and exercised there); adding the same
+          # runner to this matrix would close the remaining installer gap.
+          - target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-22.04
+          - target: x86_64-apple-darwin
+            runs_on: macos-15-intel
+          - target: aarch64-apple-darwin
+            runs_on: macos-14
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The release under test, not the dispatched branch: the installer
+          # and the crates-io wait script must be the tag's own. Qualified, so
+          # a branch of the same name can never shadow the release tag.
+          ref: refs/tags/${{ env.TAG }}
+          # Keep the source checkout away from $GITHUB_WORKSPACE so the smoke
+          # test cannot accidentally select checkout path dependencies.
+          path: source-checkout
+
+      - name: Install Rust 1.93.0
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.93.0
+
+      - name: Print Rust versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install GNU coreutils
+        if: startsWith(matrix.target, 'x86_64-apple') || startsWith(matrix.target, 'aarch64-apple')
+        run: |
+          brew install coreutils
+
+      - name: Resolve timeout command
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            command -v gtimeout >/dev/null 2>&1 ||
+              { echo "::error::GNU coreutils gtimeout is unavailable"; exit 1; }
+            echo "CERULION_TIMEOUT_COMMAND=gtimeout" >> "$GITHUB_ENV"
+          else
+            command -v timeout >/dev/null 2>&1 ||
+              { echo "::error::timeout is unavailable"; exit 1; }
+            echo "CERULION_TIMEOUT_COMMAND=timeout" >> "$GITHUB_ENV"
+          fi
+
+      # An unauthenticated raw.githubusercontent.com fetch answers 404 on a
+      # non-public repository, and releases/download/... does so with or without
+      # a token — so the installer is the tag checkout's copy (same file, no
+      # network) and this target's assets come through the API (`gh release
+      # download`), served from a loopback mirror in the layout the installer
+      # expects: <base-url>/<tag>/<archive>.
+      - name: Mirror release assets for this target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mirror="$RUNNER_TEMP/mirror"
+          mirror_port=8765
+          mirror_url="http://127.0.0.1:$mirror_port"
+          archive="cerulion-${TAG#v}-${TARGET}.tar.gz"
+          mkdir -p "$mirror/$TAG"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$mirror/$TAG" \
+            --pattern "$archive" --pattern "$archive.sha256" --pattern SHA256SUMS
+          # gh exits 0 once ANY pattern matched, so a release missing one of
+          # the three must fail here — not as a probe timeout or an installer
+          # 404 a step later.
+          for asset in "$archive" "$archive.sha256" SHA256SUMS; do
+            [ -s "$mirror/$TAG/$asset" ] ||
+              { echo "::error::release $TAG has no asset $asset"; exit 1; }
+          done
+          python3 -m http.server "$mirror_port" --bind 127.0.0.1 --directory "$mirror" \
+            > "$RUNNER_TEMP/mirror.log" 2>&1 < /dev/null &
+          echo "MIRROR_PID=$!" >> "$GITHUB_ENV"
+          echo "MIRROR_URL=$mirror_url" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            if curl -fs "$mirror_url/$TAG/SHA256SUMS" -o /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::release asset mirror did not answer on $mirror_url"
+          exit 1
+
+      - name: Install tagged release
+        run: |
+          # Pin the checkout-at-tag contract above: the tag ref is fetched
+          # locally on both paths, so HEAD must be its commit.
+          [ "$(git -C source-checkout rev-parse HEAD)" = "$(git -C source-checkout rev-parse "refs/tags/$TAG^{commit}")" ] ||
+            { echo "::error::source-checkout is not at $TAG"; exit 1; }
+          source-checkout/tools/scripts/install.sh --version "$TAG" \
+            --base-url "$MIRROR_URL" --dir "$RUNNER_TEMP/cerulion-bin"
+          echo "$RUNNER_TEMP/cerulion-bin" >> "$GITHUB_PATH"
+          expected="${TAG#v}"
+          actual=$( "$RUNNER_TEMP/cerulion-bin/cerulion" --version )
+          printf '%s\n' "$actual" | grep -F "$expected" >/dev/null ||
+            { echo "::error::cerulion --version did not contain $expected"; exit 1; }
+          # The Linux archive carries the ROS 2 Jazzy rmw and the heap hook,
+          # and the installer places both beside the CLI; macOS archives
+          # carry neither by design.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            for library in librmw_cerulion.so libcerulion_heaphook.so; do
+              [ -f "$RUNNER_TEMP/cerulion-bin/$library" ] ||
+                { echo "::error::the installer did not place $library beside the CLI"; exit 1; }
+            done
+          fi
+
+      # release.yml publishes on the SAME tag push and verifies all 17 crates
+      # before uploading — measured 30 min on a cold hosted runner — so the
+      # wait must outlast that, not just the upload.
+      #
+      # Wait for the two crates that ship the released binaries, not only the
+      # three that already exist on crates.io: `cargo publish --workspace`
+      # publishes in dependency order and cerulion_cli depends on every other
+      # publishable crate, so its presence at this version proves the whole
+      # workspace landed — except cerulion_wsd, which nothing depends on and
+      # which publishes beside it, so it is waited for by name. A publish that
+      # stops at one of the eleven never-published names (the crates.io new-crate
+      # rate-limit shape) would otherwise leave this smoke GREEN while
+      # `cargo install cerulion_cli` resolves nothing.
+      - name: Wait for crates.io publication
+        run: source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd
+
+      - name: Run README quick-start
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke-workspace"
+          cd "$RUNNER_TEMP/smoke-workspace"
+          cerulion workspace create my_robot
+          manifest="$RUNNER_TEMP/smoke-workspace/my_robot/Cargo.toml"
+          expected="${TAG#v}"
+          if ! grep -Fqx "cerulion_core = \"=$expected\"" "$manifest" ||
+             ! grep -Fqx "native_ros2_messages = \"=$expected\"" "$manifest"; then
+            echo "::error::smoke workspace did not use exact registry pins matching $expected"
+            exit 1
+          fi
+          if grep -Eq '^[[:space:]]*[[:alnum:]_-]+[[:space:]]*=.*path[[:space:]]*=' "$manifest"; then
+            echo "::error::smoke workspace contains a path dependency; registry scaffolding was not exercised"
+            exit 1
+          fi
+          cd my_robot
+          cerulion node create sensor --policy period_ms=100 -o geometry_msgs/Vector3 reading
+          cerulion node build sensor
+          cerulion graph create perception
+          cerulion node stage sensor -g perception
+          set +e
+          "$CERULION_TIMEOUT_COMMAND" 60s cerulion graph run perception
+          status=$?
+          set -e
+          if [ "$status" -ne 124 ]; then
+            echo "::error::graph run returned $status; expected timeout exit 124"
+            exit 1
+          fi
+
+      # The request log (every path served and its status) is printed on
+      # every outcome, so an installer 404 or checksum mismatch can be read
+      # against what the mirror actually held.
+      - name: Stop release asset mirror
+        if: always()
+        run: |
+          [ -z "${MIRROR_PID:-}" ] || kill "$MIRROR_PID" 2>/dev/null || :
+          [ ! -f "$RUNNER_TEMP/mirror.log" ] || cat "$RUNNER_TEMP/mirror.log"
+
+  homebrew:
+    name: Homebrew formula
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: release
+    runs-on: ubuntu-22.04
+    # The formula lives on main in the tap repository, cerulion-inc/homebrew-cerulion,
+    # which is protected, so nothing here writes with the workflow token: the job
+    # stays read-only and every write goes through HOMEBREW_TAP_TOKEN, a token
+    # scoped to contents and pull requests on the tap repository alone.
+    permissions:
+      contents: read
+    steps:
+      - name: Decide whether this tag updates the formula
+        id: gate
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          case "$TAG" in
+            *-*)
+              # The formula tracks stable releases only, matching the
+              # installer's default path, which also skips prereleases.
+              echo "Homebrew formula not updated for prerelease tag $TAG"
+              echo "update=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          # Fail closed on a stable tag: a silent skip here ships a release
+          # whose `brew install` still serves the previous version, with a
+          # green release log and nothing to read.
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set, so the Homebrew formula for $TAG cannot be proposed. Add a fine-grained token carrying contents and pull requests read and write on the tap repository cerulion-inc/homebrew-cerulion, then re-run this job."
+            exit 1
+          fi
+          echo "update=true" >> "$GITHUB_OUTPUT"
+
+      # The formula is rendered by a script that ships in the tree, so the
+      # shape that reaches users can be checked without cutting a release.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.gate.outputs.update == 'true'
+
+      - name: Propose the formula for this release
+        if: steps.gate.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAP_REPOSITORY: cerulion-inc/homebrew-cerulion
+        run: |
+          version=${TAG#v}
+          # releases/download/... answers 404 on a non-public repository even
+          # with a token; the API asset endpoint behind `gh release download`
+          # does not. The rendered formula still points at releases/download
+          # URLs, which Homebrew fetches unauthenticated, so the formula only
+          # serves users once the repository is public.
+          gh release download "$TAG" --repo "$REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          formula="$RUNNER_TEMP/cerulion.rb"
+          ./tools/scripts/render_homebrew_formula.sh \
+            "$version" "$TAG" "$REPOSITORY" "$RUNNER_TEMP/SHA256SUMS" > "$formula"
+
+          # A full clone, not a shallow one: the branch is pushed back to the
+          # repository it came from, and a truncated history is the one shape
+          # that push can refuse.
+          branch="chore/homebrew-formula-${TAG}"
+          repo="$RUNNER_TEMP/formula-repo"
+          git clone --branch main \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPOSITORY}.git" "$repo"
+
+          # A re-run builds on whatever the branch already holds, so a
+          # correction someone pushed onto it by hand survives.
+          if git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+            git -C "$repo" checkout -B "$branch" "refs/remotes/origin/$branch"
+          else
+            git -C "$repo" checkout -b "$branch"
+          fi
+
+          mkdir -p "$repo/Formula"
+          cp "$formula" "$repo/Formula/cerulion.rb"
+          git -C "$repo" add Formula/cerulion.rb
+          if git -C "$repo" diff --cached --quiet; then
+            echo "The formula branch already carries $TAG"
+          else
+            git -C "$repo" \
+              -c user.name="cerulion-release[bot]" \
+              -c user.email="cerulion-release[bot]@users.noreply.github.com" \
+              commit -m "chore(homebrew): cerulion ${TAG}"
+            git -C "$repo" push origin "$branch"
+          fi
+
+          # Nothing to propose when main already carries this exact formula:
+          # the first release renders one main has never seen, and a re-run
+          # after the change has merged has to end here rather than ask for a
+          # pull request with no difference in it.
+          if git -C "$repo" diff --quiet "refs/remotes/origin/main" HEAD -- Formula/cerulion.rb; then
+            echo "Formula/cerulion.rb on main already describes $TAG"
+            exit 0
+          fi
+
+          cd "$repo"
+          url=$(gh pr list --repo "$TAP_REPOSITORY" --head "$branch" --state open \
+            --json url --jq '.[0].url // empty')
+          if [ -n "$url" ]; then
+            echo "Formula pull request already open, branch updated: $url"
+          else
+            url=$(gh pr create --repo "$TAP_REPOSITORY" --base main --head "$branch" \
+              --title "chore(homebrew): cerulion ${TAG}" \
+              --body "Formula for ${TAG}. The checksums are the ones published in that release's SHA256SUMS. Merging it is what puts ${TAG} in front of everyone who has tapped cerulion-inc/cerulion.")
+            echo "Formula pull request: $url"
+          fi
+          # The pull request is the paper trail; the tag was the deliberate act, so
+          # the job merges it itself. A failed merge is loud: until someone merges by
+          # hand, brew install serves the previous version.
+          if gh pr merge --repo "$TAP_REPOSITORY" --squash "$url"; then
+            echo "Formula merged: $url"
+          else
+            echo "::error::The formula pull request could not be merged: $url. Merge it by hand; until then brew install serves the previous version."
+            exit 1
+          fi

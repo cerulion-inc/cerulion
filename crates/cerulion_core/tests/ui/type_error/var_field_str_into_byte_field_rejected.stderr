@@ -1,0 +1,19 @@
+error[E0308]: mismatched types
+  --> tests/ui/type_error/var_field_str_into_byte_field_rejected.rs:26:27
+   |
+26 |         self.image.data = "should-not-compile";
+   |                         - ^^^^^^^^^^^^^^^^^^^^ expected `&[u8]`, found `&str`
+   |                         |
+   |                         arguments to this method are incorrect
+   |
+   = note: expected reference `&[u8]`
+              found reference `&'static str`
+note: method defined here
+  --> $OUT_DIR[native_ros2_messages]/sensor_msgs.rs
+   |
+   |     pub fn __cer_assign_data(&mut self, v: &[u8]) -> ::std::result::Result<(), ::cerulion_core::TransportError> {
+   |            ^^^^^^^^^^^^^^^^^
+help: consider adding a leading `b`
+   |
+26 |         self.image.data = b"should-not-compile";
+   |                           +

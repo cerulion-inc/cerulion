@@ -1,0 +1,5 @@
+error: `#[cerulion(unordered)]` cannot apply to `BTreeMap`. This is matched on the NAME you wrote — a macro sees tokens, not types — so which remedy is yours depends on which `BTreeMap` this is. If this is std's `BTreeMap`: the escape exists to lift the `Ord` obligation off the key, and rebuilding a `BTreeMap` needs `insert`, whose own bound is `Ord` — so the escape cannot lift anything here, and an un-`Ord` key would fail inside `std` instead. Drop the attribute: a `BTreeMap` is already captured in its own deterministic order and already refuses duplicates on decode; if the key really is un-`Ord`, the container has to be a `HashMap`/`HashSet` or an `IndexMap`/`IndexSet`. If instead this is a container of your OWN that merely shares the name: dropping the attribute would leave a field whose type has no `CerulionState`, so capture it with `#[cerulion(serde)]`, or implement `CerulionState` for it and leave the attribute off.
+  --> tests/ui/state_derive_unordered_on_btree.rs:21:11
+   |
+21 |     grid: BTreeMap<u32, u8>,
+   |           ^^^^^^^^

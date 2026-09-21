@@ -1,0 +1,29 @@
+[package]
+name = "cerulion_macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Procedural macros for defining Cerulion node types: #[cerulion_node], #[cerulion_node_impl] and #[derive(CerulionState)]"
+readme = "README.md"
+keywords = ["robotics", "proc-macro", "codegen", "cerulion"]
+categories = ["science::robotics", "development-tools::procedural-macro-helpers"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing", "visit", "visit-mut", "extra-traits"] }

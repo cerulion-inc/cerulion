@@ -1,0 +1,43 @@
+# POD-class SPLIT leg graph (type-class axis) — the FIXED-POD
+# twin of graphs/rtt_bench_split.yaml: the identical chain split into
+# two OS processes by `process_groups` (g1 = {ping} / g2 = {pong,
+# latency}; the ping -> pong edge is the one REAL cross-process
+# iceoryx2 hop under barrier lockstep). Run with
+# `cerulion graph run rtt_bench_pod_split --release` — NO
+# --single-process — under the real clock.
+#
+# PROVENANCE (do not edit in isolation): every node / topic / schema
+# value here is a FAITHFUL MIRROR of graphs/rtt_bench_pod.yaml, copied
+# verbatim. The ONLY intended difference is the `process_groups:` block
+# appended at the end (plus these provenance comments), the same rule the
+# variable pair (rtt_bench.yaml / rtt_bench_split.yaml) pins; the graph's name
+# is its file stem, so neither file carries a `name:` key. The pod-vs-variable
+# A/B additionally depends on the wiring staying identical to
+# rtt_bench_split.yaml — only `type:` and `schema:` differ.
+prefix: rtt_bench_pod
+nodes:
+- id: ping
+  type: pod_ping_node
+  inputs: []
+  outputs:
+  - name: ping_out
+    schema: cer_bench_msgs/PodPayload
+    history_size: 0
+- id: pong
+  type: pod_pong_node
+  inputs:
+  - name: ping_in
+    source: ping/ping_out
+  outputs:
+  - name: echo_out
+    schema: cer_bench_msgs/PodPayload
+    history_size: 0
+- id: latency
+  type: pod_latency_node
+  inputs:
+  - name: echo_in
+    source: pong/echo_out
+  outputs: []
+process_groups:
+  g1: [ping]
+  g2: [pong, latency]

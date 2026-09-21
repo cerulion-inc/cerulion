@@ -1,0 +1,39 @@
+=== run dir: <BOXHOME>/lanes/rmw-latency-lane-20260918/benches/latency/results/8a84baf25d5d1710-2026-09-18-fixed100-g3-deferred
+=== repo sha: 9f30d2b3bbd4e52254eb7fc970369288f7649889
+=== image: sha256:f16d6779f497ce0b735c5ea2b2f00b767a26270cef5715882ea1eb162118855c
+=== mh: 8a84baf25d5d1710
+=== started: 2026-09-18T15:07:40Z
+######## loan cell rep 1/5 (ten payloads) ########
+
+ros2 sweep: 10 (cell,payload) ok, 0 failed, 8 skipped
+---- rep 1 rc=0 15:11:37Z
+######## loan cell rep 2/5 (ten payloads) ########
+
+ros2 sweep: 10 (cell,payload) ok, 0 failed, 8 skipped
+---- rep 2 rc=0 15:15:33Z
+######## loan cell rep 3/5 (ten payloads) ########
+
+ros2 sweep: 10 (cell,payload) ok, 0 failed, 8 skipped
+---- rep 3 rc=0 15:19:30Z
+######## loan cell rep 4/5 (ten payloads) ########
+
+ros2 sweep: 10 (cell,payload) ok, 0 failed, 8 skipped
+---- rep 4 rc=0 15:23:28Z
+######## loan cell rep 5/5 (ten payloads) ########
+
+ros2 sweep: 10 (cell,payload) ok, 0 failed, 8 skipped
+---- rep 5 rc=0 15:27:25Z
+=== compile-csv STRICT ===
+note: SUPPRESSED 10 percentile cell(s) across 10 row(s) - fewer than 20 pooled samples back those tails at this n, so the cells are written empty rather than citable-looking (audit A2). Add reps (bench.py full --reps N) or extend the schedule to make them citable.
+compile_csv: aggregating 5 reps (rep1, rep2, rep3, rep4, rep5)
+8a84baf25d5d1710-2026-09-18-fixed100-g3-deferred/results_jazzy_cerulion_shm_loan_be1_chrt0.csv: 10 rows
+compile_csv: wrote 1 CSV files
+---- compile rc=0
+=== stock parity spot check (separate dir) ===
+    ok
+
+ros2 sweep: 2 (cell,payload) ok, 0 failed, 8 skipped
+---- stock rc=0
+8a84baf25d5d1710-2026-09-18-fixed100-g3-deferred-stockspot/results_jazzy_stock_rclcpp_chrt0.csv: 2 rows
+compile_csv: wrote 1 CSV files
+=== FINAL CAMPAIGN FINISHED: 2026-09-18T15:28:16Z

@@ -1,0 +1,19 @@
+error: `sync_window_ms` must be > 0 (zero-window sync rejects every fan-in)
+ --> tests/ui/sync_window_ms_zero.rs:8:1
+  |
+8 | #[cerulion_node(sync_window_ms = 0)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `input` in this scope
+  --> tests/ui/sync_window_ms_zero.rs:12:7
+   |
+12 |     #[input(trigger)]
+   |       ^^^^^
+
+error: cannot find attribute `input` in this scope
+  --> tests/ui/sync_window_ms_zero.rs:10:7
+   |
+10 |     #[input(trigger)]
+   |       ^^^^^

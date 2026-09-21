@@ -1,0 +1,5 @@
+error: unknown attribute `foo`, expected `period_ms`, `sync_window_ms`, `unbounded_sync`, `external`, `tick_within_ms`, `throttle_ms`, `allow_non_deterministic`, or `uses_live_io`
+ --> tests/ui/unknown_attribute.rs:3:17
+  |
+3 | #[cerulion_node(foo = "bar")]
+  |                 ^^^

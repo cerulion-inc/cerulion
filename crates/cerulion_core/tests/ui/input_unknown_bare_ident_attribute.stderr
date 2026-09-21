@@ -1,0 +1,11 @@
+error: unknown input attribute `newest_first`. Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`.
+  --> tests/ui/input_unknown_bare_ident_attribute.rs:10:22
+   |
+10 |     #[input(trigger, newest_first)]
+   |                      ^^^^^^^^^^^^
+
+error: cannot find attribute `input` in this scope
+  --> tests/ui/input_unknown_bare_ident_attribute.rs:10:7
+   |
+10 |     #[input(trigger, newest_first)]
+   |       ^^^^^

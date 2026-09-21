@@ -1,0 +1,13 @@
+warning: use of deprecated field `native_ros2_messages::sensor_msgs::ImageShm::data`: write-only proxy for variable field `data` — reading it yields a useless marker. Read with the accessor method `data()`; write with `self.<port>.data = expr` or `.fill_from(...)`.
+  --> tests/ui/type_error/var_field_method_call_no_method_on_proxy.rs:29:14
+   |
+29 |         self.image.data.push(1u8);
+   |              ^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+error[E0599]: no method named `push` found for struct `native_ros2_messages::sensor_msgs::__cer_wp_Image_data` in the current scope
+  --> tests/ui/type_error/var_field_method_call_no_method_on_proxy.rs:29:25
+   |
+29 |         self.image.data.push(1u8);
+   |                         ^^^^ method not found in `native_ros2_messages::sensor_msgs::__cer_wp_Image_data`

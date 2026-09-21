@@ -1,0 +1,15 @@
+lane=stock - the ZERO-CONFIG ROS 2 default (what `ros2 run` gives you).
+transport label: stock (fastdds defaults: UDP+builtin SHM transport, datasharing off)
+  - rmw: rmw_fastrtps_cpp (the ROS 2 default on humble/jazzy/lyrical)
+  - transports: Fast DDS defaults - UDPv4 + builtin SHM transport (COPY-based,
+    not zero-copy); DataSharing OFF at the rmw layer (rmw_fastrtps forces
+    data_sharing().off() without RMW_FASTRTPS_USE_QOS_FROM_XML=1)
+  - no profiles XML, no transport env (scrubbed loudly if inherited)
+  - qos: stock = rmw_qos_profile_default (RELIABLE / VOLATILE / KEEP_LAST(10))
+  - recv: rclcpp typed callback; publish: plain publish (no loan call sites;
+    rcl's subscription-loan gate stays at its shipped default)
+  - NO verify_shm gate: this lane claims no SHM-engagement label - the row's
+    claim is 'the defaults, whatever they do', which needs no transport proof.
+citations: memo.md §3 (stock) / §2 (composed) - rmw_fastrtps
+README defaults; Fast DDS transport + data-sharing docs; ros2/rmw qos_profiles.h;
+rclcpp node_options.hpp (use_intra_process_comms default false); nav2 PR #2750/#5804.

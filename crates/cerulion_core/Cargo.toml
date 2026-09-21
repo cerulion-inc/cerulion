@@ -1,0 +1,279 @@
+[package]
+name = "cerulion_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Core runtime for Cerulion: zero-copy transport, wire format, codegen, scheduler, and graph execution"
+readme = "README.md"
+keywords = ["robotics", "zero-copy", "iceoryx2", "real-time", "ipc"]
+categories = ["science::robotics", "concurrency", "network-programming"]
+# What a crates.io download carries: this crate's own sources, its build
+# script, its README, the text of the license it is published under and this
+# manifest. The agent instruction files, the integration test tree, the graph
+# fixture those tests read and the cargo-fuzz sub-crate under fuzz/ all serve
+# work inside this repository, so none of them travel with the package.
+include = ["src/", "build.rs", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# Lockstep pinning x cargo-machete: the `iceoryx2-bb-*` / `iceoryx2-pal-*` / `iceoryx2-cal`
+# / `iceoryx2-log-types` entries below are DECLARED ON PURPOSE and are not
+# `use`d from this crate's source. They exist so every member of the iceoryx2
+# dependency FAMILY is exact-pinned to one version: a sub-crate skew between
+# the host runtime and a node cdylib (e.g. `iceoryx2-bb-elementary` 0.9.1 vs
+# 0.9.2) makes `PackageVersion` disagree across the shared-memory connection
+# and the data plane dies SILENTLY — no node fires, no error. That contract is
+# enforced by `cerulion_core/tests/iceoryx2_version_lockstep_test.rs`, which
+# would FAIL if any of these were removed, so an unused-dependency tool must be
+# told rather than obeyed here.
+#
+# `iceoryx2-bb-posix` is deliberately ABSENT from the list: this crate really
+# does `use` it, and cargo-machete says so ("was marked as ignored, but is
+# actually used") — so listing it would be a waiver for a dependency that
+# needs none. `regex` was absent for the opposite reason — the tool was RIGHT
+# about it — and has now been REMOVED rather than waived, which is the outcome
+# that comment anticipated: a waiver for a true positive is how a dead
+# dependency becomes permanent.
+[package.metadata.cargo-machete]
+ignored = [
+    "iceoryx2-bb-concurrency",
+    "iceoryx2-bb-container",
+    "iceoryx2-bb-derive-macros",
+    "iceoryx2-bb-elementary",
+    "iceoryx2-bb-elementary-traits",
+    "iceoryx2-bb-linux",
+    "iceoryx2-bb-lock-free",
+    "iceoryx2-bb-loggers",
+    "iceoryx2-bb-memory",
+    "iceoryx2-bb-print",
+    "iceoryx2-bb-system-types",
+    "iceoryx2-cal",
+    "iceoryx2-log-types",
+    "iceoryx2-pal-concurrency-sync",
+    "iceoryx2-pal-configuration",
+    "iceoryx2-pal-os-api",
+    "iceoryx2-pal-posix",
+    "iceoryx2-pal-print",
+]
+
+[dependencies]
+thiserror = "2"
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+# Transport layer - local IPC
+# Upgraded 0.8.1 → 0.9.1 to unlock per-publisher
+# allocation_strategy (the 1-line solution) + BackpressureStrategy
+# rename + set_backpressure_handler (backpressure enforcement in iceoryx2) +
+# the upstream fix for native blocking that no longer deadlocks on
+# subscriber disconnect.
+#
+# PINNED to EXACT `=0.9.1` (not `^0.9`/`~0.9.1`): a user's freshly
+# scaffolded workspace (no Cargo.lock) would otherwise re-resolve to
+# the newest 0.9.x patch (e.g. 0.9.2) while the installed `cerulion`
+# binary links 0.9.1 — the two patch releases stamp incompatible
+# `iceoryx2-bb-elementary::PackageVersion`s into every shared-memory
+# zero-copy connection segment, producing a `VersionMismatch` → an
+# "Unable to establish connection" flood with no data flow.
+# NOTE: `=0.9.1` on the top-level
+# crate is necessary but NOT sufficient — iceoryx2's deps on its own
+# sub-crates (`iceoryx2-bb-elementary`, `iceoryx2-cal`, the `*-pal-*`
+# set, …) are loose `0.9`, so a fresh lock floats THEM to 0.9.2 even
+# while the top-level stays 0.9.1, and `bb-elementary::PackageVersion`
+# is stamped into every zero-copy connection's SHM segment → a
+# sub-crate skew alone triggers `ZeroCopyCreationError::VersionMismatch`
+# → the same silent data-plane death. The full sub-crate family is
+# therefore exact-pinned in the dedicated block below; bump the WHOLE
+# family + `iceoryx2-log` together, in lockstep, when upgrading.
+iceoryx2 = "=0.9.1"
+# Bridge iceoryx2's internal logger (`trace!`,
+# `warn!`, etc. inside iceoryx2's own code) to the `tracing`
+# crate so its emissions flow through Cerulion's standard log
+# plumbing. We implement the bridge directly (mirrors
+# `iceoryx2-bb-loggers::tracing::Logger`) instead of depending on
+# `iceoryx2-bb-loggers` because that crate's `tracing` feature
+# conflicts with the `console` feature iceoryx2 already enables
+# transitively (only one default-logger may be selected).
+# PINNED to EXACT `=0.9.1` for the same patch-skew reason as `iceoryx2`
+# above — keep both pins in lockstep.
+iceoryx2-log = "=0.9.1"
+# Pin iceoryx2's ENTIRE sub-crate family to the SAME exact
+# version as the top-level `iceoryx2`/`iceoryx2-log` crates above. The
+# cdylib node architecture statically links `cerulion_core` (hence
+# iceoryx2) into every node `.so`; if the host runtime and a node
+# cdylib resolve different iceoryx2 sub-crate versions, the
+# `PackageVersion` they stamp into the shared-memory zero-copy
+# connection disagrees and NO data flows (a `VersionMismatch` once per
+# receiver, never retried). Pinning the family HERE propagates the
+# constraint to every dependent — the `cerulion` binary, the in-repo
+# benches, and a user's freshly scaffolded node workspace (all dep
+# `cerulion_core`). `default-features = false` adds ONLY the version
+# constraint (each sub-crate's features still come from iceoryx2's own
+# unioned requests), so this never alters a sub-crate's feature set —
+# in particular it does not pull `iceoryx2-bb-loggers`' `tracing`
+# logger (see the note above). Guarded by the
+# `iceoryx2_version_lockstep_test` integration test. Bump the whole
+# block in lockstep with `iceoryx2` when intentionally upgrading
+# (and update `PIN` in `iceoryx2_version_lockstep_test`).
+iceoryx2-bb-concurrency = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-container = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-derive-macros = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-elementary = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-elementary-traits = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-linux = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-lock-free = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-loggers = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-memory = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-posix = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-print = { version = "=0.9.1", default-features = false }
+iceoryx2-bb-system-types = { version = "=0.9.1", default-features = false }
+iceoryx2-cal = { version = "=0.9.1", default-features = false }
+iceoryx2-log-types = { version = "=0.9.1", default-features = false }
+iceoryx2-pal-concurrency-sync = { version = "=0.9.1", default-features = false }
+iceoryx2-pal-configuration = { version = "=0.9.1", default-features = false }
+iceoryx2-pal-os-api = { version = "=0.9.1", default-features = false }
+iceoryx2-pal-posix = { version = "=0.9.1", default-features = false }
+iceoryx2-pal-print = { version = "=0.9.1", default-features = false }
+# Insertion-ordered map for deterministic scheduler iteration.
+# The `rayon` feature pulls indexmap's parallel iterators
+# (`par_values_mut`) so the level executor's wide-fire path can walk the
+# scheduler's `IndexMap<String, ScheduledNode>` in parallel by index (each
+# yielded `&mut ScheduledNode` is disjoint), keyed against an index-aligned
+# scratch — no per-step HashMap allocation.
+indexmap = { version = "2.8", features = ["rayon", "serde"] }
+# Within-level parallel node fire. The level executor
+# fans a DAG level's independent (disjoint &mut) nodes across a build-time-
+# sized thread pool. rayon's collect preserves input order and we re-sort the
+# per-node trace fragments by decision position before merging, so the merged
+# trace stays byte-identical to the serial `tick_decided` order.
+rayon = "1.10"
+# CLOCK_MONOTONIC for kernel-wide timestamps
+libc = "0.2"
+# The home directory behind `~/.cerulion/runs`, the canonical root a
+# gathered `RunRecord::run_dir` must resolve inside before the `runs` verb reads
+# it. The derivation lives here (not in `cerulion_cli_engine::run_dir`, which
+# WRITES those directories) because `cerulion_core` cannot depend on the CLI
+# engine and two copies of one root is the mistake — so the writer
+# delegates to this crate instead. Already in the workspace tree via
+# cerulion_cli_engine and cerulion_discovery.
+dirs = "6"
+
+# Graph loading
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# Dynamic library loading for cdylib nodes
+libloading = "0.8"
+
+# Proc macros for node type definition
+cerulion_macros = { workspace = true }
+
+# Network transport
+zenoh = { version = "1", default-features = false, features = ["transport_tcp"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+# Stable get_or_try_init (std::sync::OnceLock version is nightly-only)
+once_cell = "1"
+
+# `clock.rs` calls `windows_sys` from its two `#[cfg(windows)]` arms; without
+# this dependency a Windows build cannot resolve the crate at all and its
+# "monolith fallback on non-Unix" promise is unfulfillable. MEASURED on the
+# Windows target shape: exactly 12 errors, every one of them
+# this missing dependency — 4 x `E0433 cannot find crate windows_sys` plus the
+# 8 type errors cascading from the two arms those leave unfinished.
+#
+# The features are EXACTLY the module paths `clock.rs` names, and nothing more.
+# windows-sys gates each module on a feature mirroring its path, so the mapping
+# is mechanical (verified against 0.61.2's own `Cargo.toml` + `src/`):
+#   Win32_Foundation        -> Win32::Foundation::FILETIME       (thread_cpu_ns)
+#   Win32_System_Performance-> Win32::System::Performance::Query{PerformanceFrequency,PerformanceCounter} (real_ns)
+#   Win32_System_Threading  -> Win32::System::Threading::{GetCurrentThread,GetThreadTimes} (thread_cpu_ns)
+# `Win32_Foundation` is implied transitively (`Win32_System_Performance` ->
+# `Win32_System` -> `Win32` -> `Win32_Foundation`), but is listed explicitly
+# because the code names that module directly — an implied feature is a fact
+# about another crate's feature graph, not a declaration of what we use.
+#
+# NOT exact-pinned (`=`), deliberately, unlike the iceoryx2 family above. That
+# pin exists for a specific ABI hazard: a sub-crate skew stamps an incompatible
+# `PackageVersion` into every SHM segment and silently kills the data plane.
+# windows-sys has no such hazard (it is `extern` declarations plus link
+# directives — no shared state between copies), and ~30 crates already in this
+# workspace's lockfile depend on `windows-sys 0.61.x` through caret ranges, so
+# an exact pin here could only FORCE A DUPLICATE the moment any one of them
+# needs a newer patch. 0.61 is the current major-equivalent series (0.61.2 is
+# the newest published version and is already the resolved one in Cargo.lock).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+] }
+
+[features]
+fuzz-helpers = []
+# Enables `tracing/max_level_trace`. This does NOT re-enable debug/trace in a
+# release build while `release_max_level_info` is set on the tracing dependency
+# above: tracing consults every `release_max_level_*` feature first under
+# not(debug_assertions), and Cargo unifies features across the binary, so the
+# release ceiling stays at info. Build without `--release` to get debug lines.
+# Making this a real release override means moving the ceiling out of the
+# unconditional dependency features of every crate that sets it (a manifest
+# redesign, not done here).
+debug-logging = ["tracing/max_level_trace"]
+# Expose test-only helpers (e.g. `ClosureNodeEntry`) outside `#[cfg(test)]`.
+# Enabled automatically for integration tests via the dev-dependencies self
+# reference below (Part B).
+test-helpers = []
+
+[dev-dependencies]
+# The internal dev-deps below are INTENTIONALLY path-only (no
+# `version`, no `workspace = true`). `cargo package` strips path-only
+# dev-dependencies, which is what breaks the publish-time cycles
+# cerulion_core <-> native_ros2_messages and cerulion_core <->
+# cerulion_cli_engine (both depend on cerulion_core as a normal dep).
+# Do NOT add `version` to them.
+#
+# Enable `test-helpers` on native_ros2_messages so
+# codegen-emitted test-only items (`<Name>Shm::take_overflow`) are visible
+# to integration tests in `cerulion_core/tests/`.
+native_ros2_messages = { path = "../native_ros2_messages", features = ["test-helpers"] }
+cerulion_cli_engine = { path = "../cerulion_cli_engine" }
+# Self-reference enables `test-helpers` for integration tests / examples
+# (the items behind `#[cfg(any(test, feature = "test-helpers"))]` are
+# visible to `tests/*.rs` and `examples/*.rs` but NOT to downstream crates).
+cerulion_core = { path = ".", features = ["test-helpers"] }
+tempfile = "3"
+proptest = "1"
+trybuild = "1"
+bytemuck = { version = "1", features = ["derive"] }
+# Captures `tracing::warn!` / `info!` output per-test for assertion in
+# integration tests. Used to pin the
+# (None, None) default-Data-trigger warn message. The `no-env-filter`
+# feature is required because the warn under test fires from
+# `cerulion_core::graph::runtime` (not the test crate), and the default
+# tracing-test EnvFilter scopes to the test-crate-name only.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# Process-global mutex via `#[serial]`
+# attribute. Used by integration tests whose bodies touch a process-
+# global resource (cdylib `NODES` static, `CER_FAIL_MODE` env var, or
+# `CountingAllocator.enable()` scope) and would race under
+# `cargo test --workspace`'s default parallel execution. Replaces
+# file-local `env_lock()` / `alloc_lock()` patterns with a single
+# standardized attribute. NOTE: `#[serial]` provides mutex
+# serialization within a binary but does NOT guarantee FIFO ordering
+# of waiting tests — tests whose correctness depends on ordering
+# (e.g., tick-panic-then-shutdown) must still be combined into a
+# single `#[test]` body.
+serial_test = "3"
+# The permissive standalone wire decoder. `cerulion-wire` hand-mirrors
+# `cerulion_core/src/wire.rs`; `tests/wire_lockstep_test.rs` builds frames with
+# THIS crate's real writer types and re-parses them with `cerulion-wire`, so any
+# drift in the wire layout fails loudly. Path-only (stripped by `cargo package`,
+# per the note above) — AGPL crate dev-depending on a permissive one is fine.
+cerulion-wire = { path = "../cerulion_wire" }

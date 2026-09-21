@@ -1,0 +1,5 @@
+error: unknown attribute `deadline_ms`, expected `period_ms`, `sync_window_ms`, `unbounded_sync`, `external`, `tick_within_ms`, `throttle_ms`, `allow_non_deterministic`, or `uses_live_io`
+ --> tests/ui/deadline_ms_rejected.rs:9:17
+  |
+9 | #[cerulion_node(deadline_ms = 100)]
+  |                 ^^^^^^^^^^^

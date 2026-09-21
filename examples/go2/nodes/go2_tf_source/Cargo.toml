@@ -1,0 +1,70 @@
+# The Go2 TF broadcaster node crate. Publishes the
+# static mount table on `/tf_static` and an odom→base transform on `/tf` as
+# standard `tf2_msgs/TFMessage`, so this workspace and a robot running a ROS 2
+# `robot_state_publisher` feed the same desk-side viz contract
+# (`cerulion-vizd` consumes the topics on the user's machine).
+# Depends on the PURE `go2_tf` codec (NOT `cerulion_viz`), so this
+# producer never pulls the Rerun SDK. `go2_tf` and
+# `cerulion_viz` live in the isolated
+# `cerulion_viz` workspace at the repo root, so these deps reach across to
+# it by path.
+[package]
+name = "go2_tf_source"
+version = "0.1.0"
+edition = "2021"
+description = "Go2 TF broadcaster: static mounts + odom→base on /tf(+static)"
+# LITERAL, not `license.workspace = true` — same two-loader rule as the
+# [dependencies] note below. Both workspaces declare AGPL-3.0-only, so this is
+# byte-identical; spelling it out removes the last field whose value
+# would depend on WHICH workspace happens to be loading this manifest.
+license = "AGPL-3.0-only"
+# No viz/rerun on the robot: this crate has zero
+# rerun edges even under `-e normal,dev`. A `cerulion_viz` +
+# `rerun` DEV-dep here would put a 257-crate Rerun SDK edge AND a
+# `rust-version = "1.92"` rerun MSRV floor on a crate that ships to the ROBOT.
+# The viz e2e lives on the DESK side — `cerulion_viz/lib/cerulion_viz/tests/
+# tf_source_e2e_test.rs`, which dev-depends on THIS crate — so the
+# dependency edge points robot→(nothing) instead of
+# robot→rerun. No `rust-version` is declared here (matching every other
+# demo node crate). The `rerun-leanness` CI job pins the invariant.
+
+# Not published to crates.io: a demo node crate.
+publish = false
+
+[lib]
+# cdylib = the production artifact (`cerulion graph run` via DylibNodeEntry);
+# rlib = so integration tests can link the crate in-process.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+# EXPLICIT relative paths, NOT `workspace = true` — the same rule
+# `cerulion_viz/lib/cerulion_viz/Cargo.toml` already documents for the other end
+# of this edge. This crate is loaded from TWO workspaces (its own
+# `examples/go2`, and the ROOT workspace via cerulion_viz's dev-dep), and cargo
+# resolves `workspace = true` against whichever workspace is doing the loading:
+# the root's `[workspace.dependencies]` has `cerulion_core` but NOT
+# `native_ros2_messages`, so inheritance hard-fails the whole root manifest load
+# ("`dependency.native_ros2_messages` was not found in `workspace.dependencies`").
+# Explicit paths resolve identically from either loader. The targets are
+# byte-equivalent to what `examples/go2`'s `[workspace.dependencies]` supplies.
+cerulion_core = { path = "../../../../crates/cerulion_core" }
+native_ros2_messages = { path = "../../../../crates/native_ros2_messages" }
+go2_tf = { path = "../../../../crates/cerulion_viz/lib/go2_tf" }
+
+# No [dev-dependencies], deliberately. Anything added here
+# lands in `cargo tree -e normal,dev` for this ROBOT crate; the `rerun-leanness`
+# CI job fails on a `rerun` edge. The viz e2e lives in
+# `cerulion_viz/lib/cerulion_viz/tests/tf_source_e2e_test.rs`.
+
+# This resolves against WHICHEVER workspace is loading this manifest — the same
+# two-loader rule the [dependencies] note above documents. Both `examples/go2` and
+# the ROOT workspace therefore declare `[workspace.lints]`, and the two tables
+# are pinned semantically identical by
+# `cerulion_cli_engine/tests/workspace_lints_manifest_test.rs`. Without the
+# `examples/go2` half this line fails the load from that side outright.
+[lints]
+workspace = true

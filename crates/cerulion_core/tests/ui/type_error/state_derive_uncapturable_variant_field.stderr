@@ -1,0 +1,15 @@
+error[E0277]: `CudaContext` cannot be part of a Cerulion node's state
+  --> tests/ui/type_error/state_derive_uncapturable_variant_field.rs:36:15
+   |
+36 |     Connected(CudaContext),
+   |               ^^^^^^^^^^^ this enum variant's field cannot be captured for replay
+   |
+help: the trait `CerulionVariantMember` is not implemented for `CudaContext`
+  --> tests/ui/type_error/state_derive_uncapturable_variant_field.rs:31:1
+   |
+31 | struct CudaContext;
+   | ^^^^^^^^^^^^^^^^^^
+   = note: Cerulion snapshots node state so a recording made mid-run can be replayed. Every field must say what it is.
+   = note: `#[cerulion(reconstruct)]` is NOT available here — an enum restores by REPLACING the whole value, so reading one must MINT the variant, and a handle cannot be minted from bytes. This is the one place the advice for a struct field does not carry over.
+   = note: fix 1, if this is a HANDLE: hold it OUTSIDE the enum — a `#[cerulion(reconstruct)]` field on the struct that owns the enum, re-opened in `fn restored(&mut self)` — and leave the enum carrying only the capturable part
+   = note: fix 2, if this is real state: make it capturable — add `#[derive(CerulionState)]` to `CudaContext`

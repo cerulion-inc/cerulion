@@ -1,0 +1,5 @@
+error: unknown `#[cerulion(...)]` key `recontsruct`, expected `reconstruct`, `serde`, or `unordered`
+  --> tests/ui/state_derive_unknown_cerulion_key.rs:14:16
+   |
+14 |     #[cerulion(recontsruct)]
+   |                ^^^^^^^^^^^

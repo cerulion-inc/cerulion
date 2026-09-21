@@ -1,0 +1,82 @@
+[package]
+name = "native_ros2_messages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "ROS 2 message types for Cerulion zero-copy messaging: 22 packages and 254 messages generated at build time from the vendored .msg files"
+readme = "README.md"
+keywords = ["robotics", "ros2", "messages", "cerulion"]
+categories = ["science::robotics"]
+# build.rs scans msg/ at compile time, so the vendored message tree has to
+# travel with the package or the crate builds empty. The upstream manifest
+# rides along as that tree's provenance record: it names the repository and
+# the ref every vendored message came from, which is what a reader of the
+# notice file needs in order to check an attribution. The agent instruction
+# files and the test tree stay behind.
+#
+# The legal files travel too, because this package redistributes other
+# people's work: LICENSE is the AGPL-3.0-only text the generated Rust code is
+# published under, NOTICE attributes every vendored package to its upstream,
+# and LICENSE-APACHE and LICENSE-BSD-3-CLAUSE are the two upstream licenses
+# the vendored .msg files are under. Both of those licenses require a
+# recipient to get the license text and the attribution notice, so a download
+# that carried msg/ without them would not satisfy them.
+include = [
+    "src/",
+    "msg/",
+    "upstream_msg_manifest.txt",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "LICENSE-APACHE",
+    "LICENSE-BSD-3-CLAUSE",
+]
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Test-only items emitted by codegen (e.g. `<Name>Shm::take_overflow`)
+# are gated `#[cfg(any(test, feature = "test-helpers"))]`. Integration tests
+# in `cerulion_core/tests/` enable this feature via the dev-dep propagation
+# pattern (see `cerulion_core/Cargo.toml`).
+test-helpers = []
+
+[dependencies]
+cerulion_core = { workspace = true }
+# NO direct `serde` dependency, deliberately. Codegen-emitted
+# `<Name>Snapshot` types name `::cerulion_core::serde` and carry
+# `#[serde(crate = "::cerulion_core::serde")]`, because a scaffolded USER node
+# crate depends only on `cerulion_core` + `native_ros2_messages` and a bare
+# `::serde` path does not resolve there. Keeping a direct dep here would make
+# this crate the one place that path skew could not be observed — the build
+# would resolve through the local dep and the user's crate would still break.
+
+[build-dependencies]
+cerulion_core = { workspace = true }
+
+# Dev-dependencies — used only by tests/roundtrip_test.rs.
+# `paste` lets the per-schema `roundtrip!` macro construct unique `#[test]`
+# function names from the package + schema identifier without hand-typing
+# 127 separate function bodies.
+#
+# The round-trip suite now builds its publishers/subscribers via
+# `cerulion_core::testing::TestTransport` (isolated iceoryx2, parallel-safe),
+# replacing the deleted `InProcessPublisher`. That helper is gated behind
+# cerulion_core's `test-helpers` feature, so enable it here (dev-only — the
+# regular [dependencies] entry above stays feature-free for library builds).
+[dev-dependencies]
+paste = "1"
+cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+# `tests/serde_corpus_test.rs` needs a concrete serde FORMAT
+# to prove the generated derives actually round-trip (the corpus walk only
+# reads text). Dev-only — the library itself still has no serde dependency.
+serde_json = "1"

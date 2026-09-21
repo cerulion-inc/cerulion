@@ -1,0 +1,68 @@
+name: Feature Request
+description: Suggest a new feature or improvement for Cerulion
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We'd love to hear your ideas for improving Cerulion! Please describe the feature you'd like to see.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem does this feature solve? Is it related to a pain point you've experienced?
+      placeholder: "I'm always frustrated when..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the solution you'd like. Include API sketches, CLI commands, or configuration examples if applicable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Describe any alternative solutions or workarounds you've considered.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of Cerulion does this relate to?
+      options:
+        - Transport (iceoryx2 / shared memory)
+        - Network (zenoh / cross-machine)
+        - Scheduler (determinism / trigger policies)
+        - CLI (cerulion commands)
+        - TUI (interactive dashboard)
+        - Codegen (schemas / message types)
+        - Graph (YAML / runtime)
+        - Macros (#[cerulion_node])
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ros2-comparison
+    attributes:
+      label: ROS2 Comparison
+      description: Does ROS2 have this feature?
+      options:
+        - "Yes - Cerulion should match or exceed it"
+        - "Partially - ROS2 has something similar"
+        - "No - This is unique to Cerulion"
+        - "Not sure"
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Any other context, screenshots, or references for the feature request.

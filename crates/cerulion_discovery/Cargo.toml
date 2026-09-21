@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# `cerulion_discovery` — the LAN peer-discovery SUBSTRATE shared by the
+# CLI's `topic list` ladder and `cerulion-netd`'s session fold.
+#
+# WHY A CRATE. `cerulion_cli_engine` already depends on `cerulion_netd` (for
+# `NetdClient`), so netd CANNOT import the ladder from the CLI engine — that edge
+# would be cyclic. The repo's precedent for exactly this shape is
+# `cerulion_wireclient`, extracted from `cerulion_connectd` so netd could reuse
+# its vocabulary with no `netd → connectd` cycle. Same move, same reason: ONE
+# implementation of the peer-cache FORMAT, the candidate types, the TCP
+# reachability pre-filter, and the connect-set planner — consumed by both sides.
+#
+# SCOPE IS DELIBERATELY THIN. Only the pieces BOTH consumers need live here:
+# - `ladder`      — the candidate types, the locator parser/dedupe key, the
+#                   bounded TCP pre-filter, and the pure `plan_connect_set`.
+# - `peer_cache`  — the `~/.cerulion/peers.json` FORMAT + the READER half.
+#
+# The mDNS / hostname / subnet-sweep rungs, the parallel `gather_rungs` engine,
+# and the peer-cache WRITER stay in `cerulion_cli_engine`. The writer split is
+# not incidental: writing the cache requires evidence a gather CONFIRMED a robot
+# live, which netd (a daemon with no gather of its own) structurally does not
+# have — so netd links a crate that has no `save_peers` to call.
+#
+# NO transport dep (no cerulion_core, no iceoryx2, no zenoh, no iroh, no mdns-sd)
+# — this crate is std + serde + dirs + tracing, so adding it to netd's dependency
+# tree changes nothing about the CLI's or vizd's leanness.
+[package]
+name = "cerulion_discovery"
+version.workspace = true
+edition.workspace = true
+# INHERITED AGPL (the workspace default): this code was extracted from
+# `cerulion_cli_engine` (AGPL) and stays under the same terms. Do NOT relicense —
+# unlike `cerulion_pairing`/`cerulion_link`, nothing here needs to embed in
+# proprietary firmware.
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "LAN peer discovery for Cerulion: discovered-peer types, the `~/.cerulion/peers.json` cache format and reader, a bounded TCP reachability filter, and the connect-set planner shared by the `cerulion` CLI and `cerulion-netd`"
+readme = "README.md"
+keywords = ["robotics", "discovery", "lan", "networking", "cerulion"]
+categories = ["science::robotics", "network-programming"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The peer cache is a small JSON document (`~/.cerulion/peers.json`).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `~/.cerulion` resolution for the default cache path.
+dirs = "6"
+# Structured logging (never println! in library code).
+tracing = "0.1"
+
+[dev-dependencies]
+# LEVEL pins for the reader's degrade paths. A corrupt / version-skewed
+# cache must be LOUD (`warn!`) — it is the difference between "no robots cached"
+# and "your cache is unreadable" — and only a level-matching predicate catches a
+# demotion to `debug!`. `no-env-filter` so the capture sees this crate's target
+# regardless of RUST_LOG.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }

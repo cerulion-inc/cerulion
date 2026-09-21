@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "heaphook_shim"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Test fixture: a trivial malloc interposer (libheaphook_shim.so) that forwards to glibc's real allocator. Preloaded AHEAD of libcerulion_heaphook.so, it wins malloc resolution so the hook's won-malloc detection must report status_won=0 (the foreign-allocator degrade)."
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+name = "heaphook_shim"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

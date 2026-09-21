@@ -1,0 +1,10 @@
+error[E0119]: conflicting implementations of trait `CerulionState` for type `HandImplNode`
+  --> tests/ui/type_error/node_hand_written_state_impl.rs:47:1
+   |
+47 | #[cerulion_node(period_ms = 10)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `HandImplNode`
+...
+64 | impl CerulionState for HandImplNode {
+   | ----------------------------------- first implementation here
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

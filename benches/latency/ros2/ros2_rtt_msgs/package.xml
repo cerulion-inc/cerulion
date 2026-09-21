@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ros2_rtt_msgs</name>
+  <version>0.1.0</version>
+  <description>
+    Fixed-size POD message types for ros2_rtt_bench. One Pod&lt;N&gt;.msg
+    per payload size in the round-trip sweep. POD layout (uint64 ts_ns
+    + uint8[N-8] payload) is what CycloneDDS+iceoryx and FastDDS+SHM
+    require to satisfy `Publisher::can_loan_messages() == true`, which
+    is the zero-copy publisher path the benchmark exercises.
+  </description>
+  <maintainer email="bench@cerulion.com">cerulion</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

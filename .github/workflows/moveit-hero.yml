@@ -1,0 +1,84 @@
+name: MoveIt Hero Demo
+
+# Gate the unmodified-MoveIt-on-rmw_cerulion hero demo against regression.
+# Heavy (builds a ROS 2 Jazzy + MoveIt image, then compiles rmw_cerulion
+# inside it), so it is NOT per-PR — nightly + manual only.
+#
+# Neither trigger is reachable from a fork: `schedule` and `workflow_dispatch`
+# only ever run on a branch of this repository, so no fork PR can start this
+# job. That is deliberate — it builds and runs a container from the checkout.
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:43 UTC daily. Off-peak and off the hour: GitHub queues the whole
+    # world's `0 * * * *` crons at once, and stale.yml already holds 07:17.
+    - cron: "43 3 * * *"
+
+# Only needs to read the checkout. upload-artifact uses the runtime token, not
+# a GITHUB_TOKEN scope, so nothing here needs write.
+permissions:
+  contents: read
+
+# A 90-minute job on a nightly cron plus manual dispatch can overlap itself,
+# and two runs would race on the same image tag and the same output directory.
+# Queue rather than cancel: a nightly regression result is worth finishing.
+concurrency:
+  group: moveit-hero
+  cancel-in-progress: false
+
+jobs:
+  moveit-hero:
+    name: Unmodified MoveIt on rmw_cerulion
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Test host launcher paths and Docker arguments
+        run: python3 -B examples/moveit_hero/test_run_demo.py
+
+      - name: Build hero image (ROS 2 Jazzy + MoveIt + Panda)
+        run: docker build -f examples/moveit_hero/Dockerfile -t cerulion-moveit-hero examples/moveit_hero
+
+      - name: Run demo (move_group over rmw_cerulion; OMPL plan + pilz determinism)
+        run: CER_DEMO_NO_BUILD=1 bash examples/moveit_hero/run_demo.sh
+
+      - name: Assert result files (machine-readable, primary gate)
+        if: always()
+        run: |
+          OUT=examples/moveit_hero/out
+          # Primary gate: JSON written by scripted_plan.py, independent of any
+          # log routing. Secondary: stdout sentinels tee'd into run.log.
+          #
+          # `.rmw` is the identifier rclpy reports for the middleware it
+          # actually loaded, NOT the RMW_IMPLEMENTATION this job exported —
+          # asserting on the env var would be circular, since we are the ones
+          # who set it.
+          test -f "$OUT/ompl.json" || { echo "no ompl.json produced"; exit 1; }
+          test -f "$OUT/pilz.json" || { echo "no pilz.json produced"; exit 1; }
+          jq -e '.status=="pass" and .rmw=="rmw_cerulion" and .points>0' "$OUT/ompl.json" \
+            || { echo "OMPL result not pass on rmw_cerulion"; exit 1; }
+          jq -e '.status=="pass" and .rmw=="rmw_cerulion" and .identical==true' "$OUT/pilz.json" \
+            || { echo "pilz determinism not pass on rmw_cerulion"; exit 1; }
+          LOG="$OUT/run.log"
+          test -f "$LOG" || { echo "no run log produced"; exit 1; }
+          # Deliberately NOT grepping the log for RMW_IMPLEMENTATION=rmw_cerulion:
+          # entrypoint.sh prints that line from the variable it just exported, so
+          # the check could never fail. The `.rmw` jq assertions above are the
+          # real test — they read what rclpy actually bound.
+          grep -q "OMPL_PLAN_OK" "$LOG" || { echo "OMPL stdout sentinel missing"; exit 1; }
+          grep -q "PILZ_DETERMINISM_PASS" "$LOG" || { echo "pilz stdout sentinel missing"; exit 1; }
+          echo "all assertions passed"
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: moveit-hero-run-log
+          # Logs and result JSON only. entrypoint.sh builds the rmw prefix
+          # inside this directory, and a nightly artifact is not a release
+          # channel for a compiled .so.
+          path: |
+            examples/moveit_hero/out/*.log
+            examples/moveit_hero/out/*.json
+          if-no-files-found: warn

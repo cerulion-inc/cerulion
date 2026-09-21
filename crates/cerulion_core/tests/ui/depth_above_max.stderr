@@ -1,0 +1,11 @@
+error: depth must be <= 64 (MAX_CONSUMER_DEPTH): every unit of depth commits a full max_slice_len-sized SHM slot — use a backpressure policy (drop_oldest / sample(N) / block) instead of a deeper queue
+  --> tests/ui/depth_above_max.rs:12:5
+   |
+12 |     image: u32,
+   |     ^^^^^
+
+error: cannot find attribute `input` in this scope
+  --> tests/ui/depth_above_max.rs:11:7
+   |
+11 |     #[input(depth = 65)]
+   |       ^^^^^

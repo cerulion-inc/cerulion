@@ -1,0 +1,22 @@
+[package]
+name = "test_node_raw_ffi_template_cdylib"
+version = "0.1.0"
+edition = "2021"
+description = "Oracle-vector cdylib: lib.rs is the byte-for-byte output of `templates::generate_lib_rs(NodeMetadata { node_type: \"raw_ffi_template\", policy: None, inputs: vec![], outputs: vec![] })`. The drift test in cerulion_cli_engine asserts the two stay in sync; regenerate with `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# The generated raw-FFI cdylib references
+# `::cerulion_core::graph::node::NodeContext` in `cerulion_node_init`
+# to reclaim the host's `Box::into_raw`'d allocation (preventing the
+# per-init NodeContext leak). User workspaces produced by
+# `cerulion node create` get this dep via `templates::generate_cargo_toml`
+# which emits `cerulion_core = { workspace = true }`.
+[dependencies]
+cerulion_core = { path = "../../cerulion_core" }
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

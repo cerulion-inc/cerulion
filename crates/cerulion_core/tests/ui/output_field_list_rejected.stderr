@@ -1,0 +1,11 @@
+error: unknown output attribute `data`; #[output] takes no field list. Write self.<port>.<field> = expr in the node body instead — the macro resolves fixed vs variable fields at compile time. #[output] accepts only the bare form or `promise_within_ms = N`.
+  --> tests/ui/output_field_list_rejected.rs:11:14
+   |
+11 |     #[output(data, encoding)]
+   |              ^^^^
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/output_field_list_rejected.rs:11:7
+   |
+11 |     #[output(data, encoding)]
+   |       ^^^^^^

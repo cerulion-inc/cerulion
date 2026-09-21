@@ -1,0 +1,129 @@
+# Work-state ledger for tools/scripts/check_public_surface.sh (class work-state).
+# `<count> <key> <path>`: the lines of a file that match one pattern key of
+# tools/scripts/public_surface_workstate.txt today, after the allow list. The
+# gate fails a file whose count is ABOVE its line (new wording: every matching
+# line is printed) or BELOW it (a stale line pre-authorises the next one): after
+# rewriting lines in a file, lower its line or delete it. Lines only ever go
+# down, and a file that is not listed allows none. A USER-FACING page
+# (README.md, CHANGELOG.md, docs/ outside docs/internals/, examples/**/*.md,
+# crates/**/README.md, .github/**/*.md) is never listed here: it reads zero, or
+# tools/scripts/public_surface_allow.txt names its one legitimate line.
+# `check_public_surface.sh --regenerate-workstate-ledger` rewrites this file
+# from the tree.
+3 review-round .claude/skills/deep-review/SKILL.md
+1 who-decided .github/CODEOWNERS
+1 change-ref AGENTS.md
+2 change-ref benches/latency/METHODOLOGY.md
+1 plan-step benches/latency/PITFALLS.md
+2 change-ref benches/latency/PITFALLS.md
+2 our-machines benches/latency/README.md
+1 change-ref benches/latency/README.md
+4 our-machines benches/latency/bench.py
+3 change-ref benches/latency/bench.py
+4 review-round benches/latency/check_percentile_parity.py
+3 candour-voice benches/latency/check_percentile_parity.py
+11 change-ref benches/latency/check_percentile_parity.py
+15 history-voice benches/latency/check_percentile_parity.py
+1 our-machines benches/latency/native/src/lib.rs
+2 change-ref benches/latency/plot.py
+1 history-voice benches/latency/plot_usage.py
+5 change-ref benches/latency/ros2/memo.md
+1 our-machines benches/latency/ros2/ros2_rtt_bench/src/common.hpp
+1 plan-step benches/latency/ros2/ros2_rtt_bench/src/composed_rtt_node.cpp
+2 change-ref benches/latency/ros2/ros2_rtt_bench/src/composed_rtt_node.cpp
+1 plan-step benches/latency/ros2/ros2_rtt_bench/src/latency_node.cpp
+1 plan-step benches/latency/ros2/ros2_rtt_bench/src/latency_node_rcl.cpp
+1 our-machines benches/latency/ros2/ros2_rtt_bench/src/latency_node_rcl.cpp
+1 change-ref benches/latency/ros2/ros2_rtt_bench/src/pod_dispatch.hpp
+2 our-machines benches/latency/ros2/ros2_rtt_bench/src/pong_node_rcl.cpp
+1 change-ref benches/latency/ros2/run_bench.sh
+1 our-machines benches/latency/ros2/verify_shm.sh
+1 change-ref benches/latency/ros2/verify_shm.sh
+1 our-machines benches/latency/workspace/nodes/ping_node/src/lib.rs
+1 our-machines benches/latency/workspace/run_workspace.sh
+1 candour-voice crates/cerulion_accountd/assets/team.html
+1 candour-voice crates/cerulion_accountd/src/team.rs
+8 plan-step crates/cerulion_bag/tests/bag_crash_recovery_test.rs
+3 plan-step crates/cerulion_bag/tests/bag_late_channel_test.rs
+3 plan-step crates/cerulion_bag/tests/bag_roundtrip_test.rs
+2 plan-step crates/cerulion_bag/tests/bag_validation_test.rs
+1 plan-step crates/cerulion_bag/tests/bag_writer_syscall_test.rs
+1 candour-voice crates/cerulion_bagd/src/absorbance.rs
+1 candour-voice crates/cerulion_bagd/src/flashback_plane.rs
+1 plan-step crates/cerulion_bagd/src/lib.rs
+1 plan-step crates/cerulion_bagd/src/state_coverage.rs
+1 candour-voice crates/cerulion_bagd/tests/e2e_test.rs
+1 candour-voice crates/cerulion_bagd/tests/flashback_trace_e2e_test.rs
+2 our-machines crates/cerulion_cli/tests/bagd_subprocess_test.rs
+3 our-machines crates/cerulion_cli/tests/mp_supervisor_box_test.rs
+1 candour-voice crates/cerulion_cli_engine/src/shm_state.rs
+2 candour-voice crates/cerulion_cli_engine/src/topic_cmd.rs
+1 candour-voice crates/cerulion_cli_engine/src/viz_client.rs
+1 candour-voice crates/cerulion_cli_engine/tests/bag_record_schema_provenance_test.rs
+1 candour-voice crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs
+2 candour-voice crates/cerulion_cli_engine/tests/replay_engine_test.rs
+2 candour-voice crates/cerulion_cli_engine/tests/ros_attach_test.rs
+1 candour-voice crates/cerulion_connectd/tests/reinject_e2e_test.rs
+1 candour-voice crates/cerulion_core/build.rs
+1 plan-step crates/cerulion_core/src/codegen/generator/structs.rs
+2 plan-step crates/cerulion_core/src/flashback.rs
+1 candour-voice crates/cerulion_core/src/flashback/retention.rs
+11 plan-step crates/cerulion_core/src/graph/topology.rs
+1 candour-voice crates/cerulion_core/src/scheduler/catchup_clamp.rs
+4 review-round crates/cerulion_core/src/testing.rs
+1 candour-voice crates/cerulion_core/src/testing.rs
+7 plan-step crates/cerulion_core/src/transport/adaptive_sizer.rs
+1 candour-voice crates/cerulion_core/src/transport/discovery.rs
+1 candour-voice crates/cerulion_core/src/transport/reg_channel.rs
+2 our-machines crates/cerulion_core/tests/barrier_level_gate_subprocess_iox2_test.rs
+4 our-machines crates/cerulion_core/tests/barrier_test.rs
+3 plan-step crates/cerulion_core/tests/chunk_c_ffi_error_test.rs
+1 candour-voice crates/cerulion_core/tests/fill_from_codegen_test.rs
+1 candour-voice crates/cerulion_core/tests/free_run_ctor_iox2_test.rs
+1 candour-voice crates/cerulion_core/tests/gateway_iox2_test.rs
+1 review-round crates/cerulion_core/tests/graph_latency_test.rs
+5 plan-step crates/cerulion_core/tests/macro_cdylib_overflow_test.rs
+4 our-machines crates/cerulion_core/tests/monitor_wait_park_iox2_test.rs
+18 plan-step crates/cerulion_core/tests/overflow_iox2_test.rs
+3 plan-step crates/cerulion_core/tests/overflow_recovery_iox2_test.rs
+45 plan-step crates/cerulion_core/tests/overflow_redirect_e2e_test.rs
+3 plan-step crates/cerulion_core/tests/overflow_redirect_test.rs
+1 deferred-work crates/cerulion_core/tests/read_outcome_capture_iox2_test.rs
+2 candour-voice crates/cerulion_core/tests/recording_honest_clock_iox2_test.rs
+2 our-machines crates/cerulion_core/tests/serial_discipline_test.rs
+1 our-machines crates/cerulion_core/tests/shm_guard_madvise_iox2_test.rs
+2 history-voice crates/cerulion_core/tests/sync_per_set_iox2_test.rs
+1 history-voice crates/cerulion_core/tests/topic_buffer_sizing_test.rs
+1 plan-step crates/cerulion_core/tests/waitset_fd_source_iox2_test.rs
+1 plan-step crates/cerulion_core/tests/zero_alloc_test.rs
+2 our-machines crates/cerulion_dds/tests/live_discovery_box_test.rs
+1 candour-voice crates/cerulion_netd/src/client.rs
+11 candour-voice crates/cerulion_netd/src/convergence.rs
+1 candour-voice crates/cerulion_netd/tests/convergence_wait_e2e_test.rs
+1 candour-voice crates/cerulion_remoted/tests/wire_plane_test.rs
+5 candour-voice crates/cerulion_viz/bin/cerulion_vizd/src/daemon.rs
+1 candour-voice crates/cerulion_viz/bin/cerulion_vizd/src/events.rs
+1 session-id crates/cerulion_viz/bin/cerulion_vizd/tests/host_test.rs
+1 session-id crates/cerulion_viz/bin/cerulion_vizd/tests/vizd_e2e_test.rs
+1 candour-voice crates/cerulion_viz/bin/cerulion_vizd/tests/vizd_e2e_test.rs
+7 our-machines crates/cerulion_viz/lib/cerulion_viz/src/archetype.rs
+1 candour-voice crates/cerulion_viz/lib/cerulion_viz/src/archetype.rs
+1 session-id crates/cerulion_viz/lib/cerulion_viz/src/blueprint.rs
+3 our-machines crates/cerulion_viz/lib/cerulion_viz/src/sink.rs
+3 our-machines crates/cerulion_viz/lib/cerulion_viz/tests/openh264_live_fetch_test.rs
+1 history-voice crates/cerulion_wsd/AGENTS.md
+3 our-machines crates/rmw_cerulion/tests/rclpy_xproc_test.rs
+1 our-machines crates/rmw_cerulion/tests/rmw_adopt_take_linux_test.rs
+1 plan-step crates/test_fixtures/test_node_failing_cdylib/src/lib.rs
+5 plan-step crates/test_fixtures/test_node_state_liar_cdylib/src/lib.rs
+1 candour-voice docs/internals/core-testing.md
+1 candour-voice docs/internals/network-daemons.md
+1 candour-voice docs/internals/rmw.md
+7 plan-step examples/go2/nodes/camera_jpeg/tests/node_publish_test.rs
+2 our-machines examples/go2/nodes/dds_bridge/tests/participant_lease_ageout_test.rs
+1 plan-step tools/ros2_migrate/README.md
+1 plan-step tools/ros2_migrate/assert_matrix.py
+5 plan-step tools/ros2_migrate/cerulion_ros2_migrate_clang.cpp
+2 plan-step tools/ros2_migrate/fixtures/src/migrate_fixture_pkg/src/unsafe_shadowed_publisher.cpp
+23 plan-step tools/ros2_migrate/run_matrix.sh
+5 plan-step tools/ros2_migrate/run_matrix_selftest.sh

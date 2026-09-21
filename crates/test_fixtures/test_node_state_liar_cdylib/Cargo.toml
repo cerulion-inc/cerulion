@@ -1,0 +1,17 @@
+[package]
+name = "test_node_state_liar_cdylib"
+version = "0.1.0"
+edition = "2021"
+description = "Test fixture: a HAND-WRITTEN raw-FFI cdylib whose state exporter ignores the host sink's refusal"
+# Test fixture — never publish to crates.io.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cerulion_core = { path = "../../cerulion_core" }
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

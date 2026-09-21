@@ -1,0 +1,11 @@
+error: duplicate `promise_within_ms` in #[output]
+  --> tests/ui/output_duplicate_promise_within_ms.rs:11:5
+   |
+11 |     #[output(promise_within_ms = 5, promise_within_ms = 10)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/output_duplicate_promise_within_ms.rs:11:7
+   |
+11 |     #[output(promise_within_ms = 5, promise_within_ms = 10)]
+   |       ^^^^^^

@@ -1,0 +1,48 @@
+# The Go2 sport driver node crate (home: examples/go2, the Go2 example
+# Cerulion workspace, one crate per node). `request` is the pure std-only
+# policy that turns a velocity command into exactly one `unitree_api/Request`
+# (or none); `dds` is the live ros2-client writer on `/api/sport/request`;
+# `lib.rs` wraps them in the data-triggered `#[cerulion_node]` SportDriver.
+[package]
+name = "sport_driver"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Go2 sport driver: geometry_msgs/Twist to unitree_api/Request on /api/sport/request"
+
+[lib]
+# `cdylib` is the production artifact (loaded by `cerulion graph run` via
+# DylibNodeEntry). `rlib` is ADDITIONALLY emitted so tests/*.rs can link the
+# crate in-process; it adds nothing to the production surface.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+# The one-per-process DDS participant wrapper, the QoS helpers and the
+# field-verified `unitree_api/Request` struct the writer serializes.
+cerulion_go2_dds = { path = "../../lib/cerulion_go2_dds" }
+tracing = "0.1"
+
+[dev-dependencies]
+# `test-helpers` unlocks `cerulion_core::testing::iceoryx_test_config` +
+# `TransportManager::init_for_test` for the e2e (the teleop_mux precedent:
+# isolated per-test iceoryx2 SHM roots).
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+# Matches cerulion_core's own indexmap major (2.x): `GraphRuntime::build`
+# takes `IndexMap<String, Box<dyn NodeEntry>>`.
+indexmap = "2.8"
+# The canonical teleop saturation limits live in the joystick crate; the
+# driver's clamp duplicates them and `tests/const_consistency_test.rs` pins
+# the two in lockstep (the keyboard crate uses the same pattern).
+joystick_teleop = { path = "../joystick_teleop" }
+
+# The example workspace mirrors the root `[workspace.lints]` table (see
+# `examples/go2/Cargo.toml`), so every member here inherits the SAME strict
+# lints as the main tree rather than sitting under no lint table at all.
+[lints]
+workspace = true

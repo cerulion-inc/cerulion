@@ -1,0 +1,15 @@
+cpu_dma_lock: open(/dev/cpu_dma_latency) failed: No such file or directory - continuing without DMA lock (p99 may degrade)
+cpu_dma_lock: open(/dev/cpu_dma_latency) failed: No such file or directory - continuing without DMA lock (p99 may degrade)
+cpu_dma_lock: open(/dev/cpu_dma_latency) failed: No such file or directory - continuing without DMA lock (p99 may degrade)
+[INFO] [1789745247.477483018] [ros2_rtt_bench_pong]: Msg::is_plain: 1 (has_fixed_size=1, is_trivially_copyable=1, sizeof=4194304)
+[INFO] [1789745247.478036157] [ros2_rtt_bench_pong]: pong_node ready (msg=pod payload=4194304 loaned=1 qos=stock)
+[INFO] [1789745247.478447656] [ros2_rtt_bench_latency]: Msg::is_plain: 1 (has_fixed_size=1, is_trivially_copyable=1, sizeof=4194304)
+[INFO] [1789745247.481211352] [ros2_rtt_bench_ping]: Msg::is_plain: 1 (has_fixed_size=1, is_trivially_copyable=1, sizeof=4194304)
+[INFO] [1789745247.481743775] [ros2_rtt_bench_ping]: ping_node ready (msg=pod payload=4194304 loaned=1 qos=stock)
+[INFO] [1789745247.485561402] [ros2_rtt_bench_latency]: latency_node ready (msg=pod payload=4194304 target=2000 warmup=100 chrt=0 loaned=1 qos=stock pacing=quiescent rate=100Hz readiness=matched+graph)
+[INFO] [1789745268.569844928] [ros2_rtt_bench_latency]: RAW_DUMP_DONE payload=4194304 samples=2000 bytes=16000 path=/raw/jazzy_stock_rclcpp_chrt0_4194304.bin
+DELIVERY role=latency received=2100 kicks_sent=2109 unstamped=0 nonpositive_rtt=0
+[INFO] [1789745269.567472225] [rclcpp]: signal_handler(SIGINT/SIGTERM)
+DELIVERY role=pong echoed=2101
+[INFO] [1789745269.570129972] [rclcpp]: signal_handler(SIGINT/SIGTERM)
+DELIVERY role=ping published=2106

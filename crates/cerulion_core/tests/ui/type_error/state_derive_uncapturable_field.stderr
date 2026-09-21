@@ -1,0 +1,24 @@
+error[E0277]: `CudaContext` cannot be part of a Cerulion node's state
+  --> tests/ui/type_error/state_derive_uncapturable_field.rs:26:11
+   |
+26 |     cuda: CudaContext,
+   |           ^^^^^^^^^^^ this field cannot be captured for replay
+   |
+help: the trait `CerulionState` is not implemented for `CudaContext`
+  --> tests/ui/type_error/state_derive_uncapturable_field.rs:21:1
+   |
+21 | struct CudaContext;
+   | ^^^^^^^^^^^^^^^^^^
+   = note: Cerulion snapshots node state so a recording made mid-run can be replayed. Every field must say what it is.
+   = note: if this is a HANDLE that should be rebuilt rather than restored, mark the field `#[cerulion(reconstruct)]` and re-open it in `fn restored(&mut self)`
+   = note: if this is real state, make it capturable: add `#[derive(CerulionState)]` to `CudaContext`
+   = help: the following other types implement trait `CerulionState`:
+             &'static str
+             ()
+             (A, B)
+             (A, B, C)
+             (A, B, C, D)
+             (A, B, C, D, E)
+             (A, B, C, D, E, F)
+             (A, B, C, D, E, F, G)
+           and $N others

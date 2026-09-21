@@ -1,0 +1,13 @@
+error: `throttle_ms` cannot be combined with `period_ms`: period already pins the fire rate, so a rate cap is redundant or conflicting. Use `throttle_ms` with a data/deadline/sync/external trigger to cap a bursty producer, or just lower `period_ms`.
+ --> tests/ui/throttle_with_period.rs:8:1
+  |
+8 | #[cerulion_node(period_ms = 10, throttle_ms = 15)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/throttle_with_period.rs:10:7
+   |
+10 |     #[output]
+   |       ^^^^^^

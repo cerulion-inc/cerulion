@@ -1,0 +1,35 @@
+# Dockerfile.dockerignore — BuildKit per-Dockerfile ignore for
+# benches/latency/ros2/docker/Dockerfile (whose build context is the
+# REPO ROOT — its COPY paths are repo-root-relative).
+#
+# BuildKit picks this file up because it sits next to the Dockerfile
+# and is named <Dockerfile>.dockerignore; the legacy (non-BuildKit)
+# builder IGNORES it and would tar the full repo — .git and target/
+# included, tens of GB — into the context. The canonical build path
+# (bench.py::ensure_docker_image) therefore sets DOCKER_BUILDKIT=1 on
+# the `docker build` child, so an engine without BuildKit refuses
+# loudly instead of quietly uploading the repo root. A hand-run
+# `docker build` must export it too (it is the default since Docker 23).
+#
+# Paths are relative to the CONTEXT ROOT (the repo root).
+#
+# BLOCKLIST, not allowlist, on purpose: the ignore file's job is to
+# keep the heavy artifacts out of the context, not to enumerate what
+# the image may see — an allowlist would silently break the build
+# whenever the bench tree grows.
+
+# VCS + build output (the heavy hitters).
+.git
+**/target
+
+# Archives / recordings / result artifacts that may sit in a working
+# tree (never needed to compile the bench packages).
+**/*.tar.gz
+**/*.mcap
+**/__pycache__
+benches/**/results
+benches/**/raw
+
+# Host-side colcon artifacts, if anyone ever builds the bench ws on
+# the host (the image always colcon-builds its own copy).
+benches/latency/ros2/ros2_ws

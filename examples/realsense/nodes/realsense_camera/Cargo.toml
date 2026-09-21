@@ -1,0 +1,41 @@
+[package]
+name = "realsense_camera"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+# `realsense` links the official Intel SDK (librealsense2) through the
+# realsense-rust bindings. It is deliberately NOT in `default`: a plain
+# `cargo build` must succeed on a machine without the SDK. `cerulion node build
+# realsense_camera` probes for the `realsense2` pkg-config module (the metadata
+# block below) and adds `--features realsense` when the SDK is installed.
+# Without the feature the node still compiles; its `external_source` reports
+# `HostDriven`, so `cerulion graph run` refuses the launch and names this node.
+realsense = ["dep:realsense-rust"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+# realsense-sys 2.56.5 links librealsense2 through pkg-config (`realsense2`)
+# and ships pre-generated bindings, so no bindgen or libclang is needed.
+realsense-rust = { version = "=1.3.0", optional = true }
+
+[dev-dependencies]
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+
+# Consumed by `cerulion node build realsense_camera`: it probes every
+# pkg-config module below and adds `--features realsense` only when all of them
+# resolve; otherwise it builds without the feature and prints `without-it`
+# plus the platform's `install` line. Keep the install lines in step with
+# README.md, "Install the SDK".
+[package.metadata.cerulion.optional-system-deps.realsense]
+pkg-config = ["realsense2"]
+summary = "live RealSense capture (color rgb8 + depth 16UC1 through librealsense2)"
+without-it = "this node has no camera driver: external_source() reports HostDriven and `cerulion graph run` refuses the graph at launch, naming this node"
+install.macos = "brew install librealsense"
+install.ubuntu = "sudo mkdir -p /etc/apt/keyrings && curl -sSf https://librealsense.realsenseai.com/Debian/librealsenseai.asc | gpg --dearmor | sudo tee /etc/apt/keyrings/librealsenseai.gpg > /dev/null && echo \"deb [signed-by=/etc/apt/keyrings/librealsenseai.gpg] https://librealsense.realsenseai.com/Debian/apt-repo $(lsb_release -cs) main\" | sudo tee /etc/apt/sources.list.d/librealsense.list && sudo apt-get update && sudo apt-get install -y librealsense2-dev librealsense2-utils pkg-config"

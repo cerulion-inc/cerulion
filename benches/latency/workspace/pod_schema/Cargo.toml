@@ -1,0 +1,37 @@
+# cer_bench_msgs — the fixed-POD bench message crate (type-class
+# axis, METHODOLOGY §18).
+#
+# A REAL crate, not a `mod` inside each node, for two measured
+# reasons:
+#
+#  * `node_metadata::collect_use_imports` contributes NO schema package for
+#    a `use` path whose first segment names a same-file module.
+#    Three node crates each carrying `mod cer_bench_msgs {
+#    include!(…) }` therefore reported the BARE `PodPayload`, while the wire
+#    type is generated in the `cer_bench_msgs` package — so the graph could
+#    not name the schema the way the recorder writes it. A genuine crate
+#    path keeps its qualifier, so node metadata, the graph YAML, the `.msg`
+#    store registration and the wire hash all say `cer_bench_msgs/PodPayload`.
+#  * ONE compilation instead of three include!'d copies: producer and
+#    consumer cannot bake different array lengths even in principle.
+[package]
+name = "cer_bench_msgs"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+cerulion_core = { workspace = true }
+
+[build-dependencies]
+cerulion_core = { workspace = true }
+
+# cargo-machete reports `cerulion_core` as an unused normal dependency here.
+# It is a FALSE POSITIVE and the dependency must stay: this crate's whole body
+# is `include!(concat!(env!("OUT_DIR"), "/pod_payload.rs"))`, and the generated
+# code names `::cerulion_core` 15 times (`TransportError` on every generated
+# setter, the `ShmMessage` impl, the schema-hash constant). machete parses the
+# checked-in source only, so it cannot see through an OUT_DIR include — remove
+# the dependency and the crate stops compiling.
+[package.metadata.cargo-machete]
+ignored = ["cerulion_core"]

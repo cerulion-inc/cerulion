@@ -1,0 +1,14 @@
+run_bench.sh: note - /dev/cpu_dma_latency not present (pass --device /dev/cpu_dma_latency); p99 may degrade
+run_bench.sh: rmws=[stock] shm=[stock] chrt=[off] recv=rclcpp qos=stock msg=pod pacing=fixed100 sizes=[4194304]
+
+============================================================
+  RMW: stock
+============================================================
+
+  ---- SHM mode: stock ----
+  lane provenance note -> jazzy_stock_rclcpp_chrt0_provenance.txt (no SHM gate: the lane claims no transport label)
+    stock stock  chrt=off qos=stock size=4194304   ... ok (2000 samples in jazzy_stock_rclcpp_chrt0_4194304.bin)
+
+============================================================
+  Done in 23s - raw .bins under /raw
+============================================================

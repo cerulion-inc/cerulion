@@ -1,0 +1,46 @@
+# SPLIT leg graph — the IDENTICAL 3-node round-trip chain, split into two
+# OS processes by `process_groups`: g1 = {ping} at global level 0,
+# g2 = {pong, latency} at levels 1-2 (contiguous bands — the barrier
+# requires contiguous splits). The `ping -> pong` edge becomes a REAL
+# cross-process iceoryx2 hop under barrier lockstep; the pong -> latency
+# echo hop stays in-process in g2, so the split-vs-mono delta is ONE
+# explicit cross-process hop (the same 2-group shape as
+# benches/mp_latency/graphs/mplat_split.yaml). Declaration order = rank
+# (g1 = 0, g2 = 1). Run with `cerulion graph run rtt_bench_split --release`
+# — NO --single-process — under the real clock (the product default).
+#
+# PROVENANCE (do not edit in isolation): every node / topic / schema /
+# max_slice_len value here is a FAITHFUL MIRROR of graphs/rtt_bench.yaml,
+# copied verbatim. The ONLY intended difference is the `process_groups:`
+# block appended at the end (plus these provenance comments); the graph's name
+# is its file stem, so neither file carries a `name:` key. The split-vs-mono A/B depends on
+# IDENTICAL provisioning — do NOT change one file without the other.
+prefix: rtt_bench
+nodes:
+- id: ping
+  type: ping_node
+  inputs: []
+  outputs:
+  - name: ping_out
+    schema: sensor_msgs/Image
+    max_slice_len: 17000000
+    history_size: 0
+- id: pong
+  type: pong_node
+  inputs:
+  - name: ping_in
+    source: ping/ping_out
+  outputs:
+  - name: echo_out
+    schema: sensor_msgs/Image
+    max_slice_len: 17000000
+    history_size: 0
+- id: latency
+  type: latency_node
+  inputs:
+  - name: echo_in
+    source: pong/echo_out
+  outputs: []
+process_groups:
+  g1: [ping]
+  g2: [pong, latency]

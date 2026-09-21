@@ -1,0 +1,11 @@
+# Goal status constants
+int8 STATUS_UNKNOWN=0
+int8 STATUS_ACCEPTED=1
+int8 STATUS_EXECUTING=2
+int8 STATUS_CANCELING=3
+int8 STATUS_SUCCEEDED=4
+int8 STATUS_CANCELED=5
+int8 STATUS_ABORTED=6
+
+action_msgs/GoalInfo goal_info
+int8 status

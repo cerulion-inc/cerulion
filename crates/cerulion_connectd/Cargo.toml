@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "cerulion_connectd"
+version.workspace = true
+edition.workspace = true
+# License is INHERITED from the workspace (AGPL-3.0-only). `cerulion_connectd`
+# links `cerulion_core` for the desk-local SHM ingress seam, so it is AGPL —
+# it is the desk-side re-inject client `cerulion connect` spawns. Do NOT
+# override the license.
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Desk-side client behind `cerulion connect`: dials a robot over iroh, requests topics, and re-injects each raw wire frame into local shared memory, so `topic echo`, `viz` and any subscriber read the remote topic as a local one."
+# Not published to crates.io: a desk-side daemon spawned by `cerulion connect`,
+# not a library dependency, with path-only internal deps.
+publish = false
+
+# binstall metadata is deliberately absent: this crate is unpublished and ships only in the release archive.
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cerulion-connectd"
+path = "src/main.rs"
+
+[dependencies]
+# The shared desk-side `cerulion/wire/1` client substrate: the
+# control vocabulary (`protocol`), the dial-config parsers (`config`), the unified
+# `error`, and the per-topic re-inject reader (`reader::run_topic_reader`). This
+# crate re-exports its `config`/`error`/`protocol` modules + `worker`'s reader
+# items verbatim, so the public surface is unchanged; the extraction exists so
+# `cerulion_netd`'s WAN plane can share the SAME substrate without a `netd →
+# connectd` cyclic package edge.
+cerulion_wireclient = { path = "../cerulion_wireclient" }
+# The ONE iroh endpoint (desk device key = EndpointId), dial-by-key QUIC, the
+# per-topic uni frame streams, and the wire ALPN constant. Pulls the iroh tree —
+# which is exactly why this crate is EXCLUDED from the workspace
+# `default-members` (a plain `cargo build` stays iroh-free); build it via
+# `cargo build -p cerulion_connectd` or `--workspace`.
+cerulion_link = { path = "../cerulion_link" }
+# The zenoh-free desk-local SHM RE-INJECTION seam: `IngressInjector` +
+# `reinject_raw` (validates `total_size` + `schema_hash` per then
+# `publish_raw`s into local SHM on a `network:None` `TransportManager`), the
+# 32-byte `WireHeader`, `MaxSliceLen`, and the shared `cerulion_q`
+# catalog/schema vocabulary (`CatalogReply` / `SchemaReply` — ONE wire
+# vocabulary across the LAN + remote). Linking `cerulion_core` makes
+# `connectd` AGPL (correct — it is a desk-side CLI over the SHM plane).
+cerulion_core = { path = "../cerulion_core" }
+# The desk device IDENTITY: `DeviceIdentity::from_seed` derives the desk's
+# ed25519 public half (== its iroh `EndpointId`), which the robot's pairing
+# access list authorizes. No network I/O — pure identity/formats. The `pair`
+# subcommand ALSO uses its CPace initiator (`pake::CpaceInitiator`) to run the
+# code-pairing ceremony against the robot's ops plane.
+cerulion_pairing = { path = "../cerulion_pairing" }
+# The ops-plane RPC CLIENT (`cerulion/ops/1`): `OpsClient::connect_current` +
+# `call(verb, args)` speaks cerud's BE-u32 framed JSON over a `QuicOpsStream`.
+# The `pair` subcommand drives the robot's `code-pair-start`/`code-pair-finish`
+# bootstrap verbs through it. `cerud` is transport-agnostic (NO iroh / iceoryx2)
+# — it rides the iroh stream connectd already links, so no new heavy tree enters.
+cerud = { path = "../cerud" }
+# The dial + control loop + per-topic re-inject tasks run on tokio (the runtime
+# iroh already mandates). `signal` powers the binary's Ctrl-C graceful shutdown;
+# `time` bounds the control-frame handshake; `sync` powers the shutdown channel.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+    "sync",
+] }
+# Structured logging (never println! in library code). Cap release logging at
+# info, mirroring cerulion_core / cerulion_remoted.
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
+# The binary installs an env-filter subscriber; the library never installs one.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The mirrored wire control protocol (WireRequest / WireResponse / StreamPreamble)
+# and the desk-side summary serialize via serde/serde_json — the SAME
+# length-prefixed JSON the robot's `cerulion_remoted::wire` serves.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Hex decode of the robot's 64-char `--eid` and (optional) the desk device key.
+hex = "0.4"
+# Thin CLI for the binary (the robot eid / direct addrs / topic set / key file /
+# schemas dir / relay seam). Already a workspace citizen (cerud/bagd/remoted).
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+# The e2e tests drive the REAL robot side in-process: `reinject_e2e` builds a
+# `cerulion_remoted` `WirePlane` + `PairingAuthorizer` over real iroh loopback and
+# proves the desk client re-injects BYTE-IDENTICAL frames; `protocol_parity`
+# round-trips bytes between connectd's mirrored types and remoted's serve types;
+# and `pair_e2e` runs the REAL CPace ceremony against a remoted `OpsServing`. A
+# dev-dep keeps the PRODUCTION build free of the robot's ops SERVER (remoted) — the
+# desk carries only the ops CLIENT (`cerud`, a prod dep for the `pair` ceremony).
+cerulion_remoted = { path = "../cerulion_remoted" }
+# The e2e tests build a CLAIMED + paired trust store to seed the robot's access
+# list (the desk key is admitted). Already a prod dep; the test uses more of it.
+cerulion_pairing = { path = "../cerulion_pairing" }
+# The e2e tests drive REAL iceoryx2 over PER-TEST SHM roots
+# (`TransportManager::init_for_test` + `testing::iceoryx_test_config`), which live
+# behind cerulion_core's `test-helpers` feature.
+cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+# Bounded awaits (every test future is `timeout`-wrapped so CI can never hang)
+# + the `oneshot` shutdown channel the e2e drives the worker with.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# The `#[traced_test]` reinject-rejection / teardown log pins; `no-env-filter`
+# scopes the capture to ALL targets (mirrors cerulion_core / cerulion_remoted).
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# Isolated temp dirs for the schema-materialization tests + the epoch-cache
+# directory the push e2e reads.
+tempfile = "3"
+# The epoch-push e2e signs a GENUINE intermediate + access-list epoch (the
+# robot re-verifies both against its own root set, so a hand-faked blob would be
+# refused and the test would prove nothing). Signing needs the real ed25519 keys.
+ed25519-dalek = "2"

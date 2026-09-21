@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# The main-workspace DDS platform crate for `cerulion ros2 attach`.
+#
+# Houses ONE-per-process participant construction (with_only_networks — the
+# multi-homed-discovery fix a multi-interface robot REQUIRES) + SPDP/SEDP
+# discovery enumeration over cerulion-ros2-client/cerulion-rustdds. This is the
+# ONLY place in the main workspace that depends on the DDS stack; the
+# `cerulion ros2 attach` COMMAND logic is pure over the plain types re-exported
+# here (in
+# cerulion_cli_engine::ros_cmd), so the pure half is oracle-testable without a
+# DDS peer and this crate is the single "flip point" if placement ever moves.
+#
+# ── Dep provenance (verified against the pins of the examples/go2 workspace:
+#    cerulion_go2_dds/Cargo.toml) ───────────────────────────────────────────
+#   cerulion-ros2-client 0.10.1 (Apache-2.0, MSRV 1.88) ->
+#     cerulion-rustdds 0.14.2 (Apache-2.0, MSRV 1.88 — the effective floor,
+#     well under the root's 1.93 MSRV job). default-features = false keeps the
+#     DDS-security
+#     (rustls/ring/webpki) tree OUT of the resolve; the distro feature selects
+#     the ros2-client GID width — Iron+ (`jazzy`, the default) = 16-byte,
+#     pre-Iron (`humble`) = 24-byte. See the [features] section for why the
+#     default is `jazzy` (the wire rung's functional domain is Iron+).
+#   smol 2 + futures 0.3: the node SPINNER + the discovery-event collect loop
+#     run on one `smol::LocalExecutor` (the demos bridge pump's exact executor
+#     shape — src/pump.rs).
+#   thiserror 2 / tracing 0.1: errors + structured logging (workspace convention).
+#
+# DENY note: cerulion-rustdds 0.14.2 still carries mio 0.6 -> net2 through
+# mio-extras; the root deny.toml retains the scoped RUSTSEC-2020-0016 ignore.
+
+[package]
+name = "cerulion_dds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Uses the workspace MSRV (1.93, the CI-enforced floor — bumped from 1.88 when
+# cerulion_viz's rerun 0.34 SDK joined the workspace). The DDS dep tree's own
+# floor is only 1.88 (cerulion-rustdds 0.14.2) — comfortably under 1.93.
+rust-version.workspace = true
+description = "Cerulion DDS platform crate: one-per-process ros2-client/rustdds participant + discovery enumeration for `cerulion ros2 attach`"
+readme = "README.md"
+keywords = ["robotics", "ros2", "dds", "discovery", "cerulion"]
+categories = ["science::robotics", "network-programming"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[features]
+# GID width per distro (ros2-client 0.10.1, `gid.rs`): pre-Iron distros use the
+# 24-byte GID; Iron and NEWER use the 16-byte GID. ros2-client selects the width
+# by feature: `iron`/`jazzy`/`kilted` => 16-byte, everything below (`humble`,
+# `galactic`) => 24-byte.
+#
+# Default = `jazzy` (the 16-byte-GID world), because the wire rung's FUNCTIONAL
+# DOMAIN is exactly Iron+: RIHS01 type hashes shipped in Iron .0 (May 2023); the
+# `get_type_description` service the rung calls shipped in Jazzy .0 AND was
+# backported to Iron in the 2023-09-08 patch releases (rclcpp 21.0.3 /
+# rclpy 4.1.3, default-ON) — so the rung serves patched-Iron and newer, all of
+# which encode `ros_discovery_info` (`ParticipantEntitiesInfo`) with 16-byte
+# gids. The 24-byte-GID `humble` build simply cannot DECODE those PEIs, yielding
+# an empty node table (the rung would be structurally inert on its own target
+# networks). This also matches ros2-client's own default (`jazzy`). Pinned by
+# `discovery::tests::{jazzy_feature_selects_the_16_byte_gid_world,
+# default_build_stays_on_the_16_byte_gid_jazzy_world}`.
+#
+# Pre-Iron networks (e.g. the Unitree Go2's Humble-era stack) lose NOTHING under
+# the jazzy default: there are no RIHS01 hashes there, so the wire rung skips
+# with a loud reason regardless of GID width, and the `ros_discovery_info` PEI
+# parse degrades quietly to an empty node table — every OTHER attach rung is
+# GID-independent. For an explicit pre-Iron opt-in:
+#   cargo build -p cerulion_dds --no-default-features --features humble
+default = ["jazzy"]
+# `live` compiles the ros2-client/rustdds discovery BACKEND (participant +
+# LiveDiscovery). With `live` OFF only the DDS-free vocabulary (DiscoveredEndpoint
+# / DdsDiscovery / DdsError) compiles — so `cerulion_cli_engine`, which depends on
+# this crate with `default-features = false`, stays FREE of the DDS stack (mio/
+# net2/rustdds) in its isolated builds + tests. The binary (`cerulion_cli`) pulls
+# the default features, so a `--workspace` build still compiles + deny-checks the
+# whole DDS tree.
+live = [
+    "dep:ros2-client",
+    "dep:smol",
+    "dep:futures",
+    "dep:async-channel",
+    "dep:serde",
+]
+humble = ["live", "ros2-client/humble"]
+jazzy = ["live", "ros2-client/jazzy"]
+
+[dependencies]
+# Optional: pulled in ONLY by the `live` feature (see above). `thiserror` is
+# NON-optional — `DdsError` (part of the always-compiled DDS-free vocabulary)
+# derives it. `tracing` is NON-optional too: the
+# always-compiled `ChainedAcquirer` warns loudly on a rung's unsolicited
+# result (the trust-boundary contract the engine driver can't see past the
+# chain), and the engine consumer already depends on tracing itself.
+ros2-client = { package = "cerulion-ros2-client", version = "0.10.1", default-features = false, optional = true }
+# REP-2011 GetTypeDescription request/response structs (wire_acquirer, live-only):
+# derive-only serde, matching the version ros2-client itself serializes with.
+serde = { version = "1", features = ["derive"], optional = true }
+smol = { version = "2", optional = true }
+futures = { version = "0.3", optional = true }
+tracing = "0.1"
+# The collect-loop seam names the status channel type (`Node::status_receiver`
+# hands us an `async_channel::Receiver<NodeEvent>`); ^2 unifies with
+# ros2-client's own async-channel 2.3.
+async-channel = { version = "2", optional = true }
+thiserror = "2"
+
+[dev-dependencies]
+# The skew-warn EMIT-site pin drives
+# `plan_service_calls` under `#[traced_test]` and asserts the `tracing::warn!`
+# actually fires at the plan site (the pure message builder is oracle-tested
+# separately). Version + `no-env-filter` match the workspace convention
+# (cerulion_core / cerulion_cli_engine dev-deps): without `no-env-filter`,
+# tracing-test's EnvFilter scopes capture to the test-crate-name target only.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "heaphook_probe"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Test fixture: a standalone malloc/dlsym probe binary that libcerulion_heaphook.so is LD_PRELOADed onto (the heaphook e2e test). DELIBERATELY does NOT depend on cerulion_heaphook — the interposers must reach it only through the preload, never a static link."
+license = "AGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "heaphook_probe"
+path = "src/main.rs"
+
+# libc for dlsym / malloc-family / fork / _exit / RTLD_DEFAULT. A plain dep (not
+# target-gated): it compiles on macOS too, so a default `cargo build` there
+# still builds the fixture — it is only ever RUN under the Linux e2e test,
+# where the hook is preloaded onto it.
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

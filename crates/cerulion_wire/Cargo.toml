@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# `cerulion-wire` is DELIBERATELY permissive-licensed (MIT OR Apache-2.0),
+# overriding the workspace-default AGPL. It is the standalone wire-format
+# DECODE seam so closed-source apps (the Cerulion Studio sidecar) can read raw
+# Cerulion frames without linking the AGPL `cerulion_core`. Raw frame bytes are
+# data; a byte-format reader is a protocol boundary, not a derivative of the
+# runtime — hence the permissive license.
+[package]
+name = "cerulion-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+description = "Minimal, dependency-light reader/encoder for the Cerulion wire format (permissive decode seam, no cerulion_core dependency)"
+keywords = ["robotics", "wire-format", "zero-copy", "parser", "cerulion"]
+categories = ["parsing", "encoding"]
+# Not published to crates.io yet: it is outside the documented publish set in
+# `docs/PUBLISHING.md`. Flip this to publish the standalone wire reader.
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The ONLY dependency: a compile-time-only derive for the error enum. thiserror
+# is MIT/Apache, adds no runtime code, and is already ubiquitous in the tree.
+thiserror = "2"

@@ -1,0 +1,19 @@
+error[E0080]: evaluation panicked: ShmMessage impl violates wire-format invariant: WireHeader::SIZE + WIRE_FIXED_SIZE + 8 * VARIABLE_FIELD_COUNT must fit in u32
+ --> $RUST/core/src/panic.rs
+  |
+  = note: evaluation of `<Pathological as cerulion_core::ShmMessage>::_SHM_INVARIANTS` failed here
+  |
+ ::: src/message.rs
+  |
+  | /         assert!(
+  | |             total <= u32::MAX as usize,
+  | |             "ShmMessage impl violates wire-format invariant: \
+  | |              WireHeader::SIZE + WIRE_FIXED_SIZE + 8 * VARIABLE_FIELD_COUNT must fit in u32",
+  | |         );
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+  --> tests/ui/const_eval/shm_invariants_overflow_variable_count.rs:45:15
+   |
+45 | const _: () = <Pathological as ShmMessage>::_SHM_INVARIANTS;
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

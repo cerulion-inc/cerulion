@@ -1,0 +1,11 @@
+error: unknown output attribute `variable(...)`; #[output] accepts only the bare form or `promise_within_ms = N`
+  --> tests/ui/output_unknown_paren_attribute.rs:10:14
+   |
+10 |     #[output(variable(data))]
+   |              ^^^^^^^^
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/output_unknown_paren_attribute.rs:10:7
+   |
+10 |     #[output(variable(data))]
+   |       ^^^^^^

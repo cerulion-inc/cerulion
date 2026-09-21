@@ -1,0 +1,139 @@
+# The Go2 mapping config for the GENERIC `dds_bridge` node: the DDS side of
+# graphs/bridge.yaml. The node itself is robot-agnostic; this file is the
+# Go2's config, and it is the same shape `cerulion ros2 attach` generates.
+#
+# Consumed via the DDS_BRIDGE_CONFIG env var (see graphs/bridge.yaml's RUN
+# lines). Each mapping's `ros_type` must be RESOLVABLE by EITHER of two
+# routes:
+#
+#   1. the bridge's TYPED codec registry (sensor_msgs/PointCloud2,
+#      unitree_go/SportModeState, geometry_msgs/Twist, unitree_api/Request),
+#      which carries a hand-written projection into a Cerulion schema; or
+#   2. the generic RAW codec, which transcodes any type whose `.msg` the
+#      schema store below (`msg_dirs`) or the built-in corpus can supply.
+#      This is how `unitree_go/Go2FrontVideoData` rides: it needs no registry
+#      entry and no `route: raw` (that flag FORCES a registry type onto the
+#      raw path; an unregistered type takes it automatically).
+#
+# A type resolvable by NEITHER fails launch LOUDLY; note the refusal still
+# lists only the registry set, so a typo in a store-typed name reads as "not
+# one of these four" rather than "no .msg found". Check `msg_dirs` too.
+#
+# `cerulion_topic` documents the Cerulion-side route for a TYPED mapping; the
+# GRAPH's `topic:` override is authoritative for those, so keep this file and
+# bridge.yaml in sync. For a RAW mapping (the camera) `cerulion_topic` IS the
+# route.
+#
+# WHICH UNIT IS THIS FOR: any Go2. Every value that varies between units is
+# listed in README.md "Defaults and overrides" with its override; the three
+# that live in this file are:
+#
+# * domain_id: must equal the robot's ROS_DOMAIN_ID (Go2 factory default 0).
+# * only_networks / GO2_IFACE: REQUIRED on a companion with more than one
+#   interface (docker, VPN, WiFi plus the robot LAN). Without it rustdds
+#   advertises every local address as a DDS locator, the discovery packets
+#   fragment past about 1.4 KB, and the robot's CycloneDDS DROPS fragmented
+#   discovery data ("DATAFRAG ... not yet supported"): discovery silently
+#   fails. Put the companion's robot-LAN interface IP below, or export
+#   GO2_IFACE=<ip> (the config value wins over the environment).
+# * The topic names: /utlidar/cloud (the lidar cloud), /sportmodestate (the
+#   high-rate body state; /lf/sportmodestate is its low-rate twin) and
+#   /frontvideostream (the camera) are the vendor's names. Confirm them on
+#   YOUR unit with `cerulion ros2 attach --iface <ip> --dry-run`, which lists
+#   every topic the robot publishes; a unit running a different vendor stack
+#   may publish a different set.
+#
+# QoS: best_effort subscriptions match BOTH reliable and best-effort
+# publishers (a reliable subscription would NOT match a best-effort
+# publisher); keep best_effort unless a mapping provably needs reliable
+# delivery.
+
+domain_id: 0
+
+# The companion's robot-LAN interface IP. Empty = fall back to GO2_IFACE, else a
+# LOUD warn + every-interface locators (single-interface hosts only).
+only_networks: []
+
+# The workspace `.msg` store, so the generic codec can resolve types
+# that are NOT built-in ROS 2 messages. REQUIRED for the /frontvideostream
+# mapping below: `unitree_go/Go2FrontVideoData` exists only here.
+#
+# It matters WHICH definition it finds. The `unitree_go` ament package ships a
+# four-field reconstruction that does not match what the Go2 firmware actually
+# publishes, and decoding real samples against it fails on every frame with a
+# "hostile length/count prefix", the video payload read at the wrong offset. The
+# store copy (schemas/unitree_go/msg/Go2FrontVideoData.msg) is the corrected,
+# evidence-derived layout, and the store is consulted BEFORE any acquisition
+# rung, so it also stops `ros2 attach` re-harvesting the wrong ament copy.
+#
+# Relative paths resolve against THIS FILE's directory, so `../schemas` is the
+# workspace store beside graphs/ and the graph runs from any working directory.
+msg_dirs:
+  - ../schemas
+
+mappings:
+  # The lidar cloud, for the desk-side viewer. No visualization node is
+  # staged on the robot: the desk DEMANDS the cerulion_topic below BY NAME
+  # (`cerulion viz --robot go2 /go2/utlidar/cloud`; `--robot` requires at
+  # least one topic), `cerulion-netd` mirrors it into desk-local shared
+  # memory, and `cerulion-vizd` decodes the packed `fields` blob this bridge
+  # writes, on the USER's machine. The robot ships raw frames.
+  - dds_topic: /utlidar/cloud
+    ros_type: sensor_msgs/PointCloud2
+    cerulion_topic: /go2/utlidar/cloud
+    qos: best_effort
+
+  # The high-level body state as a nav_msgs/Odometry PROJECTION (pose +
+  # twist; quaternion reordered from Unitree [w,x,y,z]). Nothing consumes it:
+  # the TF source keeps an identity `odom` to `base` while this layout is not
+  # validated against real robot bytes (README.md "Validate on your robot").
+  - dds_topic: /sportmodestate
+    ros_type: unitree_go/SportModeState
+    cerulion_topic: /go2/odom
+    qos: best_effort
+
+  # The front camera. This is the ONE source of Go2 camera imagery that is
+  # reachable, and it is a plain DDS topic.
+  #
+  # Each sample is `{uint64 time_frame, uint32 video_height, uint8[]
+  # video_data}` where video_data is ONE H.264 Annex-B access unit: exactly
+  # what `h264parse ! nvv4l2decoder` consumes and exactly what a desk-side
+  # H.264 decoder consumes. No depayloading, no re-containerizing. The
+  # firmware publishes TWO renditions on this one topic, distinguishable by
+  # `video_height`: 640x360 and 1280x720, one of each per `time_frame`
+  # (confirmed from the streams' own SPS on two Go2 EDU units; see
+  # ../schemas/unitree_go/msg/Go2FrontVideoData.msg).
+  #
+  # This mapping is also `camera_jpeg`'s SOURCE. The node does not join the
+  # vendor's UDP multicast video group itself, because on
+  # a companion with WiFi the multicast route can resolve to the wrong
+  # interface and needs a per-machine fix before one frame arrives, while
+  # "the camera is a topic" generalizes to a robot nobody has seen. The node
+  # is `#[input(trigger)]`-driven off the `/go2/camera/h264` this mapping
+  # publishes.
+  #
+  # No `ros_type` in the bridge's typed registry, so this rides the generic
+  # raw codec automatically (no `route: raw` needed).
+  #
+  # max_slice_len: the largest access unit measured over 60 consecutive live
+  # samples was a little over 60 KB (a 720p IDR carrying SPS+PPS+IDR). 1 MiB
+  # is about sixteen times that: generous on purpose, and cheap, since
+  # iceoryx2 `Static` pools are demand-paged and resident memory tracks the
+  # actual frame size, not the reservation.
+  #
+  # A frame LARGER than this cap is DROPPED, not truncated: the loan of an
+  # over-cap slice fails, so the raw route's publish returns Err and the
+  # whole sample is discarded (the wire sequence is NOT burned, so the stream
+  # stays gap-free for the frames that do cross). It is counted
+  # (`raw_route_failures`) and flood-latched: the FIRST drop of a regime logs
+  # a `warn!` naming the behaviour, every repeat logs at `debug!`, so a
+  # sustained over-cap regime is ONE warn at the default log level plus a
+  # climbing counter, never a silent loss and never a corrupted half-frame.
+  # Size the cap with headroom rather than relying on the log: a dropped
+  # H.264 access unit is a lost frame, and a lost IDR costs the desk-side
+  # decoder the whole GOP.
+  - dds_topic: /frontvideostream
+    ros_type: unitree_go/Go2FrontVideoData
+    cerulion_topic: /go2/camera/h264
+    qos: best_effort
+    max_slice_len: 1048576

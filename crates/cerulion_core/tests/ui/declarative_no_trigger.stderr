@@ -1,0 +1,19 @@
+error: no trigger policy: add `#[input(trigger)]` to a field, or specify `period_ms` or `external` on the node
+ --> tests/ui/declarative_no_trigger.rs:4:1
+  |
+4 | #[cerulion_node]
+  | ^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/declarative_no_trigger.rs:8:7
+  |
+8 |     #[output]
+  |       ^^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/declarative_no_trigger.rs:6:7
+  |
+6 |     #[input]
+  |       ^^^^^

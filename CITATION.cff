@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: Cerulion
+# Founders as personal authors (citation credit), then the entity;
+# further individual contributors are credited in docs/legal/AUTHORS.
+authors:
+  - family-names: Sharma
+    given-names: Lakshay
+  - family-names: Kariyawasam
+    given-names: Raveen
+  - name: "Cerulion Inc. and contributors"
+version: 1.0.0
+date-released: "2026-09-21"
+url: "https://github.com/cerulion-inc/cerulion"
+repository-code: "https://github.com/cerulion-inc/cerulion"
+license: AGPL-3.0-only
+keywords:
+  - robotics
+  - middleware
+  - zero-copy
+  - ROS2
+  - iceoryx2
+  - real-time
+  - pub-sub
+# Add a `doi:` once the Zenodo integration with GitHub mints one for the release tag.

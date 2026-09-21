@@ -1,0 +1,80 @@
+00:22:26.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:26.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26064 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:26.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18896 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:26.000Z pid=5327 ppid=5317 ni=0 %cpu=1.0 rss=557792 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:26.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:26.000Z pid=5317 ppid=5316 ni=0 %cpu=2.9 rss=26064 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:27.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18896 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:27.000Z pid=5327 ppid=5317 ni=0 %cpu=0.7 rss=587216 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:27.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:27.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26080 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:27.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18896 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:27.000Z pid=5327 ppid=5317 ni=0 %cpu=0.7 rss=616688 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:28.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:28.000Z pid=5317 ppid=5316 ni=0 %cpu=2.7 rss=26096 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:28.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18928 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:28.000Z pid=5327 ppid=5317 ni=0 %cpu=0.7 rss=653136 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:28.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:28.000Z pid=5317 ppid=5316 ni=0 %cpu=2.7 rss=26096 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:28.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18928 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:28.000Z pid=5327 ppid=5317 ni=0 %cpu=0.7 rss=681952 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:29.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:29.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26112 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:29.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18928 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:29.000Z pid=5327 ppid=5317 ni=0 %cpu=0.7 rss=720032 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:30.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:30.000Z pid=5317 ppid=5316 ni=0 %cpu=2.5 rss=26112 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:30.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18928 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:30.000Z pid=5327 ppid=5317 ni=0 %cpu=0.9 rss=757040 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:30.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:30.000Z pid=5317 ppid=5316 ni=0 %cpu=2.9 rss=26128 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:30.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18928 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:30.000Z pid=5327 ppid=5317 ni=0 %cpu=0.7 rss=789616 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:31.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:31.000Z pid=5317 ppid=5316 ni=0 %cpu=3.0 rss=26144 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:31.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18928 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:31.000Z pid=5327 ppid=5317 ni=0 %cpu=0.7 rss=827024 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:32.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:32.000Z pid=5317 ppid=5316 ni=0 %cpu=2.9 rss=26176 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:32.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:32.000Z pid=5327 ppid=5317 ni=0 %cpu=0.8 rss=859136 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:32.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:32.000Z pid=5317 ppid=5316 ni=0 %cpu=3.0 rss=26176 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:32.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:32.000Z pid=5327 ppid=5317 ni=0 %cpu=1.0 rss=890608 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:33.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10384 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:33.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26192 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:33.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:33.000Z pid=5327 ppid=5317 ni=0 %cpu=1.0 rss=922064 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:33.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10368 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:33.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26192 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:33.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:33.000Z pid=5327 ppid=5317 ni=0 %cpu=0.8 rss=950608 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:34.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10368 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:34.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26208 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:34.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:34.000Z pid=5327 ppid=5317 ni=0 %cpu=1.1 rss=980048 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:35.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10368 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:35.000Z pid=5317 ppid=5316 ni=0 %cpu=2.9 rss=26208 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:35.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:35.000Z pid=5327 ppid=5317 ni=0 %cpu=1.0 rss=1010000 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:35.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10368 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:35.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26224 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:35.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:35.000Z pid=5327 ppid=5317 ni=0 %cpu=0.7 rss=1038896 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:36.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10368 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:36.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26240 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:36.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:36.000Z pid=5327 ppid=5317 ni=0 %cpu=1.1 rss=1067104 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:36.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10368 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:36.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26240 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:36.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:36.000Z pid=5327 ppid=5317 ni=0 %cpu=1.0 rss=1097376 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:37.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10368 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:37.000Z pid=5317 ppid=5316 ni=0 %cpu=2.8 rss=26256 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:37.000Z pid=5326 ppid=5317 ni=0 %cpu=0.0 rss=18944 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:37.000Z pid=5327 ppid=5317 ni=0 %cpu=1.0 rss=1126224 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa
+00:22:38.000Z pid=5316 ppid=4422 ni=0 %cpu=0.0 rss=10368 cmd=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python <BOXHOME>/lanes/platform-20
+00:22:38.000Z pid=5317 ppid=5316 ni=0 %cpu=1.0 rss=26288 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run rtt_bench --release --single-process
+00:22:38.000Z pid=5326 ppid=5317 ni=0 %cpu=0.4 rss=19072 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion graph run-gateway --handoff <TMPDIR>/cerulion
+00:22:38.000Z pid=5327 ppid=5317 ni=0 %cpu=2.3 rss=1147440 cmd=<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/cerulion bagd --out <BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspa

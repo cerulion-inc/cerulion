@@ -1,0 +1,38 @@
+error: #[on_event] cannot be attached to the reserved `init` method; move the handler to a separate method
+  --> tests/ui/on_event_on_reserved_method.rs:31:8
+   |
+31 |     fn init(&mut self, _event: BackpressureEvent) {}
+   |        ^^^^
+
+error[E0599]: no method named `__cer_user_init` found for struct `ReservedMethodNode` in the current scope
+  --> tests/ui/on_event_on_reserved_method.rs:14:1
+   |
+14 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `ReservedMethodNode`
+15 | #[derive(Default)]
+16 | struct ReservedMethodNode {
+   | ------------------------- method `__cer_user_init` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_zero_copy_tick` found for struct `ReservedMethodNode` in the current scope
+  --> tests/ui/on_event_on_reserved_method.rs:14:1
+   |
+14 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `ReservedMethodNode`
+15 | #[derive(Default)]
+16 | struct ReservedMethodNode {
+   | ------------------------- method `__cer_zero_copy_tick` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_shutdown` found for struct `ReservedMethodNode` in the current scope
+  --> tests/ui/on_event_on_reserved_method.rs:14:1
+   |
+14 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+15 | #[derive(Default)]
+16 | struct ReservedMethodNode {
+   | ------------------------- method `__cer_user_shutdown` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

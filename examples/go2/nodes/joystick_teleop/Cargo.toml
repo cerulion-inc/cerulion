@@ -1,0 +1,51 @@
+# The Go2 joystick teleop node crate (home: examples/go2 — the Go2 demo
+# Cerulion workspace, one crate per node). `mapping` is the pure
+# std-only axis→Twist core; `pump` is the hardware `gilrs` gamepad pump;
+# `lib.rs` wraps them in the `#[cerulion_node(external)]` JoystickTeleop node.
+[package]
+name = "joystick_teleop"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Go2 joystick teleop: Bluetooth gamepad to geometry_msgs/Twist with a deadman"
+
+[lib]
+# `cdylib` is the production artifact (loaded by `cerulion graph run` via
+# DylibNodeEntry). `rlib` is ADDITIONALLY emitted so the integration tests +
+# the sibling crate's const-consistency dev-dep can link the crate in-process
+# (a cdylib-only crate cannot be consumed by Rust code); it adds nothing to the
+# production surface.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+# Pure-Rust gamepad input: evdev backend on Linux (the Jetson path), also
+# macOS/Windows backends. gilrs 0.11.2 has MSRV 1.84 (≤ the workspace's 1.88).
+# Third-party dep declared CRATE-LOCALLY (not a examples/go2 workspace dep).
+gilrs = "0.11"
+# Structured logging in the hardware pump (disconnect warns, gilrs-init warn).
+tracing = "0.1"
+
+[dev-dependencies]
+# `test-helpers` unlocks `cerulion_core::testing::iceoryx_test_config` +
+# `TransportManager::init_for_test` for the e2e (the teleop_mux precedent).
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+# Matches cerulion_core's own indexmap major (2.x) — `GraphRuntime::build`
+# takes `IndexMap<String, Box<dyn NodeEntry>>`.
+indexmap = "2.8"
+# The sibling keyboard node, by path, for the cross-crate constant-consistency
+# test (`tests/const_consistency_test.rs`): the joystick constants are
+# CANONICAL and the keyboard duplicates them — this pins the two in lockstep.
+# Dev-dep only, so the keyboard crate's production build stays gilrs-free.
+keyboard_teleop = { path = "../keyboard_teleop" }
+
+# The demo workspace mirrors the root `[workspace.lints]` table (see
+# `examples/go2/Cargo.toml`), so every member here inherits the SAME strict lints as
+# the main tree rather than sitting under no lint table at all.
+[lints]
+workspace = true

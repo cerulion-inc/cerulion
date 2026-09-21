@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  FastDDS profile — SHM transport only.
+
+  FastDDS auto-discovers SHM as a same-host transport on Humble
+  defaults; this profile makes the choice explicit by registering an
+  SHM transport descriptor and registering the SHM transport descriptor beside the (required) built-in transports
+  (which would also enable UDPv4 as a fallback).
+
+  segment_size = 64 MiB. Empirically tested 256 MiB and it BROKE
+  even size=64 on jazzy (deterministic latency-node bootstrap hang).
+  64 MiB was working for sizes ≤1 MB; 16 MiB payload at jazzy/kilted
+  needs different tuning (e.g. flow_controllers, asynchronous mode)
+  not segment_size. Don't naively bump segment_size without re-
+  verifying small payloads still work. port_queue_capacity stays at
+  the original 1024 for the same reason.
+
+  ## Why no DataSharing AUTOMATIC block here — this is the
+  ## STOCK-DEFAULTS lane (audit fix C1)
+
+  Under ROS 2, DataSharing (Fast DDS's true zero-copy path) is OFF
+  by default on EVERY distro in the matrix, regardless of Fast DDS's
+  own AUTO default: rmw_fastrtps calls writer_qos.data_sharing().off()
+  and reader_qos.data_sharing().off() inside
+  `if (!participant_info->leave_middleware_default_qos)` on both the
+  jazzy and lyrical/rolling branches (rmw_fastrtps_cpp
+  publisher.cpp / subscription.cpp), and leave_middleware_default_qos
+  flips only with RMW_FASTRTPS_USE_QOS_FROM_XML=1. So this profile —
+  run WITHOUT that env var (run_bench.sh unsets it for the shm lane)
+  — measures Fast DDS exactly as an out-of-box ROS 2 user gets it:
+  SHM *transport* engaged, DataSharing off. The vendor-recommended
+  zero-copy configuration is a separate labeled lane: shm mode `zc`
+  (configs/fastdds_zc.xml + RMW_FASTRTPS_USE_QOS_FROM_XML=1, the
+  rmw_fastrtps README's own recipe).
+
+  Two claims an earlier revision of this comment made are FALSE and
+  are corrected here so the suite doesn't publish wrong statements
+  about the compared stack's behavior:
+    - PR ros2/rmw_fastrtps#568 (merged 2023-01, Iron+) decoupled
+      LOANED MESSAGES from data-sharing (can_loan_messages = is_plain
+      since Iron). It did NOT remove the data_sharing().off()
+      overrides — those persist through jazzy AND lyrical. So on
+      Iron+ what engages automatically with a plain type is LOANS
+      (the API-boundary borrow/take), NOT DataSharing; a `loaned=1`
+      column on a stock fastdds cell does not prove a zero-copy data
+      path.
+    - Reliability never gates rmw_fastrtps loans in any era, and
+      RELIABLE-vs-BEST_EFFORT is not in Fast DDS's documented
+      data-sharing constraint list either (bounded plain non-keyed
+      type, PREALLOCATED* memory policy, reader depth <= writer
+      depth).
+
+  Humble empirical note (why the zc lane is jazzy/lyrical territory):
+  Humble's apt Fast-DDS 2.6.x segfaulted parsing the data_sharing XML
+  elements (a one-shot `ros2 topic pub` exits rc=139, measured in the
+  May-2026 campaign) — a humble zc cell fails its verify probe
+  loudly; humble stays stock-defaults-only, as a measured limitation.
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_transport</transport_id>
+        <type>SHM</type>
+        <segment_size>67108864</segment_size>
+        <port_queue_capacity>1024</port_queue_capacity>
+        <healthy_check_timeout_ms>1000</healthy_check_timeout_ms>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="participant_default" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_transport</transport_id>
+        </userTransports>
+        <!-- useBuiltinTransports=true is REQUIRED on Fast DDS 2.14+/3.x
+             (jazzy / kilted): PDP discovery always uses UDP/TCP even
+             when SHM is enabled (Fast DDS 3.x SHM transport docs +
+             Transport FAQ). Disabling builtin transports kills
+             participant matching, manifesting as "Waiting for at least
+             1 matching subscription(s)" → context invalid. Our SHM
+             user transport descriptor still tunes the SHM segment;
+             intra-host DataSharing prefers SHM over UDP automatically. -->
+        <useBuiltinTransports>true</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

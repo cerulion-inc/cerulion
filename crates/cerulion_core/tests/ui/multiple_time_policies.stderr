@@ -1,0 +1,13 @@
+error: only one of `period_ms`, `sync_window_ms`, `unbounded_sync`, or `external` can be specified
+ --> tests/ui/multiple_time_policies.rs:9:1
+  |
+9 | #[cerulion_node(period_ms = 100, external)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/multiple_time_policies.rs:11:7
+   |
+11 |     #[output]
+   |       ^^^^^^

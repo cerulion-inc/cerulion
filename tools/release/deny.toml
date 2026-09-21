@@ -1,0 +1,288 @@
+# deny.toml - cargo-deny configuration
+#
+# Run locally with:
+#   cargo install cargo-deny --locked
+#   cargo deny check advisories licenses bans sources
+#
+# CI runs the same four checks via EmbarkStudios/cargo-deny-action@v2
+# in the `deps` job of .github/workflows/ci.yml (blocking).
+#
+# Schema: cargo-deny 0.16+ (`version = 2` for [advisories] and [licenses]).
+
+# -----------------------------------------------------------------------------
+# Advisories: RustSec vulnerability database (fetched fresh in CI)
+# -----------------------------------------------------------------------------
+[advisories]
+version = 2
+# With version = 2, vulnerabilities are always "deny" and
+# unmaintained/unsound/notice advisories are always "warn" - those knobs
+# are no longer configurable.
+#
+# yanked = "warn" (not "deny"): a maintainer yanking a release we already
+# lock would otherwise break every open PR with no action on our side.
+# Warnings stay visible in the job log; bump the lockfile when one appears.
+yanked = "warn"
+
+# Accepted advisories, each with a reason. Vulnerabilities are NEVER
+# ignored here - fix them by updating the lockfile (lz4_flex
+# RUSTSEC-2026-0041 was fixed via `cargo update -p lz4_flex`, not an
+# entry in this list).
+ignore = [
+    # Unmaintained compile-time proc-macro, no runtime code, reaches us
+    # transitively - it cannot be updated away from this side. Revisit
+    # when upstream dependencies migrate off `paste`.
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, compile-time only, transitive" },
+    { id = "RUSTSEC-2026-0294", reason = "iceoryx2-bb-container 0.9.1: the unsound String::as_mut_bytes and deref_mut are never called by this workspace (no call site; the transport is used through iceoryx2 0.9.1's public services), and every iceoryx2 crate is pinned to 0.9.1 by the version-lockstep test; lifted with the iceoryx2 0.10 migration" },
+    # Net2 is UNMAINTAINED-class (deprecated in favor of socket2),
+    # NOT a fixable vulnerability. It reaches us through the cerulion_dds DDS
+    # discovery path: {cerulion-rustdds 0.14.2, mio-extras} -> mio 0.6.23 ->
+    # net2. The upstream 0.14.2 event loop still uses mio 0.6, so no safe
+    # upgrade exists at the verified pins. Re-audit on every DDS dependency
+    # bump; remove this ignore when the upstream mio migration lands.
+    { id = "RUSTSEC-2020-0016", reason = "net2 via cerulion_dds -> cerulion-rustdds 0.14.2 -> mio 0.6.23 event loop: unmaintained-class, no safe upgrade at verified pins" },
+]
+
+# -----------------------------------------------------------------------------
+# Licenses: our first-party crates are AGPL-3.0-only; every
+# THIRD-PARTY dependency must carry a license compatible with redistributing
+# this workspace under AGPL-3.0-only (permissive licenses below all are).
+# -----------------------------------------------------------------------------
+[licenses]
+version = 2
+# Allow list derived from an actual `cargo metadata` survey of the locked
+# dependency tree (2026-06, 415 packages). Every entry below appears in the
+# tree; nothing speculative is allowed:
+#   - MIT / Apache-2.0 / "X OR Y" combinations: the bulk of the tree.
+#   - Apache-2.0 WITH LLVM-exception: rustix, linux-raw-sys, wasi.
+#   - BSD-2-Clause: git-version; BSD-3-Clause: bindgen, sha1_smol, subtle.
+#   - ISC: libloading, json5.
+#   - Zlib: const_format, foldhash, nanorand.
+#   - 0BSD: enum-iterator (0BSD-only crates; also appears in OR exprs).
+#   - Unicode-3.0: unicode-ident is "(MIT OR Apache-2.0) AND Unicode-3.0",
+#     so Unicode-3.0 must be allowed for the AND clause to be satisfiable.
+#
+# Deliberately NOT allowed (covered by OR alternatives instead):
+#   - EPL-2.0 (zenoh, stabby): all are "EPL-2.0 OR Apache-2.0" → Apache-2.0.
+#   - BSL-1.0 (ryu): "Apache-2.0 OR BSL-1.0" → Apache-2.0.
+#   - Unlicense (memchr, aho-corasick): "Unlicense OR MIT" → MIT.
+#   - LGPL-2.1-or-later (r-efi): "MIT OR Apache-2.0 OR LGPL..." → MIT.
+allow = [
+    # First-party: every Cerulion crate is AGPL-3.0-only. AGPL is the
+    # OUTBOUND license of the combined work - it does NOT require dependencies to
+    # be AGPL, so the permissive dependency licenses below stay allowed.
+    "AGPL-3.0-only",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+# option-ext is MPL-2.0-only (no OR alternative). MPL-2.0 is a weak,
+# file-level copyleft - compatible with distributing this workspace under
+# AGPL-3.0-only as long as we don't modify option-ext sources (we
+# don't; it's a transitive dep of `dirs`). Scoped as an exception rather
+# than a global allow so a second MPL crate entering the tree is a loud,
+# reviewed event instead of a silent pass.
+# `crate =` is the cargo-deny 0.14+ PackageSpec key (the pre-0.14 form was
+# `name =`). Verified working: the `deps` CI job reports
+# `licenses ok` with option-ext (MPL-2.0-only) present in the locked graph -
+# i.e. this exception fires.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    # The cerulion_dds DDS tree (ros2-client/rustdds, default-features
+    # = false so the rustls/ring/webpki security tree is excluded) carries these
+    # per-crate licenses, mirroring the surveyed examples/go2/deny.toml. Scoped (not
+    # globally allowed) so a NEW license is a loud, reviewed event. An actual
+    # `cargo deny check` run is authoritative - prune any entry it reports as an
+    # unmatched exception (a transitive that default-features=false drops).
+    # NOTE: indent / tiny-keccak / xxhash-rust are ALSO pulled by the rerun 0.34
+    # SDK (cerulion_viz), so these exceptions are now shared by both trees.
+    { allow = ["MPL-2.0"], crate = "indent" },
+    { allow = ["CC0-1.0"], crate = "tiny-keccak" },
+    { allow = ["BSL-1.0"], crate = "xxhash-rust" },
+    # Rerun-only. Carried over from the (now-deleted) isolated
+    # cerulion_viz/deny.toml when the viz stack joined the root workspace. The
+    # rerun 0.34 SDK's gRPC client sink bundles the Mozilla root-CA store via
+    # webpki-roots (CDLA-Permissive-2.0 - a permissive data license, compatible
+    # with distributing under AGPL-3.0-only). Only reachable through the
+    # cerulion_viz members; scoped so a second CDLA crate is a reviewed event.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    # Iroh transitives pulled by the permissive `cerulion_link` client-
+    # protocol crate (the dial-by-key QUIC layer). `cerulion_link` is NOT in
+    # default-members, but cargo-deny scans the whole lockfile, so these surface
+    # workspace-wide. Scoped per-crate (NOT globally allowing Unlicense / MPL-2.0)
+    # so a NEW license in the iroh tree is a loud, reviewed event. attohttpc is
+    # the HTTP client pulled via iroh's UPnP/IGD NAT port-mapping
+    # (portmapper -> igd-next -> attohttpc); ws_stream_wasm / async_io_stream /
+    # pharos are iroh-relay's wasm-websocket transport; webpki-root-certs is the
+    # CDLA-Permissive-2.0 sibling of the already-allowed webpki-roots (Mozilla
+    # root-CA store, a permissive data license compatible with distributing
+    # under AGPL-3.0-only).
+    { allow = ["MPL-2.0"], crate = "attohttpc" },
+    { allow = ["Unlicense"], crate = "ws_stream_wasm" },
+    { allow = ["Unlicense"], crate = "async_io_stream" },
+    { allow = ["Unlicense"], crate = "pharos" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
+]
+
+[licenses.private]
+# Workspace crates that are not published (test fixtures carry
+# `publish = false`) are exempt from the license check. Published-intent
+# crates (cerulion_core, cerulion_cli, ...) all declare
+# `license = "AGPL-3.0-only"` and are checked normally.
+ignore = true
+
+# -----------------------------------------------------------------------------
+# Bans: duplicate versions and wildcard requirements
+# -----------------------------------------------------------------------------
+[bans]
+# MEASURED 2026-08-16 (`cargo deny check bans`): 65 crates resolve to more than
+# one version. Flipping to "deny" today would need a 65-entry `skip` list, which
+# is a worse artifact than the warning - a skip list of that size goes stale
+# silently and stops meaning anything. Nearly all of it is transitive and not
+# ours to fix: the windows-* family (9), the rand/getrandom/rand_core split (3+),
+# darling 3x, hashbrown 4x, syn 1/2, and the jni / phf / strum pairs the rerun
+# and iroh trees each bring.
+#
+# The list, so a future triage starts from a written baseline rather than a fresh
+# survey: bindgen bit-vec bitflags block-buffer cfg-if clap_lex console
+# convert_case core-foundation cpufeatures crossterm crypto-common
+# curve25519-dalek darling darling_core darling_macro digest ed25519
+# ed25519-dalek fiat-crypto flume foldhash getrandom hashbrown itertools jni
+# jni-sys linux-raw-sys lru lz4_flex mio nix nom phf phf_shared r-efi rand
+# rand_chacha rand_core rustc-hash rustix sha2 shlex signature socket2 spin strum
+# strum_macros syn thiserror thiserror-impl toml_datetime unicode-width
+# wasm-streams winapi windows-sys windows-targets windows_aarch64_gnullvm
+# windows_aarch64_msvc windows_i686_gnu windows_i686_msvc windows_x86_64_gnu
+# windows_x86_64_gnullvm windows_x86_64_msvc winnow
+multiple-versions = "warn"
+# No workspace manifest uses literal `foo = "*"` requirements, BUT
+# cargo-deny also counts version-less `path = "..."` dependencies as
+# wildcards, and today the workspace's internal deps (cerulion_core →
+# cerulion_macros, cerulion_cli → cerulion_cli_engine, the test
+# fixtures, ...) are path-only. Once every
+# internal dependency of the publishable crates carries a `version` and
+# the fixtures carry `publish = false`, flip this to
+#   wildcards = "deny"
+#   allow-wildcard-paths = true   # path-only deps stay legal in private crates
+# Until then "warn" keeps the signal visible without failing CI on a
+# known, tracked condition.
+wildcards = "warn"
+
+# ---------------------------------------------------------------------------
+# Architecture bans: WHO may depend on the two heavy trees.
+#
+# These express the direct-dependency half of the architecture decisions -
+# the iroh WAN stack and the Rerun desk rasterizer each have exactly one door
+# into the workspace, and a crate that adds a second one fails here by name
+# instead of going unnoticed.
+#
+# READ THIS BEFORE DELETING THE `iroh-leanness` / `rerun-leanness` CI JOBS:
+# these entries do NOT subsume them, and cannot. `[[bans.deny]] wrappers`
+# constrains WHO DEPENDS on a crate; those jobs constrain WHICH RESOLVE GRAPH a
+# crate appears in - specifically that `default-members` (a plain `cargo build`)
+# resolves without iroh/rerun at all. That invariant is defeated by things this
+# file cannot see: cargo's per-package FEATURE UNIFICATION (netd's default-on
+# `wan` turning iroh on for the one shared netd rlib the CLI links), a member
+# being added to `default-members`, a consumer dropping `default-features =
+# false`. cargo-deny has NO concept of `default-members` - it resolves over the
+# whole workspace, which is why it is green in every one of those cases.
+#
+# WHAT FEATURE SET THAT RESOLVE USES, stated precisely because the earlier
+# wording ("with all features") was not true as written: this file declares no
+# `[graph]` section and the `deps` job passes no feature flags, so the resolve is
+# cargo-deny's DEFAULT - each package's own default features, plus whatever
+# workspace feature UNIFICATION turns on, with dev-dependencies included
+# (`[graph] exclude-dev` defaults to false). It is NOT `--all-features`: that is
+# a separate flag nobody passes, so a dependency reachable ONLY through a
+# non-default feature of some crate that nothing else enables is outside what
+# this file checks. Do not read a green `cargo deny` as a statement about every
+# feature combination.
+#
+# The DIRECT-EDGE half of that blind spot is covered elsewhere, and deliberately:
+# `dependency_door_test.rs` reads the MANIFEST-DECLARED dependency list out of
+# `cargo metadata --no-deps`, where an `optional = true` entry is present whether
+# or not any feature turns it on - so an `iroh`/`rerun` dep hidden behind an
+# off-by-default feature (the exact shape `cerulion_netd`'s `wan` plane uses for
+# its own deps) fails there even though it is invisible here. What stays
+# uncovered by BOTH is a TRANSITIVE appearance reachable only through a
+# non-default feature of some third-party crate; that is what the sentence above
+# is about.
+#
+# WHAT THESE ENTRIES CANNOT EXPRESS AT ALL (measured on cargo-deny 0.20.2):
+# the SUBCRATE spelling. Dependency direction runs umbrella -> subcrate, so a
+# crate depending directly on `re_chunk` or `iroh-base` pulls the tree while the
+# banned umbrella name never enters the graph. Two things were tried:
+#   * a glob crate spec (`name = "re_*"`) is ACCEPTED and matches NOTHING - the
+#     config parses, `bans ok` is reported, and the wrappers are marked unmatched.
+#     An inert ban that looks armed is worse than no ban, so it is not used.
+#     (Control: the literal `name = "re_chunk"` reports `bans FAILED`.)
+#   * concrete per-subcrate entries cannot express the rule either. `wrappers`
+#     lists who may DIRECTLY depend on a banned crate, and these crates are
+#     legitimately present - `re_chunk`'s own direct dependents include
+#     `re_chunk_store`, `re_entity_db`, `re_grpc_client`, `re_log_channel`,
+#     `re_sdk` and `rerun`. Every entry would have to list the tree's whole
+#     internal graph (43 crates), per entry, and rot on the next Rerun release.
+# So the direct-edge invariant is enforced in Rust instead, where the family is
+# DERIVED at test time and cannot go stale:
+# `crates/cerulion_cli_engine/tests/dependency_door_test.rs`. It derives the family as
+# the UNION of each package's declared `repository` and a name-shape rule -
+# measured, neither alone is complete, and a name-shape rule alone was fail-open
+# on `sorted-index-buffer`, which iroh publishes under a prefix-less name. The
+# two CI leanness jobs probe the NAME-SHAPE family only (they are shell, reading
+# the lockfile); that is a weaker set than the Rust gate's, which is why the Rust
+# gate is the one that carries this invariant.
+# The two jobs also cover the ISOLATED `examples/go2` workspace and its DEV edges,
+# which a root-workspace `cargo deny` run never reaches. They are complementary
+# gates on different invariants; keep both.
+#
+# `wrappers` lists every crate cargo-deny sees as a dependent, dev-dependencies
+# included (`[graph] exclude-dev` defaults to false).
+
+[[bans.deny]]
+name = "iroh"
+# `cerulion_link` is THE iroh seam - a thin dial-by-key QUIC
+# wrapper every other crate goes through (`cerulion_remoted`, `cerulion_netd`'s
+# WAN plane, `cerulion_wireclient`, `cerulion_connectd`). A second direct edge
+# means a second place iroh's version pin, relay config, and error mapping live.
+# `cerulion_remoted` is a DEV edge only: its wire-plane test needs iroh's
+# `VarInt`, which `cerulion_link` does not re-export.
+wrappers = ["cerulion_link", "cerulion_remoted"]
+
+[[bans.deny]]
+name = "rerun"
+# No viz on the robot: rasterization is desk-side.
+# `cerulion_viz` is the generic viz support lib and `cerulion-vizd` the desk
+# daemon; nothing else in the workspace may link the Rerun SDK. This is the
+# direct-edge guard for the violation the `rerun-leanness` job was written after
+# - a robot-side crate acquiring a `cerulion_viz` + `rerun` dev-dependency.
+wrappers = ["cerulion_viz", "cerulion_vizd"]
+
+# -----------------------------------------------------------------------------
+# Sources: crates.io plus the re_grpc_server fork
+# -----------------------------------------------------------------------------
+[sources]
+# Cargo.lock resolves from the crates.io registry plus the pinned re_grpc_server
+# source below.
+# re_grpc_server fork - a sparse single-crate fork of 0.34.1
+#      adding TWO `ServerOptions` modes for cerulion-vizd's instant-only live viz,
+#      one per buffer on that path: `drop_temporal_history` (the
+#      per-client REPLAY history, so a late joiner gets statics + blueprint and
+#      zero temporal replay) and `live_temporal_budget_bytes` (the LIVE
+#      broadcast queue, so a viewer that cannot keep up is served the present
+#      rather than a backlog). Pinned until upstream ships equivalents.
+# iceoryx2 and zenoh still come from crates.io.
+unknown-registry = "deny"
+unknown-git = "deny"
+# The pinned re_grpc_server fork. PRUNE this the moment the
+# root `[patch.crates-io]` is dropped (upstream re_grpc_server ships BOTH a
+# statics-only / drop-temporal history mode and a bounded, non-blocking live
+# queue).
+allow-git = [
+    "https://github.com/cerulion-inc/re_grpc_server",
+]

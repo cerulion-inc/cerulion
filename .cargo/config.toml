@@ -1,0 +1,28 @@
+# Cargo configuration for the Cerulion workspace
+#
+# This file configures runtime environment variables for cargo commands.
+
+[env]
+# Suppress verbose iceoryx2 warnings about stale listener notifications.
+# These warnings occur when subscribers disconnect and are cosmetic.
+# Override with: IOX2_LOG_LEVEL=warn cargo run ...
+IOX2_LOG_LEVEL = "error"
+
+# Suppress cerulion tracing output by default for clean benchmark output.
+# This prevents info/debug logs during tests and benchmarks.
+# Override with: RUST_LOG=cerulion_core=debug cargo test ...
+RUST_LOG = { value = "warn", force = false }
+
+# The login gate is on in every build: a `cerulion` command runs under an
+# account. This repository's own runs are the exception, and this is where they
+# get it. Cargo applies it to everything it starts, tests and the binaries they
+# spawn included, and the workspaces under examples/ inherit it because cargo
+# reads every .cargo/config.toml from the current directory up to the root.
+#
+# force = true so a value left over in a shell environment cannot decide whether
+# the suite passes. A test whose SUBJECT is the gate removes the variable on the
+# command it spawns, which is how those tests still see the gate enforce.
+#
+# Contributor machinery, not product surface: docs/internals/cli.md says what it
+# is for, and no user documentation names it.
+CERULION_LOGIN_GATE = { value = "off", force = true }

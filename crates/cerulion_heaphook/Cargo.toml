@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "cerulion_heaphook"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "LD_PRELOAD malloc-family interposer that lets stock ROS 2 code fill an unbounded message field directly into the tail of a loaned Cerulion shared-memory slot"
+license = "AGPL-3.0-only"
+repository.workspace = true
+homepage.workspace = true
+# Not published to crates.io: this is an LD_PRELOAD .so (libcerulion_heaphook.so)
+# the `cerulion ros2 run|launch` launcher auto-injects and the rmw dlsyms — it
+# is consumed as a preloaded shared object, never `cargo add`ed. Excluded from
+# the release workflow's `cargo publish --workspace`.
+publish = false
+
+[lib]
+# cdylib: the libcerulion_heaphook.so the loader maps ahead of libc so its
+#   malloc/free/… win first-in-load-order symbol resolution (LD_PRELOAD).
+# rlib:   lets the pure-logic core (window/registry/recursion/abi state
+#   machines) be unit-tested in-process on EVERY platform, and lets the
+#   subprocess e2e test drive the built .so via LD_PRELOAD.
+crate-type = ["cdylib", "rlib"]
+
+# The interposition + FFI export layer is Linux + GNU (glibc/libstdc++) ONLY:
+# the platform boundary is dynamically linked glibc >= 2.34 + libstdc++ with the
+# default std::allocator.
+# It is compiled only under `cfg(all(target_os = "linux", target_env = "gnu"))`;
+# elsewhere (this macOS desk included) the crate is the pure-logic core alone,
+# which builds and unit-tests everywhere. See the gating note in src/lib.rs.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# dlsym(RTLD_NEXT, ...) to reach the real allocator, pthread_atfork, write(2)
+# for the allocation-free load breadcrumb, and the C integer types.
+libc = "0.2"
+# A single `debug!`-once breadcrumb at load naming the ABI version (repo
+# logging convention). Referenced ONLY from the Linux load constructor, so it
+# is a Linux-target dep; a plain macOS build pulls nothing.
+tracing = "0.1"
+
+# The Linux e2e (`tests/heaphook_e2e_test.rs`) spawns the probe in its own
+# process group and `killpg`s the group on a child/drain timeout so a forked
+# grandchild holding the pipe cannot leak past a probe failure.
+# `libc` is already a runtime dep above — this only exposes it to the test crate.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

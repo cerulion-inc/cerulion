@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# `cerulion_hygiene` — the ONE Unix-socket lifecycle for every Cerulion desk
+# daemon (`cerulion-netd`, `cerulion-vizd`, `cerulion-wsd`) and their clients.
+#
+# WHY A CRATE. Three daemons need the same ~150 lines
+# (socket-path ladder, flock-held single-daemon lock, stale-socket recovery,
+# live-daemon refusal), and `cerulion_cli_engine` needs the
+# vizd ladder too because it must not depend on vizd. Copies drift: one
+# copy ends in a rung shared across users (`/tmp/cerulion/<d>.sock`) with no
+# directory check at all, while another has a per-user rung and a
+# directory/pidfile ownership check. A client that resolves the path from one
+# copy and a daemon that binds it from another cannot be proven to agree.
+#
+# The engine already depends on netd (`NetdClient`) and vizd depends on netd,
+# so the shared code cannot live in either daemon — the same shape that
+# produced `cerulion_discovery` and `cerulion_mdns`. std + libc + tracing ONLY:
+# no transport, no tokio (the wsd wrapper converts to a tokio listener itself),
+# so it adds nothing to the default build.
+[package]
+name = "cerulion_hygiene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Unix-socket lifecycle shared by the Cerulion desk daemons (cerulion-netd, cerulion-vizd, cerulion-wsd) and their clients: the socket-path ladder, the single-daemon lock with stale-socket recovery, and the socket-directory check"
+readme = "README.md"
+keywords = ["unix-socket", "daemon", "lockfile", "ipc", "cerulion"]
+categories = ["science::robotics", "os::unix-apis"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = "0.2"
+tracing = "0.1"
+
+[dev-dependencies]
+# The tighten `warn!` and the cleanup-failure `warn!` are the only user-visible
+# signals that the daemon changed, or failed to remove, a file of the user's;
+# `debug!` does not exist in a shipped daemon (`release_max_level_info`), so the
+# tests match the LEVEL TOKEN and COUNT the lines (`logs_assert`, not the
+# level-agnostic `logs_contain`) — a demotion and a doubled log both fail.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# `crate_license_texts_test.rs` reads the workspace manifest and every
+# publishable member's manifest to work out which license texts each package
+# owes its readers. It parses them rather than pattern-matching the text,
+# because a missed `include` entry or a `license.workspace = true` it failed
+# to resolve would make the gate pass while a crate ships with no grant in
+# it. Dev-only: nothing in `src/` parses TOML, and the shipped crate stays
+# std + libc + tracing.
+toml = "0.9"

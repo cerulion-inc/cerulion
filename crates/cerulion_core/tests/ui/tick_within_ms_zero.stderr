@@ -1,0 +1,13 @@
+error: `tick_within_ms` must be > 0 (zero-duration tick deadline misses every fire)
+ --> tests/ui/tick_within_ms_zero.rs:5:1
+  |
+5 | #[cerulion_node(period_ms = 100, tick_within_ms = 0)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/tick_within_ms_zero.rs:7:7
+  |
+7 |     #[output]
+  |       ^^^^^^

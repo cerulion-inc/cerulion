@@ -1,0 +1,51 @@
+error: #[cerulion_node_impl] takes no arguments — input/output ports are auto-discovered from the sibling `#[cerulion_node]` struct's `#[input]`/`#[output]` field attributes
+  --> tests/ui/node_impl_takes_no_args.rs:21:22
+   |
+21 | #[cerulion_node_impl(inputs(inp))]
+   |                      ^^^^^^
+
+warning: unexpected `cfg` condition value: `cdylib`
+  --> tests/ui/node_impl_takes_no_args.rs:13:1
+   |
+13 | #[cerulion_node]
+   | ^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `debug-logging`, `fuzz-helpers`, and `test-helpers`
+   = note: using a cfg inside a attribute macro will use the cfgs from the destination crate and not the ones from the defining crate
+   = help: try referring to `cerulion_node` crate for guidance on how handle this unexpected cfg
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+   = note: this warning originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_init` found for struct `ImplArgsNode` in the current scope
+  --> tests/ui/node_impl_takes_no_args.rs:13:1
+   |
+13 | #[cerulion_node]
+   | ^^^^^^^^^^^^^^^^ method not found in `ImplArgsNode`
+14 | #[derive(Default)]
+15 | struct ImplArgsNode {
+   | ------------------- method `__cer_user_init` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_zero_copy_tick` found for struct `ImplArgsNode` in the current scope
+  --> tests/ui/node_impl_takes_no_args.rs:13:1
+   |
+13 | #[cerulion_node]
+   | ^^^^^^^^^^^^^^^^ method not found in `ImplArgsNode`
+14 | #[derive(Default)]
+15 | struct ImplArgsNode {
+   | ------------------- method `__cer_zero_copy_tick` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_shutdown` found for struct `ImplArgsNode` in the current scope
+  --> tests/ui/node_impl_takes_no_args.rs:13:1
+   |
+13 | #[cerulion_node]
+   | ^^^^^^^^^^^^^^^^
+14 | #[derive(Default)]
+15 | struct ImplArgsNode {
+   | ------------------- method `__cer_user_shutdown` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

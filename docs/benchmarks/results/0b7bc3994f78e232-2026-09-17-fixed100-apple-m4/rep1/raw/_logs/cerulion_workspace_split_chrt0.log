@@ -1,0 +1,554 @@
+run_workspace.sh: stock mode - C-state exits unmanaged, tails not comparable to capped runs
+  (CER_BENCH_DMA_LOCK=0: CERULION_CPU_DMA_LOCK is UNSET for the graph, inherited value included;
+   no /dev/cpu_dma_latency cap is held)
+Rebuilding cerulion binary + workspace cdylibs (release) for iceoryx2 parity...
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[98544]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[99324]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[99716]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_cli` (bin "cerulion") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.59s
+warning: the following packages contain code that will be rejected by a future version of Rust: binrw v0.15.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1678]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: `cer_bench_msgs` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1892]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1811]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1866]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[7467]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1798]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1842]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `pong_node` (lib) generated 1 warning
+warning: `pod_pong_node` (lib) generated 1 warning
+warning: `latency_node` (lib) generated 1 warning
+warning: `ping_node` (lib) generated 1 warning
+warning: `pod_latency_node` (lib) generated 1 warning
+warning: `pod_ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.11s
+
+leg=split graph=rtt_bench_split msg=variable pacing=fixed100 raw_name=cerulion_workspace_split_chrt0
+sizes: 64 256 1024 4096 16384 65536 262144 1048576 4194304 16777216
+
+========================================
+  payload=64  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[7709]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.68s
+[2m2026-09-17T00:24:59.264613Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16841 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:24:59.310255Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:24:59.310843Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 1 stale .shm_state file(s) at exit, releasing 16.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m1 [3mreleased_bytes[0m[2m=[0m16384
+-- delivery accounting (leg=split payload=64) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2119 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:24:58.693552Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:24:58.693557Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:24:58.883478Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2123
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  payload=256  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[7803]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.70s
+[2m2026-09-17T00:25:23.257318Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16869 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:25:23.315540Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:25:23.316090Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 1 stale .shm_state file(s) at exit, releasing 16.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m1 [3mreleased_bytes[0m[2m=[0m16384
+-- delivery accounting (leg=split payload=256) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2132 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:25:21.742049Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:25:21.742053Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:25:22.061901Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2136
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  payload=1024  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[7881]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.70s
+[2m2026-09-17T00:25:47.036246Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16839 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:25:47.127323Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:25:47.127946Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 2 stale .shm_state file(s) at exit, releasing 32.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m2 [3mreleased_bytes[0m[2m=[0m32768
+-- delivery accounting (leg=split payload=1024) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2117 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:25:45.729107Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:25:45.729111Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:25:45.898991Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2121
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  payload=4096  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[7983]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.69s
+[2m2026-09-17T00:26:10.033411Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16833 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:26:10.117649Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:26:10.118214Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 1 stale .shm_state file(s) at exit, releasing 16.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m1 [3mreleased_bytes[0m[2m=[0m16384
+-- delivery accounting (leg=split payload=4096) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2114 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:26:09.660980Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:26:09.660986Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:26:09.800858Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2118
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  payload=16384  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[8190]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.83s
+[2m2026-09-17T00:26:34.051958Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16845 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:26:34.169301Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:26:34.170017Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 2 stale .shm_state file(s) at exit, releasing 32.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m2 [3mreleased_bytes[0m[2m=[0m32768
+-- delivery accounting (leg=split payload=16384) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2120 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:26:32.503679Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:26:32.503684Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:26:32.703642Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2124
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  payload=65536  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[8346]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.71s
+[2m2026-09-17T00:26:56.807428Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16831 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:26:56.866743Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:26:56.867180Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 1 stale .shm_state file(s) at exit, releasing 16.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m1 [3mreleased_bytes[0m[2m=[0m16384
+-- delivery accounting (leg=split payload=65536) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2113 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:26:56.532499Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:26:56.532503Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:26:56.663877Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2117
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  payload=262144  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[8442]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.70s
+[2m2026-09-17T00:27:19.533632Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16832 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:27:19.580800Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:27:19.581233Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 2 stale .shm_state file(s) at exit, releasing 32.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m2 [3mreleased_bytes[0m[2m=[0m32768
+-- delivery accounting (leg=split payload=262144) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2118 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:27:19.221298Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:27:19.221304Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:27:19.361203Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2122
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  payload=1048576  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[8522]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.70s
+[2m2026-09-17T00:27:43.318983Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16831 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:27:43.414274Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:27:43.414603Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 1 stale .shm_state file(s) at exit, releasing 16.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m1 [3mreleased_bytes[0m[2m=[0m16384
+-- delivery accounting (leg=split payload=1048576) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2113 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:27:42.018602Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:27:42.018608Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:27:42.148423Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2117
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  payload=4194304  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[8626]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.70s
+[2m2026-09-17T00:28:11.081918Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16829 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:28:11.100060Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:28:11.100593Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 2 stale .shm_state file(s) at exit, releasing 32.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m2 [3mreleased_bytes[0m[2m=[0m32768
+-- delivery accounting (leg=split payload=4194304) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2112 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:28:05.726026Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:28:05.726033Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:28:05.845870Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2116
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  payload=16777216  pacing=fixed100 rate=100Hz  effective=100.00Hz (period_ms=10)  measured=2000  warmup=100  watchdog=102s
+========================================
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1528]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[1680]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `native_ros2_messages` (build script) generated 1 warning
+warning: native_ros2_messages@0.1.0: message name 'Pose2D' is defined in multiple packages (geometry_msgs, vision_msgs); unqualified references to it are ambiguous - qualify as pkg/Pose2D in .msg files
+   Compiling ping_node v0.1.0 (<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/nodes/ping_node)
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[8712]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/workspace/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `ping_node` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.70s
+[2m2026-09-17T00:28:34.970948Z[0m [32m INFO[0m [2mcerulion_bagd[0m[2m:[0m bagd recording complete [3mfiles[0m[2m=[0m0 [3mmessages[0m[2m=[0m0 [3mbytes[0m[2m=[0m0 [3mring_records[0m[2m=[0m16828 [3mdropped_unwritten[0m[2m=[0m0 [3mheaderless[0m[2m=[0m0 [3mframes_lost[0m[2m=[0m0 [3muntapped[0m[2m=[0m0
+[2m2026-09-17T00:28:35.084132Z[0m [32m INFO[0m exit hygiene: reclaimed dead iceoryx2 node state left by earlier runs [3mcleanups[0m[2m=[0m4 [3mdeferred[0m[2m=[0m0 [3mbudget_ms[0m[2m=[0m2000
+[2m2026-09-17T00:28:35.085473Z[0m [32m INFO[0m exit hygiene: reclaimed stale shared-memory state left by earlier runs [3msummary[0m[2m=[0mreclaimed 1 stale .shm_state file(s) at exit, releasing 16.0 KiB of orphaned shared memory [3mreclaimed[0m[2m=[0m1 [3mreleased_bytes[0m[2m=[0m16384
+-- delivery accounting (leg=split payload=16777216) --
+   schedule_rate=100Hz effective_rate=100.00Hz (period_ms=10)
+RTT_DELIVERY role=latency leg=split received=2100 skipped=0 measured=2100
+RTT_DELIVERY role=ping leg=split published=2113 slots_skipped=0
+RTT_DELIVERY role=pong leg=split forwarded=2100
+[2m2026-09-17T00:28:33.713751Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mpong [3minput[0m[2m=[0mping_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:28:33.713756Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mlatency [3minput[0m[2m=[0mecho_in [3mfires[0m[2m=[0m2100 [3mdrop_oldest[0m[2m=[0m0
+[2m2026-09-17T00:28:33.843637Z[0m [32m INFO[0m live loop delivery telemetry [3mnode_id[0m[2m=[0mping [3mfires[0m[2m=[0m2117
+   samples_in_bin=2000 measured=2000 warmup=100
+
+========================================
+  Done - leg=split raw .bin samples in <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw
+  (percentiles are computed OFFLINE from the .bins - compile_csv.py)
+========================================
+-rw-r--r--  1 root  staff  16000 Sep 16 17:25 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_1024.bin
+-rw-r--r--  1 root  staff  16000 Sep 16 17:27 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_1048576.bin
+-rw-r--r--  1 root  staff  16000 Sep 16 17:26 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_16384.bin
+-rw-r--r--  1 root  staff  16000 Sep 16 17:28 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_16777216.bin
+-rw-r--r--  1 root  staff  16000 Sep 16 17:25 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_256.bin
+-rw-r--r--  1 root  staff  16000 Sep 16 17:27 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_262144.bin
+-rw-r--r--  1 root  staff  16000 Sep 16 17:26 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_4096.bin
+-rw-r--r--  1 root  staff  16000 Sep 16 17:28 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_4194304.bin
+-rw-r--r--  1 root  staff  16000 Sep 16 17:24 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_64.bin
+-rw-r--r--  1 root  staff  16000 Sep 16 17:26 <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/cerulion_workspace_split_chrt0_65536.bin

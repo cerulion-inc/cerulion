@@ -1,0 +1,19 @@
+error: cannot combine `#[input(trigger)]` with `period_ms` or `external`; trigger inputs define data-driven policy, which conflicts with time-driven policy
+ --> tests/ui/declarative_trigger_with_period.rs:4:1
+  |
+4 | #[cerulion_node(period_ms = 100)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/declarative_trigger_with_period.rs:8:7
+  |
+8 |     #[output]
+  |       ^^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/declarative_trigger_with_period.rs:6:7
+  |
+6 |     #[input(trigger)]
+  |       ^^^^^

@@ -1,0 +1,22 @@
+diff --git a/benches/latency/workspace/run_workspace.sh b/benches/latency/workspace/run_workspace.sh
+index 0009bd6..e63c9b2 100755
+--- a/benches/latency/workspace/run_workspace.sh
++++ b/benches/latency/workspace/run_workspace.sh
+@@ -1055,7 +1055,7 @@ run_size_once() {
+         CER_BENCH_RAW_DUMP_DIR="$CER_BENCH_RAW_DUMP_DIR"
+         CER_BENCH_RAW_NAME="$CER_BENCH_RAW_NAME"
+         IOX2_LOG_LEVEL=error
+-        "$CERULION" graph run "$GRAPH" --release "${LEG_FLAGS[@]}" "${PACING_FLAGS[@]}")
++        "$CERULION" graph run "$GRAPH" --release ${LEG_FLAGS[@]+"${LEG_FLAGS[@]}"} ${PACING_FLAGS[@]+"${PACING_FLAGS[@]}"})
+ 
+     # Usage sidecar (CER_BENCH_USAGE=1): start the sampler right before the
+     # run so the ONLY descendants of this shell in its window are the
+@@ -1085,7 +1085,7 @@ run_size_once() {
+             > "$RUN_LOG" 2>&1
+         RUN_STATUS=$?
+     else
+-        "$TIMEOUT_BIN" --kill-after=10 "$WATCHDOG_SECS" "${CHRT_PREFIX[@]}" \
++        "$TIMEOUT_BIN" --kill-after=10 "$WATCHDOG_SECS" ${CHRT_PREFIX[@]+"${CHRT_PREFIX[@]}"} \
+             "${RUN_CMD[@]}" \
+             > "$RUN_LOG" 2>&1
+         RUN_STATUS=$?

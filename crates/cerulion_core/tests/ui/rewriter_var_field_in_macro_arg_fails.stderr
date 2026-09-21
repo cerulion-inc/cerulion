@@ -1,0 +1,7 @@
+error: self.image.data cannot appear inside a macro argument (here: `println!`) — port field access is rewritten at expansion time and the rewriter does not descend into macro token streams. Hoist it to a local first: `let v = …; println!(…, v);`.
+  --> tests/ui/rewriter_var_field_in_macro_arg_fails.rs:26:1
+   |
+26 | #[cerulion_node_impl]
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `cerulion_node_impl` (in Nightly builds, run with -Z macro-backtrace for more info)

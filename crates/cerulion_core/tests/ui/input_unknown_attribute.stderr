@@ -1,0 +1,11 @@
+error: unknown input attribute `bogus_key`. Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`.
+ --> tests/ui/input_unknown_attribute.rs:9:13
+  |
+9 |     #[input(bogus_key = 5)]
+  |             ^^^^^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/input_unknown_attribute.rs:9:7
+  |
+9 |     #[input(bogus_key = 5)]
+  |       ^^^^^

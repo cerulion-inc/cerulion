@@ -1,0 +1,38 @@
+error: PromiseWithinEvent is an output-scoped event; use `output = "..."`, not `input = ...`
+  --> tests/ui/on_event_promise_wrong_filter.rs:30:8
+   |
+30 |     fn on_late(&mut self, _ev: PromiseWithinEvent) {}
+   |        ^^^^^^^
+
+error[E0599]: no method named `__cer_user_init` found for struct `PromiseWrongFilterNode` in the current scope
+  --> tests/ui/on_event_promise_wrong_filter.rs:10:1
+   |
+10 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `PromiseWrongFilterNode`
+11 | #[derive(Default)]
+12 | struct PromiseWrongFilterNode {
+   | ----------------------------- method `__cer_user_init` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_zero_copy_tick` found for struct `PromiseWrongFilterNode` in the current scope
+  --> tests/ui/on_event_promise_wrong_filter.rs:10:1
+   |
+10 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `PromiseWrongFilterNode`
+11 | #[derive(Default)]
+12 | struct PromiseWrongFilterNode {
+   | ----------------------------- method `__cer_zero_copy_tick` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_shutdown` found for struct `PromiseWrongFilterNode` in the current scope
+  --> tests/ui/on_event_promise_wrong_filter.rs:10:1
+   |
+10 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+11 | #[derive(Default)]
+12 | struct PromiseWrongFilterNode {
+   | ----------------------------- method `__cer_user_shutdown` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

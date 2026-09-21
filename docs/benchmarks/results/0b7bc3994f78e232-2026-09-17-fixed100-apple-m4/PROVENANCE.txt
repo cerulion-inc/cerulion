@@ -1,0 +1,155 @@
+platform@ba5d75c5c - macOS platform latency campaign (MAC LANE)
+==============================================================
+
+WHAT THIS IS
+  The published fixed100 spec (k=5 reps interleaved by rep, 2000 measured
+  samples per size, ten sizes 64 B - 16 MiB, fixed 100 Hz target, STOCK
+  posture, always-on window recorder ON) re-run on an Apple M4 laptop
+  (10-core, 24 GB), macOS 26, so the Linux row has a platform sibling.
+
+PROVENANCE (read off the artifacts, not from memory)
+  suite git sha        ba5d75c5c226e749c9f5e8846c55c21b8bfd1035
+                       (asserted at launch; a mismatch was an exit-12 NON-RESULT)
+  cerulion binary      sha256 c5415a914e650bef004a757690e7006093fc5829f0def249d6a215bb65a0e07d
+                       (sha16 c5415a914e650bef) - ONE binary built all rows
+  toolchain            rustc 1.98.1 / cargo 1.98.1, Apple clang 17.0.0
+  cold build           454 s (cli 181 s, workspace nodes 93 s, native benches 180 s)
+  measured             2026-09-17, 00:19Z - 01:32Z UTC
+  run.json git_dirty   TRUE - and this is EXPECTED: the tree carries exactly the
+                       2-line portability patch in evidence/portability-patch.diff
+                       and nothing else. See PORTABILITY below.
+
+CELLS
+  cerulion_workspace_mono_chrt0    graph run rtt_bench --single-process
+  cerulion_workspace_split_chrt0   graph run rtt_bench_split, declared 2-group
+                                   multi-process, CERULION_EXECUTION_MODE=free_run
+  iox2_chrt0                       raw iceoryx2 floor - NON-RESULT, see below
+  NO ROS 2 cells: this box has no Jazzy container and none was built.
+
+  `chrt0` in every cell name is a chrt-ABSENCE marker, not a chrt claim. The
+  suite names cells `<cell>_chrt{N}` unconditionally and `--chrt 0` applies NO
+  chrt wrapper; on macOS find_chrt_prefix() returns None regardless. No row
+  here claims RT scheduling, and no governor was set (macOS exposes none) -
+  run.json accordingly records cpu_governor/turbo_boost as "unknown", which is
+  an absence of information, not a claim of a setting.
+
+WITNESSES (every per-size run log, ANSI-stripped before every field grep)
+  recorder ON, all Cerulion cells: "flashback: holding a rolling window for
+    this run" + window="own_recorder". Also confirmed live in ps: a
+    `cerulion bagd --out .../recordings/flashbacks/...` child in 20/20 samples
+    (evidence/recorder-ps-evidence.txt).
+  free run, split cell: execution_mode=FreeRun workers=2; "free-run deployment:
+    no shared barrier is created"; build_path=FreeRunLive on BOTH workers.
+    Forbidden and ABSENT throughout: execution_mode=Lockstep, build_path=Lockstep,
+    "gating quantum installed", "left cross-process barrier cohort", the INERT warn.
+  Result: 10 of 10 cell-reps passed with failing=0 (evidence/campaign.log).
+
+  #912 RECORDER PLACEMENT IS ABSENT ON THIS PLATFORM, BY CONSTRUCTION.
+    The pin and the nice are `#[cfg(target_os = "linux")]` (graph_cmd.rs
+    :16076-16098), and BOTH placement log arms sit inside that same cfg block,
+    so neither line can be emitted here. This was verified twice over: read in
+    the source, and MEASURED as nice=0 in 80/80 process samples. It is recorded
+    as observed-vs-expected rather than gated on - gating it would fail every
+    macOS cell for a line the binary provably does not contain.
+    CONSEQUENCE: #912 exists because an unpinned, un-niced window recorder was
+    measured on Linux to grow the split's RTT with payload size. macOS gets no
+    pin, so the split row here carries a recorder the Linux row does not.
+
+THE SPLIT ROW'S LABEL: "free run on, degraded park, no recorder placement
+witness on macOS" - each clause is backed by this run's own logs
+  free run on   - witnessed in every split log: execution_mode=FreeRun workers=2,
+                  "no shared barrier is created", build_path=FreeRunLive on both
+                  workers; barrier=false on 100/100 wait-policy lines.
+  degraded park - macOS has no futex/UMWAIT/WFE, so the live-loop park falls back
+                  to bounded spin plus a chunked sleep-recheck. MEASURED across
+                  all 100 split park-telemetry lines: doorbell=false on 100/100
+                  workers, wakes_doorbell=0, wakes_timeout=105,891 of 210,832
+                  park entries (50.2% of all wakes are the TIMEOUT fallback, i.e.
+                  the second worker is woken by nothing else), and 16,380,868
+                  park_yields - 78 yields per park entry. That cadence, not the
+                  transport, is what separates the 88 us split row from the
+                  3.4 us mono row on this platform.
+  no recorder placement witness on macOS - see the #912 paragraph above: the pin,
+                  the nice and BOTH placement log arms are cfg(target_os="linux"),
+                  so the line cannot be emitted here; nice=0 was confirmed in
+                  80/80 process samples.
+  HOW THESE NUMBERS WERE COMPUTED, so a verifier does not repeat the silent-zeros
+  path: every aggregate above was taken over ANSI-STRIPPED lines. The logs in this
+  package are the raw run logs and still carry the escapes, and in the compact
+  tracing format the escapes sit BETWEEN the key, the "=" and the value - so
+  `park_entries=(\d+)` against the RAW text matches NOTHING and the whole table
+  silently reads ZERO for every counter. It is a plausible-looking all-zeros
+  result, not an error, which is why it has to be stated rather than left to be
+  rediscovered. Strip first, then match:
+      sed -E 's/\x1b\[[0-9;]*m//g' <log> | grep -E 'live loop park telemetry'
+  The same rule governs every witness in this package (the recorder decision line,
+  the free-run stamp, the build-path lines): strip, then grep the field.
+
+PORTABILITY (evidence/portability-patch.diff) - 2 lines, 3 expansions
+  macOS ships bash 3.2, where `set -u` makes an EMPTY array expansion an
+  "unbound variable" error (measured on the box). run_workspace.sh sets
+  `set -uo pipefail` and expands LEG_FLAGS (empty for the SPLIT leg),
+  PACING_FLAGS (empty for fixed100) and CHRT_PREFIX (empty at chrt0), so BOTH
+  legs aborted unpatched. Each is wrapped in the ${A[@]+"${A[@]}"} idiom the
+  same file already uses at :1048. On bash >= 4.4 the two forms are
+  behaviourally identical (both expand to zero words when empty), so the Linux
+  rows remain comparable; the patch only stops bash 3.2 aborting.
+  Two lane-local shims were also needed and are NOT in the measured path:
+  `sha256sum` (macOS has none; wraps shasum -a 256, verified against the GNU
+  reference digest) and `gtimeout` (no brew coreutils on the box; a python
+  stand-in for GNU timeout, contract-tested 6/6 including whole-process-group
+  reaping). The watchdog never fired on any row reported here.
+
+THE iox2 FLOOR CELL IS A NON-RESULT (no number was minted, and none is shown)
+  results_iox2_chrt0.csv carries 2 rows with EMPTY latency and
+  achieved_rate_hz=did_not_sustain; the other 8 sizes have no row at all.
+  From the cell's own log, 64 B: NOT SUSTAINED at 100 Hz (skipped 6669 of 2100
+  grid slots), then 50 Hz (6251 of 2100), then 20 Hz (2025 of 2100) - ladder
+  exhausted. Skips exceed the slot count because the counter accumulates every
+  grid slot jumped; inverting it gives the real per-round-trip wall: ~42 ms at
+  the 100 Hz rung, ~80 ms at 50 Hz, ~98 ms at 20 Hz, against single-digit
+  MICROseconds for this cell on Linux. The process held 99.6 % CPU throughout,
+  and the behaviour reproduced in an interactive foreground run, so it is
+  neither a busy box nor an artefact of how this lane detached its jobs.
+  It is reported as unmeasurable-at-fixed100 on this platform. A follow-up
+  should run this binary under `--variant backtoback` (no rate limiter) at one
+  small size: microseconds would place the defect in the paced sleep path,
+  tens of ms in the round trip itself. That question does not touch the
+  Cerulion rows above, which were measured by a different mechanism entirely.
+
+RATE LADDER (achieved_rate_hz, from the .rate sidecars)
+  split: 100 Hz at all 10 sizes in all 5 reps.
+  mono:  100 Hz everywhere except ONE size, 16 KiB, in rep 1 only (50 Hz) -
+         hence achieved_rate_hz="mixed" on that one row. The suite labels it;
+         it is not silent. See REP-1 MONO below.
+
+REP-1 MONO WAS MEASURED TWICE, AND BOTH ARE KEPT
+  The first rep-1 mono run began 36 s after a 10-core cold build, with the
+  1-minute load average still at 3.02, and tripped the sustain gate at two
+  sizes (1 KiB and 256 KiB). It was re-run ~1 h later on an idle box, on the
+  stated criterion "measured on an idle box" - NOT "whichever looks better".
+  The re-run did NOT remove the fallback: it MOVED it to 16 KiB. That refutes
+  the load-tail hypothesis and shows the gate trip is INTERMITTENT on this box
+  (3 trips across 60 mono size-runs). The re-run is the shipped rep 1; the
+  first attempt's logs and .rate sidecars are kept in
+  evidence/rep1-mono-first-attempt/ so the choice is auditable. Cost of the
+  re-run, stated plainly: rep-1 mono is no longer time-adjacent to rep-1 split,
+  so strict interleave-by-rep holds for reps 2-5 and not for rep 1.
+
+CI-IDLE DISCIPLINE (this box is a CI runner)
+  Every job window was gated on a desk-side poll of the runner-state file and
+  every job's [start,end] is stamped in evidence/jobs.tsv; the poll timeline is
+  evidence/ci-window-timeline.tsv. Every line inside every shipped job window
+  reads idle. Nothing under the runner's own tree was touched and no CI process
+  was signalled.
+
+WHAT IS NOT HERE
+  No .bin sample dumps (retained on the measuring box beside the run dir, per
+  the retention rule). No plots. No ROS 2 or zenoh rows - those cells were
+  never run on this box, and HEADLINE.md names them as MISSING rather than
+  leaving a reader to assume.
+
+Publication normalization: macOS per-user temporary-directory roots matching
+/var/folders/<shard>/<opaque>/T or /private/var/folders/<shard>/<opaque>/T
+are written as <TMPDIR> in the retained logs and process evidence. Run-specific
+suffixes, timestamps, counters, rates and measured tables are unchanged.

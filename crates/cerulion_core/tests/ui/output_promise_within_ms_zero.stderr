@@ -1,0 +1,11 @@
+error: `#[output(promise_within_ms = N)]` requires N > 0 — zero would miss on every step
+ --> tests/ui/output_promise_within_ms_zero.rs:8:5
+  |
+8 |     out: u32,
+  |     ^^^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/output_promise_within_ms_zero.rs:7:7
+  |
+7 |     #[output(promise_within_ms = 0)]
+  |       ^^^^^^

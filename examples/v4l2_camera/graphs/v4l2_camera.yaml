@@ -1,0 +1,16 @@
+prefix: v4l2_camera
+nodes:
+  - id: v4l2_camera
+    type: v4l2_camera
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+        max_slice_len: 1048576
+  - id: brightness_meter
+    type: brightness_meter
+    inputs:
+      - name: image
+        source: v4l2_camera/image
+    outputs:
+      - name: brightness
+        schema: std_msgs/Float32

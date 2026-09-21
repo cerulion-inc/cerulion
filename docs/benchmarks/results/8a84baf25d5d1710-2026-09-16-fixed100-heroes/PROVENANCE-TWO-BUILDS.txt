@@ -1,0 +1,32 @@
+TWO BUILDS IN THIS PACKAGE  -  state both, never a single provenance sha.
+
+  mono, iox2, zenoh and every ROS 2 row   : main 68a0d6196a962237f8628cd94c9f93371703e827
+                                            cerulion binary sha16 17d52c9b1552e530
+  the MULTI-PROCESS row (published)       : PR #912 head a68a2a987dcee4945d6620b11b04af039e15a3bd
+                                            cerulion binary sha16 d7d940c5aec0c63d
+
+  hero-stock-freerun-fixed/  = the PUBLISHED multi-process row (#912 head).
+  hero-stock-freerun/        = pre-fix, main 68a0d6196, free run + recorder ON,
+                               post-sweep -- labeled DIAGNOSTIC, not published.
+
+  All run.json files carry the scrub: uname node -> box-x86, argv and
+  path fields -> <BOXHOME>. NOTE the fields are NESTED under invocations[]; a
+  top-level-only scrub silently substitutes NOTHING and ships the hostname.
+  No run logs and no .bin in the package.
+
+CSV NOTE: the leading "#" schema-note lines in every packaged results CSV were
+rewritten to ASCII in the PACKAGE COPIES only (compile_csv.py's template still
+emits an em dash in the one_way_p50_ns comment; changing it is a post-launch
+code change). The DATA ROWS are byte-identical to the run output - asserted by
+diffing every non-"#" line before and after the rewrite.
+
+MULTI-PROCESS ROW, THREE SHAS:
+The multi-process row was measured on the PR #912 head
+a68a2a987dcee4945d6620b11b04af039e15a3bd (binary sha16 d7d940c5aec0c63d). The
+PR head at merge was 8c375a3ca49eeb19bbc6d8e09c33b3902b6bd713, which differs
+from the measured head in one file, 3 lines, the text of two recorder placement
+log lines only (diff stat: cerulion_cli_engine/src/graph_cmd.rs | 6 +++---,
+1 file changed, 3 insertions(+), 3 deletions(-); the structured core= and nice=
+fields are unchanged and the runtime is untouched). The run (1) verdict is
+verifier-attested and carried over; no re-measure. Merged into main as
+a3d8d330c49275222bb9242d03dc83b3bcc242f6.

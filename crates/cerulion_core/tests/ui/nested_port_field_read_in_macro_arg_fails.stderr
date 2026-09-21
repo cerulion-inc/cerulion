@@ -1,0 +1,7 @@
+error: self.imu.orientation cannot appear inside a macro argument (here: `cerulion_core::tracing::debug!`) — port field access is rewritten at expansion time and the rewriter does not descend into macro token streams. Hoist it to a local first: `let v = …; cerulion_core::tracing::debug!(…, v);`.
+  --> tests/ui/nested_port_field_read_in_macro_arg_fails.rs:23:1
+   |
+23 | #[cerulion_node_impl]
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `cerulion_node_impl` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,1867 @@
+{
+  "schema_version": 1,
+  "variant": "fixed100",
+  "machine_hash": "8a84baf25d5d1710",
+  "invocations": [
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 1,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "1"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T17:54:47-0700",
+      "ended_at": "2026-09-15T18:01:48-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T17:54:47-0700",
+          "ended_at": "2026-09-15T17:58:17-0700"
+        },
+        {
+          "cell": "zenoh_shm_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T17:58:17-0700",
+          "ended_at": "2026-09-15T18:01:48-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 1,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "1",
+        "--leg",
+        "both",
+        "--msg-class",
+        "variable"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:01:48-0700",
+      "ended_at": "2026-09-15T18:09:11-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:01:48-0700",
+          "ended_at": "2026-09-15T18:05:30-0700"
+        },
+        {
+          "cell": "cerulion_workspace_mono_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:05:30-0700",
+          "ended_at": "2026-09-15T18:09:11-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 1,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "1",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "stock_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:09:11-0700",
+      "ended_at": "2026-09-15T18:13:13-0700",
+      "cells": [
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:09:11-0700",
+          "ended_at": "2026-09-15T18:09:35-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:09:35-0700",
+          "ended_at": "2026-09-15T18:09:59-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:09:59-0700",
+          "ended_at": "2026-09-15T18:10:23-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:10:23-0700",
+          "ended_at": "2026-09-15T18:10:47-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:10:47-0700",
+          "ended_at": "2026-09-15T18:11:10-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:11:10-0700",
+          "ended_at": "2026-09-15T18:11:34-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:11:34-0700",
+          "ended_at": "2026-09-15T18:11:58-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:11:58-0700",
+          "ended_at": "2026-09-15T18:12:22-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:12:22-0700",
+          "ended_at": "2026-09-15T18:12:46-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:12:46-0700",
+          "ended_at": "2026-09-15T18:13:13-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 1,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "1",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "composed_ipcon_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:13:13-0700",
+      "ended_at": "2026-09-15T18:17:11-0700",
+      "cells": [
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:13:13-0700",
+          "ended_at": "2026-09-15T18:13:37-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:13:37-0700",
+          "ended_at": "2026-09-15T18:14:01-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:14:01-0700",
+          "ended_at": "2026-09-15T18:14:25-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:14:25-0700",
+          "ended_at": "2026-09-15T18:14:48-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:14:48-0700",
+          "ended_at": "2026-09-15T18:15:12-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:15:12-0700",
+          "ended_at": "2026-09-15T18:15:36-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:15:36-0700",
+          "ended_at": "2026-09-15T18:16:00-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:16:00-0700",
+          "ended_at": "2026-09-15T18:16:23-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:16:23-0700",
+          "ended_at": "2026-09-15T18:16:47-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:16:47-0700",
+          "ended_at": "2026-09-15T18:17:11-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    },
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 2,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "2"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:17:11-0700",
+      "ended_at": "2026-09-15T18:24:12-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:17:11-0700",
+          "ended_at": "2026-09-15T18:20:41-0700"
+        },
+        {
+          "cell": "zenoh_shm_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:20:41-0700",
+          "ended_at": "2026-09-15T18:24:12-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 2,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "2",
+        "--leg",
+        "both",
+        "--msg-class",
+        "variable"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:24:12-0700",
+      "ended_at": "2026-09-15T18:32:18-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:24:12-0700",
+          "ended_at": "2026-09-15T18:28:37-0700"
+        },
+        {
+          "cell": "cerulion_workspace_mono_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:28:37-0700",
+          "ended_at": "2026-09-15T18:32:18-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 2,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "2",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "stock_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:32:19-0700",
+      "ended_at": "2026-09-15T18:36:21-0700",
+      "cells": [
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:32:19-0700",
+          "ended_at": "2026-09-15T18:32:42-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:32:42-0700",
+          "ended_at": "2026-09-15T18:33:06-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:33:06-0700",
+          "ended_at": "2026-09-15T18:33:30-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:33:30-0700",
+          "ended_at": "2026-09-15T18:33:54-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:33:54-0700",
+          "ended_at": "2026-09-15T18:34:18-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:34:18-0700",
+          "ended_at": "2026-09-15T18:34:42-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:34:42-0700",
+          "ended_at": "2026-09-15T18:35:06-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:35:06-0700",
+          "ended_at": "2026-09-15T18:35:30-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:35:30-0700",
+          "ended_at": "2026-09-15T18:35:54-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:35:54-0700",
+          "ended_at": "2026-09-15T18:36:21-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 2,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "2",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "composed_ipcon_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:36:21-0700",
+      "ended_at": "2026-09-15T18:40:18-0700",
+      "cells": [
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:36:21-0700",
+          "ended_at": "2026-09-15T18:36:45-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:36:45-0700",
+          "ended_at": "2026-09-15T18:37:08-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:37:08-0700",
+          "ended_at": "2026-09-15T18:37:32-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:37:32-0700",
+          "ended_at": "2026-09-15T18:37:56-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:37:56-0700",
+          "ended_at": "2026-09-15T18:38:20-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:38:20-0700",
+          "ended_at": "2026-09-15T18:38:43-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:38:43-0700",
+          "ended_at": "2026-09-15T18:39:07-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:39:07-0700",
+          "ended_at": "2026-09-15T18:39:31-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:39:31-0700",
+          "ended_at": "2026-09-15T18:39:55-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:39:55-0700",
+          "ended_at": "2026-09-15T18:40:18-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    },
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 3,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "3"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:40:19-0700",
+      "ended_at": "2026-09-15T18:47:19-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:40:19-0700",
+          "ended_at": "2026-09-15T18:43:49-0700"
+        },
+        {
+          "cell": "zenoh_shm_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:43:49-0700",
+          "ended_at": "2026-09-15T18:47:19-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 3,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "3",
+        "--leg",
+        "both",
+        "--msg-class",
+        "variable"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:47:19-0700",
+      "ended_at": "2026-09-15T18:55:26-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:47:19-0700",
+          "ended_at": "2026-09-15T18:51:45-0700"
+        },
+        {
+          "cell": "cerulion_workspace_mono_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:51:45-0700",
+          "ended_at": "2026-09-15T18:55:26-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 3,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "3",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "stock_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:55:26-0700",
+      "ended_at": "2026-09-15T18:59:29-0700",
+      "cells": [
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:55:27-0700",
+          "ended_at": "2026-09-15T18:55:50-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:55:50-0700",
+          "ended_at": "2026-09-15T18:56:14-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:56:14-0700",
+          "ended_at": "2026-09-15T18:56:38-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:56:38-0700",
+          "ended_at": "2026-09-15T18:57:02-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:57:02-0700",
+          "ended_at": "2026-09-15T18:57:26-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:57:26-0700",
+          "ended_at": "2026-09-15T18:57:50-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:57:50-0700",
+          "ended_at": "2026-09-15T18:58:14-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:58:14-0700",
+          "ended_at": "2026-09-15T18:58:38-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:58:38-0700",
+          "ended_at": "2026-09-15T18:59:01-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:59:01-0700",
+          "ended_at": "2026-09-15T18:59:29-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 3,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "3",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "composed_ipcon_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T18:59:29-0700",
+      "ended_at": "2026-09-15T19:03:26-0700",
+      "cells": [
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:59:29-0700",
+          "ended_at": "2026-09-15T18:59:52-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T18:59:52-0700",
+          "ended_at": "2026-09-15T19:00:16-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:00:16-0700",
+          "ended_at": "2026-09-15T19:00:40-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:00:40-0700",
+          "ended_at": "2026-09-15T19:01:04-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:01:04-0700",
+          "ended_at": "2026-09-15T19:01:27-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:01:27-0700",
+          "ended_at": "2026-09-15T19:01:51-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:01:51-0700",
+          "ended_at": "2026-09-15T19:02:15-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:02:15-0700",
+          "ended_at": "2026-09-15T19:02:39-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:02:39-0700",
+          "ended_at": "2026-09-15T19:03:02-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:03:02-0700",
+          "ended_at": "2026-09-15T19:03:26-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    },
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 4,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "4"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T19:03:26-0700",
+      "ended_at": "2026-09-15T19:10:27-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:03:26-0700",
+          "ended_at": "2026-09-15T19:06:57-0700"
+        },
+        {
+          "cell": "zenoh_shm_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:06:57-0700",
+          "ended_at": "2026-09-15T19:10:27-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 4,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "4",
+        "--leg",
+        "both",
+        "--msg-class",
+        "variable"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T19:10:27-0700",
+      "ended_at": "2026-09-15T19:18:34-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:10:27-0700",
+          "ended_at": "2026-09-15T19:14:53-0700"
+        },
+        {
+          "cell": "cerulion_workspace_mono_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:14:53-0700",
+          "ended_at": "2026-09-15T19:18:34-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 4,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "4",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "stock_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T19:18:34-0700",
+      "ended_at": "2026-09-15T19:22:36-0700",
+      "cells": [
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:18:34-0700",
+          "ended_at": "2026-09-15T19:18:58-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:18:58-0700",
+          "ended_at": "2026-09-15T19:19:22-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:19:22-0700",
+          "ended_at": "2026-09-15T19:19:46-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:19:46-0700",
+          "ended_at": "2026-09-15T19:20:10-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:20:10-0700",
+          "ended_at": "2026-09-15T19:20:34-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:20:34-0700",
+          "ended_at": "2026-09-15T19:20:57-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:20:57-0700",
+          "ended_at": "2026-09-15T19:21:21-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:21:21-0700",
+          "ended_at": "2026-09-15T19:21:45-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:21:45-0700",
+          "ended_at": "2026-09-15T19:22:09-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:22:09-0700",
+          "ended_at": "2026-09-15T19:22:36-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 4,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "4",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "composed_ipcon_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T19:22:36-0700",
+      "ended_at": "2026-09-15T19:26:34-0700",
+      "cells": [
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:22:36-0700",
+          "ended_at": "2026-09-15T19:23:00-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:23:00-0700",
+          "ended_at": "2026-09-15T19:23:24-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:23:24-0700",
+          "ended_at": "2026-09-15T19:23:48-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:23:48-0700",
+          "ended_at": "2026-09-15T19:24:11-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:24:11-0700",
+          "ended_at": "2026-09-15T19:24:35-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:24:35-0700",
+          "ended_at": "2026-09-15T19:24:59-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:24:59-0700",
+          "ended_at": "2026-09-15T19:25:23-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:25:23-0700",
+          "ended_at": "2026-09-15T19:25:46-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:25:46-0700",
+          "ended_at": "2026-09-15T19:26:10-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:26:10-0700",
+          "ended_at": "2026-09-15T19:26:34-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    },
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 5,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "5"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T19:26:34-0700",
+      "ended_at": "2026-09-15T19:33:35-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:26:34-0700",
+          "ended_at": "2026-09-15T19:30:04-0700"
+        },
+        {
+          "cell": "zenoh_shm_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:30:04-0700",
+          "ended_at": "2026-09-15T19:33:35-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 5,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "5",
+        "--leg",
+        "both",
+        "--msg-class",
+        "variable"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T19:33:35-0700",
+      "ended_at": "2026-09-15T19:40:58-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:33:35-0700",
+          "ended_at": "2026-09-15T19:37:17-0700"
+        },
+        {
+          "cell": "cerulion_workspace_mono_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:37:17-0700",
+          "ended_at": "2026-09-15T19:40:58-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 5,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "5",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "stock_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T19:40:58-0700",
+      "ended_at": "2026-09-15T19:45:00-0700",
+      "cells": [
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:40:58-0700",
+          "ended_at": "2026-09-15T19:41:22-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:41:22-0700",
+          "ended_at": "2026-09-15T19:41:46-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:41:46-0700",
+          "ended_at": "2026-09-15T19:42:10-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:42:10-0700",
+          "ended_at": "2026-09-15T19:42:34-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:42:34-0700",
+          "ended_at": "2026-09-15T19:42:58-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:42:58-0700",
+          "ended_at": "2026-09-15T19:43:21-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:43:21-0700",
+          "ended_at": "2026-09-15T19:43:45-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:43:45-0700",
+          "ended_at": "2026-09-15T19:44:09-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:44:09-0700",
+          "ended_at": "2026-09-15T19:44:33-0700"
+        },
+        {
+          "cell": "jazzy_stock_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:44:33-0700",
+          "ended_at": "2026-09-15T19:45:00-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 5,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/hero-20260916T004920Z/run",
+        "--rep",
+        "5",
+        "--distro",
+        "jazzy",
+        "--cells",
+        "composed_ipcon_rclcpp_chrt0"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-15T19:45:00-0700",
+      "ended_at": "2026-09-15T19:48:58-0700",
+      "cells": [
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:45:00-0700",
+          "ended_at": "2026-09-15T19:45:24-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:45:24-0700",
+          "ended_at": "2026-09-15T19:45:48-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:45:48-0700",
+          "ended_at": "2026-09-15T19:46:12-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:46:12-0700",
+          "ended_at": "2026-09-15T19:46:35-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:46:35-0700",
+          "ended_at": "2026-09-15T19:46:59-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:46:59-0700",
+          "ended_at": "2026-09-15T19:47:23-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:47:23-0700",
+          "ended_at": "2026-09-15T19:47:47-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:47:47-0700",
+          "ended_at": "2026-09-15T19:48:10-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:48:10-0700",
+          "ended_at": "2026-09-15T19:48:34-0700"
+        },
+        {
+          "cell": "jazzy_composed_ipcon_rclcpp_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-15T19:48:34-0700",
+          "ended_at": "2026-09-15T19:48:58-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan \u2014 can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types \u2014 an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip \u2014 re-verify on new rmw_zenoh versions)"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:b183180261994bda2bb858a7c86169c791de5c2d5050ff63393538eec0a869e7",
+          "repo_git_sha": "68a0d6196a962237f8628cd94c9f93371703e827"
+        }
+      }
+    }
+  ]
+}

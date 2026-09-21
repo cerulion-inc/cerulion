@@ -1,0 +1,107 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
+
+# A new push to a PR cancels the review still running for the commit it just
+# replaced. Reviews stack hard on active PRs (measured: three pull requests
+# got 15, 9 and 8 review runs), each one an ubuntu job plus LLM
+# spend, and a review of a superseded commit is posted against code that no
+# longer exists. Cancelling mid-run leaves no half-review: the action buffers
+# its comments and posts at the end. This is not a required check on `main`,
+# so a cancel never blocks a merge.
+#
+# Keyed on the PR number ONLY — the workflow has no push trigger, so there is
+# no non-PR run that could ever need a fallback group.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    # Three gates, all required: the PR author is one of the two maintainers
+    # (the CODEOWNERS logins); the head branch lives in this repository, so a
+    # fork PR never starts a job that holds the OAuth token; and the PR is not
+    # a draft (a draft marked ready arrives as ready_for_review and runs then).
+    if: |
+      contains(fromJSON('["lakshay2010sharma","raveenk9696"]'), github.event.pull_request.user.login) &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+
+    runs-on: ubuntu-latest
+    # 60, not 20: the last 60 runs measured median 2.1 min, p90 18.8 min,
+    # max 44.3 min, and 4 of 60 exceeded 20 min; every
+    # one concluded `success`, and those are the large PRs where the review
+    # is worth most. Without a cap the default is 360 min; 60 bounds a hung
+    # run without killing a real one.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # write (not read): the review posts its findings as PR review comments;
+      # with read-only perms the first runs buffered nothing and
+      # their verdicts were unreachable (27 permission denials in the run log).
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      # The code-review plugin runs its eligibility checks and review passes as
+      # child agents. The action's runtime (2.1.x) launches those in the background by default
+      # ("Async agent launched successfully"), and a headless run has no one
+      # to wake the parent when they finish: measured on one run, the parent
+      # said "I'll wait for the two background agents", emitted a turn with no
+      # tool call, and the session ended: 6 turns, 25 s, $0.26, nothing
+      # posted. A second run had the same shape. Foreground child agents make the
+      # parent block on each one, which is the only order a one-shot run can
+      # work in. (Runs that posted got lucky on timing.)
+      CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.193
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # No bot or App allow-list is set: the author gate on the job's if:
+          # already limits this job to pull requests the two maintainers opened,
+          # and the action refuses non-User actors by default.
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          # `--comment` is load-bearing: the plugin's code-review command is
+          # no-comment by default (anthropics/claude-code e4f6820;
+          # hardened 6dcc7d8) — without the flag it reviews, then stops before
+          # posting. At the audit, there were zero reviews or comments from this workflow on any
+          # PR in this repo's history (a comment search by the review app = 0) while the
+          # workflow ran 955 times in August alone, up to 44 min and $44 a run.
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
+          # The inline-comment MCP server is only started when --allowedTools
+          # names it (claude-code-action src/mcp/install-mcp-server.ts:
+          # `hasInlineCommentTools` gates adding `github_inline_comment` to the
+          # mcp config), and headless default mode auto-denies every tool not
+          # pre-approved — the long runs were racking up 57-189 denials. This
+          # is the action's own pr-review-comprehensive.yml recipe.
+          # Off, because this repository is public and so is every Actions
+          # log it writes: the action's full output is the whole session,
+          # every file it read and every command result, from a run that
+          # holds the OAuth token.
+          show_full_output: false
+          claude_args: |
+            --allowedTools "Skill,mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*),Bash(git diff:*),Bash(git log:*),Bash(git blame:*),Bash(git show:*)"
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+
+      # No artifact carries the per-turn transcript. Artifacts on a public
+      # repository are downloadable by anyone with the link, and the
+      # transcript records every tool call and its result for the same
+      # session, so uploading it would publish what show_full_output above
+      # keeps out of the log.

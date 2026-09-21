@@ -1,0 +1,19 @@
+prefix: realsense
+nodes:
+  - id: realsense_camera
+    type: realsense_camera
+    outputs:
+      - name: color
+        schema: sensor_msgs/Image
+        max_slice_len: 1048576
+      - name: depth
+        schema: sensor_msgs/Image
+        max_slice_len: 1048576
+  - id: nearest_obstacle
+    type: nearest_obstacle
+    inputs:
+      - name: depth
+        source: realsense_camera/depth
+    outputs:
+      - name: obstacle
+        schema: sensor_msgs/Range

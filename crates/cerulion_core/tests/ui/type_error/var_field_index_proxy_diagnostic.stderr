@@ -1,0 +1,23 @@
+warning: use of deprecated field `native_ros2_messages::sensor_msgs::ImageShm::data`: write-only proxy for variable field `data` — reading it yields a useless marker. Read with the accessor method `data()`; write with `self.<port>.data = expr` or `.fill_from(...)`.
+  --> tests/ui/type_error/var_field_index_proxy_diagnostic.rs:32:14
+   |
+32 |         self.image.data[0] = 1u8;
+   |              ^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+error[E0277]: self.<port>.data[i] / += are unsupported on variable-length fields. Replace the whole value with self.<port>.data = expr, or write incrementally with self.<port>.data.fill_from(|buf| …).
+  --> tests/ui/type_error/var_field_index_proxy_diagnostic.rs:32:25
+   |
+32 |         self.image.data[0] = 1u8;
+   |                         ^ the trait `native_ros2_messages::sensor_msgs::__cer_wg_Image_data` is not implemented for `{integer}`
+   |
+   = note: required for `native_ros2_messages::sensor_msgs::__cer_wp_Image_data` to implement `Index<{integer}>`
+
+error[E0308]: mismatched types
+  --> tests/ui/type_error/var_field_index_proxy_diagnostic.rs:32:30
+   |
+32 |         self.image.data[0] = 1u8;
+   |              -------------   ^^^ expected `()`, found `u8`
+   |              |
+   |              expected due to the type of this binding

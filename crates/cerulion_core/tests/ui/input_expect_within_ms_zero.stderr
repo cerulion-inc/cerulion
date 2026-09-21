@@ -1,0 +1,11 @@
+error: `#[input(expect_within_ms = N)]` requires N > 0 — zero would miss on every step
+  --> tests/ui/input_expect_within_ms_zero.rs:10:5
+   |
+10 |     image: u32,
+   |     ^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/input_expect_within_ms_zero.rs:9:7
+  |
+9 |     #[input(expect_within_ms = 0)]
+  |       ^^^^^

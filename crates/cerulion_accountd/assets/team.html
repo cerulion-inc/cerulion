@@ -1,0 +1,1153 @@
+<!doctype html>
+<!--
+  SPDX-License-Identifier: AGPL-3.0-only
+  A6: the Team & access page.
+
+  A HOSTED surface: the account service serves this document and it renders
+  INSIDE Cerulion Studio's in-app webview. It is deliberately NOT a Studio-bundled
+  asset — the data logic lives with the service that owns the data, so it survives
+  the shell swap and a change here reaches every desk without a
+  Studio release.
+
+  SELF-CONTAINED by contract: all CSS + JS are inline and there is no external
+  fetch of any kind. The only network traffic is same-origin XHR to this service's
+  own session-authed JSON endpoints.
+
+  ── The session handshake (no token ever rides a URL) ──────────────────────────
+  This document carries no credential. On load it posts `{cmd:"team_ready"}` over
+  the host's IPC channel; the host answers by calling
+  `window.__cerulion_session({session_token, refresh_token, account_id})`
+  and the page boots from there. Opened in a plain browser (no host, no IPC) it
+  renders a loud "open this from Cerulion Studio" state — never a blank page and
+  never a token-paste box.
+
+  ── Always dismissible ────────────────────────────────────────────────────────
+  Whenever a host bridge exists, the header close button is visible and Escape
+  dismisses the panel — from the FIRST paint, not only after the handshake. The
+  states a user most needs to leave (still connecting, "no session was handed
+  over", "open this from Cerulion Studio") are precisely the ones reached before
+  the handshake. A host bridge is the ONLY condition: there is no opt-out.
+  Escape MUST be bound here: while this webview holds keyboard focus the Studio
+  shell's own egui-side Escape handler never sees the key. Because it is a
+  DOCUMENT handler it is scoped twice: it blurs a focused text field instead of
+  dismissing (Escape is that field's key), and it routes through `requestClose`,
+  the ONE place the in-flight-revoke guard is applied — so the key and the close
+  button can never disagree.
+
+  ── A failed credential write-back stays in this page ─────────────────────────
+  accountd's refresh is single-use, so once `refreshSession()` succeeds the old
+  pair is dead and the rotated pair lives ONLY here until the host writes it. If
+  that write fails, the host says so (`__cerulion_session_saved`) and this page
+  raises it in the persistent `#alert` bar — the host must NOT replace this
+  document to report it, or the desk loses its only live credential.
+
+  ── Design language ────────────────────────────────────────────────────────────
+  The `--cer-*` values below MIRROR the Studio shell's palette, whose SINGLE SOURCE
+  OF TRUTH is `cerulion-studio/native/studio-shell/palette.toml` (and the non-colour
+  `--sp/--r/--fs/--dur/--ease` scale in that repo's `assets/studio.css`). This page
+  cannot `include_str!` across repos, so the values are duplicated here on purpose;
+  `team::tests::palette_tokens_match_the_studio_shell_palette` pins every one of
+  them against a hand oracle so a silent drift fails accountd's test suite.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>Team &amp; access · Cerulion</title>
+<style>
+/* ── Palette (mirror of cerulion-studio/native/studio-shell/palette.toml) ── */
+:root {
+  --cer-bg-stage: #10161f;
+  --cer-bg-header: #0c1219;
+  --cer-bg-hover: #141d2a;
+  --cer-bg-elevated: #182338;
+  --cer-bg-badge: #1a2636;
+  --cer-bg-active: #223252;
+  --cer-border: #223047;
+  --cer-border-strong: #2c3f5c;
+  --cer-border-subtle: #1a2536;
+  --cer-text-primary: #e6edf6;
+  --cer-text-bright: #cfe0f5;
+  --cer-text-muted: #7c93b3;
+  --cer-text-faint: #6a7f9e;
+  --cer-text-dim: #55688a;
+  --cer-accent: #4b86e0;
+  --cer-accent-soft: #9db8e6;
+  --cer-accent-bright: #b9d5ff;
+  --cer-accent-hover: #5c95ec;
+  --cer-accent-press: #3d76cf;
+  --cer-success: #6fd39a;
+  --cer-success-bright: #4ad07f;
+  --cer-error: #ff8f8f;
+  --cer-warn: #e6b45a;
+  --cer-scrollbar: #22314a;
+  --cer-scrollbar-hover: #2c3f5c;
+  --cer-focus-ring: #4b86e0;
+
+  /* Type / spacing / radii / motion (mirror of studio.css) */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --fs-micro: 10px; --fs-meta: 11px; --fs-label: 11.5px;
+  --fs-body: 12.5px; --fs-title: 13px; --fs-lead: 15px;
+  --sp-1: 2px; --sp-2: 4px; --sp-3: 6px; --sp-4: 8px; --sp-5: 10px;
+  --sp-6: 12px; --sp-8: 16px; --sp-10: 20px; --sp-12: 24px; --sp-16: 32px;
+  --r-sm: 5px; --r-md: 7px; --r-lg: 9px; --r-full: 999px;
+  --ease-out: cubic-bezier(.2,.8,.2,1);
+  --dur-fast: 120ms; --dur: 180ms;
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font-family: var(--font-sans);
+  background: var(--cer-bg-stage);
+  color: var(--cer-text-primary);
+  display: flex; flex-direction: column; height: 100%;
+  -webkit-font-smoothing: antialiased;
+  font-size: var(--fs-body);
+}
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--cer-scrollbar); border-radius: var(--r-full);
+  border: 2px solid transparent; background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--cer-scrollbar-hover); background-clip: padding-box; }
+::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+:focus-visible { outline: 2px solid var(--cer-focus-ring); outline-offset: 1px; }
+
+/* ── Header ───────────────────────────────────────────────────────────────── */
+#topbar {
+  height: 48px; flex: none; display: flex; align-items: center; gap: var(--sp-4);
+  padding: 0 var(--sp-8);
+  background: var(--cer-bg-header); border-bottom: 1px solid var(--cer-border);
+}
+.brand { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
+.brand-mark { display: flex; color: var(--cer-accent-bright); flex: none; }
+.brand-name {
+  font: 600 var(--fs-title)/1.2 var(--font-sans); letter-spacing: .01em;
+  color: var(--cer-text-primary); white-space: nowrap;
+}
+.brand-sep { color: var(--cer-text-dim); font-size: var(--fs-title); }
+.brand-page { font: 500 var(--fs-title)/1.2 var(--font-sans); color: var(--cer-text-muted); white-space: nowrap; }
+.spacer { flex: 1; min-width: 0; }
+.pill {
+  display: inline-flex; align-items: center; gap: var(--sp-2); flex: none;
+  padding: 3px var(--sp-3); border-radius: var(--r-full);
+  background: var(--cer-bg-badge);
+  font: 500 var(--fs-meta)/1 var(--font-sans); color: var(--cer-text-muted);
+  max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.icon-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; flex: none;
+  border: none; background: none; color: var(--cer-text-faint);
+  border-radius: var(--r-sm); cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+.icon-btn:hover { color: var(--cer-text-bright); background: var(--cer-bg-hover); }
+.icon-btn:active { background: var(--cer-bg-active); }
+#close[hidden] { display: none; }
+
+/* ── Layout ───────────────────────────────────────────────────────────────── */
+#main { flex: 1; min-height: 0; overflow-y: auto; }
+.wrap { max-width: 860px; margin: 0 auto; padding: var(--sp-12) var(--sp-10) var(--sp-16); }
+
+.section { margin-bottom: var(--sp-16); }
+.section-head {
+  display: flex; align-items: center; gap: var(--sp-3);
+  margin-bottom: var(--sp-5); padding-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--cer-border-subtle);
+}
+.section-title {
+  font: 600 var(--fs-micro)/1.2 var(--font-sans); letter-spacing: .09em;
+  text-transform: uppercase; color: var(--cer-text-faint);
+}
+.section-count {
+  font: 500 var(--fs-meta)/1 var(--font-sans); color: var(--cer-text-muted);
+  background: var(--cer-bg-badge); border-radius: var(--r-full);
+  padding: 2px var(--sp-3); font-variant-numeric: tabular-nums;
+}
+.section-note { margin-left: auto; font: 400 var(--fs-meta)/1.4 var(--font-sans); color: var(--cer-text-dim); }
+
+/* ── Cards ────────────────────────────────────────────────────────────────── */
+.card {
+  background: var(--cer-bg-header); border: 1px solid var(--cer-border);
+  border-radius: var(--r-lg); margin-bottom: var(--sp-4); overflow: hidden;
+}
+.card-head {
+  display: flex; align-items: center; gap: var(--sp-4);
+  padding: var(--sp-5) var(--sp-6);
+}
+.card-icon { display: flex; color: var(--cer-text-muted); flex: none; }
+.card-main { flex: 1; min-width: 0; }
+.card-title {
+  font: 600 var(--fs-title)/1.35 var(--font-sans); color: var(--cer-text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card-sub {
+  font: 400 var(--fs-meta)/1.5 var(--font-mono); color: var(--cer-text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card-body { padding: 0 var(--sp-6) var(--sp-5); }
+.card-body.divided { border-top: 1px solid var(--cer-border-subtle); padding-top: var(--sp-5); }
+
+.badge {
+  display: inline-flex; align-items: center; gap: var(--sp-2); flex: none;
+  padding: 2px var(--sp-3); border-radius: var(--r-sm);
+  background: var(--cer-bg-badge); color: var(--cer-text-muted);
+  font: 500 var(--fs-label)/1.5 var(--font-sans); white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.badge.ok { color: var(--cer-success); }
+.badge.bad { color: var(--cer-error); }
+.badge.warn { color: var(--cer-warn); }
+.dot { width: 6px; height: 6px; border-radius: var(--r-full); flex: none; background: currentColor; }
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-5); flex: none;
+  border: 1px solid var(--cer-border-strong); border-radius: var(--r-md);
+  background: var(--cer-bg-elevated); color: var(--cer-text-bright);
+  font: 500 var(--fs-label)/1.6 var(--font-sans); cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+.btn:hover { background: var(--cer-bg-hover); border-color: var(--cer-accent); }
+.btn:active { background: var(--cer-bg-active); }
+.btn:disabled { opacity: .5; cursor: default; background: var(--cer-bg-elevated); border-color: var(--cer-border); }
+.btn.primary { background: var(--cer-accent); border-color: var(--cer-accent); color: #0b1220; }
+.btn.primary:hover { background: var(--cer-accent-hover); border-color: var(--cer-accent-hover); }
+.btn.primary:active { background: var(--cer-accent-press); }
+.btn.danger { color: var(--cer-error); }
+.btn.danger:hover { border-color: var(--cer-error); background: var(--cer-bg-hover); }
+
+/* ── Rows ─────────────────────────────────────────────────────────────────── */
+.row {
+  display: flex; align-items: center; gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-6);
+  border-top: 1px solid var(--cer-border-subtle);
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.row:hover { background: var(--cer-bg-hover); }
+.row-main { flex: 1; min-width: 0; }
+.row-title { font: 400 var(--fs-body)/1.4 var(--font-mono); color: var(--cer-text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-sub { font: 400 var(--fs-meta)/1.5 var(--font-sans); color: var(--cer-text-dim); }
+.row-meta { display: flex; align-items: center; gap: var(--sp-3); flex: none; }
+
+.sub-head {
+  font: 600 var(--fs-micro)/1.2 var(--font-sans); letter-spacing: .08em;
+  text-transform: uppercase; color: var(--cer-text-dim);
+  margin: var(--sp-5) 0 var(--sp-3);
+}
+.keylist { display: flex; flex-direction: column; gap: var(--sp-2); }
+.keyline {
+  display: flex; align-items: center; gap: var(--sp-3);
+  font: 400 var(--fs-meta)/1.6 var(--font-mono); color: var(--cer-text-muted);
+}
+.keyline .k { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Revoke form ──────────────────────────────────────────────────────────── */
+.form { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; margin-top: var(--sp-4); }
+select, input[type="text"] {
+  font: 400 var(--fs-label)/1.6 var(--font-sans);
+  color: var(--cer-text-primary); background: var(--cer-bg-stage);
+  border: 1px solid var(--cer-border-strong); border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-4); outline: none;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+input[type="text"] { flex: 1; min-width: 220px; font-family: var(--font-mono); }
+select:hover, input[type="text"]:hover { border-color: var(--cer-border-strong); }
+select:focus, input[type="text"]:focus { border-color: var(--cer-accent); }
+input::placeholder { color: var(--cer-text-dim); }
+
+/* ── States ───────────────────────────────────────────────────────────────── */
+.state {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: var(--sp-5); text-align: center;
+  padding: var(--sp-16) var(--sp-8); min-height: 60vh;
+}
+.state-icon { color: var(--cer-text-dim); display: flex; }
+.state-icon.bad { color: var(--cer-error); }
+.state-title { font: 600 var(--fs-lead)/1.4 var(--font-sans); color: var(--cer-text-bright); }
+.state-sub { font: 400 var(--fs-body)/1.6 var(--font-sans); color: var(--cer-text-muted); max-width: 460px; }
+.state-sub code {
+  font-family: var(--font-mono); font-size: var(--fs-label);
+  background: var(--cer-bg-badge); border-radius: var(--r-sm);
+  padding: 1px var(--sp-2); color: var(--cer-accent-soft);
+}
+/* The PERSISTENT cause block. Mirrors `.detail` in the Studio shell's local
+   fallback chrome (cerulion-studio/native/studio-shell/assets/team_fallback.html)
+   so the two chromes read as one surface. A state that HAS a cause renders it
+   here, as text, for as long as the state is on screen — a toast self-clears,
+   and the reason must outlive it. */
+.detail {
+  width: 100%; max-width: 460px; margin-top: calc(var(--sp-1) * -1);
+  padding: var(--sp-4) var(--sp-5);
+  border: 1px solid var(--cer-border); border-left: 2px solid var(--cer-error);
+  border-radius: var(--r-md); background: var(--cer-bg-header);
+  font: 400 var(--fs-meta)/1.6 var(--font-mono); color: var(--cer-text-faint);
+  text-align: left; word-break: break-word;
+  -webkit-user-select: text; user-select: text;
+}
+.empty {
+  padding: var(--sp-12) var(--sp-8); text-align: center;
+  border: 1px dashed var(--cer-border); border-radius: var(--r-lg);
+  display: flex; flex-direction: column; align-items: center; gap: var(--sp-3);
+}
+.empty-title { font: 600 var(--fs-body)/1.4 var(--font-sans); color: var(--cer-text-faint); }
+.empty-sub { font: 400 var(--fs-meta)/1.5 var(--font-sans); color: var(--cer-text-dim); max-width: 380px; }
+
+.banner {
+  display: flex; align-items: flex-start; gap: var(--sp-4);
+  padding: var(--sp-5) var(--sp-6); margin-bottom: var(--sp-8);
+  border: 1px solid var(--cer-border); border-left: 2px solid var(--cer-error);
+  border-radius: var(--r-md); background: var(--cer-bg-header);
+}
+.banner.warn { border-left-color: var(--cer-warn); }
+.banner-icon { flex: none; display: flex; color: var(--cer-error); margin-top: 1px; }
+.banner.warn .banner-icon { color: var(--cer-warn); }
+.banner-text { flex: 1; min-width: 0; font: 400 var(--fs-label)/1.6 var(--font-sans); color: var(--cer-text-muted); }
+.banner-text strong { color: var(--cer-text-bright); font-weight: 600; }
+
+/* ── Persistent page-level alert ──────────────────────────────────────────── */
+/* A condition that MUST outlive a toast. Today there is exactly one: a refreshed
+   sign-in the desk could not store, which leaves the credential on disk stale so
+   every `cerulion` cloud command is about to be refused. It lives OUTSIDE
+   `#content` (a re-render never wipes it) and clears only when the condition
+   does. The host does NOT swap the panel to its local chrome for this: that
+   would replace the live document, and after a successful refresh the ONLY copy
+   of the rotated token pair is in THIS page's memory. */
+#alert {
+  flex: none; padding: var(--sp-4) var(--sp-10);
+  border-bottom: 1px solid var(--cer-border); border-left: 2px solid var(--cer-warn);
+  background: var(--cer-bg-header);
+  font: 500 var(--fs-label)/1.6 var(--font-sans); color: var(--cer-warn);
+  word-break: break-word;
+  -webkit-user-select: text; user-select: text;
+}
+#alert[hidden] { display: none; }
+
+/* ── Footer scope note ────────────────────────────────────────────────────── */
+#scope {
+  flex: none; padding: var(--sp-5) var(--sp-10);
+  background: var(--cer-bg-header); border-top: 1px solid var(--cer-border);
+  font: 400 var(--fs-meta)/1.6 var(--font-sans); color: var(--cer-text-dim);
+}
+#scope .wrap { padding: 0; }
+#scope strong { color: var(--cer-text-faint); font-weight: 600; }
+
+/* ── Toast ────────────────────────────────────────────────────────────────── */
+#toast {
+  position: fixed; left: 50%; bottom: var(--sp-12); transform: translate(-50%, 12px);
+  max-width: 560px; padding: var(--sp-4) var(--sp-6);
+  border: 1px solid var(--cer-border-strong); border-radius: var(--r-md);
+  background: var(--cer-bg-elevated); color: var(--cer-text-bright);
+  font: 500 var(--fs-label)/1.5 var(--font-sans);
+  opacity: 0; pointer-events: none;
+  transition: opacity var(--dur) var(--ease-out), transform var(--dur) var(--ease-out);
+  z-index: 10;
+}
+#toast.show { opacity: 1; transform: translate(-50%, 0); }
+#toast.bad { border-color: var(--cer-error); color: var(--cer-error); }
+#toast.ok { border-color: var(--cer-success); color: var(--cer-success); }
+
+.spin { animation: spin 900ms linear infinite; transform-origin: 50% 50%; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header id="topbar">
+  <span class="brand">
+    <span class="brand-mark" id="brandMark"></span>
+    <span class="brand-name">Cerulion</span>
+    <span class="brand-sep">/</span>
+    <span class="brand-page">Team &amp; access</span>
+  </span>
+  <span class="spacer"></span>
+  <span class="pill" id="who" hidden></span>
+  <button class="icon-btn" id="close" title="Close" aria-label="Close" hidden></button>
+</header>
+
+<div id="alert" role="alert" aria-live="assertive" hidden></div>
+
+<main id="main">
+  <div class="wrap" id="content"></div>
+</main>
+
+<footer id="scope">
+  <div class="wrap">
+    <strong>Honest scope.</strong> Revocation is <strong>online-enforced</strong>: a robot refuses a
+    revoked account or device once it syncs the new access epoch — an offline robot keeps honouring
+    a desk-carried grant until then. Grants themselves are carried by the desk and signed offline,
+    so the account service cannot enumerate them; what it owns — and what this page edits — is each
+    robot's <strong>revocation set</strong>. Revocations are grow-only and cannot be undone here.
+  </div>
+</footer>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+// ── Icons (Lucide, MIT) — 24-viewBox path data, stroked with currentColor. ──
+var ICONS = {
+  "users": '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  "x": '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  "cpu": '<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/>',
+  "laptop": '<path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/>',
+  "shield-off": '<path d="M19.7 14a6.9 6.9 0 0 0 .3-2V5l-8-3-3.2 1.2"/><path d="m2 2 20 20"/><path d="M4.7 4.7 4 5v7c0 6 8 10 8 10a20.3 20.3 0 0 0 5.6-4.6"/>',
+  "shield-check": '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+  "alert": '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  "plug": '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
+  "loader": '<path d="M12 2v4"/><path d="m16.2 7.8 2.9-2.9"/><path d="M18 12h4"/><path d="m16.2 16.2 2.9 2.9"/><path d="M12 18v4"/><path d="m4.9 19.1 2.9-2.9"/><path d="M2 12h4"/><path d="m4.9 4.9 2.9 2.9"/>'
+};
+var BRAND_MARK =
+  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<circle cx="12" cy="12" r="9"/><path d="M15.5 8.6A5 5 0 1 0 15.5 15.4"/></svg>';
+
+function icon(name, px) {
+  px = px || 16;
+  return '<svg width="' + px + '" height="' + px + '" viewBox="0 0 24 24" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" ' +
+    'aria-hidden="true">' + (ICONS[name] || ICONS["alert"]) + '</svg>';
+}
+
+// ── DOM helpers. `text()` is the ONLY way user/server strings reach the DOM, so
+//    no server-controlled value is ever parsed as HTML. ────────────────────────
+function el(tag, cls, text) {
+  var n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+function short(s, n) {
+  s = String(s || "");
+  n = n || 16;
+  return s.length > n ? s.slice(0, n) + "\u2026" : s;
+}
+
+var toastTimer = null;
+function toast(msg, kind) {
+  var t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = "show " + (kind || "");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { t.className = ""; }, kind === "bad" ? 8000 : 4200);
+}
+
+// ── Host IPC (Cerulion Studio). Absent in a plain browser — every call guards. ──
+function hostAvailable() {
+  try {
+    return !!(window.ipc && window.ipc.postMessage);
+  } catch (e) { /* a host with a broken bridge is treated as no host */ }
+  return false;
+}
+
+function postHost(obj) {
+  try {
+    if (window.ipc && window.ipc.postMessage) {
+      window.ipc.postMessage(JSON.stringify(obj));
+      return true;
+    }
+  } catch (e) { /* a host with a broken bridge is treated as no host */ }
+  return false;
+}
+
+/**
+ * The PERSISTENT page-level alert (`#alert`). A toast self-clears after seconds;
+ * some conditions must stay on screen until they are actually resolved.
+ *
+ * A `sticky` alert is never displaced by a transient one and is cleared only by
+ * `clearAlert(true)` — i.e. by the condition itself going away.
+ */
+var ALERT_STICKY = false;
+function showAlert(text, sticky) {
+  if (ALERT_STICKY && !sticky) return;
+  var a = document.getElementById("alert");
+  a.textContent = String(text); // untrusted (a host/service error string) — TEXT only
+  a.hidden = false;
+  ALERT_STICKY = !!sticky;
+}
+function clearAlert(force) {
+  if (ALERT_STICKY && !force) return;
+  var a = document.getElementById("alert");
+  a.textContent = "";
+  a.hidden = true;
+  ALERT_STICKY = false;
+}
+
+/**
+ * Dismiss the panel. Wired to BOTH the header close button and Escape, so the
+ * two agree in every state — including the ones the user can get STUCK in
+ * (pre-handshake, "no session handed over", "open from Studio"). A plain
+ * browser has no host, so this is a no-op there and the affordance is hidden.
+ *
+ * Two guards, both about LEAVING (never about the revoke itself: the destructive
+ * action carries no prompt by design, and none is added here):
+ *
+ *  1. `closeIsAvailable()` — Escape honours the SAME predicate as the close
+ *     button, so the key can never act where the affordance is hidden. It is
+ *     host presence and nothing else, so with no host this is a no-op twice
+ *     over (`postHost` would fail anyway) — the predicate is about the two
+ *     surfaces agreeing, not about a state it alone can refuse.
+ *  2. The one guard that can actually REFUSE a dismissal: an in-flight revoke
+ *     is never silently abandoned. Closing does not cancel the request (it
+ *     completes server-side either way) — it throws away the OUTCOME, which is
+ *     the one thing the user came here for. So the first close attempt while a
+ *     destructive call is in flight explains that and stays; a second one leaves
+ *     anyway, so a hung request can never wedge the panel.
+ *
+ * The refusal is announced on BOTH surfaces on purpose. `showAlert` is the
+ * persistent bar the "explains that and STAYS" contract wants, but it yields to
+ * an already-raised STICKY alert (`if (ALERT_STICKY && !sticky) return;`) — and
+ * the sticky alert is exactly the persist-failure bar a mid-revoke refresh can
+ * raise, so on the one compound path that matters the bar would render NOTHING
+ * while the attempt still armed `CLOSE_ARMED`: a silent no-op on a user action.
+ * Raising it sticky instead is worse — it would overwrite the persist failure
+ * with a transient note that `settle()`'s non-forcing `clearAlert()` can no
+ * longer take down. So the toast rides alongside as the surface a sticky alert
+ * can never swallow, the same pairing `__cerulion_session_saved` already uses.
+ */
+var PENDING_DESTRUCTIVE = 0; // in-flight mutating API calls (the revokes)
+var CLOSE_ARMED = false;     // a close was already refused for an in-flight revoke
+function requestClose() {
+  if (!closeIsAvailable()) return;
+  if (PENDING_DESTRUCTIVE > 0 && !CLOSE_ARMED) {
+    CLOSE_ARMED = true;
+    var why = "A revoke is still in flight — it will finish either way. Close again to " +
+      "leave without seeing the outcome.";
+    showAlert(why); // the persistent bar, whenever a sticky alert is not holding it
+    toast(why, "bad"); // …and a surface a sticky alert can NEVER swallow
+    return;
+  }
+  postHost({ cmd: "team_close" });
+}
+
+/**
+ * Whether this page can be dismissed: only with a host bridge to ask. Kept as a
+ * NAMED predicate because it is applied in two places that must never disagree
+ * — `requestClose()` (the shared dismissal path Escape and the host's Escape
+ * both route through) and `syncCloseAffordance()` (the button's visibility).
+ * Deliberately NOT gated on a completed handshake — the states a user most needs
+ * to leave are the ones reached BEFORE it.
+ */
+function closeIsAvailable() {
+  return hostAvailable();
+}
+
+function syncCloseAffordance() {
+  document.getElementById("close").hidden = !closeIsAvailable();
+}
+
+// ── Session state ───────────────────────────────────────────────────────────
+var SESSION = null;      // { session_token, refresh_token, account_id }
+var BOOTED = false;      // the host handshake completed at least once
+var REFRESHING = null;   // in-flight refresh promise (coalesces concurrent 401s)
+
+/**
+ * The host handshake entry point. Cerulion Studio calls this after the page
+ * posts `team_ready`, handing over the desk's CURRENT tokens (resolved at open
+ * time, never baked into a URL). Calling it again re-boots with fresh tokens.
+ */
+window.__cerulion_session = function (s) {
+  if (!s || typeof s.session_token !== "string" || !s.session_token) {
+    SESSION = s || null;
+    syncCloseAffordance();
+    renderState({
+      tone: "bad", icon: "shield-off", title: "No session was handed over",
+      body: "The host connected but did not supply a session token. Sign in with " +
+        "<code>cerulion login</code>, then reopen this page."
+    });
+    return;
+  }
+  SESSION = s;
+  BOOTED = true;
+  syncCloseAffordance();
+  boot();
+};
+
+/**
+ * The host's ack for a `team_session_update`. A failed persist is LOUD **and
+ * PERSISTENT**: it goes into the sticky `#alert` bar, not (only) a toast.
+ *
+ * This is the ONLY surface for that failure, deliberately. The host must NOT
+ * swap the panel to its local chrome here: accountd's refresh is single-use, so
+ * once it succeeds the old pair is dead and the rotated pair exists ONLY in this
+ * page's memory (the host keeps its own copy at the OLD pair precisely because
+ * the write failed). Replacing this document would destroy the desk's only live
+ * credential — and take the user's in-flight action with it.
+ */
+window.__cerulion_session_saved = function (r) {
+  if (r && r.ok) { clearAlert(true); return; }
+  var why = (r && r.error) ? String(r.error) : "unknown error";
+  var msg = "Your refreshed sign-in could not be saved to this desk (" + why +
+    "). This page keeps working, but run `cerulion login` to repair the sign-in on disk.";
+  showAlert(msg, true);
+  toast(msg, "bad");
+};
+
+// ── HTTP ────────────────────────────────────────────────────────────────────
+function describeHttpError(status, body) {
+  var detail = "";
+  if (body && typeof body === "object") {
+    detail = body.error_description || body.error || "";
+  }
+  if (!detail) detail = "HTTP " + status;
+  return detail;
+}
+
+function rawApi(path, opts) {
+  opts = opts || {};
+  var init = {
+    method: opts.method || "GET",
+    headers: { "Authorization": "Bearer " + SESSION.session_token, "Accept": "application/json" },
+    cache: "no-store",
+    credentials: "omit"
+  };
+  if (opts.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.body);
+  }
+  return fetch(path, init).then(function (resp) {
+    if (resp.status === 204) return { ok: true, status: 204, body: null };
+    return resp.json().catch(function () { return null; }).then(function (body) {
+      return { ok: resp.ok, status: resp.status, body: body };
+    });
+  });
+}
+
+/**
+ * Exchange the refresh token for a fresh pair and hand the ROTATED pair back to
+ * the host to persist. accountd's refresh is SINGLE-USE (it rotates both tokens
+ * under a compare-and-swap), so the desk's stored pair MUST be replaced or the
+ * next `cerulion` cloud call would present a spent token — hence the write-back,
+ * and hence the loud `__cerulion_session_saved` failure path.
+ */
+function refreshSession() {
+  if (REFRESHING) return REFRESHING;
+  if (!SESSION || !SESSION.refresh_token) {
+    return Promise.reject(new Error("no refresh token was handed over"));
+  }
+  REFRESHING = fetch("/v1/auth/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    cache: "no-store",
+    credentials: "omit",
+    body: JSON.stringify({ refresh_token: SESSION.refresh_token })
+  }).then(function (resp) {
+    return resp.json().catch(function () { return null; }).then(function (body) {
+      if (!resp.ok) throw new Error(describeHttpError(resp.status, body));
+      SESSION.session_token = body.session_token;
+      SESSION.refresh_token = body.refresh_token;
+      // Persist through the host so the CLI and Studio keep ONE live pair.
+      postHost({
+        cmd: "team_session_update",
+        session_token: body.session_token,
+        refresh_token: body.refresh_token,
+        expires_in: body.expires_in
+      });
+      return true;
+    });
+  }).then(function (v) { REFRESHING = null; return v; },
+           function (e) { REFRESHING = null; throw e; });
+  return REFRESHING;
+}
+
+/**
+ * A session-authed JSON call that transparently refreshes ONCE on a 401. Any
+ * other non-2xx rejects with the service's own `error_description` so the reason
+ * always reaches the user (never a silent empty view).
+ *
+ * Mutating calls (every POST on this page is a revoke) are COUNTED while in
+ * flight, so `requestClose` can refuse to throw away an outcome the user is
+ * waiting on. The counting lives here rather than in the revoke functions on
+ * purpose: those must stay a straight line from entry to request (no statement
+ * may sit between them — see `the_revoke_path_reaches_the_request_with_no_user_gate`).
+ */
+function api(path, opts) {
+  var destructive = !!(opts && opts.method === "POST");
+  if (destructive) PENDING_DESTRUCTIVE++;
+  function settle() {
+    if (!destructive) return;
+    PENDING_DESTRUCTIVE--;
+    if (PENDING_DESTRUCTIVE <= 0) {
+      PENDING_DESTRUCTIVE = 0;
+      CLOSE_ARMED = false;
+      clearAlert(); // drop the "revoke in flight" note (a sticky alert survives)
+    }
+  }
+  return rawApi(path, opts).then(function (r) {
+    if (r.status !== 401) return r;
+    return refreshSession().then(function () { return rawApi(path, opts); });
+  }).then(function (r) {
+    settle();
+    if (!r.ok) throw new Error(describeHttpError(r.status, r.body));
+    return r.body;
+  }, function (e) { settle(); throw e; });
+}
+
+// ── Full-page states ────────────────────────────────────────────────────────
+/**
+ * Render one full-page state. `spec` is:
+ *
+ *   { tone, icon, title, body, detail, action, onAction }
+ *
+ * `body` is static AUTHOR-written copy (inserted as HTML so it can carry
+ * `<code>`/`<strong>`); `detail` is the untrusted CAUSE — a service error string
+ * — and is rendered as TEXT into a PERSISTENT block, never parsed as HTML and
+ * never left to a toast. A toast self-clears after seconds; a user who looks
+ * away, or who reads the state at all carefully, would otherwise be told "the
+ * reason is shown below" with nothing below it.
+ */
+function renderState(spec) {
+  var content = document.getElementById("content");
+  clear(content);
+  var s = el("div", "state");
+  var ic = el("div", "state-icon" + (spec.tone === "bad" ? " bad" : ""));
+  ic.innerHTML = icon(spec.icon, 32);
+  s.appendChild(ic);
+  s.appendChild(el("div", "state-title", spec.title));
+  var sub = el("div", "state-sub");
+  // Static author-written copy only — never a server or user string.
+  sub.innerHTML = spec.body;
+  s.appendChild(sub);
+  if (spec.detail) {
+    s.appendChild(el("div", "detail", String(spec.detail)));
+  }
+  if (spec.action) {
+    var b = el("button", "btn primary", spec.action);
+    b.addEventListener("click", spec.onAction);
+    s.appendChild(b);
+  }
+  content.appendChild(s);
+}
+
+function renderLoading() {
+  var content = document.getElementById("content");
+  clear(content);
+  var s = el("div", "state");
+  var ic = el("div", "state-icon");
+  ic.innerHTML = '<span class="spin" style="display:flex">' + icon("loader", 28) + "</span>";
+  s.appendChild(ic);
+  s.appendChild(el("div", "state-title", "Loading your team \u2026"));
+  content.appendChild(s);
+}
+
+// ── The main view ───────────────────────────────────────────────────────────
+var STATE = { me: null, devices: [], robots: [], access: {} };
+
+function boot() {
+  renderLoading();
+  syncCloseAffordance();
+
+  Promise.all([
+    api("/v1/me"),
+    api("/v1/devices"),
+    api("/v1/robots")
+  ]).then(function (r) {
+    STATE.me = r[0];
+    STATE.devices = (r[1] && r[1].devices) || [];
+    STATE.robots = (r[2] && r[2].robots) || [];
+    // Per-robot access state. A single robot's failure must not blank the page,
+    // so each settles into either an access object or an `error` marker.
+    return Promise.all(STATE.robots.map(function (rb) {
+      return api("/v1/robots/" + encodeURIComponent(rb.robot_id) + "/access")
+        .then(function (a) { STATE.access[rb.robot_id] = a; },
+              function (e) { STATE.access[rb.robot_id] = { error: e.message }; });
+    }));
+  }).then(function () {
+    render();
+  }).catch(function (e) {
+    // The cause rides the PERSISTENT detail block, not (only) the toast \u2014 the
+    // toast self-clears after 8s and this state can sit on screen indefinitely.
+    renderState({
+      tone: "bad", icon: "alert", title: "Could not load your team",
+      body: "The account service refused or could not answer this request. " +
+        "The reason is below \u2014 if it mentions a session, sign in again with " +
+        "<code>cerulion login</code>.",
+      detail: e && e.message ? e.message : String(e),
+      action: "Retry", onAction: function () { boot(); }
+    });
+  });
+}
+
+function render() {
+  var who = document.getElementById("who");
+  if (STATE.me) {
+    who.hidden = false;
+    who.textContent = "account " + short(STATE.me.account_id, 12);
+    who.title = "account " + STATE.me.account_id + " \u00b7 user " + STATE.me.user_id;
+  }
+  var content = document.getElementById("content");
+  clear(content);
+  content.appendChild(renderRobotsSection());
+  content.appendChild(renderDevicesSection());
+}
+
+function sectionHead(title, count, note) {
+  var h = el("div", "section-head");
+  h.appendChild(el("span", "section-title", title));
+  h.appendChild(el("span", "section-count", count));
+  if (note) h.appendChild(el("span", "section-note", note));
+  return h;
+}
+
+// ── Robots ──────────────────────────────────────────────────────────────────
+function renderRobotsSection() {
+  var sec = el("section", "section");
+  sec.appendChild(sectionHead("Robots you own", STATE.robots.length,
+    "owner-only \u00b7 revocations apply on the robot's next sync"));
+  if (!STATE.robots.length) {
+    var e = el("div", "empty");
+    e.appendChild(el("div", "empty-title", "No robots registered to this account"));
+    e.appendChild(el("div", "empty-sub",
+      "A robot binds to your account when you run the Cerulion installer on it and sign in."));
+    sec.appendChild(e);
+    return sec;
+  }
+  STATE.robots.forEach(function (rb) { sec.appendChild(renderRobotCard(rb)); });
+  return sec;
+}
+
+function renderRobotCard(rb) {
+  var access = STATE.access[rb.robot_id] || {};
+  var card = el("div", "card");
+  card.dataset.robot = rb.robot_id;
+
+  var head = el("div", "card-head");
+  var ic = el("span", "card-icon");
+  ic.innerHTML = icon("cpu", 18);
+  head.appendChild(ic);
+  var main = el("div", "card-main");
+  main.appendChild(el("div", "card-title", rb.hostname));
+  var sub = rb.robot_id;
+  if (rb.org_id) sub += "  \u00b7  org " + rb.org_id;
+  main.appendChild(el("div", "card-sub", sub));
+  head.appendChild(main);
+
+  var meta = el("div", "row-meta");
+  if (access.error) {
+    var bad = el("span", "badge bad");
+    bad.appendChild(el("span", "dot"));
+    bad.appendChild(el("span", null, "access unavailable"));
+    bad.title = access.error;
+    meta.appendChild(bad);
+  } else {
+    var nAcc = (access.revoked_accounts || []).length;
+    var nDev = (access.revoked_devices || []).length;
+    var total = nAcc + nDev;
+    var b = el("span", "badge" + (total ? " warn" : " ok"));
+    b.appendChild(el("span", "dot"));
+    b.appendChild(el("span", null, total
+      ? total + (total === 1 ? " revocation" : " revocations")
+      : "no revocations"));
+    meta.appendChild(b);
+    meta.appendChild(el("span", "badge", "epoch " + (access.epoch || 0)));
+  }
+  head.appendChild(meta);
+  card.appendChild(head);
+
+  if (access.error) {
+    var body = el("div", "card-body divided");
+    body.appendChild(banner("bad", "alert",
+      "This robot's access list could not be read: " + access.error));
+    card.appendChild(body);
+    return card;
+  }
+
+  var body = el("div", "card-body divided");
+
+  // Revoked sets (what the epoch actually carries).
+  var accs = access.revoked_accounts || [];
+  var devs = access.revoked_devices || [];
+  if (accs.length) body.appendChild(keyBlock("Revoked accounts", accs, "shield-off"));
+  if (devs.length) body.appendChild(keyBlock("Revoked devices", devs, "shield-off"));
+  if (!accs.length && !devs.length) {
+    var ok = el("div", "row-sub", "Every account and device that holds a grant for this robot is " +
+      "currently allowed. Revoke one below to cut it off.");
+    ok.style.marginTop = "var(--sp-2)";
+    body.appendChild(ok);
+  }
+
+  // Quick-revoke each of YOUR devices from THIS robot.
+  var mine = STATE.devices.filter(function (d) {
+    return !d.revoked && devs.indexOf(d.public_key) === -1;
+  });
+  if (mine.length) {
+    body.appendChild(el("div", "sub-head", "Cut one of your desks off this robot"));
+    var list = el("div", "keylist");
+    mine.forEach(function (d) {
+      var line = el("div", "keyline");
+      var k = el("span", "k", d.device_id + "  \u00b7  " + short(d.public_key, 20));
+      line.appendChild(k);
+      var b = el("button", "btn danger", "Revoke");
+      b.title = "Revoke this device key from " + rb.hostname;
+      b.addEventListener("click", function () {
+        doRobotRevoke(rb, { device_key: d.public_key },
+          "Revoked " + d.device_id + " from " + rb.hostname, b);
+      });
+      line.appendChild(b);
+      list.appendChild(line);
+    });
+    body.appendChild(list);
+  }
+
+  // Free-form revoke (a guest account, or a device key you do not own).
+  body.appendChild(el("div", "sub-head", "Revoke by id"));
+  var form = el("div", "form");
+  var sel = el("select");
+  var o1 = el("option", null, "Account"); o1.value = "account_id";
+  var o2 = el("option", null, "Device key"); o2.value = "device_key";
+  sel.appendChild(o1); sel.appendChild(o2);
+  var input = el("input");
+  input.type = "text";
+  input.placeholder = "base64url id \u2014 e.g. a guest's account id";
+  input.spellcheck = false;
+  input.autocomplete = "off";
+  var go = el("button", "btn danger", "Revoke access");
+  function submit() {
+    var v = input.value.trim();
+    if (!v) { toast("Enter the account id or device key to revoke.", "bad"); input.focus(); return; }
+    var target = {};
+    target[sel.value] = v;
+    doRobotRevoke(rb, target,
+      "Revoked " + (sel.value === "account_id" ? "account " : "device ") + short(v, 12) +
+      " from " + rb.hostname, go, function () { input.value = ""; });
+  }
+  go.addEventListener("click", submit);
+  input.addEventListener("keydown", function (e) { if (e.key === "Enter") submit(); });
+  form.appendChild(sel); form.appendChild(input); form.appendChild(go);
+  body.appendChild(form);
+
+  card.appendChild(body);
+  return card;
+}
+
+function keyBlock(title, keys, iconName) {
+  var wrap = document.createDocumentFragment();
+  wrap.appendChild(el("div", "sub-head", title + " (" + keys.length + ")"));
+  var list = el("div", "keylist");
+  keys.forEach(function (k) {
+    var line = el("div", "keyline");
+    var ic = el("span", null);
+    ic.innerHTML = icon(iconName, 14);
+    ic.style.display = "flex";
+    ic.style.color = "var(--cer-error)";
+    line.appendChild(ic);
+    var kk = el("span", "k", k);
+    kk.title = k;
+    line.appendChild(kk);
+    list.appendChild(line);
+  });
+  wrap.appendChild(list);
+  return wrap;
+}
+
+function banner(kind, iconName, text) {
+  var b = el("div", "banner" + (kind === "warn" ? " warn" : ""));
+  var ic = el("span", "banner-icon");
+  ic.innerHTML = icon(iconName, 16);
+  b.appendChild(ic);
+  b.appendChild(el("span", "banner-text", text));
+  return b;
+}
+
+/**
+ * Owner-driven revoke against ONE robot. No confirmation prompt (by design:
+ * account-keyed recovery exists, so a modal would only add friction to the
+ * exact action a user came here to perform. The button disables in flight and the
+ * outcome is always announced.
+ */
+function doRobotRevoke(rb, target, okMsg, btn, onOk) {
+  btn.disabled = true;
+  api("/v1/robots/" + encodeURIComponent(rb.robot_id) + "/revoke", { method: "POST", body: target })
+    .then(function (access) {
+      STATE.access[rb.robot_id] = access;
+      if (onOk) onOk();
+      toast(okMsg + " \u00b7 now at epoch " + access.epoch, "ok");
+      replaceRobotCard(rb);
+    })
+    .catch(function (e) {
+      btn.disabled = false;
+      toast("Revoke refused: " + e.message, "bad");
+    });
+}
+
+function replaceRobotCard(rb) {
+  var old = document.querySelector('.card[data-robot="' + cssEscape(rb.robot_id) + '"]');
+  if (!old || !old.parentNode) { render(); return; }
+  old.parentNode.replaceChild(renderRobotCard(rb), old);
+}
+
+// Minimal attribute-selector escape (robot ids are base64url, but never assume).
+function cssEscape(s) { return String(s).replace(/["\\]/g, "\\$&"); }
+
+// ── Devices ─────────────────────────────────────────────────────────────────
+function renderDevicesSection() {
+  var sec = el("section", "section");
+  var active = STATE.devices.filter(function (d) { return !d.revoked; }).length;
+  sec.appendChild(sectionHead("Your devices", STATE.devices.length,
+    active + " active \u00b7 revoking cuts the desk from every robot you own"));
+
+  if (!STATE.devices.length) {
+    var e = el("div", "empty");
+    e.appendChild(el("div", "empty-title", "No devices registered to this account"));
+    e.appendChild(el("div", "empty-sub",
+      "A desk registers its device key the first time it signs in and pairs with a robot."));
+    sec.appendChild(e);
+    return sec;
+  }
+
+  var card = el("div", "card");
+  STATE.devices.forEach(function (d, i) {
+    var row = el("div", "row");
+    if (i === 0) row.style.borderTop = "none";
+    var ic = el("span", "card-icon");
+    ic.innerHTML = icon(d.principal_kind === "machine" ? "plug" : "laptop", 16);
+    row.appendChild(ic);
+    var main = el("div", "row-main");
+    main.appendChild(el("div", "row-title", d.device_id));
+    main.appendChild(el("div", "row-sub",
+      (d.principal_kind || "human") + "  \u00b7  key " + short(d.public_key, 22)));
+    row.appendChild(main);
+
+    var meta = el("div", "row-meta");
+    var b = el("span", "badge " + (d.revoked ? "bad" : "ok"));
+    b.appendChild(el("span", "dot"));
+    b.appendChild(el("span", null, d.revoked ? "revoked" : "active"));
+    meta.appendChild(b);
+    if (!d.revoked) {
+      var btn = el("button", "btn danger", "Revoke");
+      btn.title = "Revoke this desk: it can never obtain a new device cert, and every robot you " +
+        "own refuses it once it syncs.";
+      btn.addEventListener("click", function () { doDeviceRevoke(d, btn); });
+      meta.appendChild(btn);
+    }
+    row.appendChild(meta);
+    card.appendChild(row);
+  });
+  sec.appendChild(card);
+  return sec;
+}
+
+/**
+ * Self-revoke one of this account's devices. NO confirmation prompt — not even
+ * for the LAST remaining device (account-keyed recovery
+ * means a wrongly-revoked desk is re-provisioned by signing in again, so the
+ * prompt buys nothing and costs friction on the intended action).
+ */
+function doDeviceRevoke(d, btn) {
+  btn.disabled = true;
+  api("/v1/devices/" + encodeURIComponent(d.device_id) + "/revoke", { method: "POST" })
+    .then(function (r) {
+      d.revoked = !!r.revoked;
+      var msg = "Revoked " + d.device_id + " \u00b7 " + r.robots_updated +
+        (r.robots_updated === 1 ? " owned robot updated" : " owned robots updated");
+      if (r.robots_failed && r.robots_failed.length) {
+        toast(msg + " \u2014 but " + r.robots_failed.length +
+          " robot(s) could not be updated. The device IS revoked; run the revoke again to " +
+          "reach them.", "bad");
+      } else {
+        toast(msg, "ok");
+      }
+      // The device left every owned robot's allow-set, so re-read the epochs.
+      return Promise.all(STATE.robots.map(function (rb) {
+        return api("/v1/robots/" + encodeURIComponent(rb.robot_id) + "/access")
+          .then(function (a) { STATE.access[rb.robot_id] = a; },
+                function (e) { STATE.access[rb.robot_id] = { error: e.message }; });
+      })).then(function () { render(); });
+    })
+    .catch(function (e) {
+      btn.disabled = false;
+      toast("Revoke refused: " + e.message, "bad");
+    });
+}
+
+// ── Startup ─────────────────────────────────────────────────────────────────
+document.getElementById("brandMark").innerHTML = BRAND_MARK;
+document.getElementById("close").innerHTML = icon("x", 16);
+document.getElementById("close").addEventListener("click", requestClose);
+
+/** Whether `node` is a control the user types or picks a value in. */
+function isTextEntry(node) {
+  if (!node) return false;
+  if (node.isContentEditable) return true;
+  var tag = node.tagName ? String(node.tagName).toLowerCase() : "";
+  return tag === "input" || tag === "textarea" || tag === "select";
+}
+
+// Escape dismisses the panel. This is the ONLY Escape handler that can fire once
+// this document holds keyboard focus: the Studio shell's own handler runs on egui
+// raw input, which never sees a key press while the webview is focused. Without
+// this binding Escape was dead on the hosted page (the local fallback chrome has
+// always bound it, which is why the two behaved differently).
+//
+// It is scoped away from TEXT ENTRY: while the caret is in the "Revoke by id"
+// field, Escape is the universal "get me out of this field" key, and a document
+// handler that closed the whole panel instead would fire exactly when a user is
+// mid-thought about a destructive action. So Escape there BLURS the field; a
+// second Escape — now outside it — closes. Dismissal itself always goes through
+// `requestClose`, so the button and the key can never disagree.
+document.addEventListener("keydown", function (e) {
+  if (e.key !== "Escape") return;
+  if (isTextEntry(e.target)) { e.target.blur(); return; }
+  requestClose();
+});
+
+/**
+ * The HOST's dismissal entry point — the third and last way this panel can be
+ * asked to close, and the reason all three agree.
+ *
+ * A host that renders this page inside its own window (Cerulion Studio) has a
+ * second keyboard surface: while the STAGE holds focus, no key event reaches
+ * this document at all, so the host binds Escape itself. Before this existed the
+ * host closed the panel DIRECTLY, which consulted neither guard — it discarded
+ * an in-flight revoke's outcome with no warning. Routing the host's key through
+ * the SAME `requestClose` is what makes the button, this document's Escape, and
+ * the host's Escape one behaviour rather than three.
+ *
+ * A host that gets no answer here (this document never loaded, or its script
+ * died before this line) must still have an escape hatch, so the host's own
+ * contract is: ask once, and force the close on a SECOND press.
+ */
+window.__cerulion_request_close = function () { requestClose(); };
+
+// Show the close affordance from the FIRST paint when a host is present, so the
+// pre-handshake and stuck states are dismissible too.
+syncCloseAffordance();
+
+/**
+ * Announce readiness to the host, which answers with `__cerulion_session`. If
+ * there is no host at all (a plain browser), or the host never answers, fall
+ * back to the loud "open from Studio" state rather than an empty page.
+ */
+(function start() {
+  renderLoading();
+  var hosted = postHost({ cmd: "team_ready" });
+  var WAIT_MS = hosted ? 6000 : 400;
+  setTimeout(function () {
+    if (BOOTED) return;
+    renderState({
+      tone: "bad", icon: "users", title: "Open this from Cerulion Studio",
+      body: "Team &amp; access is an <strong>embedded</strong> surface: it reads your team from the " +
+        "account service using the sign-in cached on your desk, and never asks you to paste a " +
+        "token into a browser." +
+        (hosted
+          ? " Studio did not hand over a session \u2014 sign in with <code>cerulion login</code> and reopen it."
+          : " In Cerulion Studio, open <strong>Team &amp; access</strong> from the sidebar header."),
+      action: hosted ? "Retry" : null,
+      onAction: hosted ? function () { renderLoading(); postHost({ cmd: "team_retry" }); } : null
+    });
+  }, WAIT_MS);
+})();
+</script>
+</body>
+</html>

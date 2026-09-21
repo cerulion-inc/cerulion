@@ -1,2 +1,75 @@
-.vscode
+# Build artifacts
+target/
+**/target/
+
+# The per-dependency license inventory `cargo about` renders from the locked
+# dependency graph into every release archive and Debian package. A build
+# output, not source: `tools/release/about.toml` and `tools/release/about.hbs` are what is
+# tracked, and the release workflow regenerates the file on each runner. A
+# committed copy could silently disagree with the graph it claims to describe.
+/THIRD-PARTY-LICENSES.md
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+
+# Local assistant-tool state (local settings + per-agent worktrees + scheduled tasks lock)
+.claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Rust
+**/*.rs.bk
+Cargo.lock
+!/Cargo.lock
+# examples/go2 is an ISOLATED workspace that resolves its own lockfile - an
+# unpinned fresh resolve pulls zenoh 1.9.0, which unavoidably ships
+# RUSTSEC-2026-0041 (its own lz4_flex ^0.10 rollback). Track the pinned
+# lockfile so builds are deny-clean by construction; after any dep change
+# re-pin with `cargo update -p zenoh --precise 1.8.0` (see the lz4_flex note
+# under `[advisories]` in tools/release/deny.toml).
+!/examples/go2/Cargo.lock
+# examples/* are likewise ISOLATED workspaces (root Cargo.toml `exclude`)
+# that resolve their own lockfiles - a fresh resolve pulls zenoh 1.9.0
+# (RUSTSEC-2026-0041 lz4_flex rollback). Commit pinned lockfiles (zenoh
+# =1.8.0, the same pin as examples/go2) so first-touch example builds are
+# advisory-clean by construction; after any dep change re-pin via
+# `cargo update -p zenoh --precise 1.8.0` inside each example.
+!/examples/basic_timer/Cargo.lock
+!/examples/camera_pipeline/Cargo.lock
+!/examples/obstacle_avoidance/Cargo.lock
+!/examples/perception/Cargo.lock
+!/examples/realsense/Cargo.lock
+!/examples/v4l2_camera/Cargo.lock
+
+# Python
+__pycache__/
+*.pyc
+
+# Quality loop progress tracking
+.ralph-progress.json
+
+# (The benches/cerulion_round_trip{,_quiescent} ignore blocks were removed
+# with those trees when the latency suite replaced them; benches/latency
+# carries its own results hygiene via its results/ layout.)
+
+# Agent docs: personal assistant instructions + maintainer notes stay untracked.
+# `AGENTS.md` (root + scoped) is the tracked guidance; `CLAUDE.md` files are
+# one-line shims that import it. `.agents-tokens.local` is the name-class token
+# list `tools/scripts/check_agents_md.sh` scrubs with - the list is itself internal
+# vocabulary, so it never ships in the script or the repo.
+CLAUDE.local.md
+notes/
+.agents-tokens.local
+# The leak guard's private pattern list (`tools/scripts/leak_scan.py`), when a
+# contributor keeps it inside the checkout and points LEAK_PATTERNS_FILE at it.
+# The list names what the guard scrubs, so it never ships.
+.leak-patterns.local

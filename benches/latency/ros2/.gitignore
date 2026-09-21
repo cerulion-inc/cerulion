@@ -1,0 +1,7 @@
+# Host-side colcon artifacts, if anyone ever builds the bench ws on
+# the host for debugging (the docker image always colcon-builds its
+# own copy under /bench/ros2_ws).
+ros2_ws/
+
+# Per-run RMW logs (CycloneDDS auto-creates these when CYCLONEDDS_LOG=info).
+*.log

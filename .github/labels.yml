@@ -1,0 +1,117 @@
+# GitHub label taxonomy for cerulion.
+# Source of truth, synced to the repo by the github-labeler action (see .github/CONTRIBUTING.md).
+# The sync PRUNES anything not listed here (skip-delete: false), so every label
+# that an issue form, workflow, or doc references MUST have an entry in this file.
+# Colors are grouped by category so the issue list reads at a glance.
+# Declarative config consumed by crazy-max/ghaction-github-labeler — no custom
+# sync script; the action does idempotent create/update/prune itself.
+
+# --- Priority (red -> green gradient) ---
+- name: P0-Critical
+  color: b60205
+  description: Drop everything — production-breaking or release blocker
+- name: P1-High
+  color: d93f0b
+  description: High priority — schedule next
+- name: P2-Medium
+  color: fbca04
+  description: Medium priority — normal queue
+- name: P3-Low
+  color: 0e8a16
+  description: Low priority — nice to have
+
+# --- Contributor onboarding (GitHub-standard colors) ---
+- name: good first issue
+  color: 7057ff
+  description: Good entry point for new contributors
+- name: help wanted
+  color: "008672"
+  description: Maintainers would welcome a contribution here
+- name: agent-friendly
+  color: a371f7
+  description: Well-scoped for an AI coding agent to implement
+
+# --- Workflow / process (yellow-brown) ---
+- name: triage
+  color: d4a017
+  description: Awaiting triage — auto-applied by the bug and performance issue templates
+- name: needs-info
+  color: d4a017
+  description: Waiting on the reporter for requested details — auto-closed in 14 days if no reply
+- name: needs-design
+  color: d4a017
+  description: Requires design discussion before implementation
+- name: breaking-change
+  color: e99695
+  description: Changes a public API or wire format — needs migration notes
+
+# --- Automation & housekeeping ---
+- name: stale
+  color: ededed
+  description: Set by the needs-info closer 7 days after an unanswered info request — cleared on reply
+- name: pinned
+  color: "344563"
+  description: Never auto-closed — exempt from the needs-info closer
+- name: security
+  color: ee0701
+  description: Security-relevant, never auto-closed; see .github/SECURITY.md for private disclosure
+- name: duplicate
+  color: cfd3d7
+  description: Already tracked in another issue or pull request
+- name: wontfix
+  color: ffffff
+  description: Acknowledged but deliberately not planned
+- name: question
+  color: d876e3
+  description: General question — usually better suited to GitHub Discussions
+
+# --- Domain (blue) ---
+- name: zero-copy-critical
+  color: 1d76db
+  description: Touches the hot path — must preserve zero-copy guarantees
+- name: performance
+  color: 0052cc
+  description: Latency, throughput, or allocation impact
+
+# --- Area (one per feature form's Area dropdown option; one family color) ---
+- name: area/transport
+  color: bfd4f2
+  description: Transport (iceoryx2 / shared memory)
+- name: area/network
+  color: bfd4f2
+  description: Network (zenoh / cross-machine)
+- name: area/scheduler
+  color: bfd4f2
+  description: Scheduler (determinism / trigger policies)
+- name: area/cli
+  color: bfd4f2
+  description: CLI (cerulion commands)
+- name: area/tui
+  color: bfd4f2
+  description: TUI (interactive dashboard)
+- name: area/codegen
+  color: bfd4f2
+  description: Codegen (schemas / message types)
+- name: area/graph
+  color: bfd4f2
+  description: Graph (YAML / runtime)
+- name: area/macros
+  color: bfd4f2
+  description: "Macros (#[cerulion_node])"
+- name: area/docs
+  color: bfd4f2
+  description: Documentation area — the feature form's "Documentation" option
+- name: area/other
+  color: bfd4f2
+  description: Anything without a dedicated area label
+
+# --- Type (GitHub-standard colors) ---
+- name: docs
+  color: 0075ca
+  description: Documentation only
+- name: bug
+  color: d73a4a
+  description: Something is not working
+- name: enhancement
+  color: a2eeef
+  description: New feature or improvement

@@ -1,0 +1,5 @@
+error: #[cerulion_node] requires at least one #[input] or #[output] field attribute. Use `#[cerulion_node]` + `#[cerulion_node_impl]` with `#[input]` / `#[output]` field attrs.
+ --> tests/ui/no_input_or_output_attrs_rejected.rs:6:8
+  |
+6 | struct NoPortsNode {
+  |        ^^^^^^^^^^^

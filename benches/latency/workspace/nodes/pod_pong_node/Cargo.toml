@@ -1,0 +1,20 @@
+[package]
+name = "pod_pong_node"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+# The generated fixed-POD message type (type-class axis). A real
+# crate dependency, not an include!'d build script: the CLI's node-metadata
+# import map keeps a genuine crate path as the schema package, so this node
+# reports `cer_bench_msgs/PodPayload` — the name the graph declares, the
+# `.msg` store registers, and the wire SCHEMA_HASH carries.
+cer_bench_msgs = { workspace = true }

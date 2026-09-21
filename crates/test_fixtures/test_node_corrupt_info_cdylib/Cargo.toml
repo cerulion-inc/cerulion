@@ -1,0 +1,22 @@
+[package]
+name = "test_node_corrupt_info_cdylib"
+version = "0.1.0"
+edition = "2021"
+description = "Test cdylib whose cerulion_node_info() returns corrupted JSON"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Mirrors `test_node_cdylib`: `cerulion_node_init` reclaims the host's
+# `Box::into_raw(NodeContext)` via `Box::from_raw` so each init call
+# doesn't leak one NodeContext (the allocator-pairing contract). In
+# practice the tests never reach init — `GraphRuntime::build`
+# refuses to load this fixture at info-parse time — but the FFI surface
+# stays correct in case a future test drives init directly.
+[dependencies]
+cerulion_core = { path = "../../cerulion_core" }
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

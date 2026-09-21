@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# `cerulion_link` is DELIBERATELY permissive-licensed (MIT OR Apache-2.0),
+# overriding the workspace-default AGPL. It is part of the client-protocol
+# layer, which is permissive-licensed by design, so the closed-source
+# Cerulion Studio sidecar can link it directly.
+[package]
+name = "cerulion_link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+description = "Thin iroh wrapper giving Cerulion dial-by-key QUIC (raw wire-frame + ops tunnels); the remote plane of the dual-plane gateway (zenoh=LAN, iroh=remote)"
+readme = "README.md"
+keywords = ["robotics", "iroh", "quic", "p2p", "cerulion"]
+categories = ["network-programming"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of BOTH licenses it is published under and this manifest. Whatever
+# else the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The device key IS the iroh EndpointId; iroh gives us dial-by-key QUIC. Pinned
+# EXACT to 1.0.2 — the pre-1.0 API churned heavily (NodeId→EndpointId rename)
+# and this thin wrapper is written against the exact 1.0.2 surface. iroh itself
+# `=`-pins release-candidate crypto (ed25519-dalek =3.0.0-rc.0,
+# curve25519-dalek =5.0.0-rc.0) — see the crate README.
+iroh = "=1.0.2"
+tracing = "0.1.44"
+thiserror = "2"
+# iroh's endpoint builder REQUIRES a rustls crypto provider (its `bind()` errors
+# with `InvalidCryptoProvider` otherwise) and reads it from the BUILDER, not the
+# rustls process-default. `build_endpoint` hands it ring's provider — the one the
+# iroh tree already pulls — so a bare consumer needn't wire it up.
+# `default-features = false` keeps aws-lc-rs (and its C toolchain build) OUT of
+# the workspace tree.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# tokio is the runtime iroh already mandates (and already in the lockfile, so
+# this adds ZERO new crates). It is a DIRECT dep so the cancel-safety guidance
+# in `framing` can carry a compile-tested doctest of the dedicated-task pattern
+# (`spawn` + `mpsc` + `select!`), and so consumers get a first-class async
+# surface without re-declaring tokio themselves.
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
+
+[dev-dependencies]
+# The loopback test drives two endpoints in one tokio runtime; `rt-multi-thread`
+# + `time` are on top of the normal-dep tokio (features union), and `time` bounds
+# every await so CI can never hang. `iroh` is a dev-dep too so the test can
+# derive the expected public keys independently (an oracle, not a self-compare).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+iroh = "=1.0.2"

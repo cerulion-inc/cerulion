@@ -1,0 +1,58 @@
+iox2 FLOOR DISCRIMINATOR - backtoback probe (readme-ruled amendment 1, stage 1)
+==============================================================================
+Question it answers: the fixed100 run of this cell wrote `did_not_sustain` at
+every ladder rung, and inverting its skip counter implied ~42-98 ms per round
+trip. Two candidate causes: (a) the iceoryx2 round trip really is that slow on
+macOS, or (b) the defect is in the PACED path (the bench's RateLimiter sleep),
+and the transport is fine. backtoback runs the identical binary with NO rate
+limiter, so it separates them.
+
+VERDICT: (b). The transport is fine. The defect is the paced path.
+
+MEASURED, 2026-09-17T03:36:13Z-03:36:14Z, suite ba5d75c5c, iox2 bin sha16
+c2bf1353305141f2, payload 64 B, rep 1, 10000 measured samples (+1000 warmup),
+STOCK posture (CER_BENCH_DMA_LOCK=0), CI verified idle:
+
+    p50       0.792 us
+    p99       1.125 us
+    p99.9     1.375 us
+    min/max   0.541 / 6.334 us
+    mean      0.810 us
+    >100 us   0 of 10000
+    wall      under 1 s for the whole size ("ok rc=0 bins=1/1 (0s)")
+
+The raw iceoryx2 round trip on this machine is SUB-MICROSECOND - the fastest
+cell in the whole campaign, and ~4x faster than the Cerulion mono leg (3.46 us)
+and ~110x faster than the split leg (88 us), which is the shape you would
+expect of a raw floor.
+
+WHY THE fixed100 CELL STILL FAILED, restated with both numbers in hand: the
+round trip costs ~0.8 us, so a 100 Hz grid slot (10 ms) is ~12,000 round trips
+wide. The cell could not miss its slots because of transport work. What it
+does between slots is `thread::sleep(remaining - 50 us)` then a spin to the
+deadline (native/src/lib.rs:656-684). On macOS that sleep overshoots by tens of
+milliseconds, so EVERY slot lands late, `next_grid_slot` jumps the schedule
+index forward, and the skips accumulate past the slot count - which is exactly
+the "skipped 6669 of 2100" shape the fixed100 log carries. The cost also GREW
+with the rung period (~42 ms at 10 ms slots, ~80 ms at 20 ms, ~98 ms at 50 ms),
+which is a sleep-granularity signature, not a payload or transport one.
+
+CPU LINE: the fixed100 attempt held 99.6 % CPU for 6 min 56 s without finishing
+one 64 B rung (spin-bound, sampled by ps). The backtoback probe finished the
+same size in under 1 second - too fast for the 2 s CPU sampler to take a single
+sample, which is itself the contrast: the CPU log for this probe is EMPTY
+because there was nothing to sample.
+
+STAGE 2 (the follow-on, RUN 2026-09-17T03:40:37Z-03:40:41Z, CI idle): k=5 x 10
+sizes completed in FOUR SECONDS - 50 .bin files, 50000 pooled samples per size,
+compile-csv rc=0. Curve: p50 0.459-0.792 us, worst pooled p99 1.458 us at 64 B,
+0 of 500,000 samples over 100 us. See percentiles-k5-all-sizes.txt and
+run-btb-full/results_iox2_chrt0.csv.
+
+SCOPE / WHAT THIS DOES NOT SAY: the backtoback curve is NOT a fixed100 row and
+must never be presented as one - it was not rate-paced at all, so it carries no
+rate label and is not comparable to the 100 Hz rows in HEADLINE.md. What it
+establishes is narrower and sufficient: the transport is sound on macOS, and the
+fixed100 refusal is a PACING artefact. It does not measure this cell under the
+campaign's own 100 Hz spec, because on this platform that spec cannot be met by
+this binary - which is the finding, not a gap in it.

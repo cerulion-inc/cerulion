@@ -1,0 +1,143 @@
+# The Go2 front-camera JPEG transcode node crate (home: examples/go2 —
+# the Go2 demo Cerulion workspace; NOT a member of the parent cerulion
+# workspace, so it has its own target dir and lockfile).
+#
+# CI: `examples/go2` IS built and tested on GitHub CI, by the `demos-go2` job in
+# .github/workflows/ci.yml — it runs `cargo build --workspace --tests` and then
+# most of the workspace's test suite on every PR. What that job deliberately
+# does NOT install is GStreamer, which is exactly the point of making the
+# `gstreamer` feature non-default: this crate compiles capture-LESS there, so
+# the gst deps below never resolve in CI even though the crate does. The one
+# test binary the job cannot RUN is `loopback_e2e_test` (it needs the gst
+# elements at run time) — everything else, `--lib` included, runs.
+#
+# `frame` is the pure std-only JPEG structural reader; `h264` the pure
+# admission gate; `capture` the gst-free transcode state machine;
+# `pipeline_desc` the (gst-free) pipeline-description strings; `pipeline` the
+# GStreamer seam itself, behind the `gstreamer` feature; `lib.rs` wraps them in
+# the data-triggered `#[cerulion_node]` CameraJpeg transcode node.
+[package]
+name = "camera_jpeg"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Go2 front-camera H.264→JPEG ingress node (GStreamer NVDEC/software → CompressedImage on iceoryx2)"
+
+[lib]
+# `cdylib` is the production artifact (loaded by `cerulion graph run` via
+# DylibNodeEntry — the teleop_mux pattern). `rlib` is
+# ADDITIONALLY emitted so tests/*.rs can link the crate in-process (a
+# cdylib-only crate cannot be consumed by its own integration tests); it adds
+# nothing to the production surface.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+# `gstreamer` gates the real capture pipeline (module `pipeline` + the two gst
+# crates). It is OPTIONAL (not a hard dep, not a dev-dep) so the pure `frame`
+# unit oracles + the `node_publish` transport test build and run on a machine
+# WITHOUT GStreamer (the "queue logic testable with injected buffers, no
+# camera, no gst" goal).
+gstreamer = ["dep:gstreamer", "dep:gstreamer-app"]
+# `gstreamer` is deliberately NOT in `default`. As a default it would make
+# this ONE node's system library a prerequisite for the whole
+# documented `cd examples/go2 && cargo build --release` — taking dds_bridge,
+# go2_tf_source, teleop_mux, joystick_teleop and keyboard_teleop down with it
+# on any machine lacking GStreamer's dev headers (a plain Mac, a fresh robot).
+#
+# The capability is not lost by making it non-default: `cerulion node build
+# camera_jpeg` PROBES for GStreamer via pkg-config and adds
+# `--features gstreamer` when it is present, per the
+# [package.metadata.cerulion.optional-system-deps] block at the bottom of this
+# file. That probe cannot live in a build.rs — a build script cannot enable a
+# feature of its own crate — so it lives in the CLI
+# (cerulion_cli_engine::system_deps).
+#
+# Without the feature the node is NOT silently inert: its `init()` returns
+# `Err`, which FAILS THE GRAPH BUILD naming the node. Loud, at launch, before
+# a single frame is lost. (A data-triggered node has no launch-time
+# external-source check to carry that guarantee, so `init()` does. An
+# `external` node is instead refused at launch with
+# `ExternalNodesInertAtLaunch`.)
+#
+# ⚠ ARTIFACT-OVERWRITE HAZARD (the cost of making this non-default). Both
+# `cerulion node build camera_jpeg --release` and a plain workspace-wide
+# `cargo build --release` write the SAME
+# `examples/go2/target/release/libcamera_jpeg.{so,dylib}`, and the two feature
+# sets have different fingerprints — so cargo REBUILDS rather than skipping,
+# and the plain build silently REPLACES a capture-enabled cdylib with a
+# capture-less one. On robot day: run ROBOT-DAY 0.5 (`cargo build --release`)
+# FIRST and the `node build` line AFTER; if you later rebuild the workspace to
+# pick up an edit to another node, re-run `cerulion node build camera_jpeg
+# --release` before `cerulion graph run`. The failure is loud but MIS-ATTRIBUTED
+# — the graph build fails on camera_jpeg's `init()`, which reads as a problem
+# with the node rather than with the clobber you just caused. Nothing at build
+# or load time detects this.
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+# The `unitree_go/Go2FrontVideoData` type the `h264` trigger input is
+# declared with, generated from examples/go2/schemas (the SAME .msg the dds_bridge
+# codec reads), so this node's port schema hash equals the one the bridge
+# stamps into the frames it publishes.
+unitree_go = { path = "../../lib/unitree_go" }
+tracing = "0.1"
+# gstreamer-rs 0.24.x: the newest release whose MSRV (1.83) is <= the Jetson
+# companion computer's toolchain ceiling (1.88) — 0.25.x requires Rust 1.92.
+#
+# No `v1_XX` feature is enabled, so the binding compiles against
+# gstreamer-sys's base floor of 1.14. A `v1_NN` feature is a MINIMUM system
+# GStreamer requirement, not a target: enabling `v1_20` makes the crate
+# unbuildable on any system below 1.20, which is what the Unitree Go2 is
+# (GStreamer 1.16.3 — the stock L4T/focal package, and no >= 1.20 candidate
+# exists in its apt repos). Since this node calls no 1.20-gated API, dropping
+# the flag costs nothing and makes the crate build on both a Jetson (1.20.3)
+# and the Go2 (1.16.3). Do not re-add a `v1_XX` feature without first checking
+# the LOWEST system GStreamer that must be supported.
+gstreamer = { version = "0.24", optional = true }
+gstreamer-app = { version = "0.24", optional = true }
+
+[dev-dependencies]
+# `test-helpers` unlocks `TransportManager::init_for_test` + the isolated
+# per-test iceoryx2 SHM root (the teleop_mux / cerulion_cli precedent).
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+# Matches cerulion_core's own indexmap major (2.x) — `GraphRuntime::build`
+# takes `IndexMap<String, Box<dyn NodeEntry>>`.
+indexmap = "2.8"
+
+# ── Optional SYSTEM dependency declaration ─────────────────────────
+# Consumed by `cerulion node build camera_jpeg` (cerulion_cli_engine::
+# system_deps). It probes every `pkg-config` module below and adds
+# `--features gstreamer` only when ALL of them resolve; otherwise it builds
+# without the feature and prints `without-it` plus the platform's `install`
+# command. Every field here is REQUIRED — a dep whose absence is unexplained
+# cannot produce an actionable message, so the parser refuses a partial block
+# (and refuses a typo'd KEY INSIDE the block outright, rather than silently
+# skipping the probe; a misspelling of the TABLE NAME itself cannot be a hard
+# error — `package.metadata` is shared with every other tool — so it is a loud
+# warn naming both spellings instead).
+#
+# SCOPE of what a resolved pkg-config module proves: that the DEV headers are
+# here and the crate will link. It does NOT prove the GStreamer ELEMENTS this
+# node's pipeline needs are installed — headers and plugins are separate
+# packages. The `install.debian` line below installs the headers (core +
+# plugins-base); the elements ride `gstreamer1.0-plugins-good` (jpegenc),
+# `-plugins-bad` (h264parse), `-plugins-ugly` (x264enc, the loopback test's
+# source) and `gstreamer1.0-libav` (avdec_h264, the software decode arm), which
+# BRINGUP.md and ROBOT-DAY.md 0.7 carry as their own prerequisite row. The
+# absence of an element is caught LOUDLY at pipeline start
+# (`CameraError::MissingElements`), never silently.
+[package.metadata.cerulion.optional-system-deps.gstreamer]
+pkg-config = ["gstreamer-1.0", "gstreamer-app-1.0"]
+summary = "live camera capture (H.264 decode -> JPEG)"
+without-it = "this node has no decoder, so its init() FAILS THE GRAPH BUILD naming the node — `cerulion graph run` refuses any graph containing it, loudly and at launch, rather than running it inert"
+install.macos = "brew install gstreamer"
+install.debian = "sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev"
+
+# The demo workspace mirrors the root `[workspace.lints]` table (see
+# `examples/go2/Cargo.toml`), so every member here inherits the SAME strict lints as
+# the main tree rather than sitting under no lint table at all.
+[lints]
+workspace = true

@@ -1,0 +1,1028 @@
+{
+  "what": "The reviewed point ledger for the README benchmark figures: every plotted p50 and p99, read once from the package CSVs and reviewed independently of the renderer. build_benchmark_plots.py asserts each CSV sha256 and every point against it before drawing.",
+  "source_kind": "read-only CSV extraction; expected values are source observations, not regenerated chart outputs or new measurements",
+  "expected_size_bytes": [
+    64,
+    256,
+    1024,
+    4096,
+    16384,
+    65536,
+    262144,
+    1048576,
+    4194304,
+    16777216
+  ],
+  "source_sha256_pins": "the package CSV as shipped in this repository",
+  "charts": {
+    "native-rtt.svg": {
+      "series": [
+        {
+          "label": "Cerulion multi-process, free run",
+          "source_csv": "docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/hero-stock-freerun-fixed/results_cerulion_workspace_split_chrt0.csv",
+          "source_sha256": "d947421cfbcf0db2a3c9b8283a774c2cfd7e64faa3ea005e194be4054a5d0242",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 4067,
+              "p99_ns": 6610,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 3966,
+              "p99_ns": 6625,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 4010,
+              "p99_ns": 7768,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 4009,
+              "p99_ns": 6746,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 4017,
+              "p99_ns": 6454,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 4045,
+              "p99_ns": 6761,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 4035,
+              "p99_ns": 7634,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 4076,
+              "p99_ns": 7378,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 4329,
+              "p99_ns": 8180,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 4434,
+              "p99_ns": 10446,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        },
+        {
+          "label": "Cerulion single-process",
+          "source_csv": "docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/hero-stock/results_cerulion_workspace_mono_chrt0.csv",
+          "source_sha256": "ba5a0dbcb3902b7de17b91ed9227d0b732e79cd4737f8a583fd56998b5acbbfd",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 2685,
+              "p99_ns": 9414,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 2682,
+              "p99_ns": 9510,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 2662,
+              "p99_ns": 9347,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 2677,
+              "p99_ns": 9365,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 2696,
+              "p99_ns": 9707,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 2746,
+              "p99_ns": 9936,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 2709,
+              "p99_ns": 10030,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 2760,
+              "p99_ns": 10736,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 2769,
+              "p99_ns": 11657,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 2802,
+              "p99_ns": 14226,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        },
+        {
+          "label": "ROS2 defaults",
+          "source_csv": "docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/hero-stock/results_jazzy_stock_rclcpp_chrt0.csv",
+          "source_sha256": "0fb887bdc7af43f25f7bc3f22d797172595d496ec64531ce8468c0ace7c4cf1d",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 311109,
+              "p99_ns": 568168,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 309681,
+              "p99_ns": 556147,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 409714,
+              "p99_ns": 604246,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 442228,
+              "p99_ns": 587249,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 464062,
+              "p99_ns": 614180,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 463745,
+              "p99_ns": 639071,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 483164,
+              "p99_ns": 653168,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 10951634,
+              "p99_ns": 43402264,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 12912069,
+              "p99_ns": 35958716,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 103853928,
+              "p99_ns": 156924061,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        },
+        {
+          "label": "ROS2 composed+IPC",
+          "source_csv": "docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/hero-stock/results_jazzy_composed_ipcon_rclcpp_chrt0.csv",
+          "source_sha256": "7ebd23ceeb46294a47fb82ffd2adefe5e0ad9af9f18ac8a8d07e5bd50da9c229",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 24639,
+              "p99_ns": 31468,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 28334,
+              "p99_ns": 30786,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 28475,
+              "p99_ns": 31203,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 28390,
+              "p99_ns": 31218,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 28902,
+              "p99_ns": 32469,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 25850,
+              "p99_ns": 31424,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 27730,
+              "p99_ns": 42084,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 29791,
+              "p99_ns": 36988,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 33631,
+              "p99_ns": 36484,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 33415,
+              "p99_ns": 37337,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        },
+        {
+          "label": "zenoh SHM",
+          "source_csv": "docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/hero-stock/results_zenoh_shm_chrt0.csv",
+          "source_sha256": "504298d00b675319e5586761b30a0242de113eee9970ec55bd1634a1935eaecc",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 509668,
+              "p99_ns": 831363,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 534698,
+              "p99_ns": 741355,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 469108,
+              "p99_ns": 823746,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 475261,
+              "p99_ns": 742773,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 413063,
+              "p99_ns": 652321,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 423936,
+              "p99_ns": 755237,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 539090,
+              "p99_ns": 757593,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 580635,
+              "p99_ns": 833599,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 542945,
+              "p99_ns": 800297,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 591337,
+              "p99_ns": 800378,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        }
+      ]
+    },
+    "platform-rtt.svg": {
+      "series": [
+        {
+          "label": "x86 split",
+          "source_csv": "docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/hero-stock-freerun-fixed/results_cerulion_workspace_split_chrt0.csv",
+          "source_sha256": "d947421cfbcf0db2a3c9b8283a774c2cfd7e64faa3ea005e194be4054a5d0242",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 4067,
+              "p99_ns": 6610,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 3966,
+              "p99_ns": 6625,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 4010,
+              "p99_ns": 7768,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 4009,
+              "p99_ns": 6746,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 4017,
+              "p99_ns": 6454,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 4045,
+              "p99_ns": 6761,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 4035,
+              "p99_ns": 7634,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 4076,
+              "p99_ns": 7378,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 4329,
+              "p99_ns": 8180,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 4434,
+              "p99_ns": 10446,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        },
+        {
+          "label": "x86 mono",
+          "source_csv": "docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/hero-stock/results_cerulion_workspace_mono_chrt0.csv",
+          "source_sha256": "ba5a0dbcb3902b7de17b91ed9227d0b732e79cd4737f8a583fd56998b5acbbfd",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 2685,
+              "p99_ns": 9414,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 2682,
+              "p99_ns": 9510,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 2662,
+              "p99_ns": 9347,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 2677,
+              "p99_ns": 9365,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 2696,
+              "p99_ns": 9707,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 2746,
+              "p99_ns": 9936,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 2709,
+              "p99_ns": 10030,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 2760,
+              "p99_ns": 10736,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 2769,
+              "p99_ns": 11657,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 2802,
+              "p99_ns": 14226,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        },
+        {
+          "label": "jetson split",
+          "source_csv": "docs/benchmarks/results/9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx/results_cerulion_workspace_split_chrt0.csv",
+          "source_sha256": "028eb35fd119dc8ed2013cc8d69ceb8bd6a1855ae1e3204c591e05791ad36e24",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 25265,
+              "p99_ns": 52771,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 25921,
+              "p99_ns": 51746,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 28385,
+              "p99_ns": 53442,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 27169,
+              "p99_ns": 51940,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 26625,
+              "p99_ns": 51170,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 28689,
+              "p99_ns": 55939,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 29889,
+              "p99_ns": 60034,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 31825,
+              "p99_ns": 65474,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 29681,
+              "p99_ns": 72163,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 29505,
+              "p99_ns": 78532,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        },
+        {
+          "label": "jetson mono",
+          "source_csv": "docs/benchmarks/results/9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx/results_cerulion_workspace_mono_chrt0.csv",
+          "source_sha256": "40d9a96aefcb8d41d1a5207c9d6d31378d242c728ca34bbbe6b01eff6553de88",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 22337,
+              "p99_ns": 39011,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 22913,
+              "p99_ns": 40834,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 23265,
+              "p99_ns": 34721,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 22672,
+              "p99_ns": 43681,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "mixed"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 22849,
+              "p99_ns": 37442,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 22625,
+              "p99_ns": 38337,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 23408,
+              "p99_ns": 45730,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 24225,
+              "p99_ns": 50405,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 22657,
+              "p99_ns": 62116,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "mixed"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 24625,
+              "p99_ns": 66114,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        },
+        {
+          "label": "mac split",
+          "source_csv": "docs/benchmarks/results/0b7bc3994f78e232-2026-09-17-fixed100-apple-m4/results_cerulion_workspace_split_chrt0.csv",
+          "source_sha256": "9cfc90f7091edd4ff077f8b1a67dcea8356e412c25de1a58652e92e5a983cc1a",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 88479,
+              "p99_ns": 142167,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 89229,
+              "p99_ns": 140541,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 89375,
+              "p99_ns": 139875,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 89416,
+              "p99_ns": 139541,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 87062,
+              "p99_ns": 140125,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 87375,
+              "p99_ns": 140375,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 87937,
+              "p99_ns": 140875,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 87854,
+              "p99_ns": 140917,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 92896,
+              "p99_ns": 139458,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 89770,
+              "p99_ns": 138417,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        },
+        {
+          "label": "mac mono",
+          "source_csv": "docs/benchmarks/results/0b7bc3994f78e232-2026-09-17-fixed100-apple-m4/results_cerulion_workspace_mono_chrt0.csv",
+          "source_sha256": "929cc691a20aa8c27a4558054c9f6eb7b20575087c6799aa2f6ee9029700407c",
+          "metric_columns": [
+            "round_trip_p50_ns",
+            "round_trip_p99_ns"
+          ],
+          "points": [
+            {
+              "payload_bytes": 64,
+              "p50_ns": 3458,
+              "p99_ns": 19125,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 256,
+              "p50_ns": 3458,
+              "p99_ns": 13333,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1024,
+              "p50_ns": 3458,
+              "p99_ns": 11750,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4096,
+              "p50_ns": 3375,
+              "p99_ns": 7792,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16384,
+              "p50_ns": 3458,
+              "p99_ns": 11834,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "mixed"
+            },
+            {
+              "payload_bytes": 65536,
+              "p50_ns": 3375,
+              "p99_ns": 7459,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 262144,
+              "p50_ns": 3375,
+              "p99_ns": 21416,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 1048576,
+              "p50_ns": 3458,
+              "p99_ns": 20541,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 4194304,
+              "p50_ns": 3584,
+              "p99_ns": 10750,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            },
+            {
+              "payload_bytes": 16777216,
+              "p50_ns": 3750,
+              "p99_ns": 10042,
+              "samples": 10000,
+              "repetitions": 5,
+              "achieved_rate_hz": "100"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,120 @@
+name: Performance Regression
+description: Report a latency, throughput, or allocation regression in Cerulion
+title: "[Perf]: "
+labels: ["performance", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for flagging a performance regression! Cerulion targets flat, zero-copy latency (the README's performance table carries the current figures). Please provide before/after numbers and a reproduction so we can bisect the cause.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Regression Description
+      description: What got slower? Latency, throughput, jitter, or heap-allocation count?
+      placeholder: "p50 RTT went from ~4 µs to ~20 µs at 1 MiB payloads..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: benchmark
+    attributes:
+      label: Affected Benchmark
+      description: Which benchmark or test surfaced the regression?
+      options:
+        - latency_threshold_test
+        - graph_latency_test
+        - flat_latency_test
+        - cross_thread_rtt_test
+        - benches/latency (bench.py smoke)
+        - benches/latency (full sweep)
+        - Custom / application benchmark
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: baseline
+    attributes:
+      label: Baseline Latency / Throughput
+      description: The previous (good) measurement, with payload size and percentile.
+      placeholder: "e.g., 4.08 µs p50 RTT @ 1 MiB"
+    validations:
+      required: true
+
+  - type: input
+    id: observed
+    attributes:
+      label: Observed Latency / Throughput
+      description: The current (regressed) measurement, same payload size and percentile.
+      placeholder: "e.g., 21µs p50 RTT @ 1MiB"
+    validations:
+      required: true
+
+  - type: input
+    id: commit-range
+    attributes:
+      label: Commit Range
+      description: "Last known-good commit and first known-bad commit (a `git bisect` range helps a lot)."
+      placeholder: "good abc1234 .. bad def5678"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction Command
+      description: The exact command(s) that reproduce the regression.
+      placeholder: |
+        cargo test -p cerulion_core --test latency_threshold_test --release -- --test-threads=1
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      description: CPU model, core count, RAM, and anything else relevant (e.g. CPU governor, isolated cores).
+      placeholder: |
+        CPU: AMD Ryzen 9 7950X (16C/32T)
+        RAM: 64 GB DDR5
+        Governor: performance
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Cerulion Version
+      description: "Output of `cerulion --version` or commit hash"
+      placeholder: "e.g., 0.1.0 or abc1234"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Benchmark Output / Logs
+      description: "Paste the benchmark output and any relevant `RUST_LOG` output. This will be automatically formatted as code."
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Flamegraphs, `perf` output, graph YAML, schema files, or anything else that helps triage.

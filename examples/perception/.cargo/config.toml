@@ -1,0 +1,6 @@
+# Quiet iceoryx2 + Cerulion logging by default (mirrors the generated-workspace
+# and benches/* convention). The replay verdict is printed to stderr
+# unconditionally, so the demo stays legible without raising the log level.
+[env]
+IOX2_LOG_LEVEL = "error"
+RUST_LOG = { value = "warn", force = false }

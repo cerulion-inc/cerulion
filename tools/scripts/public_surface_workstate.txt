@@ -1,0 +1,29 @@
+# Work-state vocabulary that shipped text never carries (class `work-state` of
+# tools/scripts/check_public_surface.sh). Shipped text describes the product to its
+# user: what works, what is experimental, what is not supported, what to do. It never
+# reports how the project was built: who decided, which plan step or review round a
+# line came from, which machine a test ran on, or what is still on a to-do list.
+#
+# One entry per line: `key | python regex | what to write instead`. A `#` line is a
+# comment. Matching is per line, case-sensitive unless the regex says otherwise.
+hardware-status | ROBOT-GATED|\b[Ss]till gated\b|\bgated on (a|the) robot\b|verify on the day|verify-on-robot|\brobot-gated\b | state the limitation: "Experimental", "not validated on hardware", "calibrate for your unit"
+who-decided | \bfounders?\b|(?<!maintainer )\bruling\b|\bruled (on )?20\d\d|\bruled\b(?! out) | keep the fact, drop who decided it
+plan-step | \b[Cc]hunks?[- ]\d+\w?\b|\b[Cc]hunk[- ][A-J]\b|\b[Ss]tage \d[a-c]\b|\b[Ss]tage-\d\b|\bRoute S\b|\bTrack [AB]\b|\bLane [A-Z]\b|\bp\d chunk\b|\bPhase \d\b|\bPR-\d\b|\bfold-\d+\b|\bdelta-\d+\b|\bwave [A-Z]\b|\b2c[12]\b|\bWS-?2c\b|\b[Pp]re-C\d\w?\b|\bC\d[a-d]\b(?!-state)|\bspike\b | describe the behaviour; a plan step label means nothing to a reader
+review-round | [Rr]eview[- ]train|(?<![a-z-])pass-\d+|(?<![a-z-])wave[- ]\d+|\bR\d (finding|wave|LOW|MEDIUM|HIGH)\b|deep-review|\bfind-pass\b|\bFIND-\d|\bFINDING \d|\bFIX[- ][0-9A-Z]\b|(?<![a-z-])[Rr]ound[- ]\d{1,2}(?!\d)|\bskeptics?\b|\bsecond[- ]pass\b|\b[Rr]eview(er)?(['’]s)? (finding|fix|gap|item|supplement|found|measured|reproduced|walked|asked|caught)|\ba (major |converged )?review finding\b|\bfound in review\b|\bafter review\b|\b[Cc]ode review\b|\baudit (item|amendment|[A-D]\d)\b|\bmini-train\b|(?i:\bgreptile\b|\bentelligence\b) | say what the code guarantees, not which review found it
+session-id | (?<![A-Za-z0-9])pt\d{2,3}(?![A-Za-z0-9])|\bS\d pt\d+ | drop it
+deferred-work | \bfollow-?ups?\b|\bpost-cut\b|\bpre-cut\b|\bTODO\(|\bFIXME\b|tracked separately|\bis a flagged\b|\bfiled (follow|issue)\b | state the limitation ("not supported yet") or drop the sentence
+proof-tag | MUTATION-VERIFIED|MUTATION-TESTED|mutation-verified|\bbox-(validated|verified)\b|BOX-(VALIDATED|VERIFIED) | say what breaks the test ("reverting X fails it") or where it runs ("Linux x86_64 and aarch64")
+our-machines | \b[Tt]he box\b|\bbox's\b|\b(x86|Jetson|Linux|dev|shared|CI|bench) box\b|\b[Bb]ox-only\b|BOX-ONLY|(?<![A-Za-z])box_(only|same|linux|unix|jetson|two)|\bon-box\b|\bbox-(x86|jetson|unix|linux)\b|(?i:\bauthoring desk\b) | name the requirement: "needs Linux with <hardware>", "hardware-only", "needs a ROS 2 Jazzy container"
+candour-voice | (?<![Dd]is)[Hh]onest|HONEST | use the precise word: "a lower bound", "a hard limit", "what is true"; or drop it
+
+change-ref | \bPR ?#\d+\b|\bthis PR\b|\bPR body\b|\bPR['’]s\b|\bon this branch\b|\b(see|per|in|from|the|by|of) #\d{2,4}\b|\(#\d{2,4}\) | a reader cannot open our pull requests: state the fact the reference stood for
+history-voice | \b[Pp]re-fix\b|\b[Pp]ost-fix\b|\b[Bb]efore the fix\b|\b[Tt]he earlier version of this\b|\bBefore this (change|fix)\b|\bthe fix (routes|makes|adds|moved|was)\b | describe what the code does and what would break without it ("without this guard, X happens"), not the story of the bug
+design-ref | \bdesign §\s?\d|§\d+(\.\d+)*\s?Q\d|\baudit amendment\b|\b[Ww]ake design\b|\bc6-plan\.md\b|\bplan R\d\b|-DESIGN\.md\b|RUNNING-LOG | a pointer to a document that does not ship: state the rule here, or drop the pointer
+
+# A machine NICKNAME ("the Air") carries no host name, no address and no login, so no
+# regex here can name it: it belongs in the private pattern list of leak_scan.py, tagged
+# @nickname (docs/leak_guard.md, "Supply private patterns locally").
+plan-label | \b[A-Z]\d-era\b|\bWS-?\d:|\bRoute-?\d\b|\(I\d{1,2}\)|\bA[01] (?:scope|note|ships?|lands?|acceptance)\b|\blands? with (?:the )?A\d\b|\bout of A\d\b|\((?:a )?later chunks?\)|\blands? in (?:a |the )?later chunks?\b|\bis a later chunk\b|\bin later chunks\b|\bissue spec\b | a milestone, workstream or requirement label means nothing to a reader: name what ships, what does not, and what the requirement is
+promise-voice | \bcoming soon\b|\bnot measured yet\b|(?i:\backnowledged gaps?\b)|\bspeed[- ]bumps?\b | promise nothing: say what is true today ("not supported", "not measured by this suite")
+approval-voice | \bby decision\b(?! position)|\bapproved by\b|\breviewed and approved\b|\bcounsels?\b|\bsign-?offs?\b|\bConfirmed design\b|\bdo not flag it in review\b | keep the fact, drop who approved it and that it was approved at all
+review-actor | \bREVIEW ITEM\b|\b(?:fix|mini|review)[- ]waves?\b|\b[Ww]aves? \d+(?:[-/]\d+)?\b|\bwave['’]s\b|\b(?:this|that|same) waves?\b|\b(?:the|this) train\b|\btrain['’]s\b|\btrain [a-z]\d\b|\brounds \d+ to \d+\b|\badversarial (?:review|reviewer|verifier|skeptic|agent|pass)\b|(?i:\b(?:copilot|bugbot|devin)\b) | say what the code guarantees, not which review round, sweep or tool found it

@@ -1,0 +1,23 @@
+error: #[cerulion_node(external)] node `ExternalMissingSource` must define an `external_source` method on its `#[cerulion_node_impl]` block: `fn external_source(&mut self) -> ExternalSource`. Return `ExternalSource::HostDriven` if the node fires only via a host `trigger_external`, or `ExternalSource::Fd(fd)` / `ExternalSource::Blocking(..)` to self-trigger from a device fd or a blocking SDK.
+  --> tests/ui/external_source_missing.rs:18:1
+   |
+18 | / impl ExternalMissingSource {
+19 | |     fn tick(&mut self) -> Result<(), NodeError> {
+20 | |         self.cmd.x = 0.0;
+21 | |         Ok(())
+22 | |     }
+23 | | }
+   | |_^
+
+warning: unexpected `cfg` condition value: `cdylib`
+  --> tests/ui/external_source_missing.rs:11:1
+   |
+11 | #[cerulion_node(external)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `debug-logging`, `fuzz-helpers`, and `test-helpers`
+   = note: using a cfg inside a attribute macro will use the cfgs from the destination crate and not the ones from the defining crate
+   = help: try referring to `cerulion_node` crate for guidance on how handle this unexpected cfg
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+   = note: this warning originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

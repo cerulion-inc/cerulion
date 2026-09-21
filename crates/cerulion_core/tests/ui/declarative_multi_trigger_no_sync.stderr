@@ -1,0 +1,25 @@
+error: multiple trigger inputs (imu, camera) require one of: `#[cerulion_node(sync_window_ms = N)]` (bounded — one fire per N-ms window with the latest of each trigger) OR `#[cerulion_node(unbounded_sync)]` (no time bound — one fire when each trigger has ≥1 unconsumed message; not recommended for control loops)
+ --> tests/ui/declarative_multi_trigger_no_sync.rs:4:1
+  |
+4 | #[cerulion_node]
+  | ^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/declarative_multi_trigger_no_sync.rs:10:7
+   |
+10 |     #[output]
+   |       ^^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/declarative_multi_trigger_no_sync.rs:8:7
+  |
+8 |     #[input(trigger)]
+  |       ^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/declarative_multi_trigger_no_sync.rs:6:7
+  |
+6 |     #[input(trigger)]
+  |       ^^^^^

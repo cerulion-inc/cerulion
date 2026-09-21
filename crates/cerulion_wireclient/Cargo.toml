@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# `cerulion_wireclient`: the desk-side `cerulion/wire/1` CLIENT
+# substrate, extracted from `cerulion_connectd` so BOTH the connectd worker AND
+# `cerulion_netd`'s iroh WAN plane consume ONE shared implementation (control
+# vocabulary + dial-config parsers + the per-topic re-inject reader) without a
+# package edge from netd to connectd. Breaking that edge is what lets connectd
+# become a `cerulion_netd::NetdClient` consumer with NO cyclic package dependency.
+[package]
+name = "cerulion_wireclient"
+version.workspace = true
+edition.workspace = true
+# License is INHERITED from the workspace (AGPL-3.0-only). `cerulion_wireclient`
+# links `cerulion_core` (the SHM re-inject seam + the shared `cerulion_q` catalog
+# vocabulary), so it is AGPL. Do NOT override the license.
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Desk-side client pieces for the `cerulion/wire/1` remote protocol: the control vocabulary (WireRequest, WireResponse, StreamPreamble), the dial-config parsers, and the per-topic reader that re-injects received frames into local shared memory"
+readme = "README.md"
+keywords = ["robotics", "iroh", "remote-access", "protocol", "cerulion"]
+categories = ["science::robotics", "network-programming"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The ONE iroh endpoint (desk device key = EndpointId), the per-topic uni frame
+# streams, and the wire ALPN constant. `config` needs `EndpointId`/`RelayConfig`
+# and `reader` needs `RecvStream`/`read_frame`/`DEFAULT_MAX_FRAME_LEN`, so iroh is
+# an UNCONDITIONAL dep — which is exactly why this crate is EXCLUDED from the
+# workspace `default-members` (a plain `cargo build` stays iroh-free).
+cerulion_link = { workspace = true }
+# The zenoh-free desk-local SHM RE-INJECTION seam: `IngressInjector` +
+# `reinject_raw` (validates `total_size` + `schema_hash` per then
+# `publish_raw`s into local SHM), the 32-byte `WireHeader`, `MaxSliceLen`, and the
+# shared `cerulion_q` catalog/schema vocabulary (`CatalogReply` / `SchemaReply`).
+# Linking `cerulion_core` makes this crate AGPL (correct — desk-side SHM plane).
+cerulion_core = { workspace = true }
+# Structured logging (never println! in library code). Cap release logging at
+# info, mirroring cerulion_core / cerulion_connectd.
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
+# The mirrored wire control protocol (WireRequest / WireResponse / StreamPreamble)
+# serializes via serde/serde_json — the SAME length-prefixed JSON the robot's
+# `cerulion_remoted::wire` serves.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Unified error enum.
+thiserror = "2"
+# Hex decode of the robot's 64-char `--eid` and (optional) the desk device key.
+hex = "0.4"
+# Generate the 32-byte EPHEMERAL desk device seed when no key file is given.
+getrandom = "0.2"
+# A4: resolve the desk's cloud account from the cached device cert
+# (`~/.cerulion/device.cert`) that `cerulion login` writes, so the netd WAN dial
+# config presents an account-bound identity. `cerulion_pairing` owns the
+# `SignedDeviceCert`/`AccountId` types + the shared `account_for_device_key` I1
+# verifier; it is permissive (MIT OR Apache) + iroh-free, so it does NOT change this
+# crate's AGPL posture (already AGPL via cerulion_core). Was a dev-dep (the parse_eid
+# oracle) — now a first-class dependency of `config::resolve_desk_account`.
+cerulion_pairing = { workspace = true }
+# The cached device cert is `base64url(postcard(SignedDeviceCert))` — the exact shape
+# `cerulion login` / `cerulion_cli_engine::device_binding` write + read. Match their
+# versions so the resolver decodes the identical bytes.
+base64 = "0.22"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+
+[dev-dependencies]
+# Isolated temp dirs for the desk-key + device-cert file tests.
+tempfile = "3"
+# The device-cert oracle test signs a throwaway `SignedDeviceCert` (`DeviceCert::sign`
+# takes an ed25519 `SigningKey`) to build the exact `base64url(postcard(..))` blob
+# `cerulion login` writes. Same 2.x line as cerulion_pairing.
+ed25519-dalek = "2"
+# Capture the epoch-push classification LOGS so each outcome's operator
+# remediation text is pinned, not just its enum discriminant (three different refusals
+# share the `NoSink` outcome but must never share a remediation). `no-env-filter` per
+# repo memory: the default EnvFilter scopes capture to the test-crate-name target only.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }

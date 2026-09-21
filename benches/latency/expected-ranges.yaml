@@ -1,0 +1,39 @@
+# expected-ranges.yaml — per-host p50 round-trip baselines for the smoke gate
+# (`python3 benches/latency/bench.py smoke`).
+#
+# Schema (schema_version 2):
+#
+#   schema_version: 2
+#   hosts:
+#     <machine_hash>:                  # 16-char sha256 prefix — see
+#                                      # scripts/benchmarks/lib/machine_hash.sh
+#                                      # (compute_live_machine_hash)
+#       machine_hash: <machine_hash>   # repeated for self-describing entries
+#       measured_on_git_sha: <40-char git sha the baseline was captured at>
+#       notes: "<free-form provenance string>"
+#       rtt_p50_ns:
+#         <pacing>:                    # quiescent | fixed100 | backtoback —
+#                                      # the CER_BENCH_PACING modes have
+#                                      # different latency distributions, so
+#                                      # baselines are keyed per pacing variant
+#           <cell_name>:               # raw cell name, e.g. iox2_chrt0
+#             <payload_bytes>: [<min_ns>, <max_ns>]
+#
+# Multiple hosts coexist under `hosts:` — the smoke gate looks up its own
+# machine_hash + pacing variant and compares measured p50s against
+# [min, max]. p50 > max is FAIL_HIGH (regression); p50 < min is FAIL_LOW
+# (suspiciously fast — usually a broken measurement, e.g. the responder
+# never engaged).
+#
+# Entries are written ONLY by `bench.py smoke --capture-baseline`, which
+# measures real p50s on the current host and records [p50/2, p50*2] safety
+# bounds. NEVER hand-write latency numbers into this file (the no-fake-data
+# rule in AGENTS.md). The hosts map below is intentionally empty
+# until a real machine captures a baseline.
+#
+# This file is parsed by the constrained YAML reader in
+# benches/latency/bench.py (zero-dependency). Stick to the schema above:
+# 2-space indents, full-line comments only, inline `[min, max]` integer
+# lists, inline `{}` for empty maps.
+schema_version: 2
+hosts: {}

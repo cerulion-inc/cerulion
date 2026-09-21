@@ -1,0 +1,10 @@
+hero-stock-freerun/  -  pre-fix, main 68a0d6196, free run + recorder ON,
+post-sweep. LABELED DIAGNOSTIC, not the published row.
+
+Build: main 68a0d6196a962237f8628cd94c9f93371703e827
+       cerulion binary sha16 17d52c9b1552e530
+This is stage A3. The published multi-process row is hero-stock-freerun-fixed/
+(PR #912 head). Keep both: this dir is what the fix is measured against.
+
+ scrub applied to run.json: uname node -> box-x86 (x5), argv root
+paths -> <BOXHOME> (x5), nested under invocations[].

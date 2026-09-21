@@ -1,0 +1,78 @@
+# Unitree Go2 Integration: the Go2 demo Cerulion workspace.
+# An ISOLATED per-node-crate workspace
+# (NOT a member of the parent cerulion workspace; built on the robot's
+# companion computer), directly consumable by `cerulion graph run`.
+[workspace]
+# `nodes/*` = Cerulion node crates (cdylibs). `lib/*` = shared support
+# libraries that are NOT nodes (`lib/cerulion_go2_dds`, the DDS-interop
+# wrapper) — kept out of `nodes/` so `cerulion graph run` node-type resolution
+# never treats a helper lib as a node.
+#
+# The generic Rerun viz stack lives in the isolated `cerulion_viz` workspace
+# at the repo root, so `cerulion viz` ships it as a product. The demo's
+# producer nodes (`go2_tf_source`, `dds_bridge`) depend on
+# `cerulion_viz/lib/go2_tf` by path (see their Cargo.tomls).
+members = ["nodes/*", "lib/*"]
+resolver = "2"
+
+[workspace.package]
+# Demo crates inherit the repo license (first-party = AGPL-3.0-only;
+# cargo-deny's unlicensed check runs against this workspace, see `deny.toml`).
+license = "AGPL-3.0-only"
+
+# MIRRORS the root workspace's `[workspace.lints]` table, byte for byte.
+#
+# `nodes/go2_tf_source` is loaded by TWO workspaces — this one (its declaring
+# workspace) and the ROOT workspace, which reaches it through
+# `cerulion_viz/lib/cerulion_viz`'s path dev-dependency — and cargo resolves
+# `workspace = true` against whichever workspace is doing the LOADING. So a
+# `[lints] workspace = true` in that crate hard-fails the manifest load from
+# whichever side has no `[workspace.lints]` to inherit from. That is the same
+# two-loader rule its own manifest already documents for
+# `dependency.native_ros2_messages`: the root's `[workspace.dependencies]` has
+# `cerulion_core` but NOT `native_ros2_messages`, so inheritance there fails the
+# whole root manifest load, and the value is spelled out on both
+# sides rather than inherited.
+#
+# Keep this table SEMANTICALLY IDENTICAL to the root's — formatting may differ,
+# content may not. `cerulion_cli_engine/tests/workspace_lints_manifest_test.rs`
+# parses both and fails if they drift.
+[workspace.lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("cdylib"))',
+    'cfg(cerulion_rmw_vendored_bindings)',
+    'cfg(cerulion_rmw_generated_bindings)',
+] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+
+[workspace.dependencies]
+cerulion_core = { path = "../../crates/cerulion_core" }
+native_ros2_messages = { path = "../../crates/native_ros2_messages" }
+# The DDS-interop support lib (lib/cerulion_go2_dds) uses ros2-client
+# (pure-Rust ROS 2 client over rustdds — no rcl/rmw). default-features = false
+# keeps the DDS-security (rustls/ring) tree out of the resolve; the humble/jazzy
+# GID feature is forwarded by the crate's own [features] (default = humble, the
+# Go2-firmware-era GID). The pin resolves to 0.10.0 / rustdds 0.13.1.
+ros2-client = { version = "0.10", default-features = false }
+
+# Pin the same rustdds fork the root workspace uses, so the Go2 DDS
+# participants advertise the short SPDP participant lease (the
+# `participant_lease_duration` builder knob).
+# This gives SIGKILL-orphaned Go2 readers a ~10s ageout on the robot's writers
+# instead of the stock ~50s.
+#
+# The `rev` matches the root workspace's patch (the fork's
+# `participant-lease` branch); the git source is allow-listed in this
+# workspace's `deny.toml [sources]`.
+[patch.crates-io]
+rustdds = { git = "https://github.com/cerulion-inc/RustDDS", rev = "4f18a0345ff4fee705b9fd4dab7b34f6417c26f8" }

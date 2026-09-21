@@ -1,0 +1,11 @@
+error: unknown output attribute `expect_within_ms = ...`, expected `promise_within_ms = N`
+  --> tests/ui/output_unknown_name_value_attribute.rs:10:14
+   |
+10 |     #[output(expect_within_ms = 5)]
+   |              ^^^^^^^^^^^^^^^^
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/output_unknown_name_value_attribute.rs:10:7
+   |
+10 |     #[output(expect_within_ms = 5)]
+   |       ^^^^^^

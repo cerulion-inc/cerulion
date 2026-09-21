@@ -1,0 +1,44 @@
+error: duplicate #[on_event] handler for BackpressureEvent on `a` — each (port, event-kind) pair may have at most one handler (the dispatch drains a single pending event per accessor per tick). Handlers for DIFFERENT event kinds on the same port are allowed.
+  --> tests/ui/on_event_duplicate_port_kind.rs:35:8
+   |
+35 |     fn on_pressure_two(&mut self, _event: BackpressureEvent) {}
+   |        ^^^^^^^^^^^^^^^
+
+error: first BackpressureEvent handler for `a` declared here
+  --> tests/ui/on_event_duplicate_port_kind.rs:32:8
+   |
+32 |     fn on_pressure_one(&mut self, _event: BackpressureEvent) {}
+   |        ^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `__cer_user_init` found for struct `DupPortKindNode` in the current scope
+  --> tests/ui/on_event_duplicate_port_kind.rs:15:1
+   |
+15 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `DupPortKindNode`
+16 | #[derive(Default)]
+17 | struct DupPortKindNode {
+   | ---------------------- method `__cer_user_init` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_zero_copy_tick` found for struct `DupPortKindNode` in the current scope
+  --> tests/ui/on_event_duplicate_port_kind.rs:15:1
+   |
+15 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `DupPortKindNode`
+16 | #[derive(Default)]
+17 | struct DupPortKindNode {
+   | ---------------------- method `__cer_zero_copy_tick` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_shutdown` found for struct `DupPortKindNode` in the current scope
+  --> tests/ui/on_event_duplicate_port_kind.rs:15:1
+   |
+15 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+16 | #[derive(Default)]
+17 | struct DupPortKindNode {
+   | ---------------------- method `__cer_user_shutdown` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

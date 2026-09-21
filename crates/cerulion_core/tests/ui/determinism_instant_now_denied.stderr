@@ -1,0 +1,5 @@
+error: `Instant::now()` reads the live monotonic clock and voids bit-for-bit replay determinism. Read time through the node's own clock accessor instead: `self.now_ns()` (nanoseconds from the clock the scheduler is running on, so it replays identically). If you need real wall time regardless of replay, `self.real_ns()` says so explicitly. If this node is genuinely allowed to be non-deterministic, opt out with `#[cerulion_node(allow_non_deterministic)]`.
+  --> tests/ui/determinism_instant_now_denied.rs:20:27
+   |
+20 |         let _t = Instant::now();
+   |                           ^^^

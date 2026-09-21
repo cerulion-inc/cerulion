@@ -1,0 +1,11 @@
+error: expected `#[output]` or `#[output(...)]`
+  --> tests/ui/output_name_value_form_rejected.rs:10:7
+   |
+10 |     #[output = "data"]
+   |       ^^^^^^^^^^^^^^^
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/output_name_value_form_rejected.rs:10:7
+   |
+10 |     #[output = "data"]
+   |       ^^^^^^

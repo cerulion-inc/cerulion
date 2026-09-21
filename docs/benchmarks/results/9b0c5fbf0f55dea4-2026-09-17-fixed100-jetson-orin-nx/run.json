@@ -1,0 +1,647 @@
+{
+ "campaign": "platform@ba5d75c5c",
+ "note": "This campaign ran three cells into three run directories so that two workspace invocations at the same rep could not clobber one another's RunManifest (RunManifest is keyed by (run_dir, subcommand, rep)). Each directory's own run.json is carried here verbatim under run_dirs.",
+ "run_dirs": {
+  "iox2": {
+   "schema_version": 1,
+   "variant": "fixed100",
+   "machine_hash": "9b0c5fbf0f55dea4",
+   "invocations": [
+    {
+     "subcommand": "native",
+     "variant": "fixed100",
+     "rep": 1,
+     "argv": [
+      "bench.py",
+      "native",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--bin",
+      "iox2",
+      "--rep",
+      "1",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-iox2"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:03:45-0700",
+     "ended_at": "2026-09-16T19:07:16-0700",
+     "cells": [
+      {
+       "cell": "iox2_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:03:45-0700",
+       "ended_at": "2026-09-16T19:07:16-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "native",
+     "variant": "fixed100",
+     "rep": 2,
+     "argv": [
+      "bench.py",
+      "native",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--bin",
+      "iox2",
+      "--rep",
+      "2",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-iox2"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:28:19-0700",
+     "ended_at": "2026-09-16T19:31:49-0700",
+     "cells": [
+      {
+       "cell": "iox2_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:28:19-0700",
+       "ended_at": "2026-09-16T19:31:49-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "native",
+     "variant": "fixed100",
+     "rep": 3,
+     "argv": [
+      "bench.py",
+      "native",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--bin",
+      "iox2",
+      "--rep",
+      "3",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-iox2"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:40:50-0700",
+     "ended_at": "2026-09-16T19:44:20-0700",
+     "cells": [
+      {
+       "cell": "iox2_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:40:50-0700",
+       "ended_at": "2026-09-16T19:44:20-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "native",
+     "variant": "fixed100",
+     "rep": 4,
+     "argv": [
+      "bench.py",
+      "native",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--bin",
+      "iox2",
+      "--rep",
+      "4",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-iox2"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:53:21-0700",
+     "ended_at": "2026-09-16T19:56:52-0700",
+     "cells": [
+      {
+       "cell": "iox2_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:53:21-0700",
+       "ended_at": "2026-09-16T19:56:52-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "native",
+     "variant": "fixed100",
+     "rep": 5,
+     "argv": [
+      "bench.py",
+      "native",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--bin",
+      "iox2",
+      "--rep",
+      "5",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-iox2"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T20:06:49-0700",
+     "ended_at": "2026-09-16T20:10:19-0700",
+     "cells": [
+      {
+       "cell": "iox2_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T20:06:49-0700",
+       "ended_at": "2026-09-16T20:10:19-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    }
+   ]
+  },
+  "cerulion_workspace_mono": {
+   "schema_version": 1,
+   "variant": "fixed100",
+   "machine_hash": "9b0c5fbf0f55dea4",
+   "invocations": [
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 1,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "1",
+      "--leg",
+      "mono",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-mono"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:07:16-0700",
+     "ended_at": "2026-09-16T19:11:46-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_mono_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:07:16-0700",
+       "ended_at": "2026-09-16T19:11:46-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 2,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "2",
+      "--leg",
+      "mono",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-mono"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:31:49-0700",
+     "ended_at": "2026-09-16T19:36:19-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_mono_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:31:49-0700",
+       "ended_at": "2026-09-16T19:36:19-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 3,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "3",
+      "--leg",
+      "mono",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-mono"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:44:21-0700",
+     "ended_at": "2026-09-16T19:48:50-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_mono_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:44:21-0700",
+       "ended_at": "2026-09-16T19:48:50-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 4,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "4",
+      "--leg",
+      "mono",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-mono"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:56:52-0700",
+     "ended_at": "2026-09-16T20:02:17-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_mono_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:56:52-0700",
+       "ended_at": "2026-09-16T20:02:17-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 5,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "5",
+      "--leg",
+      "mono",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-mono"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T20:10:19-0700",
+     "ended_at": "2026-09-16T20:15:40-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_mono_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T20:10:19-0700",
+       "ended_at": "2026-09-16T20:15:40-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    }
+   ]
+  },
+  "cerulion_workspace_split": {
+   "schema_version": 1,
+   "variant": "fixed100",
+   "machine_hash": "9b0c5fbf0f55dea4",
+   "invocations": [
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 1,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "1",
+      "--leg",
+      "split",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-split"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:11:46-0700",
+     "ended_at": "2026-09-16T19:16:17-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_split_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:11:46-0700",
+       "ended_at": "2026-09-16T19:16:17-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 2,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "2",
+      "--leg",
+      "split",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-split"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:36:19-0700",
+     "ended_at": "2026-09-16T19:40:49-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_split_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:36:19-0700",
+       "ended_at": "2026-09-16T19:40:49-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 3,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "3",
+      "--leg",
+      "split",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-split"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T19:48:50-0700",
+     "ended_at": "2026-09-16T19:53:21-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_split_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T19:48:50-0700",
+       "ended_at": "2026-09-16T19:53:21-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 4,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "4",
+      "--leg",
+      "split",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-split"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T20:02:17-0700",
+     "ended_at": "2026-09-16T20:06:48-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_split_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T20:02:17-0700",
+       "ended_at": "2026-09-16T20:06:48-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    },
+    {
+     "subcommand": "workspace",
+     "variant": "fixed100",
+     "rep": 5,
+     "argv": [
+      "bench.py",
+      "workspace",
+      "--variant",
+      "fixed100",
+      "--chrt",
+      "0",
+      "--rep",
+      "5",
+      "--leg",
+      "split",
+      "--msg-class",
+      "variable",
+      "--run-dir",
+      "<BOXHOME>/lanes/platform-jetson/run-ws-split"
+     ],
+     "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+     "git_dirty": true,
+     "machine_hash": "9b0c5fbf0f55dea4",
+     "uname": "Linux box-jetson 5.15.148-tegra #1 SMP PREEMPT Mon Jul 14 03:14:07 UTC 2025 aarch64 aarch64",
+     "platform": "linux",
+     "cpu_governor": "schedutil",
+     "turbo_boost": "unknown",
+     "dma_lock_posture": "stock",
+     "started_at": "2026-09-16T20:15:41-0700",
+     "ended_at": "2026-09-16T20:20:11-0700",
+     "cells": [
+      {
+       "cell": "cerulion_workspace_split_chrt0",
+       "payload": null,
+       "outcome": "ok",
+       "started_at": "2026-09-16T20:15:41-0700",
+       "ended_at": "2026-09-16T20:20:11-0700"
+      }
+     ],
+     "skips": [],
+     "docker_images": {}
+    }
+   ]
+  }
+ }
+}

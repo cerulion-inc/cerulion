@@ -1,0 +1,25 @@
+# Allow list for tools/scripts/check_public_surface.sh. One entry per line:
+#   <path> | <class> | <match> | <reason of at least 12 characters>
+# <path> is the finding's path exactly as the gate prints it; <match> is a
+# substring of the finding message, or `*` for every finding of that class on
+# that path. An entry that excuses nothing FAILS the run: a stale waiver
+# pre-authorises the next finding, so the list can only describe what is
+# really there. Every entry below is either a maintainer ruling or a recipe that
+# is not a usage example; the summary line prints allowlist=N so growth shows
+# in every log.
+# Class work-state: an entry excuses the LINE before the file's count is taken,
+# so a legitimate line is never ledger debt, and `*` is refused: <match> names
+# the one line (a piece of the finding's quoted text).
+crates/cerulion_cli_engine/AGENTS.md | examples-shape | cargo ... --example | the line regenerates a test fixture from a crate example: a maintainer recipe, not a usage example
+docs/legal/LICENSE-HISTORY.md | examples-shape | cargo ... --example | the license history records how a fixture was regenerated; not a usage example
+examples/moveit_hero | examples-shape | * | a container gate for rmw_cerulion, not a workspace; whether it becomes one is a maintainer ruling still open
+docs/user-api.md | docs-refs | cerulion heap | the span quotes the heap hook's stderr breadcrumb verbatim, which begins with the word cerulion; it is not a command
+docs/media/architecture-flow-static.svg | unreferenced-media | * | the no-motion twin of an animated asset, kept by ruling and described in the media index
+docs/media/cerulion-logo-static.svg | unreferenced-media | * | the no-motion twin of an animated asset, kept by ruling and described in the media index
+docs/media/development-loop-static.svg | unreferenced-media | * | the no-motion twin of an animated asset, kept by ruling and described in the media index
+crates/rmw_cerulion/src/ffi/vendored_bindings.rs | shipped-text | names an owner | bindgen output over the upstream ROS 2 headers; the owner tag is upstream's own text
+tools/scripts/check_agents_md.sh | work-state | the founder said so | a banned-word fixture of the agent-docs gate's self-test: the gate must spell the word it refuses
+tools/scripts/check_agents_md.sh | work-state | see pt56 for the measurement | a banned session-reference fixture of the agent-docs gate's self-test: the gate must spell the shape it refuses
+.github/CONTRIBUTING.md | work-state | coming soon | maintainer ruling: the Discord row announces the chat as coming
+docs/media/charts/build_benchmark_plots.py | work-state | coming soon | maintainer ruling: the macOS latency improvement is announced as coming
+docs/media/platform-rtt.svg | work-state | coming soon | maintainer ruling: the macOS latency improvement is announced as coming

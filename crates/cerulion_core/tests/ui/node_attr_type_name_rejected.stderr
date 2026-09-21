@@ -1,0 +1,5 @@
+error: `type_name` is not accepted — the node type is the folder name (`nodes/<type>/`) and is resolved at graph-load time. Remove the `type_name = "..."` argument.
+ --> tests/ui/node_attr_type_name_rejected.rs:6:17
+  |
+6 | #[cerulion_node(type_name = "camera")]
+  |                 ^^^^^^^^^

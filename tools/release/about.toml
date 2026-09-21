@@ -1,0 +1,118 @@
+# cargo-about configuration for THIRD-PARTY-LICENSES.md, the per-dependency
+# license inventory that ships in every release archive and in the Debian
+# package, beside LICENSE, NOTICE and LICENSE-BSD-3-CLAUSE.
+#
+# The binaries statically link their whole dependency graph, so redistributing
+# them redistributes those crates. Most of the licenses in the graph (MIT,
+# Apache-2.0, the BSD family, ISC) require the license text and the copyright
+# notice to travel with a binary distribution. NOTICE names the components a
+# reader is likely to care about; this generated file is the exhaustive
+# machine-produced record that discharges the requirement.
+#
+# deny.toml is the POLICY and this file is the RENDERER. `accepted` below is
+# deny.toml's `[licenses] allow` list, entry for entry and in the same order,
+# and is deliberately NOT widened: a license this file could render but
+# cargo-deny would refuse must never reach an archive unreviewed. Keep the two
+# lists in step; if a new license is genuinely needed, it is reviewed in
+# deny.toml first and mirrored here second.
+#
+# Order is significant. cargo-about resolves a multi-license expression
+# ("MIT OR Apache-2.0") by taking the first entry below that satisfies it, so
+# this ordering also decides which arm a dual-licensed crate is listed under.
+# It follows deny.toml's ordering, which puts MIT ahead of Apache-2.0.
+accepted = [
+    "AGPL-3.0-only",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+]
+
+# Build scripts and test harnesses are not linked into a shipped binary, so
+# their licenses are not part of what redistribution carries. This mirrors what
+# the archive actually contains rather than what the repository can build.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# The four triples the release workflow builds. Pinning all four here rather
+# than resolving for the host has two effects that are both wanted: the
+# inventory is the UNION over every released platform, so no archive can be
+# short an attribution that a platform-specific dependency required; and the
+# output is identical on every runner, so the file CI generates is the file a
+# reviewer regenerates locally. A superset of attributions is harmless; a
+# missing one is the actual risk.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+# Crates marked `publish = false` are dropped. That is every test fixture under
+# crates/test_fixtures (38 of them, none of which declares a license because
+# none is published or linked into a shipped binary) and the first-party crates
+# that are not published. Without this, `--fail` in the release workflow would
+# refuse the whole inventory over fixtures that ship in nothing. It drops only
+# the private crates themselves, never their dependencies, so no third-party
+# attribution is lost.
+[private]
+ignore = true
+
+# Per-crate exceptions, mirroring deny.toml's `exceptions` block one for one.
+# Each is a license that is NOT in the global `accepted` list above and is
+# allowed only for the single crate named, so a second crate arriving under the
+# same license is a loud, reviewed event instead of a silent pass. The
+# reasoning for each lives in deny.toml beside the matching entry; it is not
+# duplicated here, so there is one place to read and one place to change.
+#
+# cargo-about warns "config found for a crate not present in the graph" for a
+# stanza whose crate does not appear under the four triples above. Five do that
+# today: ws_stream_wasm, async_io_stream and pharos are iroh-relay's wasm
+# websocket transport and only exist on a wasm target, and tiny-keccak and
+# webpki-root-certs sit behind features these builds do not enable. The
+# warnings are the expected result of mirroring deny.toml, which scans the
+# whole lockfile rather than four triples, and they are kept rather than pruned
+# so a dependency change that does pull one of those crates onto a released
+# target finds its exception already in place instead of failing the release.
+
+# MPL-2.0: weak, file-level copyleft. Unmodified transitive dependencies.
+[option-ext]
+accepted = ["MPL-2.0"]
+
+[indent]
+accepted = ["MPL-2.0"]
+
+[attohttpc]
+accepted = ["MPL-2.0"]
+
+# CC0-1.0: public-domain dedication.
+[tiny-keccak]
+accepted = ["CC0-1.0"]
+
+# BSL-1.0: permissive, no binary-distribution notice requirement.
+[xxhash-rust]
+accepted = ["BSL-1.0"]
+
+# CDLA-Permissive-2.0: a permissive DATA license. Both crates are the Mozilla
+# root-CA store rather than code.
+[webpki-roots]
+accepted = ["CDLA-Permissive-2.0"]
+
+[webpki-root-certs]
+accepted = ["CDLA-Permissive-2.0"]
+
+# Unlicense: public-domain dedication. The iroh relay's wasm websocket
+# transport and its two support crates.
+[ws_stream_wasm]
+accepted = ["Unlicense"]
+
+[async_io_stream]
+accepted = ["Unlicense"]
+
+[pharos]
+accepted = ["Unlicense"]

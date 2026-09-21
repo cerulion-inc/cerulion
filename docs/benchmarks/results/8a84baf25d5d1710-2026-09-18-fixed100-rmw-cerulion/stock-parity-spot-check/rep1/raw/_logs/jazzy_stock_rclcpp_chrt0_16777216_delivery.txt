@@ -1,0 +1,3 @@
+DELIVERY role=latency received=2100 kicks_sent=2444 unstamped=0 nonpositive_rtt=0
+DELIVERY role=pong echoed=2110
+DELIVERY role=ping published=2441

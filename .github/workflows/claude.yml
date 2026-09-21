@@ -1,0 +1,75 @@
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    # Two gates, both required. The mention gate is the trigger; the actor gate
+    # restricts who can pull it: only the two maintainers (the CODEOWNERS
+    # logins). On a public repository the triggering comment IS the prompt
+    # (this workflow has no fixed prompt:), so anyone able to start this job
+    # would drive Claude with text they control, against the repository, with
+    # the OAuth token in the job's context.
+    if: |
+      contains(fromJSON('["lakshay2010sharma","raveenk9696"]'), github.actor) &&
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
+    runs-on: ubuntu-latest
+    # One run at a time per issue or pull request. A second mention on the
+    # same thread queues behind the first rather than cancelling it: unlike a
+    # review of a superseded commit, an interactive request is not made
+    # worthless by a later one. issue_comment events on a pull request carry
+    # the PR number as issue.number; the review events carry pull_request.number.
+    concurrency:
+      group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    # 60, not 20: an interactive task triggered here can legitimately run a long
+    # time (the review workflow's max is 44 min), and there is no run data to
+    # size this tighter — all 60 recent runs were skipped by the `if` above.
+    # Without a cap the default is 360 min; 60 bounds a hung run.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read # Required so the action can read CI results on PRs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.193
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # No bot or App allow-list is set: the actor gate on the job's if:
+          # already limits who can start this job to the two maintainers, and
+          # the action refuses non-User actors by default.
+
+          # This optional setting allows the action to read CI results on PRs
+          additional_permissions: |
+            actions: read
+
+          # Optional: give the action a custom prompt. If none is given, it follows the instructions in the comment that tagged it.
+          # prompt: 'Update the pull request description to include a summary of changes.'
+
+          # Optional: Add claude_args to customize behavior and configuration
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+          # claude_args: '--allowed-tools Bash(gh pr *)'
+

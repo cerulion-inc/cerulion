@@ -1,0 +1,5 @@
+error: remove `#[derive(CerulionState)]` — `#[cerulion_node]` emits this impl itself, so carrying both is a conflicting-implementation error (E0119). The node's impl is the better one: it is built from the NON-PORT fields, while the derive would also walk the `#[input]`/`#[output]` ports, whose declared types are zero-sized SHM markers that carry no `CerulionState` and never will. Per-field escapes are unaffected — `#[cerulion(reconstruct)]`, `#[cerulion(serde)]` and `#[cerulion(unordered)]` are read by the fold-in from the same place the derive reads them.
+  --> tests/ui/state_derive_before_an_aliased_node_attr.rs:49:8
+   |
+49 | struct AliasedNode {
+   |        ^^^^^^^^^^^

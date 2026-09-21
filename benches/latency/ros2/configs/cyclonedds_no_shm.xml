@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  CycloneDDS profile — SHM disabled (UDP loopback only).
+
+  Forces all communication over UDP, skipping the iceoryx integration
+  even when iox-roudi is reachable. Used to baseline the cost of the
+  classic DDS transport against the SHM-engaged variant.
+
+  Config provenance (May-2026 campaign fixes):
+    * <NetworkInterface> pin below: newer apt builds' discovery layer
+      could not auto-pick an interface (0/0 rows) without it.
+    * Large UDP payloads: fragmentation overflows the default 65 KiB
+      rmw_cyclonedds_cpp ceiling at 1+ MB; the FragmentSize below keeps
+      every encoded datagram under the IPv4 UDP cap.
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+    <General>
+      <!-- Pin to loopback. With docker host networking the container
+           inherits the host netns and sees both `lo` and the host's
+           real NIC (e.g. WiFi). `autodetermine="true"` picks the
+           first non-loopback by routing-priority (that's WiFi, with
+           MTU 1500) and CycloneDDS happily ships 64 KB datagrams at it
+           (EMSGSIZE, retcode -58, at every send > MTU). All 3 bench
+           processes live in the same container/netns; loopback works.
+           Cyclone 0.10+ (jazzy and later) requires the <Interfaces>
+           wrapper; Cyclone 0.9 (humble) accepts it too. -->
+      <Interfaces>
+        <NetworkInterface name="lo"/>
+      </Interfaces>
+      <!-- IPv4 UDP datagram cap is 65507 B. CycloneDDS adds ~40 B of
+           IP+UDP+RTPS framing on top of FragmentSize. 65000 keeps
+           the encoded datagram comfortably under the cap. The previous
+           65500 caused EMSGSIZE on loopback for 64 KB+ payloads.
+           Cyclone DDS 0.10+ moved <FragmentSize> from <Internal> to
+           <General>; append explicit "B" unit (bare ints deprecated). -->
+      <FragmentSize>65000B</FragmentSize>
+      <!-- WARNING: SocketReceiveBufferSize / SocketSendBufferSize are
+           NOT valid elements under <General> in CycloneDDS 0.9 (humble).
+           Adding them caused "unknown element" and rmw_create_node
+           aborted. Reverted. The host-side sysctls + the per-cell
+           docker sysctl ipfrag bump (bench.py ros2) do the equivalent
+           at the kernel level. -->
+    </General>
+    <SharedMemory>
+      <Enable>false</Enable>
+    </SharedMemory>
+    <Tracing>
+      <Verbosity>warning</Verbosity>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

@@ -1,0 +1,16 @@
+# The `perception` demo: a REAL per-node-crate Cerulion workspace that
+# exercises the replay tolerance layer end-to-end on recorded data.
+#
+# This is its OWN cargo workspace (like examples/go2): it is NOT a member
+# of the repo-root workspace. The root Cargo.toml lists explicit members and
+# never globs, and this directory carries its own `[workspace]`, so `cargo build
+# --workspace` at the repo root ignores it entirely, exactly the mechanism the
+# benches rely on. Path deps reach back up to the repo-root crates.
+[workspace]
+members = ["nodes/*"]
+resolver = "2"
+
+[workspace.dependencies]
+cerulion_core = { path = "../../crates/cerulion_core" }
+native_ros2_messages = { path = "../../crates/native_ros2_messages" }
+serde_yaml = "0.9"

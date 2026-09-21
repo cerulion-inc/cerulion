@@ -1,0 +1,11 @@
+{
+  "what": "One sha256 per figure over its plotted points (series label, source path and every p50/p99 point, as canonical JSON), recorded when the figures were reviewed. build_benchmark_plots.py recomputes each hash from what it is about to draw and refuses to draw on a mismatch.",
+  "figures": {
+    "native-rtt": {
+      "points_sha256": "9fa493ee37037f585349871197f9c1823cc6986d75fe8d9d01c12106122b6d43"
+    },
+    "platform-rtt": {
+      "points_sha256": "d3ae0f90e4c6fb65144f01248b744e2191e33ca137dcc8909faf1fa62f3b53b1"
+    }
+  }
+}

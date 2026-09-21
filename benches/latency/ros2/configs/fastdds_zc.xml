@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  FastDDS profile — SHM transport + DataSharing AUTOMATIC (the `zc`
+  lane: FastDDS's TRUE zero-copy path). Audit fix C1.
+
+  This is the rmw_fastrtps README's own zero-copy recipe, verbatim in
+  shape (https://github.com/ros2/rmw_fastrtps — "Full support for
+  Zero Copy" section): publisher/subscriber default profiles carrying
+  <data_sharing><kind>AUTOMATIC</kind></data_sharing>, loaded with
+  RMW_FASTRTPS_USE_QOS_FROM_XML=1 in the environment (run_bench.sh
+  exports it for shm mode `zc` only). Because it is the vendor's own
+  recommended configuration, this lane cannot be called tuning.
+
+  Why a separate lane exists (and why the plain `shm` lane does NOT
+  get DataSharing): rmw_fastrtps calls writer_qos.data_sharing().off()
+  and reader_qos.data_sharing().off() inside
+  `if (!participant_info->leave_middleware_default_qos)` on BOTH the
+  jazzy and lyrical/rolling branches (publisher.cpp /
+  subscription.cpp); leave_middleware_default_qos flips only with
+  RMW_FASTRTPS_USE_QOS_FROM_XML=1. So out-of-box ROS 2 runs Fast DDS
+  with its zero-copy mechanism forced off — the `shm` lane measures
+  that stock-defaults behavior (labeled as such), and THIS lane
+  measures Fast DDS at its vendor-recommended best.
+
+  DataSharing vs the SHM transport (copy-count story): on the `shm`
+  lane a sample rides loaned write -> SHM segment copy -> reader
+  history copy -> loaned take; with DataSharing the writer history IS
+  the shared segment — the documented constraints (bounded plain
+  non-keyed type, PREALLOCATED* memory policy, reader depth <= writer
+  depth) are all satisfied by the bench's fixed-size Pod<N> types
+  under both QoS lanes (be1 = KEEP_LAST(1), rel10 = KEEP_LAST(10)).
+  Reliability is NOT in Fast DDS's data-sharing constraint list.
+
+  The SHM transport descriptor below is kept identical to
+  fastdds_shm.xml (64 MiB segment) so the only delta between the two
+  lanes is DataSharing itself: discovery still needs the builtin
+  UDP transports, and any endpoint that fails the data-sharing
+  eligibility gate falls back to the same tuned SHM transport the
+  stock lane uses. There is NO per-size 16 MB segment switch on this
+  lane — DataSharing bypasses the transport segment, fragmentation,
+  and the >=1MB async FlowController entirely, which is also why this
+  lane is the first thing to try where the 16 MB SHM-transport cell
+  has never passed.
+
+  NOTE RMW_FASTRTPS_USE_QOS_FROM_XML=1 also hands publish-mode and
+  history-memory-policy control to the XML/Fast DDS defaults (the rmw
+  stops forcing ASYNCHRONOUS publish mode + PREALLOCATED_WITH_REALLOC)
+  — that is part of the vendor recipe, not a side effect we suppress.
+  ROS-level QoS (reliability/durability/depth from bench_qos()) still
+  applies to the DDS entities.
+
+  Distro reality (verify on your machine; the verify_shm.sh probe fails LOUDLY
+  either way): jazzy = Fast DDS 2.14.x, lyrical = 3.6.2 — data_sharing
+  is a valid DataWriter/DataReader QoS element in both XSDs. Humble's
+  apt Fast-DDS 2.6.x SEGFAULTED parsing these elements in the May-2026
+  campaign (rc=139 on a one-shot `ros2 topic pub`) — a humble zc cell
+  is expected to fail its verify probe loudly, keeping humble
+  stock-defaults-only as a measured, documented limitation.
+
+  Engagement evidence: DataSharing writer segments appear as
+  /dev/shm/fast_datasharing_* while a zc cell runs; run_bench.sh's
+  clean_shm removes stale ones between sizes (the `fastdds shm clean`
+  convention).
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_transport</transport_id>
+        <type>SHM</type>
+        <segment_size>67108864</segment_size>
+        <port_queue_capacity>1024</port_queue_capacity>
+        <healthy_check_timeout_ms>1000</healthy_check_timeout_ms>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="participant_default" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_transport</transport_id>
+        </userTransports>
+        <!-- useBuiltinTransports=true is REQUIRED on Fast DDS 2.14+/3.x:
+             PDP discovery always uses UDP/TCP even when SHM/DataSharing
+             is enabled (Fast DDS SHM transport docs). Disabling builtin
+             transports kills participant matching. -->
+        <useBuiltinTransports>true</useBuiltinTransports>
+      </rtps>
+    </participant>
+    <publisher profile_name="datawriter_default" is_default_profile="true">
+      <qos>
+        <data_sharing>
+          <kind>AUTOMATIC</kind>
+        </data_sharing>
+      </qos>
+    </publisher>
+    <subscriber profile_name="datareader_default" is_default_profile="true">
+      <qos>
+        <data_sharing>
+          <kind>AUTOMATIC</kind>
+        </data_sharing>
+      </qos>
+    </subscriber>
+  </profiles>
+</dds>

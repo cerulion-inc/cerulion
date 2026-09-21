@@ -1,0 +1,135 @@
+# Release: publish the Cerulion crate stack to crates.io
+#
+# Publishes in dependency order. Triggered manually (workflow_dispatch) or by
+# pushing a `v*` tag. Uses `cargo publish --workspace`, which resolves the
+# inter-crate order itself and waits for each crate to land on the index
+# before publishing its dependents — driven through `tools/scripts/publish_crates.sh`,
+# which waits out crates.io's new-crate rate limit and resumes with only the
+# crates not yet on the index (the v0.1.0 run died on that limit after 6 of
+# 17 crates, and a plain `cargo publish --workspace` cannot be re-run once
+# any member is published).
+#
+# rmw_cerulion is intentionally NOT published (path-only deps; ROS2 rmw C-ABI
+# layer, not part of the CLI stack) — it carries `publish = false`, so
+# `cargo publish --workspace` skips it automatically.
+#
+# A REAL publish only happens on a `v*` tag push, where the tag↔version guard
+# runs. `workflow_dispatch` is dry-run ONLY (package + verify, never upload) —
+# this removes any path that could upload an unguarded version to crates.io.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    # publish_crates.sh's OWN retry budget is 90 min (its DEADLINE_SECONDS): it
+    # waits out crates.io's new-crate rate limit for at most that long, then
+    # exits cleanly with cargo's status. This job timeout MUST stay strictly
+    # greater than that budget so the script fails with a clear message instead
+    # of being SIGKILLed mid-attempt; the 30-min margin covers checkout, cache
+    # restore, the first attempt's verify builds and a final, smaller attempt.
+    #
+    # CROSS-WORKFLOW: release-artifacts.yml runs on the same tag; its smoke job
+    # waits on crates.io only 2700s (45 min) with a 45-min timeout — shorter than
+    # this 90-min budget, so a heavily rate-limited publish can finish after that
+    # smoke fails. That loses no release: release-artifacts.yml uploads the
+    # GitHub Release BINARIES from its own `release` job independently of
+    # crates.io, and the APT publish gate keys on that `release`
+    # job, so a slow crates.io publish only delays the crates.io-dependent smoke.
+    # Raising the smoke's crates.io wait/timeout to cover this budget is the
+    # complementary knob and lives in release-artifacts.yml, not here.
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      IOX2_LOG_LEVEL: error
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      # The publish job verifies all 17 workspace crates back to back on one
+      # hosted runner: a dry run died 17 minutes in with
+      # "No space left on device". On a v* tag the same job
+      # uploads as it goes, so running out of disk mid-way would leave crates.io
+      # half-published — and a published version can never be re-published.
+      # Same reclaim as examples-replay.yml: ~25 GB of
+      # preinstalled SDKs this job never uses.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          df -h /
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-
+            cargo-${{ runner.os }}-
+
+      # Guard: internal [workspace.dependencies] versions must match
+      # [workspace.package].version, or downstream crates fail to resolve on
+      # crates.io mid-publish. Runs on every trigger (dispatch + tag) so a
+      # mismatch fails fast BEFORE any upload.
+      - name: Verify internal dependency versions are in sync
+        run: bash tools/scripts/check_version_sync.sh
+
+      # Guard: the tag (vX.Y.Z) must match [workspace.package].version.
+      - name: Verify tag matches workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(tools/scripts/workspace_version.sh)
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag != workspace version $ver"; exit 1
+          fi
+
+      # Guard: the SAME citation check release-artifacts.yml applies before it
+      # uploads anything. Both workflows fire on one tag push and this one is
+      # the irreversible half (a crates.io version can never be re-published),
+      # so it must refuse for every reason the artifacts workflow refuses —
+      # otherwise a stale CITATION.cff date ships 17 crates with no release.
+      - name: Verify citation metadata matches the release
+        run: |
+          version=$(tools/scripts/workspace_version.sh)
+          tag_ref_name=
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && \
+             printf '%s' "${GITHUB_REF}" | grep -q '^refs/tags/v'; then
+            tag_ref_name=$GITHUB_REF_NAME
+          fi
+          tools/scripts/check_citation_release.sh "$version" "$tag_ref_name"
+
+      - name: Dry-run (package + verify, no upload)
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo publish --workspace --dry-run
+
+      # Real publish ONLY on an actual v* tag PUSH — the tag↔version guard above
+      # always runs on this path, so an unguarded version can never reach
+      # crates.io. The `event_name == 'push'` clause is load-bearing: a
+      # workflow_dispatch can target a tag ref (making github.ref a refs/tags/v),
+      # so without it a manual dispatch on a tag would upload, breaking the
+      # "dispatch is dry-run only" contract.
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: tools/scripts/publish_crates.sh

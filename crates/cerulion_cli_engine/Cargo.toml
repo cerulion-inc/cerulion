@@ -1,0 +1,294 @@
+[package]
+name = "cerulion_cli_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Command engine for the Cerulion CLI: workspace, node, graph, topic, and schema command logic"
+readme = "README.md"
+keywords = ["robotics", "cli", "zero-copy", "middleware", "cerulion"]
+categories = ["science::robotics", "development-tools"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[features]
+# Exposes the forge-shaped `auth::seed_logged_in_at` test-provisioning
+# helper (writes a logged-in-ever auth.json). NOT enabled by default, so a shipped
+# binary linking this lib carries no one-call "mint a passing login gate" surface;
+# the crate's own `cfg(test)` tests see it without the feature.
+#
+# The replay verifier's per-site RECORD-BUDGET overrides
+# (`replay_engine::override_{read_log,frame_index,schedule}_record_budget`) sit behind
+# the same gate, for the same reason: a shipped binary must carry no way to
+# shrink the budget the three `VerifierDecline` budget causes are measured
+# against. Unlike `seed_logged_in_at`, these ARE reached from the integration
+# tests, which is what the dev-dependency self-reference below is for.
+test-seams = []
+
+[dependencies]
+cerulion_core = { workspace = true }
+# Promoted from a dev-dependency to a real dependency — the
+# schema-introspection seam (`schema_cmd::builtin_layout_resolver`) reads
+# the embedded `native_ros2_messages::BUILTIN_MSGS` registry at CLI
+# runtime. Path + exact `version` per the workspace's internal-crate
+# publish policy (root Cargo.toml `[workspace.dependencies]` note); keep
+# the version in lockstep with `[workspace.package].version`.
+native_ros2_messages = { workspace = true }
+# The DDS platform crate backing `cerulion ros2 attach`. The engine's
+# `ros_cmd` command logic is PURE over the plain discovery types (DiscoveredEndpoint
+# / DdsDiscovery / DdsError). `default-features = false` = types + trait ONLY, so
+# the engine's isolated builds/tests stay FREE of the DDS stack (mio/net2/rustdds);
+# the live backend (LiveDiscovery, behind the `live` feature — default distro
+# `jazzy`, the Iron+ 16-byte-GID world the wire rung targets) is wired by the
+# binary, which pulls cerulion_dds's default features.
+cerulion_dds = { workspace = true }
+# The LAN peer-discovery substrate — the discovered-peer types, the
+# `~/.cerulion/peers.json` format + READER, the bounded TCP reachability
+# pre-filter, and the pure connect-set planner. Extracted from this crate's
+# `discovery_ladder`/`peer_cache` so `cerulion-netd` can fold TTL-fresh cached
+# peers into its own session without a `netd -> cli_engine` cyclic edge (this
+# crate depends on netd for `NetdClient`). Unconditional, NOT unix-gated: the
+# ladder + `completions` read the cache on every platform, unlike the
+# `cfg(unix)` netd dep below.
+cerulion_discovery = { workspace = true }
+# The vizd socket ladder the `viz` verb resolves — the SAME constant the daemon binds.
+cerulion_hygiene = { workspace = true }
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+# Replaces the hand-rolled
+# `\\\"` / `\\\\` un-escape in `node_metadata::try_parse_raw_ffi_node`
+# with a real JSON parser. `cerulion_core` already pulls
+# `serde_json` transitively; listing it explicitly here.
+serde_json = "1"
+# `cerulion bag migrate` stamps the SOURCE bag's SHA-256 into the
+# `__cerulion/migration.json` provenance attachment, so a migrated bag can be
+# checked back against the recording it descends from. `sha2 = "0.10"` is
+# already the workspace's digest crate (cerulion_pairing, cerulion_accountd,
+# cerulion_remoted, cerud, cerulion_viz) and is already allow-listed by
+# `deny.toml` — this adds a version, not a new dependency to audit.
+sha2 = "0.10"
+regex = "1.10"
+# Must track `cerulion_core`'s iceoryx2 version (0.9). The CLI's
+# `topic_cmd::topic_list` / `topic_info` introspection path calls
+# `iceoryx2::service::Service::list(Config::global_config(), ...)` to
+# enumerate the services the runtime created via `cerulion_core`'s
+# iceoryx2 node. Static-config storage format + paths are NOT compatible
+# across iceoryx2 majors, so a stale `0.8` here links a *second* iceoryx2
+# whose `Service::list` cannot see 0.9-created services in the same
+# process — `topic list` silently returns `[]`. PINNED to EXACT
+# `=0.9.1` to match `cerulion_core/Cargo.toml` — a 0.9.x *patch* bump
+# (e.g. 0.9.2) changes the SHM event-protocol wire format, so a fresh
+# workspace that re-resolves cli_engine's own iceoryx2 dep to a newer
+# patch would re-introduce the same `topic list`/`topic info` skew the
+# `cerulion_core` pin closes. Bump both in lockstep.
+iceoryx2 = "=0.9.1"
+indexmap = "2.8"
+# Discovery ladder: pure-Rust mDNS-SD service discovery for the
+# primary discovery rung (`mdns_discovery::browse_rung`) — by design.
+# No C deps; advertises + browses `_cerulion._tcp` on the LAN.
+mdns-sd = "0.20"
+# The `_cerulion._tcp` ADVERTISE half, extracted so `cerulion-netd`
+# (which now hosts the robot serving plane) runs the SAME beacon.
+# `cerulion_cli_engine` depends on `cerulion_netd`, so the beacon could not live
+# here without a cyclic edge. The BROWSE half stays in `mdns_discovery`.
+cerulion_mdns = { workspace = true }
+# Resolve the home dir for the peer cache (`~/.cerulion/peers.json`,
+# `peer_cache`) and the peers config (`~/.cerulion/config.toml`,
+# `hostname_peers`). Already in the workspace lockfile transitively.
+dirs = "6"
+# Parse the `~/.cerulion/config.toml` `peers = [...]` list
+# (`hostname_peers`). Already in the workspace lockfile transitively.
+toml = "0.9"
+#
+# The pairing-store fix keeps the `~/.cerulion/robots.toml` WRITE path on THIS crate
+# rather than adding `toml_edit`: the merge edits a `toml::Table` (the whole
+# parsed document) instead of a typed struct, which is what preserves foreign
+# top-level keys. `toml_edit` 0.25 was tried first — it would additionally
+# preserve comments — and it does NOT resolve: it requires `toml_writer ^1.1.2`
+# while `toml` 0.9.11 pins 1.0.6, so adopting it means bumping a dependency
+# shared with every other `toml` user in the tree. Not worth it for a
+# machine-written pairing store; see `merge_robots_toml` for the residual.
+# Discovery rung 4 (`--scan`): enumerate local IPv4 interfaces + netmasks to derive
+# the /24(s) the opt-in subnet sweep probes (`subnet_sweep::local_ipv4_subnets`).
+# Pure Rust (libc/windows-sys only); ALREADY in the workspace lockfile at 0.15
+# transitively (mdns-sd pulls it), so this direct dep re-uses the SAME
+# already-cargo-deny-vetted crate — no new resolution.
+if-addrs = "0.15"
+# AST-walk node source files to detect the
+# `#[cerulion_node]` attribute on actual structs (not in
+# comments / strings / etc.). `full` enables the item-level
+# (struct/fn/mod/...) AST nodes we walk. `parsing` enables
+# `syn::parse_file`; in syn 2.x it's part of the default
+# feature set, but we list it explicitly so a future
+# `default-features = false` doesn't silently break parsing.
+syn = { version = "2", features = ["full", "parsing"] }
+# `proc-macro2` is already pulled in transitively by `syn`; we
+# depend on it directly so we can name `TokenTree::Ident` when
+# scanning macro-arg tokens (see `node_metadata.rs::macro_attr_carries_external`).
+# The `span-locations` feature
+# enables `Span::byte_range()` in fallback (non-proc-macro)
+# mode — required for `inject_macro_field`'s
+# Span-based body-brace location in `templates.rs`.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+# The multi-process supervisor's clean-shutdown path SIGINTs each
+# remaining worker (`ChildGuard::signal_int`) so it self-drops from the barrier
+# cohort and exits 0 — `libc::kill` (Unix-only; the reference is `#[cfg(unix)]`, the
+# supervisor is Linux-only at runtime). Matches `cerulion_cli`'s existing libc
+# dev-dep used by its tests' process-group signals.
+libc = "0.2"
+
+# Login flow: the account-service HTTP client. reqwest 0.13 is
+# already in the workspace lockfile, so the crate itself is not new. `blocking` =
+# the synchronous client the sync CLI uses (no tokio in the CLI); `json` = the
+# request/response bodies. The production default is HTTPS, so the
+# CLI MUST carry a TLS backend: `rustls-no-provider` pulls
+# rustls-platform-verifier (the system root store) while naming no crypto
+# provider — the `ring` provider below is what the iroh tree (netd/connectd,
+# the release package set) already resolves rustls to, so the release build
+# unifies to ONE provider and adds no aws-lc-rs/cmake requirement.
+# `login_cmd::http_client` — the crate's only client builder — installs the
+# provider explicitly so a build that ALSO unifies
+# aws-lc-rs (cerulion_accountd's reqwest `rustls` feature, e.g. `cargo build
+# --workspace`) cannot leave rustls with two candidate providers and a
+# panicking `ClientConfig::builder()` (the hazard
+# cerulion_accountd/Cargo.toml documents for its tests).
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-no-provider",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+# Derive the ed25519 device PUBLIC key from the 32-byte device seed
+# for `POST /v1/devices`. Same 2.x line cerulion_pairing / cerulion_accountd pin
+# (one ed25519-dalek in the tree).
+ed25519-dalek = "2"
+# Generate the 32-byte device seed (0600 `~/.cerulion/desk.key`).
+# Already in the lockfile (cerulion_wireclient / cerulion_accountd use it).
+getrandom = "0.3"
+# Base64url-encode the device public key for `POST /v1/devices`
+# (matches accountd's `parse_pubkey_b64`, URL_SAFE_NO_PAD). Already locked.
+base64 = "0.22"
+# The proof-of-possession gesture (`pop::sign_pop`) the desk/robot
+# uses to prove it holds the private half of a transport key, + the desk-side
+# device-cert binding resolver (decodes the cached `SignedDeviceCert`). Shared with
+# the account service so the signer + verifier never drift on the message bytes.
+# cerulion_pairing is permissive (MIT OR Apache-2.0) and has NO network / iroh dep
+# ("formats, cryptography, and state machines" only), so this adds no C toolchain
+# and keeps the default build iroh-lean.
+cerulion_pairing = { workspace = true }
+# Decode the cached `SignedDeviceCert` (~/.cerulion/device.cert): the
+# byte-deterministic container format cerulion_pairing / cerulion_accountd already
+# use on the wire (base64url(postcard(cert))). Already in the lockfile.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+
+# `cerulion graph run --record` spawns the `bagd` recorder
+# binary and hands it the exact per-topic schemas via the shared
+# `cerulion_bagd::RecordedTopic` JSON DTO. `cerulion_bagd`'s lib is `#![cfg(unix)]`
+# (it spawns a Unix daemon + SIGTERM teardown), so the dependency + the CLI's
+# recording orchestration are Unix-gated — a non-Unix `--record` returns a loud
+# "unsupported on this platform" error.
+[target.'cfg(unix)'.dependencies]
+cerulion_bagd = { workspace = true }
+# `cerulion replay` reads a recorded MCAP bag back via
+# `cerulion_bag::BagReader` (completeness, scheduler-trace, attachments). The
+# `cerulion_bag` crate is `#![cfg(unix)]` (it reuses `cerulion_core`'s Unix-only
+# `trace_ring::TraceRingRecord`), so the dependency + the `replay_cmd` module it
+# feeds are Unix-gated — a non-Unix `cerulion replay` returns a loud
+# "unsupported on this platform" error (mirrors `cerulion bagd`).
+cerulion_bag = { workspace = true }
+# `topic echo`/`info`/`hz` demand a remote topic's shared mirror from
+# the one-per-computer `cerulion-netd` daemon (over its UDS control seam) instead
+# of opening their own zenoh session. `cerulion_netd` is a Unix daemon (UDS +
+# flock), so — like `cerulion_bagd`/`cerulion_bag` — it is Unix-gated; the non-Unix
+# build's remote-observe path returns a loud "requires Unix" error.
+# `default-features = false`: netd's `wan` feature is now
+# default-on (the iroh WAN plane ships by default, by design), but the CLI
+# consumes ONLY the lean `NetdClient` UDS surface, so it must NOT link iroh. This
+# `default-features = false` subtracts THIS edge's wan; the load-bearing half is that
+# netd is excluded from `default-members` (root Cargo.toml) so cargo's per-package
+# feature unification cannot turn wan back on for the one shared netd rlib the CLI
+# links. Verify the WHOLE default build (not the isolated `-p cerulion_cli_engine`
+# graph, which cannot observe unification): `cargo tree -e normal -i iroh` at the
+# workspace root must find nothing — pinned by the `iroh-leanness` CI job.
+cerulion_netd = { workspace = true }
+
+[dev-dependencies]
+# The repo's `test-helpers`/`test-seams` idiom (cerulion_core,
+# cerulion_bag, cerulion_bagd, cerulion_viz, cerulion_vizd, cerulion_remoted and
+# cerud all carry the same self-reference) — it turns `test-seams` ON for the
+# INTEGRATION test targets, which link the non-test rlib and so cannot see this
+# crate's `cfg(test)` items. Path-only, no `version`, per the publish policy above:
+# `cargo package` strips path-only dev-dependencies, so this cannot become a
+# publish-time cycle.
+#
+# COST, stated because it has bitten this repo before: the self-reference
+# feature-unifies `test-seams` ON for every command that builds a test target,
+# `cargo test -p cerulion_cli_engine` and `cargo clippy -p cerulion_cli_engine
+# --all-targets` included — so neither compiles the lib WITHOUT the feature. The
+# only local probe that does is the BARE `cargo check -p cerulion_cli_engine` /
+# `cargo clippy -p cerulion_cli_engine -- -D warnings`; run it after touching any
+# `cfg(any(test, feature = "test-seams"))` gate.
+cerulion_cli_engine = { path = ".", features = ["test-seams"] }
+tempfile = "3"
+# `bagd_argv` builds a PRIVATE argv between this binary and itself, and
+# nothing checked that the recorder ACCEPTS it — so reserving the `__cerulion/`
+# attachment namespace at bagd's `--attach` broke every `graph run --record` at
+# startup with the whole engine suite green. `graph_cmd`'s composition arm now
+# parses that argv with the REAL `cerulion_bagd::BagdArgs` derive and runs bagd's
+# own validators over the result. Dev-only, and it adds nothing to the shipped
+# tree: `cerulion_bagd` is already a normal dependency and already enables
+# clap's `derive`.
+clap = { version = "4", features = ["derive"] }
+# The device-code login e2e drives `login_cmd::run_login` against the
+# REAL account-service router on an ephemeral port (Principle #13 — no mock
+# service). `cerulion_accountd` is a path dev-dep (out of default-members, so the
+# default build never links it); `tokio` serves the axum router on a background
+# runtime while the blocking `run_login` drives the client from the main thread.
+cerulion_accountd = { path = "../cerulion_accountd" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+# Replay memory scaler: the replay-RSS scaling test (`replay_engine_test.rs`)
+# reads its own peak resident set via `getrusage` in a replay-only subprocess.
+# `libc` is already a normal dependency; listing it here makes it directly
+# nameable from the separate integration-test crate.
+libc = "0.2"
+# `#[serial]` for the multi-process worker test
+# (`tests/mp_worker_box_test.rs`) — the iceoryx2 SHM singleton + the barrier
+# registry make the cross-process supervisor tests mutually exclusive. Tracks
+# `cerulion_core`'s `serial_test = "3"`.
+serial_test = "3"
+# The multi-process worker test serializes a `WorkerPlan` + the minted iceoryx2
+# `Config` to disk. `serde_json` is already a normal dependency; listing it under
+# dev-dependencies makes it directly nameable from the separate integration-test
+# crate (`tests/mp_worker_box_test.rs`).
+serde_json = "1"
+# The pinned schema-hash literals in `topic_cmd.rs` are kept in
+# sync with the generated constants by a test in tests/integration_test.rs.
+# `native_ros2_messages` is now a real [dependencies] entry
+# (above); the former dev-dependency here was redundant and removed.
+# `test-helpers` exposes `ClosureNodeEntry` so unit tests in
+# `graph_cmd.rs` can build an in-process `GraphRuntime` without
+# pulling in iceoryx2.
+cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+# `no-env-filter` is required so the test subscriber doesn't filter
+# out cross-crate events. Without it, `#[traced_test]` builds an
+# EnvFilter scoped to the test crate's `module_path!()` and silently
+# drops emissions from `cerulion_cli_engine::node_cmd` when invoked
+# from `cerulion_cli_engine`'s integration tests. See
+# `reference_tracing_test_no_env_filter.md`.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }

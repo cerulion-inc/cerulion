@@ -1,0 +1,7 @@
+#!/bin/sh
+# leak guard: commit-msg hook. Scans the message and the author and committer
+# identities, then chains to the hook that was active before. All logic lives
+# in tools/scripts/leak_scan.py; see docs/leak_guard.md.
+# shellcheck source=tools/hooks/leak-guard-lib.sh
+. "$(dirname "$0")/leak-guard-lib.sh"
+leak_guard_run commit-msg "$1"

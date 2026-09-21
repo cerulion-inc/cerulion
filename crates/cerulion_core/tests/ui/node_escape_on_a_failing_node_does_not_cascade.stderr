@@ -1,0 +1,13 @@
+error: cannot combine `#[input(trigger)]` with `period_ms` or `external`; trigger inputs define data-driven policy, which conflicts with time-driven policy
+  --> tests/ui/node_escape_on_a_failing_node_does_not_cascade.rs:31:1
+   |
+31 | #[cerulion_node(period_ms = 10)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `input` in this scope
+  --> tests/ui/node_escape_on_a_failing_node_does_not_cascade.rs:34:7
+   |
+34 |     #[input(trigger)]
+   |       ^^^^^

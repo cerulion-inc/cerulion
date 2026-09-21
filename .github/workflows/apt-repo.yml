@@ -1,0 +1,422 @@
+name: Publish APT repository
+
+# Two ways in. A tag push publishes that tag once release-artifacts.yml has
+# uploaded its debs. A manual dispatch (re)publishes an EXISTING tag whose
+# assets are already on the GitHub Release; it exists because a tag push
+# that reached the assets but not this workflow (the v0.1.0 case)
+# has no other way back in. Publication is additive, so re-running a tag
+# that is already in the pool re-signs the metadata and deletes nothing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing release tag to (re)publish, e.g. v0.1.0"
+        required: true
+        type: string
+
+concurrency:
+  group: apt-repository
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  AWS_PAGER: ""
+  # The ONE place the tag is chosen; every `run:` below reads $TAG. On a
+  # dispatch `inputs.tag` wins; on a tag push it is the pushed ref. An EMPTY
+  # dispatch input would fall through to `github.ref_name` (the branch the
+  # dispatch ran from), which the probe step refuses by comparing $TAG with
+  # the raw input.
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  preflight:
+    name: Wait for release assets
+    runs-on: ubuntu-22.04
+    # Release artifacts allow 45 minutes; the 60-minute poll deadline needs both.
+    timeout-minutes: 105
+    outputs:
+      available: ${{ steps.inputs.outputs.available }}
+      stable: ${{ steps.inputs.outputs.stable }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # On a tag push a prerelease tag or missing configuration is a SKIP: the
+      # push also made a GitHub Release, and an APT publish is optional for
+      # it. On a dispatch the operator asked for exactly this publish, so the
+      # same conditions are ERRORS — a green run that published nothing is
+      # the outcome a manual re-publish exists to rule out.
+      - name: Probe APT publishing inputs
+        id: inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.tag }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_S3_BUCKET: ${{ vars.APT_S3_BUCKET }}
+          APT_AWS_ROLE_ARN: ${{ secrets.APT_AWS_ROLE_ARN }}
+          APT_CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.APT_CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          # APT_GPG_KEY_ID is optional; it overrides the recorded fingerprint
+          # fallback used by the import step below.
+          # APT_CLOUDFRONT_PATH_PREFIX and APT_KEYRING_REVISION are optional.
+          if [ -z "$TAG" ]; then
+            echo "::error::TAG is empty; this workflow runs on a tag push or a workflow_dispatch naming an existing tag"
+            exit 1
+          fi
+          dispatch=false
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            dispatch=true
+            if [ "$TAG" != "$INPUT_TAG" ]; then
+              echo "::error::the workflow_dispatch input 'tag' is empty (TAG fell back to '$TAG'); pass the existing release tag to (re)publish, e.g. v0.1.0"
+              exit 1
+            fi
+          fi
+          stable=false
+          if printf '%s' "$TAG" |
+               grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' &&
+             tools/scripts/debian_version.sh "${TAG#v}" >/dev/null; then
+            stable=true
+          elif [ "$dispatch" = true ]; then
+            echo "::error::'$TAG' is not a stable release tag (vMAJOR.MINOR.PATCH); prereleases are GitHub-release-only and are never published to APT"
+            exit 1
+          else
+            echo "APT repository publish skipped for prerelease/non-semver tag $TAG; prereleases are GitHub-release-only"
+          fi
+          # The commit the release-artifacts candidates are matched on. A tag
+          # push runs AT the tag's commit, so GITHUB_SHA is it. A dispatch runs
+          # at the head of the branch it was dispatched from, so the tag is
+          # looked up — and an annotated tag points at a tag OBJECT, which is
+          # peeled to its commit.
+          if [ "$dispatch" = true ]; then
+            if ! object=$(gh api "repos/$REPOSITORY/git/ref/tags/$TAG" \
+                --jq '[.object.type, .object.sha] | @tsv'); then
+              echo "::error::tag $TAG does not exist in $REPOSITORY; nothing to (re)publish"
+              exit 1
+            fi
+            object_type=$(printf '%s' "$object" | cut -f1)
+            commit=$(printf '%s' "$object" | cut -f2)
+            peeled=0
+            while [ "$object_type" = tag ]; do
+              peeled=$((peeled + 1))
+              if [ "$peeled" -gt 5 ]; then
+                echo "::error::tag $TAG nests more than 5 tag objects deep; refusing to guess its commit"
+                exit 1
+              fi
+              if ! object=$(gh api "repos/$REPOSITORY/git/tags/$commit" \
+                  --jq '[.object.type, .object.sha] | @tsv'); then
+                echo "::error::could not dereference tag object $commit reached from $TAG"
+                exit 1
+              fi
+              object_type=$(printf '%s' "$object" | cut -f1)
+              commit=$(printf '%s' "$object" | cut -f2)
+            done
+            if [ "$object_type" != commit ] || [ -z "$commit" ]; then
+              echo "::error::tag $TAG resolves to a '$object_type' object, not a commit"
+              exit 1
+            fi
+            echo "tag $TAG is at commit $commit"
+          else
+            commit=$GITHUB_SHA
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          missing=
+          [ -n "$APT_GPG_PRIVATE_KEY" ] || missing="$missing APT_GPG_PRIVATE_KEY"
+          [ -n "$APT_S3_BUCKET" ] || missing="$missing vars.APT_S3_BUCKET"
+          [ -n "$APT_AWS_ROLE_ARN" ] || missing="$missing APT_AWS_ROLE_ARN"
+          [ -n "$APT_CLOUDFRONT_DISTRIBUTION_ID" ] || missing="$missing vars.APT_CLOUDFRONT_DISTRIBUTION_ID"
+          if [ -n "$missing" ]; then
+            if [ "$dispatch" = true ]; then
+              echo "::error::APT repository publish cannot run; configure:$missing (optional: vars.APT_GPG_KEY_ID, vars.APT_CLOUDFRONT_PATH_PREFIX, and vars.APT_KEYRING_REVISION customize the publish)"
+              exit 1
+            fi
+            echo "APT repository publish skipped; configure:$missing (optional: vars.APT_GPG_KEY_ID, vars.APT_CLOUDFRONT_PATH_PREFIX, and vars.APT_KEYRING_REVISION customize the publish)"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "stable=$stable" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "stable=$stable" >> "$GITHUB_OUTPUT"
+
+      # This workflow runs separately from release-artifacts.yml (a tag push
+      # triggers both; a dispatch runs long after it). Wait for that
+      # workflow's release job rather than racing its assets.
+      #
+      # The gate is the "release" JOB ("Publish GitHub Release assets"), never
+      # the RUN's overall conclusion. The same run also carries the install
+      # smoke and Homebrew jobs, which fail for reasons that say nothing about
+      # the assets: the v0.1.0 run uploaded every asset and then
+      # lost its smoke and Homebrew jobs to 404s (the repository is not
+      # public, so their unauthenticated downloads fail). A run-level check
+      # counted that run as unsuccessful before it ever looked at the release
+      # job, and v0.1.0 was never published to APT although its debs existed.
+      # Per candidate run: release job queued or in progress -> keep waiting;
+      # completed and not successful -> unsuccessful; successful -> download
+      # the two debs and stop. The fast-fail below fires only when every
+      # candidate's release job has concluded unsuccessfully.
+      - name: Wait for GitHub Release debs
+        if: steps.inputs.outputs.available == 'true' && steps.inputs.outputs.stable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ steps.inputs.outputs.commit }}
+        run: |
+          if [ -z "$TAG" ] || [ -z "$COMMIT" ]; then
+            echo "::error::TAG ('$TAG') or its commit ('$COMMIT') is empty; the probe step must resolve both"
+            exit 1
+          fi
+          version=${TAG#v}
+          debian_version=$(tools/scripts/debian_version.sh "$version")
+          deadline=$(( $(date +%s) + 3600 ))
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            # Find this tag's release-artifacts.yml runs by asking the REST API
+            # for that workflow's push-event runs AT the tag's commit. Two
+            # properties matter, and each fixes a real bug in the `gh run list
+            # --limit 50` lookup this replaced:
+            #   * head_sha filters to the tag's commit and --paginate walks
+            #     EVERY matching run, so there is no fixed recent-run window: an
+            #     older tag re-published by dispatch still finds its run even
+            #     behind 50+ newer release-artifacts pushes (the 50-run window
+            #     hid it, and preflight then waited the full deadline and failed).
+            #   * a tag-push run's head_branch is the pushed TAG's ref name (the
+            #     API reports "v0.1.0", never null or empty), so requiring
+            #     head_branch == $TAG admits ONLY this tag. The old filter also
+            #     accepted null/empty head_branch, which let a failed SIBLING tag
+            #     pushed at the same commit fast-fail this tag wrongly.
+            # Run ids grow with time, so `sort -rn` orders candidates newest-first.
+            if ! candidate_runs=$(gh api --paginate \
+              "repos/$REPOSITORY/actions/workflows/release-artifacts.yml/runs?head_sha=$COMMIT&event=push" \
+              --jq '.workflow_runs[] | select(.head_branch == env.TAG) | .id' |
+              sort -rn); then
+              candidate_runs=
+            fi
+            candidate_count=0
+            unsuccessful_count=0
+            while IFS= read -r release_run_id; do
+              [ -n "$release_run_id" ] || continue
+              candidate_count=$((candidate_count + 1))
+              # One call per candidate: the run status is consulted ONLY when
+              # the release job does not exist; the decision is the job's own.
+              if ! run_state=$(gh run view "$release_run_id" --repo "$REPOSITORY" \
+                --json status,jobs --jq '
+                  [.status] + ([.jobs[] | select(.name == "release" or .name == "Publish GitHub Release assets")]
+                    | .[0] // {} | [(.name // ""), (.status // ""), (.conclusion // "")])
+                  | @tsv'); then
+                continue
+              fi
+              run_status=$(printf '%s' "$run_state" | cut -f1)
+              release_job_name=$(printf '%s' "$run_state" | cut -f2)
+              release_job_status=$(printf '%s' "$run_state" | cut -f3)
+              release_job_conclusion=$(printf '%s' "$run_state" | cut -f4)
+              if [ -z "$release_job_name" ]; then
+                # A queued run has not created its jobs yet: keep waiting. A run
+                # that completed without ever creating the release job (cancelled
+                # before it existed) never will: count it as unsuccessful.
+                if [ "$run_status" = completed ]; then
+                  unsuccessful_count=$((unsuccessful_count + 1))
+                fi
+                continue
+              fi
+              echo "release-artifacts run $release_run_id: job '$release_job_name' is $release_job_status${release_job_conclusion:+ ($release_job_conclusion)}"
+              [ "$release_job_status" = completed ] || continue
+              if [ "$release_job_conclusion" != success ]; then
+                unsuccessful_count=$((unsuccessful_count + 1))
+                continue
+              fi
+              # The job succeeded, so the assets exist; a failed download here
+              # is transient and the next poll retries it.
+              if gh release download "$TAG" --repo "$REPOSITORY" \
+                   --pattern "cerulion_${debian_version}_amd64.deb" \
+                   --pattern "cerulion_${debian_version}_arm64.deb" \
+                   --dir "$RUNNER_TEMP/release-assets" --clobber &&
+                 [ -f "$RUNNER_TEMP/release-assets/cerulion_${debian_version}_amd64.deb" ] &&
+                 [ -f "$RUNNER_TEMP/release-assets/cerulion_${debian_version}_arm64.deb" ]; then
+                exit 0
+              fi
+            done <<EOF
+          $candidate_runs
+          EOF
+            if [ "$candidate_count" -gt 0 ] &&
+               [ "$unsuccessful_count" -eq "$candidate_count" ]; then
+              echo "::error::every release-artifacts.yml candidate for tag $TAG at commit $COMMIT has a release job that concluded unsuccessfully (or never ran)"
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "::error::release-artifacts.yml did not successfully publish assets for tag $TAG at commit $COMMIT"
+          exit 1
+
+  publish:
+    name: Publish signed APT repository
+    if: needs.preflight.outputs.available == 'true' && needs.preflight.outputs.stable == 'true'
+    needs: preflight
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install apt-utils
+        run: sudo apt-get update && sudo apt-get install -y apt-utils
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.APT_AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Download release debs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "::error::TAG is empty"
+            exit 1
+          fi
+          version=${TAG#v}
+          debian_version=$(tools/scripts/debian_version.sh "$version")
+          deb_amd64="cerulion_${debian_version}_amd64.deb"
+          deb_arm64="cerulion_${debian_version}_arm64.deb"
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          gh release download "$TAG" --repo "$REPOSITORY" \
+            --pattern "$deb_amd64" \
+            --pattern "$deb_arm64" \
+            --pattern SHA256SUMS \
+            --dir "$RUNNER_TEMP/release-assets"
+          sums="$RUNNER_TEMP/release-assets/SHA256SUMS"
+          expected="$RUNNER_TEMP/release-assets/debs.sha256"
+          : > "$expected"
+          for deb in "$deb_amd64" "$deb_arm64"; do
+            checksum=$(awk -v archive="$deb" '$2 == archive { print $1; exit }' "$sums")
+            printf '%s' "$checksum" | grep -Eq '^[[:xdigit:]]{64}$' || {
+              echo "::error::missing or invalid SHA-256 checksum for $deb"
+              exit 1
+            }
+            printf '%s  %s\n' "$checksum" "$deb" >> "$expected"
+          done
+          (cd "$RUNNER_TEMP/release-assets" && sha256sum -c "$expected")
+
+      - name: Import signing key
+        id: key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PUBLIC_KEYS: ${{ secrets.APT_GPG_PUBLIC_KEYS }}
+          APT_GPG_KEY_ID: ${{ vars.APT_GPG_KEY_ID }}
+          APT_KEYRING_KEYS: ${{ vars.APT_KEYRING_KEYS }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
+          mkdir -m 0700 "$GNUPGHOME"
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          if [ -n "$APT_GPG_PUBLIC_KEYS" ]; then
+            printf '%s\n' "$APT_GPG_PUBLIC_KEYS" | gpg --batch --import
+          fi
+          expected=${APT_GPG_KEY_ID:-953C69FD279D9256FA4B71C5DA5FDE5D0DC6D91B}
+          configured_file="$RUNNER_TEMP/apt-configured-fingerprints"
+          ordered_file="$RUNNER_TEMP/apt-ordered-fingerprints"
+          expected_file="$RUNNER_TEMP/apt-expected-fingerprints"
+          imported_file="$RUNNER_TEMP/apt-imported-fingerprints"
+          printf '%s\n' "$expected" | tr ',' '\n' |
+            sed 's/[[:space:]]//g' | tr '[:lower:]' '[:upper:]' > "$configured_file"
+          if grep -q '^$' "$configured_file"; then
+            echo "::error::APT_GPG_KEY_ID contains an empty fingerprint"
+            exit 1
+          fi
+          awk '!seen[$0]++' "$configured_file" > "$ordered_file"
+          sort -u "$ordered_file" > "$expected_file"
+          if [ ! -s "$expected_file" ]; then
+            echo "::error::APT_GPG_KEY_ID contains no fingerprints"
+            exit 1
+          fi
+          gpg --batch --with-colons --list-secret-keys |
+            awk -F: '$1 == "sec" { want_fpr = 1; next }
+              want_fpr && $1 == "fpr" { print $10; want_fpr = 0 }' |
+            tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' | sort -u > "$imported_file"
+          if [ ! -s "$imported_file" ]; then
+            echo "::error::no imported APT signing key"
+            exit 1
+          fi
+          # Every configured signing key must be present in the secret. Extra
+          # imported keys are allowed so a rotation can retain old material
+          # while the bootstrap keyring remains a superset.
+          while IFS= read -r fingerprint; do
+            if ! grep -Fqx "$fingerprint" "$imported_file"; then
+              echo "::error::APT signing key is missing from secrets.APT_GPG_PRIVATE_KEY: $fingerprint"
+              exit 1
+            fi
+          done < "$expected_file"
+          keyring_expected=${APT_KEYRING_KEYS:-$expected}
+          printf '%s\n' "$keyring_expected" | tr ',' '\n' |
+            sed 's/[[:space:]]//g' | tr '[:lower:]' '[:upper:]' |
+            awk 'NF && !seen[$0]++' > "$RUNNER_TEMP/apt-keyring-fingerprints"
+          while IFS= read -r fingerprint; do
+            if ! gpg --batch --list-keys "$fingerprint" >/dev/null 2>&1; then
+              echo "::error::add missing public key $fingerprint to secrets.APT_GPG_PUBLIC_KEYS for APT_KEYRING_KEYS"
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/apt-keyring-fingerprints"
+          # The first configured key clearsigns InRelease, so this order is load-bearing.
+          fingerprints=$(paste -sd, "$ordered_file")
+          echo "APT signing key fingerprints: $fingerprints"
+          echo "fingerprint=$fingerprints" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve existing pool and build repository
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+          APT_S3_BUCKET: ${{ vars.APT_S3_BUCKET }}
+          APT_S3_PREFIX: ${{ vars.APT_S3_PREFIX }}
+          APT_CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.APT_CLOUDFRONT_DISTRIBUTION_ID }}
+          APT_CLOUDFRONT_PATH_PREFIX: ${{ vars.APT_CLOUDFRONT_PATH_PREFIX }}
+          APT_KEYRING_REVISION: ${{ vars.APT_KEYRING_REVISION }}
+          APT_KEYRING_KEYS: ${{ vars.APT_KEYRING_KEYS }}
+          FINGERPRINT: ${{ steps.key.outputs.fingerprint }}
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "::error::TAG is empty"
+            exit 1
+          fi
+          export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
+          version=${TAG#v}
+          debian_version=$(tools/scripts/debian_version.sh "$version")
+          repo="$RUNNER_TEMP/apt-repo"
+          mkdir -p "$repo/pool"
+          prefix=${APT_S3_PREFIX#/}
+          prefix=${prefix%/}
+          remote="s3://${APT_S3_BUCKET}${prefix:+/$prefix}"
+          cloudfront_path_prefix=${APT_CLOUDFRONT_PATH_PREFIX:-}
+          aws s3 sync "$remote/pool/" "$repo/pool/"
+          published_keyring="$RUNNER_TEMP/published-archive-keyring.gpg"
+          keyring_key="${prefix:+$prefix/}cerulion-archive-keyring.gpg"
+          if head_error=$(aws s3api head-object --bucket "$APT_S3_BUCKET" \
+            --key "$keyring_key" 2>&1); then
+            if ! aws s3 cp "$remote/cerulion-archive-keyring.gpg" "$published_keyring"; then
+              echo "::error::could not download the currently published APT keyring; refusing to guess publication order"
+              exit 1
+            fi
+          elif printf '%s\n' "$head_error" | grep -Eq '404|Not Found'; then
+            published_keyring=
+          else
+            echo "::error::could not determine the currently published APT keyring; refusing to guess publication order"
+            printf '%s\n' "$head_error" >&2
+            exit 1
+          fi
+          tools/scripts/build_apt_repo.sh "$repo" "$FINGERPRINT" \
+            "$RUNNER_TEMP/release-assets/cerulion_${debian_version}_amd64.deb" \
+            "$RUNNER_TEMP/release-assets/cerulion_${debian_version}_arm64.deb"
+          aws s3 sync "$repo/pool/" "$remote/pool/"
+          [ -n "${APT_CLOUDFRONT_DISTRIBUTION_ID:-}" ] || {
+            echo "::error::APT_CLOUDFRONT_DISTRIBUTION_ID is required for publication"
+            exit 1
+          }
+          primary_fingerprint=${FINGERPRINT%%,*}
+          tools/scripts/publish_apt_repo.sh "$repo" "$remote" \
+            "$APT_CLOUDFRONT_DISTRIBUTION_ID" "$cloudfront_path_prefix" \
+            "$published_keyring" "$primary_fingerprint"
+        shell: bash

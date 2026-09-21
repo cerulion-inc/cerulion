@@ -1,0 +1,11 @@
+error: depth must be >= 1
+  --> tests/ui/depth_zero.rs:11:5
+   |
+11 |     image: u32,
+   |     ^^^^^
+
+error: cannot find attribute `input` in this scope
+  --> tests/ui/depth_zero.rs:10:7
+   |
+10 |     #[input(depth = 0)]
+   |       ^^^^^

@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "cerulion_pairing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Permissive, deliberately overriding the
+# workspace-default AGPL-3.0-only. This crate is the offline-verifiable pairing
+# identity layer: the VERIFIER must embed in proprietary vendor firmware and the
+# closed Cerulion Studio app must link the CLIENT library, so the whole crate is
+# dual MIT / Apache-2.0. Do NOT change this to `.workspace = true`.
+license = "MIT OR Apache-2.0"
+description = "Offline-verifiable pairing identity: cert/grant formats, robot-side chain verifier, CPace PAKE, and client pairing library (no network I/O)"
+readme = "README.md"
+keywords = ["robotics", "pairing", "pake", "certificates", "cerulion"]
+categories = ["science::robotics", "authentication"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of BOTH licenses it is published under and this manifest. Whatever
+# else the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# ed25519 — the device key IS the transport identity (its 32-byte public key
+# doubles as the iroh EndpointId). Pinned to the 2.x STABLE line (NOT the 3.0
+# release — a deliberate decision): well-audited, `verify_strict` rejects non-canonical
+# / small-order points. Pulls curve25519-dalek 4.x, which unifies with
+# pake-cpace's curve25519-dalek 4.x (one version in the tree).
+ed25519-dalek = "2"
+# CPace balanced PAKE (the CFRG-selected balanced PAKE) — jedisct1's faithful
+# libsodium port over ristretto255 + HMAC-SHA512. `#![no_std]` +
+# `#![forbid(unsafe_code)]` (firmware-friendly). Binds BOTH party identities
+# (id_a / id_b) AND associated data (ad) into the transcript — exactly the
+# channel-binding the design requires. Pins curve25519-dalek ^4.1.
+pake-cpace = "0.1.7"
+# SHA-256 + HMAC-SHA256 for the tamper-evident trust-store MAC, the chassis
+# secret hash, and PAKE key-confirmation tags. (CPace's own hashing is
+# HMAC-SHA512, internal to pake-cpace.)
+sha2 = "0.10"
+hmac = "0.12"
+# Constant-time comparison for MAC tags, confirmation tags, and the chassis
+# secret — never a data-dependent `==` on a secret.
+subtle = "2"
+# Zeroize the CPace-derived key material on drop (the PAKE key path is the most
+# sensitive). Already present transitively (curve25519-dalek/ed25519-dalek) — no
+# new crate; the manual `Drop` impls use only the `Zeroize` trait (no derive).
+zeroize = "1"
+# Container (de)serialization for on-disk / on-wire transport of certs, grants,
+# epochs, and the trust store. postcard is deterministic, compact, no_std-first
+# (firmware-friendly). NOTE: what is SIGNED is the hand-rolled canonical
+# `signing_payload()` bytes (see `format::canonical`), never the postcard output
+# — so serialization malleability can never affect a signature.
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+# Unified crate error enum.
+thiserror = "2"
+# Structured logging (used sparingly — this is a library). Deliberately NO
+# `release_max_level_*` feature: Cargo features are additive, so enabling one
+# here would statically cap the release-mode log level of EVERY downstream
+# binary that links this crate (vendor firmware, the Studio sidecar). Capping
+# the max level is a final-binary decision — a library must never make it.
+tracing = { version = "0.1.44" }
+
+[dev-dependencies]
+# Tests exercise the real issuer/CA signing API with fixed-seed keys.
+ed25519-dalek = "2"
+# Temp dirs for the file-backed trust-store round-trip / atomic-write tests.
+tempfile = "3"
+# Round-trip the serde-derived container types through a concrete format.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+# Recompute a VALID HMAC over a corrupted header in the store tamper tests
+# (proving the structural magic/version checks run AFTER the MAC verifies).
+hmac = "0.12"
+sha2 = "0.10"

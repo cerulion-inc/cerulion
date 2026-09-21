@@ -1,0 +1,34 @@
+# iceoryx2 global config for the MoveIt hero demo.
+#
+# WHY THIS EXISTS: a full ROS 2 / MoveIt graph runs many nodes (move_group,
+# robot_state_publisher, ros2_control_node, controller spawners, the plan
+# client). EVERY ROS node creates a publisher on the shared /rosout and
+# /parameter_events topics. iceoryx2's built-in default caps publishers (and
+# subscribers) per service at 2 — so the 3rd node's /rosout publisher fails and
+# the whole graph dies at startup. This is the external hand-configuration the
+# earlier hand-run container had, which was never captured in-repo. Baking it
+# here is what makes the demo reproducible from a clean clone.
+#
+# rmw_cerulion / cerulion_core build their iceoryx2 node via NodeBuilder::new(),
+# which loads Config::global_config() — that auto-loads this file from the user
+# config path ($HOME/.config/iceoryx2/iceoryx2.toml). All config structs are
+# #[serde(default)], so this partial override is valid; every unspecified field
+# keeps iceoryx2's default.
+#
+# SCOPE: demo-image config only — NOT an rmw_cerulion source change. Raising
+# a per-service port ceiling here is the smallest faithful fix. If the wider
+# "ROS-on-cerulion needs bigger default caps" question is real, that belongs in
+# cerulion_core, not this demo.
+# Data-service ports: every ROS node opens a publisher on the shared /rosout +
+# /parameter_events topics (default cap 2).
+[defaults.publish-subscribe]
+max-publishers = 32
+max-subscribers = 32
+
+# Event-service ports: cerulion arms one notifier + one listener per data
+# publisher AND per data subscriber, so a shared topic like /parameter_events
+# exhausts the default 16 event slots well before the data ports fill. Raise in
+# step with the pub/sub caps above.
+[defaults.event]
+max-notifiers = 64
+max-listeners = 64

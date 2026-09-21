@@ -1,0 +1,148 @@
+# The sensor graph: the DDS ingress bridge plus the camera transcode leg.
+#
+# Runs the GENERIC `dds_bridge` node on the companion computer: it subscribes
+# to the Go2 firmware's DDS topics (per graphs/go2.bridge.yaml, the mapping
+# config) and republishes them zero-copy on the Cerulion wire. Every produced
+# topic is network-viewable (SERVING below): the desk runs
+#
+#   cerulion viz --robot go2 /go2/utlidar/cloud /go2/camera/jpeg
+#
+# which DEMANDS those topics, and only then does the robot forward them.
+# `--robot` takes the robot's announced name and needs at least one topic
+# (README.md "Defaults and overrides"). The robot ships raw frames;
+# `cerulion-netd` mirrors each demanded topic into desk-local shared memory
+# and `cerulion-vizd` decodes and renders there. /go2/odom is produced but
+# nothing consumes it (the TF source keeps an identity `odom` to `base`
+# while the layout is not validated on a robot; README.md "Validate on your robot").
+#
+# The SECOND leg: `camera_jpeg` consumes the bridge's /go2/camera/h264 (the
+# raw-routed /frontvideostream), decodes it (NVDEC on a Jetson, software
+# elsewhere) and republishes JPEG on /go2/camera/jpeg, which also egresses.
+# The camera's H.264 source is an ABSOLUTE topic with no in-graph declared
+# producer (the bridge's raw routes are created at run time, not from this
+# file's `outputs:`), so the graph treats it as an external source: if the
+# bridge takes more than a few seconds to open it you will see ONE "no
+# publisher" warn and then frames.
+#
+# This is the STANDALONE sensor graph; run it beside tf.yaml in a second
+# shell. With no `network:` block both runs' egress converges onto the
+# machine's ONE `cerulion-netd` session instead of each binding a listener.
+#
+# SERVING (how the desk sees this graph): networking is PERMISSIVE by default.
+# With no `network:` block the run registers its egress with `cerulion-netd`,
+# which announces every produced topic and forwards one only while a remote
+# subscriber demands it. ONE thing is required, on every network: give netd a
+# listen locator before the serve, in the shell (or service environment) that
+# runs the graph:
+#
+#   export CERULION_NETD_LISTEN=tcp/0.0.0.0:7683
+#
+# netd's listen list comes only from that variable and its default is empty,
+# so a netd started without it binds nothing and no desk can reach it; with
+# it set, netd also advertises itself over mDNS, so a desk on the same LAN
+# finds the robot with no configuration. Off the LAN, the desk names the
+# locator: `cerulion topic list --connect tcp/<companion address>:7683`.
+#
+# Do NOT add a `network:` block to "turn networking on": a block TIGHTENS the
+# run to Strict, which binds the block's locators verbatim in a per-run
+# gateway and ignores CERULION_NETD_LISTEN.
+#
+# RUN (on the companion computer):
+#   export GO2_IFACE=<this computer's robot-LAN interface IP>
+#   export DDS_BRIDGE_CONFIG=graphs/go2.bridge.yaml
+#   ulimit -n 65536
+#   cerulion graph run bridge --release --single-process
+#
+#   * DDS_BRIDGE_CONFIG is REQUIRED: the generic bridge has no default
+#     mapping; a missing or invalid config makes the node report itself
+#     host-driven and `graph run` REFUSES the launch loudly.
+#   * GO2_IFACE (or `only_networks:` in go2.bridge.yaml) is REQUIRED on a
+#     companion with more than one interface: see that file's BRINGUP notes
+#     (the CycloneDDS fragmented-discovery constraint).
+#   * `--single-process` is RECOMMENDED, not required: networked
+#     multi-process runs are first-class, but this graph is only validated as
+#     one process, and the flag also skips the partition prompt.
+#   * `camera_jpeg` MUST have been built WITH capture:
+#         cerulion node build camera_jpeg --release
+#     Its `gstreamer` feature is non-default (so the workspace builds on a host
+#     with no GStreamer), and a build without it has no decoder: the node's
+#     `init()` then FAILS THE GRAPH BUILD naming itself, rather than running
+#     inert. NOTE the artifact-overwrite hazard in the camera crate's
+#     Cargo.toml: a later plain `cargo build --release` replaces the
+#     capture-enabled library with a capture-less one, and the next
+#     `graph run` refuses. Re-run the `node build` line after any workspace
+#     rebuild.
+#   * Optional: CAMERA_TARGET_HEIGHT=360 decodes the low-bandwidth rendition
+#     instead of 720 (the topic carries both, interleaved).
+#
+# The four outputs below are the bridge's FIXED port set (one per supported
+# ros_type; see nodes/dds_bridge docs). ALL FOUR MUST STAY DECLARED even when
+# the mapping config uses fewer: macro ports are compile-time, and the
+# generated tick resolves every output proxy BEFORE the node body runs, so a
+# graph missing one port fails every tick ("zero-copy tick: missing publisher
+# for output `...`") and the bridge silently publishes nothing. Ports whose
+# ros_type has no mapping in the config simply never publish (the output gate
+# discards untouched ports each fire); their topics exist but stay silent.
+# The `topic:` overrides here are the AUTHORITATIVE Cerulion-side names; keep
+# them in sync with go2.bridge.yaml's cerulion_topic documentation.
+
+prefix: orin
+
+nodes:
+  - id: bridge
+    type: dds_bridge
+    outputs:
+      - name: cloud
+        schema: sensor_msgs/PointCloud2
+        topic: /go2/utlidar/cloud
+        # A lidar cloud is point_step times points per sweep; 1 MiB is ample
+        # headroom for the Go2 lidar's frames. A larger cloud is dropped and
+        # counted, with a LOUD warn naming this cap (fix here, never silent).
+        max_slice_len: 1048576
+      - name: odom
+        schema: nav_msgs/Odometry
+        topic: /go2/odom
+      - name: twist
+        schema: geometry_msgs/TwistStamped
+        topic: /go2/twist_in
+      - name: request_json
+        schema: std_msgs/String
+        topic: /go2/request_json
+
+  # The camera leg. Consumes the bridge's raw-routed H.264 (ONE
+  # Annex-B access unit per sample) and publishes decoded JPEG.
+  #
+  # `source:` is ABSOLUTE and matches `cerulion_topic` for /frontvideostream in
+  # go2.bridge.yaml; keep the two in sync (the graph is authoritative, but
+  # here the PRODUCER is the bridge's config, so a mismatch shows up as a
+  # camera that never gets a frame).
+  #
+  # The topic interleaves a 640x360 and a 1280x720 rendition; the node decodes
+  # ONE (default 720, CAMERA_TARGET_HEIGHT overrides) and counts the other.
+  - id: camera
+    type: camera_jpeg
+    inputs:
+      - name: h264
+        source: /go2/camera/h264
+    outputs:
+      - name: jpeg
+        schema: sensor_msgs/CompressedImage
+        topic: /go2/camera/jpeg
+        # A 720-line JPEG is a fraction of a megabyte; 1 MiB is generous
+        # headroom and cheap (iceoryx2 `Static` pools are demand-paged, so
+        # resident memory tracks the real frame size, not the reservation).
+        # This is a CEILING, not the loan: the publisher sizes each loan
+        # adaptively and a bigger frame spills up to this value, so headroom
+        # costs nothing until it is used. A frame ABOVE the cap is DROPPED
+        # (never truncated: a truncated JPEG is a corrupt JPEG) with a
+        # flood-latched warn naming the real numbers; raise this rather than
+        # ignore it.
+        #
+        # Measured on a Go2 EDU over an off-LAN link with both camera topics
+        # served at once: the raw /go2/camera/h264 route arrived at roughly
+        # twice the rate of this robot-transcoded JPEG, so the transcode, not
+        # the link, is the limit. The desk-side H.264 path exists, so
+        # /go2/camera/h264 is directly viewable and this JPEG leg is the
+        # fallback for a desk that cannot decode. Both are produced; the desk
+        # picks by demanding one, and an undemanded topic costs nothing.
+        max_slice_len: 1048576

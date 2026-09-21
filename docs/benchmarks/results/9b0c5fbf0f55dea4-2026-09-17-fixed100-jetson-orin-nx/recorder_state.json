@@ -1,0 +1,2361 @@
+{
+  "pass": "on",
+  "sha": "ba5d75c5c",
+  "run_dir": "<BOXHOME>/lanes/platform-jetson/run-merged",
+  "states": {
+    "ON (always-on Flashback default; env untouched)": "ON-pass Cerulion cells",
+    "OFF (...)": "OFF-pass Cerulion cells",
+    "n/a (no Cerulion recorder in this cell)": "iox2 / zenoh / ROS 2 cells"
+  },
+  "cells": {
+    "cerulion_workspace_split_chrt0": {
+      "cell": "Cerulion split",
+      "state": "ON (always-on Flashback default; env untouched); free run ON (CERULION_EXECUTION_MODE=free_run)",
+      "pass": "on",
+      "evidence": "50/50 run logs satisfy the ON contract (decision window=own_recorder + holding line + ARMED line, 0x OFF line, 0x --no-rings line); window values {'own_recorder': 50}; hold=50 armed=50 off=0 no_rings=0; MODE: split free_run: 50/50 logs carry stamp execution_mode=FreeRun + no-barrier line + every worker build_path FreeRunLive, 0x lockstep quantum line, 0x INERT/garbage warn",
+      "counts": {
+        "logs": 50,
+        "holding_window": 50,
+        "armed": 50,
+        "flashback_off": 0,
+        "no_rings_line": 0,
+        "decision_lines": 50,
+        "no_rings_token": 0,
+        "window_values": {
+          "own_recorder": 50
+        }
+      },
+      "per_log": [
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [
+            "FreeRun"
+          ],
+          "no_barrier": true,
+          "worker_paths": [
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ],
+            [
+              "FreeRun",
+              "FreeRunLive"
+            ]
+          ],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        }
+      ],
+      "log_files": [
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_1024_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_1048576_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_16384_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_16777216_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_256_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_262144_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_4096_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_4194304_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_64_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_split_chrt0_65536_r100.log"
+      ],
+      "csv": "results_cerulion_workspace_split_chrt0.csv"
+    },
+    "cerulion_workspace_mono_chrt0": {
+      "cell": "Cerulion mono",
+      "state": "ON (always-on Flashback default; env untouched)",
+      "pass": "on",
+      "evidence": "52/52 run logs satisfy the ON contract (decision window=own_recorder + holding line + ARMED line, 0x OFF line, 0x --no-rings line); window values {'own_recorder': 52}; hold=52 armed=52 off=0 no_rings=0; MODE: mono: 52/52 logs carry no FreeRun mode; INERT warn present in 0/52 logs (env exported on the mono leg: no)",
+      "counts": {
+        "logs": 52,
+        "holding_window": 52,
+        "armed": 52,
+        "flashback_off": 0,
+        "no_rings_line": 0,
+        "decision_lines": 52,
+        "no_rings_token": 0,
+        "window_values": {
+          "own_recorder": 52
+        }
+      },
+      "per_log": [
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep1/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep2/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep3/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r50.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep4/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_4096_r50.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        },
+        {
+          "log": "rep5/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log",
+          "window": [
+            "own_recorder"
+          ],
+          "hold": true,
+          "armed": true,
+          "off": false,
+          "no_rings": false,
+          "stamp_modes": [],
+          "no_barrier": false,
+          "worker_paths": [],
+          "lockstep_quantum": false,
+          "mode_inert": false,
+          "mode_garbage": false
+        }
+      ],
+      "log_files": [
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+        "rep1/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+        "rep2/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+        "rep3/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r50.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+        "rep4/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_1024_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_1048576_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_16384_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_16777216_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_256_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_262144_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_4096_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_4096_r50.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_4194304_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_64_r100.log",
+        "rep5/raw/_logs/cerulion_workspace_mono_chrt0_65536_r100.log"
+      ],
+      "csv": "results_cerulion_workspace_mono_chrt0.csv"
+    },
+    "iox2_chrt0": {
+      "cell": "raw iceoryx2",
+      "state": "n/a (no Cerulion recorder in this cell)",
+      "pass": "on",
+      "evidence": "verified: native bin / ROS 2 container, no Cerulion recorder exists in this cell",
+      "counts": {
+        "logs": 0,
+        "holding_window": 0,
+        "armed": 0,
+        "flashback_off": 0,
+        "no_rings_line": 0,
+        "decision_lines": 0,
+        "no_rings_token": 0,
+        "window_values": {}
+      },
+      "per_log": [],
+      "log_files": [],
+      "csv": "results_iox2_chrt0.csv"
+    }
+  }
+}

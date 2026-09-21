@@ -1,0 +1,20 @@
+[package]
+name = "v4l2_camera"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+
+# The V4L2 ioctl/mmap calls exist only on Linux; every other platform gets the
+# `unsupported` face of the `device` module and needs no libc.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

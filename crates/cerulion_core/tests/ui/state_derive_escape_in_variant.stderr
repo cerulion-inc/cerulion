@@ -1,0 +1,11 @@
+error: `#[cerulion(reconstruct)]` is not supported on an enum variant's field. An enum restores by replacing the whole value (its variant can change), so there is no in-place field to leave untouched. A handle cannot be minted from bytes, so this variant has to stop holding one. Hold the handle OUTSIDE the enum — a `#[cerulion(reconstruct)]` field on the struct that owns the enum, re-opened in `fn restored(&mut self)` — and leave the enum carrying only the capturable part. Wrapping the handle in a struct that carries the escape and holding THAT in the variant does compile, but the wrapper cannot be read back, so restoring this variant then fails with `Unrestorable` every time — loudly, never silently, but it never succeeds either.
+  --> tests/ui/state_derive_escape_in_variant.rs:38:9
+   |
+38 |         #[cerulion(reconstruct)]
+   |         ^
+
+error: `#[cerulion(serde)]` is not supported on an enum variant's field. An enum restores by replacing the whole value (its variant can change), so there is no in-place field to leave untouched. Move the field into a struct that carries the escape, and hold that struct in the variant: that wrapper reads back, so the variant still round-trips.
+  --> tests/ui/state_derive_escape_in_variant.rs:47:9
+   |
+47 |         #[cerulion(serde)]
+   |         ^

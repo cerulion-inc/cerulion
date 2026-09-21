@@ -1,0 +1,21 @@
+[package]
+name = "test_node_macro_trigger_block_cdylib"
+version = "0.1.0"
+edition = "2021"
+# Test fixture — never publish to crates.io.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cerulion_core = { path = "../../cerulion_core" }
+native_ros2_messages = { path = "../../native_ros2_messages" }
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

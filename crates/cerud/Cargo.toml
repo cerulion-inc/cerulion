@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "cerud"
+version.workspace = true
+edition.workspace = true
+# License is INHERITED from the workspace (AGPL-3.0-only). `cerud` is the OPEN
+# robot-side ops service — do NOT override the license (a deliberate decision).
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Robot-side operations service for Cerulion: mechanical verbs (inventory, log-tail, restart) over a versioned framed protocol, deny-by-default per-verb authorization, a hash-chained receipt audit log, deploy-bundle types, and a control-lease, deadman and e-stop state machine. Transport-agnostic."
+# Not published to crates.io: `cerud` is the robot-side ops SERVICE — a daemon
+# operators deploy and talk to over its framed protocol, not a library anyone
+# adds with `cargo add`. It is outside the publish set in `docs/PUBLISHING.md`.
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cerud"
+path = "src/main.rs"
+
+[dependencies]
+# Structured logging (never println! in library code). Cap release logging at
+# info, mirroring cerulion_core / cerulion_bagd.
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
+# The binary installs an env-filter subscriber; the library never installs one.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Protocol envelopes, receipt entries, bundle manifests, and verb args/results
+# all serialize via serde/serde_json (human-debuggable, dependency-light).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SHA-256 for the receipt hash-chain, verb args digests, and content-addressed
+# deploy bundles. Already vetted in the workspace lockfile (RustCrypto).
+sha2 = "0.10"
+hex = "0.4"
+# Unified error enum per crate.
+thiserror = "2"
+# statvfs (disk free) + uname (kernel release) for the inventory verb probes.
+libc = "0.2"
+# Thin CLI for the binary (Unix-domain-socket dev transport, receipt-log path,
+# log-tail allow-list root). Already a workspace citizen (cerulion_bagd/cli).
+clap = { version = "4", features = ["derive"] }
+
+[features]
+# Exposes the receipt-log fault-injection seams
+# (`ReceiptLog::fail_next_{record,sync}_for_test`) used to exercise the
+# server's fail-closed audit path + the write→sync rollback. NEVER enabled by
+# the production binary/lib (a plain `cargo build -p cerud` does not expose the
+# methods); the integration tests turn it on via the self dev-dependency below.
+test-seam = []
+
+[dev-dependencies]
+# Isolated temp dirs/files for the receipt-log, log-tail, and deploy tests, and
+# a unique per-test Unix socket path for the transport e2e (parallel-safe — no
+# process-global singletons, so no serial_test needed).
+tempfile = "3"
+# Self-reference turns on the `test-seam` feature for tests/*.rs (the
+# fault-injection seams become visible to the integration-test crate but NOT to
+# downstream consumers — mirrors cerulion_bagd's `test-helpers` pattern).
+cerud = { path = ".", features = ["test-seam"] }

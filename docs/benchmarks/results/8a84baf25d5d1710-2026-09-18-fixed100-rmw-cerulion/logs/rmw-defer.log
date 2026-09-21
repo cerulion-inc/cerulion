@@ -1,0 +1,14 @@
+#16 DONE 0.2s
+=== image: sha256:f16d6779f497ce0b735c5ea2b2f00b767a26270cef5715882ea1eb162118855c
+sz=64 rtt=16000 inline_warn=0
+0
+sz=262144 rtt=16000 inline_warn=0
+0
+sz=1048576 rtt=16000 inline_warn=0
+0
+sz=4194304 rtt=16000 inline_warn=0
+0
+sz=16777216 rtt=16000 inline_warn=0
+0
+echo_rule=prefetched_loan prefetch_depth=1 refill_defer_us=1000
+=== DEFER SMOKE FINISHED ===

@@ -1,0 +1,307 @@
+[00:19:05Z] [+00000s] HEAD ASSERT OK: ba5d75c5c226e749c9f5e8846c55c21b8bfd1035
+[00:19:05Z] [+00000s] cerulion binary sha16=c5415a914e650bef
+[00:19:05Z] [+00000s] load at start: 3.02 6.39 4.90
+[00:19:05Z] [+00000s] shm at start: iceoryx2_tmp=0 shm_state=0
+[00:19:05Z] [+00000s] === PLATFORM CAMPAIGN START (fixed100, k=5, STOCK/no-chrt, recorder ON) ===
+[00:19:05Z] [+00000s] REP-BOUNDARY 1 2026-09-17T00:19:05Z
+[00:19:05Z] [+00000s] JOB-START cell=cerulion_workspace_mono_chrt0 rep=1 env='<none>' load=3.02 6.39 4.90
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=1 (macos) ###############
+  → workspace leg=mono msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/_logs/cerulion_workspace_mono_chrt0.log)
+    ok rc=0 bins=10/10 (328s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[00:24:34Z] [+00329s] JOB-END   cell=cerulion_workspace_mono_chrt0 rep=1 rc=0 window=[2026-09-17T00:19:05Z .. 2026-09-17T00:24:34Z]
+[00:24:34Z] [+00329s]   WITNESS[cerulion_workspace_mono_chrt0 rep1 mode=mono]: logs=12 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+[00:24:34Z] [+00329s] JOB-START cell=cerulion_workspace_split_chrt0 rep=1 env='CERULION_EXECUTION_MODE=free_run' load=1.19 3.18 3.88
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=1 (macos) ###############
+  → workspace leg=split msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/_logs/cerulion_workspace_split_chrt0.log)
+    ok rc=0 bins=10/10 (241s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[00:28:35Z] [+00570s] JOB-END   cell=cerulion_workspace_split_chrt0 rep=1 rc=0 window=[2026-09-17T00:24:34Z .. 2026-09-17T00:28:35Z]
+[00:28:35Z] [+00570s]   WITNESS[cerulion_workspace_split_chrt0 rep1 mode=freerun]: logs=10 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+[00:28:35Z] [+00570s] JOB-START cell=iox2_chrt0 rep=1 env='<none>' load=1.16 2.03 3.18
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - native bins: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[4071]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_macros` (lib) generated 1 warning
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[4295]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[4286]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)
+  |
+  = note: dyld[4223]: Library not loaded: @rpath/libLLVM.dylib
+            Referenced from: <AC0D75A8-23BF-301F-B7CE-3E5CC0C1BC06> <BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-objcopy
+            Reason: tried: '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/../lib/libLLVM.dylib' (no such file), '<BOXHOME>/lanes/platform-20260917T000530Z/repo/benches/latency/native/target/release/deps/libLLVM.dylib' (no such file), '<BOXHOME>/lib/libLLVM.dylib' (no such file), '/usr/local/lib/libLLVM.dylib' (no such file), '/usr/lib/libLLVM.dylib' (no such file, not in dyld cache)
+          
+
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip") generated 1 warning
+warning: `cerulion_latency_bench` (bin "zenoh_shm_round_trip_pong") generated 1 warning
+warning: `cerulion_latency_bench` (bin "raw_iceoryx2_round_trip") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.33s
+[00:45:12Z] [+01567s] DONE-PLATFORM (ABORTED rc=0) jobs: cerulion_workspace_mono_chrt0:1 cerulion_workspace_split_chrt0:1
+    ! DID NOT SUSTAIN the fixed100 ladder at payloads: 64, 256 - no latency minted (empty rows downstream)
+    missing .bins for payloads: 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216
+[build] cargo build --release in benches/latency/native
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### native variant=fixed100 chrt=0 rep=1 (macos) ###############
+  → raw_iceoryx2_round_trip chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/_logs/iox2_chrt0.log, watchdog 1800s)
+    FAIL rc=-15 bins=0/10 (996s)
+
+native sweep: 0 passed, 1 failed (raw → <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw)
+[00:54:26Z] [+00000s] HEAD ASSERT OK: ba5d75c5c226e749c9f5e8846c55c21b8bfd1035
+[00:54:26Z] [+00000s] cerulion binary sha16=c5415a914e650bef
+[00:54:26Z] [+00000s] load at start: 1.77 1.96 2.12
+[00:54:26Z] [+00000s] shm at start: iceoryx2_tmp=0 shm_state=14
+[00:54:26Z] [+00000s] === PLATFORM CAMPAIGN START (fixed100, k=5, STOCK/no-chrt, recorder ON) ===
+[00:54:26Z] [+00000s] targeted re-run: JOBS=' cerulion_workspace_mono_chrt0:2 cerulion_workspace_split_chrt0:2 cerulion_workspace_mono_chrt0:3 cerulion_workspace_split_chrt0:3 cerulion_workspace_mono_chrt0:4 cerulion_workspace_split_chrt0:4 cerulion_workspace_mono_chrt0:5 cerulion_workspace_split_chrt0:5'
+[00:54:26Z] [+00000s] JOB-START cell=cerulion_workspace_mono_chrt0 rep=2 env='<none>' load=1.77 1.96 2.12
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=2 (macos) ###############
+  → workspace leg=mono msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep2/raw/_logs/cerulion_workspace_mono_chrt0.log)
+    ok rc=0 bins=10/10 (235s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[00:58:22Z] [+00236s] JOB-END   cell=cerulion_workspace_mono_chrt0 rep=2 rc=0 window=[2026-09-17T00:54:26Z .. 2026-09-17T00:58:22Z]
+[00:58:22Z] [+00236s]   WITNESS[cerulion_workspace_mono_chrt0 rep2 mode=mono]: logs=10 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+[00:58:22Z] [+00236s] JOB-START cell=cerulion_workspace_split_chrt0 rep=2 env='CERULION_EXECUTION_MODE=free_run' load=1.06 1.52 1.89
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=2 (macos) ###############
+  → workspace leg=split msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep2/raw/_logs/cerulion_workspace_split_chrt0.log)
+    ok rc=0 bins=10/10 (237s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[01:02:19Z] [+00473s] JOB-END   cell=cerulion_workspace_split_chrt0 rep=2 rc=0 window=[2026-09-17T00:58:22Z .. 2026-09-17T01:02:19Z]
+[01:02:19Z] [+00473s]   WITNESS[cerulion_workspace_split_chrt0 rep2 mode=freerun]: logs=10 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+[01:02:19Z] [+00473s] JOB-START cell=cerulion_workspace_mono_chrt0 rep=3 env='<none>' load=1.21 1.32 1.70
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=3 (macos) ###############
+  → workspace leg=mono msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep3/raw/_logs/cerulion_workspace_mono_chrt0.log)
+    ok rc=0 bins=10/10 (236s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[01:06:15Z] [+00709s] JOB-END   cell=cerulion_workspace_mono_chrt0 rep=3 rc=0 window=[2026-09-17T01:02:19Z .. 2026-09-17T01:06:15Z]
+[01:06:15Z] [+00709s]   WITNESS[cerulion_workspace_mono_chrt0 rep3 mode=mono]: logs=10 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+[01:06:15Z] [+00709s] JOB-START cell=cerulion_workspace_split_chrt0 rep=3 env='CERULION_EXECUTION_MODE=free_run' load=0.83 1.06 1.49
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=3 (macos) ###############
+  → workspace leg=split msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep3/raw/_logs/cerulion_workspace_split_chrt0.log)
+    ok rc=0 bins=10/10 (242s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[01:10:18Z] [+00952s] JOB-END   cell=cerulion_workspace_split_chrt0 rep=3 rc=0 window=[2026-09-17T01:06:15Z .. 2026-09-17T01:10:18Z]
+[01:10:18Z] [+00952s]   WITNESS[cerulion_workspace_split_chrt0 rep3 mode=freerun]: logs=10 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+[01:10:18Z] [+00952s] JOB-START cell=cerulion_workspace_mono_chrt0 rep=4 env='<none>' load=1.14 1.14 1.42
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=4 (macos) ###############
+  → workspace leg=mono msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep4/raw/_logs/cerulion_workspace_mono_chrt0.log)
+    ok rc=0 bins=10/10 (236s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[01:14:15Z] [+01189s] JOB-END   cell=cerulion_workspace_mono_chrt0 rep=4 rc=0 window=[2026-09-17T01:10:18Z .. 2026-09-17T01:14:15Z]
+[01:14:15Z] [+01189s]   WITNESS[cerulion_workspace_mono_chrt0 rep4 mode=mono]: logs=10 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+[01:14:15Z] [+01189s] JOB-START cell=cerulion_workspace_split_chrt0 rep=4 env='CERULION_EXECUTION_MODE=free_run' load=1.06 1.21 1.39
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=4 (macos) ###############
+  → workspace leg=split msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep4/raw/_logs/cerulion_workspace_split_chrt0.log)
+    ok rc=0 bins=10/10 (238s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[01:18:13Z] [+01427s] JOB-END   cell=cerulion_workspace_split_chrt0 rep=4 rc=0 window=[2026-09-17T01:14:15Z .. 2026-09-17T01:18:13Z]
+[01:18:14Z] [+01428s]   WITNESS[cerulion_workspace_split_chrt0 rep4 mode=freerun]: logs=10 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+[01:18:14Z] [+01428s] JOB-START cell=cerulion_workspace_mono_chrt0 rep=5 env='<none>' load=0.70 0.97 1.24
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=5 (macos) ###############
+  → workspace leg=mono msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep5/raw/_logs/cerulion_workspace_mono_chrt0.log)
+    ok rc=0 bins=10/10 (241s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[01:22:15Z] [+01669s] JOB-END   cell=cerulion_workspace_mono_chrt0 rep=5 rc=0 window=[2026-09-17T01:18:14Z .. 2026-09-17T01:22:15Z]
+[01:22:15Z] [+01669s]   WITNESS[cerulion_workspace_mono_chrt0 rep5 mode=mono]: logs=10 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+[01:22:15Z] [+01669s] JOB-START cell=cerulion_workspace_split_chrt0 rep=5 env='CERULION_EXECUTION_MODE=free_run' load=1.22 1.05 1.20
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=5 (macos) ###############
+  → workspace leg=split msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep5/raw/_logs/cerulion_workspace_split_chrt0.log)
+    ok rc=0 bins=10/10 (241s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[01:26:16Z] [+01910s] JOB-END   cell=cerulion_workspace_split_chrt0 rep=5 rc=0 window=[2026-09-17T01:22:15Z .. 2026-09-17T01:26:16Z]
+[01:26:16Z] [+01910s]   WITNESS[cerulion_workspace_split_chrt0 rep5 mode=freerun]: logs=10 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+warn: cerulion_workspace_mono_chrt0 payload 1024: achieved rate disagrees across reps (rep1=50, rep2=100, rep3=100, rep4=100, rep5=100) - the fixed100 ladder settled differently per rep; writing 'mixed' (plots annotate it)
+warn: cerulion_workspace_mono_chrt0 payload 262144: achieved rate disagrees across reps (rep1=50, rep2=100, rep3=100, rep4=100, rep5=100) - the fixed100 ladder settled differently per rep; writing 'mixed' (plots annotate it)
+note: iox2_chrt0 payload 64: DID NOT SUSTAIN the fixed100 fallback ladder - empty row written (no latency minted)
+note: iox2_chrt0 payload 256: DID NOT SUSTAIN the fixed100 fallback ladder - empty row written (no latency minted)
+note: SUPPRESSED 20 percentile cell(s) across 20 row(s) - fewer than 20 pooled samples back those tails at this n, so the cells are written empty rather than citable-looking (audit A2). Add reps (bench.py full --reps N) or extend the schedule to make them citable.
+note: 2 row(s) DID NOT SUSTAIN the fixed100 fallback ladder - written as empty did_not_sustain rows (no latency minted; plots render the gap with an in-figure note).
+error: iox2_chrt0 payload 64: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 64: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 64: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 64: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 256: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 256: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 256: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 256: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: 48 bad (prefix, payload) row(s) across 1 cell(s) - every discovered cell must carry the full 10-size sweep in every rep at the schedule's exact measured sample count (strict by default; CSVs for the good rows were written). Re-run the failed cells via bench.py, or pass --allow-partial to accept a partial artifact loudly.
+compile_csv: aggregating 5 reps (rep1, rep2, rep3, rep4, rep5)
+run-platform/results_cerulion_workspace_mono_chrt0.csv: 10 rows
+run-platform/results_cerulion_workspace_split_chrt0.csv: 10 rows
+run-platform/results_iox2_chrt0.csv: 2 rows
+[01:26:17Z] [+01911s] compile-csv rc=1
+[01:26:17Z] [+01911s] DONE-PLATFORM (COMPLETED rc=0) jobs: cerulion_workspace_mono_chrt0:2 cerulion_workspace_split_chrt0:2 cerulion_workspace_mono_chrt0:3 cerulion_workspace_split_chrt0:3 cerulion_workspace_mono_chrt0:4 cerulion_workspace_split_chrt0:4 cerulion_workspace_mono_chrt0:5 cerulion_workspace_split_chrt0:5
+[01:27:30Z] [+00000s] HEAD ASSERT OK: ba5d75c5c226e749c9f5e8846c55c21b8bfd1035
+[01:27:30Z] [+00000s] cerulion binary sha16=c5415a914e650bef
+[01:27:30Z] [+00000s] load at start: 1.39 1.26 1.25
+[01:27:30Z] [+00000s] shm at start: iceoryx2_tmp=2 shm_state=2
+[01:27:30Z] [+00000s] === PLATFORM CAMPAIGN START (fixed100, k=5, STOCK/no-chrt, recorder ON) ===
+[01:27:30Z] [+00000s] targeted re-run: JOBS='cerulion_workspace_mono_chrt0:1'
+[01:27:30Z] [+00000s] JOB-START cell=cerulion_workspace_mono_chrt0 rep=1 env='<none>' load=1.39 1.26 1.25
+! STOCK POSTURE (CER_BENCH_DMA_LOCK=0) - workspace legs: no bench-side C-state tuning is applied (workspace legs run the product flagless default; native bins skip the C-state lock; ros2 containers get NO /dev/cpu_dma_latency device). Tails are NOT comparable to capped runs.
+[env] cpu governor: unknown; turbo/boost: unknown
+
+############### workspace variant=fixed100 chrt=0 rep=1 (macos) ###############
+    cleared 20 stale cerulion_workspace_mono_chrt0_* .bin/.rate/.usage.csv from a prior run
+  → workspace leg=mono msg=variable chrt=0  (log: <BOXHOME>/lanes/platform-20260917T000530Z/run-platform/rep1/raw/_logs/cerulion_workspace_mono_chrt0.log)
+    ok rc=0 bins=10/10 (287s)
+
+workspace sweep: 1 passed, 0 failed, 0 skipped
+[01:32:16Z] [+00286s] JOB-END   cell=cerulion_workspace_mono_chrt0 rep=1 rc=0 window=[2026-09-17T01:27:30Z .. 2026-09-17T01:32:16Z]
+[01:32:17Z] [+00287s]   WITNESS[cerulion_workspace_mono_chrt0 rep1 mode=mono]: logs=13 failing=0 ; #912 placement line OBSERVED=[<absent: cfg(linux)-only, EXPECTED absent on macOS>]
+warn: cerulion_workspace_mono_chrt0 payload 16384: achieved rate disagrees across reps (rep1=50, rep2=100, rep3=100, rep4=100, rep5=100) - the fixed100 ladder settled differently per rep; writing 'mixed' (plots annotate it)
+note: iox2_chrt0 payload 64: DID NOT SUSTAIN the fixed100 fallback ladder - empty row written (no latency minted)
+note: iox2_chrt0 payload 256: DID NOT SUSTAIN the fixed100 fallback ladder - empty row written (no latency minted)
+note: SUPPRESSED 20 percentile cell(s) across 20 row(s) - fewer than 20 pooled samples back those tails at this n, so the cells are written empty rather than citable-looking (audit A2). Add reps (bench.py full --reps N) or extend the schedule to make them citable.
+note: 2 row(s) DID NOT SUSTAIN the fixed100 fallback ladder - written as empty did_not_sustain rows (no latency minted; plots render the gap with an in-figure note).
+error: iox2_chrt0 payload 64: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 64: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 64: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 64: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 256: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 256: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 256: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 256: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1024: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4096: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16384: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 65536: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 262144: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 1048576: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 4194304: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep1 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep2 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep3 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep4 (payload never produced, or the cell failed there)
+error: iox2_chrt0 payload 16777216: missing .bin in rep5 (payload never produced, or the cell failed there)
+error: 48 bad (prefix, payload) row(s) across 1 cell(s) - every discovered cell must carry the full 10-size sweep in every rep at the schedule's exact measured sample count (strict by default; CSVs for the good rows were written). Re-run the failed cells via bench.py, or pass --allow-partial to accept a partial artifact loudly.
+compile_csv: aggregating 5 reps (rep1, rep2, rep3, rep4, rep5)
+run-platform/results_cerulion_workspace_mono_chrt0.csv: 10 rows
+run-platform/results_cerulion_workspace_split_chrt0.csv: 10 rows
+run-platform/results_iox2_chrt0.csv: 2 rows
+[01:32:17Z] [+00287s] compile-csv rc=1
+[01:32:17Z] [+00287s] DONE-PLATFORM (COMPLETED rc=0) jobs: cerulion_workspace_mono_chrt0:1

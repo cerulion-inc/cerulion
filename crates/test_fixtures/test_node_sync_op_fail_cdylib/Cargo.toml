@@ -1,0 +1,21 @@
+[package]
+name = "test_node_sync_op_fail_cdylib"
+version = "0.1.0"
+edition = "2021"
+description = "Arm 18 fixture: a raw-FFI Sync cdylib whose cerulion_node_sync_head_op FAILS for one named input while its drain/refill work (proves the host's R-Fail policy is fail-closed at the FFI seam)"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Keeps the host's `NodeContext` (unlike `test_node_drain_fail_cdylib`, which
+# drops it): this fixture FORWARDS the real drain / refill / head ops to it, so
+# only the ONE named input's head ops are faulted and everything else on the
+# per-set path is genuinely live.
+[dependencies]
+cerulion_core = { path = "../../cerulion_core" }
+native_ros2_messages = { path = "../../native_ros2_messages" }
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

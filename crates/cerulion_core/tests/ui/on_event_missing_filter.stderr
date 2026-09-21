@@ -1,0 +1,38 @@
+error: #[on_event] requires exactly one of `input = "<port>"` or `output = "<port>"`, e.g. #[on_event(input = "imu")]
+  --> tests/ui/on_event_missing_filter.rs:26:8
+   |
+26 |     fn on_pressure(&mut self, _event: BackpressureEvent) {}
+   |        ^^^^^^^^^^^
+
+error[E0599]: no method named `__cer_user_init` found for struct `NoInputArgNode` in the current scope
+  --> tests/ui/on_event_missing_filter.rs:9:1
+   |
+ 9 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `NoInputArgNode`
+10 | #[derive(Default)]
+11 | struct NoInputArgNode {
+   | --------------------- method `__cer_user_init` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_zero_copy_tick` found for struct `NoInputArgNode` in the current scope
+  --> tests/ui/on_event_missing_filter.rs:9:1
+   |
+ 9 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `NoInputArgNode`
+10 | #[derive(Default)]
+11 | struct NoInputArgNode {
+   | --------------------- method `__cer_zero_copy_tick` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_shutdown` found for struct `NoInputArgNode` in the current scope
+  --> tests/ui/on_event_missing_filter.rs:9:1
+   |
+ 9 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+10 | #[derive(Default)]
+11 | struct NoInputArgNode {
+   | --------------------- method `__cer_user_shutdown` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

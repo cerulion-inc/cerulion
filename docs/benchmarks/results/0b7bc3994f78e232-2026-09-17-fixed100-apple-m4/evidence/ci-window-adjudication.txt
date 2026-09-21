@@ -1,0 +1,19 @@
+CI-idle adjudication of every SHIPPED job window, against the runner-state file
+(101 lines, 2026-09-16T23:55:29Z .. 2026-09-17T01:36:03Z). A window is VALID only
+if EVERY state line inside it reads idle AND no poll gap exceeds 180 s.
+The shipped rep-1 mono is the RE-RUN (01:27:30-01:32:16); the first attempt's
+evidence is under evidence/rep1-mono-first-attempt/.
+
+cell                              rep  start                 end                   rc  verdict
+cerulion_workspace_mono_chrt0     1    2026-09-17T01:27:30Z  2026-09-17T01:32:16Z  0   VALID (5 lines, all idle)
+cerulion_workspace_split_chrt0    1    2026-09-17T00:24:34Z  2026-09-17T00:28:35Z  0   VALID (4 lines, all idle)
+cerulion_workspace_mono_chrt0     2    2026-09-17T00:54:26Z  2026-09-17T00:58:22Z  0   VALID (4 lines, all idle)
+cerulion_workspace_split_chrt0    2    2026-09-17T00:58:22Z  2026-09-17T01:02:19Z  0   VALID (4 lines, all idle)
+cerulion_workspace_mono_chrt0     3    2026-09-17T01:02:19Z  2026-09-17T01:06:15Z  0   VALID (4 lines, all idle)
+cerulion_workspace_split_chrt0    3    2026-09-17T01:06:15Z  2026-09-17T01:10:18Z  0   VALID (4 lines, all idle)
+cerulion_workspace_mono_chrt0     4    2026-09-17T01:10:18Z  2026-09-17T01:14:15Z  0   VALID (4 lines, all idle)
+cerulion_workspace_split_chrt0    4    2026-09-17T01:14:15Z  2026-09-17T01:18:13Z  0   VALID (4 lines, all idle)
+cerulion_workspace_mono_chrt0     5    2026-09-17T01:18:14Z  2026-09-17T01:22:15Z  0   VALID (4 lines, all idle)
+cerulion_workspace_split_chrt0    5    2026-09-17T01:22:15Z  2026-09-17T01:26:16Z  0   VALID (4 lines, all idle)
+
+OVERALL: ALL SHIPPED WINDOWS VALID

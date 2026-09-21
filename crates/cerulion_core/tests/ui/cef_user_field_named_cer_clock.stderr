@@ -1,0 +1,42 @@
+warning: unexpected `cfg` condition value: `cdylib`
+  --> tests/ui/cef_user_field_named_cer_clock.rs:15:1
+   |
+15 | #[cerulion_node(period_ms = 100)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `debug-logging`, `fuzz-helpers`, and `test-helpers`
+   = note: using a cfg inside a attribute macro will use the cfgs from the destination crate and not the ones from the defining crate
+   = help: try referring to `cerulion_node` crate for guidance on how handle this unexpected cfg
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+   = note: this warning originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0124]: field `__cer_rt` is already declared
+  --> tests/ui/cef_user_field_named_cer_clock.rs:15:1
+   |
+15 | #[cerulion_node(period_ms = 100)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field already declared
+...
+20 |     __cer_rt: u32,
+   |     ------------- `__cer_rt` first declared here
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0062]: field `__cer_rt` specified more than once
+  --> tests/ui/cef_user_field_named_cer_clock.rs:15:1
+   |
+15 | #[cerulion_node(period_ms = 100)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ used more than once
+...
+20 |     __cer_rt: u32,
+   |     ------------- first use of `__cer_rt`
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0610]: `u32` is a primitive type and therefore doesn't have fields
+  --> tests/ui/cef_user_field_named_cer_clock.rs:15:1
+   |
+15 | #[cerulion_node(period_ms = 100)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

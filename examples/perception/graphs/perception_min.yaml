@@ -1,0 +1,23 @@
+# The CI-cheap demo loop: camera -> detector ONLY (no tracker). This is the
+# graph the demo RECORDS and REPLAYS. A distinct prefix from perception.yaml so
+# the two graphs' resolved topic names never collide.
+#
+# The detector's output resolves to /percepmin/detector/detections, the topic
+# tolerance.yaml judges under bbox_iou / max_abs / set_equal.
+prefix: percepmin
+nodes:
+  - id: camera
+    type: camera
+    outputs:
+      - name: image_raw
+        schema: sensor_msgs/Image
+        max_slice_len: 65536
+  - id: detector
+    type: detector
+    inputs:
+      - name: image_raw
+        source: camera/image_raw
+    outputs:
+      - name: detections
+        schema: DetectionArray
+        max_slice_len: 4096

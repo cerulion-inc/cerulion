@@ -1,0 +1,258 @@
+# cargo-nextest configuration - THE SERIAL FENCE.
+#
+# WHY THIS FILE EXISTS. Every `cargo test -p cerulion_core` step in CI carries
+# `-- --test-threads=1`, and has since an early CI change. That flag is not an iceoryx2
+# constraint: it is test-hygiene residue. A classification of the whole
+# `crates/cerulion_core/tests` tree found the large majority of its binaries already on
+# per-test SHM roots (`init_for_test` / `generate_isolated_config` /
+# `build_for_test`), needing no shared namespace at all - they are serialised
+# for nothing. What genuinely cannot run beside a sibling is a much smaller set,
+# enumerated below, and nextest lets us say so PRECISELY instead of serialising
+# the whole package.
+#
+# nextest runs EACH TEST IN ITS OWN PROCESS. That single fact dissolves most of
+# what `#[serial]` was defending, with no test edits at all:
+#
+#   * the cdylib `NODES` registry is a process global - a fresh process has a
+#     fresh one, so two cdylib fixtures can no longer poison each other;
+#   * `std::env::set_var` / `EnvVarGuard` mutate the process environment - a
+#     fresh process has its own;
+#   * `#[traced_test]` installs a GLOBAL `tracing` subscriber, and only one may
+#     be installed per process - one test per process, one subscriber;
+#   * a `#[global_allocator]` counting probe measures its own process only.
+#
+# `#[serial]` is left in place everywhere. Under process-per-test its mutex
+# serialises nothing (each process has its own), so it is inert rather than
+# wrong, and removing ~60 attributes would be a large diff that buys nothing and
+# would break `cargo test` for anyone running it directly.
+#
+# TWO FENCES, TWO DIFFERENT MECHANISMS. Do not conflate them:
+#
+#   1. `default-namespace` is a test GROUP with `max-threads = 1`. Its members
+#      are binaries that create or enumerate iceoryx2 services on the DEFAULT
+#      SHM namespace (via `TransportManager::get_or_init()` and friends, or by
+#      spawning a `cerulion` binary that does). They must not run beside EACH
+#      OTHER. A group serialises its own members while everything else keeps
+#      running in parallel beside it - which is exactly the requirement.
+#      Unique-topic minting is NOT sufficient protection here: it isolates the
+#      data plane, but service-directory enumeration and dead-node sweeps see
+#      the whole namespace.
+#
+#   2. `threads-required = "num-cpus"` is applied to the wall-clock TIMING
+#      gates. Those do not need protection from a particular sibling - they need
+#      a QUIET MACHINE, because their verdict is a measured latency. Making such
+#      a test claim every runner slot is how nextest expresses "run this alone".
+#      A mutex group would be the WRONG tool: it would let the whole rest of the
+#      suite run alongside and skew the measurement.
+#
+# A binary may legitimately be in both (a latency gate that also happens to use
+# the default namespace); several below are.
+#
+# THE INVENTORY IS GATED, NOT TRUSTED. A mis-scoped filter that silently
+# un-fenced a singleton binary is the failure mode this whole change has to
+# avoid, so `crates/cerulion_core/tests/serial_discipline_test.rs` READS THIS FILE and
+# asserts its membership equals a declared inventory carrying a reason per
+# entry. Adding a singleton-touching test without fencing it fails that gate;
+# so does adding a fence entry the inventory does not declare.
+#
+# `binary(=name)` is nextest's EXACT-match form. The globbing form `binary(x)`
+# is a substring match, which would silently pull in a future
+# `transport_test_v2` - exact match is what keeps the inventory accurate.
+
+[test-groups]
+# Serialised against each other; everything outside the group runs beside them.
+default-namespace = { max-threads = 1 }
+
+# ---------------------------------------------------------------------------
+# FENCE 1 - the DEFAULT iceoryx2 namespace.
+#
+# Every binary here was hand-audited: the classifier greps for the singleton
+# accessors, and each hit was then READ, because the grep alone is wrong in both
+# directions. Excluded after reading (recorded so the next audit need not
+# re-derive them):
+#
+#   * `serial_discipline_test`, `context_transport_test`, `error_message_test`
+#     - the accessor appears only inside a doc comment or a string literal
+#     (`serial_discipline_test` holds the list as data; `error_message_test`
+#     asserts on an error message that names it). None of the three calls it.
+#   * `supervisor_precreate_iox2_test` - ASSERTS `TransportManager::get()` is
+#     `Err`, i.e. that the process-global instance is unset. It creates nothing
+#     on the default namespace, and process-per-test makes that assertion MORE
+#     reliable than it is today, not less.
+#   * `cerulion_bagd`'s `e2e_test` - its one `init_with_ix_config_json` call
+#     passes deliberately malformed JSON; the parse fails before any singleton
+#     or iceoryx2 touch (the test says so itself), so it installs nothing.
+# ---------------------------------------------------------------------------
+
+[[profile.default.overrides]]
+filter = '''
+  binary(=adaptive_sizing_iceoryx2_test)
++ binary(=cli_e2e_graph_latency_test)
++ binary(=cross_thread_rtt_test)
++ binary(=deliver_history_failure_iox2_test)
++ binary(=dylib_corrupt_info_test)
++ binary(=e2e_cli_test)
++ binary(=fill_from_e2e_test)
++ binary(=flat_latency_test)
++ binary(=graph_latency_test)
++ binary(=graph_test)
++ binary(=latency_threshold_test)
++ binary(=macro_cdylib_test)
++ binary(=macro_graph_test)
++ binary(=network_test)
++ binary(=non_trigger_hold_iox2_test)
++ binary(=output_proxy_test)
++ binary(=overflow_iox2_test)
++ binary(=publisher_pool_sizing_test)
++ binary(=service_test)
++ binary(=shm_footprint_probe)
++ binary(=shm_guard_madvise_iox2_test)
++ binary(=snapshot_view_iox2_test)
++ binary(=step_zero_alloc_test)
++ binary(=trace_ring_hook_zero_alloc_test)
++ binary(=transport_test)
++ binary(=zero_alloc_test)
++ binary(=zero_copy_ci_test)
++ binary(=zero_copy_hot_path_test)
+'''
+test-group = 'default-namespace'
+
+# ---------------------------------------------------------------------------
+# FENCE 2 - wall-clock timing gates. These need a QUIET MACHINE, not protection
+# from one particular sibling, so they claim every runner slot instead of
+# joining a mutex group.
+#
+# FIVE are whole-file `#![cfg(not(debug_assertions))]` and so run only in the
+# release latency lanes. THREE are DEBUG-OK and therefore gate EVERY pull
+# request - `cross_thread_rtt_test`, `flat_latency_test`,
+# `ingress_publish_raw_notify_iox2_test` - which makes them the members this
+# fence matters most for, since a PR lane is where the machine is busiest.
+# (Checked per file, not inferred: grepping for the cfg anywhere in the file
+# misclassifies the first two, which mention it on individual items while the
+# file itself is debug-OK.)
+# ---------------------------------------------------------------------------
+
+[[profile.default.overrides]]
+filter = '''
+  binary(=cli_e2e_graph_latency_test)
++ binary(=cross_thread_rtt_test)
++ binary(=flat_latency_test)
++ binary(=graph_latency_test)
++ binary(=ingress_publish_raw_notify_iox2_test)
++ binary(=latency_threshold_test)
++ binary(=period_decompose_bench_test)
++ binary(=streaming_latency_bench_test)
+'''
+threads-required = 'num-cpus'
+
+# ---------------------------------------------------------------------------
+# Run-shape defaults.
+#
+# `slow-timeout` with NO `terminate-after` REPORTS a slow test and keeps
+# waiting; it does not kill one. Omitting the key is how "never terminate" is
+# spelled - nextest rejects `terminate-after = 0` outright (it wants a nonzero
+# usize), which is worth knowing before someone writes the zero meaning to be
+# explicit. It is absent deliberately: several fenced binaries legitimately take
+# minutes (`barrier_level_gate_iox2_test`'s stalled-peer arm spends the
+# production ~5 s barrier timeout on purpose), and a runner-wide kill switch is
+# how a load-sensitive suite starts failing for reasons that are not bugs.
+# ---------------------------------------------------------------------------
+
+[profile.default]
+slow-timeout = { period = "60s" }
+failure-output = "immediate-final"
+fail-fast = false
+
+# The profile CI uses (`ci_test_shard.sh` passes `--profile ci`).
+#
+# It carries the SAME fence: the overrides above are declared on `default` and
+# a named profile inherits them - VERIFIED with
+# `cargo nextest show-config test-groups --profile ci`, which prints the
+# `default-namespace` group and the binaries it captures, rather than assumed
+# from the schema.
+#
+# No `retries` key, deliberately. A retry turns a flake green and hides it, and
+# this repo's whole approach to flakes is to find the cause (its test table is
+# full of them, each with the measurement that identified it). The differences
+# from `default` are only about OUTPUT and patience on a shared runner: a longer
+# slow-report period, a quiet STREAMING log, and a final summary that names
+# every test.
+[profile.ci]
+slow-timeout = { period = "120s" }
+# WHAT RIDES THE ARCHIVE BESIDE THE TEST BINARIES (CI's build-once job).
+#
+# `cargo nextest archive` packs the test binaries. Two classes of file this
+# repo's tests need are NOT test binaries and would be missing at run time:
+#
+#   * the FIXTURE CDYLIBS the `DylibNodeEntry` tests dlopen, and
+#   * the real `cerulion` / `cerulion-vizd` / `heaphook_probe` binaries the e2e
+#     tests SPAWN (`CARGO_BIN_EXE_*`).
+#
+# Both live as DIRECT children of `<target>/<profile>`, and that is exactly
+# where the tests look: `find_fixture_cdylib` derives its search path from THIS
+# TEST BINARY's own location, so under an extracted archive it resolves to
+# `<extracted>/target/debug/…`. Including the profile directory at depth 1 puts
+# them back at that path, platform-suffix-agnostic (`.so` here, `.dylib` on a
+# developer's Mac) and immune to a fixture being renamed or added - which an
+# explicit per-file list is not.
+#
+# DEPTH 1, and that number is measured rather than read off the schema. Depth 0
+# does NOT mean "this directory's own entries": nextest logs
+# `ignoring extra path <dir> specified with depth 0 since it is a directory`
+# and archives nothing: depth 0 leaves the archive carrying ZERO fixtures and
+# ZERO workspace bins (270 entries, one `.dylib`, and that one was libstd).
+# Depth 1 is one level of
+# children, which is exactly the finished artifacts: `deps/`, `build/`,
+# `incremental/` and `examples/` are subdirectories and their CONTENTS stay out.
+archive.include = [
+    { path = "debug", relative-to = "target", depth = 1, on-missing = "error" },
+]
+failure-output = "immediate-final"
+# Quiet while the run STREAMS, so a green shard does not interleave thousands of
+# PASS lines with the output of the tests still running. Failures are unaffected
+# - `failure-output = "immediate-final"` prints those twice over. The per-test
+# walls live in the FINAL block instead (next key), which is one place to look
+# rather than a thread-interleaved stream.
+status-level = "retry"
+# `pass`, so the final summary names EVERY test WITH ITS WALL.
+#
+# WHY A NUMBER BEATS A SHORT LOG. This key used to be `leak`, which named only
+# the tests nextest flagged, and the consequence was that a green CI log carried
+# NO per-test duration for the overwhelming majority of binaries - the only
+# timings in it were the summary total and whatever tripped `slow-timeout`. So
+# "which binary is this shard's tail?" could not be answered from a run that
+# passed, and every proposal to split a long test file, re-level the shard map
+# or un-serialise a package had to be argued without a measurement - which is
+# how a timing argument ends up resting on a guess, the one thing the gates in
+# this tree consistently refuse to do. The price of fixing it is one block of
+# PASS lines at the END of a green shard's log.
+#
+# `pass` SUBSUMES `leak`, so the reason this key was set in the first place
+# still holds: a LEAKY test is still NAMED rather than only counted. VERIFIED,
+# not inferred from the level ordering, with a two-test probe crate - one plain
+# test, one leaking a `sleep` child that holds the output pipe - run under both
+# spellings. Under `leak` the plain test gets NO LINE AT ALL (which is the whole
+# problem); under `pass` BOTH tests get a line carrying a wall, and the leaky one
+# still carries its `LEAK` marker.
+#
+# Two things worth knowing if you repeat that A/B. It has to be done with a
+# CONFIG file: the CLI's `--final-status-level` REJECTS `leak` ("possible values:
+# none, fail, flaky, slow, skip, pass, all") while the config's
+# `FinalStatusLevel` accepts it. And leak DETECTION is load-sensitive - the same
+# probe on a busy desk labelled the plain test leaky too, because the marker
+# means "a pipe was still open `leak-timeout` after the process exited", which a
+# loaded machine can produce on its own. That is a property of leak detection,
+# not of this key; the key only decides whether the line is PRINTED.
+#
+# nextest reports a test as leaky when a process it spawned still holds the
+# output pipe after the test itself has exited. That is a signal `cargo test`
+# never produced, and this suite spawns a great deal - self-re-exec harnesses,
+# `graph run` supervisors, bagd daemons. MEASURED across burn-in passes here:
+# 1, 0, 0 and 3 leaks on identical runs, i.e. genuinely timing-dependent.
+#
+# Leaks do not fail a run and nothing here treats them as failures. The point is
+# that a summary line saying "3 leaky" with no names is unactionable, and a
+# leaked child is how a runner ends up with orphaned processes holding SHM
+# segments - worth being able to name the moment somebody wants to.
+final-status-level = "pass"
+fail-fast = false

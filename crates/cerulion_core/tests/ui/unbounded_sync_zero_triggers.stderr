@@ -1,0 +1,19 @@
+error: `unbounded_sync` requires ≥2 `#[input(trigger)]` fields — add them, or pick a different policy (`period_ms` / `external`)
+ --> tests/ui/unbounded_sync_zero_triggers.rs:5:1
+  |
+5 | #[cerulion_node(unbounded_sync)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/unbounded_sync_zero_triggers.rs:9:7
+  |
+9 |     #[input]
+  |       ^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/unbounded_sync_zero_triggers.rs:7:7
+  |
+7 |     #[input]
+  |       ^^^^^

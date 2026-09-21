@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  CycloneDDS profile — SHM enabled (iceoryx integration).
+
+  Engages iceoryx as the local-host transport. iox-roudi must be
+  running BEFORE any participant opens: run_bench.sh starts it as a
+  background process before the cyclonedds+shm batch and kills it
+  after. NOTE on the absent-roudi failure mode: iceoryx's
+  initRuntime() WAITS for RouDi (and classically TERMINATES the
+  process after its wait budget) — a "silently falls back to UDP"
+  reading is not supported by
+  the iceoryx runtime-registration design; check the actual per-distro
+  behavior on your machine (either way, verify_shm.sh's roudi-delta
+  gate catches a participant that came up without SHM engagement).
+
+  Cross-distro validity of the <SharedMemory>
+  element: on humble/jazzy (CycloneDDS 0.10.5) this is the
+  built-in iceoryx bridge's native config. On lyrical (CycloneDDS
+  11.0.1) the built-in bridge was replaced by the PSMX plugin
+  interface, and <SharedMemory><Enable>true</Enable> is a DEPRECATED
+  but FULLY FUNCTIONAL alias: convert_deprecated_sharedmemory() in
+  src/core/ddsi/src/ddsi_config.c (releases/11.0.x) converts it into
+  the IDENTICAL in-tree psmx_iox instance the modern
+  <PubSubMessageExchange name="iox" library="psmx_iox"> syntax would
+  create — same plugin, same defaults, Prefix default "DDS_CYCLONE"
+  becoming INSTANCE_NAME (which is what keeps verify_shm.sh's
+  DDS_CYCLONE roudi grep valid on every distro). Running lyrical
+  through this alias is byte-equivalent to the modern syntax, NOT a
+  degraded legacy path. If anyone modernizes this file to
+  <PubSubMessageExchange>, they MUST set SERVICE_NAME=DDS_CYCLONE or
+  the iceoryx service name silently becomes the `name` attribute and
+  the structural verify loses its marker.
+
+  Tracing/Verbosity is set to "info" so verify_shm.sh can grep the
+  iceoryx engagement marker in CYCLONEDDS_LOG output. (In practice
+  the apt builds print no iceoryx marker of their own — engagement is
+  verified via iox-roudi's debug log; see verify_shm.sh.)
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+    <SharedMemory>
+      <Enable>true</Enable>
+      <LogLevel>info</LogLevel>
+    </SharedMemory>
+    <Tracing>
+      <Verbosity>info</Verbosity>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

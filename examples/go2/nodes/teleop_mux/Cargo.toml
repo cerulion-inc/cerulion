@@ -1,0 +1,41 @@
+# The Go2 teleop safety mux node crate (home: examples/go2 — the Go2
+# demo Cerulion workspace, one crate per node). `arbitrate` is the
+# pure std-only staleness-arbitration core; `lib.rs` wraps it in the
+# `#[cerulion_node(period_ms = 20)]` TeleopMux node.
+[package]
+name = "teleop_mux"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Go2 teleop safety mux: staleness arbitration between joystick and keyboard"
+
+[lib]
+# `cdylib` is the production artifact (loaded by `cerulion graph run` via
+# DylibNodeEntry). `rlib` is ADDITIONALLY emitted so tests/mux_e2e_test.rs can link
+# the crate in-process (a cdylib-only crate cannot be consumed by its own
+# integration tests); it adds nothing to the production surface.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+
+[dev-dependencies]
+# `test-helpers` unlocks `cerulion_core::testing::iceoryx_test_config` +
+# `TransportManager::init_for_test` for the e2e (the cerulion_cli /
+# cerulion_cli_engine precedent — each enables the same feature to build
+# isolated per-test iceoryx2 SHM roots).
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+# Matches cerulion_core's own indexmap major (2.x) — `GraphRuntime::build`
+# takes `IndexMap<String, Box<dyn NodeEntry>>`.
+indexmap = "2.8"
+
+# The demo workspace mirrors the root `[workspace.lints]` table (see
+# `examples/go2/Cargo.toml`), so every member here inherits the SAME strict lints as
+# the main tree rather than sitting under no lint table at all.
+[lints]
+workspace = true

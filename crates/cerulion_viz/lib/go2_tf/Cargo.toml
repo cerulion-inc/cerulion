@@ -1,0 +1,23 @@
+# The PURE Go2 TF transforms element codec + robot geometry
+# constants. std + thiserror ONLY — no rerun, no transport —
+# so the PRODUCER node (`nodes/go2_tf_source`) can depend on it without
+# pulling the heavy Rerun SDK. The rerun-side mapping (entity tree,
+# `Transform3D` / `Pinhole` logging) lives in `lib/cerulion_viz`, which also
+# depends on this crate. This keeps the encode↔decode convention in ONE
+# place: the producer encodes and the sink decodes the SAME bytes.
+[package]
+name = "go2_tf"
+version = "1.0.0"
+edition = "2021"
+description = "Go2 TFMessage transforms element codec + robot geometry constants"
+license.workspace = true
+# Not published to crates.io: a demo-support codec, not part of the
+# documented publish set.
+publish = false
+
+[dependencies]
+thiserror = "2"
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

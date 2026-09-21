@@ -1,0 +1,221 @@
+# The GENERIC shared Rerun-visualization support
+# library. rlib only (no cdylib) — consumed in-process by the `cerulion-vizd`
+# daemon (bin/cerulion_vizd) and by tests. (It also backed the graph-embedded
+# `nodes/rerun_sink` cdylib until that crate was deleted: visualization is
+# desk-side, so the sink lost its last caller.) Lifted OUT of the Go2 demo
+# (formerly `examples/go2/lib/go2_viz`); the Go2-specific
+# constants are now parametrized behind `VizConfig` (see `src/config.rs`) whose
+# `Default` reproduces the exact Go2 values, so the demo stays byte-identical.
+[package]
+name = "cerulion_viz"
+version = "1.0.0"
+edition = "2021"
+description = "Cerulion Rerun viz support: PointCloud2 codec, schema→archetype adapter, RecordingStream lifecycle, VizConfig parametrization"
+license.workspace = true
+# MSRV note: the `rerun` dep below declares
+# `rust-version` 1.92 (rerun 0.34.x), but its transitive `fixed` 1.31.0 dep
+# declares 1.93 — so the effective floor for building this crate with unpinned
+# deps is 1.93. This crate is a MEMBER of the root workspace (under
+# `cerulion_viz/*`), and the root MSRV was raised 1.88 -> 1.93 expressly to admit
+# it (so `fixed` resolves naturally to 1.31.0, no lockfile pin back to 1.30.0),
+# so `rust-version = "1.93"` here is exactly the root floor. It is kept out of
+# `default-members` (see the root Cargo.toml) so a plain `cargo build` never
+# pulls rerun; the root `cargo +1.93.0 check --workspace` MSRV job, `cargo clippy
+# --workspace`, and `cargo deny check` all COVER it now.
+rust-version = "1.93"
+# Not published to crates.io: the viz tree is excluded from `default-members`
+# and pulls the Rerun SDK; it is not part of the documented publish set.
+publish = false
+
+[dependencies]
+# EXPLICIT path deps (not `workspace = true`). This crate sits on a
+# cross-workspace path edge with the ISOLATED `examples/go2` workspace (L15
+# inverted the direction: it is now a dev-DEPENDENT of `go2_tf_source`, and was
+# formerly a path dependency OF it), and cargo cannot resolve `workspace = true`
+# inheritance for a path crate loaded from a DIFFERENT workspace — so the root
+# crates are referenced by explicit relative path here.
+cerulion_core = { path = "../../../cerulion_core" }
+native_ros2_messages = { path = "../../../native_ros2_messages" }
+# The PURE TF transforms codec + robot geometry (no Rerun) — shared
+# with the producer node (nodes/go2_tf_source) so the encode↔decode convention
+# lives in ONE place.
+go2_tf = { path = "../go2_tf" }
+tracing = "0.1"
+thiserror = "2"
+# The sink's FrameWalker seeds ALSO from the
+# bridge config's `msg_dirs` store (read via $DDS_BRIDGE_CONFIG) so acquired /
+# store-only types RENDER instead of hitting the unknown-hash drop. Parsed via
+# `serde_yaml::Value` (no serde-derive needed); 0.9 is already this demo
+# workspace's YAML engine (dds_bridge).
+serde_yaml = "0.9"
+# NO direct `serde`: the MONITORS v1 vocabulary (`MonitorCondition` /
+# `MonitorState` / `IneligibleReason`) that `cerulion-vizd`'s `monitors` verb
+# puts on the wire lives in `cerulion_core` and derives serde THERE; this crate
+# names no serde item of its own. The YAML read below goes through
+# `serde_yaml::Value`, which needs no serde-derive.
+# URDF parse for the stick-figure skeleton archetype (joints + links
+# only). roxmltree 0.20 is a tiny pure-Rust DOM XML reader that is
+# DEPENDENCY-FREE (0.20 inlined its tokenizer; the lockfile entry carries no
+# transitive deps) and MIT OR Apache-2.0 — already on this workspace's deny.toml
+# allow-list, so NO new per-crate exception is needed. Chosen over `urdf-rs`
+# deliberately: urdf-rs would pull a heavier serde-xml transitive tree of
+# unknown license into this isolated workspace (and we only need joint
+# origins/axes + link names), whereas roxmltree keeps the resolve deny-clean and
+# the extraction fully under our control + hermetically testable.
+roxmltree = "0.20"
+# H.264 Sequence Parameter Set parsing for the desk-side video demux
+# (`src/video.rs`). NOT a decoder — rerun's viewer decodes; this reads the SPS to
+# learn a sub-stream's picture size so an interleaved multi-rendition topic
+# (alternating 360p and 720p on one topic) is split into per-resolution
+# child entities instead of being fed to one decoder that cannot survive it.
+#
+# NO new resolve: `h264-reader` 0.8.0 is ALREADY in the workspace lockfile as a
+# transitive dep of rerun's own `re_video`, so naming it directly here adds an
+# edge, not a crate. License MIT — already on the root deny.toml allow-list.
+h264-reader = "0.8"
+# The desk-side H.264 DECODER. Measured, rerun 0.34's native video path
+# spawns an `ffmpeg` CLI and leaves `-threads` unset, so libavcodec's FRAME
+# threading holds ~one frame per core before it emits anything: 567 ms of lag on a
+# 16-core desk (and worse on a bigger one) against 0.5 ms decoding in-process. See
+# `src/video_decode.rs` for the full sweep.
+#
+# `openh264` was chosen over the two alternatives on the numbers plus the
+# dependency: a long-lived `ffmpeg -threads 1` we spawn ourselves still measures
+# 68 ms / 3 frames of pipeline AND keeps the user-installed-ffmpeg dependency
+# alive, while platform decoders (VideoToolbox / VA-API) need per-OS code for a
+# path that must work on any desk.
+#
+# `default-features = false` + `libloading` is the LICENSING posture, and it is
+# load-bearing: the crate's DEFAULT feature is `source`, which compiles Cisco's
+# OpenH264 C into our binary and would make US the distributor of an AVC decoder.
+# Cisco's patent grant covers the binaries CISCO distributes, so the shipped build
+# DLOPENs their released binary instead (the Firefox model) — checksum-verified
+# against openh264-sys2's embedded hash list, so a file that is not a Cisco release
+# is refused. The runtime fetch below owns fetching + caching it; until the binary is
+# cached the desk falls back to the (laggy but working) viewer-decodes path, loudly.
+#
+# License BSD-2-Clause, already on the root deny.toml allow-list; the transitive
+# tree (libloading, sha2 and their deps) is permissive and already-allowed.
+openh264 = { version = "0.9", default-features = false, features = ["libloading"] }
+# The raw `DECODING_STATE` constants. `openh264` re-exports only
+# `DynamicAPI`, and `video_decode` has to tell the two error arms that RESET the
+# decoder context (`dsOutOfMemory`, `dsRefListNullPtrs`) apart from the ones that
+# leave its held pictures intact — see `StreamDecoder`'s stamp queue. Naming the
+# values rather than hardcoding 16384/64 keeps them the crate's, not ours.
+#
+# An EDGE, not a new crate: this is `openh264`'s own dependency at the same
+# version, already in the workspace lockfile, so it resolves nothing new (the
+# `sha2` precedent below). License BSD-2-Clause, already allow-listed.
+openh264-sys2 = { version = "0.9", default-features = false }
+# ── The runtime fetch of Cisco's OpenH264 binary (src/openh264_fetch.rs)
+#
+# The three crates below exist because the patent grant follows the DISTRIBUTOR:
+# Cisco's grant covers the binaries CISCO ships, so the decoder has to be
+# downloaded from their CDN at first need and can never be vendored into our
+# installer (the Firefox model — see src/openh264_fetch.rs). That means an HTTPS
+# client, a bzip2 decoder (every Cisco asset is .bz2; there is no uncompressed
+# variant — a request for one answers 403, measured), and a SHA-256.
+#
+# All three are EDGES, not new crates: every one is already in the workspace
+# lockfile, so naming them here resolves nothing new (the `h264-reader`
+# precedent above).
+#
+# `ureq` 3 — blocking HTTPS with rustls + webpki-roots, already present via
+# rerun's `ehttp`. Blocking is the right shape: the fetch runs on its own
+# detached thread and there is no runtime to borrow. License MIT OR Apache-2.0.
+ureq = "3"
+# `bzip2-rs` — a PURE-RUST bzip2 DECODER (crc32fast + tinyvec, both already in
+# the lockfile). Chosen over the `bzip2` crate deliberately: bzip2 0.6's default
+# backend `libbz2-rs-sys` carries the non-SPDX `bzip2-1.0.6` license, which would
+# need a deny.toml clarify entry, and its `bzip2-sys` alternative pulls a C build.
+# This one is MIT OR Apache-2.0 — already on the root allow-list — and decode is
+# all we need. License MIT OR Apache-2.0.
+bzip2-rs = "0.1"
+# `sha2` — the digest the fetcher pins each platform's blob against. Already in
+# the tree as `openh264-sys2`'s own dependency, which is what the LOADER hashes
+# with, so both checks run the same implementation. License MIT OR Apache-2.0.
+sha2 = "0.10"
+# Rerun logging SDK, added CRATE-LOCALLY (never in cerulion_core).
+# `default-features = false` + `sdk` gives the RecordingStream + core logging +
+# the gRPC client sink + the archetypes (Points3D / EncodedImage / Scalars /
+# TextDocument) WITHOUT the viewer (native_viewer / web_viewer), the analytics
+# uploader, or the map view. License: MIT OR Apache-2.0 (both on the root
+# deny.toml allow-list). This is the feature set the crate builds with;
+# if `connect_grpc` needs an extra feature on this rerun minor, add it
+# here.
+rerun = { version = "0.34", default-features = false, features = ["sdk"] }
+
+[features]
+# COMPILE the H.264 decoder in instead of dlopening Cisco's binary.
+#
+# NOT A SHIPPING CONFIGURATION — see the `openh264` dependency note above for why
+# (it makes us the distributor of an AVC decoder). It exists so this crate's own
+# tests and CI decode HERMETICALLY: no network, no cached blob, no per-runner
+# setup. A build that enables it announces itself at runtime (`resolve_backend`),
+# so it cannot ship silently.
+decoder-from-source = ["openh264/source"]
+# Expose the `TapManager` drain-error fault seam
+# (`fault_inject_tap_receive_after`, behind `#[cfg(any(test, feature =
+# "test-helpers"))]`) to integration tests, which compile the lib WITHOUT
+# `cfg(test)`. Forwards to `cerulion_core/test-helpers` (the
+# `DataOnlySubscriber` receive-fault seam the tap seam delegates to). Enabled for
+# this crate's own test build via the self dev-dependency below — the exact
+# cerulion_core self-reference pattern.
+test-helpers = ["cerulion_core/test-helpers"]
+
+[dev-dependencies]
+# test-helpers unlocks TransportManager::init_for_test + iceoryx_test_config
+# for the memory-sink e2e (the teleop_mux precedent). Explicit path (see the
+# [dependencies] note on cross-workspace inheritance).
+cerulion_core = { path = "../../../cerulion_core", features = ["test-helpers"] }
+# Self-reference enables THIS crate's `test-helpers` feature for its own
+# integration tests / examples (the `TapManager` fault-inject seam behind
+# `#[cfg(any(test, feature = "test-helpers"))]`), mirroring cerulion_core's own
+# self dev-dep pattern.
+# The self dev-dep enables `decoder-from-source` so the video tests decode hermetically (see
+# the feature's note above).
+cerulion_viz = { path = ".", features = ["test-helpers", "decoder-from-source"] }
+# Assert the never-block drop-latch LOG discipline (loud-once warn ->
+# debug repeats -> recovery info). `no-env-filter` so the subscriber captures
+# our target regardless of RUST_LOG (matches cerulion_core's dev-dep).
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# The drain-all e2e (tf_drain_all_test) builds a GraphRuntime with an
+# IndexMap<String, Box<dyn NodeEntry>> factory map.
+indexmap = "2.8"
+# MONITORS v1: the monitor vocabulary's wire spellings are pinned as literal JSON
+# (a rename must be a deliberate, visible act), which needs a JSON encoder in the
+# test build only. Already resolved throughout the workspace.
+serde_json = "1"
+# The network-only live-fetch test sweeps EVERY vendored digest against
+# Cisco's CDN, so it needs the same HTTP client + bzip2 decoder the fetcher uses
+# (both are already [dependencies] above; naming them here makes the intent
+# explicit for the test target).
+ureq = "3"
+bzip2-rs = "0.1"
+# The live test must compute the digest INDEPENDENTLY rather than
+# calling the fetcher's own `verify_digest` — a verifier that always answered Ok
+# would otherwise carry the very assertion meant to catch it.
+sha2 = "0.10"
+# The store-seeded-walker tests write ament-
+# mirror `<dir>/<pkg>/msg/<Type>.msg` trees + bridge configs into scratch dirs
+# (matches the dds_bridge dev-dep).
+tempfile = "3"
+# L15 (no viz/rerun on the robot): the Track-B TF producer,
+# for `tests/tf_source_e2e_test.rs`. The edge deliberately points DESK → ROBOT.
+# It used to run the other way (go2_tf_source dev-depended on cerulion_viz +
+# rerun to host that same e2e), which put the Rerun SDK and its MSRV floor on a
+# crate that ships to the robot. Inverting it keeps the oracles identical and
+# leaves `go2_tf_source` rerun-free even under `-e normal,dev` — pinned by the
+# `rerun-leanness` CI job. Cross-workspace path dep into the ISOLATED
+# `examples/go2` workspace: because of THIS edge, go2_tf_source is loaded by two
+# workspaces, and cargo resolves `workspace = true` against whichever one is
+# doing the loading — NOT against the package's directory ancestor. The root's
+# `[workspace.dependencies]` has no `native_ros2_messages`, so inheritance there
+# hard-fails the whole root manifest load; go2_tf_source therefore spells its
+# deps (and `license`) out literally. Do not "tidy" them back to `workspace =
+# true`.
+go2_tf_source = { path = "../../../../examples/go2/nodes/go2_tf_source" }
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

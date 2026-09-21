@@ -1,0 +1,25 @@
+[package]
+name = "detector"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+
+# The DetectionArray Rust type is codegen'd from ../../schemas/detections.yaml
+# at build time (see build.rs): reading the SAME yaml the replayer parses keeps
+# the stamped wire schema_hash in lockstep with the expected one.
+[build-dependencies]
+cerulion_core = { workspace = true }
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+cerulion_core = { workspace = true, features = ["test-helpers"] }

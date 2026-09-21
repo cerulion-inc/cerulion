@@ -1,0 +1,169 @@
+name: Examples (Perception Replay)
+
+# Gates the perception replay-tolerance demo (examples/perception), the moat
+# loop made concrete: record perception_min once -> replay clean (exit 0) ->
+# swap in a detector cdylib whose one hyperparameter changed -> replay again
+# and catch the change as a SEMANTIC bbox_iou regression on a named
+# topic/field (exit 1) -> restore + SHM leak check. This is "replay is
+# regression-testing for ML", something ROS 2 replay cannot do.
+#
+# The example workspace lives OUTSIDE the main cargo workspace, so the
+# main lint/test jobs never compile it. The demo script is written the way a
+# user runs the example: it drives the `cerulion` on PATH and builds the node
+# libraries with `cerulion node build`. A user installs that binary; CI has no
+# install, so this job builds the cerulion binary in RELEASE from the checkout,
+# puts it on PATH, and then runs examples/perception/run_replay_demo.sh
+# unchanged.
+#
+# Matrix ubuntu + macOS covers the A-L catalog's L3 cross-machine exit-parity
+# row (exit 0 golden / exit 1 perturbed on BOTH platforms); the script is
+# already portable (macOS iceoryx2 state under /tmp, Linux under /dev/shm).
+#
+# Path-filtered to examples/perception/** on PRs (only demo PRs pay the cold
+# release build) + push to main + workflow_dispatch. Each matrix entry SKIPS
+# when the demo driver is absent on the ref, so this is a no-op green run on
+# forks / partial checkouts and on any ref before the example lands.
+#
+# PLUS a nightly schedule, because a path filter cannot notice that its own
+# subject broke somewhere ELSE. The demo executes the cerulion binary and the
+# whole node/graph/record/replay stack; none of that is under
+# examples/perception/**, so a change anywhere in the engine can break the
+# shipped example while this lane stays green-by-not-running. That is not
+# hypothetical: it is how main shipped a perception example that refused to
+# run for two days (the graph-validation change that broke it lives in
+# cerulion_cli_engine, and the first ref to run this lane afterwards was an
+# unrelated PR that happened to touch this very file).
+#
+# A nightly, rather than widening the PR filter to the engine crates: the
+# demo's cost is a COLD RELEASE BUILD of cerulion_core + the cerulion binary
+# + the example cdylibs, so adding cerulion_cli_engine/** (let alone
+# cerulion_core/**) would tax a large share of PRs with it. The nightly costs
+# no PR any time, and it covers every cause rather than the one crate that
+# happened to break it this time. The window it leaves is one day on main,
+# against the unbounded one it replaces.
+#
+# Scheduled runs only ever use the DEFAULT BRANCH, which is what we want here:
+# the question is "does the shipped example still run on main?".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/perception/**'
+      - '.github/workflows/examples-replay.yml'
+  pull_request:
+    paths:
+      - 'examples/perception/**'
+      - '.github/workflows/examples-replay.yml'
+  schedule:
+    # 07:30 UTC daily: off the hour, where scheduled-run contention peaks.
+    - cron: '30 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The demo runs the `cerulion` binary directly, not through cargo, so it does
+  # not pick up the workspace cargo configuration. The login gate is on in every
+  # build; this is how this repository's own runs pass it without an account.
+  CERULION_LOGIN_GATE: "off"
+
+jobs:
+  replay-demo:
+    name: Perception replay demo (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # Generous but bounded: the loop itself measured ~4s, but a cold release
+    # build of the example cdylibs + a fresh cerulion_core + the cerulion
+    # binary dominates. 45 min leaves headroom for a cold build.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Skip if demo absent on this ref
+        id: present
+        run: |
+          if [ -f "examples/perception/run_replay_demo.sh" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "examples/perception/run_replay_demo.sh not present on this ref: skipping."
+          fi
+
+      # Linux-only: the fresh cerulion_core + cerulion binary release build
+      # outgrows ubuntu-latest's free disk alongside the restored cache.
+      # Reclaim ~25 GB of preinstalled SDKs the build never uses; macOS has ample disk.
+      - name: Free disk space
+        if: steps.present.outputs.present == 'true' && runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          df -h /
+
+      - name: Install Rust toolchain
+        if: steps.present.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      # Own cache namespace (never shares with the debug-profile lint/test
+      # jobs). Covers BOTH target dirs the demo builds: the repo root (cerulion
+      # binary) and examples/perception (the node libraries). Keyed on the repo
+      # Cargo.lock, the example's own pinned Cargo.lock (both tracked) and the
+      # example's Cargo.toml files.
+      # runner.os is in the key so the ubuntu + macOS matrix arms don't collide.
+      - name: Cache cargo
+        if: steps.present.outputs.present == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            examples/perception/target
+          key: cargo-examples-perception-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'examples/perception/Cargo.lock', 'examples/perception/**/Cargo.toml') }}
+          restore-keys: |
+            cargo-examples-perception-${{ runner.os }}-
+
+      # The demo drives the `cerulion` on PATH, exactly as a user's shell would.
+      # Build it from this checkout and put it there. `GITHUB_PATH` takes effect
+      # for the steps that follow.
+      - name: Build the cerulion binary and put it on PATH
+        if: steps.present.outputs.present == 'true'
+        shell: bash
+        run: |
+          cargo build --release -p cerulion_cli
+          test -x "$GITHUB_WORKSPACE/target/release/cerulion"
+          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+
+      # `shell: bash` is EXPLICIT because that is what opts the step into
+      # `bash -eo pipefail` (an unspecified shell is only `bash -e`, with no
+      # pipefail, and the tee'd pipeline below would swallow the script's
+      # non-zero exit and green a failed demo). ulimit raises the iceoryx2 fd
+      # ceiling (default 1024 -> misleading ServiceInCorruptedState); `|| true`
+      # keeps it non-fatal on macOS where a soft raise past the hard limit is
+      # refused.
+      - name: Run the replay-tolerance demo
+        if: steps.present.outputs.present == 'true'
+        shell: bash
+        run: |
+          ulimit -n 65536 || true
+          cerulion --version
+          bash examples/perception/run_replay_demo.sh 2>&1 | tee examples/perception/demo.log
+
+      # Post-mortem only: nothing is uploaded on success. On failure grab the
+      # recorded bag(s) + the captured demo log so the exit-code / verdict
+      # mismatch is diagnosable off the runner. if-no-files-found: ignore keeps
+      # this quiet if the failure happened before any recording was produced.
+      - name: Upload demo artifacts on failure
+        if: failure() && steps.present.outputs.present == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: perception-replay-demo-${{ matrix.os }}
+          path: |
+            examples/perception/recordings/
+            examples/perception/demo.log
+          if-no-files-found: ignore

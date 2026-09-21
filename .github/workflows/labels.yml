@@ -1,0 +1,29 @@
+# Syncs .github/labels.yml to the repo's GitHub labels.
+# Triggers: manual (workflow_dispatch), or automatically when a change to
+# .github/labels.yml lands on main — so every label change is reviewed as a
+# PR diff before it mutates the repo. Off-the-shelf declarative sync action,
+# no custom scripting — it does idempotent create/update/prune itself.
+name: labels
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/labels.yml]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: crazy-max/ghaction-github-labeler@24d110aa46a59976b8a7f35518cb7f14f434c916 # v5.3.0
+        with:
+          yaml-file: .github/labels.yml
+          # Source of truth: explicitly prune labels not listed in labels.yml
+          # (incl. GitHub's default labels) so the repo matches the file exactly.
+          # This is the action's default; pinned here so the intent is conscious.
+          skip-delete: false

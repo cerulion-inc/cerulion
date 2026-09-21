@@ -1,0 +1,96 @@
+# The GENERIC config-mapped DDS ingress bridge node (home:
+# examples/go2 — the Go2 demo Cerulion workspace; NOT a member of the parent
+# cerulion workspace, so the DDS deps below are CRATE-LOCAL and never enter
+# the root workspace's dependency tree). The ingress node is
+# GENERIC — `dds_bridge`, config-mapped, with the Go2 as the FIRST CONFIG FILE
+# (graphs/go2.bridge.yaml), not a bespoke Go2-only node. This is the
+# node `cerulion ros2 attach` generates a graph for.
+#
+# Pure modules (`config`, `registry`, `mapping`, `queue`) are std+serde only —
+# oracle-testable with no DDS, no transport. `pump` is the DDS helper-thread
+# state machine (ros2-client via the `cerulion_go2_dds` wrapper);
+# `lib.rs` wraps them in the `#[cerulion_node(external)]` DdsBridge node.
+#
+# MSRV note: no rerun here. The effective floor is 1.85.1 via
+# cerulion_go2_dds -> rustdds 0.13 (see lib/cerulion_go2_dds/Cargo.toml); the
+# other deps (smol 2, serde_yaml 0.9) are below that. Well under the
+# `stable` toolchain the companion computer builds with.
+[package]
+name = "dds_bridge"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Generic config-mapped DDS→Cerulion ingress bridge node (ros2-client/rustdds → iceoryx2)"
+
+[lib]
+# `cdylib` is the production artifact (loaded by `cerulion graph run` via
+# DylibNodeEntry — the camera_jpeg / teleop_mux pattern). `rlib` is
+# ADDITIONALLY emitted so tests/*.rs can link the crate in-process; it adds
+# nothing to the production surface.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+# The one-per-process DDS participant wrapper + the
+# field-verified message structs + pure CDR codecs. The typed subscriptions in
+# `pump` deserialize DIRECTLY into the `cerulion_go2_dds` structs via the same serde-CDR
+# engine the pure codecs use (cerulion_go2_dds::cdr — byte-identical wire).
+cerulion_go2_dds = { path = "../../lib/cerulion_go2_dds" }
+# The frame-name constants (ODOM_FRAME/BASE_FRAME) — the odom
+# projection publishes the SAME frame names go2_tf_source broadcasts, kept in
+# the one shared home (std+thiserror-only lib; no rerun).
+# `go2_tf` lives in the isolated `cerulion_viz` workspace at the repo
+# root, so this dep reaches across to it by path.
+go2_tf = { path = "../../../../crates/cerulion_viz/lib/go2_tf" }
+serde = { version = "1", features = ["derive"] }
+# YAML for the mapping config: every config artifact in this demo (graphs,
+# schemas, the bridge mapping) is YAML, and serde_yaml 0.9 is already the
+# root workspace's YAML engine (cerulion_core graph parsing) — one config
+# language, one already-surveyed dep family.
+serde_yaml = "0.9"
+# The DDS drain thread: ros2-client's spinner + per-subscription
+# `async_stream()` drains run on one `smol::LocalExecutor`.
+# `futures` provides StreamExt/pin_mut for the
+# stream drain — sync `take()` polling empirically never yields under
+# ros2-client 0.10 against a CycloneDDS peer (see src/pump.rs docs).
+smol = "2"
+futures = "0.3"
+tracing = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+# `test-helpers` unlocks `cerulion_core::testing::iceoryx_test_config` +
+# `TransportManager::init_for_test` for the e2e (the camera_jpeg / teleop_mux
+# precedent — isolated per-test iceoryx2 SHM roots).
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+# Matches cerulion_core's own indexmap major (2.x) — `GraphRuntime::build`
+# takes `IndexMap<String, Box<dyn NodeEntry>>`.
+indexmap = "2.8"
+# The live-DDS e2e installs a minimal stderr subscriber so node/pump tracing —
+# including tick errors that kill the node body — PRINTS instead of vanishing
+# (RUST_LOG overrides).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The `.msg` store tests write ament-mirror
+# `<dir>/<pkg>/msg/<Type>.msg` trees into a scratch dir (config parse arms,
+# store-only codec resolution, collision precedence, mirror-duty). Tiny,
+# ubiquitous, test-only — matches the engine's `tempfile = "3"` dev-dep.
+tempfile = "3"
+# `shutdown_dispose_test` pins BOTH in-process participants to ONE
+# shared multicast interface so same-host SPDP discovery + the participant
+# dispose ride that interface's kernel-local IP_MULTICAST_LOOP path — hermetic
+# on any host, independent of LAN/switch multicast (see the test's module doc).
+# `pnet_datalink` enumerates interfaces the SAME way stock rustdds itself selects
+# multicast interfaces (it is rustdds's own transitive dep — already in the lock,
+# 0.35), so the pinned IP is guaranteed one rustdds will use. Test-only.
+pnet_datalink = "0.35"
+
+# The demo workspace mirrors the root `[workspace.lints]` table (see
+# `examples/go2/Cargo.toml`), so every member here inherits the SAME strict lints as
+# the main tree rather than sitting under no lint table at all.
+[lints]
+workspace = true

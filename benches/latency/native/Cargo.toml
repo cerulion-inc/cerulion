@@ -1,0 +1,86 @@
+# benches/latency/native: the Rust bench crate of the public latency suite.
+# Native host lines: Cerulion user-facing API, raw iceoryx2
+# floor, zenoh-SHM comparison. Supersedes the duplicated
+# benches/cerulion_round_trip{,_quiescent} trees — pacing is now a runtime
+# mode (`CER_BENCH_PACING`), not a sibling folder.
+
+[package]
+name = "cerulion_latency_bench"
+version = "0.1.0"
+edition = "2021"
+description = "Cerulion public round-trip latency benchmark: native host lines"
+
+# Isolated workspace — not part of the parent workspace. Mirrors the
+# retired bench trees' shape so `cargo build` here never drags the root
+# workspace's members (or its feature unification) into the bench build.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+# (cerulion_user_round_trip was RETIRED: the
+# manual-tick pattern must not be showcased in the public suite. The
+# user-facing Cerulion lines are the workspace legs; the API-layer cost
+# this bin isolated is gated internally by cerulion_core's release
+# latency tests.)
+
+# FLOOR line: raw iceoryx2, mirroring the upstream-canonical
+# publish-subscribe benchmark (no Cerulion wrapping). raw_prefix:
+# iox2_chrt0 (spin-bound — chrt 0 only, per the suite line inventory).
+[[bin]]
+name = "raw_iceoryx2_round_trip"
+path = "src/bin/raw_iceoryx2_round_trip.rs"
+
+# COMPARISON line: zenoh SHM, z_ping/z_pong shape — initiator (spawns the
+# pong subprocess). raw_prefix: zenoh_shm_chrt{0,1}.
+[[bin]]
+name = "zenoh_shm_round_trip"
+path = "src/bin/zenoh_shm_round_trip.rs"
+
+# COMPARISON line: zenoh SHM responder (separate process, killed by the
+# initiator when the sweep completes).
+[[bin]]
+name = "zenoh_shm_round_trip_pong"
+path = "src/bin/zenoh_shm_round_trip_pong.rs"
+
+[dependencies]
+# Path deps go up THREE levels from benches/latency/native (the retired
+# trees were two levels deep).
+#
+# Deliberately SHORT: this crate uses cerulion_core for the C-state DMA
+# lock and the clock, iceoryx2 for the floor line, and zenoh for the
+# comparison line — nothing else. `native_ros2_messages` and `indexmap`
+# were carried over from the retired trees and referenced by no source
+# file here (cargo-machete flags them); the payloads are plain byte
+# buffers, so no ROS 2 message type is needed.
+cerulion_core = { path = "../../../crates/cerulion_core" }
+# The iceoryx2 dependency family MUST resolve to exactly
+# ONE version (=0.9.1) in this lockfile. A bench binary whose statically
+# linked iceoryx2 sub-crates skew against the host runtime's stamps a
+# different `PackageVersion` into the shared-memory connection and NO data
+# flows (`VersionMismatch`, silent). cerulion_core exact-pins the whole
+# sub-crate family; this top-level pin keeps THIS manifest from ever asking
+# for anything newer. (The retired bench trees carried `iceoryx2 = "0.9"`
+# and their stale lockfiles had resolved 0.9.2 — the exact skew class this
+# pin closes.) Verify after any lockfile regeneration:
+#   grep '^name = "iceoryx2' -A1 Cargo.lock   # every entry must be 0.9.1
+iceoryx2 = "=0.9.1"
+# Pinned to the version the May-2026 campaign verified the SHM config
+# against (`zenoh_shm_config`'s JSON5 keys + the Talc-backend 1 MiB floor
+# are 1.7.2-verified). The main workspace is on zenoh 1.8 — bumping this
+# bench line is a deliberate change that re-verifies those keys, not a drive-by.
+zenoh = { version = "=1.7.2", features = ["shared-memory", "unstable"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# The repo lint rules (AGENTS.md) apply to bench code too.
+[lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+
+[lints.clippy]
+all = "warn"

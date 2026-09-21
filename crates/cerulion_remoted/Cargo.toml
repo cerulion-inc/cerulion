@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "cerulion_remoted"
+version.workspace = true
+edition.workspace = true
+# License is INHERITED from the workspace (AGPL-3.0-only). `cerulion_remoted` is
+# the robot-side daemon that owns the ONE iroh endpoint and (later) links
+# `cerulion_core` for the SHM wire plane — it is AGPL, robot-side. Do NOT
+# override the license.
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Robot-side daemon that owns the robot's single iroh endpoint and serves the wire (cerulion/wire/1) and ops (cerulion/ops/1) protocols on it, gating every connection through a deny-by-default pairing check against the offline cerulion_pairing trust store."
+# Not published to crates.io: a robot-side daemon binary, not a library
+# dependency, with path-only internal deps.
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cerulion-remoted"
+path = "src/main.rs"
+
+[features]
+# Forwards cerud's `test-seam` fault-injection feature so the ops-plane tests can
+# reach the poison-INJECTION seams (`OpsServing::poison_receipt_sink_for_test` →
+# `cerud::OpsServer::poison_receipt_sink_for_test`), which are `#[cfg(any(test,
+# feature = "test-seam"))]`-gated so they NEVER compile into the production
+# binary. Enabled for THIS crate's own test targets via the self dev-dependency
+# below (cargo's self-dep pattern), and it drags in `cerud/test-seam` so the
+# delegated cerud seam exists in the test build. The read-only
+# `receipt_sink_poisoned` production check is ungated and needs none of this.
+test-seam = ["cerud/test-seam"]
+
+[dependencies]
+# The ONE iroh endpoint (device key = EndpointId), dial-by-key QUIC, and the
+# wire/ops ALPN constants. Pulls the iroh tree — which is exactly why this crate
+# is EXCLUDED from the workspace `default-members` (a plain `cargo build` stays
+# iroh-free); build it via `cargo build -p cerulion_remoted` or `--workspace`.
+cerulion_link = { path = "../cerulion_link" }
+# What the SHM WIRE PLANE takes from core: the listener-less `DataOnlySubscriber`
+# capture tap (`create_data_only_subscriber` / `drain_owned`), the shared
+# `cerulion_q` catalog/demand/schema vocabulary (`CatalogReply`/`SchemaReply` —
+# ONE wire vocabulary across LAN + remote), the 32-byte `WireHeader`, and the
+# `default_prefix` hostname → robot-identity resolver. Linking `cerulion_core`
+# makes `remoted` AGPL (already the case — it is robot-side). Pulls iceoryx2 +
+# zenoh; another reason `remoted` stays out of `default-members`.
+cerulion_core = { path = "../cerulion_core" }
+# The mechanical ops service the ops ALPN routes into. The
+# PairingAuthorizer implements cerud's `authz::Authorizer` seam, so cerud's
+# server gates every verb through it.
+cerud = { path = "../cerud" }
+# The offline-verifiable trust store + access list + scope/caps model. The
+# accept gate reads it (never re-runs the full chain per connect — the access
+# row is truth).
+cerulion_pairing = { path = "../cerulion_pairing" }
+# The accept loop + per-connection stub handlers run on tokio (the runtime iroh
+# already mandates). `signal` powers the binary's Ctrl-C graceful shutdown;
+# `time` bounds the per-connection control-frame handshake (the accept-path
+# deadline that stops an authed-then-stalled peer holding a task forever — the
+# security review's per-connection resource-hold fix).
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+    # The wire plane's control loop `select!`s on an mpsc channel (the
+    # cancel-safe reader-task pattern) + the revocation-sweep timer. `sync` also
+    # backs `forward.rs`'s `Notify` (previously pulled only via feature unification —
+    # now declared here, since remoted uses it directly).
+    "sync",
+] }
+# Structured logging (never println! in library code). Cap release logging at
+# info, mirroring cerulion_core / cerud / cerulion_bagd.
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
+# The binary installs an env-filter subscriber; the library never installs one.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Unified error enum per crate.
+thiserror = "2"
+# The device→account side-map (R1) + the skeleton accept-decision status frame
+# serialize via serde/serde_json (human-debuggable, dependency-light).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Hex encode/decode of the 32-byte device keys + accounts in the side-map's
+# human-readable on-disk form.
+hex = "0.4"
+# HMAC-SHA256 + constant-time tag comparison for the device→account side-map's
+# tamper-evident MAC (security review R1 hardening). The side-map is the
+# SOLE device_key→account binding the accept gate trusts, so it MUST carry the
+# same integrity guarantee as the trust store: it is authenticated with the SAME
+# firmware secure-storage MAC key, mirroring `cerulion_pairing`'s store framing.
+# These exact versions are already in the workspace lock (via `cerulion_pairing`)
+# — no new crate versions enter the tree.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+# The strong-path `pair` verb carries a `PairingPresentation` over the wire. The
+# pairing crate's cert/grant/signature types are BYTE-oriented serde (an ed25519
+# `Signature` (de)serializes as raw bytes), which does NOT round-trip through
+# serde_json (no native bytes type) — so the presentation rides a deterministic,
+# compact POSTCARD blob (hex in the JSON arg), the SAME format the trust store
+# itself persists. These exact versions are already in the workspace lock (via
+# `cerulion_pairing`) — no new crate versions enter the tree.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+# Thin CLI for the binary (state-root + key/store/index overrides, relay seam,
+# the --network kill-switch). Already a workspace citizen (cerud/bagd). The
+# `env` feature powers the CERULION_STATE_ROOT / CERULION_RELAY_URL fallbacks.
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+# The loopback accept-gate test drives two endpoints in one runtime; `time`
+# bounds every await so CI can never hang (mirrors cerulion_link's loopback).
+# `sync` powers the `oneshot` shutdown channel the `serve`-loop tests use to stop
+# the accept loop after driving a bad + a good inbound connection through it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# The authorizer matrix test builds a REAL certificate chain (deterministic
+# fixed-seed keys — Principle #13) to seed a restricted-scope access row, since
+# `VerifiedPairing::new` is crate-private to cerulion_pairing.
+ed25519-dalek = "2"
+# Isolated temp dirs/files for the device-index persistence round-trip tests.
+tempfile = "3"
+# The wire-plane tests drive REAL iceoryx2 over PER-TEST SHM
+# roots (`TransportManager::init_for_test` + `testing::iceoryx_test_config`),
+# which live behind cerulion_core's `test-helpers` feature — so the dev-dep
+# enables it (cargo unifies this with the plain `[dependencies]` cerulion_core
+# only for the test build; a non-test build stays test-helpers-free).
+cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+# The WAN drop-to-live flood-latch pin asserts EXACTLY ONE loud `warn!` per
+# regime — captured via `#[traced_test]`. The `no-env-filter` feature makes the
+# capture subscriber scope to ALL targets (not just the test crate), mirroring
+# cerulion_core / cerulion_bagd. Already a workspace citizen.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# The wire-plane status pin kills a demanded topic's uni-stream from the desk
+# via QUIC STOP_SENDING (`RecvStream::stop(VarInt)`) while the control connection
+# stays live — `VarInt` is an iroh re-export not surfaced by `cerulion_link`, so
+# the test links iroh directly (same version pin + dev-dep pattern as
+# `cerulion_link`'s own tests). Adds ZERO new crates (iroh is already in the tree).
+iroh = "=1.0.2"
+# Self dev-dependency (cargo's self-dep pattern, mirroring `cerud`): turns ON this
+# crate's own `test-seam` feature for its OWN test targets, so the cfg-gated
+# poison-INJECTION seam (`OpsServing::poison_receipt_sink_for_test`, and via
+# `test-seam = ["cerud/test-seam"]` the delegated `cerud` seam) is compiled for
+# the integration tests only — NEVER for a plain `cargo build -p cerulion_remoted`.
+cerulion_remoted = { path = ".", features = ["test-seam"] }

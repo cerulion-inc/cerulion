@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  FastDDS profile — SHM transport, 256 MiB segment, 16 MB cells ONLY.
+
+  Selected by run_bench.sh ONLY for size=16777216 fastdds+shm runs
+  (fresh processes per size, so the profile env can switch per size).
+  Every other size uses fastdds_shm.xml (64 MiB segment).
+
+  Why per-size and not global: 256 MiB as the GLOBAL segment was tested in
+  the May-2026 campaign and BROKE even size=64 on jazzy (deterministic
+  latency-node bootstrap hang), while 64 MiB worked for sizes <= 1 MB
+  but not for 16 MB payloads. Scoping the big segment to the one size
+  that needs it keeps the small-payload cells on the proven config.
+
+  NOT VERIFIED: the 16 MB fastdds+shm cell has not
+  passed with ANY segment size in the containerized harness — this
+  config is the spec-pinned attempt, not a verified result. If it
+  still fails, the cell fails LOUDLY (no .bin -> exit 13); do not
+  paper over it by widening the small-size config.
+
+  useBuiltinTransports=true: REQUIRED on Fast DDS 2.14+/3.x — PDP
+  discovery always uses UDP/TCP even when SHM is enabled; disabling
+  builtin transports kills participant matching ("Waiting for at
+  least 1 matching subscription(s)" -> context invalid).
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_transport</transport_id>
+        <type>SHM</type>
+        <segment_size>268435456</segment_size>
+        <port_queue_capacity>1024</port_queue_capacity>
+        <healthy_check_timeout_ms>1000</healthy_check_timeout_ms>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="participant_default" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_transport</transport_id>
+        </userTransports>
+        <useBuiltinTransports>true</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

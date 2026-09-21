@@ -1,0 +1,67 @@
+# RouDi mempool config — ros2_rtt_bench (CycloneDDS + iceoryx SHM).
+#
+# The default RouDi config that ships with iceoryx has its largest
+# mempool around 256 KB — too small for the 1 MB / 4 MB / 16 MB
+# payloads in our 10-size round-trip sweep (64 B .. 16 MB). With the bench's fixed-size
+# Pod<N> messages every byte goes through iceoryx (no heap-allocated
+# variable-length tail like sensor_msgs/Image had), so a RouDi config
+# without matching chunks fails the run.
+#
+# We size each mempool one bucket above the matching Pod<N> size so
+# iceoryx's ChunkHeader + alignment overhead is comfortably absorbed:
+# the next-larger bucket is what iceoryx actually picks when the
+# user-payload + header doesn't fit the exact-size bucket.
+#
+# Total resident memory under iceoryx after RouDi starts:
+#   ~ 320 + 256 + 80 + 64 + 64 + 64 + 64 + 80 + 80 = ~1 GB
+# Comfortably below host RAM; all goes through /dev/shm.
+
+[general]
+version = 1
+
+[[segment]]
+
+# Padding bucket below the smallest Pod (Pod64 = 64 B): iceoryx
+# itself uses small buffers internally, keep one tier below.
+[[segment.mempool]]
+size = 128
+count = 5000
+
+# 64 B → use the 1 KB bucket so the ChunkHeader fits.
+[[segment.mempool]]
+size = 1024
+count = 1000
+
+[[segment.mempool]]
+size = 4096
+count = 1000
+
+[[segment.mempool]]
+size = 16384
+count = 500
+
+[[segment.mempool]]
+size = 65536
+count = 200
+
+[[segment.mempool]]
+size = 262144
+count = 100
+
+[[segment.mempool]]
+size = 1048576
+count = 50
+
+[[segment.mempool]]
+size = 4194304
+count = 20
+
+# 16 MB Pod16777216 — iceoryx ChunkHeader is 192 B, so 16 MB +
+# header doesn't fit the 16777216 bucket. Use the next bucket
+# above: 16 MB + 64 KB headroom. count=20 (was 10): bench's 10000-
+# RT loop kept hitting "no chunks available" with count=10 because
+# iceoryx held loaned chunks past their immediate use. Container
+# --shm-size bumped to 4g in run_full_sweep.sh to fit 20 × 16 MiB.
+[[segment.mempool]]
+size = 16842752
+count = 20

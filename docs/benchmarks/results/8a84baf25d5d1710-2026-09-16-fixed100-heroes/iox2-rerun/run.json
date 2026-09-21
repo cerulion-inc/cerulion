@@ -1,0 +1,207 @@
+{
+  "schema_version": 1,
+  "variant": "fixed100",
+  "machine_hash": "8a84baf25d5d1710",
+  "invocations": [
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 1,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "1",
+        "--bin",
+        "iox2",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/iox2rerun-20260916T073650Z/iox2-rerun-after-scoped-shm-sweep"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T00:36:50-0700",
+      "ended_at": "2026-09-16T00:40:21-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T00:36:50-0700",
+          "ended_at": "2026-09-16T00:40:21-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 2,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "2",
+        "--bin",
+        "iox2",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/iox2rerun-20260916T073650Z/iox2-rerun-after-scoped-shm-sweep"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T00:40:21-0700",
+      "ended_at": "2026-09-16T00:43:51-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T00:40:21-0700",
+          "ended_at": "2026-09-16T00:43:51-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 3,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "3",
+        "--bin",
+        "iox2",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/iox2rerun-20260916T073650Z/iox2-rerun-after-scoped-shm-sweep"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T00:43:51-0700",
+      "ended_at": "2026-09-16T00:47:21-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T00:43:51-0700",
+          "ended_at": "2026-09-16T00:47:21-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 4,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "4",
+        "--bin",
+        "iox2",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/iox2rerun-20260916T073650Z/iox2-rerun-after-scoped-shm-sweep"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T00:47:22-0700",
+      "ended_at": "2026-09-16T00:50:52-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T00:47:22-0700",
+          "ended_at": "2026-09-16T00:50:52-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "native",
+      "variant": "fixed100",
+      "rep": 5,
+      "argv": [
+        "bench.py",
+        "native",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "5",
+        "--bin",
+        "iox2",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/iox2rerun-20260916T073650Z/iox2-rerun-after-scoped-shm-sweep"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T00:50:52-0700",
+      "ended_at": "2026-09-16T00:54:22-0700",
+      "cells": [
+        {
+          "cell": "iox2_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T00:50:52-0700",
+          "ended_at": "2026-09-16T00:54:22-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    }
+  ]
+}

@@ -1,0 +1,1643 @@
+# Upstream ROS 2 message signature manifest, GENERATED. Do not hand-edit
+# the signature blocks; regenerate with ./scripts/refresh_upstream_msg_manifest.sh
+# and review the diff. The `!source` / `!accept` / `!accept-fields` lines below ARE
+# hand-authored — they are human judgements and a refresh preserves them verbatim.
+# (`!not-vendored` was REMOVED: it only ever suppressed an orphan signature block,
+# and since a refresh rebuilds the body from the vendored tree that block can never
+# be re-emitted, so one refresh made every such line permanently inert. A legacy
+# line now fails at parse rather than sitting there looking meaningful.)
+#
+# Gated by native_ros2_messages/tests/upstream_drift_test.rs. Each `=<pkg>/<Name>`
+# block records the NORMALIZED upstream signature of a vendored message:
+#   f <type> <name>        a field, in DECLARATION ORDER (order is layout)
+#   c <type> <NAME>=<val>  a constant, sorted by name (position carries no meaning)
+# Normalization is documented in that test's module docs; briefly: field types come
+# from the real `parse_rosmsg`, same-package nested refs are qualified on both
+# sides, and comments/whitespace are dropped.
+#
+# WHY: Cerulion resolves layout by schema hash over the field list. If our text
+# disagrees with a stock robot's, the hashes disagree and `walk_by_hash` refuses at
+# the hash gate before framing is consulted — the topic silently renders nothing.
+# The other corpus tests diff the vendored tree against ITSELF, so they cannot see
+# a self-consistent transcription error. This manifest is the external truth.
+
+# ─── provenance: where each package's upstream truth was verified against ───
+# ONE DISTRO PIN PER PACKAGE, pinned per https://github.com/ros/rosdistro
+# `<distro>/distribution.yaml`. Of the 22 packages below, 20 carry a distro pin
+# (19 Jazzy, and `control_msgs` LYRICAL because 13 of its 39 messages do not exist
+# in Jazzy at all — see the waiver section for what that cost us) and 2 carry NO
+# distro pin at all. "Jazzy" is the majority, NOT the whole corpus.
+# `jazzy`   = the repo's jazzy branch, which IS its Jazzy release branch.
+# `release` = the ros2-gbp release repo at the exact released tag (authoritative;
+#             used for packages that have no branch for their distro).
+# `UNVERIFIED` = no distro-pinned source exists for this package at all.
+#
+# MUTABILITY, stated because the gate's design leans on provenance being
+# reviewable: only the 5 `release` pins name an IMMUTABLE tag. The other 17 name a
+# moving branch (`@jazzy` x15, `@main` x2), so two refreshes months apart emit
+# byte-identical `!source` lines over different upstream states. For those 17 the
+# line records WHERE we looked, not WHEN — only this file's git history dates a
+# branch-pinned signature.
+#
+# These lines are cross-checked against the refresh script's `clone` table by
+# `upstream_drift_test.rs::refresh_script_clone_refs_match_the_manifest_source_pins`,
+# so the two copies of each pin cannot drift apart silently.
+!source action_msgs jazzy ros2/rcl_interfaces@jazzy
+!source builtin_interfaces jazzy ros2/rcl_interfaces@jazzy
+!source statistics_msgs jazzy ros2/rcl_interfaces@jazzy
+!source unique_identifier_msgs jazzy ros2/unique_identifier_msgs@jazzy
+!source diagnostic_msgs jazzy ros2/common_interfaces@jazzy
+!source geometry_msgs jazzy ros2/common_interfaces@jazzy
+!source nav_msgs jazzy ros2/common_interfaces@jazzy
+!source sensor_msgs jazzy ros2/common_interfaces@jazzy
+!source shape_msgs jazzy ros2/common_interfaces@jazzy
+!source std_msgs jazzy ros2/common_interfaces@jazzy
+!source trajectory_msgs jazzy ros2/common_interfaces@jazzy
+!source visualization_msgs jazzy ros2/common_interfaces@jazzy
+!source tf2_msgs jazzy ros2/geometry2@jazzy
+!source grid_map_msgs jazzy ANYbotics/grid_map@jazzy
+!source vision_msgs jazzy ros-perception/vision_msgs@jazzy
+!source control_msgs release ros2-gbp/control_msgs-release@release/lyrical/control_msgs/6.10.0-1
+!source moveit_msgs release ros2-gbp/moveit_msgs-release@release/jazzy/moveit_msgs/2.6.0-1
+!source octomap_msgs release ros2-gbp/octomap_msgs-release@release/jazzy/octomap_msgs/2.0.1-1
+!source object_recognition_msgs release ros2-gbp/object_recognition_msgs-release@release/jazzy/object_recognition_msgs/2.0.0-5
+!source radar_msgs release ros2-gbp/radar_msgs-release@release/jazzy/radar_msgs/0.2.2-4
+!source autoware_perception_msgs UNVERIFIED autowarefoundation/autoware_msgs@main (not a rosdistro package — no Jazzy pin exists)
+!source autoware_planning_msgs UNVERIFIED autowarefoundation/autoware_msgs@main (not a rosdistro package — no Jazzy pin exists)
+
+# ─── accepted divergences ───
+# Each line is a message whose vendored text deliberately does NOT match the
+# recorded upstream signature. The gate FAILS if one of these stops diverging,
+# and also if one names a message that is neither vendored nor in this manifest
+# (so waivers can neither rot into dead weight nor lie in wait to pre-authorise
+# a future divergence).
+#
+# TWO DIRECTIVES, DELIBERATELY SPELLED DIFFERENTLY:
+#   !accept        <pkg/Name> <reason>  — waives the CONSTANT lines only. The
+#                                         FIELD list is still compared, so a
+#                                         wire-affecting divergence under this
+#                                         directive still FAILS.
+#   !accept-fields <pkg/Name> <reason>  — waives the FIELD list too. The only
+#                                         directive that can silence the
+#                                         wire-affecting class. Also required
+#                                         for a message upstream does not have
+#                                         at all, since absence compares
+#                                         NOTHING, fields included.
+#
+# That split exists because the blanket form is what hid the original fork: reach
+# for a distro pin before a waiver whenever an absence is really "we vendored a
+# different distro". See the control_msgs note below for what it cost us once.
+#
+# control_msgs USED to carry FIFTEEN waivers here — 2 field-level divergences plus
+# 13 messages that "exist only in Rolling, absent from Jazzy" — because the package
+# was pinned to Jazzy (`release/jazzy/control_msgs/5.9.0-1`) while the corpus was
+# actually vendored from a later distro. That was not a harmless bookkeeping gap:
+# a waiver on absence tells this gate to compare NOTHING for that message, and
+# `control_msgs/VDA5050State` was sitting behind one carrying `string last_node_id`
+# where upstream declares `uint32`. A stock robot publishing the upstream layout
+# had every frame dropped at the schema-hash gate, and the gate built to catch
+# exactly that class could not see it.
+#
+# The fix is a DISTRO PIN, not more waivers: `control_msgs` now pins to
+# `release/lyrical/control_msgs/6.10.0-1`, where all 39 vendored messages exist and
+# are compared. All 15 waivers are GONE, and all 39 vendored files are byte-identical
+# to that upstream release. Deleting the 13 Jazzy-less types was the alternative and
+# was REJECTED by design: they are public API.
+#
+# RESIDUAL, RECORDED HERE BECAUSE THE PIN REMOVED THE ONLY OTHER TRACE OF IT:
+# "byte-identical to upstream" above means to LYRICAL 6.10.0. Two of the 15 removed
+# waivers were NOT absence waivers — they documented real, hash-affecting
+# divergences against JAZZY's control_msgs 5.9.0, and this PR did not change either
+# vendored file, so those divergences are still live against a Jazzy robot:
+#   * control_msgs/PidState — Jazzy declares p_error/i_error/d_error/p_term/d_term/
+#     i_max/i_min; we (with Lyrical) declare error/error_dot/i_term/p_gain/i_gain/
+#     d_gain/output.
+#   * control_msgs/SteeringControllerStatus — Jazzy names the field
+#     linear_velocity_command; we (with Lyrical) name it traction_command.
+# Field names are part of the hash recipe, so a stock ROS 2 JAZZY arm publishing
+# either type hashes differently from us: on the rmw path `walk_by_hash` refuses at
+# the hash gate and the topic renders nothing; on the `ros2 attach` RAW path our
+# corpus is used to CDR-decode the robot's bytes, and PidState's differing field set
+# misdecodes rather than refusing. This gate cannot flag it — it compares against
+# the pinned distro, which is Lyrical by design.
+# REMEDIATION when it bites: resolve the robot's schema FROM THE ROBOT rather than
+# from our corpus (`cerulion ros2 attach`'s schema-resolution ladder — the
+# wire `~/get_type_description` rung serves the robot's own .msg text, which is
+# authoritative for whatever distro it runs). Vendoring both distros' spellings is
+# not possible: one package, one pin, one hash per type.
+#
+# statistics_msgs/StatisticDataPoint: upstream declares the STATISTICS_DATA_TYPE_*
+# constants in the sibling StatisticDataType.msg (which we also vendor, matching
+# upstream). Ours ADDITIONALLY inlines them here. Constants never reach
+# MessageSchema, so this cannot affect the wire; removing them would drop
+# user-visible names for no wire benefit.
+!accept statistics_msgs/StatisticDataPoint additionally inlines the STATISTICS_DATA_TYPE_* constants that upstream declares only in the sibling StatisticDataType.msg — constants do not reach the wire
+#
+# autoware_msgs is not in rosdistro, so there is no Jazzy-pinned source to verify
+# against; deltas here are measured against `main` and may reflect upstream
+# evolution rather than a transcription error.
+#
+# NOTE: three further autoware deltas need NO waiver because they are wire-NEUTRAL
+# and the normalizer collapses them — ours bounds PredictedObjectKinematics
+# .predicted_paths and PredictedPath.path as [<=100] and Trajectory.points as
+# [<=10000] where main writes []. A bounded `T[<=N]` parses to the same
+# DynamicArray as `T[]` (the bound is an upper limit, not a layout fact), so the
+# schema hash is identical either way.
+!accept autoware_perception_msgs/ObjectClassification UNVERIFIED (no Jazzy pin) — main adds ANIMAL/HAZARD/OVER_DRIVABLE constants and drops UNKNOWN=0 which we keep; constants do not reach the wire
+#
+# KNOWN COVERAGE GAP (not gated — messages that exist in each package's PINNED
+# UPSTREAM but which we do not vendor at all, so they have no signature block here).
+# Adding them is additive and safe; it is tracked separately, not by this manifest.
+#
+# Upstream JAZZY has these and we do not vendor them:
+#   geometry_msgs/VelocityWithCovarianceStamped
+#   nav_msgs/Goals, nav_msgs/Trajectory, nav_msgs/TrajectoryPoint
+#   moveit_msgs/PipelineState, moveit_msgs/ServoStatus
+#
+# The autoware_* packages are NOT in rosdistro and have NO Jazzy release at all
+# (see their UNVERIFIED '!source' lines above), so these are absent from
+# autoware_msgs@main — NOT from Jazzy, which never shipped autoware_msgs:
+#   autoware_perception_msgs: DetectedObject(+Kinematics,+s), TrackedObject(+Kinematics,+s),
+#     TrafficLightElement, TrafficLightGroup(+Array), TrafficSignal(+Array),
+#     TrafficSignalElement, PredictedTrafficLightState
+#   autoware_planning_msgs: Path, PathPoint, PoseWithUuidStamped, RouteState
+
+=action_msgs/GoalInfo
+f unique_identifier_msgs/UUID goal_id
+f builtin_interfaces/Time stamp
+=action_msgs/GoalStatus
+f action_msgs/GoalInfo goal_info
+f int8 status
+c int8 STATUS_ABORTED=6
+c int8 STATUS_ACCEPTED=1
+c int8 STATUS_CANCELED=5
+c int8 STATUS_CANCELING=3
+c int8 STATUS_EXECUTING=2
+c int8 STATUS_SUCCEEDED=4
+c int8 STATUS_UNKNOWN=0
+=action_msgs/GoalStatusArray
+f action_msgs/GoalStatus[] status_list
+=autoware_perception_msgs/ObjectClassification
+f uint8 label
+f float32 probability
+c uint8 ANIMAL=8
+c uint8 BICYCLE=6
+c uint8 BUS=3
+c uint8 CAR=1
+c uint8 HAZARD=9
+c uint8 MOTORCYCLE=5
+c uint8 OVER_DRIVABLE=10
+c uint8 PEDESTRIAN=7
+c uint8 TRAILER=4
+c uint8 TRUCK=2
+c uint8 UNDER_DRIVABLE=11
+c uint8 UNKNOWN=0
+=autoware_perception_msgs/PredictedObject
+f unique_identifier_msgs/UUID object_id
+f float32 existence_probability
+f autoware_perception_msgs/ObjectClassification[] classification
+f autoware_perception_msgs/PredictedObjectKinematics kinematics
+f autoware_perception_msgs/Shape shape
+=autoware_perception_msgs/PredictedObjectKinematics
+f geometry_msgs/PoseWithCovariance initial_pose_with_covariance
+f geometry_msgs/TwistWithCovariance initial_twist_with_covariance
+f geometry_msgs/AccelWithCovariance initial_acceleration_with_covariance
+f autoware_perception_msgs/PredictedPath[] predicted_paths
+=autoware_perception_msgs/PredictedObjects
+f std_msgs/Header header
+f autoware_perception_msgs/PredictedObject[] objects
+=autoware_perception_msgs/PredictedPath
+f geometry_msgs/Pose[] path
+f builtin_interfaces/Duration time_step
+f float32 confidence
+=autoware_perception_msgs/Shape
+f uint8 type
+f geometry_msgs/Polygon footprint
+f geometry_msgs/Vector3 dimensions
+c uint8 BOUNDING_BOX=0
+c uint8 CYLINDER=1
+c uint8 POLYGON=2
+=autoware_planning_msgs/LaneletPrimitive
+f int64 id
+f string primitive_type
+=autoware_planning_msgs/LaneletRoute
+f std_msgs/Header header
+f geometry_msgs/Pose start_pose
+f geometry_msgs/Pose goal_pose
+f autoware_planning_msgs/LaneletSegment[] segments
+f unique_identifier_msgs/UUID uuid
+f bool allow_modification
+=autoware_planning_msgs/LaneletSegment
+f autoware_planning_msgs/LaneletPrimitive preferred_primitive
+f autoware_planning_msgs/LaneletPrimitive[] primitives
+=autoware_planning_msgs/Trajectory
+f std_msgs/Header header
+f autoware_planning_msgs/TrajectoryPoint[] points
+=autoware_planning_msgs/TrajectoryPoint
+f builtin_interfaces/Duration time_from_start
+f geometry_msgs/Pose pose
+f float32 longitudinal_velocity_mps
+f float32 lateral_velocity_mps
+f float32 acceleration_mps2
+f float32 heading_rate_rps
+f float32 front_wheel_angle_rad
+f float32 rear_wheel_angle_rad
+=builtin_interfaces/Duration
+f int32 sec
+f uint32 nanosec
+=builtin_interfaces/Time
+f int32 sec
+f uint32 nanosec
+=control_msgs/AdmittanceControllerState
+f std_msgs/Float64MultiArray mass
+f std_msgs/Float64MultiArray damping
+f std_msgs/Float64MultiArray stiffness
+f geometry_msgs/Quaternion rot_base_control
+f geometry_msgs/TransformStamped ref_trans_base_ft
+f std_msgs/Int8MultiArray selected_axes
+f std_msgs/String ft_sensor_frame
+f geometry_msgs/TransformStamped admittance_position
+f geometry_msgs/TwistStamped admittance_acceleration
+f geometry_msgs/TwistStamped admittance_velocity
+f geometry_msgs/WrenchStamped wrench_base
+f sensor_msgs/JointState joint_state
+=control_msgs/BatteryStateArray
+f sensor_msgs/BatteryState[] battery_states
+=control_msgs/CANopenState
+f uint8 node_id
+f uint8 nmt_state
+f uint8 dsp_402_state
+f uint32 last_emcy_code
+c uint8 DSP402_FAULT=7
+c uint8 DSP402_FAULT_REACTION_ACTIVE=6
+c uint8 DSP402_NOT_READY_TO_SWITCH_ON=0
+c uint8 DSP402_OPERATION_ENABLED=4
+c uint8 DSP402_QUICK_STOP_ACTIVE=5
+c uint8 DSP402_READY_TO_SWITCH_ON=2
+c uint8 DSP402_SWITCHED_ON=3
+c uint8 DSP402_SWITCH_ON_DISABLED=1
+c uint8 NMT_INITIALISING=0
+c uint8 NMT_OPERATIONAL=5
+c uint8 NMT_PRE_OPERATIONAL=127
+c uint8 NMT_STOPPED=4
+=control_msgs/DynamicInterfaceGroupValues
+f std_msgs/Header header
+f string[] interface_groups
+f control_msgs/InterfaceValue[] interface_values
+=control_msgs/DynamicInterfaceValues
+f std_msgs/Header header
+f control_msgs/InterfaceValue states
+f control_msgs/InterfaceValue commands
+=control_msgs/DynamicJointState
+f std_msgs/Header header
+f string[] joint_names
+f control_msgs/InterfaceValue[] interface_values
+=control_msgs/EtherCATState
+f uint16 slave_position
+f string vendor_id
+f string product_code
+f uint8 al_state
+f bool has_error
+f uint16 al_status_code
+c uint8 AL_STATE_BOOTSTRAP=3
+c uint8 AL_STATE_INIT=1
+c uint8 AL_STATE_OP=8
+c uint8 AL_STATE_PREOP=2
+c uint8 AL_STATE_SAFEOP=4
+=control_msgs/Float64Values
+f std_msgs/Header header
+f float64[] values
+=control_msgs/GenericHardwareState
+f uint8 health_status
+f uint8[] error_domain
+f uint8 operational_mode
+f uint8 power_state
+f uint8 connectivity_status
+f string manufacturer
+f string model
+f string firmware_version
+f diagnostic_msgs/KeyValue[] state_details
+c uint8 CALIBRATION_REQUIRED=10
+c uint8 CONNECTION_SLOW=4
+c uint8 CONNECT_DOWN=2
+c uint8 CONNECT_FAILURE=3
+c uint8 CONNECT_UNKNOWN=0
+c uint8 CONNECT_UP=1
+c uint8 EMERGENCY_STOP_HW=5
+c uint8 EMERGENCY_STOP_SW=6
+c uint8 ERROR_HW=2
+c uint8 ERROR_NONE=0
+c uint8 ERROR_OVER_TRAVEL=4
+c uint8 ERROR_SW=3
+c uint8 ERROR_UNKNOWN=1
+c uint8 HEALTH_DEGRADED=2
+c uint8 HEALTH_ERROR=4
+c uint8 HEALTH_FATAL=5
+c uint8 HEALTH_OK=1
+c uint8 HEALTH_UNKNOWN=0
+c uint8 HEALTH_WARNING=3
+c uint8 MODE_ADMITTANCE=6
+c uint8 MODE_AUTO=2
+c uint8 MODE_CARTESIAN_POSE=10
+c uint8 MODE_CARTESIAN_TWIST=9
+c uint8 MODE_HOLD_TO_RUN=8
+c uint8 MODE_JOG_MANUAL=5
+c uint8 MODE_MAINTENANCE=4
+c uint8 MODE_MANUAL=1
+c uint8 MODE_MONITORED_STOP=7
+c uint8 MODE_SAFE=3
+c uint8 MODE_TRAJECTORY_FORWARDING=11
+c uint8 MODE_TRAJECTORY_STREAMING=12
+c uint8 MODE_UNKNOWN=0
+c uint8 POWER_CHARGING=8
+c uint8 POWER_CHARGING_ERROR=9
+c uint8 POWER_ERROR=5
+c uint8 POWER_LEVEL_CRITICAL=7
+c uint8 POWER_LEVEL_LOW=6
+c uint8 POWER_OFF=1
+c uint8 POWER_ON=3
+c uint8 POWER_SLEEP=4
+c uint8 POWER_STANDBY=2
+c uint8 POWER_UNKNOWN=0
+c uint8 PROTECTIVE_STOP_HW=7
+c uint8 PROTECTIVE_STOP_SW=8
+c uint8 SAFETY_STOP=9
+=control_msgs/GripperCommand
+f float64 position
+f float64 max_effort
+=control_msgs/HardwareDeviceDiagnostics
+f std_msgs/Header header
+f string device_id
+f diagnostic_msgs/KeyValue[] entries
+=control_msgs/HardwareDeviceStatus
+f std_msgs/Header header
+f string device_id
+f control_msgs/GenericHardwareState[] hardware_status
+f control_msgs/CANopenState[] canopen_states
+f control_msgs/EtherCATState[] ethercat_states
+f control_msgs/VDA5050State[] vda5050_states
+=control_msgs/HardwareDiagnostics
+f std_msgs/Header header
+f string hardware_id
+f control_msgs/HardwareDeviceDiagnostics[] hardware_device_diagnostics
+=control_msgs/HardwareStatus
+f std_msgs/Header header
+f string hardware_id
+f control_msgs/HardwareDeviceStatus[] hardware_device_states
+=control_msgs/InterfaceValue
+f string[] interface_names
+f float64[] values
+=control_msgs/JointCommand
+f std_msgs/Header header
+f string[] joint_names
+f string interface_name
+f float64[] values
+=control_msgs/JointComponentTolerance
+f string joint_name
+f uint16 component
+f float64 position
+f float64 velocity
+f float64 acceleration
+c uint16 ROTATION=5
+c uint16 TRANSLATION=4
+c uint16 X_AXIS=1
+c uint16 Y_AXIS=2
+c uint16 Z_AXIS=3
+=control_msgs/JointControllerState
+f std_msgs/Header header
+f float64 set_point
+f float64 process_value
+f float64 process_value_dot
+f float64 error
+f float64 time_step
+f float64 command
+f float64 p
+f float64 i
+f float64 d
+f float64 i_clamp
+f bool antiwindup
+=control_msgs/JointJog
+f std_msgs/Header header
+f string[] joint_names
+f float64[] displacements
+f float64[] velocities
+f float64 duration
+=control_msgs/JointTolerance
+f string name
+f float64 position
+f float64 velocity
+f float64 acceleration
+=control_msgs/JointTrajectoryControllerState
+f std_msgs/Header header
+f string[] joint_names
+f trajectory_msgs/JointTrajectoryPoint reference
+f trajectory_msgs/JointTrajectoryPoint feedback
+f trajectory_msgs/JointTrajectoryPoint error
+f trajectory_msgs/JointTrajectoryPoint output
+f string[] multi_dof_joint_names
+f trajectory_msgs/MultiDOFJointTrajectoryPoint multi_dof_reference
+f trajectory_msgs/MultiDOFJointTrajectoryPoint multi_dof_feedback
+f trajectory_msgs/MultiDOFJointTrajectoryPoint multi_dof_error
+f trajectory_msgs/MultiDOFJointTrajectoryPoint multi_dof_output
+f float64 speed_scaling_factor
+=control_msgs/JointWrenchTrajectory
+f std_msgs/Header header
+f string[] joint_names
+f control_msgs/JointWrenchTrajectoryPoint[] points
+=control_msgs/JointWrenchTrajectoryPoint
+f trajectory_msgs/JointTrajectoryPoint point
+f control_msgs/WrenchFramed wrench
+=control_msgs/Keys
+f std_msgs/Header header
+f string[] keys
+=control_msgs/MecanumDriveControllerState
+f std_msgs/Header header
+f float64 front_left_wheel_velocity
+f float64 back_left_wheel_velocity
+f float64 back_right_wheel_velocity
+f float64 front_right_wheel_velocity
+f geometry_msgs/Twist reference_velocity
+=control_msgs/MotionArgument
+f string name
+f float64 value
+=control_msgs/MotionPrimitive
+f int8 type
+f float64 blend_radius
+f control_msgs/MotionArgument[] additional_arguments
+f geometry_msgs/PoseStamped[] poses
+f float64[] joint_positions
+c int8 CIRCULAR_CARTESIAN=51
+c int8 LINEAR_CARTESIAN=50
+c int8 LINEAR_JOINT=0
+c int8 UNKNOWN=-1
+=control_msgs/MotionPrimitiveSequence
+f control_msgs/MotionPrimitive[] motions
+=control_msgs/MultiDOFCommand
+f string[] dof_names
+f float64[] values
+f float64[] values_dot
+=control_msgs/MultiDOFStateStamped
+f std_msgs/Header header
+f control_msgs/SingleDOFState[] dof_states
+=control_msgs/PidState
+f std_msgs/Header header
+f builtin_interfaces/Duration timestep
+f float64 error
+f float64 error_dot
+f float64 i_term
+f float64 p_gain
+f float64 i_gain
+f float64 d_gain
+f float64 output
+=control_msgs/SingleDOFState
+f string name
+f float64 reference
+f float64 feedback
+f float64 feedback_dot
+f float64 error
+f float64 error_dot
+f float64 time_step
+f float64 output
+=control_msgs/SingleDOFStateStamped
+f std_msgs/Header header
+f control_msgs/SingleDOFState dof_state
+=control_msgs/SpeedScalingFactor
+f float64 factor
+=control_msgs/SteeringControllerCommand
+f std_msgs/Header header
+f float64 steering_angle
+f float64 linear_velocity
+=control_msgs/SteeringControllerStatus
+f std_msgs/Header header
+f float64[] traction_wheels_position
+f float64[] traction_wheels_velocity
+f float64[] steer_positions
+f float64[] traction_command
+f float64[] steering_angle_command
+=control_msgs/VDA5050SafetyState
+f string e_stop
+f bool field_violation
+c string AUTO_ACK="autoAck"
+c string MANUAL="manual"
+c string NONE="none"
+c string REMOTE="remote"
+=control_msgs/VDA5050State
+f string order_id
+f string action_status
+f uint32 last_node_id
+f bool driving
+f float64 battery_charge
+f string operating_mode
+f string error_type
+f string error_description
+c string ACTION_FAILED="FAILED"      # Action execution failed
+c string ACTION_FINISHED="FINISHED"    # Action completed successfully
+c string ACTION_INITIALIZING="INITIALIZING" # Action is being initialized
+c string ACTION_PAUSED="PAUSED"      # Action execution is paused
+c string ACTION_RUNNING="RUNNING"     # Action is currently executing
+c string ACTION_WAITING="WAITING"     # Action is waiting to be executed
+c string MODE_AUTOMATIC="AUTOMATIC"   # Vehicle operates autonomously
+c string MODE_EMERGENCY="EMERGENCY"   # Vehicle is in emergency mode
+c string MODE_MANUAL="MANUAL"      # Vehicle is under manual control
+c string MODE_SEMI_AUTOMATIC="SEMIAUTOMATIC" # Vehicle requires operator confirmation
+c string MODE_SERVICE="SERVICE"     # Vehicle is in service/maintenance mode
+c string MODE_TEACHIN="TEACHIN"     # Vehicle is in teach-in mode for route learning
+=control_msgs/WrenchFramed
+f string frame_id
+f geometry_msgs/Wrench wrench
+=diagnostic_msgs/DiagnosticArray
+f std_msgs/Header header
+f diagnostic_msgs/DiagnosticStatus[] status
+=diagnostic_msgs/DiagnosticStatus
+f uint8 level
+f string name
+f string message
+f string hardware_id
+f diagnostic_msgs/KeyValue[] values
+c uint8 ERROR=2
+c uint8 OK=0
+c uint8 STALE=3
+c uint8 WARN=1
+=diagnostic_msgs/KeyValue
+f string key
+f string value
+=geometry_msgs/Accel
+f geometry_msgs/Vector3 linear
+f geometry_msgs/Vector3 angular
+=geometry_msgs/AccelStamped
+f std_msgs/Header header
+f geometry_msgs/Accel accel
+=geometry_msgs/AccelWithCovariance
+f geometry_msgs/Accel accel
+f float64[36] covariance
+=geometry_msgs/AccelWithCovarianceStamped
+f std_msgs/Header header
+f geometry_msgs/AccelWithCovariance accel
+=geometry_msgs/Inertia
+f float64 m
+f geometry_msgs/Vector3 com
+f float64 ixx
+f float64 ixy
+f float64 ixz
+f float64 iyy
+f float64 iyz
+f float64 izz
+=geometry_msgs/InertiaStamped
+f std_msgs/Header header
+f geometry_msgs/Inertia inertia
+=geometry_msgs/Point
+f float64 x
+f float64 y
+f float64 z
+=geometry_msgs/Point32
+f float32 x
+f float32 y
+f float32 z
+=geometry_msgs/PointStamped
+f std_msgs/Header header
+f geometry_msgs/Point point
+=geometry_msgs/Polygon
+f geometry_msgs/Point32[] points
+=geometry_msgs/PolygonInstance
+f geometry_msgs/Polygon polygon
+f int64 id
+=geometry_msgs/PolygonInstanceStamped
+f std_msgs/Header header
+f geometry_msgs/PolygonInstance polygon
+=geometry_msgs/PolygonStamped
+f std_msgs/Header header
+f geometry_msgs/Polygon polygon
+=geometry_msgs/Pose
+f geometry_msgs/Point position
+f geometry_msgs/Quaternion orientation
+=geometry_msgs/Pose2D
+f float64 x
+f float64 y
+f float64 theta
+=geometry_msgs/PoseArray
+f std_msgs/Header header
+f geometry_msgs/Pose[] poses
+=geometry_msgs/PoseStamped
+f std_msgs/Header header
+f geometry_msgs/Pose pose
+=geometry_msgs/PoseWithCovariance
+f geometry_msgs/Pose pose
+f float64[36] covariance
+=geometry_msgs/PoseWithCovarianceStamped
+f std_msgs/Header header
+f geometry_msgs/PoseWithCovariance pose
+=geometry_msgs/Quaternion
+f float64 x
+f float64 y
+f float64 z
+f float64 w
+=geometry_msgs/QuaternionStamped
+f std_msgs/Header header
+f geometry_msgs/Quaternion quaternion
+=geometry_msgs/Transform
+f geometry_msgs/Vector3 translation
+f geometry_msgs/Quaternion rotation
+=geometry_msgs/TransformStamped
+f std_msgs/Header header
+f string child_frame_id
+f geometry_msgs/Transform transform
+=geometry_msgs/Twist
+f geometry_msgs/Vector3 linear
+f geometry_msgs/Vector3 angular
+=geometry_msgs/TwistStamped
+f std_msgs/Header header
+f geometry_msgs/Twist twist
+=geometry_msgs/TwistWithCovariance
+f geometry_msgs/Twist twist
+f float64[36] covariance
+=geometry_msgs/TwistWithCovarianceStamped
+f std_msgs/Header header
+f geometry_msgs/TwistWithCovariance twist
+=geometry_msgs/Vector3
+f float64 x
+f float64 y
+f float64 z
+=geometry_msgs/Vector3Stamped
+f std_msgs/Header header
+f geometry_msgs/Vector3 vector
+=geometry_msgs/VelocityStamped
+f std_msgs/Header header
+f string body_frame_id
+f string reference_frame_id
+f geometry_msgs/Twist velocity
+=geometry_msgs/Wrench
+f geometry_msgs/Vector3 force
+f geometry_msgs/Vector3 torque
+=geometry_msgs/WrenchStamped
+f std_msgs/Header header
+f geometry_msgs/Wrench wrench
+=grid_map_msgs/GridMap
+f std_msgs/Header header
+f grid_map_msgs/GridMapInfo info
+f string[] layers
+f string[] basic_layers
+f std_msgs/Float32MultiArray[] data
+f uint16 outer_start_index
+f uint16 inner_start_index
+=grid_map_msgs/GridMapInfo
+f float64 resolution
+f float64 length_x
+f float64 length_y
+f geometry_msgs/Pose pose
+=moveit_msgs/AllowedCollisionEntry
+f bool[] enabled
+=moveit_msgs/AllowedCollisionMatrix
+f string[] entry_names
+f moveit_msgs/AllowedCollisionEntry[] entry_values
+f string[] default_entry_names
+f bool[] default_entry_values
+=moveit_msgs/AttachedCollisionObject
+f string link_name
+f moveit_msgs/CollisionObject object
+f string[] touch_links
+f trajectory_msgs/JointTrajectory detach_posture
+f float64 weight
+=moveit_msgs/BoundingVolume
+f shape_msgs/SolidPrimitive[] primitives
+f geometry_msgs/Pose[] primitive_poses
+f shape_msgs/Mesh[] meshes
+f geometry_msgs/Pose[] mesh_poses
+=moveit_msgs/CartesianPoint
+f geometry_msgs/Pose pose
+f geometry_msgs/Twist velocity
+f geometry_msgs/Accel acceleration
+=moveit_msgs/CartesianTrajectory
+f std_msgs/Header header
+f string tracked_frame
+f moveit_msgs/CartesianTrajectoryPoint[] points
+=moveit_msgs/CartesianTrajectoryPoint
+f moveit_msgs/CartesianPoint point
+f builtin_interfaces/Duration time_from_start
+=moveit_msgs/CollisionObject
+f std_msgs/Header header
+f geometry_msgs/Pose pose
+f string id
+f object_recognition_msgs/ObjectType type
+f shape_msgs/SolidPrimitive[] primitives
+f geometry_msgs/Pose[] primitive_poses
+f shape_msgs/Mesh[] meshes
+f geometry_msgs/Pose[] mesh_poses
+f shape_msgs/Plane[] planes
+f geometry_msgs/Pose[] plane_poses
+f string[] subframe_names
+f geometry_msgs/Pose[] subframe_poses
+f uint8 operation
+c uint8 ADD=0
+c uint8 APPEND=2
+c uint8 MOVE=3
+c uint8 REMOVE=1
+=moveit_msgs/ConstraintEvalResult
+f bool result
+f float64 distance
+=moveit_msgs/Constraints
+f string name
+f moveit_msgs/JointConstraint[] joint_constraints
+f moveit_msgs/PositionConstraint[] position_constraints
+f moveit_msgs/OrientationConstraint[] orientation_constraints
+f moveit_msgs/VisibilityConstraint[] visibility_constraints
+=moveit_msgs/ContactInformation
+f std_msgs/Header header
+f geometry_msgs/Point position
+f geometry_msgs/Vector3 normal
+f float64 depth
+f string contact_body_1
+f uint32 body_type_1
+f string contact_body_2
+f uint32 body_type_2
+c uint32 ROBOT_ATTACHED=2
+c uint32 ROBOT_LINK=0
+c uint32 WORLD_OBJECT=1
+=moveit_msgs/CostSource
+f float64 cost_density
+f geometry_msgs/Vector3 aabb_min
+f geometry_msgs/Vector3 aabb_max
+=moveit_msgs/DisplayRobotState
+f moveit_msgs/RobotState state
+f moveit_msgs/ObjectColor[] highlight_links
+f bool hide
+=moveit_msgs/DisplayTrajectory
+f string model_id
+f moveit_msgs/RobotTrajectory[] trajectory
+f moveit_msgs/RobotState trajectory_start
+=moveit_msgs/GenericTrajectory
+f std_msgs/Header header
+f trajectory_msgs/JointTrajectory[] joint_trajectory
+f moveit_msgs/CartesianTrajectory[] cartesian_trajectory
+=moveit_msgs/Grasp
+f string id
+f trajectory_msgs/JointTrajectory pre_grasp_posture
+f trajectory_msgs/JointTrajectory grasp_posture
+f geometry_msgs/PoseStamped grasp_pose
+f float64 grasp_quality
+f moveit_msgs/GripperTranslation pre_grasp_approach
+f moveit_msgs/GripperTranslation post_grasp_retreat
+f moveit_msgs/GripperTranslation post_place_retreat
+f float32 max_contact_force
+f string[] allowed_touch_objects
+=moveit_msgs/GripperTranslation
+f geometry_msgs/Vector3Stamped direction
+f float32 desired_distance
+f float32 min_distance
+=moveit_msgs/JointConstraint
+f string joint_name
+f float64 position
+f float64 tolerance_above
+f float64 tolerance_below
+f float64 weight
+=moveit_msgs/JointLimits
+f string joint_name
+f bool has_position_limits
+f float64 min_position
+f float64 max_position
+f bool has_velocity_limits
+f float64 max_velocity
+f bool has_acceleration_limits
+f float64 max_acceleration
+f bool has_jerk_limits
+f float64 max_jerk
+=moveit_msgs/KinematicSolverInfo
+f string[] joint_names
+f moveit_msgs/JointLimits[] limits
+f string[] link_names
+=moveit_msgs/LinkPadding
+f string link_name
+f float64 padding
+=moveit_msgs/LinkScale
+f string link_name
+f float64 scale
+=moveit_msgs/MotionPlanDetailedResponse
+f moveit_msgs/RobotState trajectory_start
+f string group_name
+f moveit_msgs/RobotTrajectory[] trajectory
+f string[] description
+f float64[] processing_time
+f moveit_msgs/MoveItErrorCodes error_code
+=moveit_msgs/MotionPlanRequest
+f moveit_msgs/WorkspaceParameters workspace_parameters
+f moveit_msgs/RobotState start_state
+f moveit_msgs/Constraints[] goal_constraints
+f moveit_msgs/Constraints path_constraints
+f moveit_msgs/TrajectoryConstraints trajectory_constraints
+f moveit_msgs/GenericTrajectory[] reference_trajectories
+f string pipeline_id
+f string planner_id
+f string group_name
+f int32 num_planning_attempts
+f float64 allowed_planning_time
+f float64 max_velocity_scaling_factor
+f float64 max_acceleration_scaling_factor
+f string cartesian_speed_limited_link
+f float64 max_cartesian_speed
+=moveit_msgs/MotionPlanResponse
+f moveit_msgs/RobotState trajectory_start
+f string group_name
+f moveit_msgs/RobotTrajectory trajectory
+f float64 planning_time
+f moveit_msgs/MoveItErrorCodes error_code
+=moveit_msgs/MotionSequenceItem
+f moveit_msgs/MotionPlanRequest req
+f float64 blend_radius
+=moveit_msgs/MotionSequenceRequest
+f moveit_msgs/MotionSequenceItem[] items
+=moveit_msgs/MotionSequenceResponse
+f moveit_msgs/MoveItErrorCodes error_code
+f moveit_msgs/RobotState sequence_start
+f moveit_msgs/RobotTrajectory[] planned_trajectories
+f float64 planning_time
+=moveit_msgs/MoveItErrorCodes
+f int32 val
+f string message
+f string source
+c int32 ABORT=-30
+c int32 COLLISION_CHECKING_UNAVAILABLE=-22
+c int32 COMMUNICATION_FAILURE=-25
+c int32 CONTROL_FAILED=-4
+c int32 CRASH=-29
+c int32 FAILURE=99999
+c int32 FRAME_TRANSFORM_FAILURE=-21
+c int32 GOAL_CONSTRAINTS_VIOLATED=-14
+c int32 GOAL_IN_COLLISION=-12
+c int32 GOAL_STATE_INVALID=-27
+c int32 GOAL_VIOLATES_PATH_CONSTRAINTS=-13
+c int32 INVALID_GOAL_CONSTRAINTS=-16
+c int32 INVALID_GROUP_NAME=-15
+c int32 INVALID_LINK_NAME=-18
+c int32 INVALID_MOTION_PLAN=-2
+c int32 INVALID_OBJECT_NAME=-19
+c int32 INVALID_ROBOT_STATE=-17
+c int32 MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE=-3
+c int32 NO_IK_SOLUTION=-31
+c int32 PLANNING_FAILED=-1
+c int32 PREEMPTED=-7
+c int32 ROBOT_STATE_STALE=-23
+c int32 SENSOR_INFO_STALE=-24
+c int32 START_STATE_INVALID=-26
+c int32 START_STATE_IN_COLLISION=-10
+c int32 START_STATE_VIOLATES_PATH_CONSTRAINTS=-11
+c int32 SUCCESS=1
+c int32 TIMED_OUT=-6
+c int32 UNABLE_TO_AQUIRE_SENSOR_DATA=-5
+c int32 UNDEFINED=0
+c int32 UNRECOGNIZED_GOAL_TYPE=-28
+=moveit_msgs/ObjectColor
+f string id
+f std_msgs/ColorRGBA color
+=moveit_msgs/OrientationConstraint
+f std_msgs/Header header
+f geometry_msgs/Quaternion orientation
+f string link_name
+f float64 absolute_x_axis_tolerance
+f float64 absolute_y_axis_tolerance
+f float64 absolute_z_axis_tolerance
+f uint8 parameterization
+f float64 weight
+c uint8 ROTATION_VECTOR=1
+c uint8 XYZ_EULER_ANGLES=0
+=moveit_msgs/OrientedBoundingBox
+f geometry_msgs/Pose pose
+f geometry_msgs/Point32 extents
+=moveit_msgs/PlaceLocation
+f string id
+f trajectory_msgs/JointTrajectory post_place_posture
+f geometry_msgs/PoseStamped place_pose
+f float64 quality
+f moveit_msgs/GripperTranslation pre_place_approach
+f moveit_msgs/GripperTranslation post_place_retreat
+f string[] allowed_touch_objects
+=moveit_msgs/PlannerInterfaceDescription
+f string name
+f string pipeline_id
+f string[] planner_ids
+=moveit_msgs/PlannerParams
+f string[] keys
+f string[] values
+f string[] descriptions
+=moveit_msgs/PlanningOptions
+f moveit_msgs/PlanningScene planning_scene_diff
+f bool plan_only
+f bool look_around
+f int32 look_around_attempts
+f float64 max_safe_execution_cost
+f bool replan
+f int32 replan_attempts
+f float64 replan_delay
+=moveit_msgs/PlanningScene
+f string name
+f moveit_msgs/RobotState robot_state
+f string robot_model_name
+f geometry_msgs/TransformStamped[] fixed_frame_transforms
+f moveit_msgs/AllowedCollisionMatrix allowed_collision_matrix
+f moveit_msgs/LinkPadding[] link_padding
+f moveit_msgs/LinkScale[] link_scale
+f moveit_msgs/ObjectColor[] object_colors
+f moveit_msgs/PlanningSceneWorld world
+f bool is_diff
+=moveit_msgs/PlanningSceneComponents
+f uint32 components
+c uint32 ALLOWED_COLLISION_MATRIX=128
+c uint32 LINK_PADDING_AND_SCALING=256
+c uint32 OBJECT_COLORS=512
+c uint32 OCTOMAP=32
+c uint32 ROBOT_STATE=2
+c uint32 ROBOT_STATE_ATTACHED_OBJECTS=4
+c uint32 SCENE_SETTINGS=1
+c uint32 TRANSFORMS=64
+c uint32 WORLD_OBJECT_GEOMETRY=16
+c uint32 WORLD_OBJECT_NAMES=8
+=moveit_msgs/PlanningSceneWorld
+f moveit_msgs/CollisionObject[] collision_objects
+f octomap_msgs/OctomapWithPose octomap
+=moveit_msgs/PositionConstraint
+f std_msgs/Header header
+f string link_name
+f geometry_msgs/Vector3 target_point_offset
+f moveit_msgs/BoundingVolume constraint_region
+f float64 weight
+=moveit_msgs/PositionIKRequest
+f string group_name
+f moveit_msgs/RobotState robot_state
+f moveit_msgs/Constraints constraints
+f bool avoid_collisions
+f string ik_link_name
+f geometry_msgs/PoseStamped pose_stamped
+f string[] ik_link_names
+f geometry_msgs/PoseStamped[] pose_stamped_vector
+f builtin_interfaces/Duration timeout
+=moveit_msgs/RobotState
+f sensor_msgs/JointState joint_state
+f sensor_msgs/MultiDOFJointState multi_dof_joint_state
+f moveit_msgs/AttachedCollisionObject[] attached_collision_objects
+f bool is_diff
+=moveit_msgs/RobotTrajectory
+f trajectory_msgs/JointTrajectory joint_trajectory
+f trajectory_msgs/MultiDOFJointTrajectory multi_dof_joint_trajectory
+=moveit_msgs/TrajectoryConstraints
+f moveit_msgs/Constraints[] constraints
+=moveit_msgs/VisibilityConstraint
+f float64 target_radius
+f geometry_msgs/PoseStamped target_pose
+f int32 cone_sides
+f geometry_msgs/PoseStamped sensor_pose
+f float64 max_view_angle
+f float64 max_range_angle
+f uint8 sensor_view_direction
+f float64 weight
+c uint8 SENSOR_X=2
+c uint8 SENSOR_Y=1
+c uint8 SENSOR_Z=0
+=moveit_msgs/WorkspaceParameters
+f std_msgs/Header header
+f geometry_msgs/Vector3 min_corner
+f geometry_msgs/Vector3 max_corner
+=nav_msgs/GridCells
+f std_msgs/Header header
+f float32 cell_width
+f float32 cell_height
+f geometry_msgs/Point[] cells
+=nav_msgs/MapMetaData
+f builtin_interfaces/Time map_load_time
+f float32 resolution
+f uint32 width
+f uint32 height
+f geometry_msgs/Pose origin
+=nav_msgs/OccupancyGrid
+f std_msgs/Header header
+f nav_msgs/MapMetaData info
+f int8[] data
+=nav_msgs/Odometry
+f std_msgs/Header header
+f string child_frame_id
+f geometry_msgs/PoseWithCovariance pose
+f geometry_msgs/TwistWithCovariance twist
+=nav_msgs/Path
+f std_msgs/Header header
+f geometry_msgs/PoseStamped[] poses
+=object_recognition_msgs/ObjectInformation
+f string name
+f shape_msgs/Mesh ground_truth_mesh
+f sensor_msgs/PointCloud2 ground_truth_point_cloud
+=object_recognition_msgs/ObjectType
+f string key
+f string db
+=object_recognition_msgs/RecognizedObject
+f std_msgs/Header header
+f object_recognition_msgs/ObjectType type
+f float32 confidence
+f sensor_msgs/PointCloud2[] point_clouds
+f shape_msgs/Mesh bounding_mesh
+f geometry_msgs/Point[] bounding_contours
+f geometry_msgs/PoseWithCovarianceStamped pose
+=object_recognition_msgs/RecognizedObjectArray
+f std_msgs/Header header
+f object_recognition_msgs/RecognizedObject[] objects
+f float32[] cooccurrence
+=object_recognition_msgs/Table
+f std_msgs/Header header
+f geometry_msgs/Pose pose
+f geometry_msgs/Point[] convex_hull
+=object_recognition_msgs/TableArray
+f std_msgs/Header header
+f object_recognition_msgs/Table[] tables
+=octomap_msgs/Octomap
+f std_msgs/Header header
+f bool binary
+f string id
+f float64 resolution
+f int8[] data
+=octomap_msgs/OctomapWithPose
+f std_msgs/Header header
+f geometry_msgs/Pose origin
+f octomap_msgs/Octomap octomap
+=radar_msgs/RadarReturn
+f float32 range
+f float32 azimuth
+f float32 elevation
+f float32 doppler_velocity
+f float32 amplitude
+=radar_msgs/RadarScan
+f std_msgs/Header header
+f radar_msgs/RadarReturn[] returns
+=radar_msgs/RadarTrack
+f unique_identifier_msgs/UUID uuid
+f geometry_msgs/Point position
+f geometry_msgs/Vector3 velocity
+f geometry_msgs/Vector3 acceleration
+f geometry_msgs/Vector3 size
+f uint16 classification
+f float32[6] position_covariance
+f float32[6] velocity_covariance
+f float32[6] acceleration_covariance
+f float32[6] size_covariance
+c uint16 DYNAMIC=2
+c uint16 NO_CLASSIFICATION=0
+c uint16 STATIC=1
+=radar_msgs/RadarTracks
+f std_msgs/Header header
+f radar_msgs/RadarTrack[] tracks
+=sensor_msgs/BatteryState
+f std_msgs/Header header
+f float32 voltage
+f float32 temperature
+f float32 current
+f float32 charge
+f float32 capacity
+f float32 design_capacity
+f float32 percentage
+f uint8 power_supply_status
+f uint8 power_supply_health
+f uint8 power_supply_technology
+f bool present
+f float32[] cell_voltage
+f float32[] cell_temperature
+f string location
+f string serial_number
+c uint8 POWER_SUPPLY_HEALTH_COLD=6
+c uint8 POWER_SUPPLY_HEALTH_DEAD=3
+c uint8 POWER_SUPPLY_HEALTH_GOOD=1
+c uint8 POWER_SUPPLY_HEALTH_OVERHEAT=2
+c uint8 POWER_SUPPLY_HEALTH_OVERVOLTAGE=4
+c uint8 POWER_SUPPLY_HEALTH_SAFETY_TIMER_EXPIRE=8
+c uint8 POWER_SUPPLY_HEALTH_UNKNOWN=0
+c uint8 POWER_SUPPLY_HEALTH_UNSPEC_FAILURE=5
+c uint8 POWER_SUPPLY_HEALTH_WATCHDOG_TIMER_EXPIRE=7
+c uint8 POWER_SUPPLY_STATUS_CHARGING=1
+c uint8 POWER_SUPPLY_STATUS_DISCHARGING=2
+c uint8 POWER_SUPPLY_STATUS_FULL=4
+c uint8 POWER_SUPPLY_STATUS_NOT_CHARGING=3
+c uint8 POWER_SUPPLY_STATUS_UNKNOWN=0
+c uint8 POWER_SUPPLY_TECHNOLOGY_LIFE=4
+c uint8 POWER_SUPPLY_TECHNOLOGY_LIMN=6
+c uint8 POWER_SUPPLY_TECHNOLOGY_LION=2
+c uint8 POWER_SUPPLY_TECHNOLOGY_LIPO=3
+c uint8 POWER_SUPPLY_TECHNOLOGY_NICD=5
+c uint8 POWER_SUPPLY_TECHNOLOGY_NIMH=1
+c uint8 POWER_SUPPLY_TECHNOLOGY_TERNARY=7
+c uint8 POWER_SUPPLY_TECHNOLOGY_UNKNOWN=0
+c uint8 POWER_SUPPLY_TECHNOLOGY_VRLA=8
+=sensor_msgs/CameraInfo
+f std_msgs/Header header
+f uint32 height
+f uint32 width
+f string distortion_model
+f float64[] d
+f float64[9] k
+f float64[9] r
+f float64[12] p
+f uint32 binning_x
+f uint32 binning_y
+f sensor_msgs/RegionOfInterest roi
+=sensor_msgs/ChannelFloat32
+f string name
+f float32[] values
+=sensor_msgs/CompressedImage
+f std_msgs/Header header
+f string format
+f uint8[] data
+=sensor_msgs/FluidPressure
+f std_msgs/Header header
+f float64 fluid_pressure
+f float64 variance
+=sensor_msgs/Illuminance
+f std_msgs/Header header
+f float64 illuminance
+f float64 variance
+=sensor_msgs/Image
+f std_msgs/Header header
+f uint32 height
+f uint32 width
+f string encoding
+f uint8 is_bigendian
+f uint32 step
+f uint8[] data
+=sensor_msgs/Imu
+f std_msgs/Header header
+f geometry_msgs/Quaternion orientation
+f float64[9] orientation_covariance
+f geometry_msgs/Vector3 angular_velocity
+f float64[9] angular_velocity_covariance
+f geometry_msgs/Vector3 linear_acceleration
+f float64[9] linear_acceleration_covariance
+=sensor_msgs/JointState
+f std_msgs/Header header
+f string[] name
+f float64[] position
+f float64[] velocity
+f float64[] effort
+=sensor_msgs/Joy
+f std_msgs/Header header
+f float32[] axes
+f int32[] buttons
+=sensor_msgs/JoyFeedback
+f uint8 type
+f uint8 id
+f float32 intensity
+c uint8 TYPE_BUZZER=2
+c uint8 TYPE_LED=0
+c uint8 TYPE_RUMBLE=1
+=sensor_msgs/JoyFeedbackArray
+f sensor_msgs/JoyFeedback[] array
+=sensor_msgs/LaserEcho
+f float32[] echoes
+=sensor_msgs/LaserScan
+f std_msgs/Header header
+f float32 angle_min
+f float32 angle_max
+f float32 angle_increment
+f float32 time_increment
+f float32 scan_time
+f float32 range_min
+f float32 range_max
+f float32[] ranges
+f float32[] intensities
+=sensor_msgs/MagneticField
+f std_msgs/Header header
+f geometry_msgs/Vector3 magnetic_field
+f float64[9] magnetic_field_covariance
+=sensor_msgs/MultiDOFJointState
+f std_msgs/Header header
+f string[] joint_names
+f geometry_msgs/Transform[] transforms
+f geometry_msgs/Twist[] twist
+f geometry_msgs/Wrench[] wrench
+=sensor_msgs/MultiEchoLaserScan
+f std_msgs/Header header
+f float32 angle_min
+f float32 angle_max
+f float32 angle_increment
+f float32 time_increment
+f float32 scan_time
+f float32 range_min
+f float32 range_max
+f sensor_msgs/LaserEcho[] ranges
+f sensor_msgs/LaserEcho[] intensities
+=sensor_msgs/NavSatFix
+f std_msgs/Header header
+f sensor_msgs/NavSatStatus status
+f float64 latitude
+f float64 longitude
+f float64 altitude
+f float64[9] position_covariance
+f uint8 position_covariance_type
+c uint8 COVARIANCE_TYPE_APPROXIMATED=1
+c uint8 COVARIANCE_TYPE_DIAGONAL_KNOWN=2
+c uint8 COVARIANCE_TYPE_KNOWN=3
+c uint8 COVARIANCE_TYPE_UNKNOWN=0
+=sensor_msgs/NavSatStatus
+f int8 status
+f uint16 service
+c int8 STATUS_FIX=0
+c int8 STATUS_GBAS_FIX=2
+c int8 STATUS_NO_FIX=-1
+c int8 STATUS_SBAS_FIX=1
+c int8 STATUS_UNKNOWN=-2
+c uint16 SERVICE_COMPASS=4
+c uint16 SERVICE_GALILEO=8
+c uint16 SERVICE_GLONASS=2
+c uint16 SERVICE_GPS=1
+c uint16 SERVICE_UNKNOWN=0
+=sensor_msgs/PointCloud
+f std_msgs/Header header
+f geometry_msgs/Point32[] points
+f sensor_msgs/ChannelFloat32[] channels
+=sensor_msgs/PointCloud2
+f std_msgs/Header header
+f uint32 height
+f uint32 width
+f sensor_msgs/PointField[] fields
+f bool is_bigendian
+f uint32 point_step
+f uint32 row_step
+f uint8[] data
+f bool is_dense
+=sensor_msgs/PointField
+f string name
+f uint32 offset
+f uint8 datatype
+f uint32 count
+c uint8 FLOAT32=7
+c uint8 FLOAT64=8
+c uint8 INT16=3
+c uint8 INT32=5
+c uint8 INT8=1
+c uint8 UINT16=4
+c uint8 UINT32=6
+c uint8 UINT8=2
+=sensor_msgs/Range
+f std_msgs/Header header
+f uint8 radiation_type
+f float32 field_of_view
+f float32 min_range
+f float32 max_range
+f float32 range
+f float32 variance
+c uint8 INFRARED=1
+c uint8 ULTRASOUND=0
+=sensor_msgs/RegionOfInterest
+f uint32 x_offset
+f uint32 y_offset
+f uint32 height
+f uint32 width
+f bool do_rectify
+=sensor_msgs/RelativeHumidity
+f std_msgs/Header header
+f float64 relative_humidity
+f float64 variance
+=sensor_msgs/Temperature
+f std_msgs/Header header
+f float64 temperature
+f float64 variance
+=sensor_msgs/TimeReference
+f std_msgs/Header header
+f builtin_interfaces/Time time_ref
+f string source
+=shape_msgs/Mesh
+f shape_msgs/MeshTriangle[] triangles
+f geometry_msgs/Point[] vertices
+=shape_msgs/MeshTriangle
+f uint32[3] vertex_indices
+=shape_msgs/Plane
+f float64[4] coef
+=shape_msgs/SolidPrimitive
+f uint8 type
+f float64[] dimensions
+f geometry_msgs/Polygon polygon
+c uint8 BOX=1
+c uint8 BOX_X=0
+c uint8 BOX_Y=1
+c uint8 BOX_Z=2
+c uint8 CONE=4
+c uint8 CONE_HEIGHT=0
+c uint8 CONE_RADIUS=1
+c uint8 CYLINDER=3
+c uint8 CYLINDER_HEIGHT=0
+c uint8 CYLINDER_RADIUS=1
+c uint8 PRISM=5
+c uint8 PRISM_HEIGHT=0
+c uint8 SPHERE=2
+c uint8 SPHERE_RADIUS=0
+=statistics_msgs/MetricsMessage
+f string measurement_source_name
+f string metrics_source
+f string unit
+f builtin_interfaces/Time window_start
+f builtin_interfaces/Time window_stop
+f statistics_msgs/StatisticDataPoint[] statistics
+=statistics_msgs/StatisticDataPoint
+f uint8 data_type
+f float64 data
+=statistics_msgs/StatisticDataType
+c uint8 STATISTICS_DATA_TYPE_AVERAGE=1
+c uint8 STATISTICS_DATA_TYPE_MAXIMUM=3
+c uint8 STATISTICS_DATA_TYPE_MINIMUM=2
+c uint8 STATISTICS_DATA_TYPE_SAMPLE_COUNT=5
+c uint8 STATISTICS_DATA_TYPE_STDDEV=4
+c uint8 STATISTICS_DATA_TYPE_UNINITIALIZED=0
+=std_msgs/Bool
+f bool data
+=std_msgs/Byte
+f uint8 data
+=std_msgs/ByteMultiArray
+f std_msgs/MultiArrayLayout layout
+f uint8[] data
+=std_msgs/Char
+f uint8 data
+=std_msgs/ColorRGBA
+f float32 r
+f float32 g
+f float32 b
+f float32 a
+=std_msgs/Empty
+=std_msgs/Float32
+f float32 data
+=std_msgs/Float32MultiArray
+f std_msgs/MultiArrayLayout layout
+f float32[] data
+=std_msgs/Float64
+f float64 data
+=std_msgs/Float64MultiArray
+f std_msgs/MultiArrayLayout layout
+f float64[] data
+=std_msgs/Header
+f builtin_interfaces/Time stamp
+f string frame_id
+=std_msgs/Int16
+f int16 data
+=std_msgs/Int16MultiArray
+f std_msgs/MultiArrayLayout layout
+f int16[] data
+=std_msgs/Int32
+f int32 data
+=std_msgs/Int32MultiArray
+f std_msgs/MultiArrayLayout layout
+f int32[] data
+=std_msgs/Int64
+f int64 data
+=std_msgs/Int64MultiArray
+f std_msgs/MultiArrayLayout layout
+f int64[] data
+=std_msgs/Int8
+f int8 data
+=std_msgs/Int8MultiArray
+f std_msgs/MultiArrayLayout layout
+f int8[] data
+=std_msgs/MultiArrayDimension
+f string label
+f uint32 size
+f uint32 stride
+=std_msgs/MultiArrayLayout
+f std_msgs/MultiArrayDimension[] dim
+f uint32 data_offset
+=std_msgs/String
+f string data
+=std_msgs/UInt16
+f uint16 data
+=std_msgs/UInt16MultiArray
+f std_msgs/MultiArrayLayout layout
+f uint16[] data
+=std_msgs/UInt32
+f uint32 data
+=std_msgs/UInt32MultiArray
+f std_msgs/MultiArrayLayout layout
+f uint32[] data
+=std_msgs/UInt64
+f uint64 data
+=std_msgs/UInt64MultiArray
+f std_msgs/MultiArrayLayout layout
+f uint64[] data
+=std_msgs/UInt8
+f uint8 data
+=std_msgs/UInt8MultiArray
+f std_msgs/MultiArrayLayout layout
+f uint8[] data
+=tf2_msgs/TF2Error
+f uint8 error
+f string error_string
+c uint8 CONNECTIVITY_ERROR=2
+c uint8 EXTRAPOLATION_ERROR=3
+c uint8 INVALID_ARGUMENT_ERROR=4
+c uint8 LOOKUP_ERROR=1
+c uint8 NO_ERROR=0
+c uint8 TIMEOUT_ERROR=5
+c uint8 TRANSFORM_ERROR=6
+=tf2_msgs/TFMessage
+f geometry_msgs/TransformStamped[] transforms
+=trajectory_msgs/JointTrajectory
+f std_msgs/Header header
+f string[] joint_names
+f trajectory_msgs/JointTrajectoryPoint[] points
+=trajectory_msgs/JointTrajectoryPoint
+f float64[] positions
+f float64[] velocities
+f float64[] accelerations
+f float64[] effort
+f builtin_interfaces/Duration time_from_start
+=trajectory_msgs/MultiDOFJointTrajectory
+f std_msgs/Header header
+f string[] joint_names
+f trajectory_msgs/MultiDOFJointTrajectoryPoint[] points
+=trajectory_msgs/MultiDOFJointTrajectoryPoint
+f geometry_msgs/Transform[] transforms
+f geometry_msgs/Twist[] velocities
+f geometry_msgs/Twist[] accelerations
+f builtin_interfaces/Duration time_from_start
+=unique_identifier_msgs/UUID
+f uint8[16] uuid
+=vision_msgs/BoundingBox2D
+f vision_msgs/Pose2D center
+f float64 size_x
+f float64 size_y
+=vision_msgs/BoundingBox2DArray
+f std_msgs/Header header
+f vision_msgs/BoundingBox2D[] boxes
+=vision_msgs/BoundingBox3D
+f geometry_msgs/Pose center
+f geometry_msgs/Vector3 size
+=vision_msgs/BoundingBox3DArray
+f std_msgs/Header header
+f vision_msgs/BoundingBox3D[] boxes
+=vision_msgs/Classification
+f std_msgs/Header header
+f vision_msgs/ObjectHypothesis[] results
+=vision_msgs/Detection2D
+f std_msgs/Header header
+f vision_msgs/ObjectHypothesisWithPose[] results
+f vision_msgs/BoundingBox2D bbox
+f string id
+=vision_msgs/Detection2DArray
+f std_msgs/Header header
+f vision_msgs/Detection2D[] detections
+=vision_msgs/Detection3D
+f std_msgs/Header header
+f vision_msgs/ObjectHypothesisWithPose[] results
+f vision_msgs/BoundingBox3D bbox
+f string id
+=vision_msgs/Detection3DArray
+f std_msgs/Header header
+f vision_msgs/Detection3D[] detections
+=vision_msgs/LabelInfo
+f std_msgs/Header header
+f vision_msgs/VisionClass[] class_map
+f float32 threshold
+=vision_msgs/ObjectHypothesis
+f string class_id
+f float64 score
+=vision_msgs/ObjectHypothesisWithPose
+f vision_msgs/ObjectHypothesis hypothesis
+f geometry_msgs/PoseWithCovariance pose
+=vision_msgs/Point2D
+f float64 x
+f float64 y
+=vision_msgs/Pose2D
+f vision_msgs/Point2D position
+f float64 theta
+=vision_msgs/VisionClass
+f uint16 class_id
+f string class_name
+=vision_msgs/VisionInfo
+f std_msgs/Header header
+f string method
+f string database_location
+f int32 database_version
+=visualization_msgs/ImageMarker
+f std_msgs/Header header
+f string ns
+f int32 id
+f int32 type
+f int32 action
+f geometry_msgs/Point position
+f float32 scale
+f std_msgs/ColorRGBA outline_color
+f uint8 filled
+f std_msgs/ColorRGBA fill_color
+f builtin_interfaces/Duration lifetime
+f geometry_msgs/Point[] points
+f std_msgs/ColorRGBA[] outline_colors
+c int32 ADD=0
+c int32 CIRCLE=0
+c int32 LINE_LIST=2
+c int32 LINE_STRIP=1
+c int32 POINTS=4
+c int32 POLYGON=3
+c int32 REMOVE=1
+=visualization_msgs/InteractiveMarker
+f std_msgs/Header header
+f geometry_msgs/Pose pose
+f string name
+f string description
+f float32 scale
+f visualization_msgs/MenuEntry[] menu_entries
+f visualization_msgs/InteractiveMarkerControl[] controls
+=visualization_msgs/InteractiveMarkerControl
+f string name
+f geometry_msgs/Quaternion orientation
+f uint8 orientation_mode
+f uint8 interaction_mode
+f bool always_visible
+f visualization_msgs/Marker[] markers
+f bool independent_marker_orientation
+f string description
+c uint8 BUTTON=2
+c uint8 FIXED=1
+c uint8 INHERIT=0
+c uint8 MENU=1
+c uint8 MOVE_3D=7
+c uint8 MOVE_AXIS=3
+c uint8 MOVE_PLANE=4
+c uint8 MOVE_ROTATE=6
+c uint8 MOVE_ROTATE_3D=9
+c uint8 NONE=0
+c uint8 ROTATE_3D=8
+c uint8 ROTATE_AXIS=5
+c uint8 VIEW_FACING=2
+=visualization_msgs/InteractiveMarkerFeedback
+f std_msgs/Header header
+f string client_id
+f string marker_name
+f string control_name
+f uint8 event_type
+f geometry_msgs/Pose pose
+f uint32 menu_entry_id
+f geometry_msgs/Point mouse_point
+f bool mouse_point_valid
+c uint8 BUTTON_CLICK=3
+c uint8 KEEP_ALIVE=0
+c uint8 MENU_SELECT=2
+c uint8 MOUSE_DOWN=4
+c uint8 MOUSE_UP=5
+c uint8 POSE_UPDATE=1
+=visualization_msgs/InteractiveMarkerInit
+f string server_id
+f uint64 seq_num
+f visualization_msgs/InteractiveMarker[] markers
+=visualization_msgs/InteractiveMarkerPose
+f std_msgs/Header header
+f geometry_msgs/Pose pose
+f string name
+=visualization_msgs/InteractiveMarkerUpdate
+f string server_id
+f uint64 seq_num
+f uint8 type
+f visualization_msgs/InteractiveMarker[] markers
+f visualization_msgs/InteractiveMarkerPose[] poses
+f string[] erases
+c uint8 KEEP_ALIVE=0
+c uint8 UPDATE=1
+=visualization_msgs/Marker
+f std_msgs/Header header
+f string ns
+f int32 id
+f int32 type
+f int32 action
+f geometry_msgs/Pose pose
+f geometry_msgs/Vector3 scale
+f std_msgs/ColorRGBA color
+f builtin_interfaces/Duration lifetime
+f bool frame_locked
+f geometry_msgs/Point[] points
+f std_msgs/ColorRGBA[] colors
+f string texture_resource
+f sensor_msgs/CompressedImage texture
+f visualization_msgs/UVCoordinate[] uv_coordinates
+f string text
+f string mesh_resource
+f visualization_msgs/MeshFile mesh_file
+f bool mesh_use_embedded_materials
+c int32 ADD=0
+c int32 ARROW=0
+c int32 ARROW_STRIP=12
+c int32 CUBE=1
+c int32 CUBE_LIST=6
+c int32 CYLINDER=3
+c int32 DELETE=2
+c int32 DELETEALL=3
+c int32 LINE_LIST=5
+c int32 LINE_STRIP=4
+c int32 MESH_RESOURCE=10
+c int32 MODIFY=0
+c int32 POINTS=8
+c int32 SPHERE=2
+c int32 SPHERE_LIST=7
+c int32 TEXT_VIEW_FACING=9
+c int32 TRIANGLE_LIST=11
+=visualization_msgs/MarkerArray
+f visualization_msgs/Marker[] markers
+=visualization_msgs/MenuEntry
+f uint32 id
+f uint32 parent_id
+f string title
+f string command
+f uint8 command_type
+c uint8 FEEDBACK=0
+c uint8 ROSLAUNCH=2
+c uint8 ROSRUN=1
+=visualization_msgs/MeshFile
+f string filename
+f uint8[] data
+=visualization_msgs/UVCoordinate
+f float32 u
+f float32 v

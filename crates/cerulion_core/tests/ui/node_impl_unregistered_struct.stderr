@@ -1,0 +1,5 @@
+error: #[cerulion_node_impl] could not find a registered #[cerulion_node] for `PlainStruct`. The struct's `#[cerulion_node]` attribute must appear before this impl block in source order, and at least one field must carry a `#[input]` or `#[output]` attribute.
+  --> tests/ui/node_impl_unregistered_struct.rs:14:6
+   |
+14 | impl PlainStruct {
+   |      ^^^^^^^^^^^

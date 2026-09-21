@@ -1,0 +1,15 @@
+warning: use of deprecated field `native_ros2_messages::sensor_msgs::ImageShm::data`: write-only proxy for variable field `data` — reading it yields a useless marker. Read with the accessor method `data()`; write with `self.<port>.data = expr` or `.fill_from(...)`.
+  --> tests/ui/type_error/var_field_compound_assign_proxy_diagnostic.rs:33:14
+   |
+33 |         self.image.data += b"abc".as_slice();
+   |              ^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+error[E0277]: self.<port>.data[i] / += are unsupported on variable-length fields. Replace the whole value with self.<port>.data = expr, or write incrementally with self.<port>.data.fill_from(|buf| …).
+  --> tests/ui/type_error/var_field_compound_assign_proxy_diagnostic.rs:33:25
+   |
+33 |         self.image.data += b"abc".as_slice();
+   |                         ^^ the trait `native_ros2_messages::sensor_msgs::__cer_wg_Image_data` is not implemented for `&[u8]`
+   |
+   = note: required for `native_ros2_messages::sensor_msgs::__cer_wp_Image_data` to implement `AddAssign<&[u8]>`

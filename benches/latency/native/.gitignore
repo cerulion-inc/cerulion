@@ -1,0 +1,10 @@
+# Build artifacts only. Cargo.lock is deliberately RE-INCLUDED (the same
+# rule as ../workspace/.gitignore): the repo root .gitignore ignores every
+# non-root Cargo.lock, but this isolated bench workspace's lockfile is
+# load-bearing — the iceoryx2 family must stay pinned =0.9.1 in lockstep
+# with the repo lockfile (the binary<->cdylib skew class) and zenoh
+# stays on the 1.7.2 line the zenoh_shm cells were verified against (see
+# Cargo.toml). PITFALLS.md tells readers to grep BOTH lockfiles as in-repo
+# artifacts, which is only true if this one is tracked.
+/target/
+!Cargo.lock

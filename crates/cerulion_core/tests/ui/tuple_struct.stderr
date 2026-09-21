@@ -1,0 +1,5 @@
+error: #[cerulion_node] can only be applied to structs with named or unit fields, not tuple structs
+ --> tests/ui/tuple_struct.rs:4:8
+  |
+4 | struct TupleNode(u32, u64);
+  |        ^^^^^^^^^

@@ -1,0 +1,19 @@
+error: `throttle_ms` must be > 0 (a zero-ms rate cap would defer every fire)
+ --> tests/ui/throttle_ms_zero.rs:9:1
+  |
+9 | #[cerulion_node(throttle_ms = 0)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/throttle_ms_zero.rs:13:7
+   |
+13 |     #[output]
+   |       ^^^^^^
+
+error: cannot find attribute `input` in this scope
+  --> tests/ui/throttle_ms_zero.rs:11:7
+   |
+11 |     #[input(trigger)]
+   |       ^^^^^

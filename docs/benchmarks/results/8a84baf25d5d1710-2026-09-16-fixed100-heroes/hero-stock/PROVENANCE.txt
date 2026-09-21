@@ -1,0 +1,10 @@
+hero-stock/  -  the mode-independent rows, from the ON pass.
+Build: main 68a0d6196a962237f8628cd94c9f93371703e827, binary sha16 17d52c9b1552e530.
+Posture: shipped default (lockstep) multi-process where applicable, fixed100,
+chrt 0, CER_BENCH_DMA_LOCK=0 (stock, C-state exits unmanaged), k=5 x 2000.
+Rows: cerulion_workspace_mono_chrt0, iox2_chrt0, zenoh_shm_chrt0,
+jazzy_stock_rclcpp_chrt0, jazzy_composed_ipcon_rclcpp_chrt0.
+The lockstep SPLIT row is NOT here  -  see hero-stock-lockstep/. The published
+multi-process row is hero-stock-freerun-fixed/ (PR #912 head).
+NOTE the iox2 row here is the PRE-sweep reading; the published floor row is
+iox2-rerun/ (post-sweep). scrub applied recursively to run.json.

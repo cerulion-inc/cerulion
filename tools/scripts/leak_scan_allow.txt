@@ -1,0 +1,18 @@
+# Path allowlist for tools/scripts/leak_scan.py. One entry per line:
+#   <glob> | <class> | <reason of at least 12 characters>
+# The class must be a generic class id, or a private CATEGORY such as
+# private@person (a bare private waiver is refused, so a waiver for a person's
+# name can never excuse a machine name in the same file). In a full-tree run an
+# entry that matches no tracked file, or that excused nothing, FAILS the run: a
+# stale waiver pre-authorises a future leak. A private@<tag> entry is judged
+# on use only when a loaded private entry carries that tag; when none does,
+# the run notes it and goes on, so the secret's content cannot decide whether
+# a push to main is red (the path check still runs). The summary line prints
+# allowlist=N so growth is visible in every log. A single fixture line takes a
+# line pragma (`leak-scan: allow <class> <reason>`) instead of a path entry, so
+# the rest of the file stays under the class.
+# The founders' names stay in the legal, citation, conduct and ownership files by ruling.
+README.md | private@person | the citation block names the authors by ruling
+CITATION.cff | private@person | the citation file names the authors by ruling
+docs/legal/AUTHORS | private@person | the authors file names the authors by ruling
+.github/CODE_OF_CONDUCT.md | private@person | the conduct contact names a maintainer by ruling

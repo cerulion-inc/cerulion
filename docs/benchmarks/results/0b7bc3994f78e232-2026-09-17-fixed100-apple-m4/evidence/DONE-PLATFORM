@@ -1,0 +1,8 @@
+stamp_utc_end: 2026-09-17T01:32:17Z
+elapsed_s: 287
+exit_code: 0
+final_state: COMPLETED
+jobs_completed: cerulion_workspace_mono_chrt0:1
+load_at_end: 1.56 1.16 1.18
+shm_at_end: iceoryx2_tmp_entries=2 shm_state=1
+launchctl_at_end: 429

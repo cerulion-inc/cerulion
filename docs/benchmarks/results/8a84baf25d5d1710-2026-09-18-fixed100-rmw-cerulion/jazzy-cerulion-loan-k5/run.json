@@ -1,0 +1,722 @@
+{
+  "schema_version": 1,
+  "variant": "fixed100",
+  "machine_hash": "8a84baf25d5d1710",
+  "invocations": [
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 1,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--distro",
+        "jazzy",
+        "--chrt",
+        "0",
+        "--variant",
+        "fixed100",
+        "--run-dir",
+        "<BOXHOME>/lanes/rmw-latency-lane-20260918/benches/latency/results/8a84baf25d5d1710-2026-09-18-fixed100-g3-deferred",
+        "--rep",
+        "1",
+        "--cells",
+        "jazzy_cerulion_shm_loan_be1_chrt0"
+      ],
+      "git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889",
+      "git_dirty": true,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:43:15 UTC  x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-18T08:07:40-0700",
+      "ended_at": "2026-09-18T08:11:37-0700",
+      "cells": [
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:07:40-0700",
+          "ended_at": "2026-09-18T08:08:04-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:08:04-0700",
+          "ended_at": "2026-09-18T08:08:28-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:08:28-0700",
+          "ended_at": "2026-09-18T08:08:51-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:08:51-0700",
+          "ended_at": "2026-09-18T08:09:15-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:09:15-0700",
+          "ended_at": "2026-09-18T08:09:39-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:09:39-0700",
+          "ended_at": "2026-09-18T08:10:02-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:10:02-0700",
+          "ended_at": "2026-09-18T08:10:26-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:10:26-0700",
+          "ended_at": "2026-09-18T08:10:49-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:10:49-0700",
+          "ended_at": "2026-09-18T08:11:13-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:11:13-0700",
+          "ended_at": "2026-09-18T08:11:37-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan - can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types - an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip - re-verify on new rmw_zenoh versions)"
+        },
+        {
+          "scope": "jazzy_cerulion_no_shm_*",
+          "reason": "rmw_cerulion's only data path is iceoryx2 shared memory - there is no non-SHM transport to measure, so a no_shm cell would carry a label no run can honour"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:f16d6779f497ce0b735c5ea2b2f00b767a26270cef5715882ea1eb162118855c",
+          "repo_git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889"
+        }
+      }
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 2,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--distro",
+        "jazzy",
+        "--chrt",
+        "0",
+        "--variant",
+        "fixed100",
+        "--run-dir",
+        "<BOXHOME>/lanes/rmw-latency-lane-20260918/benches/latency/results/8a84baf25d5d1710-2026-09-18-fixed100-g3-deferred",
+        "--rep",
+        "2",
+        "--cells",
+        "jazzy_cerulion_shm_loan_be1_chrt0"
+      ],
+      "git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889",
+      "git_dirty": true,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:43:15 UTC  x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-18T08:11:37-0700",
+      "ended_at": "2026-09-18T08:15:33-0700",
+      "cells": [
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:11:37-0700",
+          "ended_at": "2026-09-18T08:12:00-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:12:00-0700",
+          "ended_at": "2026-09-18T08:12:24-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:12:24-0700",
+          "ended_at": "2026-09-18T08:12:48-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:12:48-0700",
+          "ended_at": "2026-09-18T08:13:11-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:13:11-0700",
+          "ended_at": "2026-09-18T08:13:35-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:13:35-0700",
+          "ended_at": "2026-09-18T08:13:59-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:13:59-0700",
+          "ended_at": "2026-09-18T08:14:22-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:14:22-0700",
+          "ended_at": "2026-09-18T08:14:46-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:14:46-0700",
+          "ended_at": "2026-09-18T08:15:09-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:15:09-0700",
+          "ended_at": "2026-09-18T08:15:33-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan - can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types - an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip - re-verify on new rmw_zenoh versions)"
+        },
+        {
+          "scope": "jazzy_cerulion_no_shm_*",
+          "reason": "rmw_cerulion's only data path is iceoryx2 shared memory - there is no non-SHM transport to measure, so a no_shm cell would carry a label no run can honour"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:f16d6779f497ce0b735c5ea2b2f00b767a26270cef5715882ea1eb162118855c",
+          "repo_git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889"
+        }
+      }
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 3,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--distro",
+        "jazzy",
+        "--chrt",
+        "0",
+        "--variant",
+        "fixed100",
+        "--run-dir",
+        "<BOXHOME>/lanes/rmw-latency-lane-20260918/benches/latency/results/8a84baf25d5d1710-2026-09-18-fixed100-g3-deferred",
+        "--rep",
+        "3",
+        "--cells",
+        "jazzy_cerulion_shm_loan_be1_chrt0"
+      ],
+      "git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889",
+      "git_dirty": true,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:43:15 UTC  x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-18T08:15:33-0700",
+      "ended_at": "2026-09-18T08:19:30-0700",
+      "cells": [
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:15:33-0700",
+          "ended_at": "2026-09-18T08:15:57-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:15:57-0700",
+          "ended_at": "2026-09-18T08:16:20-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:16:20-0700",
+          "ended_at": "2026-09-18T08:16:44-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:16:44-0700",
+          "ended_at": "2026-09-18T08:17:08-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:17:08-0700",
+          "ended_at": "2026-09-18T08:17:31-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:17:31-0700",
+          "ended_at": "2026-09-18T08:17:55-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:17:55-0700",
+          "ended_at": "2026-09-18T08:18:19-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:18:19-0700",
+          "ended_at": "2026-09-18T08:18:42-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:18:42-0700",
+          "ended_at": "2026-09-18T08:19:06-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:19:06-0700",
+          "ended_at": "2026-09-18T08:19:30-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan - can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types - an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip - re-verify on new rmw_zenoh versions)"
+        },
+        {
+          "scope": "jazzy_cerulion_no_shm_*",
+          "reason": "rmw_cerulion's only data path is iceoryx2 shared memory - there is no non-SHM transport to measure, so a no_shm cell would carry a label no run can honour"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:f16d6779f497ce0b735c5ea2b2f00b767a26270cef5715882ea1eb162118855c",
+          "repo_git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889"
+        }
+      }
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 4,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--distro",
+        "jazzy",
+        "--chrt",
+        "0",
+        "--variant",
+        "fixed100",
+        "--run-dir",
+        "<BOXHOME>/lanes/rmw-latency-lane-20260918/benches/latency/results/8a84baf25d5d1710-2026-09-18-fixed100-g3-deferred",
+        "--rep",
+        "4",
+        "--cells",
+        "jazzy_cerulion_shm_loan_be1_chrt0"
+      ],
+      "git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889",
+      "git_dirty": true,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:43:15 UTC  x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-18T08:19:30-0700",
+      "ended_at": "2026-09-18T08:23:28-0700",
+      "cells": [
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:19:30-0700",
+          "ended_at": "2026-09-18T08:19:53-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:19:53-0700",
+          "ended_at": "2026-09-18T08:20:17-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:20:17-0700",
+          "ended_at": "2026-09-18T08:20:41-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:20:41-0700",
+          "ended_at": "2026-09-18T08:21:05-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:21:05-0700",
+          "ended_at": "2026-09-18T08:21:30-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:21:30-0700",
+          "ended_at": "2026-09-18T08:21:53-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:21:53-0700",
+          "ended_at": "2026-09-18T08:22:17-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:22:17-0700",
+          "ended_at": "2026-09-18T08:22:41-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:22:41-0700",
+          "ended_at": "2026-09-18T08:23:04-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:23:04-0700",
+          "ended_at": "2026-09-18T08:23:28-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan - can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types - an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip - re-verify on new rmw_zenoh versions)"
+        },
+        {
+          "scope": "jazzy_cerulion_no_shm_*",
+          "reason": "rmw_cerulion's only data path is iceoryx2 shared memory - there is no non-SHM transport to measure, so a no_shm cell would carry a label no run can honour"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:f16d6779f497ce0b735c5ea2b2f00b767a26270cef5715882ea1eb162118855c",
+          "repo_git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889"
+        }
+      }
+    },
+    {
+      "subcommand": "ros2",
+      "variant": "fixed100",
+      "rep": 5,
+      "argv": [
+        "bench.py",
+        "ros2",
+        "--distro",
+        "jazzy",
+        "--chrt",
+        "0",
+        "--variant",
+        "fixed100",
+        "--run-dir",
+        "<BOXHOME>/lanes/rmw-latency-lane-20260918/benches/latency/results/8a84baf25d5d1710-2026-09-18-fixed100-g3-deferred",
+        "--rep",
+        "5",
+        "--cells",
+        "jazzy_cerulion_shm_loan_be1_chrt0"
+      ],
+      "git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889",
+      "git_dirty": true,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:43:15 UTC  x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-18T08:23:28-0700",
+      "ended_at": "2026-09-18T08:27:25-0700",
+      "cells": [
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 64,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:23:28-0700",
+          "ended_at": "2026-09-18T08:23:53-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 256,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:23:53-0700",
+          "ended_at": "2026-09-18T08:24:16-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1024,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:24:16-0700",
+          "ended_at": "2026-09-18T08:24:40-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4096,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:24:40-0700",
+          "ended_at": "2026-09-18T08:25:03-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16384,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:25:03-0700",
+          "ended_at": "2026-09-18T08:25:27-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 65536,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:25:27-0700",
+          "ended_at": "2026-09-18T08:25:51-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 262144,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:25:51-0700",
+          "ended_at": "2026-09-18T08:26:14-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 1048576,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:26:14-0700",
+          "ended_at": "2026-09-18T08:26:38-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 4194304,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:26:38-0700",
+          "ended_at": "2026-09-18T08:27:02-0700"
+        },
+        {
+          "cell": "jazzy_cerulion_shm_loan_be1_chrt0",
+          "payload": 16777216,
+          "outcome": "ok",
+          "started_at": "2026-09-18T08:27:02-0700",
+          "ended_at": "2026-09-18T08:27:25-0700"
+        }
+      ],
+      "skips": [
+        {
+          "scope": "jazzy_{cyclonedds,zenoh}_zc_*",
+          "reason": "zc (DataSharing) is a FastDDS-specific mechanism; the other RMWs' shm lanes already ride their zero-copy paths"
+        },
+        {
+          "scope": "jazzy_*_shm_image_loan_*",
+          "reason": "unbounded types cannot loan - can_loan_messages gates on is_plain on every RMW that implements loans, so an image loan-take lane is structurally empty (the image class's receive cost IS the rclcpp lane's delivery memcpy)"
+        },
+        {
+          "scope": "jazzy_fastdds_zc_image_*",
+          "reason": "FastDDS DataSharing requires plain, bounded types - an unbounded data vector disqualifies the type at the DDS layer; the image class's serialize+copy cost shows on the shm lane"
+        },
+        {
+          "scope": "jazzy_*_image_*_rel10_* / jazzy_*_no_shm_image_*",
+          "reason": "image cells pin be1 \u00d7 shm only (the rel10 pin was a pod SHM head-to-head; no_shm answers no type-class question)"
+        },
+        {
+          "scope": "jazzy_cyclonedds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_fastdds_no_shm_rclcpp_rel10_chrt0",
+          "reason": "rel10 is SHM-only (the original rmw pin was an SHM head-to-head)"
+        },
+        {
+          "scope": "jazzy_zenoh_shm_loan_be1_chrt0",
+          "reason": "zenoh loan lane is a NO-OP stub upstream (rc=77 structural skip - re-verify on new rmw_zenoh versions)"
+        },
+        {
+          "scope": "jazzy_cerulion_no_shm_*",
+          "reason": "rmw_cerulion's only data path is iceoryx2 shared memory - there is no non-SHM transport to measure, so a no_shm cell would carry a label no run can honour"
+        }
+      ],
+      "docker_images": {
+        "latency_bench:jazzy": {
+          "id": "sha256:f16d6779f497ce0b735c5ea2b2f00b767a26270cef5715882ea1eb162118855c",
+          "repo_git_sha": "9f30d2b3bbd4e52254eb7fc970369288f7649889"
+        }
+      }
+    }
+  ]
+}

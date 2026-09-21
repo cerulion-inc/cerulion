@@ -1,0 +1,136 @@
+name: Public surface review
+
+# The semantic half of the shipped-text gates.
+#
+# tools/scripts/check_public_surface.sh refuses the wording it can NAME: a
+# pattern file of work-state vocabulary, a ledger that burns down, an allow
+# list that must excuse something real. A regex cannot see narrative, a stale
+# claim or a sentence that contradicts another page, and an independent audit
+# of this tree found all three in files every pattern passed. This job reads
+# the pull request's diff for those.
+#
+# It is ADVISORY until the maintainers add it to the required checks on main:
+# a red here is a review to read, not a block. It fails CLOSED (a missing or
+# unparseable verdict fails the job) for the same reason every other gate here
+# does: a semantic check that cannot run looks exactly like a clean one.
+#
+# COST: one ubuntu job and one model session per push, over the DIFF rather
+# than the tree, capped at 20 minutes, billed to the same OAuth account as the
+# Claude Code Review workflow. The model posts nothing and writes nothing but a
+# JSON verdict; this workflow renders the comment and decides the exit, so the
+# outcome does not depend on the model choosing to call a tool.
+#
+# The prompt is tools/review/public-surface-review.md, read into the action at
+# run time: a change to what the review looks for is a reviewable diff.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+# A new push cancels the review still running for the commit it replaced: its
+# verdict is about code that no longer exists, and this is not a required
+# check, so a cancel never blocks a merge. Keyed on the PR number only; the
+# workflow has no push trigger.
+concurrency:
+  group: public-surface-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # The same three gates as the Claude Code Review workflow, for the same
+    # reasons: the author is one of the two maintainers (the CODEOWNERS
+    # logins); the head branch lives in this repository, so a fork pull
+    # request never starts a job that holds the OAuth token; and the pull
+    # request is not a draft (a draft marked ready arrives as
+    # ready_for_review and runs then).
+    if: |
+      contains(fromJSON('["lakshay2010sharma","raveenk9696"]'), github.event.pull_request.user.login) &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+
+    runs-on: ubuntu-latest
+    # 20, not the sibling review job's 60: that job reviews the whole change
+    # for correctness through child agents; this one reads a diff against a
+    # fixed checklist and writes a JSON file.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # write, because this workflow posts the findings comment itself. The
+      # model is given no tool that can reach the API.
+      pull-requests: write
+      id-token: write
+    env:
+      # Child agents launched in the background leave a headless run with no
+      # one to wake the parent, and the session ends having posted nothing.
+      # Foreground is the only order a one-shot run works in.
+      CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The base commit has to be in the clone for the diff below.
+          fetch-depth: 0
+
+      # The diff is computed HERE and handed to the model as a file, so the
+      # review needs no git, no gh and no shell: `Read`, `Grep` and `Glob` over
+      # the checkout, and `Write` for the verdict.
+      - name: Collect the pull request diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git diff --unified=3 "$BASE_SHA...$HEAD_SHA" > pr.diff
+          wc -l pr.diff
+
+      - name: Load the review prompt
+        id: prompt
+        run: |
+          set -euo pipefail
+          {
+            printf 'text<<CERULION_PROMPT_EOF\n'
+            cat tools/review/public-surface-review.md
+            printf '\nCERULION_PROMPT_EOF\n'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Review the diff for shipped-text tells
+        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.193
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          # Off, because this repository is public and so is every Actions log
+          # it writes: the action's full output is the whole session, from a
+          # run that holds the OAuth token.
+          show_full_output: false
+          claude_args: |
+            --allowedTools "Read,Grep,Glob,Write"
+
+      # The verdict is read by this workflow, not announced by the model: a
+      # finding count the job acts on must not depend on a tool call the
+      # session may or may not make. The renderer owns the mapping (its own
+      # `--self-test` drives every arm): 0 clean and silent, 1 a LEAK or
+      # EMBARRASSING finding, 2 advisory findings only, 3 no readable verdict.
+      - name: Read the verdict and decide
+        if: always()
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          rc=0
+          python3 -B tools/review/render_public_surface_verdict.py \
+            public-surface-review.json > comment.md || rc=$?
+          cat comment.md
+          if [ "$rc" -ne 0 ]; then
+            gh pr comment "$PR_NUMBER" --body-file comment.md
+          fi
+          case "$rc" in
+            0|2) exit 0 ;;
+            *) exit 1 ;;
+          esac
+
+      # No artifact carries the session transcript. Artifacts on a public
+      # repository are downloadable by anyone with the link, and the
+      # transcript records every tool call and its result, so uploading it
+      # would publish what show_full_output above keeps out of the log.

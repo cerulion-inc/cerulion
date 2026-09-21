@@ -1,0 +1,38 @@
+error: #[on_event(input = "nope")] references an unknown input — `nope` is not declared as an `#[input]` field on the sibling `#[cerulion_node]` struct
+  --> tests/ui/on_event_liveliness_unknown_port.rs:27:8
+   |
+27 |     fn on_liveliness(&mut self, _ev: LivelinessEvent) {}
+   |        ^^^^^^^^^^^^^
+
+error[E0599]: no method named `__cer_user_init` found for struct `LivelinessUnknownPortNode` in the current scope
+  --> tests/ui/on_event_liveliness_unknown_port.rs:10:1
+   |
+10 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `LivelinessUnknownPortNode`
+11 | #[derive(Default)]
+12 | struct LivelinessUnknownPortNode {
+   | -------------------------------- method `__cer_user_init` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_zero_copy_tick` found for struct `LivelinessUnknownPortNode` in the current scope
+  --> tests/ui/on_event_liveliness_unknown_port.rs:10:1
+   |
+10 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `LivelinessUnknownPortNode`
+11 | #[derive(Default)]
+12 | struct LivelinessUnknownPortNode {
+   | -------------------------------- method `__cer_zero_copy_tick` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_shutdown` found for struct `LivelinessUnknownPortNode` in the current scope
+  --> tests/ui/on_event_liveliness_unknown_port.rs:10:1
+   |
+10 | #[cerulion_node(period_ms = 5)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+11 | #[derive(Default)]
+12 | struct LivelinessUnknownPortNode {
+   | -------------------------------- method `__cer_user_shutdown` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

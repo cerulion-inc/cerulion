@@ -1,0 +1,73 @@
+# The Go2's NON-built-in ROS 2 message types, generated from the
+# workspace `.msg` store (`examples/go2/schemas/unitree_go/msg/`) at build time.
+#
+# WHY A CRATE AND NOT A MODULE. A node that declares an `#[input]` / `#[output]`
+# of one of these types needs a real Rust type implementing `ShmMessage`; the
+# `#[cerulion_node]` macro reads `<T as ShmMessage>::SCHEMA_HASH` off it. The
+# `native_ros2_messages` crate only carries the STOCK ROS 2 corpus, and
+# `unitree_go` is not in it. Putting the generated types behind a crate whose
+# name IS the ROS package name also makes `use unitree_go::Go2FrontVideoData;`
+# resolve to the schema name `unitree_go/Go2FrontVideoData` in
+# `cerulion node info` / `cerulion graph validate` — the documented
+# "user-defined schema crates use their crate name as the package qualifier"
+# convention (cerulion_cli_engine::node_metadata) — which is the SAME string
+# `graphs/go2.bridge.yaml` maps `/frontvideostream` to.
+#
+# It lives under `lib/` (not `nodes/`) so `cerulion graph run` node-type
+# resolution never mistakes it for a node.
+#
+# ⚠ ONE DEFINITION. The generated types are produced from the SAME
+# `examples/go2/schemas/**.msg` text the `dds_bridge` generic codec reads at
+# runtime (its `msg_dirs:` store), through the SAME
+# `parse_rosmsg -> resolve_fixed_nested` pipeline. That is what keeps the
+# `schema_hash` this crate STAMPS into a node's port identical to the one the
+# bridge stamps into the frames it publishes — a second, hand-written copy of
+# the layout would skew and every frame would be dropped at the hash gate.
+[package]
+name = "unitree_go"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Go2 unitree_go ROS 2 message types, generated from examples/go2/schemas"
+
+[features]
+# Mirrors `native_ros2_messages`: codegen emits a handful of test-only items
+# behind `#[cfg(any(test, feature = "test-helpers"))]`. Declaring the feature
+# keeps `unexpected_cfgs` quiet without touching the generated text.
+test-helpers = []
+
+# cargo-machete cannot see this crate's use of `cerulion_core`: `src/lib.rs` is
+# nothing but `include!(concat!(env!("OUT_DIR"), "/unitree_go.rs"))`, and the
+# GENERATED text is what names `::cerulion_core::…` (the `ShmMessage` impls, the
+# `#[serde(crate = "::cerulion_core::serde")]` on every `<Name>Snapshot`). The
+# tool reads `use` statements in the checked-in sources, and to it this crate's
+# `src/` is empty — so the dependency is real and the report is a false
+# positive. Waived here rather than left visible, which is the opposite of the
+# `regex` call in `cerulion_core/Cargo.toml`: a waiver for a TRUE positive is
+# how a dead dependency becomes permanent, but leaving a FALSE one visible is
+# how a red gate stays red and stops being read.
+#
+# ⚠ `cerulion_core` is ALSO a `[build-dependencies]` entry below, and that one
+# IS `use`d (build.rs). cargo-machete resolves `ignored` against the union, so
+# if a future version starts reporting "was marked as ignored, but is actually
+# used" for this name, DELETE the waiver rather than restructuring the manifest
+# — the same condition the `iceoryx2-bb-posix` note in `cerulion_core` records.
+# Verified with cargo-machete 0.9.2: clean, no such warning.
+[package.metadata.cargo-machete]
+ignored = ["cerulion_core"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+# NO direct `serde`, deliberately — same reason `native_ros2_messages` carries
+# none: the codegen-emitted `<Name>Snapshot` types name
+# `::cerulion_core::serde` and carry `#[serde(crate = "::cerulion_core::serde")]`,
+# so a bare `::serde` path is never emitted and a local dep would go unused.
+
+[build-dependencies]
+cerulion_core = { workspace = true }
+
+# The demo workspace mirrors the root `[workspace.lints]` table (see
+# `examples/go2/Cargo.toml`), so every member here inherits the SAME strict lints as
+# the main tree rather than sitting under no lint table at all.
+[lints]
+workspace = true

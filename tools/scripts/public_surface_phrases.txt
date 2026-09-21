@@ -1,0 +1,8 @@
+# Phrases that contradict the README, for tools/scripts/check_public_surface.sh
+# (class shipped-text). One phrase per line, matched case-insensitively as a
+# substring in every shipped file. Each line names a claim that was found in a
+# shipped page this week and had to be scrubbed by hand; add a line the day the
+# README changes a fact that another page could still state the old way.
+not yet published to crates.io
+closed alpha
+Rust 1.88

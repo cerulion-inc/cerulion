@@ -1,0 +1,13 @@
+error: `period_ms` must be > 0 (zero-duration period would spin-loop the scheduler)
+ --> tests/ui/period_ms_zero.rs:8:1
+  |
+8 | #[cerulion_node(period_ms = 0)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/period_ms_zero.rs:10:7
+   |
+10 |     #[output]
+   |       ^^^^^^

@@ -1,0 +1,550 @@
+[workspace]
+members = [
+    "crates/cerulion_core",
+    "crates/cerulion_bag",
+    "crates/cerulion_bagd",
+    "crates/cerulion_cli_engine",
+    # Local Studio workspace engine daemon. It links cli_engine, so it inherits
+    # the workspace AGPL license rather than being a proprietary client library.
+    "crates/cerulion_wsd",
+    "crates/cerulion_cli",
+    "crates/cerulion_cli_tui",
+    "crates/cerulion_macros",
+    # The DDS platform crate for `cerulion ros2 attach` (participant
+    # construction + SPDP/SEDP discovery over ros2-client/rustdds). The ONLY
+    # main-workspace crate that pulls the DDS stack; keep the command logic
+    # pure in cerulion_cli_engine::ros_cmd so this crate is the sole flip point.
+    "crates/cerulion_dds",
+    # The open (AGPL) robot-side ops service — mechanical verbs
+    # (inventory, log-tail, restart) over a versioned framed protocol with
+    # deny-by-default authz + a hash-chained receipt log. Transport-agnostic
+    # (iroh plugs into the transport seam later); light deps, no iceoryx2/zenoh.
+    "crates/cerud",
+    "crates/native_ros2_messages",
+    "crates/rmw_cerulion",
+    # The borrow-window heap hook:
+    # `libcerulion_heaphook.so`, an LD_PRELOAD malloc-family interposer the
+    # `cerulion ros2 run|launch` launcher auto-injects and the rmw dlsyms. It is
+    # a PRELOAD PAYLOAD, not a workspace tool, so it is DELIBERATELY excluded
+    # from `default-members` below (the same treatment cerulion_wireclient etc.
+    # get, for the same reason: a plain `cargo build` should not link an
+    # allocator-interposing .so into anything). A member so `--workspace` gates
+    # cover it and CI's Linux jobs run its subprocess LD_PRELOAD e2e; the pure
+    # logic core builds + unit-tests on every platform (macOS included).
+    "crates/cerulion_heaphook",
+    # The desk-half identity layer — offline-verifiable pairing
+    # (cert/grant formats + robot-side verifier + CPace PAKE + client lib).
+    # PERMISSIVE (MIT OR Apache-2.0, overriding the workspace AGPL default) so
+    # the verifier can embed in proprietary vendor firmware and the closed
+    # Studio app can link the client lib. No iroh / no network I/O — pure
+    # formats, crypto, and state machines.
+    "crates/cerulion_pairing",
+    "crates/test_fixtures/test_node_cdylib",
+    "crates/test_fixtures/test_node_macro_cdylib",
+    "crates/test_fixtures/test_node_failing_cdylib",
+    # Policy round-trip fixtures (one per MacroPolicy variant).
+    "crates/test_fixtures/test_node_macro_period_cdylib",
+    "crates/test_fixtures/test_node_macro_sync_cdylib",
+    "crates/test_fixtures/test_node_macro_external_cdylib",
+    # Macro-emitted DataTrigger round-trip fixture.
+    "crates/test_fixtures/test_node_macro_data_trigger_cdylib",
+    # The tick that NEVER RETURNS (env-switched), the one condition
+    # the wedge alarm exists to report and the only fixture that can produce it.
+    "crates/test_fixtures/test_node_hang_cdylib",
+    # A DATA-TRIGGERED node with `backpressure = block` on its
+    # trigger input. Both older block fixtures are `external` + HostDriven,
+    # which the live path refuses, so neither can be staged into a
+    # graph a real `cerulion graph run` executes.
+    "crates/test_fixtures/test_node_macro_trigger_block_cdylib",
+    # Serve-many — DataTrigger + plain non-trigger context over the FFI
+    # (the motivating shape for the cross-step hold; no other fixture combines the two).
+    "crates/test_fixtures/test_node_macro_burst_ctx_cdylib",
+    # Oracle-vector fixture for raw-FFI template emit.
+    "crates/test_fixtures/test_node_raw_ffi_template_cdylib",
+    # Variable-schema spill round-trip across FFI.
+    "crates/test_fixtures/test_node_macro_overflow_cdylib",
+    # A cdylib's QoS (tick/throttle/expect/promise_within_ms)
+    # round-trip across the v6 info-JSON FFI.
+    "crates/test_fixtures/test_node_macro_qos_cdylib",
+    # cerulion_node_info() returns corrupted JSON; graph build must refuse.
+    "crates/test_fixtures/test_node_corrupt_info_cdylib",
+    # Period cdylib with a plain non-trigger input, for
+    # the serial-routing-of-a-real-cdylib-under-parallel-fire pin.
+    "crates/test_fixtures/test_node_macro_period_input_cdylib",
+    # ABI v8: #[input(depth = 32)] across the cdylib FFI; consumed
+    # by cdylib_depth_ffi_test (parse pin + parity + e2e ceiling oracle).
+    "crates/test_fixtures/test_node_macro_depth_cdylib",
+    # Raw-FFI cdylib whose set_snapshot_inputs FFI fails on demand, for
+    # the regression guard that the host stops calling snapshot
+    # after a failed set.
+    "crates/test_fixtures/test_node_snapshot_fail_cdylib",
+    # Macro `#[cerulion_node(external)]` whose external_source()
+    # returns ExternalSource::Blocking, collapsed at the C ABI to a kind-2
+    # doorbell-pipe fd. Runtime coverage for spawn_cdylib_blocking_doorbell +
+    # DoorbellFdSource (cdylib_blocking_doorbell_test.rs).
+    "crates/test_fixtures/test_node_macro_blocking_cdylib",
+    # Macro cdylib whose tick emits a user warn + (default) leaves
+    # variable fields unwritten to trigger the OutputProxy discard error, for the
+    # cdylib-local stderr tracing stopgap e2e (cdylib_tracing_stopgap_test.rs).
+    "crates/test_fixtures/test_node_discard_probe_cdylib",
+    # Raw-FFI cdylib whose cerulion_node_drain_trigger_input
+    # FFI fails on demand (proves a failed unified drain never fabricates a
+    # fire signal; cdylib_unified_drain_test.rs).
+    "crates/test_fixtures/test_node_drain_fail_cdylib",
+    "crates/test_fixtures/test_node_sync_op_fail_cdylib",
+    # Macro `#[cerulion_node(unbounded_sync)]` cdylib (2 trigger inputs
+    # + summing output). Proves the unbounded_sync policy crosses the cdylib FFI
+    # (gen_cdylib policy_json arm) — without that arm it emits no `"policy"` key and the
+    # node degrades to TriggerPolicy::Data. Consumed by
+    # macro_cdylib_policy_round_trip_test + cdylib_unbounded_sync_fire_test.
+    "crates/test_fixtures/test_node_macro_unbounded_sync_cdylib",
+    # Bounded-Sync cdylib with 2 #[input(trigger)] ports + a
+    # plain #[input] latest-value context port. Proves the trigger-scoped Sync
+    # flip ACROSS the cdylib FFI (ABI-v9 trigger carry + the cross-step hold via
+    # the snapshot FFI symbols): fires on trigger alignment regardless of the
+    # context input; fused.x = trigger sum, fused.y = the config value read.
+    # Consumed by cdylib_sync_nontrigger_test.rs.
+    "crates/test_fixtures/test_node_macro_sync_nontrigger_cdylib",
+    # Cdylib parity for the two `#[input(backpressure = ...)]` policies on
+    # a PER-SET Sync TRIGGER input, on the DEPLOYMENT surface (DylibNodeEntry).
+    # Exact declaration mirrors of sync_per_set_backpressure_iox2_test.rs's
+    # in-process BlockPairFuse / SampledPairFuse, plus the output a cdylib needs
+    # to be observable (counters-via-output). TWO crates, not one: the cdylib FFI
+    # exports fixed symbol names so a cdylib carries exactly ONE macro node, and
+    # the two policies cannot share a node either (`block` demands an in-graph
+    # producer; the sample membership oracle demands hand-stamped publishes onto
+    # an absolute topic). Consumed by cdylib_sync_backpressure_parity_test.rs.
+    "crates/test_fixtures/test_node_macro_sync_block_cdylib",
+    "crates/test_fixtures/test_node_macro_sync_sample_cdylib",
+    # Macro cdylib declaring one #[on_event] handler per
+    # reactive kind (Backpressure/ExpectWithin/Liveliness/PromiseWithin).
+    # Proves the #[on_event] DISPATCH fires INSIDE a DylibNodeEntry-loaded
+    # cdylib, not only in-process. Consumed by
+    # cdylib_on_event_dispatch_test.rs.
+    "crates/test_fixtures/test_node_macro_onevent_cdylib",
+    # Macro cdylib exercising the full port-write surface
+    # (variable =, var read accessor, fill_from, nested-leaf sugar, with_<field>,
+    # + NestedWriteConflict / NestedChildIncomplete fail modes) across the
+    # cdylib FFI. Consumed by cdylib_portwrite_e2e_test.rs.
+    "crates/test_fixtures/test_node_macro_portwrite_cdylib",
+    # Real-bag e2e — the PERTURBED twin of test_node_macro_period_cdylib
+    # (same fire schedule, different payload constant) so the real-bag replay can
+    # prove exit 1 without an in-test cargo build (replay_cli_test.rs).
+    "crates/test_fixtures/test_node_macro_period_perturbed_cdylib",
+    # Exit 3: the PANICKING twin (same shape, tick panics on
+    # its 3rd fire) so the real-bag replay can prove exit 3 (node failure:
+    # panic-class execution) without an in-test cargo build (replay_cli_test.rs).
+    "crates/test_fixtures/test_node_macro_period_panic_cdylib",
+    # A DELIBERATELY nondeterministic node
+    # (deterministic fire schedule, per-process-random payload folding
+    # SystemTime::now + a RandomState seed) so replay proves the diff CATCHES
+    # nondeterminism as a ByteMismatch exit 1 (replay_cli_test.rs + the engine
+    # suite's inline twin).
+    "crates/test_fixtures/test_node_nondeterministic_cdylib",
+    # Det-clock accessors — macro cdylib whose tick reads
+    # self.now_ns()/self.virt_ns()/self.ext_ns() (the Arc<dyn Clock> FFI
+    # dispatch) and stamps the results into a Twist output's linear/angular
+    # fields. Proves the trait-object vtable pointer crossing the cdylib FFI
+    # resolves correctly (real_ns()/request_shutdown() already had cdylib
+    # coverage; these three reads did not). Consumed by
+    # cdylib_clock_accessors_test.rs.
+    "crates/test_fixtures/test_node_macro_clockprobe_cdylib",
+    # Drop-oldest backpressure: a deliberately slow (50ms) macro
+    # cdylib consumer with a bare (default drop_oldest) non-trigger input, so
+    # a fast (1ms) producer reliably overflows its default-depth queue.
+    # Consumed by cdylib_dropoldest_overflow_test.rs.
+    "crates/test_fixtures/test_node_macro_slowdrain_cdylib",
+    # Block inputs are excluded from the hold: ports `BlockHoldConsumer`
+    # (non_trigger_hold_iox2_test.rs) through the cdylib FFI with an
+    # added output, so a downstream in-process drain can observe that a
+    # `block` non-trigger input reads live (never replays a held value).
+    # Consumed by cdylib_hold_block_excluded_test.rs.
+    "crates/test_fixtures/test_node_macro_holdblock_cdylib",
+    # Node-state capture/restore: a macro cdylib carrying REAL state (a u64, a
+    # String, a Vec<f64> and a `#[cerulion(reconstruct)]` escape) plus a port,
+    # so the capture/restore FFI pair can be driven over a real `dlopen`.
+    # Consumed by cdylib_state_ffi_test.rs.
+    "crates/test_fixtures/test_node_macro_state_cdylib",
+    # Node-state FFI: a HAND-WRITTEN raw-FFI cdylib exporting the state trio
+    # with an exporter that IGNORES the host sink callback's non-zero return and
+    # still reports success. The macro-generated exporter is correct by
+    # construction, so the misbehaving-exporter population it models cannot be
+    # reproduced by any macro fixture. Consumed by cdylib_state_ffi_test.rs.
+    "crates/test_fixtures/test_node_state_liar_cdylib",
+    # Node-state FFI: a MACRO cdylib whose HAND-WRITTEN `CerulionState` field impl
+    # panics on demand, so the generated capture/restore exports can be driven
+    # through the panic path: a panic escaping the live `NODES` guard poisons it
+    # and kills every node of the library, not just the capture that panicked.
+    # Consumed by cdylib_state_ffi_test.rs.
+    "crates/test_fixtures/test_node_state_panic_cdylib",
+    # A standalone malloc/dlsym probe binary the
+    # Linux e2e test LD_PRELOADs `libcerulion_heaphook.so` onto. It does NOT
+    # depend on `cerulion_heaphook` on purpose — the interposers must reach it
+    # ONLY through the preload, never a static link. Consumed by
+    # `cerulion_heaphook/tests/heaphook_e2e_test.rs` (built first on Linux CI).
+    "crates/test_fixtures/heaphook_probe",
+    # A trivial second malloc interposer preloaded AHEAD of the hook,
+    # so the e2e can prove the hook's won-malloc detection reports status_won=0
+    # for the foreign-allocator case (the handshake-gate degrade).
+    "crates/test_fixtures/heaphook_shim",
+    # ── Cerulion visualization stack (root members; the root MSRV of 1.93
+    #    is what the `rerun` 0.34 SDK needs).
+    #    These pull the heavy rerun dep tree, so they are
+    #    DELIBERATELY excluded from `default-members` below — a plain
+    #    `cargo build` stays rerun-free; the viz stack builds only via
+    #    `cargo build -p cerulion_viz` / `-p cerulion-vizd` or `--workspace`
+    #    (which is why `cargo clippy --workspace` COVERS them).
+    #    There is no graph-embedded Rerun sink cdylib member:
+    #    visualization is DESK-side — the
+    #    `cerulion-vizd` daemon decodes + renders on the user's machine — and
+    #    `ros2 attach` stages no viz node on the robot.
+    "crates/cerulion_viz/lib/go2_tf",       # pure TFMessage codec (std + thiserror; no rerun)
+    "crates/cerulion_viz/lib/cerulion_viz", # generic Rerun viz support lib (pulls rerun)
+    # The long-lived schema-generic dynamic viz DAEMON (UDS NDJSON
+    # control protocol). Pulls rerun via cerulion_viz, so it is ALSO excluded
+    # from default-members below (the `cerulion` CLI never links it — it speaks
+    # to the daemon over the socket).
+    "crates/cerulion_viz/bin/cerulion_vizd", # cerulion-vizd daemon (pulls rerun; NOT in default-members)
+    # ── Client-protocol layer (MIT OR Apache-2.0, permissive so the
+    #    closed Cerulion Studio sidecar can link them).
+    #  • `cerulion_wire` is tiny (thiserror-only) and goes in default-members.
+    #  • `cerulion_link` pulls iroh (~390 transitive crates), so it is
+    #    DELIBERATELY excluded from `default-members` below — same treatment
+    #    the `cerulion_viz/*` crates get; a plain `cargo build` stays iroh-free.
+    #    Build it via `cargo build -p cerulion_link` or `--workspace`.
+    "crates/cerulion_wire", # permissive standalone wire-format decode seam (no cerulion_core dep)
+    "crates/cerulion_link", # thin iroh dial-by-key QUIC wrapper (pulls iroh; NOT in default-members)
+    # The robot-level remote-plane daemon (AGPL). Owns the ONE
+    # iroh endpoint and multiplexes the wire+ops ALPNs, gating every accept via a
+    # deny-by-default PairingAuthorizer. Links cerulion_link (→ iroh) + cerud +
+    # cerulion_pairing, so it is DELIBERATELY excluded from default-members below
+    # (a plain `cargo build` stays iroh-free); build it via
+    # `cargo build -p cerulion_remoted` or `--workspace`.
+    "crates/cerulion_remoted",
+    # The desk-side `cerulion/wire/1` CLIENT substrate (AGPL): the
+    # control vocabulary + dial-config parsers + the per-topic re-inject reader,
+    # extracted from `cerulion_connectd` so BOTH the connect worker AND
+    # `cerulion_netd`'s WAN plane consume ONE implementation (no `netd → connectd`
+    # cyclic package edge). Links cerulion_link (→ iroh) + cerulion_core, so it is
+    # DELIBERATELY excluded from default-members below (a plain `cargo build` stays
+    # iroh-free); build it via `cargo build -p cerulion_wireclient` or `--workspace`.
+    "crates/cerulion_wireclient",
+    # The DESK-side re-inject client (AGPL). `cerulion connect`
+    # spawns this sibling binary; it dials the robot's `cerulion/wire/1` ALPN,
+    # demands topics, and re-injects each frame into desk-local SHM ("remote =
+    # local"). Links cerulion_link (→ iroh) + cerulion_core (SHM ingress seam) +
+    # cerulion_pairing (desk device identity), so it is DELIBERATELY excluded from
+    # default-members below (a plain `cargo build` stays iroh-free); build it via
+    # `cargo build -p cerulion_connectd` or `--workspace`.
+    "crates/cerulion_connectd",
+    # The ONE per-computer network gateway daemon
+    # (`cerulion-netd`). Owns the machine's single zenoh session; serves
+    # refcounted remote-topic demands over a UDS NDJSON control seam and
+    # self-exits when idle. Its `wan` feature (the iroh WAN
+    # plane) is DEFAULT-ON — so the SHIPPED daemon
+    # (`cargo build -p cerulion_netd` / `cargo install`) includes the iroh WAN
+    # plane by default. But that same default-on `wan` is exactly why netd is
+    # EXCLUDED from `default-members` below: cargo unifies features per-package, so
+    # if netd were a default-member its own root activation of `wan` would turn the
+    # iroh tree ON for the single shared netd rlib the CLI + vizd link — dragging
+    # the ~390-crate iroh tree into every plain `cargo build` despite their
+    # `default-features = false` edges (which subtract only THEIR edge's default,
+    # not netd's own root activation). Kept a member (not a default-member): a plain
+    # `cargo build` builds netd only as a dependency (features = the union of
+    # consumer activations = NO wan), so the CLI + vizd stay genuinely iroh-free,
+    # while `--workspace` still compiles the wan netd (it is a member) — keeping the
+    # workspace-wide CI gates' coverage of the WAN plane.
+    # The LAN peer-discovery SUBSTRATE shared by the CLI's `topic list`
+    # ladder and `cerulion-netd`'s boot-time session fold — the
+    # discovered-peer types, the `~/.cerulion/peers.json` format + reader, the
+    # bounded TCP reachability pre-filter, and the pure connect-set planner.
+    # `cerulion_cli_engine` already depends on `cerulion_netd`, so netd cannot
+    # import the ladder from the CLI engine (cyclic); this crate is the shared
+    # floor — the same extraction `cerulion_wireclient` got for the same reason.
+    # std + serde + dirs + tracing only: NO cerulion_core, iceoryx2, zenoh, iroh
+    # or mdns-sd, so it is safe in `default-members`.
+    "crates/cerulion_discovery",
+    # The ONE Unix-socket lifecycle (path ladder + flock singleton + directory
+    # rule) for netd, vizd, wsd and their clients. std + libc + tracing only; the
+    # engine depends on netd and vizd on netd, so a shared copy can live in
+    # neither daemon — the same leaf-crate shape as cerulion_discovery.
+    "crates/cerulion_hygiene",
+    # The `_cerulion._tcp` gateway BEACON (the advertise half of mDNS discovery).
+    # The permissive gateway plane lives in `cerulion-netd`, so the
+    # robot's serving plane and the `graph run-gateway` FALLBACK must both
+    # advertise — and `cerulion_cli_engine` already depends on `cerulion_netd`, so
+    # the beacon cannot live in the CLI engine (cyclic). `cerulion_discovery` cannot
+    # host it either: that crate is pinned mdns-sd-FREE on purpose. Its ONE extra dep,
+    # `mdns-sd`, is already in the default tree via `cerulion_cli_engine`, so this
+    # adds nothing to a plain build — hence it is safe in `default-members`.
+    "crates/cerulion_mdns",
+    "crates/cerulion_netd",
+    # The cloud account service (issuer/CA + account DB + OAuth +
+    # device-code login). AGPL-3.0-only (a server component). Pulls a web stack
+    # (axum/tokio/hyper + rusqlite), so it is DELIBERATELY excluded from
+    # `default-members` below — a plain `cargo build` stays web-stack-free (axum
+    # is reachable ONLY from this crate + the already-out-of-default iroh/rerun
+    # trees). Build it via `cargo build -p cerulion_accountd` or `--workspace`
+    # (which keeps the workspace-wide CI gates covering it). Verified with the
+    # inverted whole-build tree `cargo tree -e normal -i axum` (empty on a default
+    # build).
+    "crates/cerulion_accountd",
+]
+# default-members: the LEAN build set — every workspace member EXCEPT the
+# heavy-tree crates: the `cerulion_viz/*` crates (the `rerun` SDK, ~39 crates) AND
+# the iroh-linking crates (`cerulion_link`, `cerulion_connectd`, `cerulion_remoted`,
+# `cerulion_wireclient`, and `cerulion_netd`, whose `wan`
+# feature is default-on, ~390 crates). `cargo build` / `cargo test` with no
+# `-p`/`--workspace` operate on THIS set, so NEITHER the rerun SDK NOR the iroh tree
+# is compiled on a plain build. This is the feature-flag mechanism for the
+# viz stack (it is opt-in: `-p cerulion_viz`, `-p cerulion-vizd`, or
+# `--workspace`) AND the iroh-leanness invariant: the CLI + vizd stay
+# iroh-free because netd (default-on `wan`) is out of this set — pinned by the
+# `iroh-leanness` CI job (`cargo tree` asserts the default graph has no iroh AND the
+# per-package netd still ships wan). Globs expand the same way as `members`; every
+# entry below is a member above.
+default-members = [
+    "crates/cerulion_core",
+    "crates/cerulion_bag",
+    "crates/cerulion_bagd",
+    "crates/cerulion_discovery",
+    "crates/cerulion_hygiene",
+    # Pulls mdns-sd only (already in this tree via cerulion_cli_engine).
+    "crates/cerulion_mdns",
+    "crates/cerulion_cli_engine",
+    "crates/cerulion_wsd",
+    "crates/cerulion_cli",
+    "crates/cerulion_cli_tui",
+    "crates/cerulion_dds",
+    "crates/cerulion_macros",
+    "crates/cerud",
+    "crates/native_ros2_messages",
+    "crates/rmw_cerulion",
+    # Desk-half identity layer (light, permissive; no rerun/DDS pull).
+    "crates/cerulion_pairing",
+    "crates/test_fixtures/*",
+    # The tiny permissive wire decoder is lean (thiserror only), so it
+    # IS in the default set. `cerulion_link` is NOT — it pulls the iroh tree.
+    "crates/cerulion_wire",
+    # NOTE: `cerulion_netd` is a `members` entry but is
+    # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a
+    # default-member netd would unify the iroh tree into the CLI + vizd via
+    # per-package feature unification (see the `members` netd comment above). The
+    # shipped daemon still ships wan by default via `cargo build -p cerulion_netd` /
+    # `cargo install`; workspace-wide gates cover the wan netd via `--workspace`.
+]
+# Standalone user-style example workspaces. Each example has its own
+# [workspace], so it builds independently and is NOT part of this root
+# workspace, the same way benches/ are kept out.
+exclude = [
+    "examples/basic_timer",
+    "examples/camera_pipeline",
+    "examples/obstacle_avoidance",
+    "examples/perception",
+    "examples/realsense",
+    "examples/v4l2_camera",
+]
+resolver = "2"
+
+# Shared publish metadata inherited by every publishable crate via
+# `<field>.workspace = true`. Bump `version` here to release
+# all crates in lockstep.
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/cerulion-inc/cerulion"
+homepage = "https://github.com/cerulion-inc/cerulion"
+# MSRV 1.93 (set by the cerulion_viz members of the root
+# workspace). VERIFIED + ENFORCED: the `msrv` CI job in
+# .github/workflows/ci.yml runs `cargo +1.93.0 check --workspace --all-targets`
+# on every PR, so this value is a build-proven floor, not a survey.
+# Our own code needs only 1.87 (`usize::is_multiple_of`), and the non-viz
+# dependency tree floors at 1.88 (darling/time/time-core/home/instability
+# declare rust-version 1.88). The binding constraint is the `rerun` 0.34 SDK
+# (pulled by the `cerulion_viz` / `cerulion-vizd` members behind `default-members`).
+# `rerun` 0.34 declares `rust-version` 1.92, but its transitive `fixed` dep at
+# the current release (1.31.0) declares 1.93 — so 1.93 is rerun's REAL floor with
+# unpinned deps, and adopting it lets `fixed` resolve naturally to 1.31.0 (no
+# lockfile pin back to 1.30.0). 1.93 is the true minimum stable that checks the
+# WHOLE workspace clean.
+rust-version = "1.93"
+
+# ───────────────────────────── Workspace lint table ────────────────────────
+# The one strict lint table (the project's strict linting rule). Every workspace
+# member inherits it with
+#
+#     [lints]
+#     workspace = true
+#
+# and cargo REFUSES to mix that key with crate-local lint keys, so a member
+# either inherits this table whole or opts out visibly in its own manifest.
+#
+# A lint table hand-copied into each manifest is simply ABSENT from any
+# manifest that skips the copy (the `test_fixtures/*` cdylibs,
+# `cerulion_viz`, `go2_tf`) — i.e. a new crate opts out of the repo's
+# strictest policy by not copying it, silently, and `dead_code = "deny"` does
+# not apply to it. One inherited table closes that.
+# `cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` walks every
+# member manifest and fails, naming the crate and the fix, if one does not
+# inherit.
+[workspace.lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+# Union of the crate-specific `check-cfg` declarations the members
+# need:
+#   * `feature = "cdylib"` — the `#[cerulion_node]` macro generates
+#     `#[cfg(feature = "cdylib")]` FFI blocks (cerulion_core,
+#     cerulion_cli_engine, and every macro fixture).
+#   * the two `cerulion_rmw_*_bindings` cfgs — set by `rmw_cerulion/build.rs`.
+#
+# Declaring a cfg name workspace-wide only marks it EXPECTED; it never enables
+# anything. The cost is that a typo'd `#[cfg(feature = "cdylib")]` inside a
+# crate that has no such feature does not warn — three names, a small price
+# for one lint table over every member.
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("cdylib"))',
+    'cfg(cerulion_rmw_vendored_bindings)',
+    'cfg(cerulion_rmw_generated_bindings)',
+] }
+
+[workspace.lints.clippy]
+# `priority = -1` is mandatory once any individual clippy lint is listed
+# alongside the group: cargo ignores table order, so a group and a lint at the
+# same (default 0) priority is itself an error (`clippy::lint_groups_priority`).
+all = { level = "warn", priority = -1 }
+# Lints that encode repo policy. CI runs clippy with `-D warnings`, so `deny`
+# and `warn` are the same verdict there; `deny` is stated so a plain local
+# `cargo clippy` agrees with CI.
+#
+# The five below are NOT one class, and the difference decides what happens if
+# a line is deleted (MEASURED against clippy 1.96, not read off a group name):
+#
+#   * `dbg_macro` / `todo` / `unimplemented` are RESTRICTION-group lints, which
+#     are ALLOW by default — delete the line and the lint goes INERT.
+#   * `disallowed_macros` / `disallowed_methods` are WARN by default
+#     (`#[warn(...)] on by default`). Deleting their lines does NOT disarm
+#     them: `clippy.toml`'s entries still fire as warnings, and under CI's
+#     `-D warnings` still fail the build. Stating `deny` buys agreement with a
+#     plain local `cargo clippy`, not the ban itself — what would actually
+#     disarm those two is emptying `clippy.toml`.
+#
+# `dbg_macro` / `disallowed_macros` overlap on `dbg!` deliberately: the first
+# is the level, the second (via `clippy.toml`) is what supplies the reason.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+# NOT set here: `print_stdout` / `print_stderr`. This table applies to every
+# target of every crate, and P12 bans printing in LIBRARY code only — a bin's
+# job is to print, and a test binary printing evidence under `--nocapture` is
+# the house pattern. The ban lives at each library crate root instead:
+#     #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+# pinned by `cerulion_cli_engine/tests/library_print_ban_test.rs`.
+
+# Internal crates shared across the workspace. Each entry carries
+# BOTH `path` (local builds) AND `version` — crates.io requires a version on
+# every non-dev dependency at publish time; cargo drops the `path` when
+# packaging. Keep `version` in lockstep with [workspace.package].version.
+#
+# NOTE: dev-dependencies on internal crates intentionally stay path-only
+# (NOT `workspace = true`): path-only dev-deps are stripped by `cargo
+# package`, which is what breaks the cerulion_core <-> native_ros2_messages /
+# cerulion_cli_engine dev-dependency cycles at publish time.
+#
+# The version is EXACT (`=`) while the crates are released in lockstep: caret
+# matching on a 0.0.x prerelease is surprising, and these crates are released
+# in lockstep anyway, so `=<workspace version>` is both correct and clearest.
+[workspace.dependencies]
+cerulion_macros = { path = "crates/cerulion_macros", version = "=1.0.0" }
+cerulion_core = { path = "crates/cerulion_core", version = "=1.0.0" }
+cerulion_bag = { path = "crates/cerulion_bag", version = "=1.0.0" }
+cerulion_bagd = { path = "crates/cerulion_bagd", version = "=1.0.0" }
+cerulion_cli_engine = { path = "crates/cerulion_cli_engine", version = "=1.0.0" }
+cerulion_cli_tui = { path = "crates/cerulion_cli_tui", version = "=1.0.0" }
+cerulion_dds = { path = "crates/cerulion_dds", version = "=1.0.0", default-features = false }
+cerulion_discovery = { path = "crates/cerulion_discovery", version = "=1.0.0" }
+cerulion_hygiene = { path = "crates/cerulion_hygiene", version = "=1.0.0" }
+cerulion_link = { path = "crates/cerulion_link", version = "=1.0.0" }
+cerulion_mdns = { path = "crates/cerulion_mdns", version = "=1.0.0" }
+cerulion_netd = { path = "crates/cerulion_netd", version = "=1.0.0", default-features = false }
+cerulion_pairing = { path = "crates/cerulion_pairing", version = "=1.0.0" }
+cerulion_wireclient = { path = "crates/cerulion_wireclient", version = "=1.0.0" }
+native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0" }
+
+# ───────────────────────────── Published DDS forks ─────────────────────────
+# The DDS stack is published as the distinct crates
+# `cerulion-rustdds` 0.14.2 and `cerulion-ros2-client` 0.10.1. Two renamed forks
+# are required because `[patch.crates-io]` cannot reach published consumers:
+# published `ros2-client` would otherwise resolve its `rustdds ^0.14`
+# dependency to upstream rustdds 0.14.2, which supplies endpoint USER_DATA
+# parsing and DiscoveryDB snapshot accessors but not the
+# `participant_lease_duration` knob required by cerulion_dds. The ros2-client
+# fork keeps the Rust dependency name `rustdds` while selecting the published
+# `cerulion-rustdds` package.
+#
+# Upstream rustdds 0.14.2 carries endpoint USER_DATA parsing and
+# `DomainParticipant::discovered_readers()`/`discovered_writers()` snapshot
+# accessors. The rustdds fork adds only the `participant_lease_duration` builder
+# knob plus its SPDP lease/announce derivation and period tests.
+#
+# EXIT CONDITION: replace both published forks with plain `ros2-client` and
+# `rustdds` when upstream rustdds publishes a release with a participant lease
+# duration knob. Revalidate the live peer before removing either fork.
+[patch.crates-io]
+# A SPARSE FORK of re_grpc_server 0.34.1 (pulled transitively
+# via rerun's `server` feature — cerulion-vizd's hosted gRPC message proxy).
+#
+# The SECOND patch adds `ServerOptions::live_temporal_budget_bytes`. The
+# first patch, below, kills the per-client REPLAY history; this one bounds the
+# LIVE broadcast queue, an INDEPENDENT buffer on the same path that the first could
+# not reach (it is the crate's private `CHANNEL_SIZE_MESSAGES`/`CHANNEL_SIZE_BYTES`
+# — 1024 messages / 128 MiB — AWAITED when full, so a viewer that renders slower
+# than the producer publishes accumulates frames there). MEASURED at 27.8 MB /
+# 10.1 frames of 720p in 2.4 s against an undrained receiver, climbing toward
+# ~1.6 s of stale video. Under a budget, a TEMPORAL message arriving at an
+# over-budget queue is DROPPED rather than awaited; the scene skeleton
+# (SetStoreInfo / blueprint / statics) always takes the reliable path, and drops
+# are reported as `live_dropped` by `capture_memory`. `None` = stock behaviour.
+#
+# Upstream 0.34.1 + those two localized patches. The first is a
+# `ServerOptions::drop_temporal_history` mode that
+# makes the per-client connect-history retain the scene skeleton (persistent +
+# static_) but NEVER buffer disposable/temporal frames — Cerulion Studio's
+# instant-only live viz (a fresh viewer client gets statics + blueprint, ZERO
+# temporal replay, at any producer bandwidth; no catch-up burst, no accumulation,
+# no viewer-blueprint clobber). vizd sets it on; every other re_grpc_server user
+# gets stock behavior (default `false`). Version stays 0.34.1 so the whole re_*
+# graph stays lockstep (`cargo tree | grep re_grpc`).
+#
+# WHY A FORK — stock 0.34.1's two `ServerOptions` knobs (`playback_behavior`,
+# `memory_limit`) cannot express "deliver the scene skeleton to a late joiner but
+# never replay temporal data": `memory_limit = ZERO` drops statics too (blank
+# scene), and any non-zero budget retains a byte-tail of high-rate temporal frames
+# (the catch-up burst this mode exists to remove). The added field is the minimal expression of it.
+#
+# SPARSE-FORK MODEL — cerulion-inc/re_grpc_server is a single-crate fork (NOT a
+# fork of rerun's ~278MB monorepo — a cargo git-dep clones the whole repo per cold
+# CI job): branch `upstream` carries the crates.io tarball verbatim (tagged
+# `upstream/<ver>`), branch `main` = `upstream` + the patch (what this rev pins),
+# mirroring the cerulion-inc/RustDDS precedent above. UPGRADE: in that repo run
+# `./import-upstream.sh <new-ver>` then `git merge upstream` on main, rebuild +
+# retest, and bump the `rev` here. See its README.md + CERULION-PATCH.md.
+#
+# EXIT CONDITION: drop this patch entirely (revert to the crates.io
+# re_grpc_server, prune this rev + the `deny.toml [sources]` entry) if upstream
+# re_grpc_server ever ships BOTH a statics-only / drop-temporal history mode
+# and a bounded, non-blocking live queue. Either alone is not
+# enough — the two patches bound two different buffers on the same path, and the
+# same wording is carried by `deny.toml [sources]` and the fork's
+# CERULION-PATCH.md "Exit condition".
+#
+# LANDMINE: the added `ServerOptions` fields are safe ONLY because rerun's
+# `clap`/`run`/`web_viewer` features — which construct `ServerOptions` with
+# explicit-field literals (no `..Default::default()`) — are NOT compiled in our
+# `rerun` (sdk + server only) build. If a future workspace change enables any of
+# those features on `rerun`, those upstream literals would need the fields. Watch
+# on any `rerun` feature change.
+re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "29b38496264e4681844346aa49c770070097305e" }

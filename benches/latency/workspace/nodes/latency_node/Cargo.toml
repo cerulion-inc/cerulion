@@ -1,0 +1,17 @@
+[package]
+name = "latency_node"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+# No libc dep: wall-clock is `self.real_ns()` on the macro shim
+# (clock_gettime(CLOCK_MONOTONIC) underneath).

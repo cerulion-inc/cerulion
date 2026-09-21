@@ -1,0 +1,148 @@
+Cerulion
+Copyright (c) 2025-2026 Cerulion Inc. and the Cerulion Contributors
+
+This product is licensed under the GNU Affero General Public License v3.0 only
+(AGPL-3.0-only). See the LICENSE file for the full text. A separate commercial
+license is also available from Cerulion.
+
+This file provides attribution for third-party components that Cerulion depends
+on or derives material from. It is informational; each component remains
+governed by its own license. The full dependency-tree license policy is in
+deny.toml, and per-dependency license texts are reproduced by each crate.
+
+--------------------------------------------------------------------------------
+Third-party dependencies (linked, not vendored)
+--------------------------------------------------------------------------------
+
+iceoryx2 (https://github.com/eclipse-iceoryx/iceoryx2)
+    The zero-copy shared-memory transport Cerulion is built on.
+    Licensed under "Apache-2.0 OR MIT".
+
+zenoh (https://github.com/eclipse-zenoh/zenoh)
+    The network transport for cross-machine communication.
+    Licensed under "EPL-2.0 OR Apache-2.0" (Cerulion takes the Apache-2.0 arm).
+
+stabby (https://github.com/ZettaScaleLabs/stabby)
+    Stable-ABI support, pulled in transitively via zenoh.
+    Licensed under "EPL-2.0 OR Apache-2.0" (Cerulion takes the Apache-2.0 arm).
+
+The complete set of transitive dependencies and their licenses is enforced by
+cargo-deny via deny.toml; every dependency carries a license compatible with
+redistributing this combined work under AGPL-3.0-only.
+
+--------------------------------------------------------------------------------
+Derived material
+--------------------------------------------------------------------------------
+
+native_ros2_messages
+    The Rust message types in the `native_ros2_messages` crate are generated at
+    build time from the ROS 2 `.msg` interface definitions vendored under
+    `crates/native_ros2_messages/msg/`. The generated Rust code is part of
+    Cerulion and is licensed under AGPL-3.0-only. The vendored `.msg`
+    definitions stay under their own upstream licenses, which are not all the
+    same license.
+
+    Every vendored package is listed below with its upstream repository, the
+    revision recorded for it in
+    `crates/native_ros2_messages/upstream_msg_manifest.txt`, and the exact
+    value its upstream `package.xml` gives in the `<license>` element at that
+    revision. A copyright holder is named only where upstream states one.
+
+    The same list, with the BSD-3-Clause text beside it, also ships inside the
+    crate as `msg/README.md`, so a copy of the definitions obtained from the
+    published crate carries the notice the BSD terms require.
+
+    Apache-2.0
+    Full text in LICENSE-APACHE.
+
+        action_msgs, builtin_interfaces, statistics_msgs
+            https://github.com/ros2/rcl_interfaces at `jazzy`
+            Declared as: Apache License 2.0
+            No copyright holder stated upstream.
+
+        diagnostic_msgs, geometry_msgs, nav_msgs, sensor_msgs, shape_msgs,
+        std_msgs, trajectory_msgs, visualization_msgs
+            https://github.com/ros2/common_interfaces at `jazzy`
+            Declared as: Apache License 2.0
+            No copyright holder stated upstream.
+
+        vision_msgs
+            https://github.com/ros-perception/vision_msgs at `jazzy`
+            Declared as: Apache License 2.0
+            No copyright holder stated upstream.
+
+        radar_msgs
+            https://github.com/ros2-gbp/radar_msgs-release at
+            `release/jazzy/radar_msgs/0.2.2-4`
+            Declared as: Apache-2.0
+            No copyright holder stated upstream.
+
+        autoware_perception_msgs, autoware_planning_msgs
+            https://github.com/autowarefoundation/autoware_msgs at `main`
+            Declared as: Apache License 2.0
+            Copyright 2022 The Autoware Foundation.
+            These two are not rosdistro packages, so no Jazzy revision exists
+            for them and the recorded revision is a moving branch.
+
+    BSD-3-Clause
+    Full text in LICENSE-BSD-3-CLAUSE. Each entry names the copyright holder
+    that the BSD notice condition applies to.
+
+        unique_identifier_msgs
+            https://github.com/ros2/unique_identifier_msgs at `jazzy`
+            Declared as: BSD
+            Copyright (C) 2012, Jack O'Quin. The repository LICENSE file is
+            the BSD 3-Clause text.
+
+        tf2_msgs
+            https://github.com/ros2/geometry2 at `jazzy`
+            Declared as: BSD
+            Copyright (c) 2008, Willow Garage, Inc. The repository LICENSE
+            file is the BSD 3-Clause text.
+
+        grid_map_msgs
+            https://github.com/ANYbotics/grid_map at `jazzy`
+            Declared as: BSD
+            Copyright 2019, ANYbotics AG. The repository LICENSE file is the
+            BSD 3-Clause text.
+
+        control_msgs
+            https://github.com/ros2-gbp/control_msgs-release at
+            `release/lyrical/control_msgs/6.10.0-1`
+            Declared as: BSD-3-Clause
+            Copyright 2025 ros2_control Development Team. The released
+            package carries no license file; that copyright line and the BSD
+            3-Clause text come from the LICENSE file in the development
+            repository, https://github.com/ros-controls/control_msgs
+
+        moveit_msgs
+            https://github.com/ros2-gbp/moveit_msgs-release at
+            `release/jazzy/moveit_msgs/2.6.0-1`
+            Declared as: BSD
+            The package LICENSE file is the BSD 3-Clause text with no
+            copyright line, and the development repository
+            https://github.com/moveit/moveit_msgs carries the same text, so no
+            copyright holder is stated upstream.
+
+        octomap_msgs
+            https://github.com/ros2-gbp/octomap_msgs-release at
+            `release/jazzy/octomap_msgs/2.0.1-1`
+            Declared as: BSD
+            Copyright (c) 2011-2013, A. Hornung, University of Freiburg.
+            Neither the released package nor the development repository carries
+            a separate license file; that copyright line and the BSD 3-Clause
+            text come from the source headers in the development repository,
+            https://github.com/OctoMap/octomap_msgs
+
+        object_recognition_msgs
+            https://github.com/ros2-gbp/object_recognition_msgs-release at
+            `release/jazzy/object_recognition_msgs/2.0.0-5`
+            Declared as: BSD
+            No variant, no license file and no copyright holder are stated
+            upstream. A license file is absent from the released package and
+            from the development repository,
+            https://github.com/wg-perception/object_recognition_msgs
+            The package changelog records the copyright tag being removed.
+            It is treated as BSD-3-Clause here
+            because that is the stricter reading of a bare BSD declaration,
+            so honoring it also satisfies the two-clause form.

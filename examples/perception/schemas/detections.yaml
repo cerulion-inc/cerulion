@@ -1,0 +1,24 @@
+# DetectionArray: the demo's custom perception-output schema.
+#
+# All three fields are TOP-LEVEL float64[] primitive arrays. That element type
+# is deliberate: the tolerance replay registry can only DECODE a
+# metric-comparable field that is a numeric scalar or a `float64[]` array. A
+# `float32[]` or `uint32[]` ARRAY is publisher-opaque to the tolerance decoder and
+# a non-`bit_exact` metric on it is refused at validation (exit 4:
+# "use a float64[] layout or bit_exact"). Using float64[] keeps every field
+# decodable, which is exactly what makes this demo's metrics fire.
+#
+#   boxes     : flattened [x, y, w, h] per detection (feeds bbox_iou)
+#   scores    : per-detection confidence            (feeds max_abs)
+#   class_ids : integer-valued class labels          (feeds set_equal)
+#
+# The field key is "<type> <name>"; the value is unused. The node crates'
+# build.rs reads THIS file to codegen the `DetectionArray` Rust type, and the
+# replayer reads it to resolve the wire layout: one source of truth, so the
+# stamped schema_hash and the expected schema_hash always agree.
+schemas:
+  DetectionArray:
+    fields:
+      "float64[] boxes":
+      "float64[] scores":
+      "float64[] class_ids":

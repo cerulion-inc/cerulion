@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ros2_rtt_bench</name>
+  <version>0.1.0</version>
+  <description>
+    Round-trip latency benchmark — ROS 2 comparison harness for the
+    Cerulion benches/latency/ suite. Three rclcpp nodes
+    (ping, pong, latency) wired by subscriber callbacks form a
+    round-trip loop bootstrapped by latency_node, paced quiescent
+    (rate-limited, default) or backtoback via CER_BENCH_PACING, under
+    a be1 or rel10 QoS profile via CER_BENCH_QOS. Uses fixed-size POD
+    message types from ros2_rtt_msgs so Publisher::can_loan_messages()
+    returns true on RMWs that support the zero-copy publisher path.
+  </description>
+  <maintainer email="bench@cerulion.com">cerulion</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rcl</depend>
+  <depend>rmw</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>ros2_rtt_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

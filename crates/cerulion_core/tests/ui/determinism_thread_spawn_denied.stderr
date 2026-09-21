@@ -1,0 +1,5 @@
+error: `thread::spawn` creates an unmanaged thread whose interleaving is not reproducible, voiding bit-for-bit replay determinism. Express concurrency through the scheduler instead — split the work across nodes, which the runtime already runs in parallel where the graph allows it. If this node is genuinely allowed to be non-deterministic, opt out with `#[cerulion_node(allow_non_deterministic)]`.
+  --> tests/ui/determinism_thread_spawn_denied.rs:25:22
+   |
+25 |         std::thread::spawn(|| {});
+   |                      ^^^^^

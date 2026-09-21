@@ -1,0 +1,11 @@
+iox2-rerun/  -  the PUBLISHED raw-iceoryx2 floor row (post-sweep).
+Build: main 68a0d6196a962237f8628cd94c9f93371703e827, binary sha16 17d52c9b1552e530.
+Label (verbatim, fixed 2026-09-16):
+
+  raw iceoryx2 floor, k=5, 2.4-2.8 us; a scoped sweep of 32,624 stale test
+  nodes changed nothing; August's 0.6 us not reproduced, cause unknown
+  (kernel changed at the Aug 23 reboot is the one known difference)
+
+/dev/shm was 145 entries at this run's start AND end. The pre-sweep reading
+is hero-stock/results_iox2_chrt0.csv, kept as the diagnostic.
+ scrub applied recursively to run.json.

@@ -1,0 +1,63 @@
+8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion
+
+The fully loaned rmw_cerulion cell measured by benches/latency, with the echo
+node's reply loan refilled when nothing is in flight (METHODOLOGY section 21).
+This is the run behind the rmw_cerulion series on the native round trip chart.
+
+Build:    harness commit 9f30d2b3bbd4e52254eb7fc970369288f7649889
+          (run.json git_dirty: true on every invocation; see README caveat 7).
+Image:    latency_bench:jazzy, id sha256:f16d6779f497ce0b735c5ea2b2f00b767a26270cef5715882ea1eb162118855c
+          label com.cerulion.bench.repo_git_sha equals the harness commit.
+Binary:   librmw_cerulion.so built inside the cell's container from the mounted
+          tree; all 10 build receipts record sha256
+          979ad085fac9a40c6d5fcd1a9b5ed469739826800463b6acc1515fd31959374f.
+Posture:  fixed100, chrt 0, CER_BENCH_DMA_LOCK=0 (stock, C state exits
+          unmanaged), governor performance, turbo on, UNPINNED, k=5 x 2000.
+Row:      jazzy_cerulion_shm_loan_be1_chrt0, all ten payloads.
+          echo_rule=prefetched_loan, prefetch_depth=1, refill_defer_us=1000,
+          readiness=matched+probe (every node log).
+Compile:  bench.py compile-csv STRICT, no --allow-partial, exit 0, 10 rows,
+          100 Hz achieved on every row, loaned=1 on every row. Re-run against
+          this package copy with the tree's compile_csv.py: exit 0, data rows
+          identical.
+
+Directories:
+  jazzy-cerulion-loan-k5/    the five rep run directory. As run it was named
+                             8a84baf25d5d1710-2026-09-18-fixed100-g3-deferred;
+                             that name is kept where it is a record of what ran
+                             (run.json argv, logs/rmw-final-campaign.log, the
+                             launcher). Nothing binds the directory name: there
+                             is no manifest of paths and no checksum over it.
+  stock-parity-spot-check/   jazzy_stock_rclcpp_chrt0 at 4 and 16 MiB, k=1, same
+                             build and posture, in its own run directory so the
+                             campaign directory stays STRICT compilable.
+  acceptance-smoke/          the k=1 five size acceptance smoke, run before the
+                             campaign, with the echo node's CPU probes on.
+  logs/                      the two driver logs; launchers/ holds the scripts.
+
+NORMALIZED FOR PUBLICATION, package copies only. Counts are occurrences.
+     6  run.json uname node name -> box-x86
+    22  home directory of the bench account -> <BOXHOME>
+        (run.json argv, build receipts, one driver log line, the launchers)
+    10  checkout directory name and git worktree name in the 'git HEAD:'
+        receipt line of ten raw cell logs -> <CHECKOUT>, <WORKTREE>
+        (the receipt itself is the harness failing to read a HEAD from a
+        linked worktree; the build identity is in run.json)
+    66  internal tracker ids removed: the first '#' note line of both CSVs,
+        the '#' note line of every .rate sidecar, and one skip reason string in
+        run.json, reworded the way the tree's bench.py words it today
+     1  a memo file name in the stock cell's provenance note -> its current
+        name in the tree (memo.md)
+   762  typographic dashes in program output and notes -> ASCII hyphen. 24 of
+        them sit in run.json as the JSON escape for that character, where a
+        plain text search does not see them; they were found by walking the
+        decoded JSON values.
+NOT touched, asserted by the import:
+  - all 67 binary files (.bin samples, the smoke's rec.bin and latcpu.i32)
+    are byte identical to the run output (sha256 compared);
+  - every CSV data row is byte identical (only '#' note lines differ);
+  - the achieved rate in every .rate sidecar is identical;
+  - run.json keeps its structure, and the only fields that differ are
+    argv[], skips[].reason, uname, by exactly the substitutions above.
+The numbers are unchanged by any of this: the samples, receipts and counts are
+the run's own.

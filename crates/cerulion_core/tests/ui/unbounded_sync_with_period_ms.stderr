@@ -1,0 +1,13 @@
+error: only one of `period_ms`, `sync_window_ms`, `unbounded_sync`, or `external` can be specified
+ --> tests/ui/unbounded_sync_with_period_ms.rs:6:1
+  |
+6 | #[cerulion_node(period_ms = 100, unbounded_sync)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/unbounded_sync_with_period_ms.rs:8:7
+  |
+8 |     #[input]
+  |       ^^^^^

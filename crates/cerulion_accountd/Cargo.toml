@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "cerulion_accountd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Cerulion account service: issuer/CA + account DB + OAuth device-code login. Issues the cerulion_pairing device certs / grants / epochs a robot verifies offline."
+# Not published (the hosted service is deployed, not released to crates.io); this
+# also exempts it from the cargo-deny per-crate license check.
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cerulion-accountd"
+path = "src/bin/cerulion-accountd.rs"
+
+[dependencies]
+# The issuer end of the SHIPPED cert chain: we reuse cerulion_pairing's cert /
+# grant / epoch structures + ed25519 signing so every artifact this service
+# issues is BYTE-COMPATIBLE with the robot-side verifier (no second crypto
+# stack). cerulion_pairing is permissive (MIT OR Apache-2.0) — a permissive dep
+# under an AGPL outbound is fine.
+cerulion_pairing = { path = "../cerulion_pairing" }
+# Same 2.x ed25519-dalek line cerulion_pairing pins, so keys / signatures unify
+# to ONE version in the tree (byte-compat is load-bearing for the cross-check).
+ed25519-dalek = "2"
+
+# Web stack. axum/tokio/hyper are already in the workspace lockfile (iroh/rerun),
+# so this adds NO new crate there; and this whole crate is out of
+# `default-members`, so a plain `cargo build` never links any of it.
+axum = "0.8"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "signal",
+] }
+
+# Account DB — a stateless API over SQLite. rusqlite (synchronous, `bundled`
+# SQLite = no system dep, hermetic in CI) is the simpler of the two candidates
+# the design left open (no async-query macros, no migration DSL).
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# (De)serialization: serde_json for the HTTP surface; postcard for the
+# byte-deterministic pairing-artifact envelopes (matches cerulion_pairing's own
+# container format), base64url-wrapped for transport.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+base64 = "0.22"
+
+# SHA-256 over opaque tokens (we persist HASHES, never plaintext secrets).
+sha2 = "0.10"
+# JWT verification for Supabase Auth. The aws-lc-rs backend (and its CMake/C
+# build dependency via aws-lc-sys) is deliberate: rust_crypto pulls rsa 0.9,
+# which cargo-deny rejects for RUSTSEC-2023-0071 with no fixed release.
+# accountd is outside default-members, so plain cargo builds stay C-toolchain-free.
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+# Random device seeds, session/refresh tokens, device/user codes, account ids.
+getrandom = "0.3"
+# Safe OAuth authorization-URL construction (query-param encoding).
+url = "2"
+# Async JWKS fetches for the production Supabase verifier.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+# Unified crate error enum + structured logging.
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Real-HTTP client for the ephemeral-port acceptance test (already locked;
+# HTTP-only, no TLS backend pulled BY ACCOUNTD ITSELF).
+tempfile = "3"
+# A6: when accountd's tests build together with iroh-pulling crates
+# (`cargo test -p cerulion_remoted -p cerulion_netd -p cerulion_accountd`), Cargo
+# unifies reqwest's TLS feature to `rustls-no-provider`, so `reqwest::Client::new()`
+# panics at build time needing an installed crypto provider. We install the `ring`
+# provider (the workspace's resolved provider) ONCE at test startup — a no-op when
+# reqwest was built without any TLS (accountd alone). See `spawn()`.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

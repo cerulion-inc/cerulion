@@ -1,0 +1,8 @@
+# NB: [env] here applies to processes cargo itself runs (build scripts,
+# `cargo run`, tests) — NOT to the `cerulion` binary the runner launches
+# directly. run_workspace.sh injects IOX2_LOG_LEVEL=error into the measured
+# run explicitly (the connection-flood guard greps for surfaced iceoryx2
+# error lines). Kept for parity with the source tree + local `cargo` use.
+[env]
+IOX2_LOG_LEVEL = "error"
+RUST_LOG = { value = "warn", force = false }

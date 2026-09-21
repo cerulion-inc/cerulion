@@ -1,0 +1,27 @@
+# The tolerance document for
+# `cerulion bag play <bag> --resim all --verify --tolerance tolerance.yaml`.
+#
+# Re-execution is BYTE-EXACT by default (Principle #7). This document
+# relaxes that on the detector's output topic into SEMANTIC checks, the whole
+# point of the demo. Everything not named here stays byte-exact.
+#
+#   boxes     : bounding boxes judged by intersection-over-union. A box that
+#               shifted but still overlaps its recorded twin by >= 0.5 IoU is
+#               ACCEPTABLE; below 0.5 is a regression. (boxes is a flattened
+#               [x, y, w, h] float64[] sequence.)
+#   scores    : confidences may drift up to 0.05 absolute.
+#   class_ids : the set of predicted classes must be unchanged (order-free).
+#
+# The topic key is the RESOLVED topic name for perception_min (prefix percepmin,
+# node detector, output detections).
+topics:
+  /percepmin/detector/detections:
+    fields:
+      boxes:
+        kind: bbox_iou
+        min_iou: 0.5
+      scores:
+        kind: max_abs
+        threshold: 0.05
+      class_ids:
+        kind: set_equal

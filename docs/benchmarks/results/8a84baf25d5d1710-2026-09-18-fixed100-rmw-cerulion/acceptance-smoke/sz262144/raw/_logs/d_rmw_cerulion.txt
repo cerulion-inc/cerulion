@@ -1,0 +1,10 @@
+librmw_cerulion.so built by run_bench.sh at 2026-09-18T15:05:17Z
+repo:        /work
+target dir:  /work/target
+sha256:      979ad085fac9a40c6d5fcd1a9b5ed469739826800463b6acc1515fd31959374f
+size bytes:  8046152
+cargo:       cargo 1.98.1 (797e8a9bc 2026-08-05)
+rustc:       rustc 1.98.1 (48a229cea 2026-09-01)
+ROS_DISTRO:  jazzy
+git HEAD:    fatal: not a git repository: <BOXHOME>/<CHECKOUT>/.git/worktrees/<WORKTREE>
+git status:  unavailable (git could not read /work)

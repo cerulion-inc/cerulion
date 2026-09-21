@@ -1,0 +1,71 @@
+name: needs-info closer
+
+# By design: no blanket staling. This workflow only ever touches
+# issues/PRs a maintainer has explicitly labeled `needs-info` — every close is
+# downstream of an explicit human request for information. Blanket stale bots
+# discard triage work and burn contributors; an unanswered info request is the
+# one case that genuinely can't move without a reply.
+#
+# Windows: ~7 quiet days after the needs-info request -> `stale` marker label;
+# ~7 more -> close (14 total). Any author activity removes the marker and
+# resets the clock (remove-stale-when-updated). NOTE: actions/stale does NOT
+# reopen a closed item when someone replies — maintainers reopen manually on
+# seeing the reply (the close messages below invite exactly that).
+on:
+  schedule:
+    # Daily at 07:17 UTC (off-peak, NOT :00 to avoid the cron rush).
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: needs-info-closer
+  cancel-in-progress: false
+
+jobs:
+  close-unanswered:
+    name: Label and close unanswered needs-info items
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10.4.0
+        with:
+          # Scope gate: ONLY items carrying the maintainer-applied `needs-info`
+          # label are ever considered. Everything else is invisible to this
+          # workflow — there is no inactivity-based staling.
+          any-of-issue-labels: 'needs-info'
+          any-of-pr-labels: 'needs-info'
+          days-before-stale: 7
+          days-before-close: 7
+          # `stale` is an internal marker label only (defined in
+          # .github/labels.yml) — the user-facing messages below deliberately
+          # never use the word.
+          stale-issue-label: stale
+          stale-pr-label: stale
+          remove-stale-when-updated: true
+          operations-per-run: 30
+          # Belt-and-suspenders: never touch pinned/security items, even if
+          # someone also labels them needs-info.
+          exempt-issue-labels: 'pinned,security'
+          exempt-pr-labels: 'pinned,security'
+          stale-issue-message: >
+            We asked for more information on this issue and haven't heard back
+            in 7 days. Without it we can't act on this, so it will be closed
+            in 7 days. If you reply with the requested details, the countdown
+            clears and a maintainer will follow up.
+          stale-pr-message: >
+            We asked for more information on this pull request and haven't
+            heard back in 7 days. Without it we can't move the review forward,
+            so it will be closed in 7 days. If you reply with the requested
+            details, the countdown clears and a maintainer will follow up.
+          close-issue-message: >
+            Closing for now: we didn't hear back with the information we
+            asked for. Reply with the details anytime and a maintainer will
+            reopen this issue.
+          close-pr-message: >
+            Closing for now: we didn't hear back with the information we
+            asked for. Reply with the details anytime and a maintainer will
+            reopen this pull request.

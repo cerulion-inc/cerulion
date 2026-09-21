@@ -1,0 +1,207 @@
+{
+ "schema_version": 1,
+ "variant": "backtoback",
+ "machine_hash": "0b7bc3994f78e232",
+ "invocations": [
+  {
+   "subcommand": "native",
+   "variant": "backtoback",
+   "rep": 1,
+   "argv": [
+    "bench.py",
+    "native",
+    "--variant",
+    "backtoback",
+    "--chrt",
+    "0",
+    "--rep",
+    "1",
+    "--bin",
+    "iox2",
+    "--run-dir",
+    "<BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full"
+   ],
+   "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+   "git_dirty": true,
+   "machine_hash": "0b7bc3994f78e232",
+   "uname": "Darwin box-arm64 25.6.0 Darwin Kernel Version 25.6.0: Tue Aug 18 17:51:33 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_ARM64_T8132 arm64 arm",
+   "platform": "macos",
+   "cpu_governor": "unknown",
+   "turbo_boost": "unknown",
+   "dma_lock_posture": "stock",
+   "started_at": "2026-09-16T20:40:37-0700",
+   "ended_at": "2026-09-16T20:40:38-0700",
+   "cells": [
+    {
+     "cell": "iox2_chrt0",
+     "payload": null,
+     "outcome": "ok",
+     "started_at": "2026-09-16T20:40:37-0700",
+     "ended_at": "2026-09-16T20:40:38-0700"
+    }
+   ],
+   "skips": [],
+   "docker_images": {}
+  },
+  {
+   "subcommand": "native",
+   "variant": "backtoback",
+   "rep": 2,
+   "argv": [
+    "bench.py",
+    "native",
+    "--variant",
+    "backtoback",
+    "--chrt",
+    "0",
+    "--rep",
+    "2",
+    "--bin",
+    "iox2",
+    "--run-dir",
+    "<BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full"
+   ],
+   "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+   "git_dirty": true,
+   "machine_hash": "0b7bc3994f78e232",
+   "uname": "Darwin box-arm64 25.6.0 Darwin Kernel Version 25.6.0: Tue Aug 18 17:51:33 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_ARM64_T8132 arm64 arm",
+   "platform": "macos",
+   "cpu_governor": "unknown",
+   "turbo_boost": "unknown",
+   "dma_lock_posture": "stock",
+   "started_at": "2026-09-16T20:40:38-0700",
+   "ended_at": "2026-09-16T20:40:39-0700",
+   "cells": [
+    {
+     "cell": "iox2_chrt0",
+     "payload": null,
+     "outcome": "ok",
+     "started_at": "2026-09-16T20:40:38-0700",
+     "ended_at": "2026-09-16T20:40:39-0700"
+    }
+   ],
+   "skips": [],
+   "docker_images": {}
+  },
+  {
+   "subcommand": "native",
+   "variant": "backtoback",
+   "rep": 3,
+   "argv": [
+    "bench.py",
+    "native",
+    "--variant",
+    "backtoback",
+    "--chrt",
+    "0",
+    "--rep",
+    "3",
+    "--bin",
+    "iox2",
+    "--run-dir",
+    "<BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full"
+   ],
+   "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+   "git_dirty": true,
+   "machine_hash": "0b7bc3994f78e232",
+   "uname": "Darwin box-arm64 25.6.0 Darwin Kernel Version 25.6.0: Tue Aug 18 17:51:33 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_ARM64_T8132 arm64 arm",
+   "platform": "macos",
+   "cpu_governor": "unknown",
+   "turbo_boost": "unknown",
+   "dma_lock_posture": "stock",
+   "started_at": "2026-09-16T20:40:39-0700",
+   "ended_at": "2026-09-16T20:40:39-0700",
+   "cells": [
+    {
+     "cell": "iox2_chrt0",
+     "payload": null,
+     "outcome": "ok",
+     "started_at": "2026-09-16T20:40:39-0700",
+     "ended_at": "2026-09-16T20:40:39-0700"
+    }
+   ],
+   "skips": [],
+   "docker_images": {}
+  },
+  {
+   "subcommand": "native",
+   "variant": "backtoback",
+   "rep": 4,
+   "argv": [
+    "bench.py",
+    "native",
+    "--variant",
+    "backtoback",
+    "--chrt",
+    "0",
+    "--rep",
+    "4",
+    "--bin",
+    "iox2",
+    "--run-dir",
+    "<BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full"
+   ],
+   "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+   "git_dirty": true,
+   "machine_hash": "0b7bc3994f78e232",
+   "uname": "Darwin box-arm64 25.6.0 Darwin Kernel Version 25.6.0: Tue Aug 18 17:51:33 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_ARM64_T8132 arm64 arm",
+   "platform": "macos",
+   "cpu_governor": "unknown",
+   "turbo_boost": "unknown",
+   "dma_lock_posture": "stock",
+   "started_at": "2026-09-16T20:40:40-0700",
+   "ended_at": "2026-09-16T20:40:40-0700",
+   "cells": [
+    {
+     "cell": "iox2_chrt0",
+     "payload": null,
+     "outcome": "ok",
+     "started_at": "2026-09-16T20:40:40-0700",
+     "ended_at": "2026-09-16T20:40:40-0700"
+    }
+   ],
+   "skips": [],
+   "docker_images": {}
+  },
+  {
+   "subcommand": "native",
+   "variant": "backtoback",
+   "rep": 5,
+   "argv": [
+    "bench.py",
+    "native",
+    "--variant",
+    "backtoback",
+    "--chrt",
+    "0",
+    "--rep",
+    "5",
+    "--bin",
+    "iox2",
+    "--run-dir",
+    "<BOXHOME>/lanes/platform-20260917T000530Z/run-btb-full"
+   ],
+   "git_sha": "ba5d75c5c226e749c9f5e8846c55c21b8bfd1035",
+   "git_dirty": true,
+   "machine_hash": "0b7bc3994f78e232",
+   "uname": "Darwin box-arm64 25.6.0 Darwin Kernel Version 25.6.0: Tue Aug 18 17:51:33 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_ARM64_T8132 arm64 arm",
+   "platform": "macos",
+   "cpu_governor": "unknown",
+   "turbo_boost": "unknown",
+   "dma_lock_posture": "stock",
+   "started_at": "2026-09-16T20:40:40-0700",
+   "ended_at": "2026-09-16T20:40:41-0700",
+   "cells": [
+    {
+     "cell": "iox2_chrt0",
+     "payload": null,
+     "outcome": "ok",
+     "started_at": "2026-09-16T20:40:40-0700",
+     "ended_at": "2026-09-16T20:40:41-0700"
+    }
+   ],
+   "skips": [],
+   "docker_images": {}
+  }
+ ]
+}

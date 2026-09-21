@@ -1,0 +1,5 @@
+error: `set_orientation` writes port field(s) (e.g. `self.imu.orientation.x`) — port writes are fallible, so this method must return `Result` (e.g. `Result<(), NodeError>`), and its callers must propagate with `?`. Each rewritten port-field write expands to a fallible `?`-carrying `__cer_assign_…` call (nested paths route through `__cer_with_nested_…`).
+  --> tests/ui/helper_unit_return_nested_port_write_fails.rs:31:8
+   |
+31 |     fn set_orientation(&mut self) {
+   |        ^^^^^^^^^^^^^^^

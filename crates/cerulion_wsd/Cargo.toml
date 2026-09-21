@@ -1,0 +1,53 @@
+# cerulion_wsd links cerulion_cli_engine and therefore remains AGPL-3.0-only.
+[package]
+name = "cerulion_wsd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Local workspace-engine daemon for Cerulion Studio: workspace, graph and node inspection plus versioned, lock-serialized node and graph edits over a private Unix-socket protocol, built on cerulion_cli_engine so a GUI never re-implements engine rules"
+readme = "README.md"
+keywords = ["robotics", "workspace", "daemon", "studio", "cerulion"]
+categories = ["science::robotics", "development-tools"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lib]
+name = "cerulion_wsd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cerulion-wsd"
+path = "src/main.rs"
+
+[dependencies]
+cerulion_core = { workspace = true }
+cerulion_hygiene = { workspace = true }
+cerulion_cli_engine = { workspace = true }
+# Used by src/inspect.rs (fcntl/dup2 for the --inspect-node document channel) and the
+# inspector tests.
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

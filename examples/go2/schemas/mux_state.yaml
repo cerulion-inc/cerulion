@@ -1,0 +1,35 @@
+# The DECLARED wire contract for the teleop mux's arbitration-state
+# output (MuxState is a workspace YAML schema by design).
+#
+# NOT ON THE WIRE — declared contract only. Workspace YAML schemas are
+# a CLI-introspection surface (schema info/list, graph-load hash
+# divergence warns); there is NO codegen path that turns schemas/*.yaml into
+# a compilable Rust type for a node crate:
+#   - `cerulion node build` is a plain `cargo build -p <type>` with no
+#     schema-codegen step (cerulion_cli_engine/src/node_cmd.rs:630-663);
+#   - the YAML→MessageSchema parser lives only in the CLI engine
+#     (cerulion_cli_engine/src/schema_cmd.rs:198 `parse_message_schemas`) —
+#     cerulion_core::codegen exports a Rust generator (`generate_schema`)
+#     and a .msg parser (`parse_rosmsg`) but no YAML parser
+#     (cerulion_core/src/codegen/mod.rs:13-16);
+#   - a generated node lib.rs keeps a tier-3 workspace schema as a bare
+#     unresolvable ident (cerulion_cli_engine/src/templates.rs:2406-2411).
+# With that wiring, the teleop_mux node would carry a `#[output] mux_state:
+# MuxState` port with exactly these fields (see the module docs in
+# examples/go2/nodes/teleop_mux/src/lib.rs).
+#
+# Encoding of `active` (== teleop_mux::arbitrate::ActiveSource's natural
+# discriminants — the enum deliberately declares None FIRST so this holds):
+#   0 = none (no usable source — safety zero), 1 = joystick, 2 = keyboard.
+# 0=none is the FAIL-SAFE wire value: a zero-initialized frame must read
+# as "nothing in control", never as "joystick in control".
+# `joy_stale` / `key_stale`: 1 = the source is NOT currently a usable
+# source (too old, never delivered, OR emitting non-finite garbage — the
+# mux never forwards NaN/Inf; see teleop_mux::arbitrate), 0 = usable.
+schemas:
+  MuxState:
+    description: "Teleop mux arbitration state: active source + per-source staleness"
+    fields:
+      uint8 active:
+      bool joy_stale:
+      bool key_stale:

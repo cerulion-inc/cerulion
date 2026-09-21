@@ -1,0 +1,16 @@
+# iox2_chrt0, backtoback, k=5 x 10 sizes, computed from the raw .bin files, which are
+# NOT in this package (retained on the measuring box at <lane>/run-btb-full/rep<k>/raw/).
+# 50000 pooled samples per size (5 reps x 10000). Also in results_iox2_chrt0.csv here.
+size_bytes  p50_ns  p99_ns  rep_p50_min_ns  rep_p50_max_ns  pooled_n  over_100us
+64             625    1458             584            1084     50000           0
+256            792    1083             458             833     50000           0
+1024           666     917             458             791     50000           0
+4096           584     792             500             708     50000           0
+16384          542     750             500             667     50000           0
+65536          500     667             458             583     50000           0
+262144         459     625             417             542     50000           0
+1048576        459     584             416             500     50000           0
+4194304        459     584             417             500     50000           0
+16777216       459     583             417             459     50000           0
+# p50 across sizes 459-792 ns (1.73x, DECREASING with payload - not an O(n) copy)
+# worst pooled p99 1458 ns @ 64 B ; 0 of 500000 samples over 100 us

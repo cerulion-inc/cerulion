@@ -1,0 +1,79 @@
+[package]
+name = "rmw_cerulion"
+version.workspace = true
+edition = "2021"
+description = "ROS 2 rmw implementation over the Cerulion zero-copy transport"
+license = "AGPL-3.0-only"
+# Not published to crates.io: this is the ROS 2 rmw C-ABI cdylib, consumed via
+# RMW_IMPLEMENTATION=rmw_cerulion (dlopen), not `cargo add`. It also carries
+# path-only internal deps (no version), which `cargo publish` rejects. Excluded
+# from the release workflow's `cargo publish --workspace`.
+publish = false
+
+[lib]
+# cdylib: the librmw_cerulion.so that `RMW_IMPLEMENTATION=rmw_cerulion`
+# dlopen()s. rlib: lets the conformance tests call the extern "C"
+# surface in-process.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Fault-injection seams for the conformance tests (`src/test_seams.rs`):
+# NEVER on in the shipped cdylib. Turned on for the INTEGRATION test targets by
+# the dev-dependency self-reference below (the repo's `test-helpers`/
+# `test-seams` idiom) — those targets link the non-test rlib and cannot see
+# `cfg(test)` items, hence a feature. COST: the self-reference feature-unifies
+# it ON for every command that builds a test target (`cargo test -p
+# rmw_cerulion`, `cargo clippy -p rmw_cerulion --all-targets`); the only probe
+# of the BARE lib is `cargo clippy -p rmw_cerulion -- -D warnings` — run it
+# after touching any `cfg(feature = "test-seams")` gate.
+test-seams = []
+
+[dependencies]
+cerulion_core = { path = "../cerulion_core" }
+tracing = "0.1"
+# The .so runs inside FOREIGN processes (move_group, rviz) that install
+# no Rust tracing subscriber — without one, every tracing::error! in
+# this crate is silently dropped. runtime() installs a stderr fmt
+# subscriber gated by RUST_LOG (default: rmw_cerulion=warn).
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# prctl(PR_SET_TIMERSLACK, 1): 1 ns timer slack on rmw_wait
+# threads so the 100 µs poll sleep doesn't cost ~153 µs (Linux default
+# timer_slack_ns = 50 µs). Already a workspace dependency elsewhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.70"
+# Compiles the std::string ABI shim (shim/cppstring_shim.cpp) for the
+# introspection_cpp bridge — see build.rs.
+cc = "1"
+
+[dev-dependencies]
+# libc: per-platform SIGSEGV/SIGBUS in rmw_shadow_take_test (the hand-defined
+# pair bound SIGBUS to macOS's 10, which is SIGUSR1 on Linux).
+libc = "0.2"
+native_ros2_messages = { path = "../native_ros2_messages" }
+# The canonical-name / egress-registration pins (`rmw_canonical_names_test`)
+# host a gateway READER on the rmw singleton's DEFAULT iceoryx2 root
+# (`Config::global_config()`, hence the direct iceoryx2 dev-dep — same exact
+# pin as cerulion_core's) and read the transport's test-only registration
+# seams — both behind cerulion_core's `test-helpers` feature.
+cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+iceoryx2 = "=0.9.1"
+# Self-reference: turns `test-seams` ON for this crate's own test targets (see
+# the `[features]` note). Path-only, no `version`, so it can never become a
+# publish-time cycle (this crate is `publish = false` anyway).
+rmw_cerulion = { path = ".", features = ["test-seams"] }
+# Serializes e2e tests intra-binary: the process-global graph_guards
+# registry makes guard-quiescence assertions racy under parallel libtest
+# (same pattern as cerulion_core's serial tests).
+serial_test = "3"
+# Asserting the cerulion_core "exceeds 75%" warn does
+# NOT fire on a ceiling-raised TRANSIENT_LOCAL publisher. no-env-filter so
+# the capture reaches the cerulion_core target (the warn's crate), not
+# just rmw_cerulion — same rationale as cerulion_core's own dev-dep.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+
+[lints]
+workspace = true

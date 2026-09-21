@@ -1,0 +1,73 @@
+# Reference graph demonstrating topology only.
+#
+# Trigger policy lives on the macro side
+# (`#[cerulion_node(period_ms = N)]` etc.); graph YAML carries
+# wiring (id, type, inputs, outputs) only. This fixture is used by
+# `test_parse_perception_fixture` to validate that the YAML parser
+# handles a multi-node topology with inputs and outputs.
+
+nodes:
+  # Source: produces images.
+  - id: camera
+    type: camera
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+        max_slice_len: 6291456
+        history_size: 2
+
+  # Detects on incoming images. The output publishes under an ABSOLUTE
+  # name via the `topic:` override: an
+  # externally-fixed global name instead of the derived
+  # /{prefix}/detector/detections.
+  - id: detector
+    type: detector
+    inputs:
+      - name: image
+        source: camera/image
+    outputs:
+      - name: detections
+        schema: geometry_msgs/PoseArray
+        max_slice_len: 4096
+        topic: /detections
+
+  # High-frequency sensor.
+  - id: imu
+    type: imu
+    outputs:
+      - name: data
+        schema: sensor_msgs/Imu
+        max_slice_len: 1024
+
+  # Fuses camera + imu — the macro decides the sync policy.
+  - id: fusion
+    type: fusion
+    inputs:
+      - name: image
+        source: camera/image
+      - name: imu
+        source: imu/data
+    outputs:
+      - name: state
+        schema: nav_msgs/Odometry
+        max_slice_len: 4096
+
+  # Tracker — macro-declared trigger policy.
+  - id: tracker
+    type: tracker
+
+  # Diagnostics — macro-declared external trigger. Consumes an
+  # EXTERNAL topic via an absolute source: no
+  # in-graph producer — an out-of-graph publisher feeds it.
+  - id: diagnostics
+    type: diagnostics
+    inputs:
+      - name: health
+        source: /external/health
+
+# The /detections override above is opted into multiple
+# publishers — another graph (or a second broadcaster) may legally publish
+# the same absolute topic; the service is provisioned with the shared
+# loose port caps instead of single-writer.
+multi_publisher_topics:
+  - /detections

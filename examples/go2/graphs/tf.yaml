@@ -1,0 +1,62 @@
+# The transform broadcaster graph.
+#
+# Runs `go2_tf_source` on the companion computer: the static sensor mounts on
+# `/tf_static` and `odom` to `base` on `/tf`, both as standard
+# `tf2_msgs/TFMessage`. Both are network-viewable by default; the desk
+# renders them with
+#
+#   cerulion viz --robot go2 /tf /tf_static
+#
+# (the robot ships raw frames; `cerulion-netd` mirrors each demanded topic
+# into desk-local shared memory and `cerulion-vizd` decodes and renders
+# there). `--robot` takes the robot's announced name and needs at least one
+# topic; README.md "Defaults and overrides" says where the name comes from.
+#
+# This is the STANDALONE broadcaster. It runs on its own so the transform
+# tree works before any driver does; run it beside bridge.yaml in a second
+# shell (both runs converge on the machine's one `cerulion-netd`).
+#
+# SERVING (how the desk sees this graph): networking is PERMISSIVE by default.
+# With no `network:` block the run registers its egress with `cerulion-netd`,
+# which announces every produced topic and forwards one only while a remote
+# subscriber demands it. ONE thing is required, on every network: give netd a
+# listen locator before the serve, in the shell (or service environment) that
+# runs the graph:
+#
+#   export CERULION_NETD_LISTEN=tcp/0.0.0.0:7683
+#
+# netd's listen list comes only from that variable and its default is empty,
+# so a netd started without it binds nothing and no desk can reach it; with
+# it set, netd also advertises itself over mDNS, so a desk on the same LAN
+# finds the robot with no configuration. Off the LAN, the desk names the
+# locator: `cerulion topic list --connect tcp/<companion address>:7683`.
+#
+# Do NOT add a `network:` block to "turn networking on": a block TIGHTENS the
+# run to Strict, which binds the block's locators verbatim in a per-run
+# gateway and ignores CERULION_NETD_LISTEN. Reach for one only for a real
+# egress allow-list or an `ingress:` import (see graphs/teleop_remote.yaml).
+#
+# RUN (on the companion computer):
+#   cerulion graph run tf --release --single-process
+#
+#   `--single-process` is RECOMMENDED, not required: networked multi-process
+#   runs are first-class, but this graph is validated as one process, and
+#   the flag also skips the partition prompt.
+#
+# Experimental: `odom` to `base` is an IDENTITY placeholder, because the
+# `SportModeState` projection on /go2/odom is not validated against real robot
+# bytes (see nodes/go2_tf_source); the static mounts are estimates to measure
+# on your unit (README.md "Validate on your robot").
+
+prefix: orin
+
+nodes:
+  - id: tf_source
+    type: go2_tf_source
+    outputs:
+      - name: tf
+        schema: tf2_msgs/TFMessage
+        topic: /tf
+      - name: tf_static
+        schema: tf2_msgs/TFMessage
+        topic: /tf_static

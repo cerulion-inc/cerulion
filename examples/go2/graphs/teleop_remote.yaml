@@ -1,0 +1,63 @@
+# The robot half of networked teleop: the gamepad on the companion computer,
+# the keyboard on the desk (teleop_desk.yaml, arriving over the network), the
+# safety mux, and the sport driver.
+#
+# Created with `cerulion graph create teleop_remote -n go2` + `cerulion node
+# stage` for each node; the `topic:` overrides, the absolute `source:`
+# references and the `network:` block are hand edits.
+#
+# The `network:` block is what imports the desk's topic: `ingress` is only
+# declarable inside an explicit block, and a block makes this run STRICT (a
+# per-run gateway binds the `listen` locators VERBATIM, scouting off, egress
+# limited to the allow-list). It listens on 7684 so it never contends with
+# the companion's shared cerulion-netd plane on 7683, which the sensor graphs
+# (bridge.yaml, tf.yaml) use; the desk reaches this port by mDNS on one LAN
+# or by `CERULION_NETD_CONNECT=tcp/<companion address>:7684` off it.
+#
+# `egress` exports the arbitrated command so a desk can watch what the robot
+# is being told (`cerulion viz --robot <name> /go2/cmd_vel`). The raw
+# joystick topic stays local on purpose.
+#
+# RUN (on the companion computer):
+#
+#   export GO2_IFACE=<this computer's robot-LAN interface IP>
+#   cerulion graph run teleop_remote --single-process
+#
+# then, on the desk, `cerulion graph run teleop_desk --single-process`.
+# Same safety preconditions as teleop.yaml (ROBOT-DAY.md section 4).
+#
+# A `--record` of this graph is refused: a run that declares `ingress:` is
+# not recordable (docs/networking.md "Recording keeps the network").
+
+prefix: go2
+nodes:
+  - id: joystick_teleop
+    type: joystick_teleop
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Twist
+        topic: /go2/cmd_vel/joystick
+  - id: teleop_mux
+    type: teleop_mux
+    inputs:
+      - name: joy_cmd
+        source: /go2/cmd_vel/joystick
+      - name: key_cmd
+        source: /go2/cmd_vel/keyboard
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Twist
+        topic: /go2/cmd_vel
+  - id: sport_driver
+    type: sport_driver
+    inputs:
+      - name: cmd
+        source: /go2/cmd_vel
+network:
+  mode: peer
+  listen:
+    - tcp/0.0.0.0:7684
+  egress:
+    - /go2/cmd_vel
+  ingress:
+    - /go2/cmd_vel/keyboard

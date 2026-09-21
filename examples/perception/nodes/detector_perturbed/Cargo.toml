@@ -1,0 +1,26 @@
+[package]
+name = "detector_perturbed"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+
+# Same DetectionArray codegen as `detector`: the twin declares the identical
+# ports + schema, so libdetector_perturbed.<dylib> can be dropped over
+# libdetector.<dylib> and loaded by the perception_min graph unchanged. The ONLY
+# source difference is DETECTION_SHIFT (see src/lib.rs).
+[build-dependencies]
+cerulion_core = { workspace = true }
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+cerulion_core = { workspace = true, features = ["test-helpers"] }

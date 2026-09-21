@@ -1,0 +1,25 @@
+# benches/latency/workspace: the PRIMARY line's node workspace, a real
+# per-node-crate `cerulion graph run` workspace (nodes/* cdylib crates +
+# graphs/*.yaml) with the CLI's user-facing LAYOUT. Ported from
+# benches/cerulion_round_trip_quiescent/graph_rtt_bench.
+#
+# The layout is the user's; the node BODIES are bench fixtures and are not a
+# model for application nodes: they print result lines to stdout and read the
+# wall clock inside `tick`, which an application node must not do (see
+# examples/ for nodes to copy).
+#
+# This workspace has its OWN Cargo.lock (committed — see ../../latency
+# README + PITFALLS: the iceoryx2 dependency family MUST resolve to exactly
+# one version, =0.9.1, in every lockfile; a binary<->cdylib patch skew breaks
+# the SHM event protocol silently — the class).
+[workspace]
+members = ["nodes/*", "pod_schema"]
+resolver = "2"
+
+[workspace.dependencies]
+# Path deps go up THREE levels: benches/latency/workspace -> repo root.
+cerulion_core = { path = "../../../crates/cerulion_core" }
+native_ros2_messages = { path = "../../../crates/native_ros2_messages" }
+# The generated fixed-POD message crate (METHODOLOGY §18). A real crate, so the
+# CLI's node-metadata import map keeps `cer_bench_msgs` as the schema package.
+cer_bench_msgs = { path = "pod_schema" }

@@ -1,0 +1,261 @@
+name: Leak guard
+
+# Keeps machine names, addresses, home paths, logins, people and location
+# metadata out of what this repository publishes: file contents, path and
+# branch names, commit messages and identities, pull request text, and media
+# containers. The scanner is tools/scripts/leak_scan.py; docs/leak_guard.md
+# explains the classes and how to read a hit.
+#
+# Two tiers. GENERIC classes are shapes and ship in the tree. PRIVATE patterns
+# are a repository secret (LEAK_PATTERNS) mapped at STEP level only. A machine
+# NICKNAME (a machine called by its model, a colour, or "the big one") belongs in
+# that secret, tagged @nickname, beside the host names of the same machines: the
+# shape carries no host name, no address and no login, so no generic class can see
+# it and nothing in the tree may name it. docs/leak_guard.md says how to write the
+# entry.
+# A private hit prints the file, the line and the pattern INDEX, never the matched
+# text, and a generic hit on a line a private pattern touches (in any view of it)
+# prints no matched text either, so this log does not publish a name the
+# secret knows. A generic hit whose text is itself an address, a host, a
+# login or a path segment prints a masked shape (letters and digits replaced)
+# in this log whether or not the secret is mapped, so a fork run, where no
+# secret is, publishes no value either; a file or directory NAME that is such
+# a value is masked the same way inside every printed location, and a masked
+# location rides the annotation message, not its file property. Every
+# printed line is stripped of line breaks and escape sequences before it
+# leaves the scanner, so no path or match can start a workflow command. The
+# secret is read by the scanner from its environment and is never echoed,
+# written to disk or passed as an argument.
+#
+# What a fork can reach: a pull request from a fork runs here with NO secret,
+# so only the generic classes gate it and the log says so loudly. On a pull
+# request from a branch of this repository, on the merge queue, on a push to
+# main and on manual dispatch the private tier is REQUIRED: a deleted secret
+# fails the run instead of quietly scanning less.
+#
+# `edited` is in the pull request trigger because a title or body edit does not
+# re-run the default trigger, and a re-run replays the original payload. No
+# `paths:` filter: every diff, title, body and message is in scope.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The title and body come from the event payload, so no pull-requests scope is
+# needed; nothing here writes.
+permissions:
+  contents: read
+
+# Same three shapes as ci.yml: a pull request keys on its number and cancels
+# the superseded run; a merge queue run keys on the queue's own branch and is
+# never cancelled; anything else keys on the run id and groups with nothing.
+concurrency:
+  group: leak-guard-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'merge_group' && github.event.merge_group.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tree:
+    name: Leak guard (tree and names)
+    runs-on: ubuntu-latest
+    # A whole-tree scan takes seconds on a warm file cache; the budget only
+    # guards a hang.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The message and name scans need the base and head commits, and the
+          # push scan needs the previous tip. A shallow checkout has neither.
+          fetch-depth: 0
+
+      # The self-test runs FIRST and as its own step: the real tree is clean by
+      # construction, so this is the only place the classes meet content that
+      # violates them, and a class whose regex stopped matching would otherwise
+      # look exactly like a clean tree.
+      - name: Scanner self-test
+        run: python3 -B tools/scripts/leak_scan.py --self-test
+
+      - name: Decide whether the private tier is required
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          require=no
+          if [ "$EVENT_NAME" != pull_request ]; then
+            require=yes
+          elif [ "$HEAD_IS_FORK" != true ] && [ "$ACTOR" != 'dependabot[bot]' ]; then
+            require=yes
+          fi
+          echo "require=$require" >> "$GITHUB_OUTPUT"
+          echo "private tier required: $require (event $EVENT_NAME)"
+
+      - name: Scan the changed files and the added names (pull request, merge queue)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        env:
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+          REQUIRE: ${{ steps.mode.outputs.require }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          BRANCH_NAME: ${{ github.event.pull_request.head.ref || github.event.merge_group.head_ref }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [ "$REQUIRE" = yes ]; then flags=(--require-private); fi
+          git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
+          # The list names the files the head commit changed since the merge
+          # base, and the content scanned is that commit's copy of each one
+          # (--ref), so every listed path exists in the scan source by
+          # construction. The merge commit that the checkout holds can carry a
+          # changed file under another name when the base renamed it since the
+          # branch point; the scanner treats a listed path it cannot find as a
+          # NO RUN (exit 3), never as a clean file.
+          git diff --name-only -z --diff-filter=ACMRT "$BASE_SHA...$HEAD_SHA" > changed.zlist
+          python3 -B tools/scripts/leak_scan.py tree --ref "$HEAD_SHA" --files-from changed.zlist \
+            --allow-empty --format github ${flags[@]+"${flags[@]}"}
+          python3 -B tools/scripts/leak_scan.py names --range "$BASE_SHA..$HEAD_SHA" \
+            --branch-env BRANCH_NAME --allow-empty --format github ${flags[@]+"${flags[@]}"}
+
+      # A push to main and a manual run scan the WHOLE tree: this is also where
+      # a newly added private pattern meets old content.
+      - name: Scan the whole tree and every name (push, dispatch)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+        run: |
+          set -euo pipefail
+          python3 -B tools/scripts/leak_scan.py tree --require-private --format github
+          python3 -B tools/scripts/leak_scan.py names --require-private --format github
+
+  messages:
+    name: Leak guard (messages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether the private tier is required
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          require=no
+          if [ "$EVENT_NAME" != pull_request ]; then
+            require=yes
+          elif [ "$HEAD_IS_FORK" != true ] && [ "$ACTOR" != 'dependabot[bot]' ]; then
+            require=yes
+          fi
+          echo "require=$require" >> "$GITHUB_OUTPUT"
+
+      # On a pull request the range is the pull request's own commits plus its
+      # title and body, which arrive through environment variable NAMES so no
+      # untrusted text is ever interpolated into this block. On the merge queue
+      # the range holds the FINAL squash messages before they become permanent,
+      # the one server-side moment a message can still be stopped. On a push
+      # the range is before..after and a red run is an alarm, not a gate: main
+      # is never rewritten.
+      - name: Scan commit messages, identities and pull request text
+        env:
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+          REQUIRE: ${{ steps.mode.outputs.require }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [ "$REQUIRE" = yes ]; then flags=(--require-private); fi
+          case "$EVENT_NAME" in
+            pull_request)
+              git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
+              range="$BASE_SHA..$HEAD_SHA"
+              flags+=(--require-commits --pr-title-env PR_TITLE --pr-body-env PR_BODY)
+              ;;
+            merge_group)
+              range="$BASE_SHA..$HEAD_SHA"
+              ;;
+            push)
+              if git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+                range="$BEFORE_SHA..$AFTER_SHA"
+              else
+                range="$AFTER_SHA~1..$AFTER_SHA"
+              fi
+              ;;
+            *)
+              range="HEAD~1..HEAD"
+              ;;
+          esac
+          python3 -B tools/scripts/leak_scan.py messages --range "$range" --format github \
+            ${flags[@]+"${flags[@]}"}
+
+  media:
+    name: Leak guard (media)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether the private tier is required
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          require=no
+          if [ "$EVENT_NAME" != pull_request ]; then
+            require=yes
+          elif [ "$HEAD_IS_FORK" != true ] && [ "$ACTOR" != 'dependabot[bot]' ]; then
+            require=yes
+          fi
+          echo "require=$require" >> "$GITHUB_OUTPUT"
+          echo "private tier required: $require (event $EVENT_NAME)"
+
+      # The walkers PARSE each container (PNG, JPEG, GIF, WebP, MP4 and MOV
+      # family) for comments, EXIF, XMP, location boxes and trailing bytes; a
+      # container no walker can read is itself a hit until it is reviewed. The
+      # job always runs and always reports: a job-level skip would report
+      # success, so the event split sits at STEP level. The private tier is
+      # required on the same events as in the other two jobs: metadata text
+      # is where a device or a person's name rides into a picture.
+      - name: Walk the metadata of the changed media (pull request, merge queue)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        env:
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+          REQUIRE: ${{ steps.mode.outputs.require }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [ "$REQUIRE" = yes ]; then flags=(--require-private); fi
+          git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
+          git diff --name-only -z --diff-filter=ACMRT "$BASE_SHA...$HEAD_SHA" > changed.zlist
+          tracked=$(git ls-files -- '*.png' '*.jpg' '*.jpeg' '*.gif' '*.webp' '*.mp4' '*.mov' | wc -l | tr -d ' ')
+          echo "tracked media containers in the tree: $tracked"
+          python3 -B tools/scripts/leak_scan.py media --ref "$HEAD_SHA" --files-from changed.zlist \
+            --allow-empty --format github ${flags[@]+"${flags[@]}"}
+
+      - name: Walk the metadata of every tracked media container (push, dispatch)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+        run: |
+          set -euo pipefail
+          python3 -B tools/scripts/leak_scan.py media --require-private --format github

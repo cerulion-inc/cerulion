@@ -1,0 +1,5 @@
+error: `SystemTime::now()` reads the live system clock and voids bit-for-bit replay determinism. If you are measuring elapsed time, read it through the node's own clock accessor instead: `self.now_ns()` (nanoseconds from the clock the scheduler is running on, so it replays identically), or `self.real_ns()` for a duration you need measured against the hardware clock on this machine. Note that neither is a calendar clock — both count from an arbitrary origin, so neither can be converted to a date. If you genuinely need wall-clock date-and-time, that is inherently non-deterministic and there is no replay-safe way to read it: keep `SystemTime::now()` and declare the node with `#[cerulion_node(allow_non_deterministic)]`.
+  --> tests/ui/determinism_system_time_now_denied.rs:22:30
+   |
+22 |         let _t = SystemTime::now();
+   |                              ^^^

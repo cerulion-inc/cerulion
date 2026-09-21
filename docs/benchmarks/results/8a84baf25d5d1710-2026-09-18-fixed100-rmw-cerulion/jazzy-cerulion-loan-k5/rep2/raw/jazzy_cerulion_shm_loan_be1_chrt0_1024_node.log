@@ -1,0 +1,25 @@
+cpu_dma_lock: open(/dev/cpu_dma_latency) failed: No such file or directory - continuing without DMA lock (p99 may degrade)
+cpu_dma_lock: open(/dev/cpu_dma_latency) failed: No such file or directory - continuing without DMA lock (p99 may degrade)
+cpu_dma_lock: open(/dev/cpu_dma_latency) failed: No such file or directory - continuing without DMA lock (p99 may degrade)
+2026-09-18T15:12:26.865608Z  WARN rmw_cerulion::api::pubsub: requested QoS depth differs from the depth Cerulion provisioned - an rmw subscription's requested depth is NOT applied to its queue today, so the queue is the transport default; endpoint info reports the provisioned depth topic=/parameter_events requested_depth=1000 provisioned_depth=16
+[INFO] [1789744346.866448655] [ros2_rtt_bench_latency_rcl]: Msg::is_plain: 1 (has_fixed_size=1, is_trivially_copyable=1, sizeof=1024)
+2026-09-18T15:12:26.868280Z  WARN rmw_cerulion::api::pubsub: requested QoS depth differs from the depth Cerulion provisioned - an rmw subscription's requested depth is NOT applied to its queue today, so the queue is the transport default; endpoint info reports the provisioned depth topic=/echo requested_depth=1 provisioned_depth=16
+[WARN] [1789744346.868303210] [ros2_rtt_bench_latency_rcl]: Loaned messages are only safe with const ref subscription callbacks. If you are using any other kind of subscriptions, set the ROS_DISABLE_LOANED_MESSAGES environment variable to 1 (the default).
+[INFO] [1789744346.868309171] [ros2_rtt_bench_latency_rcl]: latency_node_rcl ready (payload=1024 target=2000 warmup=100 chrt=0 loaned=1 qos=be1 pacing=quiescent rcl_take_loaned_recv=1 readiness=matched+probe)
+2026-09-18T15:12:26.875463Z  WARN rmw_cerulion::api::pubsub: requested QoS depth differs from the depth Cerulion provisioned - an rmw subscription's requested depth is NOT applied to its queue today, so the queue is the transport default; endpoint info reports the provisioned depth topic=/parameter_events requested_depth=1000 provisioned_depth=16
+2026-09-18T15:12:26.875527Z  WARN rmw_cerulion::api::pubsub: requested QoS depth differs from the depth Cerulion provisioned - an rmw subscription's requested depth is NOT applied to its queue today, so the queue is the transport default; endpoint info reports the provisioned depth topic=/parameter_events requested_depth=1000 provisioned_depth=16
+[INFO] [1789744346.876326615] [ros2_rtt_bench_ping]: Msg::is_plain: 1 (has_fixed_size=1, is_trivially_copyable=1, sizeof=1024)
+[INFO] [1789744346.876548591] [ros2_rtt_bench_pong_rcl]: Msg::is_plain: 1 (has_fixed_size=1, is_trivially_copyable=1, sizeof=1024)
+2026-09-18T15:12:26.884493Z  WARN rmw_cerulion::api::pubsub: requested QoS depth differs from the depth Cerulion provisioned - an rmw subscription's requested depth is NOT applied to its queue today, so the queue is the transport default; endpoint info reports the provisioned depth topic=/kick requested_depth=1 provisioned_depth=16
+[INFO] [1789744346.884519902] [ros2_rtt_bench_ping]: ping_node ready (msg=pod payload=1024 loaned=1 qos=be1)
+2026-09-18T15:12:26.888680Z  WARN rmw_cerulion::api::pubsub: requested QoS depth differs from the depth Cerulion provisioned - an rmw subscription's requested depth is NOT applied to its queue today, so the queue is the transport default; endpoint info reports the provisioned depth topic=/ping requested_depth=1 provisioned_depth=16
+[WARN] [1789744346.888700976] [ros2_rtt_bench_pong_rcl]: Loaned messages are only safe with const ref subscription callbacks. If you are using any other kind of subscriptions, set the ROS_DISABLE_LOANED_MESSAGES environment variable to 1 (the default).
+[INFO] [1789744346.888715591] [ros2_rtt_bench_pong_rcl]: pong_node_rcl ready (msg_size=1024 loaned_pub=1 qos=be1 rcl_take_loaned_recv=1 echo_rule=prefetched_loan prefetch_depth=1 refill_defer_us=1000)
+[WARN] [1789744346.891618666] [ros2_rtt_bench_ping]: Loaned messages are only safe with const ref subscription callbacks. If you are using any other kind of subscriptions, set the ROS_DISABLE_LOANED_MESSAGES environment variable to 1 (the default).
+[INFO] [1789744346.893696905] [ros2_rtt_bench_latency_rcl]: readiness=matched+probe: chain proven by data (1 probe kicks, 1 probe echoes). Those round trips are warm up and are not measured; the measured window starts at the bootstrap kick below.
+[INFO] [1789744367.888412378] [ros2_rtt_bench_latency_rcl]: RAW_DUMP_DONE payload=1024 samples=2000 bytes=16000 path=/raw/jazzy_cerulion_shm_loan_be1_chrt0_1024.bin
+DELIVERY role=latency received=2100 kicks_sent=2101 take_failures=0 return_failures=0 unstamped=0 nonpositive_rtt=0
+[INFO] [1789744367.936074332] [rclcpp]: signal_handler(SIGINT/SIGTERM)
+[INFO] [1789744367.938965950] [rclcpp]: signal_handler(SIGINT/SIGTERM)
+DELIVERY role=ping published=2101
+DELIVERY role=pong echoed=2101 take_failures=0 return_failures=0

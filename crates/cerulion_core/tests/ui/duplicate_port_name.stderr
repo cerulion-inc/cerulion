@@ -1,0 +1,26 @@
+error: duplicate port name `data`
+ --> tests/ui/duplicate_port_name.rs:9:5
+  |
+9 |     data: Vector3,
+  |     ^^^^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/duplicate_port_name.rs:8:7
+  |
+8 |     #[output]
+  |       ^^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/duplicate_port_name.rs:6:7
+  |
+6 |     #[input]
+  |       ^^^^^
+
+error[E0124]: field `data` is already declared
+ --> tests/ui/duplicate_port_name.rs:9:5
+  |
+7 |     data: Vector3,
+  |     ------------- `data` first declared here
+8 |     #[output]
+9 |     data: Vector3,
+  |     ^^^^^^^^^^^^^ field already declared

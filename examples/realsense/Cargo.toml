@@ -1,0 +1,7 @@
+[workspace]
+members = ["nodes/*"]
+resolver = "2"
+
+[workspace.dependencies]
+cerulion_core = { path = "../../crates/cerulion_core" }
+native_ros2_messages = { path = "../../crates/native_ros2_messages" }

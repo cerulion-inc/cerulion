@@ -1,0 +1,56 @@
+error: #[cerulion_node_impl] requires a `tick` method on the impl block
+  --> tests/ui/node_impl_missing_tick.rs:20:1
+   |
+20 | / impl MissingTickNode {
+21 | |     // No `tick` method — only a helper.
+22 | |     fn helper(&self) -> f64 {
+23 | |         self.inp.x
+24 | |     }
+25 | | }
+   | |_^
+
+warning: unexpected `cfg` condition value: `cdylib`
+  --> tests/ui/node_impl_missing_tick.rs:11:1
+   |
+11 | #[cerulion_node]
+   | ^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `debug-logging`, `fuzz-helpers`, and `test-helpers`
+   = note: using a cfg inside a attribute macro will use the cfgs from the destination crate and not the ones from the defining crate
+   = help: try referring to `cerulion_node` crate for guidance on how handle this unexpected cfg
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+   = note: this warning originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_init` found for struct `MissingTickNode` in the current scope
+  --> tests/ui/node_impl_missing_tick.rs:11:1
+   |
+11 | #[cerulion_node]
+   | ^^^^^^^^^^^^^^^^ method not found in `MissingTickNode`
+12 | #[derive(Default)]
+13 | struct MissingTickNode {
+   | ---------------------- method `__cer_user_init` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_zero_copy_tick` found for struct `MissingTickNode` in the current scope
+  --> tests/ui/node_impl_missing_tick.rs:11:1
+   |
+11 | #[cerulion_node]
+   | ^^^^^^^^^^^^^^^^ method not found in `MissingTickNode`
+12 | #[derive(Default)]
+13 | struct MissingTickNode {
+   | ---------------------- method `__cer_zero_copy_tick` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `__cer_user_shutdown` found for struct `MissingTickNode` in the current scope
+  --> tests/ui/node_impl_missing_tick.rs:11:1
+   |
+11 | #[cerulion_node]
+   | ^^^^^^^^^^^^^^^^
+12 | #[derive(Default)]
+13 | struct MissingTickNode {
+   | ---------------------- method `__cer_user_shutdown` not found for this struct
+   |
+   = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)

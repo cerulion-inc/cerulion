@@ -1,0 +1,42 @@
+# POD-class MONO leg graph (type-class axis) — the FIXED-POD
+# twin of graphs/rtt_bench.yaml: the identical 3-node round-trip chain,
+# run as ONE process (`cerulion graph run rtt_bench_pod --single-process
+# --release`), with the message class as the ONLY moving part — the
+# variable `sensor_msgs/Image` (loaned unbounded data) is replaced by
+# `PodPayload`, a purely-fixed workspace schema whose wire fixed size is
+# exactly the sweep payload (generated per size by
+# pod_schema/pod_codegen.rs; the pod nodes' init verifies the baked size
+# against CER_BENCH_PAYLOAD_SIZE, so a stale build fails loudly instead
+# of mislabeling). No `max_slice_len` — a fixed schema carries no
+# variable field to bound.
+#
+# PROVENANCE (do not edit in isolation): the node/topic wiring mirrors
+# graphs/rtt_bench.yaml; the SPLIT sibling is graphs/rtt_bench_pod_split
+# .yaml (identical + `process_groups:` only — same faithful-mirror rule
+# as the variable pair). The variable-vs-pod A/B additionally depends on
+# THIS file staying wiring-identical to rtt_bench.yaml (ids, sources,
+# history_size) — only `type:` and `schema:` differ.
+prefix: rtt_bench_pod
+nodes:
+- id: ping
+  type: pod_ping_node
+  inputs: []
+  outputs:
+  - name: ping_out
+    schema: cer_bench_msgs/PodPayload
+    history_size: 0
+- id: pong
+  type: pod_pong_node
+  inputs:
+  - name: ping_in
+    source: ping/ping_out
+  outputs:
+  - name: echo_out
+    schema: cer_bench_msgs/PodPayload
+    history_size: 0
+- id: latency
+  type: pod_latency_node
+  inputs:
+  - name: echo_in
+    source: pong/echo_out
+  outputs: []

@@ -1,0 +1,40 @@
+# The full demo graph: camera -> detector -> tracker, plus an independent imu
+# source. Same node libraries as perception_min plus a tracker that consumes the
+# DetectionArray and publishes a running track count. Distinct prefix (percep)
+# from perception_min (percepmin).
+#
+# Two rates in one graph: the camera fires every 33 ms and the imu every 10 ms.
+# Each rate is the `period_ms` on that node's macro; this file carries topology
+# only.
+#
+# Run it live with:  cerulion graph run perception --release
+prefix: percep
+nodes:
+  - id: camera
+    type: camera
+    outputs:
+      - name: image_raw
+        schema: sensor_msgs/Image
+        max_slice_len: 65536
+  - id: imu
+    type: imu
+    outputs:
+      - name: reading
+        schema: sensor_msgs/Imu
+  - id: detector
+    type: detector
+    inputs:
+      - name: image_raw
+        source: camera/image_raw
+    outputs:
+      - name: detections
+        schema: DetectionArray
+        max_slice_len: 4096
+  - id: tracker
+    type: tracker
+    inputs:
+      - name: detections
+        source: detector/detections
+    outputs:
+      - name: tracks
+        schema: geometry_msgs/Vector3

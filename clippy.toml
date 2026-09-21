@@ -1,0 +1,41 @@
+# clippy.toml - repo-wide clippy configuration.
+#
+# Read with the root `[workspace.lints.clippy]` table, which sets the LEVEL of
+# each lint below; this file supplies the DATA (which paths are disallowed) and
+# the reason text an offender sees.
+#
+# What is deliberately NOT here: the print macros. `clippy::disallowed_macros`
+# is warn-by-default and this file is repo-global, so listing `std::println`
+# here would fire under CI's `-D warnings` on all 522 print sites in the
+# workspace - over 200 of them in integration-test binaries, where printing
+# evidence under `--nocapture` is the house pattern for box harnesses. P12's
+# actual rule is "never `println!` in LIBRARY code", and the only granularity
+# in Rust that expresses that is a crate-root attribute on the lib target:
+#
+#     #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+#
+# carried by every library crate cargo RESOLVES into the root workspace plus the
+# library members of each mirrored workspace (`examples/go2` - its node crates ship
+# to the ROBOT, which is the class this rule is written for). Pinned by
+# `crates/cerulion_cli_engine/tests/library_print_ban_test.rs`, which walks both
+# universes: a declared-`[workspace] members` walk misses a foreign path
+# dependency cargo folds in, and misses the mirrored workspaces entirely.
+
+disallowed-macros = [
+    # Debug residue. `dbg!` writes to stderr unconditionally, is invisible to
+    # `RUST_LOG`, and always means a debugging session someone forgot to end.
+    # Zero sites in the tree today, so this is a pure regression guard.
+    # (`clippy::dbg_macro` in the workspace table denies the same thing; this
+    # entry is what makes the message say WHY.)
+    { path = "std::dbg", reason = "P12: debug residue - use `tracing::debug!`, which honors RUST_LOG" },
+]
+
+disallowed-methods = [
+    # A library that exits the process steals the caller's ability to clean up,
+    # and no test can observe the error it swallowed. Errors travel as `Err` to
+    # the CLI boundary (`crates/cerulion_cli/src/main.rs`), which maps them to exit
+    # codes. The legitimate exceptions are process ENTRYPOINTS - a
+    # `graph run-worker` body, a test's self-re-exec child - and each carries a
+    # targeted `#[allow(clippy::disallowed_methods)]` naming itself.
+    { path = "std::process::exit", reason = "P12: map errors to exit codes at the CLI boundary; only a process entrypoint may exit" },
+]

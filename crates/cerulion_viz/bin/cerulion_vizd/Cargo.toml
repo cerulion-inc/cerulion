@@ -1,0 +1,134 @@
+# `cerulion-vizd` — the long-lived, schema-generic dynamic viz
+# DAEMON. ONE process, ONE iceoryx2 node (Principle #8): it owns a set of runtime
+# taps (`TapManager`) it adds/removes on demand, drains them on a poll
+# thread into the never-block `VizLogWorker`, and is driven by
+# multiple concurrent controllers (Cerulion Studio + the agent + the `cerulion
+# viz` verb) over a Unix-domain-socket NDJSON control protocol.
+#
+# It lives in the `cerulion_viz/` tree (alongside `lib/` + `nodes/`) and is kept
+# OUT of `default-members` (root Cargo.toml) so its heavy `rerun` dep (pulled via
+# `cerulion_viz`) is compiled ONLY by `cargo build -p cerulion_vizd` / `--workspace`,
+# never a plain `cargo build`. The `cerulion` CLI does NOT depend on this crate —
+# it speaks to the daemon over the socket (the same decoupling `ros2 attach` uses),
+# so a lean CLI build never pulls rerun.
+[package]
+name = "cerulion_vizd"
+version = "1.0.0"
+edition = "2021"
+description = "cerulion-vizd, the long-lived schema-generic dynamic viz daemon (UDS NDJSON control protocol)"
+license.workspace = true
+rust-version = "1.93" # inherits cerulion_viz's rerun MSRV (see lib/cerulion_viz/Cargo.toml)
+# Not published to crates.io: a desk-side daemon binary, not a library
+# dependency.
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+# lib + bin: the reusable daemon + protocol + hygiene live in the lib so the
+# e2e tests drive an IN-PROCESS daemon over an isolated per-test SHM root, and a
+# client (the `cerulion viz` verb) could lift the protocol module.
+# `src/main.rs` is the thin production entry (get_or_init transport + real stream
+# + signal handling).
+path = "src/lib.rs"
+
+[[bin]]
+name = "cerulion-vizd"
+path = "src/main.rs"
+
+[dependencies]
+# Explicit path deps (not `workspace = true`) — the cerulion_viz tree carries no
+# `[workspace.dependencies]` (see lib/cerulion_viz/Cargo.toml on cross-workspace
+# path-dep inheritance).
+cerulion_core = { path = "../../../cerulion_core" }
+cerulion_hygiene = { path = "../../../cerulion_hygiene", version = "=1.0.0" }
+cerulion_viz = { path = "../../lib/cerulion_viz" }
+# `attach_remote` DEMANDS a remote topic's shared mirror from the
+# one-per-computer `cerulion-netd` daemon (over its UDS control seam) instead of
+# opening vizd's own ingress on the zenoh session; `detach` RELEASES it. Both vizd
+# and netd are Unix daemons (UDS + flock), so no platform gate is needed here.
+# `default-features = false` — netd's `wan` feature is now
+# default-on (the iroh WAN plane ships by default, by design), but vizd
+# consumes ONLY the lean `NetdClient` UDS surface, so it must NOT link iroh. This
+# `default-features = false` subtracts THIS edge's wan; the load-bearing half is that
+# netd is excluded from `default-members` (root Cargo.toml), so cargo's per-package
+# feature unification cannot turn wan back on for the one shared netd rlib vizd links.
+# The whole default build's iroh-freedom (`cargo tree -e normal -i iroh` finds
+# nothing) is pinned by the `iroh-leanness` CI job.
+cerulion_netd = { path = "../../../cerulion_netd", default-features = false }
+# Already pulled transitively via cerulion_viz — named directly so main.rs can
+# build a `disabled()` FALLBACK `RecordingStream` when the gRPC endpoint is
+# misconfigured (so the control plane still runs with viz disabled).
+# The `server` feature unlocks `RecordingStreamBuilder::serve_grpc_opts`
+# (a locally-HOSTED gRPC message proxy) so the daemon is the ONE endpoint every
+# viewer connects to by default (the checkbox→scene bar; nobody else
+# hosts the proxy on a bare machine). Kept scoped to THIS bin (not the
+# `cerulion_viz` lib) so a lib-only consumer's build stays lean.
+rerun = { version = "0.34", default-features = false, features = ["sdk", "server"] }
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The sacred NDJSON control protocol (derive-based request/response types + the
+# one-object-per-line codec).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SIGINT + SIGTERM (features=["termination"]) → the clean drop-taps/close-socket/
+# remove-pidfile shutdown (the bagd / cerulion_cli precedent).
+ctrlc = { version = "3", features = ["termination"] }
+# flock(2) for the single-daemon pidfile lock (hygiene.rs) — the stale-proof,
+# TOCTOU-free single-daemon guarantee (kernel releases the lock on process death).
+libc = "0.2"
+
+[features]
+# Expose the `*_for_test` seams on `RunningDaemon` OUTSIDE
+# `#[cfg(test)]`. The consumers are INTEGRATION tests, which link the non-test
+# rlib, so `#[cfg(test)]` alone cannot reach them — the dev-dependencies
+# self-reference below enables this for `tests/*.rs` while leaving the seams
+# absent from any downstream crate that merely links the vizd lib. Same shape,
+# and for the same reason, as `cerulion_core`'s `test-helpers`.
+test-helpers = []
+
+[dev-dependencies]
+# Self-reference so the items behind
+# `#[cfg(any(test, feature = "test-helpers"))]` are visible to `tests/*.rs`.
+# One of them busy-spins the daemon's frame-drain thread for a caller-supplied
+# span, which must not be reachable from a crate that merely links this lib.
+cerulion_vizd = { path = ".", features = ["test-helpers"] }
+# A log-level pin for the incumbent-fallback warn on the remote-attach
+# path (`seed_and_resolve_schema`). `no-env-filter` so the capture sees this
+# crate's own target. Already resolved at 0.2.6 in the workspace lockfile
+# (cerulion_viz, cerulion_dds, rmw_cerulion, cerulion_connectd use it), and
+# cerulion_vizd is OUT of `default-members`, so this never reaches a plain build.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# test-helpers unlocks TransportManager::init_for_test + iceoryx_test_config so
+# the e2e drives an IN-PROCESS daemon over an isolated per-test SHM root
+# (parallel-safe, memory rerun sink) — the tap_manager_test.rs precedent.
+cerulion_core = { path = "../../../cerulion_core", features = ["test-helpers"] }
+# Oracle-frame construction in the e2e (SCHEMA_HASH + the layout engine).
+native_ros2_messages = { path = "../../../native_ros2_messages" }
+# The e2e builds a `rerun::RecordingStreamBuilder::memory()` sink to inspect what
+# the daemon rendered (no viewer needed in CI); `server` (matching the runtime
+# dep) lets the host-mode test bind a real proxy + a client connect to it.
+rerun = { version = "0.34", default-features = false, features = ["sdk", "server"] }
+# Hard-gate test (`tests/live_only_history_test.rs`): drive a REAL hosted
+# gRPC proxy through the PRODUCTION `host::server_options()` + a fresh viewer, to
+# pin the live-only history-OFF posture end to end. These are all rerun-family
+# crates ALREADY resolved at `=0.34.1` in the lockfile (pulled transitively via
+# `rerun`), named here so the test can host the proxy (`re_grpc_server`), drive a
+# producer + a fresh CONSUMER over gRPC (`re_grpc_client`), drain the consumer
+# (`re_log_channel`), hand-build log messages (`re_log_types`) + chunks
+# (`re_chunk`), and address the proxy (`re_uri`). `tokio` hosts the async server
+# + consumer. cerulion_vizd is OUT of `default-members`, so these dev-deps never
+# reach the lean default build (no feature-unification / deny impact there).
+re_grpc_server = "=0.34.1"
+re_grpc_client = "=0.34.1"
+# The proxy's own live-queue / history byte accounting
+# (`MessageProxyHandle::capture_memory` → `MemUsageTree`) is the measurement
+# harness's oracle — it reports what is BUFFERED, which is the quantity the
+# "no buffer for clouds or images" requirement is about.
+re_byte_size = "=0.34.1"
+re_log_channel = "=0.34.1"
+re_log_types = "=0.34.1"
+re_chunk = "=0.34.1"
+re_uri = "=0.34.1"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

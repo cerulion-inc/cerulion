@@ -1,0 +1,19 @@
+cpu_dma_lock: SKIPPED (CER_BENCH_DMA_LOCK=0 - stock posture) - C-state exits unmanaged; tails NOT comparable to capped runs.
+Raw iceoryx2 round-trip benchmark [backtoback] - 10 sizes
+
+  payload=        64 B  pacing=backtoback measured=10000 (warmup=1000) ... 0 [W] "Config::global_config()" 
+| No config file was loaded, a config with default values will be used. 
+1 [W] "Config::global_config()" 
+| No config file was loaded, a config with default values will be used. 
+dumped 10000 samples
+  payload=       256 B  pacing=backtoback measured=10000 (warmup=1000) ... dumped 10000 samples
+  payload=      1024 B  pacing=backtoback measured=10000 (warmup=1000) ... dumped 10000 samples
+  payload=      4096 B  pacing=backtoback measured=10000 (warmup=1000) ... dumped 10000 samples
+  payload=     16384 B  pacing=backtoback measured=10000 (warmup=1000) ... dumped 10000 samples
+  payload=     65536 B  pacing=backtoback measured=10000 (warmup=1000) ... dumped 10000 samples
+  payload=    262144 B  pacing=backtoback measured=10000 (warmup=1000) ... dumped 10000 samples
+  payload=   1048576 B  pacing=backtoback measured=10000 (warmup=1000) ... dumped 10000 samples
+  payload=   4194304 B  pacing=backtoback measured=10000 (warmup=1000) ... dumped 10000 samples
+  payload=  16777216 B  pacing=backtoback measured=10000 (warmup=1000) ... dumped 10000 samples
+
+Done. Raw .bin samples written to CER_BENCH_RAW_DUMP_DIR.

@@ -1,0 +1,185 @@
+{
+  "chart": "native-rtt.svg",
+  "series": "rmw_cerulion, fully loaned (ROS 2 Jazzy over rmw_cerulion, measured by benches/latency)",
+  "source_csv": "docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/jazzy-cerulion-loan-k5/results_jazzy_cerulion_shm_loan_be1_chrt0.csv",
+  "source_sha256": "ed03c7b0e848a4c686467488d2860e74d22229924723dc801ae5805566c5d585",
+  "metric_columns": [
+    "round_trip_p50_ns",
+    "round_trip_p99_ns"
+  ],
+  "points_from": {
+    "how": "independent re-reduction of the 50 raw .bin sample files; the CSV was hashed, not read"
+  },
+  "points": [
+    {
+      "payload_bytes": 64,
+      "p50_ns": 10453,
+      "p99_ns": 36175,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 8253,
+      "rep_p50s_ns": [
+        10453,
+        18281,
+        10439,
+        10279,
+        10500
+      ],
+      "loaned": "1"
+    },
+    {
+      "payload_bytes": 256,
+      "p50_ns": 10580,
+      "p99_ns": 45064,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 8209,
+      "rep_p50s_ns": [
+        10580,
+        11006,
+        10856,
+        10546,
+        10503
+      ],
+      "loaned": "1"
+    },
+    {
+      "payload_bytes": 1024,
+      "p50_ns": 10433,
+      "p99_ns": 36375,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 8227,
+      "rep_p50s_ns": [
+        10433,
+        10676,
+        10481,
+        10398,
+        10217
+      ],
+      "loaned": "1"
+    },
+    {
+      "payload_bytes": 4096,
+      "p50_ns": 10523,
+      "p99_ns": 26680,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 6451,
+      "rep_p50s_ns": [
+        10304,
+        10388,
+        10523,
+        10527,
+        10527
+      ],
+      "loaned": "1"
+    },
+    {
+      "payload_bytes": 16384,
+      "p50_ns": 10493,
+      "p99_ns": 23651,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 8451,
+      "rep_p50s_ns": [
+        10431,
+        10608,
+        10493,
+        10797,
+        10348
+      ],
+      "loaned": "1"
+    },
+    {
+      "payload_bytes": 65536,
+      "p50_ns": 10651,
+      "p99_ns": 53263,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 8393,
+      "rep_p50s_ns": [
+        10531,
+        10651,
+        10831,
+        10815,
+        10189
+      ],
+      "loaned": "1"
+    },
+    {
+      "payload_bytes": 262144,
+      "p50_ns": 10576,
+      "p99_ns": 37624,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 8030,
+      "rep_p50s_ns": [
+        10906,
+        10472,
+        10576,
+        10536,
+        10604
+      ],
+      "loaned": "1"
+    },
+    {
+      "payload_bytes": 1048576,
+      "p50_ns": 11123,
+      "p99_ns": 37214,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 8282,
+      "rep_p50s_ns": [
+        11086,
+        11486,
+        11596,
+        11008,
+        11123
+      ],
+      "loaned": "1"
+    },
+    {
+      "payload_bytes": 4194304,
+      "p50_ns": 15051,
+      "p99_ns": 50554,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 9863,
+      "rep_p50s_ns": [
+        15009,
+        15638,
+        15051,
+        14698,
+        15221
+      ],
+      "loaned": "1"
+    },
+    {
+      "payload_bytes": 16777216,
+      "p50_ns": 17474,
+      "p99_ns": 54383,
+      "samples": 10000,
+      "repetitions": 5,
+      "achieved_rate_hz": "100",
+      "floor_ns": 12706,
+      "rep_p50s_ns": [
+        17474,
+        18798,
+        16908,
+        17033,
+        18247
+      ],
+      "loaned": "1"
+    }
+  ]
+}

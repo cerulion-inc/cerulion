@@ -1,0 +1,12 @@
+prefix: basic_timer
+nodes:
+  - id: timer
+    type: timer
+    outputs:
+      - name: count
+        schema: std_msgs/Int32
+  - id: printer
+    type: printer
+    inputs:
+      - name: count
+        source: timer/count

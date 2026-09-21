@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "variant": "fixed100",
+  "machine_hash": "8a84baf25d5d1710",
+  "invocations": [
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 1,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "1",
+        "--leg",
+        "split",
+        "--msg-class",
+        "variable",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/a3-freerun-postsweep-20260916T085313Z/run-A3"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T01:53:14-0700",
+      "ended_at": "2026-09-16T01:56:54-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T01:53:14-0700",
+          "ended_at": "2026-09-16T01:56:54-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 2,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "2",
+        "--leg",
+        "split",
+        "--msg-class",
+        "variable",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/a3-freerun-postsweep-20260916T085313Z/run-A3"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T01:56:54-0700",
+      "ended_at": "2026-09-16T02:00:34-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T01:56:54-0700",
+          "ended_at": "2026-09-16T02:00:34-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 3,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "3",
+        "--leg",
+        "split",
+        "--msg-class",
+        "variable",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/a3-freerun-postsweep-20260916T085313Z/run-A3"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T02:00:34-0700",
+      "ended_at": "2026-09-16T02:04:14-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T02:00:34-0700",
+          "ended_at": "2026-09-16T02:04:14-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 4,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "4",
+        "--leg",
+        "split",
+        "--msg-class",
+        "variable",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/a3-freerun-postsweep-20260916T085313Z/run-A3"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T02:04:14-0700",
+      "ended_at": "2026-09-16T02:07:55-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T02:04:14-0700",
+          "ended_at": "2026-09-16T02:07:55-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    },
+    {
+      "subcommand": "workspace",
+      "variant": "fixed100",
+      "rep": 5,
+      "argv": [
+        "bench.py",
+        "workspace",
+        "--variant",
+        "fixed100",
+        "--chrt",
+        "0",
+        "--rep",
+        "5",
+        "--leg",
+        "split",
+        "--msg-class",
+        "variable",
+        "--run-dir",
+        "<BOXHOME>/lanes/freerun-ab-20260915T223052Z/a3-freerun-postsweep-20260916T085313Z/run-A3"
+      ],
+      "git_sha": "68a0d6196a962237f8628cd94c9f93371703e827",
+      "git_dirty": false,
+      "machine_hash": "8a84baf25d5d1710",
+      "uname": "Linux box-x86 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 7 13:43:15 UTC x86_64 x86_64",
+      "platform": "linux",
+      "cpu_governor": "performance",
+      "turbo_boost": "on",
+      "dma_lock_posture": "stock",
+      "started_at": "2026-09-16T02:07:55-0700",
+      "ended_at": "2026-09-16T02:11:35-0700",
+      "cells": [
+        {
+          "cell": "cerulion_workspace_split_chrt0",
+          "payload": null,
+          "outcome": "ok",
+          "started_at": "2026-09-16T02:07:55-0700",
+          "ended_at": "2026-09-16T02:11:35-0700"
+        }
+      ],
+      "skips": [],
+      "docker_images": {}
+    }
+  ]
+}

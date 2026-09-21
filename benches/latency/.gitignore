@@ -1,0 +1,26 @@
+# Run artifacts under results/.
+#
+# Raw `.bin` samples, compiled CSVs and the per-run EVIDENCE files are
+# deliberately NOT ignored: this suite's boundary discipline (README, "No
+# number leaves the repo without its harness") requires a reviewed run to
+# be committed with everything needed to recompute it — including
+# _logs/<cell>_versions.txt (compared-stack version provenance),
+# _logs/<cell>_<size>_delivery.txt (delivery accounting), the
+# _SHM_UNVERIFIED markers, and the ROS 2 per-size <cell>_<size>_node.log,
+# which is the ONLY source for the CSV's `loaned` column
+# (compile_csv.py::loaned_from_log). Stage a run explicitly; never with a
+# tree-wide `git add`.
+#
+# What is never committable: the raw per-cell RUN LOGS (regenerable
+# console noise, and the AGENTS rule says not to commit them) and the
+# smoke gate's scratch directory, which bench.py deletes and rewrites on
+# every invocation.
+results/**/*.log
+!results/**/*_node.log
+results/smoke/
+# A LIVE workspace run (`cerulion graph run` under workspace/) writes a
+# run directory and the flashback plane's rolling window into
+# workspace/recordings/. That is per-run scratch the product owns, not
+# bench evidence — the bench's evidence is results/ — and it appeared
+# untracked after this round's live pod-leg verification.
+workspace/recordings/

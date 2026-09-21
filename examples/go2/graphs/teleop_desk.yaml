@@ -1,0 +1,36 @@
+# The desk half of networked teleop: the terminal keyboard on YOUR machine
+# publishes /go2/cmd_vel/keyboard, and the companion computer's
+# teleop_remote graph imports it (see teleop_remote.yaml).
+#
+# Created with `cerulion graph create teleop_desk -n desk` +
+# `cerulion node stage keyboard_teleop -g teleop_desk`; the `topic:` override
+# is a hand edit so the desk publishes exactly the name the robot side
+# declares as ingress.
+#
+# No `network:` block: with none, this run is PERMISSIVE. Its egress registers
+# with this machine's cerulion-netd, which announces the topic and forwards
+# it once the robot side demands it. On one LAN nothing else is needed; to
+# reach a companion computer scouting cannot find, point this desk's netd at
+# it before the run:
+#
+#   export CERULION_NETD_CONNECT=tcp/<companion address>:7684
+#
+# (7684 is the port teleop_remote.yaml listens on; the companion's shared
+# netd plane keeps 7683 for the sensor graphs.)
+#
+# RUN (on the desk, in a real terminal):
+#
+#   cerulion graph run teleop_desk --single-process
+#
+# WASD to move, space to stop, Ctrl-C to quit (the terminal is restored). The
+# robot-side stop guarantee is the mux's 750 ms keyboard staleness window,
+# not this node: a dropped link reads as a stale keyboard and the mux zeros.
+
+prefix: desk
+nodes:
+  - id: keyboard_teleop
+    type: keyboard_teleop
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Twist
+        topic: /go2/cmd_vel/keyboard

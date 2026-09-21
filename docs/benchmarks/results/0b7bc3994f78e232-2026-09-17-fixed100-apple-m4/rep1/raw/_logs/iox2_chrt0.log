@@ -1,0 +1,16 @@
+cpu_dma_lock: SKIPPED (CER_BENCH_DMA_LOCK=0 - stock posture) - C-state exits unmanaged; tails NOT comparable to capped runs.
+Raw iceoryx2 round-trip benchmark [fixed100] - 10 sizes
+
+  payload=        64 B  pacing=fixed100 rate= 100 Hz measured= 2000 (warmup=100) ... 0 [W] "Config::global_config()" 
+| No config file was loaded, a config with default values will be used. 
+1 [W] "Config::global_config()" 
+| No config file was loaded, a config with default values will be used. 
+NOT SUSTAINED at 100 Hz - skipped 6669 of 2100 grid slots (> 1%); stepping down the ladder
+  payload=        64 B  pacing=fixed100 rate=  50 Hz measured= 2000 (warmup=100) ... NOT SUSTAINED at 50 Hz - skipped 6251 of 2100 grid slots (> 1%); stepping down the ladder
+  payload=        64 B  pacing=fixed100 rate=  20 Hz measured= 2000 (warmup=100) ... NOT SUSTAINED at 20 Hz - skipped 2025 of 2100 grid slots (> 1%); stepping down the ladder
+  payload=        64 B  DID NOT SUSTAIN the fixed100 ladder [100, 50, 20] Hz - NO latency minted (did_not_sustain sidecar written; the row renders empty)
+  payload=       256 B  pacing=fixed100 rate= 100 Hz measured= 2000 (warmup=100) ... NOT SUSTAINED at 100 Hz - skipped 6101 of 2100 grid slots (> 1%); stepping down the ladder
+  payload=       256 B  pacing=fixed100 rate=  50 Hz measured= 2000 (warmup=100) ... NOT SUSTAINED at 50 Hz - skipped 6253 of 2100 grid slots (> 1%); stepping down the ladder
+  payload=       256 B  pacing=fixed100 rate=  20 Hz measured= 2000 (warmup=100) ... NOT SUSTAINED at 20 Hz - skipped 1967 of 2100 grid slots (> 1%); stepping down the ladder
+  payload=       256 B  DID NOT SUSTAIN the fixed100 ladder [100, 50, 20] Hz - NO latency minted (did_not_sustain sidecar written; the row renders empty)
+  payload=      1024 B  pacing=fixed100 rate= 100 Hz measured= 2000 (warmup=100) ... 

@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# `cerulion-netd` — the ONE per-computer network gateway daemon
+# (decision: the network gateway runs once per computer for
+# all graphs). A shared singleton that owns the machine's zenoh session
+# (Principle #8) and serves REFCOUNTED topic demands over a Unix-domain-socket
+# NDJSON control seam: many consumers (vizd, a user graph's ingress, `topic echo`)
+# demand the SAME remote (robot, topic); the frame crosses the network ONCE and
+# re-injects into desk SHM ONCE; all readers subscribe to the one mirror.
+#
+# Lifecycle (per the design record): first-consumer-spawns-detached,
+# refcounted, SELF-EXIT on idle (~30 s after the last demand releases). The UDS
+# connection close IS the release (crash-safe refcounts) — the vizd hygiene +
+# NDJSON pattern, reused.
+#
+# Planes: netd owns the machine's zenoh session (the LAN plane, always compiled via
+# `cerulion_core`) AND — the decision to ship the iroh WAN
+# plane by default — the iroh WAN plane behind the default-on `wan` feature. So a
+# plain `cargo build -p cerulion_netd` produces the WAN-capable daemon and pulls the
+# iroh tree; `--no-default-features` yields the lean zenoh-only netd (the opt-out).
+# netd is a workspace member but is EXCLUDED from `default-members` (root
+# Cargo.toml): with `wan` default-on, a default-member netd would unify the iroh
+# tree into the CLI + vizd (cargo's per-package feature unification), so keeping it
+# out means a plain `cargo build` builds netd only as a dependency with NO wan — the
+# CLI + vizd stay iroh-free. The shipped daemon still ships wan by default via
+# `cargo build -p cerulion_netd` / `cargo install`, and `--workspace` gates still
+# compile the wan netd. The lean `NetdClient` consumers (the CLI + vizd) additionally
+# set `default-features = false` on their netd dep.
+[package]
+name = "cerulion_netd"
+version.workspace = true
+edition.workspace = true
+# License is INHERITED from the workspace (AGPL-3.0-only). `cerulion_netd` links
+# `cerulion_core` (the SHM + zenoh network plane), so it is AGPL. Do NOT override.
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Per-computer network gateway daemon for Cerulion: owns the machine's single zenoh session, serves reference-counted remote-topic demands from local tools over a Unix socket, mirrors each remote topic into local shared memory once, and exits when idle"
+readme = "README.md"
+keywords = ["robotics", "zenoh", "gateway", "daemon", "cerulion"]
+categories = ["science::robotics", "network-programming"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/cerulion-{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "cerulion-{ version }-{ target }/{ bin }{ binary-ext }"
+
+[lints]
+workspace = true
+
+[features]
+# `wan` is default-on: the iroh WAN plane
+# ships by default. Every standalone build/install of `cerulion-netd` includes it;
+# `--no-default-features` is the lean zenoh-only opt-out (the `GatewayMirrorPlane`
+# LAN path is byte-unchanged), which the CLI + vizd `NetdClient` consumers select so
+# they stay iroh-free.
+default = ["wan"]
+
+# The iroh WAN plane — netd's second transport plane, so netd owns
+# THE one mirror per (robot, topic) for BOTH planes (zenoh on the LAN, iroh over the
+# WAN). netd's iroh plane drives its OWN supervised re-inject loop
+# (`iroh_plane::run_reinject_reader`), NOT `cerulion_wireclient::reader::run_topic_reader`
+# (that is the connectd session driver's loop); the element genuinely shared with the
+# connectd worker is cerulion_core's `IngressInjector::reinject_raw` PRIMITIVE.
+# The two reader loops are not unified.
+#
+# From `cerulion_wireclient` netd reuses the `cerulion_q` wire vocabulary
+# (`protocol`) + the dial-config parsers (`config::{parse_eid, parse_addrs,
+# resolve_desk_seed}`). That substrate lives in the neutral `cerulion_wireclient`
+# crate (extracted from `cerulion_connectd`), so netd depends on THAT — NOT on
+# `cerulion_connectd` — which is what lets `cerulion_connectd` become a
+# `cerulion_netd::NetdClient` consumer with no cyclic package edge.
+#
+# The `wan` feature pulls `cerulion_link` (→ iroh, ~390 crates) +
+# `cerulion_wireclient` (the re-inject substrate) + `cerulion_pairing` (to
+# derive the desk's public device key from its seed, so the WAN pre-flight's
+# `DemandSubject::Wan` carries netd's OWN demander identity — never the dial target)
+# + a tokio runtime.
+wan = [
+    "dep:cerulion_link",
+    "dep:cerulion_wireclient",
+    "dep:cerulion_pairing",
+    "dep:tokio",
+]
+
+[lib]
+# lib + bin: the reusable daemon + protocol + refcount registry + hygiene live in
+# the lib so the e2e drives an IN-PROCESS daemon over a temp socket with an
+# injected (spy) mirror plane — parallel-safe, no zenoh. `src/main.rs` is the thin
+# production entry (init transport + the real GatewayMirrorPlane + signals).
+path = "src/lib.rs"
+
+[[bin]]
+name = "cerulion-netd"
+path = "src/main.rs"
+
+[dependencies]
+# The single zenoh session + the desk mirror primitive
+# (`TransportManager::register_ingress_topic`) netd owns once per computer.
+# Linking cerulion_core makes netd AGPL (correct — it is the desk-side network
+# plane over SHM). Direct `path` (mirrors cerulion_connectd) — a leaf daemon
+# nobody depends on needs no `[workspace.dependencies]` entry.
+cerulion_core = { workspace = true }
+# First-contact automagic: the LAN peer-discovery substrate — the
+# `~/.cerulion/peers.json` FORMAT + READER, the discovered-peer types, the bounded
+# TCP reachability pre-filter, and the pure connect-set planner. Extracted from
+# `cerulion_cli_engine` (which depends on THIS crate for `NetdClient`, so the
+# reverse edge would be cyclic) exactly as `cerulion_wireclient` was extracted from
+# `cerulion_connectd`. std + serde + dirs + tracing only — no transport, no iroh,
+# no mdns-sd — so it adds nothing to the CLI's or vizd's dependency tree.
+# NOTE: this is the READER half by construction. Writing the cache requires
+# evidence a gather CONFIRMED a robot live, which netd does not have, so
+# `save_peers` deliberately stays in `cerulion_cli_engine`.
+cerulion_discovery = { workspace = true }
+# The shared socket lifecycle (`hygiene.rs` is a thin binding of it to netd).
+cerulion_hygiene = { workspace = true }
+# The `_cerulion._tcp` BEACON (the advertise half). netd hosts the
+# robot's serving gateway since the netd fold, and that fold dropped the advertise
+# with the `run-gateway` child it lived in, so a serving robot went invisible to
+# the PRIMARY discovery rung. `cerulion_cli_engine` depends on THIS crate, so the
+# beacon cannot be imported from the CLI engine (cyclic) and `cerulion_discovery`
+# is pinned mdns-sd-free — hence the shared leaf crate. Pulls only mdns-sd +
+# serde/tracing; netd is out of `default-members` anyway.
+cerulion_mdns = { workspace = true }
+# The built-in ROS 2 corpus's hash→name bindings
+# (`builtin_hash_bindings`) for the serving that the STANDING gateway is handed at
+# daemon start. A gateway names a runtime-registered topic (an rmw publisher)
+# only through that map, and a start-booted gateway receives NO CLI-built
+# serving — so without this every rmw topic on a pure-ROS robot catalogued
+# `schema_name: None` and no desk could consume it. The CLI engine cannot supply
+# it (it depends on THIS crate — cyclic), and cerulion_core cannot hold the corpus
+# (native_ros2_messages depends on core). Already in every CLI/vizd tree.
+native_ros2_messages = { workspace = true }
+# Structured logging (never println! in library code). Cap release logging at
+# info, mirroring cerulion_core / cerulion_connectd / cerulion_vizd.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+# The binary installs an env-filter subscriber; the library never installs one.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The sacred NDJSON control protocol (derive-based request/response types + the
+# one-object-per-line codec).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SIGINT + SIGTERM (features=["termination"]) → the clean drop-session/close-
+# socket/remove-pidfile shutdown (the bagd / cerulion_vizd precedent).
+ctrlc = { version = "3", features = ["termination"] }
+# flock(2) for the single-daemon pidfile lock (hygiene.rs) — the stale-proof,
+# TOCTOU-free single-daemon guarantee (kernel releases the lock on process death).
+libc = "0.2"
+
+# ── iroh WAN plane deps. `optional = true` — pulled ONLY when the `wan`
+#    feature is active. `wan` is DEFAULT-ON (see the `[features]` block above), so a
+#    per-package `cargo build -p cerulion_netd` DOES pull the iroh tree; the lean
+#    zenoh-only opt-out is `--no-default-features`. netd is kept OUT of
+#    `default-members` (root Cargo.toml) precisely so this default-on iroh tree is
+#    NOT unified into a plain `cargo build`'s CLI + vizd.
+# The thin iroh dial-by-key QUIC wrapper: `dial`/`build_endpoint`/the per-topic uni
+# frame streams + the `cerulion/wire/1` ALPN constant. Permissive (MIT OR Apache),
+# so it does NOT change netd's AGPL posture.
+cerulion_link = { workspace = true, optional = true }
+# The desk-side `cerulion/wire/1` client SUBSTRATE netd depends on (it was
+# extracted from `cerulion_connectd` into a neutral crate so there is NO
+# `netd → connectd` cyclic package edge): the `protocol`
+# `WireRequest`/`WireResponse`/`StreamPreamble` control vocabulary (`iroh_plane.rs`)
+# and the `config::{parse_eid, parse_addrs, resolve_desk_seed}` WAN-robot input
+# parsers (`wan.rs`). NOTE: netd's iroh plane drives its OWN supervised re-inject
+# loop (`iroh_plane::run_reinject_reader`, with reader-death teardown) — NOT
+# `reader::run_topic_reader` (that is the connectd session driver's loop). The one
+# element genuinely shared with the connectd worker is cerulion_core's
+# `IngressInjector::reinject_raw` PRIMITIVE; the two reader loops are not
+# unified. Linking this keeps netd AGPL (already AGPL via core).
+cerulion_wireclient = { workspace = true, optional = true }
+# Derive the desk's public device key from its 32-byte seed
+# (`DeviceIdentity::from_seed(seed).public_key()`), so the iroh WAN plane's
+# demand-authorization pre-flight passes netd's OWN demander identity on
+# `DemandSubject::Wan` (never the dial target). Already a dev-dep for the WAN e2e;
+# promoted to an optional `wan` dep for the production derivation. Permissive-licensed
+# (does not change netd's AGPL posture — already AGPL via cerulion_core).
+cerulion_pairing = { workspace = true, optional = true }
+# The iroh dial + control round-trips + the spawned per-topic reader tasks run on a
+# tokio runtime (the runtime iroh mandates). The sync `MirrorPlane` facade blocks on
+# it. Same trimmed feature set as cerulion_connectd's runtime.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "macros",
+], optional = true }
+
+[dev-dependencies]
+# test-helpers unlocks TransportManager::init_for_test + iceoryx_test_config so
+# the mirror-plane iox2 test drives the REAL demand→mirror path over an isolated
+# per-test SHM root (the gateway_iox2_test precedent) — proving the production
+# GatewayMirrorPlane is not inert.
+cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+# ── The loopback-iroh WAN-plane e2e (`wan_plane_iroh_test.rs`, itself
+#    `#[cfg(feature = "wan")]`) stands a REAL robot up in-process (`cerulion_remoted`
+#    WirePlane + PairingAuthorizer over loopback iroh) and drives netd's iroh plane
+#    against it — cribbing `cerulion_connectd/tests/reinject_e2e_test.rs`. These are
+#    dev-deps (never in a `cargo build`). `wan` is DEFAULT-ON, so `cargo test -p
+#    cerulion_netd` already compiles this file; `--no-default-features` compiles it to
+#    nothing (the CI step names `--features wan` explicitly, redundant-but-harmless).
+cerulion_remoted = { path = "../cerulion_remoted" }
+cerulion_pairing = { path = "../cerulion_pairing" }
+cerulion_link = { path = "../cerulion_link" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# hex-encode a derived ed25519 public key into the `parse_eid`-accepted 64-char
+# form for the WAN-registry parse oracle (the wan.rs unit tests + the e2e).
+hex = "0.4"
+# The WAN-registry account-resolution test writes a cached device cert
+# (`base64url(postcard(SignedDeviceCert))`, the exact shape `cerulion login` writes)
+# so `from_env` resolves the account off it. Same versions as cerulion_pairing /
+# cerulion_wireclient.
+base64 = "0.22"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+# Isolated temp dirs for the WAN-registry account-resolution file tests.
+tempfile = "3"
+# LEVEL pins for the boot fold's log arms. `no-env-filter` so the capture
+# sees `cerulion_netd`'s own targets regardless of RUST_LOG — the whole point is
+# that demoting the success `info!` or the every-peer-failed `info!` to `debug!`
+# must FAIL a test, and a level claim can only be pinned by matching the level.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# The desk-side epoch-push e2e writes a REAL cached epoch artifact (a
+# genuinely signed intermediate + access-list epoch — Principle #13, no fabricated
+# blobs), so it needs the same signing primitive cerulion_pairing uses. Dev-only.
+ed25519-dalek = { version = "2", features = ["rand_core"] }

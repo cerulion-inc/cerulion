@@ -1,0 +1,88 @@
+# examples/go2/deny.toml — cargo-deny configuration for the ISOLATED Go2 demo
+# workspace.
+#
+# WHY A SEPARATE FILE: this workspace is not a member of the root workspace
+# (own lockfile, built on the companion computer, never enters root CI), and
+# its dependency tree carries demo-only deps (rerun, gstreamer, gilrs, crossterm) whose
+# transitive licenses do NOT appear in the root tree. Extending the ROOT
+# allow-list for them would silently loosen the root gate for future root
+# deps; per the scoped-exception pattern already used there (option-ext),
+# every demo-only license lands here as a PER-CRATE exception instead, so a
+# new crate under one of these licenses is a loud, reviewed event.
+#
+# Run from examples/go2/ (needs cargo-deny):
+#   cargo deny check advisories licenses bans sources
+#
+# Advisories note: this workspace resolves its OWN lockfile — the root
+# lockfile's zenoh 1.8.0 pin (RUSTSEC-2026-0041, see the root deny.toml)
+# does NOT reach it automatically. After any fresh resolve here, re-pin:
+#   cargo update -p zenoh --precise 1.8.0
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+    # Same acceptance as the root deny.toml: unmaintained compile-time
+    # proc-macro, no runtime code, transitive.
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, compile-time only, transitive" },
+    # net2: UNMAINTAINED-class (deprecated in favor of socket2), NOT a
+    # vulnerability. Chain: cerulion_go2_dds -> ros2-client 0.10 ->
+    # {rustdds 0.13.1, mio-extras} -> mio 0.6.23 -> net2 (the rustdds
+    # event loop predates mio 0.8; no safe upgrade exists at the
+    # verified pins). Demo-workspace-only; revisit at
+    # every ros2-client/rustdds bump (an upstream mio>=0.8 migration
+    # removes net2 and this entry MUST then be deleted).
+    { id = "RUSTSEC-2020-0016", reason = "net2 via ros2-client/rustdds mio-0.6 event loop: unmaintained-class, no safe upgrade at verified pins, demo-only" },
+]
+
+[licenses]
+version = 2
+# The root allow-list verbatim (see the root deny.toml for the per-entry
+# survey rationale) — demo-only licenses are NOT added here; they are
+# per-crate exceptions below.
+allow = [
+    "AGPL-3.0-only",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+# Demo-only per-crate exceptions (all transitive via `rerun` 0.34, surveyed
+# 2026-07-08). Every license below is compatible with distributing this
+# demo under AGPL-3.0-only:
+#   - MPL-2.0 (indent): weak file-level copyleft, unmodified use — the same
+#     reasoning as the root's option-ext exception.
+#   - CC0-1.0 (tiny-keccak): public-domain dedication.
+#   - CDLA-Permissive-2.0 (webpki-roots): permissive data license for the
+#     bundled Mozilla root-CA store.
+#   - BSL-1.0 (xxhash-rust): Boost — permissive; the root tree only ever
+#     sees BSL in OR-expressions, this crate is BSL-only.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    { allow = ["MPL-2.0"], crate = "indent" },
+    { allow = ["CC0-1.0"], crate = "tiny-keccak" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    { allow = ["BSL-1.0"], crate = "xxhash-rust" },
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The pinned rustdds lease fork (this workspace's `[patch.crates-io]`,
+# matching the root workspace). PRUNE when the patch is dropped (upstream
+# rustdds > 0.13.1 with the lease knob) — an unmatched allow-git entry then
+# becomes stale config.
+allow-git = ["https://github.com/cerulion-inc/RustDDS"]

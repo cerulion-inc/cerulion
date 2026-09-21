@@ -1,0 +1,17 @@
+# per-cell summary (compile_csv.py). Lines starting with '#' are schema notes , skip them when parsing.
+# one_way_p50_ns = round_trip_p50_ns // 2 ,  RTT p50 / 2, a DERIVED approximation valid only for path-symmetric lines; not a measurement.
+# round_trip_p50_ns = median of per-rep p50s (equals the plain p50 at rep_count=1); rep_p50_{min,max}_ns = per-rep p50 spread; all other stats pool samples across reps (iterations = pooled count).
+# empty percentile cells were SUPPRESSED: fewer than 20 pooled samples back that tail at this n (see MIN_TAIL_EXCEEDANCES; add reps or extend the schedule to make them citable).
+# achieved_rate_hz (fixed100 variant only; empty elsewhere): the publish rate the row ACTUALLY ran at, from the runner's .rate sidecar ,  below the 100 Hz target = fallback-ladder rung (plots annotate it); 'mixed' = reps disagree; 'did_not_sustain' = the ladder was exhausted and the row is EMPTY (no latency was minted).
+# unstamped / nonpositive_rtt (ROS 2 cells only): echoes that completed the round trip and yielded NO sample, pooled across reps like iterations ,  the terms that close received == samples + warmup + unstamped + nonpositive_rtt. Empty = no receipt was OWED here (a native or workspace leg writes none); 'unknown' = one WAS owed and could not be totalled (a rep the ROS 2 driver ran carried none, or carried no parseable count, or only some reps answered), never a sum over the reps that answered.
+payload_bytes,iterations,round_trip_p50_ns,round_trip_p99_ns,round_trip_mean_ns,one_way_p50_ns,chrt,loaned,floor_ns,p1_ns,p10_ns,p25_ns,p75_ns,p90_ns,p95_ns,p99_9_ns,max_ns,rep_count,rep_p50_min_ns,rep_p50_max_ns,achieved_rate_hz,unstamped,nonpositive_rtt
+64,10000,4076,9595,6262,2038,0,,3225,3494,3842,3949,4266,4977,6795,,4336538,5,3985,4189,100,,
+256,10000,4123,9720,5698,2061,0,,3634,3780,3893,3982,4289,5151,7191,,5182698,5,3982,4212,100,,
+1024,10000,4086,9672,5063,2043,0,,3352,3649,3870,3967,4288,4980,6597,,3672461,5,4024,4227,100,,
+4096,10000,4134,10684,5960,2067,0,,3498,3785,3921,4017,4357,5670,7732,,5266627,5,4027,4263,100,,
+16384,10000,4115,9875,4999,2057,0,,3675,3809,3931,4030,4329,5027,6839,,1437522,5,4112,4203,100,,
+65536,10000,4301,10267,6496,2150,0,,3408,3868,4011,4147,4502,5910,7935,,5725409,5,4151,4347,100,,
+262144,10000,4482,12207,6464,2241,0,,3603,3875,4091,4307,4748,6286,8290,,6517186,5,4224,4585,100,,
+1048576,10000,6811,17912,10237,3405,0,,3821,4793,5735,6081,7115,8448,10433,,4303441,5,5875,7110,100,,
+4194304,10000,8858,1445462,39762,4429,0,,4014,4514,5597,6722,17026,19429,24231,,3404213,5,8275,9681,100,,
+16777216,10000,9602,44681,17151,4801,0,,3565,4455,5054,7728,18375,24284,29342,,3920170,5,9224,11788,100,,

@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "cerulion_bag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "MCAP writer and reader for Cerulion recordings: byte-deterministic output, chunked writes, and bags that stay readable after a torn tail"
+readme = "README.md"
+keywords = ["robotics", "mcap", "recording", "replay", "cerulion"]
+categories = ["science::robotics", "encoding"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The trace record type + hash-recipe semantics are shared with the core
+# runtime (the `__cerulion/scheduler_trace` channel carries the 40-byte
+# `TraceRingRecord` wire form verbatim). NO direct iceoryx2 dependency — the
+# exact-pin lockstep test guards the iceoryx2 family and this crate must not
+# perturb it.
+cerulion_core = { workspace = true }
+thiserror = "2"
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
+# writev(2) + sysconf(_SC_IOV_MAX) for the zero-copy recorder flush path.
+libc = "0.2"
+# MCAP chunk / DataEnd / Footer / attachment CRCs are CRC-32/ISO-HDLC.
+crc32fast = "1.5"
+# Reader + independent test oracle only. Uncompressed bags only, so drop the
+# heavy zstd/lz4 C toolchains from the default feature set.
+mcap = { version = "0.25", default-features = false }
+# Memory fix: memory-map the bag on read so recorded payloads are served
+# as borrowed page-cache slices (kernel-evictable) instead of a full `fs::read`
+# heap copy — replay peak RSS becomes O(frame count) not O(bag size). memmap2 is
+# MIT OR Apache-2.0 (deny.toml-allowed) and wraps only the POSIX `mmap(2)` that
+# iceoryx2 already relies on; the map is read-only.
+memmap2 = "0.9"
+# Per-topic frame-span index preserves channel insertion (file) order.
+indexmap = "2.8"
+# The `__cerulion/schemas.json` schema-provenance attachment is JSON,
+# built from cerulion_core's `SchemaDoc` vocabulary (already serde-derived), so
+# this adds no new crate to the dependency tree — cerulion_core pulls both.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Expose the WritevSink seam + scripted test sink outside `#[cfg(test)]` so
+# the integration tests in tests/ can drive partial-write / EINTR / IOV_MAX
+# batching deterministically. Enabled automatically for this crate's own
+# integration tests via the dev-dependency self-reference below (mirrors
+# cerulion_core's `test-helpers` pattern).
+test-helpers = []
+
+[dev-dependencies]
+# Self-reference turns on `test-helpers` for tests/*.rs (the scripted sink +
+# framing internals become visible to integration tests but NOT to downstream
+# crates).
+cerulion_bag = { path = ".", features = ["test-helpers"] }
+# `mcap` (the independent read oracle in the round-trip test) is already a
+# normal dependency, so it needs no dev-dependency entry — it is visible to
+# integration tests via `[dependencies]`.

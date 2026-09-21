@@ -1,0 +1,30 @@
+[package]
+name = "cerulion_cli_tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Interactive terminal dashboard (TUI) for monitoring Cerulion graphs, nodes, and topics"
+readme = "README.md"
+keywords = ["robotics", "tui", "dashboard", "monitoring", "cerulion"]
+categories = ["science::robotics", "command-line-utilities"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[dependencies]
+cerulion_cli_engine = { workspace = true }
+cerulion_core = { workspace = true }
+ratatui = "0.29"
+crossterm = "0.28"
+
+[dev-dependencies]
+ratatui = { version = "0.29", features = ["unstable-backend-writer"] }

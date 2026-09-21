@@ -1,0 +1,11 @@
+error[E0599]: no method named `__cer_with_nested_data` found for mutable reference `&mut OutputProxy<'_, Image>` in the current scope
+  --> tests/ui/type_error/var_field_bogus_nested_through_plain_field.rs:31:29
+   |
+31 |         self.image.data.len = 3;
+   |                             ^
+   |
+help: there is a method `__cer_with_nested_header` with a similar name
+   |
+31 -         self.image.data.len = 3;
+31 +         self.image.data.len __cer_with_nested_header 3;
+   |

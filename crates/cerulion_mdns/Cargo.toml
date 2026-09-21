@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The `_cerulion._tcp` mDNS BEACON — the ADVERTISE half of its
+# ONE gateway beacon, extracted so BOTH advertising processes run the SAME code.
+#
+# Why a crate and not a second copy: folded the permissive gateway
+# plane into `cerulion-netd`, so a robot serving topics now has its serving plane
+# in netd while the standalone `graph run-gateway` child survives ONLY as the
+# netd-unreachable fallback. Both must advertise. `cerulion_cli_engine` already
+# depends on `cerulion_netd` (for `NetdClient`), so netd importing the beacon from
+# the CLI engine would be a CYCLIC package edge — the same constraint that
+# produced `cerulion_discovery` and `cerulion_wireclient`. And `cerulion_discovery`
+# cannot host it: that crate is pinned std + serde + dirs + tracing ONLY (no
+# mdns-sd), precisely so it stays free in `default-members`.
+#
+# So the beacon lands in its own leaf crate. What lives here is exactly what an
+# ADVERTISER needs — the service type, the TXT vocabulary, the beacon-facts
+# enrichment, the SRV port derivation, and the registration guard. The BROWSE half
+# stays in `cerulion_cli_engine::mdns_discovery`: netd never browses, and the
+# browse rung's return type (`cerulion_discovery::DiscoveredPeer`) plus its
+# `connect_cmd::normalize_eid` seam are CLI-side concerns. One definition of
+# `CERULION_SERVICE_TYPE` still serves both, so the advertiser and the browser
+# cannot drift apart on the one string that has to match.
+#
+# Costs nothing new to the default build: `mdns-sd` is ALREADY in the
+# `default-members` tree via `cerulion_cli_engine`, and this crate pulls nothing
+# else beyond serde/tracing.
+[package]
+name = "cerulion_mdns"
+version.workspace = true
+edition.workspace = true
+# INHERITED AGPL. This crate links no proprietary-embeddable surface; it is desk +
+# robot infrastructure like the rest of the discovery stack.
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "The `_cerulion._tcp` mDNS gateway beacon for Cerulion (advertise half): SRV and TXT record assembly, the endpoint facts published by the remote-access daemon, and the registration guard, shared by `cerulion-netd` and the fallback gateway process"
+readme = "README.md"
+keywords = ["robotics", "mdns", "dns-sd", "discovery", "cerulion"]
+categories = ["science::robotics", "network-programming"]
+# A crates.io download carries this crate's own sources, its README, the
+# text of the license it is published under and this manifest. Whatever else
+# the directory holds now or gains later, an integration test tree or an
+# agent instruction file, serves work inside this repository: a dependent
+# never builds from it, so it stays out of the package.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Pure-Rust mDNS-SD. No C deps; advertises `_cerulion._tcp` on the LAN.
+# SAME version as `cerulion_cli_engine`'s dep — the browse half and this advertise
+# half must speak one protocol implementation.
+mdns-sd = "0.20"
+# Parse `cerulion_remoted`'s PUBLIC beacon-facts JSON
+# (`eid`/`iroh_port`/`claimable` TXT enrichment).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Structured logging (never println! in library code).
+tracing = "0.1"
+# The advertise error the two callers map onto their own surfaces (a `CliError`
+# in the CLI, a `warn!` in netd).
+thiserror = "2"
+
+[dev-dependencies]
+# Isolated `CERULION_STATE_ROOT` dirs for the beacon-facts I/O-wiring tests.
+tempfile = "3"

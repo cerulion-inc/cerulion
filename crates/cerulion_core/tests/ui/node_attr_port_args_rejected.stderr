@@ -1,0 +1,5 @@
+error: `inputs(...)` / `outputs(...)` macro args are not accepted. Declare ports via field-level `#[input]` / `#[output]` attributes and pair the struct with `#[cerulion_node_impl]`.
+ --> tests/ui/node_attr_port_args_rejected.rs:6:17
+  |
+6 | #[cerulion_node(inputs(a), outputs(b))]
+  |                 ^^^^^^

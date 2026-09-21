@@ -1,0 +1,41 @@
+# MONO leg graph — the 3-node round-trip chain run as ONE process
+# (`cerulion graph run rtt_bench --single-process --release`).
+# Ported verbatim from
+# benches/cerulion_round_trip_quiescent/graph_rtt_bench/graphs/rtt_bench.yaml.
+# The SPLIT sibling is graphs/rtt_bench_split.yaml; the two
+# must stay FAITHFUL MIRRORS (identical nodes / topics / schemas /
+# max_slice_len) or the mono-vs-split A/B is invalid; the split file's only
+# intended delta is the `process_groups:` block (the graph's name is its file
+# stem, so neither file carries a `name:` key).
+#
+# max_slice_len 17_000_000 (> 16 MiB = 16_777_216) covers the largest
+# payload in the pinned 10-size sweep. Trigger policy lives on the node
+# macros — the ping rate knob is the compile-time
+# `#[cerulion_node(period_ms = N)]` attr, rewritten per payload size by
+# run_workspace.sh.
+prefix: rtt_bench
+nodes:
+- id: ping
+  type: ping_node
+  inputs: []
+  outputs:
+  - name: ping_out
+    schema: sensor_msgs/Image
+    max_slice_len: 17000000
+    history_size: 0
+- id: pong
+  type: pong_node
+  inputs:
+  - name: ping_in
+    source: ping/ping_out
+  outputs:
+  - name: echo_out
+    schema: sensor_msgs/Image
+    max_slice_len: 17000000
+    history_size: 0
+- id: latency
+  type: latency_node
+  inputs:
+  - name: echo_in
+    source: pong/echo_out
+  outputs: []

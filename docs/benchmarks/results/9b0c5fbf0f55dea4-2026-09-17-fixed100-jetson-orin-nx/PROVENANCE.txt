@@ -1,0 +1,163 @@
+platform@ba5d75c5c - Jetson (aarch64 Linux) platform latency campaign (JETSON LANE)
+==================================================================================
+
+WHAT THIS IS
+  The published fixed100 spec (k=5 reps INTERLEAVED BY REP, 2000 measured samples
+  per size, ten sizes 64 B - 16 MiB, fixed 100 Hz target, STOCK posture, always-on
+  window recorder ON) re-run on an NVIDIA Jetson Orin NX developer kit, so the
+  x86-64 Linux row has an arm64 Linux sibling.
+
+PROVENANCE (read off the artifacts, not from memory)
+  suite git sha     ba5d75c5c226e749c9f5e8846c55c21b8bfd1035
+                    Asserted twice: HEAD == the requested sha right after the
+                    worktree was created, and TREE-MATCH (same HEAD, zero dirty
+                    paths) immediately before the build. Either mismatch was an
+                    exit-12 NON-RESULT.
+  cerulion binary   sha256 fc0c8f51a9fa99ad9779e6a7a4cfe2f6236939b6b6587517c0781a0dbb548475
+                    (sha16 fc0c8f51a9fa99ad) - ONE binary built every Cerulion row.
+  toolchain         rustc 1.96.1 (31fca3adb 2026-06-26) / cargo 1.96.1
+  build wall        751 s (cerulion_cli + the bench workspace's own cargo
+                    workspace), plus a one-off 561 s native-bench build that
+                    bench.py performed inside rep 1's first `native` call.
+  measured          2026-09-17, 01:54:24Z - 03:20:11Z UTC (5 reps, 5902 s total)
+  hardware          NVIDIA Jetson Orin NX developer kit (aarch64, 8-core Arm
+                    Cortex-A78AE, 16 GB), Linux for Tegra R36.4.3,
+                    kernel 5.15.148-tegra
+  posture           STOCK: --chrt 0 (no chrt wrapper applied), CER_BENCH_DMA_LOCK=0,
+                    recorder env UNTOUCHED (= ON). No sudo, no tuning, no sweep.
+
+  `chrt0` in every cell name is a chrt-ABSENCE marker, not a chrt claim: the suite
+  names cells `<cell>_chrt{N}` unconditionally and `--chrt 0` applies NO chrt
+  wrapper. No row here claims RT scheduling.
+
+GOVERNOR - THE HEADLINE CAVEAT, RAISED BY THE SUITE ITSELF
+  The suite printed, verbatim, at every sweep:
+    "! cpu governor is 'schedutil', not 'performance' - DVFS can move small-payload
+     p50s by double digits; set the performance governor before a citable sweep
+     (recorded in run.json either way)"
+  It was NOT acted on, for two independent reasons: the box rules forbid sudo, and
+  STOCK is the commissioned posture - schedutil IS this Jetson's stock governor.
+  The consequence is stated rather than smoothed over: the x86-64 Linux published
+  row was measured under the PERFORMANCE governor and this arm64 row under
+  schedutil, and the suite's own estimate of that gap is double-digit percent at
+  SMALL payloads. run.json records the governor for every invocation.
+
+CELLS
+  cerulion_workspace_mono_chrt0    graph run rtt_bench --single-process.
+                                   CERULION_EXECUTION_MODE was DELIBERATELY NOT SET
+                                   here: the opt-in is INERT on a monolith by
+                                   design, and setting it would emit the INERT warn
+                                   for nothing. recorder.json accordingly records
+                                   coordination=lockstep on all 10 mono runs, which
+                                   is the correct value for a monolith and NOT a
+                                   split falling back.
+  cerulion_workspace_split_chrt0   graph run rtt_bench_split, declared 2-group
+                                   multi-process, CERULION_EXECUTION_MODE=free_run.
+                                   coordination=free_run on all 10 split runs.
+  iox2_chrt0                       raw iceoryx2 floor.
+  NO ROS 2 and NO zenoh rows - see below. HEADLINE.md names all three missing cells
+  explicitly rather than leaving a reader to assume they were measured and dropped.
+
+ROS 2 CELLS ARE ABSENT, AND THE REASON IS MEASURED, NOT ASSUMED
+  An arm64 Jazzy image DOES exist on this box (latency_bench:jazzy, arm64/linux,
+  created 2026-08-16) carrying label
+  com.cerulion.bench.repo_git_sha=5abb7c3d9f2607771ff328d41e5d1ee2afba3208.
+  The established reuse rule is: reusable only when the label sha equals the run
+  sha, OR benches/latency/ros2 is byte-identical between the two. NEITHER holds -
+  5abb7c3d..ba5d75c5c touches 19 files, +4159/-262.
+  It is worse than a stale label. bench.py bind-mounts run_bench.sh, configs/ and
+  verify_shm.sh read-only FROM THE CHECKOUT, so the DRIVER would have been the
+  current one (+2080 lines), while the 16 remaining changed files are BAKED INTO
+  THE IMAGE and include EVERY measuring node - latency_node.cpp (+345),
+  composed_rtt_node.cpp (+254), latency_node_rcl.cpp (+249), ping_node.cpp,
+  pong_node.cpp, pong_node_rcl.cpp - plus three headers that did not exist at the
+  label sha (stamp_codec.hpp, sample_gate.hpp, msg_class_dispatch.hpp). Running the
+  new driver against those old binaries is a mismatched pair, not a reuse. Building
+  an image was out of scope for this lane, so no ROS 2 row was produced.
+
+run.json git_dirty = TRUE, AND HERE IS EXACTLY WHY
+  The worktree carried ONE untracked path and no tracked change at all. Verbatim
+  `git status --porcelain` in the measured worktree, complete:
+      ?? target
+  `git diff --stat HEAD` is EMPTY - zero tracked-file modifications - and HEAD is
+  ba5d75c5c226e749c9f5e8846c55c21b8bfd1035. So the code that was built and measured
+  is byte-identical to the requested sha.
+  `target` is a SYMLINK to the shared box target, and it is there on purpose. The
+  box rule is that per-lane worktrees share one warm box target under the box lock.
+  It cannot be done with CARGO_TARGET_DIR: run_workspace.sh resolves the CLI as
+  "${CERULION:-$REPO_ROOT/target/release/cerulion}", so exporting CARGO_TARGET_DIR
+  puts the binary somewhere the runner does not look; and bench.py's
+  refuse_foreign_cerulion_override rejects an exported CERULION= pointing outside
+  the checkout. A symlink at $REPO_ROOT/target satisfies both. The workspace
+  cdylibs keep their own in-worktree target, so run_workspace.sh's
+  `rm -rf $SCRIPT_DIR/target/debug` never touches another lane's artifacts.
+  The lane's TREE-MATCH assert therefore required HEAD == the sha AND zero dirty
+  paths after excluding exactly this one untracked symlink.
+
+WITNESSES (rep 1, every per-size run log, ANSI-stripped before every field grep)
+  split (10/10 logs): window="own_recorder"; "flashback: holding a rolling window
+    for this run"; "Flashback capture plane ARMED"; execution_mode=FreeRun;
+    "execution mode stamped into every worker plan"; "free-run deployment: no
+    shared barrier is created"; build_path=FreeRunLive on BOTH workers.
+    FORBIDDEN AND ABSENT throughout (MUSTNOT=0): execution_mode=Lockstep,
+    build_path=Lockstep, "deterministic-live (cross-process) gating quantum
+    installed", "left cross-process barrier cohort", the INERT warn, the
+    garbage-value warn.
+  mono (10/10 logs): the three recorder-ON witnesses, and ZERO execution-mode
+    warns (the env is not set on this cell, so neither the INERT nor the
+    garbage-value warn may appear).
+  run.json gating={wall}; cer_bar_ shared-memory segments observed = 0.
+  #912 RECORDER PLACEMENT IS PRESENT ON BOTH CELLS, 10/10 each: the window
+    recorder is pinned with core=7 (the last of 8) at nice=10. The witness matches
+    the structured key=value TOKENS on the stripped line, not the sentence, which
+    is why it still passed although the prose at this sha reads "window recorder
+    pinned (the --record core rule; ...)" rather than the "...to core N at nice N"
+    form seen in the #912-era corpus.
+  cer-dead-node sweep thread: observed in 716 live process samples, on 10 distinct
+    run-worker pids (one carrying worker per cell, as #912 intends). The comm is
+    matched by its truncation-safe prefix - Linux truncates comm to 15 bytes, so
+    `cer-dead-node-sweep` lands on disk as `cer-dead-node-s`.
+
+RATE LADDER (achieved_rate_hz, from all 150 .rate sidecars)
+  148 of 150 read 100. The two exceptions are BOTH mono, and both isolated:
+    rep 4 @ 4 MiB = 50 Hz, and rep 5 @ 4 KiB = 50 Hz.
+  They make exactly two mono CSV rows read achieved_rate_hz="mixed" (4096 and
+  4194304). The suite labels them; nothing is silent. split and iox2 sustained
+  100 Hz at all ten sizes in all five reps (100/100 sidecars).
+  Worth stating because a sibling lane hypothesised otherwise: these trips are
+  NOT in rep 1 and so are not a post-build load tail, and they are not in rep 2
+  and so are not the timer below. Two trips across fifty mono size-runs, scattered
+  - i.e. intermittent, and reported as such rather than explained away.
+
+WINDOW HYGIENE
+  systemd timers were snapshotted at START and END and gated on. The campaign
+  opened only after a hard gate confirmed no timer within ~25 min and no mandb
+  process alive. mandb - the filesystem walk that produced a 138.7 s stall on the
+  x86-64 box - was never alive and never inside the horizon (it was >3 h out).
+  anacron.timer is HOURLY on this box, so a ~90 min campaign cannot avoid it. The
+  per-rep gate therefore waits up to 720 s and then proceeds with a loud
+  TIMER-GATE-DEGRADED line naming the timer, rather than deadlocking. That fired
+  exactly once: rep 2 waited the full cap and ran across anacron's 02:32:23Z fire.
+  IT IS NOT SWEPT UNDER THE RUG, AND IT IS NOT MERELY ASSERTED HARMLESS - it is
+  checked. Per-rep median-of-sizes p50 (us):
+    Cerulion split  rep1 27.79  rep2 28.59  rep3 27.62  rep4 26.59  rep5 28.49
+    Cerulion mono   rep1 24.30  rep2 22.64  rep3 22.64  rep4 23.19  rep5 22.74
+    raw iceoryx2    rep1  3.10  rep2  2.85  rep3  2.11  rep4  3.06  rep5  1.58
+  Per-rep samples over 100 us (of 20000 per rep):
+    Cerulion split  22 21 24 16 25      Cerulion mono  17 14 31 17 24
+    raw iceoryx2     2  2  2  2  7
+  Rep 2 sits inside the spread on every cell and carries the LOWEST mono p50 and
+  the lowest or joint-lowest tail counts. The timer measurably did not perturb it.
+
+BOX STATE
+  /dev/shm held 43 entries (84K) at START, all NVIDIA baseline names, with ZERO
+  cerulion/iox2 entries; nothing pre-existing was ever swept. After the run and
+  its teardown it was back to exactly 43 with zero of ours. No bench process was
+  left alive. Disk stayed above the 12 GB floor throughout (24 GB at START,
+  21 GB at END); no reclaim was needed.
+
+WHAT IS NOT HERE
+  No .bin sample dumps - the 150 raw dumps are retained on the measuring box
+  beside the run dir, per the retention rule. No raw run logs in the package;
+  excerpts and the full campaign log live in the evidence/ directory BESIDE this
+  package. No plots. No ROS 2 or zenoh rows.

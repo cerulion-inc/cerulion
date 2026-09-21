@@ -1,0 +1,20 @@
+run_bench.sh: note - /dev/cpu_dma_latency not present (pass --device /dev/cpu_dma_latency); p99 may degrade
+run_bench.sh: rmws=[cerulion] shm=[shm] chrt=[off] recv=loan qos=be1 msg=pod pacing=fixed100 sizes=[4194304]
+
+============================================================
+  RMW: cerulion
+============================================================
+  building rmw_cerulion cdylib from /work (bindgen against the live distro headers)
+warning: rmw_cerulion@0.1.0: rmw_cerulion: AMENT prefix '/bench/ros2_ws/install/ros2_rtt_msgs' has an include/ directory but none of the core ROS package header namespaces (["rmw", "rcutils", "rosidl_runtime_c", "rosidl_typesupport_interface", "rosidl_typesupport_introspection_c"]) - skipping it for bindgen (an unrelated include tree must not select the bindgen path; if no prefix qualifies, the build falls back to the vendored bindings).
+    Finished `release` profile [optimized] target(s) in 0.14s
+  rmw_cerulion -> /tmp/rmw_cerulion_prefix/lib/librmw_cerulion.so (on AMENT_PREFIX_PATH + LD_LIBRARY_PATH)
+  build receipt -> jazzy_cerulion_shm_loan_be1_chrt0_rmw_cerulion.txt
+
+  ---- SHM mode: shm ----
+verify_shm.sh: cerulion shm qos=be1 - iceoryx2 transport confirmed (segment in the /dev/shm delta: iox2_9204dd183d1c4d8e1ff592a30766ffa6765aa8b5_node.global_mgmt)
+    cerulion shm    chrt=off qos=be1   size=4194304   ... /bench/run_bench.sh: line 1988:   177 Segmentation fault      (core dumped) ${_pin_pong:+taskset -c $_pin_pong} "${prefix[@]}" "$INSTALL_LIB/pong_node_rcl" >> "$BIN_LOG" 2>&1
+ok (2000 samples in jazzy_cerulion_shm_loan_be1_chrt0_4194304.bin)
+
+============================================================
+  Done in 23s - raw .bins under /raw
+============================================================

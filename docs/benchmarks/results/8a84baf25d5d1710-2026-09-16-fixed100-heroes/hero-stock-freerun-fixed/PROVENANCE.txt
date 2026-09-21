@@ -1,0 +1,20 @@
+hero-stock-freerun-fixed/  -  the PUBLISHED multi-process row.
+
+Build: PR #912 head a68a2a987dcee4945d6620b11b04af039e15a3bd
+       cerulion binary sha16 d7d940c5aec0c63d
+Shape: cerulion_workspace_split_chrt0, free run ON (CERULION_EXECUTION_MODE=
+       free_run) + recorder ON at shipped defaults, fixed100, chrt 0,
+       CER_BENCH_DMA_LOCK=0, msg-class variable, k=5 x 2000, post-sweep.
+
+run.json carries SIX invocations: the first (09:43:36Z) is the aborted first
+launch's rep 1, stopped at its witness gate by a false-negative thread-name
+match, no data from it is used; the five invocations from 09:51:28Z are the
+pooled series and rep1/ holds the relaunch's files (its first per-cell log is
+stamped 09:52:13Z). run.json is NOT edited: the stale invocation stays on
+record and this note explains it.
+
+ scrub applied to run.json: uname node -> box-x86 (x6), argv root
+paths -> <BOXHOME> (x6). The fields are NESTED under invocations[]  -  a
+top-level-only scrub substitutes NOTHING and ships the hostname.
+
+No run logs and no .bin in this directory (desk evidence only).
