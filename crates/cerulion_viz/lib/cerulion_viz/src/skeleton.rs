@@ -95,6 +95,8 @@ use crate::sink::InputRoute;
 // private copy with a different fallback and NO aliasing suffix).
 use crate::tf::sanitize_segment;
 
+mod validation;
+
 /// Env var naming the Go2 URDF file. Absent ⇒ the skeleton archetype is INERT.
 ///
 /// Nothing breaks either way: today no schema classifies to the skeleton
@@ -620,6 +622,9 @@ pub enum UrdfError {
     /// The document declared no `<link>`s.
     #[error("URDF has no <link> elements")]
     NoLinks,
+    /// Explicit model validation found geometry or topology the renderer cannot preserve.
+    #[error("invalid URDF model: {0}")]
+    InvalidModel(String),
     /// An explicitly supplied geometry vector is malformed or cannot reach the renderer.
     #[error("URDF <{element}> {attribute} at line {line}: expected three finite numbers representable as f32, got {value:?}")]
     InvalidVector {
@@ -904,6 +909,22 @@ pub struct Skeleton {
 }
 
 impl Skeleton {
+    /// Validate the model subset supported by explicit URDF import.
+    ///
+    /// Checks connected tree topology, finite geometry, unique entity paths,
+    /// and explicit motor bindings. Every movable joint needs exactly one binding;
+    /// fixed-only models may omit bindings. Supports fixed/revolute/continuous joints
+    /// and at most one mesh visual per link; materials and other geometry must
+    /// be implemented before they can be admitted without silent data loss.
+    /// Limits: 4096 links, depth 256, 4096-byte entity paths, and 12 motor bindings.
+    /// Entity roots cannot start with Rerun's reserved `__` prefix; nested
+    /// segments such as `world/__nested` remain supported.
+    /// This does not read mesh files, install a model, or verify measured state.
+    /// Legacy constructors retain their compatibility behavior.
+    pub fn validate_urdf(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
+        validation::validate(xml, cfg)
+    }
+
     /// An explicitly inert skeleton (renders nothing; `reparent_cloud_route` is
     /// the identity).
     pub fn inert() -> Self {
