@@ -206,6 +206,12 @@ reads no mesh files and installs nothing into Studio. See the supported subset
 and bounds in [viz internals](internals/viz.md#frames-and-transforms). The CLI
 has no model-import flag yet.
 
+`Skeleton::try_load(path, config)` adds bounded file loading and freezes original
+GLB/OBJ/STL/DAE mesh bytes for rendering. Missing resources are errors, with no
+converted `.glb` sibling fallback. See the internals reference above for limits
+and format restrictions. Loading alone does not establish rendered appearance or
+measured articulation, and does not install into vizd.
+
 ### `cerulion connect` / `pair` / `login` / `account`
 
 Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.

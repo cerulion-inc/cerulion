@@ -223,6 +223,22 @@ This check reads no assets and installs nothing;
 mesh loading, production binding, and resolved-transform acceptance remain separate.
 Legacy constructors retain their existing best-effort behavior.
 
+`Skeleton::try_load(path, config)` runs preflight and freezes original GLB, OBJ,
+STL or DAE mesh files before returning. Relative references resolve from the
+canonical URDF target's directory, including when the URDF is a symlink. Package
+references resolve from matching ancestor/sibling package directories; missing
+packages are errors. No converted sibling is substituted. Reads are bounded to
+16 MiB of XML and 256 MiB of unique mesh bytes; repeated references share bytes.
+The declared mesh extension selects the format, while its canonical path identifies
+the file. Conflicting format aliases for one file are rejected. File errors return
+`UrdfError` without exposing a partial model. Run loading off control-handler
+threads; subsequent logging reuses the frozen bytes.
+
+Loading does not install a model into vizd or verify GPU decoding. OBJ material
+libraries are ignored by the renderer; DAE support covers triangles and diffuse
+materials without textures. This loader does not resolve resources inside mesh
+formats. Visible geometry and appearance require separate verification.
+
 - `CoordinateFrame:frame` relocates only that entity's own visualizer DATA;
   `Transform3D:parent_frame` is the component the transform resolver actually
   walks for frame-chain re-parenting. They are distinct component identifiers,

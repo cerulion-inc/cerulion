@@ -67,3 +67,8 @@ Explicit URDF imports use `Skeleton::validate_urdf` preflight; legacy constructo
 are intentionally best-effort. Keep unsupported geometry/materials and malformed
 topology loud. Require exactly one binding for each movable joint; fixed-only
 models may omit bindings. Validation alone reads no assets and proves no live articulation.
+
+`Skeleton::try_load` freezes original mesh bytes with bounded reads; run it off
+control threads. Loaded bytes do not establish GPU rendering. Derive formats from
+the URDF mesh reference, not its canonical symlink target; aliases sharing a file
+must agree on format. Resolve relative assets from the canonical URDF target.
