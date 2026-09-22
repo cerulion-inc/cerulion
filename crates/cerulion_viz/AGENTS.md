@@ -86,3 +86,8 @@ on idle reconnect with a per-row retry cursor, reset only on explicit rearm.
 The worker retries pending model statics on idle probes after reconnect.
 Initial SDK failure or unwind requires a fresh sink and recording store; validation
 failure remains retryable. Submission counters do not prove viewer delivery.
+
+Bound material-verification XML parsing before indexing: at most 65536 document
+nodes, including text and comments. Bound raw `<` and `=` byte counts before
+parsing too: the parser reserves capacity before checking its node limit.
+Scene limits alone do not bound unused metadata.
