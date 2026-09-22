@@ -47,6 +47,9 @@
 //! sensor frames. `rec.log` blocking on the worker is by DESIGN: the worker is
 //! the dedicated blocking thread; the tick stays free.
 
+#[cfg(test)]
+mod bound_model_reconnect_test;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -823,7 +826,10 @@ fn run(
     // the worker keeps going.
     let mut panic_latch = FieldsWarnLatch::new();
     loop {
-        let msg = match rx.recv_timeout(probe_interval) {
+        let wait = state
+            .bound_model_submission_wait(Instant::now())
+            .map_or(probe_interval, |due| due.min(probe_interval));
+        let msg = match rx.recv_timeout(wait) {
             Ok(msg) => Some(msg),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => {
@@ -832,6 +838,12 @@ fn run(
                 // a process-local static that is never dropped, so without this
                 // the last queued frames can be lost at a clean shutdown).
                 let flush = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // The queue is drained, but the last measured pose may still
+                    // await its presentation deadline (at most one interval).
+                    if let Some(wait) = state.bound_model_submission_wait(Instant::now()) {
+                        std::thread::sleep(wait);
+                        state.flush_due_bound_model(&rec, Instant::now());
+                    }
                     rec.flush_with_timeout(TEARDOWN_FLUSH_TIMEOUT)
                 }));
                 if let Ok(Err(e)) = flush {
@@ -842,8 +854,8 @@ fn run(
         };
         // A walker swap is handled HERE (not in `handle_message`)
         // so it can take `walker` by ownership. A plain move — it cannot panic, so
-        // it needs no `catch_unwind` — and it carries no batch to render, so
-        // `continue` skips the dispatch for this iteration. FIFO on the channel
+        // it needs no `catch_unwind`. The normal idle path still checks pending
+        // presentation deadlines. FIFO on the channel
         // means every batch enqueued after this decodes against the new walker.
         // The `match ... => other` rebind consumes `msg` without partial-moving
         // it, so the non-swap path still owns `msg` for `handle_message`.
@@ -851,7 +863,7 @@ fn run(
             Some(VizMsg::SwapWalker(new_walker)) => {
                 walker = new_walker;
                 tracing::debug!("cerulion_viz: viz walker swapped (new schema set installed)");
-                continue;
+                None
             }
             other => other,
         };
@@ -872,9 +884,11 @@ fn run(
                 &mut reconnect_latch,
                 probe_interval,
                 msg,
-            )
+            );
+            state.flush_due_bound_model(&rec, Instant::now());
         }));
         if outcome.is_err() {
+            state.abort_bound_model_batch();
             counters.render_panics.fetch_add(1, Ordering::Relaxed);
             match panic_latch.on_inferred() {
                 FieldsLogAction::WarnFirst => tracing::error!(
@@ -958,7 +972,7 @@ fn handle_message(
         }
         Some(VizMsg::SwapWalker(_)) => {
             // Unreachable by construction: `run` intercepts `SwapWalker` before
-            // dispatch (it needs `walker` by ownership) and `continue`s. If a
+            // dispatch (it needs `walker` by ownership) and substitutes None. If a
             // future refactor lets one slip through, the worker's `catch_unwind`
             // contains this panic + counts it (never a silent no-op that would
             // drop the swap).
@@ -993,7 +1007,7 @@ fn handle_message(
 /// on a genuine disconnect (`Failed`), swap a fresh sink and RE-ARM the scene
 /// setup so the bounced (empty) server re-receives the statics + blueprint +
 /// skeleton tree + `/tf_static` mounts. Loud-once. A wedged-but-alive viewer
-/// (probe `Timeout`) or a healthy one (`Ok`) is left untouched (see
+/// (probe `Timeout`) or a healthy one (`Ok`) is not reconnected (see
 /// [`should_reconnect`]).
 ///
 /// IMPORTANT — the probe's `flush_with_timeout` does NOT bound the SDK's
@@ -1038,6 +1052,7 @@ fn maybe_probe_reconnect(
                 "cerulion_viz: viz gRPC sink healthy again — reconnect regime healed"
             );
         }
+        resubmit_bound_model_statics(rec, state);
         return;
     }
 
@@ -1072,6 +1087,7 @@ fn maybe_probe_reconnect(
             // `SinkState::reset_marker_state` for the two DELETE-tracking failure
             // modes it causes (draws are unaffected).
             state.reset_marker_state();
+            resubmit_bound_model_statics(rec, state);
         }
         Err(e) => tracing::debug!(
             error = %e,
@@ -1089,6 +1105,7 @@ fn process_batch(
     state: &mut SinkState,
     inputs: Vec<InputFrames>,
 ) {
+    state.begin_bound_model_batch();
     for input in inputs {
         let mut staged: Option<Vec<u8>> = None;
         let mut coalesced: u64 = 0;
@@ -1110,6 +1127,7 @@ fn process_batch(
             state.record_coalesced(coalesced);
         }
     }
+    state.finish_bound_model_batch(rec, Instant::now());
 }
 
 /// The scene statics (Z-up world + camera Pinhole) + the default dashboard
@@ -1118,6 +1136,13 @@ fn process_batch(
 fn ensure_setup(rec: &RecordingStream) {
     log_viz_statics_once(rec);
     send_blueprint_once(rec);
+}
+
+// Resume only pending static rows; quiet sensors must not leave a fresh viewer empty.
+fn resubmit_bound_model_statics(rec: &RecordingStream, state: &mut SinkState) {
+    if let Err(error) = state.submit_bound_model_statics(rec) {
+        tracing::debug!(%error, "bound model statics pending; retry on next probe");
+    }
 }
 
 #[cfg(test)]

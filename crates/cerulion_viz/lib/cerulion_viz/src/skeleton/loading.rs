@@ -111,6 +111,7 @@ impl Skeleton {
         }
         Ok(Self {
             model: Some(model),
+            strict_loaded: true,
             ..Self::default()
         })
     }

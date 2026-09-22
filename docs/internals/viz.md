@@ -303,6 +303,50 @@ attributes: identity origins, unit mesh scale, and X for a motion axis.
 Fixed joints ignore their axis. This validation does not provide a production
 model-import path.
 
+### Explicit measured-model binding
+
+`SinkState::install_bound_model(recording, route_key, skeleton)` accepts a
+`Skeleton::try_load` result with 1..12 measured bindings covering every movable
+joint. Static-only models remain loadable but cannot use this measured-joint seam.
+The caller resolves the exact attached route; blank keys reject and valid keys
+are not normalized. Models must use `models/<id>` roots, separate from `world`
+topic and TF paths. A second model is rejected.
+
+Validation and disabled-recording failures permit retry. Initial SDK submission
+failure or unwind leaves no active model and makes the sink reject reinstallation
+and further static submission. Recovery requires a fresh sink and recording store;
+discard partial viewer data. Reconnect or rearm does not clear this guard.
+
+Only fixed joints receive static transforms. Movable joints receive complete
+origin-plus-rotation transforms with finite measured angles. Static transforms on
+movable entities would shadow these measurements. Only the selected route's
+`unitree_go/LowState` motor bank animates the model; every required angle must be
+present before submission. The selected LowState bypasses pre-walk plot admission
+and coalescing while other schemas retain normal gates. No cloud or odometry
+binding is inferred.
+
+The render worker coalesces articulation independently of telemetry: one fixed-size
+latest valid motor bank survives across batches until its presentation deadline.
+Submissions are separated by at least 16,666,667 ns on the worker's monotonic clock.
+This bounds joint SDK work to at most 60 submissions per second; it does not promise
+a display rate or bound all rendering costs. Source timestamps are unchanged.
+Invalid samples remain counted and cannot replace a valid pending pose. Plot
+admission and mutation-stream delivery retain their normal rules. The worker wakes
+for pending pose deadlines even when input is quiet; other messages cannot starve
+them. Direct `dispatch_frame` calls remain immediate. Pending temporal state is
+consumed before SDK submission and discarded on reconnect or render panic.
+
+Statics submit once per model/recording until explicitly rearmed on reconnect.
+The render worker submits pending model statics after a successful reconnect
+and retries them on subsequent probes, even when no joint frames arrive.
+`submit_bound_model_statics(current_recording)` restores fixed transforms and
+frozen assets even without sensor frames. Its cursor resumes after accepted rows
+without repeating a successful prefix. Completed submission is a no-op until rearm.
+Valid selected frames also resume pending statics. Calls use the current recording
+stream and reject different or disabled stores. Status exposes submitted frames,
+rejections and the last error; SDK submission is neither an atomic viewer
+transaction nor evidence of GPU rendering. Worker/control wiring is separate.
+
 ### Entity paths
 
 - House rule: sanitize-then-plain-string. Entity strings are a contract with

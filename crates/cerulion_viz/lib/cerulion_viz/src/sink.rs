@@ -92,7 +92,7 @@ use crate::marker::{
 use crate::plot_rate::{DumpRefreshGate, PlotRateGate, RefusalCause, MAX_PLOT_SAMPLES_PER_SEC};
 use crate::pointcloud::{FieldsLogAction, FieldsWarnLatch};
 use crate::representation::{resolve_render_plan, ForcedDumpGate, RenderPlan, Representation};
-use crate::skeleton::{Skeleton, ROBOT_ROOT};
+use crate::skeleton::{BoundModel, BoundModelStatus, Skeleton, UrdfError, ROBOT_ROOT};
 use crate::tf::{
     frame_id_of, implicit_frame_of, implicit_parent_frame_of, log_transforms, sanitize_segment,
     FrameRegistry, UnknownFrameLog, WORLD_ROOT,
@@ -1474,6 +1474,10 @@ pub struct SinkState {
     /// renders. Every caller is a test. `GO2_URDF_PATH` is what an installer
     /// would read; no live path reads it.
     skeleton: Skeleton,
+    /// Explicit route and recording binding, independent of schema classification.
+    bound_model: Option<BoundModel>,
+    // Initial SDK failure is sticky because partial rows cannot be retracted.
+    bound_model_install_failed: bool,
     /// The `/tf` / `/tf_static` child frames observed this run — the
     /// evidence [`FrameRegistry::resolve`] needs to decide whether a message's
     /// `frame_id` names a frame the transform tree can actually place.
@@ -1637,6 +1641,139 @@ impl SinkState {
         self.skeleton = skeleton;
     }
 
+    /// Bind a strictly loaded model to one exact, already-attached route key.
+    ///
+    /// The caller must resolve attachment identity before calling. Initial statics
+    /// are fallible SDK submissions, not evidence of GPU rendering or live motion.
+    /// The URDF root must be `models/<id>`, disjoint from topic and TF paths
+    /// beneath `world`. Replacement is rejected; a fresh sink owns a fresh model lifecycle.
+    /// Validation failures permit retry. Once initial SDK submission fails or panics,
+    /// discard this sink and its partial recording store before another installation.
+    pub fn install_bound_model(
+        &mut self,
+        rec: &RecordingStream,
+        route_key: &str,
+        skeleton: Skeleton,
+    ) -> Result<(), UrdfError> {
+        self.install_bound_model_with(rec, route_key, skeleton, |model| model.submit_statics(rec))
+    }
+
+    pub(crate) fn install_bound_model_with(
+        &mut self,
+        rec: &RecordingStream,
+        route_key: &str,
+        skeleton: Skeleton,
+        submit: impl FnOnce(&mut BoundModel) -> Result<(), UrdfError>,
+    ) -> Result<(), UrdfError> {
+        self.check_bound_model_install_failure()?;
+        if self.bound_model.is_some() {
+            return Err(UrdfError::Submission("a model is already installed".into()));
+        }
+        let mut binding = BoundModel::prepare(rec, route_key, skeleton)?;
+        // Arm before the SDK call, including unwinding. No active model survives
+        // a failed initial submission, and another installation cannot replay its prefix.
+        self.bound_model_install_failed = true;
+        if let Err(error) = submit(&mut binding) {
+            return Err(UrdfError::Submission(format!(
+                "{error}; initial model submission failed; use a fresh sink and recording store"
+            )));
+        }
+        self.bound_model = Some(binding);
+        self.bound_model_install_failed = false;
+        Ok(())
+    }
+
+    fn check_bound_model_install_failure(&self) -> Result<(), UrdfError> {
+        if self.bound_model_install_failed {
+            return Err(UrdfError::Submission(
+                "initial model submission failed; use a fresh sink and recording store".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Submission counters and last rejection; none is a viewer-rendering proof.
+    pub fn bound_model_status(&self) -> Option<&BoundModelStatus> {
+        self.bound_model.as_ref().map(BoundModel::status)
+    }
+
+    /// Re-arm only this model after reconnect; the next selected frame resubmits
+    /// statics. Never call periodically: static rows append to viewer storage.
+    pub fn rearm_bound_model_statics(&mut self) {
+        if let Some(model) = &mut self.bound_model {
+            model.rearm_statics();
+        }
+    }
+
+    /// Resume model statics on the current recording, even without sensor frames.
+    /// Successful rows are deduplicated until explicitly rearmed after reconnect.
+    /// The worker may retry an error on its bounded reconnect probe; successful
+    /// completion becomes a no-op. This proves SDK submission only.
+    pub fn submit_bound_model_statics(&mut self, rec: &RecordingStream) -> Result<(), UrdfError> {
+        self.check_bound_model_install_failure()?;
+        match &mut self.bound_model {
+            Some(model) => model.submit_statics(rec),
+            None => Ok(()),
+        }
+    }
+
+    /// Defer only articulation while telemetry keeps its existing admission rules.
+    pub(crate) fn begin_bound_model_batch(&mut self) {
+        if let Some(model) = &mut self.bound_model {
+            model.begin_batch();
+        }
+    }
+
+    /// Submit the latest valid pose when its presentation deadline is due.
+    pub(crate) fn finish_bound_model_batch(
+        &mut self,
+        rec: &RecordingStream,
+        now: std::time::Instant,
+    ) {
+        if let Some(model) = &mut self.bound_model {
+            model.finish_batch(rec, now);
+        }
+    }
+
+    pub(crate) fn bound_model_submission_wait(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        self.bound_model
+            .as_ref()
+            .and_then(|model| model.submission_wait(now))
+    }
+
+    pub(crate) fn flush_due_bound_model(&mut self, rec: &RecordingStream, now: std::time::Instant) {
+        if let Some(model) = &mut self.bound_model {
+            model.flush_due(rec, now);
+        }
+    }
+
+    pub(crate) fn abort_bound_model_batch(&mut self) {
+        if let Some(model) = &mut self.bound_model {
+            model.abort_batch();
+        }
+    }
+
+    fn is_bound_model_input(&self, route_key: &str) -> bool {
+        self.bound_model
+            .as_ref()
+            .is_some_and(|m| m.matches(route_key))
+    }
+
+    fn submit_bound_model_frame(
+        &mut self,
+        rec: &RecordingStream,
+        route_key: &str,
+        timestamp_ns: u64,
+        frame: &FrameValue,
+    ) {
+        if let Some(model) = &mut self.bound_model {
+            model.submit_frame(rec, route_key, timestamp_ns, frame);
+        }
+    }
+
     /// Log the installed skeleton's STATIC link tree (test seam).
     ///
     /// The `Skeleton` archetype arm used to reach this on a low-level joint-state
@@ -1660,6 +1797,7 @@ impl SinkState {
     /// setup on a reconnected server.
     pub fn clear_rebroadcast_dedup(&mut self) {
         self.tf_static_last.clear();
+        self.rearm_bound_model_statics();
     }
 
     /// Forget every input's per-viewer MARKER state after a reconnect —
@@ -2383,6 +2521,7 @@ pub fn dispatch_frame(
     state: &mut SinkState,
 ) {
     if let Some(c) = classify_and_route(walker, input_name, frame, state) {
+        state.submit_bound_model_frame(rec, input_name, c.timestamp_ns, &c.fv);
         render_classified(
             rec,
             input_name,
@@ -2446,9 +2585,13 @@ pub fn dispatch_or_stage(
         // choice: whether the latest frame REPLACES an earlier one is a property
         // of the message (a cloud replaces, a text line accumulates), and how the
         // operator chose to look at it does not change that.
-        if coalesces(c.kind) {
+        if coalesces(c.kind)
+            && !(state.is_bound_model_input(input_name)
+                && c.fv.schema_name == "unitree_go/LowState")
+        {
             true
         } else {
+            state.submit_bound_model_frame(rec, input_name, c.timestamp_ns, &c.fv);
             render_classified(
                 rec,
                 input_name,
@@ -2519,7 +2662,10 @@ fn classify_and_route<'a>(
     // owe a dump render (the anti-freeze floor), and that frame has to be walked.
     let admission = match state.decide_plot_frame_before_walk(input_name, schema_hash, timestamp_ns)
     {
-        Some((false, false)) => {
+        Some((false, false))
+            if !(state.is_bound_model_input(input_name)
+                && walker.schema_name_for_hash(schema_hash) == Some("unitree_go/LowState")) =>
+        {
             state.pre_walk_drops += 1;
             return None;
         }

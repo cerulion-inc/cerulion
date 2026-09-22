@@ -6736,3 +6736,86 @@ fn a_rotation_with_sibling_telemetry_renders_the_transform_and_its_plots() {
     );
     assert!(!state.took_anyvalues_fallback("acme/AttitudeReport"));
 }
+
+#[test]
+fn explicit_model_owns_a_namespace_outside_unbound_odometry_and_tf() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.urdf");
+    std::fs::write(
+        &path,
+        r#"<robot name="model"><link name="base"/><link name="leg"/>
+        <joint name="hinge" type="revolute"><parent link="base"/><child link="leg"/>
+        <axis xyz="0 1 0"/></joint></robot>"#,
+    )
+    .unwrap();
+    let mut cfg = cerulion_viz::skeleton::UrdfConfig {
+        motor_joints: vec!["hinge".into()],
+        ..Default::default()
+    };
+    let (rec, storage) = memory();
+    let mut state = SinkState::new();
+    assert!(state
+        .install_bound_model(&rec, "selected", Skeleton::try_load(&path, &cfg).unwrap())
+        .is_err());
+    cfg.robot_root = "models/test".into();
+    state
+        .install_bound_model(&rec, "selected", Skeleton::try_load(&path, &cfg).unwrap())
+        .unwrap();
+    rec.flush_blocking().unwrap();
+    storage.take();
+    dispatch_frame(
+        &rec,
+        &builtin_walker(),
+        "robot_odom",
+        &build_odometry_frame([7.0, 8.0, 9.0], [0.0, 0.0, 0.0, 1.0], [0.0; 3], [0.0; 3], 1),
+        &mut state,
+    );
+    dispatch_frame(
+        &rec,
+        &builtin_walker(),
+        "tf",
+        &build_tf(
+            0,
+            2,
+            &encode_tf_transforms(&[TfTransform::new(
+                "world",
+                "robot",
+                [90.0, 0.0, 0.0],
+                IDENTITY_QUAT,
+                0,
+                0,
+            )]),
+        ),
+        &mut state,
+    );
+    rec.flush_blocking().unwrap();
+    let mut saw_odom = false;
+    let mut saw_legacy_root = false;
+    for message in storage.take() {
+        if let rerun::log::LogMsg::ArrowMsg(_, arrow) = message {
+            let chunk = rerun::log::Chunk::from_arrow_msg(&arrow).unwrap();
+            let entity = chunk.entity_path().to_string();
+            assert!(!entity.trim_start_matches('/').starts_with("models/"));
+            saw_odom |= entity.trim_start_matches('/') == "world/robot_odom";
+            saw_legacy_root |= entity.trim_start_matches('/') == cerulion_viz::skeleton::ROBOT_ROOT;
+        }
+    }
+    assert!(saw_odom, "unbound odometry still renders its own pose");
+    assert!(
+        saw_legacy_root,
+        "legacy odometry and TF routing remain active"
+    );
+    let frames: Vec<_> = (0..10)
+        .map(|tick| build_raw_image_frame("rgb8", 1_000 + tick))
+        .collect();
+    assert_eq!(
+        drain_tick(&rec, &builtin_walker(), "selected", frames, &mut state),
+        9,
+        "wrong-schema snapshots still coalesce on the selected route"
+    );
+    assert_eq!(state.bound_model_status().unwrap().rejected_frames, 1);
+    assert_eq!(
+        state.bound_model_status().unwrap().joint_frames_submitted,
+        0
+    );
+}

@@ -220,6 +220,18 @@ bytes (including text and comments), and
 requires one explicitly selected DAE visual scene; multi-scene files are
 unsupported because the native decoder imports all scene definitions.
 
+The renderer library exposes `SinkState::install_bound_model` for an exact attached
+route key and a strictly loaded model rooted at `models/<id>`. Complete finite
+LowState motor angles animate the model while ordinary plots retain their gates.
+`bound_model_status` reports SDK submissions and rejections, not GPU rendering.
+The render worker retains the latest complete valid joint pose across batches,
+submitting at most 60 poses per second and delivering the retained pose when input
+goes quiet. This is an SDK work limit, not a guaranteed display rate. Ordinary
+telemetry keeps its existing admission rules; direct library dispatch is immediate.
+Preflight errors permit retry; an initial SDK failure requires a fresh sink and
+recording store, with partial viewer data discarded. Reconnecting alone does not
+clear that guard. No CLI or vizd model-import endpoint is exposed by this API.
+
 ### `cerulion connect` / `pair` / `login` / `account`
 
 Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.

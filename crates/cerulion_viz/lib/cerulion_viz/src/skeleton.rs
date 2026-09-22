@@ -100,6 +100,10 @@ use crate::sink::InputRoute;
 // private copy with a different fallback and NO aliasing suffix).
 use crate::tf::sanitize_segment;
 
+mod bound_model;
+pub(crate) use bound_model::BoundModel;
+pub use bound_model::BoundModelStatus;
+
 mod loading;
 mod materials;
 mod validation;
@@ -653,6 +657,9 @@ pub enum UrdfError {
         /// Underlying I/O failure or import limit.
         message: String,
     },
+    /// Model binding, frame validation, or SDK submission failed.
+    #[error("URDF model submission failed: {0}")]
+    Submission(String),
     /// An explicitly supplied geometry vector is malformed or cannot reach the renderer.
     #[error("URDF <{element}> {attribute} at line {line}: expected three finite numbers representable as f32, got {value:?}")]
     InvalidVector {
@@ -927,6 +934,8 @@ pub struct Skeleton {
     /// `None` = inert (env unset / URDF unreadable / unparseable). `Some` =
     /// active, rendering the stick figure.
     model: Option<UrdfModel>,
+    // Only strict asset loading can produce an installable model.
+    strict_loaded: bool,
     /// Once-per-regime latch for the frozen-skeleton
     /// warning. An ACTIVE skeleton whose `LowState` frames resolve ZERO joint
     /// angles (wrong `motor_state` field name, empty motor array, or no bound
