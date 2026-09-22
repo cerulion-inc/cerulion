@@ -65,4 +65,5 @@ seams, render-proof/layout, the rerun fork, or adding a test.
 
 Explicit URDF imports use `Skeleton::validate_urdf` preflight; legacy constructors
 are intentionally best-effort. Keep unsupported geometry/materials and malformed
-topology loud. Validation alone reads no assets and proves no live articulation.
+topology loud. Require exactly one binding for each movable joint; fixed-only
+models may omit bindings. Validation alone reads no assets and proves no live articulation.

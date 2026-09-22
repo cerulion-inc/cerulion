@@ -215,7 +215,8 @@ invalid measured-motor bindings, and geometry the current renderer would silentl
 discard. Supported joints are fixed, revolute, and continuous; a link may have no
 visual or one mesh visual. Explicit materials, primitives, multiple visuals, and
 mimic joints remain unsupported. Limits are 4096 links, depth 256, 4096-byte entity
-paths, and 12 motor bindings. Entity roots use slash-separated ASCII letters,
+paths, and 12 motor bindings. Every movable joint must have exactly one binding;
+fixed-only models may omit bindings. Entity roots use slash-separated ASCII letters,
 digits, underscores, and hyphens. They must not start with Rerun's reserved `__`
 prefix; nested segments such as `world/__nested` are allowed.
 This check reads no assets and installs nothing;

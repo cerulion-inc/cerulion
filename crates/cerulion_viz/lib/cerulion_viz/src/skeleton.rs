@@ -912,7 +912,8 @@ impl Skeleton {
     /// Validate the model subset supported by explicit URDF import.
     ///
     /// Checks connected tree topology, finite geometry, unique entity paths,
-    /// and explicit motor bindings. Supports fixed/revolute/continuous joints
+    /// and explicit motor bindings. Every movable joint needs exactly one binding;
+    /// fixed-only models may omit bindings. Supports fixed/revolute/continuous joints
     /// and at most one mesh visual per link; materials and other geometry must
     /// be implemented before they can be admitted without silent data loss.
     /// Limits: 4096 links, depth 256, 4096-byte entity paths, and 12 motor bindings.

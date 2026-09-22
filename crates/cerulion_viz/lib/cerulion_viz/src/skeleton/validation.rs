@@ -111,6 +111,14 @@ pub(super) fn validate(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
         }
     }
 
+    for (name, movable) in &joints {
+        if *movable && !cfg.motor_joints.iter().any(|bound| bound == name) {
+            return Err(UrdfError::InvalidModel(format!(
+                "movable joint {name:?} has no motor binding"
+            )));
+        }
+    }
+
     let roots: Vec<_> = links
         .keys()
         .filter(|name| !parents.contains_key(**name))
@@ -365,7 +373,7 @@ mod tests {
         rejects(&second_parent, &config(&[]), "more than one parent");
         rejects(
             &ARM.replace("</robot>", r#"<link name="orphan"/></robot>"#),
-            &config(&[]),
+            &config(&["hinge"]),
             "one root link",
         );
         let cycle = r#"<robot><link name="a"/><link name="b"/><joint name="ab" type="fixed"><parent link="a"/><child link="b"/></joint><joint name="ba" type="fixed"><parent link="b"/><child link="a"/></joint></robot>"#;
@@ -439,6 +447,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_and_partial_bindings_for_movable_joints() {
+        rejects(
+            ARM,
+            &config(&[]),
+            "movable joint \"hinge\" has no motor binding",
+        );
+        let chain = r#"<robot><link name="base"/><link name="middle"/><link name="tip"/>
+          <joint name="first" type="revolute"><parent link="base"/><child link="middle"/></joint>
+          <joint name="second" type="continuous"><parent link="middle"/><child link="tip"/></joint></robot>"#;
+        rejects(
+            chain,
+            &config(&["first"]),
+            "movable joint \"second\" has no motor binding",
+        );
+        rejects(
+            chain,
+            &config(&["second"]),
+            "movable joint \"first\" has no motor binding",
+        );
+        assert_eq!(validate(chain, &config(&["second", "first"])), Ok(()));
+    }
+
+    #[test]
     fn accepts_all_twelve_measured_motor_slots() {
         let mut xml = String::from(r#"<robot><link name="base"/>"#);
         let names: Vec<_> = (0..12).map(|i| format!("motor{i}")).collect();
@@ -485,7 +516,11 @@ mod tests {
             validate(r#"<robot><link name="base"/></robot>"#, &cfg),
             Ok(())
         );
-        rejects(ARM, &cfg, "must not exceed 4096 bytes");
+        rejects(
+            &ARM.replace("revolute", "fixed"),
+            &cfg,
+            "must not exceed 4096 bytes",
+        );
         rejects(
             r#"<robot><link name="base"><visual><geometry><mesh filename="body.glb"/></geometry></visual></link></robot>"#,
             &cfg,
@@ -500,7 +535,8 @@ mod tests {
                 robot_root: root.into(),
                 ..config(&[])
             };
-            let error = Skeleton::validate_urdf(ARM, &cfg).unwrap_err();
+            let error =
+                Skeleton::validate_urdf(&ARM.replace("revolute", "fixed"), &cfg).unwrap_err();
             assert!(matches!(error, UrdfError::InvalidModel(_)));
             assert!(error.to_string().contains("reserved"), "{error}");
         }
@@ -509,7 +545,11 @@ mod tests {
                 robot_root: root.into(),
                 ..config(&[])
             };
-            assert_eq!(Skeleton::validate_urdf(ARM, &cfg), Ok(()), "{root}");
+            assert_eq!(
+                Skeleton::validate_urdf(&ARM.replace("revolute", "fixed"), &cfg),
+                Ok(()),
+                "{root}"
+            );
         }
     }
 
@@ -551,7 +591,7 @@ mod tests {
 
     #[test]
     fn rejects_mesh_child_collisions_but_allows_unreserved_mesh_names() {
-        let bare = ARM.replace("tip", "mesh");
+        let bare = ARM.replace("revolute", "fixed").replace("tip", "mesh");
         assert_eq!(validate(&bare, &config(&[])), Ok(()));
         let mesh_parent = bare.replace(r#"<link name="base"/>"#, r#"<link name="base"><visual><geometry><mesh filename="body.glb"/></geometry></visual></link>"#);
         rejects(&mesh_parent, &config(&[]), "reserved mesh paths");
