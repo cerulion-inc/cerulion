@@ -248,8 +248,7 @@ bindings to match the native decoder. Other formats cannot verify URDF colors.
 Limits are 4096 URDF declarations and 4096 nodes per DAE scene. Require one visual
 scene and one top-level `scene/instance_visual_scene` selecting it; ambiguous or
 unresolved selections fail. Multiple scene definitions are rejected because the
-native decoder renders all definitions, tracked in
-[native scene-selection limitation](https://github.com/cerulion-inc/cerulion-studio/issues/125).
+native decoder renders all definitions instead of honoring the selection.
 Embedded reflectivity and refraction metadata do not establish matching shading.
 
 Loading does not install a model into vizd or verify GPU decoding. OBJ material
