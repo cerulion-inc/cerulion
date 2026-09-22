@@ -322,6 +322,8 @@ and coalescing while other schemas retain normal gates. No cloud or odometry
 binding is inferred.
 
 Statics submit once per model/recording until explicitly rearmed on reconnect.
+The render worker submits pending model statics after a successful reconnect
+and retries them on subsequent probes, even when no joint frames arrive.
 `submit_bound_model_statics(current_recording)` restores fixed transforms and
 frozen assets even without sensor frames. Its cursor resumes after accepted rows
 without repeating a successful prefix. Completed submission is a no-op until rearm.

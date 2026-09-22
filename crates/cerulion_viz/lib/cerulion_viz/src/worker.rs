@@ -47,6 +47,9 @@
 //! sensor frames. `rec.log` blocking on the worker is by DESIGN: the worker is
 //! the dedicated blocking thread; the tick stays free.
 
+#[cfg(test)]
+mod bound_model_reconnect_test;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -993,7 +996,7 @@ fn handle_message(
 /// on a genuine disconnect (`Failed`), swap a fresh sink and RE-ARM the scene
 /// setup so the bounced (empty) server re-receives the statics + blueprint +
 /// skeleton tree + `/tf_static` mounts. Loud-once. A wedged-but-alive viewer
-/// (probe `Timeout`) or a healthy one (`Ok`) is left untouched (see
+/// (probe `Timeout`) or a healthy one (`Ok`) is not reconnected (see
 /// [`should_reconnect`]).
 ///
 /// IMPORTANT — the probe's `flush_with_timeout` does NOT bound the SDK's
@@ -1038,6 +1041,7 @@ fn maybe_probe_reconnect(
                 "cerulion_viz: viz gRPC sink healthy again — reconnect regime healed"
             );
         }
+        resubmit_bound_model_statics(rec, state);
         return;
     }
 
@@ -1072,6 +1076,7 @@ fn maybe_probe_reconnect(
             // `SinkState::reset_marker_state` for the two DELETE-tracking failure
             // modes it causes (draws are unaffected).
             state.reset_marker_state();
+            resubmit_bound_model_statics(rec, state);
         }
         Err(e) => tracing::debug!(
             error = %e,
@@ -1118,6 +1123,13 @@ fn process_batch(
 fn ensure_setup(rec: &RecordingStream) {
     log_viz_statics_once(rec);
     send_blueprint_once(rec);
+}
+
+// Resume only pending static rows; quiet sensors must not leave a fresh viewer empty.
+fn resubmit_bound_model_statics(rec: &RecordingStream, state: &mut SinkState) {
+    if let Err(error) = state.submit_bound_model_statics(rec) {
+        tracing::debug!(%error, "bound model statics pending; retry on next probe");
+    }
 }
 
 #[cfg(test)]

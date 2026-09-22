@@ -83,5 +83,6 @@ and one exact caller-resolved attached route. Reject blank routes without changi
 valid route identity. Articulation bypasses scalar admission only for selected
 LowState; other routes and schemas retain normal behavior. Submit model statics
 on idle reconnect with a per-row retry cursor, reset only on explicit rearm.
+The worker retries pending model statics on idle probes after reconnect.
 Initial SDK failure or unwind requires a fresh sink and recording store; validation
 failure remains retryable. Submission counters do not prove viewer delivery.
