@@ -62,3 +62,7 @@ cargo test -p go2_tf                             # pure codec, no globals
 
 Deep reference: docs/internals/viz.md - read before touching vizd's control/attach
 seams, render-proof/layout, the rerun fork, or adding a test.
+
+Explicit URDF imports use `Skeleton::validate_urdf` preflight; legacy constructors
+are intentionally best-effort. Keep unsupported geometry/materials and malformed
+topology loud. Validation alone reads no assets and proves no live articulation.

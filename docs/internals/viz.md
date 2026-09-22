@@ -209,6 +209,19 @@ lockstep with the rest of the `re_*` graph).
 
 ### Frames and transforms
 
+`Skeleton::validate_urdf(xml, config)` is the strict preflight for explicit model
+import. It rejects disconnected/cyclic trees, ambiguous link/entity names,
+invalid measured-motor bindings, and geometry the current renderer would silently
+discard. Supported joints are fixed, revolute, and continuous; a link may have no
+visual or one mesh visual. Explicit materials, primitives, multiple visuals, and
+mimic joints remain unsupported. Limits are 4096 links, depth 256, 4096-byte entity
+paths, and 12 motor bindings. Entity roots use slash-separated ASCII letters,
+digits, underscores, and hyphens. They must not start with Rerun's reserved `__`
+prefix; nested segments such as `world/__nested` are allowed.
+This check reads no assets and installs nothing;
+mesh loading, production binding, and resolved-transform acceptance remain separate.
+Legacy constructors retain their existing best-effort behavior.
+
 - `CoordinateFrame:frame` relocates only that entity's own visualizer DATA;
   `Transform3D:parent_frame` is the component the transform resolver actually
   walks for frame-chain re-parenting. They are distinct component identifiers,
