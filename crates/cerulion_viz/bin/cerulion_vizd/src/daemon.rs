@@ -62,17 +62,21 @@ use cerulion_viz::sink::{
     classify_frame, classify_schema, non_tf_entity_for, reported_entity_for, route_key_for_topic,
     route_key_topic, ArchetypeKind, RenderProof,
 };
+use cerulion_viz::skeleton::UrdfConfig;
 use cerulion_viz::tap_manager::{AttachOutcome, TapManager, WakeMode};
-use cerulion_viz::worker::{InputFrames, VizControl, VizLogWorker, VizWorkerCounters};
+use cerulion_viz::worker::{
+    InputFrames, ModelLoadPhase, ModelLoadStatus, VizControl, VizLogWorker, VizWorkerCounters,
+};
 
 use crate::hygiene::{acquire_socket, SocketGuard};
 use crate::monitors::{MonitorPlane, WriteStamp};
 use crate::protocol::{
     parse_request, AttachResponse, AttachedEntry, ComposeLayoutResponse, ContainerSpec,
     DetachResponse, DiscoverResponse, DiscoveredEntry, DiscoveredRobot, DiscoveryLabel, Hello,
-    LayoutIntent, LayoutNode, LayoutSpec, ListResponse, MonitorsResponse, Placement,
-    RepresentationResponse, Request, Response, RetryHint, RunsResponse, SetBlueprintResponse,
-    SkippedDead, StatusResponse, TopicStatus, UndecodableReport, ViewSpec, WorkerStatus,
+    LayoutIntent, LayoutNode, LayoutSpec, ListResponse, ModelBindingStatus, ModelPhase,
+    ModelResponse, ModelStatus, MonitorsResponse, Placement, RepresentationResponse, Request,
+    Response, RetryHint, RunsResponse, SetBlueprintResponse, SkippedDead, StatusResponse,
+    TopicStatus, UndecodableReport, ViewSpec, WorkerStatus,
 };
 use crate::runs::{fold_runs, local_reply, LocalArm, RemoteArm};
 
@@ -1263,11 +1267,15 @@ impl SeedState {
         }
     }
 }
+#[cfg(test)]
+type ResetPlanHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 /// The shared, cloneable daemon context (all `Arc`s) passed to the poll thread +
 /// every controller thread. Its methods implement the request handlers.
 #[derive(Clone)]
 struct Ctx {
+    #[cfg(test)]
+    reset_plan_hook: ResetPlanHook,
     state: Arc<Mutex<DaemonState>>,
     manager: Arc<TransportManager>,
     /// The netd DEMAND plane — `attach_remote` demands a remote topic's
@@ -1946,6 +1954,18 @@ impl Ctx {
                 None => self.attach(id, topic, entity),
             },
             Request::Detach { id, topic } => self.detach(id, topic),
+            Request::LoadModel {
+                id,
+                urdf_path,
+                topic,
+                model_id,
+                motor_joints,
+            } => self.load_model(id, urdf_path, topic, model_id, motor_joints),
+            Request::ModelStatus { id } => Response::Model(ModelResponse {
+                id,
+                ok: true,
+                model: self.worker_control.model_status().map(model_status_dto),
+            }),
             Request::Representation {
                 id,
                 topic,
@@ -2462,6 +2482,9 @@ impl Ctx {
     /// ENQUEUED, NOT a render acknowledgement (the daemon never blocks on
     /// rendering) — or a structured error naming the problem VERBATIM.
     fn set_blueprint(&self, id: u64, layout: Option<LayoutSpec>) -> Response {
+        // Serialize derivation as well as submission: an installation reflow must
+        // never be overwritten by a reset plan built before the model existed.
+        let mut mode = self.layout_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Reset (absent/null layout) → back to the AUTO consolidated default
         // (Scene + one plot per attached topic, tiled — NOT the bare Scene-only Go2
         // default), re-enabling auto-recompose on attach/detach; a spec → validate it
@@ -2469,7 +2492,13 @@ impl Ctx {
         // error, never a silent drop) and, on a successful apply below, take over as
         // the EXPLICIT layout (attach/detach stops clobbering it).
         let (plan, reset) = match layout {
-            None => (self.consolidated_default_plan(), true),
+            None => {
+                #[cfg(test)]
+                if let Some(hook) = { self.reset_plan_hook.lock().unwrap().take() } {
+                    hook();
+                }
+                (self.consolidated_default_plan(), true)
+            }
             Some(spec) => match build_plan(&spec) {
                 Ok(plan) => (plan, false),
                 Err(e) => return Response::error(Some(id), e.to_string(), None),
@@ -2532,7 +2561,7 @@ impl Ctx {
         } else {
             LayoutMode::Explicit
         };
-        match self.apply_layout_atomic(plan, new_mode) {
+        match self.apply_layout_locked(plan, new_mode, &mut mode) {
             Ok(()) => Response::SetBlueprint(SetBlueprintResponse {
                 id: Some(id),
                 ok: true,
@@ -2715,15 +2744,18 @@ impl Ctx {
         topic: Option<String>,
         opened: &[String],
     ) -> Response {
-        let msg = if opened.is_empty() {
+        let (removed, retained) = self.rollback_compose_attaches(opened);
+        let mut msg = if opened.is_empty() {
             msg
         } else {
-            format!(
-                "{msg} (rolled back {} tap(s) this compose_layout opened)",
-                opened.len()
-            )
+            format!("{msg} (rolled back {removed} tap(s) this compose_layout opened)")
         };
-        self.rollback_compose_attaches(opened);
+        if !retained.is_empty() {
+            msg.push_str(&format!(
+                "; model input attachments retained: {}",
+                retained.join("; ")
+            ));
+        }
         Response::error(Some(id), msg, topic)
     }
 
@@ -2745,14 +2777,27 @@ impl Ctx {
     /// job is to undo as much as it can, and failing it would strand the tap too.
     /// For a topic that was never demanded (a genuine local compose) the release is
     /// a documented no-op, so this is safe for every compose.
-    fn rollback_compose_attaches(&self, opened: &[String]) {
+    fn rollback_compose_attaches(&self, opened: &[String]) -> (usize, Vec<String>) {
         if opened.is_empty() {
-            return;
+            return (0, Vec::new());
         }
+        let mut removed_topics = Vec::new();
+        let mut retained = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
             for topic in opened {
+                if let Some(route) = st
+                    .stats
+                    .get(topic)
+                    .and_then(|stat| stat.route_key.as_deref())
+                {
+                    if let Err(error) = self.cancel_owned_model_load(route) {
+                        retained.push(format!("{topic}: {error}"));
+                        continue;
+                    }
+                }
                 st.taps.detach(topic);
+                removed_topics.push(topic);
                 let removed = st.stats.remove(topic);
                 // Monitors: and the MONITOR ROW, by the same rule the
                 // two lines around it follow — the rollback is the inverse of what
@@ -2794,7 +2839,7 @@ impl Ctx {
                 st.wake_requested.remove(topic);
             }
         }
-        for topic in opened {
+        for topic in &removed_topics {
             if let Err(e) = perform_remote_release(self.demand_plane.as_ref(), &self.state, topic) {
                 tracing::warn!(
                     topic = %topic, error = %e,
@@ -2805,9 +2850,11 @@ impl Ctx {
         }
         self.refresh_attached_snapshot();
         tracing::warn!(
-            rolled_back = opened.len(),
-            "compose_layout: a failure after attaching rolled back the tap(s) this call opened"
+            rolled_back = removed_topics.len(),
+            retained = retained.len(),
+            "compose_layout: rollback completed; model-owned attachments are retained"
         );
+        (removed_topics.len(), retained)
     }
 
     /// The entity set the compose compiler GROUNDED the
@@ -3106,6 +3153,7 @@ impl Ctx {
             return self.attach_for_compose_via_demand_plane(topic);
         }
         let mut st = self.state.lock().unwrap();
+        self.check_model_route(&st, topic, &route_key_for_topic(topic, None))?;
         // This is the LOCAL arm of compose (the remote arm above
         // routes through `attach_remote`), and it takes the same
         // `WakeMode::Listener` as `attach_local` for the same reason — a topic
@@ -3253,11 +3301,14 @@ impl Ctx {
     /// reapply grounding warn current: if every topic detaches, a later reconnect
     /// re-applying the stored layout warns it now grounds nothing.
     fn refresh_attached_snapshot(&self) {
-        let entities = self
+        let mut entities: Vec<String> = self
             .attached_render_infos()
             .into_iter()
             .map(|a| a.entity)
             .collect();
+        if let Some(root) = self.installed_model_root() {
+            entities.push(format!("/{root}"));
+        }
         set_attached_entities_snapshot(entities);
     }
 
@@ -3300,7 +3351,18 @@ impl Ctx {
     fn consolidated_default_plan(&self) -> BlueprintPlan {
         // `attached_render_infos` has already folded the current set in.
         let attached = self.attached_render_infos();
-        default_layout_excluding(&attached, &self.logged_entities_snapshot())
+        let plan = default_layout_excluding(&attached, &self.logged_entities_snapshot());
+        match self.installed_model_root() {
+            Some(root) => with_model_view(plan, &root),
+            None => plan,
+        }
+    }
+
+    fn installed_model_root(&self) -> Option<String> {
+        self.worker_control
+            .model_status()
+            .filter(|status| status.phase == ModelLoadPhase::Installed)
+            .map(|status| status.root)
     }
 
     /// Record entities into the run's EVER-LOGGED set.
@@ -3371,9 +3433,18 @@ impl Ctx {
         new_mode: LayoutMode,
     ) -> Result<(), cerulion_viz::worker::VizControlError> {
         let mut guard = self.layout_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.apply_layout_locked(plan, new_mode, &mut guard)
+    }
+
+    fn apply_layout_locked(
+        &self,
+        plan: BlueprintPlan,
+        new_mode: LayoutMode,
+        mode: &mut std::sync::MutexGuard<'_, LayoutMode>,
+    ) -> Result<(), cerulion_viz::worker::VizControlError> {
         let result = self.worker_control.set_blueprint(plan);
         if result.is_ok() {
-            *guard = new_mode;
+            **mode = new_mode;
         }
         result
     }
@@ -3660,6 +3731,9 @@ impl Ctx {
         // — no spurious tap is opened.
         let already = {
             let mut st = self.state.lock().unwrap();
+            if let Err(error) = self.check_model_route(&st, &topic, &route_key) {
+                return Response::error(Some(id), error, Some(topic));
+            }
             let outcome = match st.taps.attach(
                 &self.manager,
                 &topic,
@@ -3938,20 +4012,21 @@ impl Ctx {
         // error rolls the demand back.
         let commit = {
             let mut st = self.state.lock().unwrap();
-            match st.taps.attach(
-                &self.manager,
-                &topic,
-                entity_override.as_deref(),
-                // A REMOTE/mirror topic gets the wake. Its
-                // publisher is `cerulion-netd`'s OWN desk-side
-                // `create_ingress_publisher` — on THIS machine, in a process we
-                // own, never elision-armed (arming is graph-runtime-only)
-                // — so the wake costs the desk one `sendto` per frame and bills
-                // the robot nothing. This is the whole of the measured
-                // 11.8 ms p50, and it is the ONLY class that gets a listener.
-                WakeMode::Listener,
-            ) {
-                Err(e) => RemoteCommit::TapErr(e.to_string()),
+            match self
+                .check_model_route(&st, &topic, &route_key)
+                .and_then(|()| {
+                    st.taps
+                        .attach(
+                            &self.manager,
+                            &topic,
+                            entity_override.as_deref(),
+                            // Desk-side mirror publishers provide wake notifications.
+                            WakeMode::Listener,
+                        )
+                        .map_err(|error| error.to_string())
+                }) {
+                Err(e) if st.taps.contains(&topic) => RemoteCommit::Conflict(e),
+                Err(e) => RemoteCommit::TapErr(e),
                 Ok(outcome) => {
                     // This topic ASKED for a wake. Recorded
                     // under the same lock as the tap, so `status` can tell a
@@ -4093,6 +4168,22 @@ impl Ctx {
         })
     }
 
+    /// Called under the attachment lock, which also serializes model admission.
+    /// A dead worker must not prevent cleanup of an unrelated tap or demand.
+    fn cancel_owned_model_load(
+        &self,
+        route: &str,
+    ) -> Result<(), cerulion_viz::worker::ModelLoadError> {
+        if self
+            .worker_control
+            .model_status()
+            .is_some_and(|model| model.route_key == route)
+        {
+            self.worker_control.cancel_model_load(route)?;
+        }
+        Ok(())
+    }
+
     /// `detach`: drop the tap + its stats entry, and
     /// RELEASE the topic's netd DEMAND if it held one. Releasing the demand
     /// (removing the `demanded` entry) lets netd's refcount-0 teardown tear the
@@ -4105,6 +4196,19 @@ impl Ctx {
     fn detach(&self, id: u64, topic: String) -> Response {
         let detached = {
             let mut st = self.state.lock().unwrap();
+            if let Some(route) = st
+                .stats
+                .get(&topic)
+                .and_then(|stat| stat.route_key.as_deref())
+            {
+                if let Err(error) = self.cancel_owned_model_load(route) {
+                    return Response::error(
+                        Some(id),
+                        format!("cannot detach model input: {error}; model unloading is unsupported; restart the visualization session to release it"),
+                        Some(topic),
+                    );
+                }
+            }
             let d = st.taps.detach(&topic);
             let removed = st.stats.remove(&topic);
             // Monitors: the monitor row dies with the tap it was
@@ -4151,6 +4255,101 @@ impl Ctx {
             topic,
             detached,
         })
+    }
+    /// Admit a model without touching the filesystem or discovering topics. Holding
+    /// `state` until admission pins the route against detach or a concurrent alias.
+    /// The drain also enqueues its batch under `state`, so an old attachment's
+    /// frames cannot arrive after an install admitted through a reused route.
+    fn load_model(
+        &self,
+        id: u64,
+        urdf_path: String,
+        topic: String,
+        model_id: String,
+        motor_joints: Vec<String>,
+    ) -> Response {
+        if let Err(error) = validate_model_request(&urdf_path, &topic, &model_id, &motor_joints) {
+            return Response::error(Some(id), error, Some(topic));
+        }
+        let st = self.state.lock().unwrap();
+        let Some(stat) = st.stats.get(&topic).filter(|_| st.taps.contains(&topic)) else {
+            return Response::error(
+                Some(id),
+                "load_model requires an existing exact topic attachment",
+                Some(topic),
+            );
+        };
+        let Some(route) = stat.route_key.as_ref() else {
+            return Response::error(
+                Some(id),
+                "attached topic has no committed render route",
+                Some(topic),
+            );
+        };
+        let schema = stat
+            .resolved
+            .as_ref()
+            .map(|r| r.schema.as_str())
+            .or(stat.pinned_schema.as_deref());
+        if let Some(schema) = schema.filter(|schema| *schema != "unitree_go/LowState") {
+            return Response::error(Some(id), format!("model joints require unitree_go/LowState, but attached topic resolves to {schema}"), Some(topic));
+        }
+        let entity = non_tf_entity_for(route);
+        if st.stats.iter().any(|(other, stat)| {
+            other != &topic
+                && stat
+                    .route_key
+                    .as_deref()
+                    .is_some_and(|key| non_tf_entity_for(key) == entity)
+        }) {
+            return Response::error(
+                Some(id),
+                "model route is shared by another attached topic; use a unique entity route",
+                Some(topic),
+            );
+        }
+        let config = UrdfConfig {
+            default_path: urdf_path.clone(),
+            robot_root: format!("models/{model_id}"),
+            motor_joints,
+        };
+        match self
+            .worker_control
+            .load_model(PathBuf::from(urdf_path), config, route.clone())
+        {
+            Ok(status) => Response::Model(ModelResponse {
+                id,
+                ok: true,
+                model: Some(model_status_dto(status)),
+            }),
+            Err(error) => Response::error(Some(id), error.to_string(), Some(topic)),
+        }
+    }
+
+    /// Called only while holding `state`, at each attachment commit seam. An
+    /// admitted model owns one input route; another topic must not feed it.
+    fn check_model_route(&self, st: &DaemonState, topic: &str, route: &str) -> Result<(), String> {
+        let Some(model) = self.worker_control.model_status() else {
+            return Ok(());
+        };
+        // All daemon admissions hold `state`, so a new load cannot replace this
+        // Failed snapshot before cancellation checks whether SDK writes began.
+        // Do not parse error text: retryable preflight failures return Ok(false),
+        // while partial SDK submissions retain ownership through RestartRequired.
+        if model.phase == ModelLoadPhase::Failed
+            && self.worker_control.cancel_model_load(&model.route_key) == Ok(false)
+        {
+            return Ok(());
+        }
+        if non_tf_entity_for(&model.route_key) == non_tf_entity_for(route)
+            && model.phase != ModelLoadPhase::Cancelled
+            && st.stats.iter().any(|(other, stat)| {
+                other != topic && stat.route_key.as_ref() == Some(&model.route_key)
+            })
+        {
+            return Err("render route is reserved by a robot model bound to another topic".into());
+        }
+        Ok(())
     }
 
     /// `list`: the attached taps with their resolved route/entity/schema.
@@ -6530,11 +6729,20 @@ fn report_tap_gap(latch: &mut FailureRegimeLatch, topic: &str, missed: u64, tota
     }
 }
 
+#[cfg(test)]
+impl std::fmt::Debug for Ctx {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Ctx (test inspection)")
+    }
+}
+
 /// A running daemon: the shutdown flag + the poll/accept/connection threads + the
 /// socket cleanup guard. Dropping it (or [`shutdown`](Self::shutdown)) stops
 /// every thread, drops the taps + worker, and removes the socket + pidfile.
 #[derive(Debug)]
 pub struct RunningDaemon {
+    #[cfg(test)]
+    test_context: Ctx,
     shutdown: Arc<AtomicBool>,
     accept_handle: Option<JoinHandle<()>>,
     poll_handle: Option<JoinHandle<()>>,
@@ -7133,6 +7341,8 @@ pub fn start_on_socket(
     let worker_control = worker.control();
     let shutdown = Arc::new(AtomicBool::new(false));
     let ctx = Ctx {
+        #[cfg(test)]
+        reset_plan_hook: Arc::new(Mutex::new(None)),
         state: Arc::new(Mutex::new(DaemonState::default())),
         manager,
         demand_plane,
@@ -7233,6 +7443,8 @@ pub fn start_on_socket(
 
     tracing::info!(socket = %socket_path.display(), "cerulion-vizd listening (NDJSON control protocol)");
     Ok(RunningDaemon {
+        #[cfg(test)]
+        test_context: ctx.clone(),
         shutdown,
         accept_handle: Some(accept_handle),
         poll_handle: Some(poll_handle),
@@ -7750,7 +7962,7 @@ fn poll_loop(
         // The topics this pass drained, for the demoter to
         // settle the PREVIOUS wait's fires against.
         let mut drained_topics: Vec<String> = Vec::new();
-        let batch = {
+        let drained_any = {
             let mut st = ctx.state.lock().unwrap();
             let polled = st.taps.poll_detailed(POLL_MAX);
             // Settle + demote BEFORE the wake sources are read,
@@ -7852,7 +8064,15 @@ fn poll_loop(
                     frames: p.frames,
                 });
             }
-            input_frames
+            let drained_any = !input_frames.is_empty();
+            // Keep attachment ownership through the nonblocking handoff. Once
+            // detach can acquire `state`, every frame drained from its old tap
+            // is already queued (or explicitly dropped on a full queue). A later
+            // route reuse and model admission therefore cannot enqueue InstallModel
+            // ahead of that old batch. Releasing the lock before try_enqueue lets
+            // stale frames animate a new model bound to the reused route.
+            worker.try_enqueue(input_frames);
+            drained_any
         };
         // OUTSIDE the state lock (maybe_apply_default_layout re-locks `state` under
         // `layout_lock`): a late-resolve reflows the default layout. A NO-OP under an
@@ -7886,6 +8106,7 @@ fn poll_loop(
             last_layout_generation = layout_generation;
         }
         if newly_resolved || signal_changed {
+            ctx.refresh_attached_snapshot();
             // Counted where the layout was RE-DERIVED, not where the change was
             // detected: `maybe_apply_default_layout` returns whether it got past
             // the `LayoutMode::Auto` gate and rebuilt the plan, so a pass under an
@@ -7934,8 +8155,6 @@ fn poll_loop(
         }
         // Did this pass find anything? Read BEFORE the hand-off
         // moves the batch — it decides the backlog-aware arm below.
-        let drained_any = !batch.is_empty();
-        worker.try_enqueue(batch);
         // A test-only per-pass overrun injector.
         // The duty-cycle floor is only observable on a loop whose pass genuinely
         // outruns its interval, and the MEASURED cost of a real drain is
@@ -8929,8 +9148,149 @@ mod absorb_tests {
     }
 }
 
+/// Validate the wire envelope only; XML and asset reads belong to the loader.
+fn validate_model_request(
+    path: &str,
+    topic: &str,
+    model_id: &str,
+    joints: &[String],
+) -> Result<(), String> {
+    if !Path::new(path).is_absolute() {
+        return Err("urdf_path must be an absolute local path".into());
+    }
+    if !topic.starts_with('/') || topic.len() < 2 || topic.chars().any(char::is_whitespace) {
+        return Err("topic must be an absolute nonempty topic name without whitespace".into());
+    }
+    if model_id.is_empty()
+        || model_id.len() > 128
+        || model_id.starts_with("__")
+        || !model_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(
+            "model_id must be 1..128 ASCII letters, digits, '_' or '-', without a leading '__'"
+                .into(),
+        );
+    }
+    if !(1..=12).contains(&joints.len())
+        || joints
+            .iter()
+            .any(|name| name.is_empty() || name.trim() != name)
+    {
+        return Err(
+            "motor_joints must contain 1..12 nonempty joint names in motor array order".into(),
+        );
+    }
+    if joints.iter().collect::<BTreeSet<_>>().len() != joints.len() {
+        return Err("motor_joints must not contain duplicate joint names".into());
+    }
+    Ok(())
+}
+
+fn model_status_dto(status: ModelLoadStatus) -> ModelStatus {
+    let phase = match status.phase {
+        ModelLoadPhase::Queued => ModelPhase::Queued,
+        ModelLoadPhase::Loading => ModelPhase::Loading,
+        ModelLoadPhase::Prepared => ModelPhase::Prepared,
+        ModelLoadPhase::Installing => ModelPhase::Installing,
+        ModelLoadPhase::Installed => ModelPhase::Installed,
+        ModelLoadPhase::Failed => ModelPhase::Failed,
+        ModelLoadPhase::Cancelled => ModelPhase::Cancelled,
+    };
+    ModelStatus {
+        operation_id: status.operation_id,
+        phase,
+        root: status.root,
+        route_key: status.route_key,
+        error: status.error,
+        binding: status.binding.map(|binding| ModelBindingStatus {
+            route_key: binding.route_key,
+            statics_submitted: binding.statics_submitted,
+            joint_frames_submitted: binding.joint_frames_submitted,
+            rejected_frames: binding.rejected_frames,
+            last_error: binding.last_error,
+        }),
+    }
+}
+
+/// Models own a separate coordinate tree; never place them inside the sensor
+/// world's Spatial3D origin or replace an operator's explicit layout.
+fn with_model_view(mut plan: BlueprintPlan, root: &str) -> BlueprintPlan {
+    plan.root = PlanNode::Container(PlanContainer {
+        kind: ContainerKind::Horizontal,
+        name: None,
+        shares: Some(vec![1.0, 1.0]),
+        columns: None,
+        children: vec![
+            PlanNode::View(PlanView {
+                kind: ViewKind::Spatial3d,
+                name: Some("Robot model".into()),
+                origin: Some(format!("/{root}")),
+                contents: Some(vec![format!("/{root}/**")]),
+            }),
+            plan.root,
+        ],
+    });
+    plan
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_envelope_validation_is_strict_and_does_not_read_paths() {
+        use super::validate_model_request;
+        let joints = vec!["hinge".into()];
+        assert!(
+            validate_model_request("/not/a/real/model.urdf", "/lowstate", "demo-1", &joints)
+                .is_ok()
+        );
+        for id in ["", ".", "..", "robot/a", "robot a", "__reserved", "röbot"] {
+            assert!(
+                validate_model_request("/a", "/lowstate", id, &joints).is_err(),
+                "{id}"
+            );
+        }
+        assert!(validate_model_request("/a", "/lowstate", &"a".repeat(129), &joints).is_err());
+        for topic in ["", "relative", "/", "/bad topic"] {
+            assert!(validate_model_request("/a", topic, "demo", &joints).is_err());
+        }
+        assert!(validate_model_request("relative.urdf", "/lowstate", "demo", &joints).is_err());
+        for names in [
+            vec![],
+            vec!["".into()],
+            vec![" hinge".into()],
+            vec!["a".into(), "a".into()],
+            (0..13).map(|i| format!("j{i}")).collect(),
+        ] {
+            assert!(validate_model_request("/a", "/lowstate", "demo", &names).is_err());
+        }
+    }
+
+    #[test]
+    fn model_view_owns_its_coordinate_tree_and_preserves_sensor_plan() {
+        use super::{with_model_view, BlueprintPlan, ContainerKind, PlanNode, ViewKind};
+        let sensor = BlueprintPlan::go2_default();
+        let combined = with_model_view(sensor.clone(), "models/demo");
+        assert_eq!(combined.auto_views, sensor.auto_views);
+        assert_eq!(combined.decorate, sensor.decorate);
+        let PlanNode::Container(container) = combined.root else {
+            panic!("split view")
+        };
+        assert_eq!(container.kind, ContainerKind::Horizontal);
+        assert_eq!(container.children.len(), 2);
+        assert_eq!(container.children[1], sensor.root);
+        let PlanNode::View(model) = &container.children[0] else {
+            panic!("model view")
+        };
+        assert_eq!(model.kind, ViewKind::Spatial3d);
+        assert_eq!(model.origin.as_deref(), Some("/models/demo"));
+        assert_eq!(
+            model.contents.as_deref(),
+            Some(["/models/demo/**".to_owned()].as_slice())
+        );
+    }
+
     // Test-only: the RAW derivation, kept out of production scope on purpose —
     // `discover_reports_the_same_entity_as_attach_for_a_tf_named_non_tf_topic`
     // asserts no production site calls it.
@@ -9196,11 +9556,12 @@ mod tests {
 
         // No production site may derive a REPORTED entity from `route_for_input`
         // directly — that is what left `discover` behind.
-        let whole = code_only(include_str!("daemon.rs"));
+        let whole = include_str!("daemon.rs");
         let src = whole
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .expect("this module has a test cfg gate");
+        let src = code_only(src);
         assert_eq!(
             src.matches("route_for_input(").count(),
             0,
@@ -9228,11 +9589,12 @@ mod tests {
     /// `maybe_apply_default_layout`, both of which sit behind the mode gate.
     #[test]
     fn the_logged_entity_recorder_is_fed_from_a_mode_independent_seam() {
-        let whole = code_only(include_str!("daemon.rs"));
+        let whole = include_str!("daemon.rs");
         let src = whole
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .expect("this module has a test cfg gate");
+        let src = code_only(src);
         // Exactly one production call site, and it is the ungated one.
         assert_eq!(
             src.matches("self.note_logged_entities(").count(),
@@ -9269,6 +9631,198 @@ mod tests {
         );
     }
 
+    // Real workers write process-global blueprint state even without sensor frames.
+    static WORKER_BLUEPRINT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn worker_gone_releases_unrelated_detach_and_rollback_demands() {
+        let _blueprint = WORKER_BLUEPRINT_LOCK.lock().unwrap();
+        use cerulion_core::clock::VirtualClock;
+        use cerulion_core::transport::TransportConfig;
+        use cerulion_core::wire::MaxSliceLen;
+        use cerulion_viz::schema_registry::builtin_walker;
+        use cerulion_viz::sink::SinkState;
+
+        for with_model in [false, true] {
+            let manager = TransportManager::init_for_test(
+                TransportConfig {
+                    node_name: format!("detach_worker_gone_{with_model}"),
+                    clock: Arc::new(VirtualClock::new()),
+                    subscriber_buffer_size: 16,
+                    network: None,
+                },
+                cerulion_core::testing::iceoryx_test_config(),
+            )
+            .unwrap();
+            let topics = ["/owned", "/detach", "/rollback"];
+            let _publishers: Vec<_> = topics
+                .iter()
+                .map(|topic| {
+                    manager
+                        .create_publisher(topic, MaxSliceLen::const_new(4096), 0)
+                        .unwrap()
+                })
+                .collect();
+            let (rec, _) = rerun::RecordingStreamBuilder::new("detach-worker-gone")
+                .memory()
+                .unwrap();
+            let worker = VizLogWorker::spawn(rec, builtin_walker(), SinkState::new()).unwrap();
+            let dir = std::env::temp_dir()
+                .join(format!("detach-gone-{}-{with_model}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let spy = Arc::new(SpyDemandPlane::default());
+            let mut daemon = start_with_demand_plane(
+                dir.join("control.sock"),
+                Duration::from_millis(16),
+                manager,
+                worker,
+                builtin_walker(),
+                None,
+                spy.clone(),
+            )
+            .unwrap();
+            let ctx = &daemon.test_context;
+            for topic in topics {
+                assert!(matches!(
+                    ctx.attach(1, topic.into(), None),
+                    Response::Attach(_)
+                ));
+                perform_remote_demand(spy.as_ref(), &ctx.state, "robot", topic, 0).unwrap();
+            }
+            if with_model {
+                let path = dir.join("robot.urdf");
+                std::fs::write(&path, r#"<robot name="oracle"><link name="base"/><link name="arm"/><joint name="hinge" type="continuous"><parent link="base"/><child link="arm"/></joint></robot>"#).unwrap();
+                let response = ctx.load_model(
+                    2,
+                    path.to_str().unwrap().into(),
+                    "/owned".into(),
+                    "demo".into(),
+                    vec!["hinge".into()],
+                );
+                assert!(matches!(response, Response::Model(_)), "{response:?}");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while ctx.worker_control.model_status().unwrap().phase != ModelLoadPhase::Installed
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "model must install before worker closure"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            daemon.close_worker_control_for_test();
+            assert!(matches!(
+                ctx.worker_control.cancel_model_load("detach"),
+                Err(cerulion_viz::worker::ModelLoadError::WorkerGone)
+            ));
+            let response = ctx.detach(3, "/detach".into());
+            let Response::Detach(detached) = response else {
+                panic!("{response:?}")
+            };
+            assert!(detached.detached);
+            assert_eq!(
+                ctx.rollback_compose_attaches(&["/rollback".into()]),
+                (1, vec![])
+            );
+            assert_eq!(
+                spy.release_keys(),
+                vec![
+                    ("robot".into(), "/detach".into()),
+                    ("robot".into(), "/rollback".into())
+                ]
+            );
+            {
+                let state = ctx.state.lock().unwrap();
+                for topic in ["/detach", "/rollback"] {
+                    assert!(!state.taps.contains(topic));
+                    assert!(!state.stats.contains_key(topic));
+                    assert!(!state.demanded.contains_key(topic));
+                }
+            }
+            if with_model {
+                assert!(matches!(ctx.detach(4, "/owned".into()), Response::Error(_)));
+                let (removed, retained) = ctx.rollback_compose_attaches(&["/owned".into()]);
+                assert_eq!(removed, 0);
+                assert_eq!(retained.len(), 1);
+                let state = ctx.state.lock().unwrap();
+                assert!(state.taps.contains("/owned"));
+                assert!(state.stats.contains_key("/owned"));
+                assert!(state.demanded.contains_key("/owned"));
+                assert_eq!(spy.release_keys().len(), 2);
+            }
+            daemon.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn blueprint_reset_derivation_observes_layout_lock_and_submits_matching_response() {
+        let _blueprint = WORKER_BLUEPRINT_LOCK.lock().unwrap();
+        use cerulion_core::clock::VirtualClock;
+        use cerulion_core::transport::TransportConfig;
+        use cerulion_viz::blueprint::{clear_runtime_blueprint, current_runtime_blueprint_plan};
+        use cerulion_viz::schema_registry::builtin_walker;
+        use cerulion_viz::sink::SinkState;
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "reset_lock_oracle".into(),
+                clock: Arc::new(VirtualClock::new()),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let (rec, _) = rerun::RecordingStreamBuilder::new("reset-lock")
+            .memory()
+            .unwrap();
+        let worker = VizLogWorker::spawn(rec, builtin_walker(), SinkState::new()).unwrap();
+        worker.sync();
+        clear_runtime_blueprint();
+        let dir = std::env::temp_dir().join(format!("reset-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut daemon = start_with_demand_plane(
+            dir.join("control.sock"),
+            Duration::from_millis(16),
+            manager,
+            worker,
+            builtin_walker(),
+            None,
+            Arc::new(SpyDemandPlane::default()),
+        )
+        .unwrap();
+        let lock = Arc::clone(&daemon.test_context.layout_lock);
+        let observed = Arc::new(AtomicBool::new(false));
+        let hook_observed = Arc::clone(&observed);
+        *daemon.test_context.reset_plan_hook.lock().unwrap() = Some(Box::new(move || {
+            // Runs in the actual reset handler immediately before it derives the
+            // plan. The old derive-before-lock path lets this contender acquire it.
+            assert!(
+                lock.try_lock().is_err(),
+                "reset derivation must exclude another layout writer"
+            );
+            hook_observed.store(true, Ordering::SeqCst);
+        }));
+        let response = daemon.test_context.set_blueprint(42, None);
+        assert!(observed.load(Ordering::SeqCst));
+        daemon.shutdown(); // drains the real worker's submitted blueprint
+        let plan = current_runtime_blueprint_plan().unwrap();
+        assert_eq!(plan_views(&plan).len(), 1);
+        assert_eq!(plan_views(&plan)[0].origin.as_deref(), Some("/world"));
+        let Response::SetBlueprint(response) = response else {
+            panic!("reset must succeed")
+        };
+        assert_eq!(response.id, Some(42));
+        assert!(response.ok && response.reset);
+        assert_eq!(response.views, 1);
+        assert!(response.warnings.is_empty());
+        assert_eq!(
+            *daemon.test_context.layout_lock.lock().unwrap(),
+            LayoutMode::Auto
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// There must be exactly ONE producer of the consolidated
     /// default plan in this module.
     ///
@@ -9287,13 +9841,14 @@ mod tests {
     /// (&self.attached_render_infos(), &[])` — fails HERE.
     #[test]
     fn the_consolidated_default_plan_has_exactly_one_producer() {
-        let whole = code_only(include_str!("daemon.rs"));
+        let whole = include_str!("daemon.rs");
         // PRODUCTION code only — the test module below legitimately calls the
         // layout builder directly to assert what the daemon would apply.
         let src = whole
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .expect("this module has a test cfg gate");
+        let src = code_only(src);
         let calls = src.matches("default_layout_excluding(").count();
         assert_eq!(
             calls, 1,

@@ -99,3 +99,20 @@ Bound material-verification XML parsing before indexing: at most 65536 document
 nodes, including text and comments. Bound raw `<` and `=` byte counts before
 parsing too: the parser reserves capacity before checking its node limit.
 Scene limits alone do not bound unused metadata.
+
+Explicit model control binds an existing unique attachment route. Hold the daemon
+attachment lock across immediate worker admission/cancel; no filesystem reads in
+handlers. Every attachment-removal seam, including compose rollback, must cancel
+only for the exact model-owned route and retain it on cancellation errors.
+Unrelated taps and demands must remain removable when the worker is gone. Guard
+all attach seams against aliases of a model-owned route. Installed model layout
+changes use the worker generation signal and respect explicit layout ownership.
+
+Keep the attachment lock through the nonblocking drained-frame handoff, so
+route reuse cannot place stale frames after a later model installation. Layout
+and monitoring remain outside that lock because they reacquire daemon state.
+
+Layout reset holds the layout lock through plan derivation, response metadata,
+submission and mode update. Failed preflight releases model alias ownership;
+Failed SDK installation keeps it. Query typed cancellation eligibility under the
+attachment lock; never infer restart requirements from error text.
