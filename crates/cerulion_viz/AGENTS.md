@@ -72,3 +72,13 @@ models may omit bindings. Validation alone reads no assets and proves no live ar
 control threads. Loaded bytes do not establish GPU rendering. Derive formats from
 the URDF mesh reference, not its canonical symlink target; aliases sharing a file
 must agree on format. Resolve relative assets from the canonical URDF target.
+
+Only `try_load` may defer explicit material checks: prove matching used DAE diffuse
+effects against frozen bytes before returning. Never strip declarations or confuse
+metadata proof with rendered appearance. Require a single explicitly selected
+DAE visual scene; the native decoder does not honor multi-scene selection.
+
+Bound material-verification XML parsing before indexing: at most 65536 document
+nodes, including text and comments. Bound raw `<` and `=` byte counts before
+parsing too: the parser reserves capacity before checking its node limit.
+Scene limits alone do not bound unused metadata.

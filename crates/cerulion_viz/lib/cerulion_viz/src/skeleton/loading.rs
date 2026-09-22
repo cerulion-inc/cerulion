@@ -23,6 +23,8 @@ impl Skeleton {
     /// package or sibling package directory, with no guessed-package fallback.
     /// The reference's extension selects the format, even through a symlink.
     /// References to one canonical file must agree on that format.
+    /// Explicit URDF colors are accepted only when they exactly duplicate used
+    /// embedded DAE diffuse effects; textures and appearance overrides fail.
     ///
     /// Import is bounded to 16 MiB of XML and 256 MiB of unique asset bytes.
     /// Assets are read once and retained for logging/reconnect, so later file
@@ -36,13 +38,16 @@ impl Skeleton {
         let path = path.canonicalize().map_err(|e| resource_error(path, e))?;
         let bytes = read_resource(&path, MAX_URDF_BYTES)?;
         let xml = std::str::from_utf8(&bytes).map_err(|e| UrdfError::Xml(e.to_string()))?;
-        Self::validate_urdf(xml, cfg)?;
+        super::validation::validate_for_loading(xml, cfg)?;
+        let declarations = super::materials::declarations(xml)?;
         let mut model = parse_urdf_with_config(xml, cfg)?;
         let dir = path
             .parent()
             .ok_or_else(|| resource_error(&path, "URDF file has no parent directory"))?;
         let mut remaining = MAX_ASSET_BYTES;
         let mut mesh_formats = BTreeMap::new();
+        let mut resolved = Vec::new();
+        let mut required = BTreeMap::<PathBuf, Vec<&[super::materials::Declaration]>>::new();
         for (link, visual) in &model.link_visuals {
             let asset_path = resolve_resource(dir, &visual.mesh_filename)?;
             let extension = Path::new(&visual.mesh_filename)
@@ -62,20 +67,39 @@ impl Skeleton {
                     )))
                 }
             };
-            if let Some(previous) = mesh_formats.get(&asset_path) {
-                if *previous != media_type {
+            if let Some(previous) = mesh_formats.insert(asset_path.clone(), media_type) {
+                if previous != media_type {
                     return Err(UrdfError::InvalidModel(format!(
                         "mesh reference {:?} resolves to {} with conflicting formats ({previous} and {media_type}); use one format for every reference to the same file",
                         visual.mesh_filename,
                         asset_path.display()
                     )));
                 }
-            } else {
+            }
+            if let Some(materials) = declarations.get(link) {
+                if extension != "dae" {
+                    return Err(resource_error(
+                        &asset_path,
+                        "explicit URDF colors require verified embedded DAE effects",
+                    ));
+                }
+                required
+                    .entry(asset_path.clone())
+                    .or_default()
+                    .push(materials.as_slice());
+            }
+            resolved.push((link, visual, asset_path, media_type));
+        }
+        for (link, visual, asset_path, media_type) in resolved {
+            if !model.prepared_meshes.contains_key(&asset_path) {
                 let contents = read_resource(&asset_path, remaining)?;
                 remaining -= contents.len() as u64;
+                if let Some(materials) = required.get(&asset_path) {
+                    super::materials::verify(&contents, materials)
+                        .map_err(|e| resource_error(&asset_path, e))?;
+                }
                 let asset = rerun::Asset3D::from_file_contents(contents, Some(media_type));
                 model.prepared_meshes.insert(asset_path.clone(), asset);
-                mesh_formats.insert(asset_path.clone(), media_type);
             }
             model.mesh_assets.push(LinkMeshAsset {
                 entity: format!("{}/mesh", model.link_entity[link]),

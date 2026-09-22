@@ -101,6 +101,7 @@ use crate::sink::InputRoute;
 use crate::tf::sanitize_segment;
 
 mod loading;
+mod materials;
 mod validation;
 
 /// Env var naming the Go2 URDF file. Absent ⇒ the skeleton archetype is INERT.
@@ -942,8 +943,8 @@ impl Skeleton {
     /// Checks connected tree topology, finite geometry, unique entity paths,
     /// and explicit motor bindings. Every movable joint needs exactly one binding;
     /// fixed-only models may omit bindings. Supports fixed/revolute/continuous joints
-    /// and at most one mesh visual per link; materials and other geometry must
-    /// be implemented before they can be admitted without silent data loss.
+    /// and at most one mesh visual per link. Materials require asset-aware proof
+    /// through [`Self::try_load`]; this asset-free check rejects them.
     /// Limits: 4096 links, depth 256, 4096-byte entity paths, and 12 motor bindings.
     /// Entity roots cannot start with Rerun's reserved `__` prefix; nested
     /// segments such as `world/__nested` remain supported.
