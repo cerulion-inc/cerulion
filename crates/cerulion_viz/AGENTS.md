@@ -77,3 +77,11 @@ Only `try_load` may defer explicit material checks: prove matching used DAE diff
 effects against frozen bytes before returning. Never strip declarations or confuse
 metadata proof with rendered appearance. Require a single explicitly selected
 DAE visual scene; the native decoder does not honor multi-scene selection.
+
+`SinkState::install_bound_model` requires a strictly loaded model at `models/<id>`
+and one exact caller-resolved attached route. Reject blank routes without changing
+valid route identity. Articulation bypasses scalar admission only for selected
+LowState; other routes and schemas retain normal behavior. Submit model statics
+on idle reconnect with a per-row retry cursor, reset only on explicit rearm.
+Initial SDK failure or unwind requires a fresh sink and recording store; validation
+failure remains retryable. Submission counters do not prove viewer delivery.

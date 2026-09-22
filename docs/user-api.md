@@ -218,6 +218,14 @@ asset-free `validate_urdf` still rejects explicit materials. Material verificati
 requires one explicitly selected DAE visual scene; multi-scene files are
 unsupported because the native decoder imports all scene definitions.
 
+The renderer library exposes `SinkState::install_bound_model` for an exact attached
+route key and a strictly loaded model rooted at `models/<id>`. Complete finite
+LowState motor angles animate the model while ordinary plots retain their gates.
+`bound_model_status` reports SDK submissions and rejections, not GPU rendering.
+Preflight errors permit retry; an initial SDK failure requires a fresh sink and
+recording store, with partial viewer data discarded. Reconnecting alone does not
+clear that guard. No CLI or vizd model-import endpoint is exposed by this API.
+
 ### `cerulion connect` / `pair` / `login` / `account`
 
 Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
