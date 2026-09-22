@@ -245,7 +245,11 @@ Missing or unused names, duplicates, changed colors and textures fail.
 
 This path requires COLLADA 1.4.1, metre units and identity material-symbol-to-ID
 bindings to match the native decoder. Other formats cannot verify URDF colors.
-Limits are 4096 URDF declarations and 4096 nodes per DAE scene. Require one visual
+Limits are 4096 URDF declarations, 4096 nodes per DAE scene, and 65536 XML
+nodes per DAE document (including text and comments). Parsing enforces the
+whole-document limit before building the material ID index. Before parsing, raw
+delimiter counts are limited to 131072 `<` bytes and 262144 `=` bytes, including
+text and comments, to bound the parser's initial capacity estimates. Require one visual
 scene and one top-level `scene/instance_visual_scene` selecting it; ambiguous or
 unresolved selections fail. Multiple scene definitions are rejected because the
 native decoder renders all definitions instead of honoring the selection.

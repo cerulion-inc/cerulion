@@ -216,7 +216,36 @@ fn selected_scene<'a, 'i>(root: Node<'a, 'i>) -> Result<Node<'a, 'i>, UrdfError>
 /// the native decoder's proven subset: metres and identity symbol-to-ID bindings.
 pub(super) fn verify(bytes: &[u8], required: &[&[Declaration]]) -> Result<(), UrdfError> {
     let xml = std::str::from_utf8(bytes).map_err(error)?;
-    let doc = Document::parse(xml).map_err(error)?;
+    // roxmltree reserves arrays from raw delimiter counts before checking nodes_limit.
+    // Bound those estimates, including delimiters inside text and comments.
+    let mut openings = 0;
+    let mut equals = 0;
+    for byte in bytes {
+        match byte {
+            b'<' => openings += 1,
+            b'=' => equals += 1,
+            _ => {}
+        }
+        if openings > 131_072 || equals > 262_144 {
+            return Err(error(
+                "DAE parser budget exceeded: at most 131072 '<' and 262144 '=' bytes",
+            ));
+        }
+    }
+    // Bound every subsequent traversal and ID index by actual document nodes.
+    let doc = Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            nodes_limit: 65_536,
+            ..Default::default()
+        },
+    )
+    .map_err(|cause| match cause {
+        roxmltree::Error::NodesLimitReached => {
+            error("at most 65536 XML nodes are supported per DAE document")
+        }
+        other => error(other),
+    })?;
     let root = doc.root_element();
     if !root.has_tag_name("COLLADA")
         || root.tag_name().namespace() != Some("http://www.collada.org/2005/11/COLLADASchema")
@@ -391,6 +420,39 @@ mod tests {
     fn verify_red(dae: &str) -> Result<(), UrdfError> {
         let declarations = declarations(&urdf(RED))?;
         verify(dae.as_bytes(), &[declarations["base"].as_slice()])
+    }
+
+    #[test]
+    fn bounds_dae_parser_reservations_even_in_comments() {
+        for (delimiter, limit) in [(b'<', 131_072), (b'=', 262_144)] {
+            let template = DAE.replace("</COLLADA>", "<!--padding--></COLLADA>");
+            let existing = template.bytes().filter(|byte| *byte == delimiter).count();
+            let padding = char::from(delimiter).to_string().repeat(limit - existing);
+            let at_limit = template.replace("padding", &padding);
+            verify_red(&at_limit).unwrap();
+            let over_limit =
+                template.replace("padding", &format!("{padding}{}", char::from(delimiter)));
+            assert!(verify_red(&over_limit)
+                .unwrap_err()
+                .to_string()
+                .contains("DAE parser budget exceeded"));
+        }
+    }
+
+    #[test]
+    fn bounds_all_dae_document_nodes_before_material_indexing() {
+        // Even unused metadata consumes parser and ID-index storage.
+        let baseline = Document::parse(DAE).unwrap().descendants().count();
+        let padding = (0..65_536 - baseline)
+            .map(|index| format!("<extra id=\"unused-{index}\"/>"))
+            .collect::<String>();
+        let at_limit = DAE.replace("</COLLADA>", &format!("{padding}</COLLADA>"));
+        verify_red(&at_limit).unwrap();
+        let over_limit = at_limit.replace("</COLLADA>", "<extra/></COLLADA>");
+        assert!(verify_red(&over_limit)
+            .unwrap_err()
+            .to_string()
+            .contains("65536 XML nodes"));
     }
 
     #[test]
