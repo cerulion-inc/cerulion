@@ -223,7 +223,7 @@ This check reads no assets and installs nothing;
 mesh loading, production binding, and resolved-transform acceptance remain separate.
 Legacy constructors retain their existing best-effort behavior.
 
-`Skeleton::try_load(path, config)` runs preflight and freezes original GLB, OBJ,
+`Skeleton::try_load(path, config)` runs structural preflight and freezes original GLB, OBJ,
 STL or DAE mesh files before returning. Relative references resolve from the
 canonical URDF target's directory, including when the URDF is a symlink. Package
 references resolve from matching ancestor/sibling package directories; missing
@@ -233,6 +233,24 @@ The declared mesh extension selects the format, while its canonical path identif
 the file. Conflicting format aliases for one file are rejected. File errors return
 `UrdfError` without exposing a partial model. Run loading off control-handler
 threads; subsequent logging reuses the frozen bytes.
+
+The file loader can verify inline URDF RGBA declarations against used embedded
+DAE diffuse effects. Each name must match an effect ID and all four finite color
+components must match exactly. Each material-bearing visual must declare the
+complete used effect set; different links cannot collectively satisfy it. Visuals
+without declarations retain embedded appearance. The proof follows scene geometry,
+triangle groups, material bindings and effect references in the same frozen bytes
+that are logged. Every user of a shared asset is checked. Bytes are never rewritten.
+Missing or unused names, duplicates, changed colors and textures fail.
+
+This path requires COLLADA 1.4.1, metre units and identity material-symbol-to-ID
+bindings to match the native decoder. Other formats cannot verify URDF colors.
+Limits are 4096 URDF declarations and 4096 nodes per DAE scene. Require one visual
+scene and one top-level `scene/instance_visual_scene` selecting it; ambiguous or
+unresolved selections fail. Multiple scene definitions are rejected because the
+native decoder renders all definitions, tracked in
+[native scene-selection limitation](https://github.com/cerulion-inc/cerulion-studio/issues/125).
+Embedded reflectivity and refraction metadata do not establish matching shading.
 
 Loading does not install a model into vizd or verify GPU decoding. OBJ material
 libraries are ignored by the renderer; DAE support covers triangles and diffuse

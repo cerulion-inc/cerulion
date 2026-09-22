@@ -211,6 +211,12 @@ GLB/OBJ/STL/DAE mesh bytes for rendering. Missing resources are errors, with no
 converted `.glb` sibling fallback. See the internals reference above for limits
 and format restrictions. Loading alone does not establish rendered appearance or
 measured articulation, and does not install into vizd.
+Explicit URDF colors are accepted only when asset-aware checks prove they match
+the complete set of used embedded DAE diffuse effects for each visual. Overrides,
+unresolved references and textures remain errors. Original bytes are preserved;
+asset-free `validate_urdf` still rejects explicit materials. Material verification
+requires one explicitly selected DAE visual scene; multi-scene files remain
+unsupported under [native scene-selection limitation](https://github.com/cerulion-inc/cerulion-studio/issues/125).
 
 ### `cerulion connect` / `pair` / `login` / `account`
 

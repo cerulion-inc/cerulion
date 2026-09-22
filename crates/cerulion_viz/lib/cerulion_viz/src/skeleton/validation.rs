@@ -14,6 +14,19 @@ const MAX_DEPTH: usize = 256;
 const MAX_ENTITY_PATH_BYTES: usize = 4096;
 
 pub(super) fn validate(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
+    validate_with_material_policy(xml, cfg, false)
+}
+
+/// Only the file loader may defer appearance checks until the frozen asset exists.
+pub(super) fn validate_for_loading(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
+    validate_with_material_policy(xml, cfg, true)
+}
+
+fn validate_with_material_policy(
+    xml: &str,
+    cfg: &UrdfConfig,
+    defer_materials: bool,
+) -> Result<(), UrdfError> {
     validate_config(cfg)?;
     let doc = roxmltree::Document::parse(xml).map_err(|e| UrdfError::Xml(e.to_string()))?;
     let robot = doc.root_element();
@@ -24,7 +37,10 @@ pub(super) fn validate(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
     let mut links = BTreeMap::new();
     for link in robot.children().filter(|n| n.has_tag_name("link")) {
         let name = required_attribute(link, "name")?;
-        if links.insert(name, validate_visual(link)?).is_some() {
+        if links
+            .insert(name, validate_visual(link, defer_materials)?)
+            .is_some()
+        {
             return Err(invalid(link, format!("duplicate link name {name:?}")));
         }
         if links.len() > MAX_LINKS {
@@ -50,7 +66,9 @@ pub(super) fn validate(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
             _ => {
                 return Err(invalid(
                     joint,
-                    format!("joint {name:?} has unsupported type {kind:?}; model loading currently supports fixed, revolute, and continuous joints"),
+                    format!(
+                        "joint {name:?} has unsupported type {kind:?}; model loading currently supports fixed, revolute, and continuous joints"
+                    ),
                 ));
             }
         };
@@ -101,12 +119,12 @@ pub(super) fn validate(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
             Some(false) => {
                 return Err(UrdfError::InvalidModel(format!(
                     "motor binding {name:?} must name a revolute or continuous joint"
-                )))
+                )));
             }
             None => {
                 return Err(UrdfError::InvalidModel(format!(
                     "motor binding {name:?} does not name a joint in this model"
-                )))
+                )));
             }
         }
     }
@@ -203,17 +221,24 @@ fn validate_config(cfg: &UrdfConfig) -> Result<(), UrdfError> {
 
 /// A link may omit visuals, but an explicit visual must be representable by the
 /// renderer's one-mesh-per-link contract. Never silently skip a supplied shape.
-fn validate_visual(link: roxmltree::Node<'_, '_>) -> Result<bool, UrdfError> {
+fn validate_visual(
+    link: roxmltree::Node<'_, '_>,
+    defer_materials: bool,
+) -> Result<bool, UrdfError> {
     let Some(visual) = unique_child(link, "visual")? else {
         return Ok(false);
     };
     // The current renderer loads mesh assets but does not apply URDF material
     // overrides or resolve named material references. Accepting either would
     // silently lose the requested color or texture.
-    if let Some(material) = visual.children().find(|n| n.has_tag_name("material")) {
+    if let Some(material) = visual
+        .children()
+        .find(|n| n.has_tag_name("material"))
+        .filter(|_| !defer_materials)
+    {
         return Err(invalid(
             material,
-            "URDF visual materials and textures are not supported by this loader; material import must be implemented before loading this model",
+            "URDF visual materials and textures are not supported by asset-free validation; use try_load to verify supported embedded DAE colors",
         ));
     }
     unique_child(visual, "origin")?;
@@ -260,7 +285,12 @@ fn unique_child<'a, 'input>(
     let mut matches = node.children().filter(|child| child.has_tag_name(tag));
     let first = matches.next();
     if matches.next().is_some() {
-        return Err(invalid(node, format!("at most one <{tag}> is supported; combine or remove duplicate elements before loading")));
+        return Err(invalid(
+            node,
+            format!(
+                "at most one <{tag}> is supported; combine or remove duplicate elements before loading"
+            ),
+        ));
     }
     Ok(first)
 }
@@ -280,7 +310,9 @@ fn reserve_entity(
 ) -> Result<(), UrdfError> {
     validate_entity_length(&entity)?;
     if let Some(previous) = entities.insert(entity.clone(), owner.clone()) {
-        return Err(UrdfError::InvalidModel(format!("entity path {entity:?} collides between {previous} and {owner}; rename the link to avoid sanitized or reserved mesh paths")));
+        return Err(UrdfError::InvalidModel(format!(
+            "entity path {entity:?} collides between {previous} and {owner}; rename the link to avoid sanitized or reserved mesh paths"
+        )));
     }
     Ok(())
 }
