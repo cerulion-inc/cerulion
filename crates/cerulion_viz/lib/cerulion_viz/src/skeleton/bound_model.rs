@@ -37,19 +37,25 @@ fn submission(error: impl ToString) -> UrdfError {
     UrdfError::Submission(error.to_string())
 }
 
-impl BoundModel {
-    pub(crate) fn prepare(
-        rec: &RecordingStream,
-        route_key: &str,
-        skeleton: Skeleton,
-    ) -> Result<Self, UrdfError> {
+impl Skeleton {
+    /// Reject blank keys without normalizing a caller-resolved route identity.
+    pub(crate) fn validate_binding_route(route_key: &str) -> Result<(), UrdfError> {
         if route_key.trim().is_empty() {
             return Err(submission("an exact attached route key is required"));
         }
-        if !skeleton.strict_loaded {
+        Ok(())
+    }
+
+    /// Side-effect-free binding checks shared by preparation and installation.
+    pub(crate) fn validate_binding(&self, route_key: &str) -> Result<(), UrdfError> {
+        Self::validate_binding_route(route_key)?;
+        if !self.strict_loaded {
             return Err(submission("model must come from Skeleton::try_load"));
         }
-        let model = skeleton.model.ok_or_else(|| submission("model is inert"))?;
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| submission("model is inert"))?;
         let root = &model.link_entity[&model.root_link];
         let segments: Vec<_> = root.split('/').collect();
         if segments.len() != 2 || segments[0] != "models" || segments[1].is_empty() {
@@ -70,12 +76,26 @@ impl BoundModel {
                 "model requires explicit measured motor bindings",
             ));
         }
+        Ok(())
+    }
+}
+
+impl BoundModel {
+    pub(crate) fn recording_id(rec: &RecordingStream) -> Result<rerun::StoreId, UrdfError> {
+        rec.store_info()
+            .map(|info| info.store_id)
+            .ok_or_else(|| submission("recording is disabled"))
+    }
+    pub(crate) fn prepare(
+        rec: &RecordingStream,
+        route_key: &str,
+        skeleton: Skeleton,
+    ) -> Result<Self, UrdfError> {
+        skeleton.validate_binding(route_key)?;
+        let model = skeleton.model.expect("binding validation requires a model");
         Ok(Self {
             model,
-            recording_id: rec
-                .store_info()
-                .ok_or_else(|| submission("recording is disabled"))?
-                .store_id,
+            recording_id: Self::recording_id(rec)?,
             next_static_row: 0,
             status: BoundModelStatus {
                 route_key: route_key.into(),

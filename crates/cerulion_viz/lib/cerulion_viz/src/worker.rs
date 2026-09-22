@@ -50,7 +50,13 @@
 #[cfg(test)]
 mod bound_model_reconnect_test;
 
+mod model_load;
+pub use model_load::{ModelLoadError, ModelLoadPhase, ModelLoadStatus};
+use model_load::{ModelLoader, WorkerLifetime};
+
+use crate::skeleton::{Skeleton, UrdfConfig};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -134,10 +140,46 @@ pub enum VizControlError {
 /// (`SyncSender`'s `Debug` is unconditional, so the inner `VizMsg` need not be).
 #[derive(Debug)]
 pub struct VizControl {
+    model_loader: Arc<ModelLoader>,
     tx: Mutex<Option<SyncSender<VizMsg>>>,
 }
 
 impl VizControl {
+    /// Accept one asynchronous model preparation without waiting for filesystem,
+    /// rendering, or a full queue. Success means Queued, not installed or visible.
+    /// The caller must hold its attachment lock and verify the exact route exists.
+    pub fn load_model(
+        &self,
+        path: PathBuf,
+        config: UrdfConfig,
+        route_key: String,
+    ) -> Result<ModelLoadStatus, ModelLoadError> {
+        // Serialize this handle's closure with admission; independent controls
+        // have independent senders and share only the worker-owned loader.
+        let sender = self.tx.lock().unwrap();
+        if sender.is_none() {
+            return Err(ModelLoadError::WorkerGone);
+        }
+        self.model_loader.load(path, config, route_key)
+    }
+
+    /// Latest operation, including render-worker joint counters after installation.
+    pub fn model_status(&self) -> Option<ModelLoadStatus> {
+        self.model_loader.status()
+    }
+
+    /// Cancel before detaching the exact route, under the caller's attachment lock.
+    /// Installing/Installed, or a failed installation with possible partial
+    /// statics, return an error: SDK writes cannot be retracted and unloading is
+    /// not supported. Such a route must remain attached until visualization stops.
+    pub fn cancel_model_load(&self, route_key: &str) -> Result<bool, ModelLoadError> {
+        let sender = self.tx.lock().unwrap();
+        if sender.is_none() {
+            return Err(ModelLoadError::WorkerGone);
+        }
+        self.model_loader.cancel(route_key)
+    }
+
     /// Hand `plan` to the worker to install as the runtime blueprint. Bounded
     /// (never blocks forever) + non-silent: `Ok(())` once the message is enqueued,
     /// else a structured [`VizControlError`]. The apply itself happens on the
@@ -197,7 +239,9 @@ impl VizControl {
     /// daemon calls this at shutdown START so the worker's `recv` can reach
     /// `Disconnected` — and run its bounded teardown flush — once the poll thread
     /// drops the worker, even though `Arc<VizControl>` clones survive on other
-    /// controller threads (the sender inside is now `None`).
+    /// controller threads (the sender inside is now `None`). Independently obtained
+    /// controls remain usable; the shared model loader closes with the worker.
+    /// `Arc` clones of this handle share its closed state.
     pub fn close(&self) {
         *self.tx.lock().unwrap() = None;
     }
@@ -225,6 +269,10 @@ impl InputFrames {
 /// prior batch — lets tests observe the async worker's effect deterministically
 /// without sleeps).
 enum VizMsg {
+    InstallModel {
+        id: u64,
+        skeleton: Box<Skeleton>,
+    },
     Batch(Vec<InputFrames>),
     /// Atomically replace the worker's [`FrameWalker`] between
     /// batches. The dynamic viz daemon owns the schema universe and, when it
@@ -469,6 +517,7 @@ impl ReconnectHooks {
 /// drives it (the `cerulion-vizd` daemon); the heavy
 /// state (rec + walker + [`SinkState`]) lives on the spawned thread.
 pub struct VizLogWorker {
+    model_loader: Arc<ModelLoader>,
     /// `Option` so `Drop` can drop the sender BEFORE joining (the worker's
     /// `recv` sees `Disconnected` once the queue drains → clean exit).
     tx: Option<SyncSender<VizMsg>>,
@@ -517,9 +566,12 @@ impl VizLogWorker {
         let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP);
         let counters = Arc::new(VizWorkerCounters::default());
         let counters_worker = Arc::clone(&counters);
+        let model_loader = ModelLoader::spawn(tx.clone())?;
+        let worker_models = Arc::clone(&model_loader);
         let handle = std::thread::Builder::new()
             .name("go2-viz-log".to_string())
             .spawn(move || {
+                let _lifetime = WorkerLifetime(Arc::clone(&worker_models));
                 run(
                     rec,
                     walker,
@@ -528,9 +580,11 @@ impl VizLogWorker {
                     counters_worker,
                     hooks,
                     probe_interval,
+                    &worker_models,
                 )
             })?;
         Ok(Self {
+            model_loader,
             tx: Some(tx),
             handle: Some(handle),
             counters,
@@ -546,6 +600,7 @@ impl VizLogWorker {
     /// the daemon can `close()` the shared sender at shutdown.
     pub fn control(&self) -> Arc<VizControl> {
         Arc::new(VizControl {
+            model_loader: Arc::clone(&self.model_loader),
             tx: Mutex::new(self.tx.clone()),
         })
     }
@@ -773,6 +828,7 @@ impl Drop for BlockGuard {
 
 impl Drop for VizLogWorker {
     fn drop(&mut self) {
+        self.model_loader.close();
         // Drop the sender first so the worker's `recv` returns `Disconnected`
         // once the queued backlog drains — then join so a clean shutdown's tail
         // frames are rendered + flushed before the process moves on.
@@ -803,6 +859,7 @@ impl Drop for VizLogWorker {
 /// The worker thread body: own the heavy state, drain the queue, render each
 /// batch through the existing dispatch, keep the scene statics + blueprint set
 /// up, and reconnect a dead gRPC sink on a health-probe timer.
+#[allow(clippy::too_many_arguments)]
 fn run(
     rec: RecordingStream,
     // Mutable so a `SwapWalker` message can replace it in place
@@ -813,6 +870,7 @@ fn run(
     counters: Arc<VizWorkerCounters>,
     hooks: ReconnectHooks,
     probe_interval: Duration,
+    model_loader: &ModelLoader,
 ) {
     // Set the scene up ASAP so the viewer renders correctly even before data
     // (idempotent once-guards; re-armed on reconnect).
@@ -843,14 +901,39 @@ fn run(
                 break;
             }
         };
-        // A walker swap is handled HERE (not in `handle_message`)
-        // so it can take `walker` by ownership. A plain move — it cannot panic, so
-        // it needs no `catch_unwind` — and it carries no batch to render, so
-        // `continue` skips the dispatch for this iteration. FIFO on the channel
-        // means every batch enqueued after this decodes against the new walker.
-        // The `match ... => other` rebind consumes `msg` without partial-moving
-        // it, so the non-swap path still owns `msg` for `handle_message`.
+        // These control messages consume owned payloads between batches. Model
+        // installation contains SDK panics separately so the operation becomes
+        // Failed; a walker swap is just a move. Both preserve queue order and
+        // skip ordinary frame dispatch for this iteration.
         let msg = match msg {
+            Some(VizMsg::InstallModel { id, skeleton }) => {
+                if let Err(error) = state.preflight_bound_model_installation(&rec) {
+                    model_loader.reject_prepared(id, error.to_string());
+                    continue;
+                }
+                if let Some(route) = model_loader.begin_install(id) {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        state.install_bound_model(&rec, &route, *skeleton)
+                    }));
+                    let result = match result {
+                        Ok(result) => result.map_err(|error| error.to_string()),
+                        Err(_) => {
+                            counters.render_panics.fetch_add(1, Ordering::Relaxed);
+                            Err(
+                                "model installation panicked; statics may be partially submitted"
+                                    .into(),
+                            )
+                        }
+                    };
+                    if model_loader.finish_install(id, result, state.bound_model_status().cloned())
+                    {
+                        counters
+                            .layout_signal_generation
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
             Some(VizMsg::SwapWalker(new_walker)) => {
                 walker = new_walker;
                 tracing::debug!("cerulion_viz: viz walker swapped (new schema set installed)");
@@ -877,6 +960,7 @@ fn run(
                 msg,
             )
         }));
+        model_loader.refresh(state.bound_model_status());
         if outcome.is_err() {
             counters.render_panics.fetch_add(1, Ordering::Relaxed);
             match panic_latch.on_inferred() {
@@ -959,6 +1043,7 @@ fn handle_message(
             // All prior batches are processed (in-order channel) — ack.
             let _ = ack.send(());
         }
+        Some(VizMsg::InstallModel { .. }) => unreachable!("InstallModel is handled in run()"),
         Some(VizMsg::SwapWalker(_)) => {
             // Unreachable by construction: `run` intercepts `SwapWalker` before
             // dispatch (it needs `walker` by ownership) and `continue`s. If a
@@ -1085,6 +1170,14 @@ fn maybe_probe_reconnect(
     }
 }
 
+// A quiet or malformed joint route must not leave the reconnected scene empty.
+// The sink tracks individual static rows, so retries append only pending rows.
+fn resubmit_bound_model_statics(rec: &RecordingStream, state: &mut SinkState) {
+    if let Err(error) = state.submit_bound_model_statics(rec) {
+        tracing::debug!(%error, "bound model statics pending; retry on next probe");
+    }
+}
+
 /// Render one poll's batch: the EXACT per-input drain loop the caller
 /// used to run inline (staged newest-wins for a replacing kind, render
 /// every per-sample frame, fold the coalesced count), now off the tick thread.
@@ -1123,13 +1216,6 @@ fn process_batch(
 fn ensure_setup(rec: &RecordingStream) {
     log_viz_statics_once(rec);
     send_blueprint_once(rec);
-}
-
-// Resume only pending static rows; quiet sensors must not leave a fresh viewer empty.
-fn resubmit_bound_model_statics(rec: &RecordingStream, state: &mut SinkState) {
-    if let Err(error) = state.submit_bound_model_statics(rec) {
-        tracing::debug!(%error, "bound model statics pending; retry on next probe");
-    }
 }
 
 #[cfg(test)]

@@ -86,3 +86,11 @@ on idle reconnect with a per-row retry cursor, reset only on explicit rearm.
 The worker retries pending model statics on idle probes after reconnect.
 Initial SDK failure or unwind requires a fresh sink and recording store; validation
 failure remains retryable. Submission counters do not prove viewer delivery.
+
+Prepare models on the bounded loader thread. Admission and render handoff each
+use one `try_send`; cancellation and the Installing claim share a short lock.
+Run shared binding validation before installation and reject stale operation IDs.
+No lock spans file reads or SDK calls. Initial SDK failure requires a fresh worker
+and recording store; preflight remains retryable. Close independent control handles
+independently; only worker lifetime closes the shared loader. Acquire each handle's
+sender mutex before the loader mutex, never in reverse. Shutdown terminates status.

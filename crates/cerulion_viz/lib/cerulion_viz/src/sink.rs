@@ -1665,10 +1665,7 @@ impl SinkState {
         skeleton: Skeleton,
         submit: impl FnOnce(&mut BoundModel) -> Result<(), UrdfError>,
     ) -> Result<(), UrdfError> {
-        self.check_bound_model_install_failure()?;
-        if self.bound_model.is_some() {
-            return Err(UrdfError::Submission("a model is already installed".into()));
-        }
+        self.preflight_bound_model_installation(rec)?;
         let mut binding = BoundModel::prepare(rec, route_key, skeleton)?;
         // Arm before the SDK call, including unwinding. No active model survives
         // a failed initial submission, and another installation cannot replay its prefix.
@@ -1681,6 +1678,18 @@ impl SinkState {
         self.bound_model = Some(binding);
         self.bound_model_install_failed = false;
         Ok(())
+    }
+
+    /// Check render-worker state before claiming an irreversible SDK submission.
+    pub(crate) fn preflight_bound_model_installation(
+        &self,
+        rec: &RecordingStream,
+    ) -> Result<(), UrdfError> {
+        self.check_bound_model_install_failure()?;
+        if self.bound_model.is_some() {
+            return Err(UrdfError::Submission("a model is already installed".into()));
+        }
+        BoundModel::recording_id(rec).map(|_| ())
     }
 
     fn check_bound_model_install_failure(&self) -> Result<(), UrdfError> {
