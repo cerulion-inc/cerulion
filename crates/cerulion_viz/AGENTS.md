@@ -91,3 +91,11 @@ Bound material-verification XML parsing before indexing: at most 65536 document
 nodes, including text and comments. Bound raw `<` and `=` byte counts before
 parsing too: the parser reserves capacity before checking its node limit.
 Scene limits alone do not bound unused metadata.
+
+Retain only the latest complete valid measured pose across render-worker batches;
+pace joint SDK submissions at least 16,666,667 ns apart using a monotonic presentation
+deadline. Never alter source timestamps or gate other telemetry with that clock.
+Wake for pending deadlines on idle input and check after control messages too.
+Invalid samples remain counted and cannot replace a valid pending pose. Consume
+the pose before SDK submission; reconnect and panic discard temporal model state.
+Direct dispatch remains immediate.

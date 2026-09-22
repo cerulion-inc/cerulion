@@ -1717,6 +1717,45 @@ impl SinkState {
         }
     }
 
+    /// Defer only articulation while telemetry keeps its existing admission rules.
+    pub(crate) fn begin_bound_model_batch(&mut self) {
+        if let Some(model) = &mut self.bound_model {
+            model.begin_batch();
+        }
+    }
+
+    /// Submit the latest valid pose when its presentation deadline is due.
+    pub(crate) fn finish_bound_model_batch(
+        &mut self,
+        rec: &RecordingStream,
+        now: std::time::Instant,
+    ) {
+        if let Some(model) = &mut self.bound_model {
+            model.finish_batch(rec, now);
+        }
+    }
+
+    pub(crate) fn bound_model_submission_wait(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        self.bound_model
+            .as_ref()
+            .and_then(|model| model.submission_wait(now))
+    }
+
+    pub(crate) fn flush_due_bound_model(&mut self, rec: &RecordingStream, now: std::time::Instant) {
+        if let Some(model) = &mut self.bound_model {
+            model.flush_due(rec, now);
+        }
+    }
+
+    pub(crate) fn abort_bound_model_batch(&mut self) {
+        if let Some(model) = &mut self.bound_model {
+            model.abort_batch();
+        }
+    }
+
     fn is_bound_model_input(&self, route_key: &str) -> bool {
         self.bound_model
             .as_ref()

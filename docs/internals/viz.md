@@ -325,6 +325,17 @@ present before submission. The selected LowState bypasses pre-walk plot admissio
 and coalescing while other schemas retain normal gates. No cloud or odometry
 binding is inferred.
 
+The render worker coalesces articulation independently of telemetry: one fixed-size
+latest valid motor bank survives across batches until its presentation deadline.
+Submissions are separated by at least 16,666,667 ns on the worker's monotonic clock.
+This bounds joint SDK work to at most 60 submissions per second; it does not promise
+a display rate or bound all rendering costs. Source timestamps are unchanged.
+Invalid samples remain counted and cannot replace a valid pending pose. Plot
+admission and mutation-stream delivery retain their normal rules. The worker wakes
+for pending pose deadlines even when input is quiet; other messages cannot starve
+them. Direct `dispatch_frame` calls remain immediate. Pending temporal state is
+consumed before SDK submission and discarded on reconnect or render panic.
+
 Statics submit once per model/recording until explicitly rearmed on reconnect.
 The render worker submits pending model statics after a successful reconnect
 and retries them on subsequent probes, even when no joint frames arrive.

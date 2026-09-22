@@ -4,6 +4,10 @@
 use super::{joint_transform3d, read_leg_motor_qs, Skeleton, UrdfError, UrdfModel};
 use cerulion_core::codegen::FrameValue;
 use rerun::RecordingStream;
+use std::time::{Duration, Instant};
+
+// Presentation pacing only; source timestamps and recorded sensor frames are unchanged.
+const JOINT_SUBMISSION_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
 /// SDK submission state. These counters do not prove GPU rendering or live data.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -16,7 +20,7 @@ pub struct BoundModelStatus {
     pub joint_frames_submitted: u64,
     /// Selected frames rejected before completing submission.
     pub rejected_frames: u64,
-    /// Most recent submission error; cleared by a successful frame or pending static retry.
+    /// Most recent frame or static error; a static retry clears only its own error.
     pub last_error: Option<String>,
 }
 
@@ -26,6 +30,17 @@ pub(crate) struct BoundModel {
     recording_id: rerun::StoreId,
     status: BoundModelStatus,
     next_static_row: usize,
+    defer_joint_submission: bool,
+    pending_pose: Option<MeasuredPose>,
+    next_joint_submission: Option<Instant>,
+    last_error_from_statics: bool,
+}
+
+#[derive(Debug)]
+struct MeasuredPose {
+    timestamp_ns: u64,
+    rejected_frames_at_capture: u64,
+    angles: [Option<f64>; super::LEG_MOTOR_COUNT],
 }
 
 enum StaticRow<'a> {
@@ -77,6 +92,10 @@ impl BoundModel {
                 .ok_or_else(|| submission("recording is disabled"))?
                 .store_id,
             next_static_row: 0,
+            defer_joint_submission: false,
+            pending_pose: None,
+            next_joint_submission: None,
+            last_error_from_statics: false,
             status: BoundModelStatus {
                 route_key: route_key.into(),
                 ..Default::default()
@@ -106,12 +125,14 @@ impl BoundModel {
     pub(crate) fn rearm_statics(&mut self) {
         self.status.statics_submitted = false;
         self.next_static_row = 0;
+        self.pending_pose = None;
     }
 
     pub(crate) fn submit_statics(&mut self, rec: &RecordingStream) -> Result<(), UrdfError> {
         if rec.store_info().map(|info| info.store_id).as_ref() != Some(&self.recording_id) {
             let error = submission("statics belong to a different or disabled recording");
             self.status.last_error = Some(error.to_string());
+            self.last_error_from_statics = true;
             return Err(error);
         }
         let pending = !self.status.statics_submitted;
@@ -122,8 +143,14 @@ impl BoundModel {
             StaticRow::Asset(entity, asset) => rec.log_static(entity, asset).map_err(submission),
         });
         match &result {
-            Err(error) => self.status.last_error = Some(error.to_string()),
-            Ok(()) if pending => self.status.last_error = None,
+            Err(error) => {
+                self.status.last_error = Some(error.to_string());
+                self.last_error_from_statics = true;
+            }
+            Ok(()) if pending && self.last_error_from_statics => {
+                self.status.last_error = None;
+                self.last_error_from_statics = false;
+            }
             Ok(()) => {}
         }
         result
@@ -177,24 +204,81 @@ impl BoundModel {
         if !self.matches(route_key) {
             return;
         }
-        match self.try_submit_frame(rec, timestamp_ns, frame) {
-            Ok(()) => {
-                self.status.joint_frames_submitted += 1;
-                self.status.last_error = None;
-            }
+        match self.read_pose(rec, timestamp_ns, frame) {
+            Ok(pose) => self.pending_pose = Some(pose),
             Err(error) => {
-                self.status.rejected_frames += 1;
-                self.status.last_error = Some(error.to_string());
+                self.reject(error);
+                return;
             }
+        }
+        if !self.defer_joint_submission {
+            self.flush_pose(rec);
         }
     }
 
-    fn try_submit_frame(
-        &mut self,
+    pub(crate) fn begin_batch(&mut self) {
+        self.defer_joint_submission = true;
+    }
+
+    pub(crate) fn finish_batch(&mut self, rec: &RecordingStream, now: Instant) {
+        self.defer_joint_submission = false;
+        self.flush_due(rec, now);
+    }
+
+    pub(crate) fn submission_wait(&self, now: Instant) -> Option<Duration> {
+        self.pending_pose.as_ref()?;
+        Some(
+            self.next_joint_submission
+                .map_or(Duration::ZERO, |due| due.saturating_duration_since(now)),
+        )
+    }
+
+    pub(crate) fn flush_due(&mut self, rec: &RecordingStream, now: Instant) {
+        if self.submission_wait(now) != Some(Duration::ZERO) {
+            return;
+        }
+        // Advance before SDK calls, so a failed submission cannot create a busy retry loop.
+        self.next_joint_submission = Some(now + JOINT_SUBMISSION_INTERVAL);
+        self.flush_pose(rec);
+    }
+
+    pub(crate) fn abort_batch(&mut self) {
+        self.defer_joint_submission = false;
+        if self.pending_pose.take().is_some() {
+            self.reject(submission("joint pose discarded after render batch panic"));
+        }
+    }
+
+    fn reject(&mut self, error: UrdfError) {
+        self.status.rejected_frames += 1;
+        self.last_error_from_statics = false;
+        self.status.last_error = Some(error.to_string());
+    }
+
+    fn flush_pose(&mut self, rec: &RecordingStream) {
+        // Consume before SDK submission: temporal rows are never replayed on retry.
+        let Some(pose) = self.pending_pose.take() else {
+            return;
+        };
+        let rejections_at_capture = pose.rejected_frames_at_capture;
+        match self.write_pose(rec, pose) {
+            Ok(()) => {
+                self.status.joint_frames_submitted += 1;
+                if self.status.rejected_frames == rejections_at_capture {
+                    self.status.last_error = None;
+                }
+                self.last_error_from_statics = false;
+            }
+            Err(error) => self.reject(error),
+        }
+    }
+
+    fn read_pose(
+        &self,
         rec: &RecordingStream,
         timestamp_ns: u64,
         frame: &FrameValue,
-    ) -> Result<(), UrdfError> {
+    ) -> Result<MeasuredPose, UrdfError> {
         if rec.store_info().map(|info| info.store_id).as_ref() != Some(&self.recording_id) {
             return Err(submission("frame belongs to a different recording"));
         }
@@ -210,11 +294,22 @@ impl BoundModel {
                 )));
             }
         }
+        Ok(MeasuredPose {
+            timestamp_ns,
+            rejected_frames_at_capture: self.status.rejected_frames,
+            angles,
+        })
+    }
+
+    fn write_pose(&mut self, rec: &RecordingStream, pose: MeasuredPose) -> Result<(), UrdfError> {
+        if rec.store_info().map(|info| info.store_id).as_ref() != Some(&self.recording_id) {
+            return Err(submission("frame belongs to a different recording"));
+        }
         if !self.status.statics_submitted {
             self.submit_statics(rec)?;
         }
-        super::set_robot_time(rec, timestamp_ns);
-        for (binding, angle) in self.model.motor_bindings.iter().zip(angles) {
+        super::set_robot_time(rec, pose.timestamp_ns);
+        for (binding, angle) in self.model.motor_bindings.iter().zip(pose.angles) {
             let binding = binding.as_ref().expect("installation checks every binding");
             let q = angle.expect("the complete required bank was checked");
             let tf = joint_transform3d(binding.xyz, binding.rpy, binding.axis, q);
