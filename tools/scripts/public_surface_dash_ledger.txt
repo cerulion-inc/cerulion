@@ -235,7 +235,7 @@
 6 crates/cerulion_viz/lib/cerulion_viz/src/pointcloud.rs
 16 crates/cerulion_viz/lib/cerulion_viz/src/schema_registry.rs
 40 crates/cerulion_viz/lib/cerulion_viz/src/sink.rs
-14 crates/cerulion_viz/lib/cerulion_viz/src/skeleton.rs
+13 crates/cerulion_viz/lib/cerulion_viz/src/skeleton.rs
 2 crates/cerulion_viz/lib/cerulion_viz/src/stream.rs
 3 crates/cerulion_viz/lib/cerulion_viz/src/tap_manager.rs
 6 crates/cerulion_viz/lib/cerulion_viz/src/tf.rs

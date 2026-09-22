@@ -13,6 +13,11 @@
 //!
 //! # Meshes
 //!
+//! [`Skeleton::try_load`] validates the supported model and reads original
+//! GLB, OBJ, STL, or DAE assets before returning. Missing assets and unsupported
+//! geometry are errors. Neither constructor installs a model into vizd.
+//! The older best-effort [`Skeleton::load`] behavior below remains available.
+//!
 //! Each URDF `<link>`'s first `<visual>` that carries a `<geometry><mesh>` is
 //! logged as a STATIC [`rerun::Asset3D`] on a `<link entity>/mesh` child, so the
 //! mesh rides its link's (moving) joint transform for free. Rerun reads glTF, not
@@ -95,6 +100,7 @@ use crate::sink::InputRoute;
 // private copy with a different fallback and NO aliasing suffix).
 use crate::tf::sanitize_segment;
 
+mod loading;
 mod validation;
 
 /// Env var naming the Go2 URDF file. Absent ⇒ the skeleton archetype is INERT.
@@ -306,10 +312,9 @@ struct RawVisual {
     scale: [f64; 3],
 }
 
-/// A resolved per-link mesh asset ready to log as a static [`rerun::Asset3D`]:
-/// the `.glb` sibling that EXISTS (checked at resolve time — see
-/// `UrdfModel::resolve_mesh_assets`) plus the visual origin + scale for its
-/// static [`rerun::Transform3D`]. Public so tests can oracle the resolution.
+/// A resolved mesh reference and its visual origin/scale. Strict loading freezes
+/// the original file bytes; legacy loading resolves a converted `.glb` sibling.
+/// Both log a static [`rerun::Asset3D`] under the moving link transform.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkMeshAsset {
     /// The Rerun entity the mesh logs to: `<link entity>/mesh` (a child of the
@@ -317,9 +322,10 @@ pub struct LinkMeshAsset {
     /// `/mesh` segment is RESERVED: a URDF link named literally `mesh` under a
     /// mesh-bearing parent would collide with this child (un-guarded, contrived).
     pub entity: String,
-    /// The existing `.glb` sibling (the resolved mesh path with its extension
-    /// swapped to `.glb`). The original mesh (commonly `.dae`, sometimes
-    /// `.stl`/`.obj`) is never read by the runtime.
+    /// The resolved asset file. Strict loading uses the original URDF reference;
+    /// legacy best-effort loading uses a converted `.glb` sibling. The historical
+    /// field name is retained for source compatibility; use [`Self::asset_path`]
+    /// in code that accepts either path.
     pub glb_path: PathBuf,
     /// The visual `<origin xyz>` translation.
     pub origin_xyz: [f64; 3],
@@ -330,6 +336,11 @@ pub struct LinkMeshAsset {
 }
 
 impl LinkMeshAsset {
+    /// Resolved mesh path for either native or legacy converted assets.
+    pub fn asset_path(&self) -> &Path {
+        &self.glb_path
+    }
+
     /// True when the visual origin + scale are the identity (no translation, no
     /// rotation, unit scale) — the mesh then inherits its link's transform
     /// verbatim and needs NO own `Transform3D` (see [`Self::origin_transform`]).
@@ -437,6 +448,9 @@ struct UrdfModel {
     /// for the dir-less [`Skeleton::from_urdf_str`] path). Logged by
     /// [`Self::log_statics`].
     mesh_assets: Vec<LinkMeshAsset>,
+    /// Strict loading freezes original asset bytes before exposing the model.
+    /// Shared mesh files are read once, even when referenced by several links.
+    prepared_meshes: BTreeMap<PathBuf, rerun::Asset3D>,
 }
 
 impl UrdfModel {
@@ -508,11 +522,16 @@ impl UrdfModel {
 
         // (3) Per-link visual meshes: a static Asset3D on the
         // `<link>/mesh` child, plus the visual origin+scale as that child's
-        // static Transform3D (skipped when identity+unit). Rerun reads the
-        // `.glb` bytes at log time (`from_file_path` → an io error, not a
-        // panic); every failure is a best-effort warn, never propagated.
+        // static Transform3D (skipped when identity+unit).
+        // Strict imports use frozen bytes. Legacy imports read the converted
+        // sibling at log time and report read failures as best-effort warnings.
         for asset in &self.mesh_assets {
-            match rerun::Asset3D::from_file_path(&asset.glb_path) {
+            let mesh = self
+                .prepared_meshes
+                .get(&asset.glb_path)
+                .cloned()
+                .map_or_else(|| rerun::Asset3D::from_file_path(&asset.glb_path), Ok);
+            match mesh {
                 Ok(mesh) => {
                     if let Err(e) = rec.log_static(asset.entity.clone(), &mesh) {
                         tracing::warn!(error = %e, entity = %asset.entity, "cerulion_viz skeleton: static mesh Asset3D log failed");
@@ -521,8 +540,8 @@ impl UrdfModel {
                 Err(e) => tracing::warn!(
                     error = %e,
                     entity = %asset.entity,
-                    glb = %asset.glb_path.display(),
-                    "cerulion_viz skeleton: could not read the .glb mesh — skipping it (stick figure unaffected)"
+                    path = %asset.glb_path.display(),
+                    "cerulion_viz skeleton: could not read the mesh; skipping it (stick figure unaffected)"
                 ),
             }
             if let Some(tf) = asset.origin_transform() {
@@ -622,9 +641,17 @@ pub enum UrdfError {
     /// The document declared no `<link>`s.
     #[error("URDF has no <link> elements")]
     NoLinks,
-    /// Explicit model validation found geometry or topology the renderer cannot preserve.
+    /// The strict loader cannot represent the supplied model faithfully.
     #[error("invalid URDF model: {0}")]
     InvalidModel(String),
+    /// A model or referenced asset could not be read within the import bounds.
+    #[error("cannot load URDF resource {path:?}: {message}")]
+    Resource {
+        /// Requested resource path.
+        path: PathBuf,
+        /// Underlying I/O failure or import limit.
+        message: String,
+    },
     /// An explicitly supplied geometry vector is malformed or cannot reach the renderer.
     #[error("URDF <{element}> {attribute} at line {line}: expected three finite numbers representable as f32, got {value:?}")]
     InvalidVector {
@@ -873,6 +900,7 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
         // Resolved lazily by `resolve_mesh_assets` in `Skeleton::load` (needs the
         // URDF's directory); the dir-less `from_urdf_str` leaves this empty.
         mesh_assets: Vec::new(),
+        prepared_meshes: BTreeMap::new(),
     })
 }
 
@@ -1113,7 +1141,7 @@ impl Skeleton {
         }
     }
 
-    /// The resolved per-link `.glb` mesh assets — empty when inert or
+    /// The resolved per-link mesh assets, empty when inert or
     /// when built via the dir-less [`Skeleton::from_urdf_str`]. A pure accessor
     /// for tests + operator introspection (Principle #3).
     pub fn link_mesh_assets(&self) -> &[LinkMeshAsset] {
