@@ -226,7 +226,8 @@ LowState motor angles animate the model while ordinary plots retain their gates.
 `bound_model_status` reports SDK submissions and rejections, not GPU rendering.
 Preflight errors permit retry; an initial SDK failure requires a fresh sink and
 recording store, with partial viewer data discarded. Reconnecting alone does not
-clear that guard. No CLI or vizd model-import endpoint is exposed by this API.
+clear that guard. The daemon exposes the [model control protocol](#model-control-protocol);
+the CLI does not yet expose model-import commands.
 
 ### `cerulion connect` / `pair` / `login` / `account`
 
@@ -2722,3 +2723,30 @@ You generally don't set these; the CLI generates the right feature wiring per no
 - A guide to writing tests against `cerulion_core::graph::*` directly. The integration-test patterns in `crates/cerulion_core/tests/` are framework-internal: they will continue to be supported but are not the path application authors take.
 
 If something you want to do isn't possible through the surface above, open an issue rather than reaching into internals.
+
+### Model control protocol
+
+The visualization daemon accepts `load_model` with `id`, an absolute local
+`urdf_path`, an already-attached `topic`, a single-segment `model_id`, and ordered
+`motor_joints`. This queues preparation without filesystem work on the control
+thread. `model_status` takes only `id` and returns the latest operation or null. A
+failed preflight releases route alias ownership; failure after SDK installation
+starts retains it until a fresh worker and recording store are created.
+Both return `{id, ok: true, model: ...}` on successful request handling; inspect
+`model.phase` separately to distinguish admission from installed statics. Errors
+retain the existing `{id, ok: false, error: ...}` envelope.
+
+Models occupy `models/<model_id>` and bind only to the chosen LowState route.
+No root pose or sensor transform is inferred. Auto layout adds a separate model
+pane; existing explicit layouts remain unchanged. A custom model-only explicit
+layout is not yet supported by topic-based grounding.
+
+Detaching the model input before installation cancels the operation. Unrelated
+topics and their network demands remain removable if the render worker fails.
+Once installation starts, the model route cannot be detached or replaced in that worker. Recovery after
+partial installation requires restarting `cerulion-vizd` and discarding the partial
+recording in Studio and any external recording endpoint. Viewer reconnect alone
+does not reset the worker; daemon restart alone cannot erase retained viewer data.
+Status exposes errors and joint/static submission counters; none is proof of GPU rendering or live
+spatial alignment. The first binding supports 1..12 measured movable joints,
+with every movable joint named exactly once in motor-array order.

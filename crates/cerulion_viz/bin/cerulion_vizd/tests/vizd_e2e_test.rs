@@ -13838,3 +13838,219 @@ fn a_plane_that_cannot_query_runs_degrades_rather_than_claiming_an_empty_lan_e2e
     daemon.shutdown();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Exercise model admission over the real control socket, with real files and a
+/// silent SHM route. SDK submission proves installation, not GPU appearance.
+#[test]
+fn model_import_status_route_ownership_and_layout_e2e() {
+    let _statics = blueprint_statics_guard();
+    for explicit in [false, true] {
+        clear_runtime_blueprint();
+        let mgr = isolated_transport(if explicit {
+            "model_explicit"
+        } else {
+            "model_auto"
+        });
+        let topic = "/vizd/joints";
+        let _publisher = mgr
+            .create_publisher(topic, MaxSliceLen::const_new(1 << 16), 0)
+            .unwrap();
+        let _alias = mgr
+            .create_publisher("/vizd/alias", MaxSliceLen::const_new(1 << 16), 0)
+            .unwrap();
+        let (worker, flush, storage) = memory_worker("model_control");
+        let counters = worker.counters();
+        let (socket, dir) = temp_socket("model");
+        let mut daemon = start_hermetic(
+            socket.clone(),
+            DEFAULT_POLL_INTERVAL,
+            mgr,
+            worker,
+            builtin_walker(),
+            None,
+        )
+        .unwrap();
+        let mut client = Client::connect(&socket);
+        assert_eq!(
+            client.request(r#"{"id":1,"method":"model_status"}"#),
+            serde_json::json!({"id":1,"ok":true,"model":null})
+        );
+        let path = dir.join("robot.urdf");
+        let mut load = serde_json::json!({"id":2,"method":"load_model","urdf_path":path,"topic":topic,"model_id":"demo","motor_joints":["hinge"]});
+        let absent = client.request(&load.to_string());
+        assert_eq!(absent["ok"], false);
+        assert!(absent["error"]
+            .as_str()
+            .unwrap()
+            .contains("existing exact topic attachment"));
+        assert_eq!(
+            client
+                .request(&serde_json::json!({"id":3,"method":"attach","topic":topic}).to_string())
+                ["ok"],
+            true
+        );
+        assert_eq!(
+            client.request(
+                r#"{"id":30,"method":"attach","topic":"/vizd/alias","entity":"world/vizd/joints"}"#
+            )["ok"],
+            true
+        );
+        let ambiguous = client.request(&load.to_string());
+        assert_eq!(ambiguous["ok"], false);
+        assert!(ambiguous["error"].as_str().unwrap().contains("shared"));
+        assert_eq!(
+            client.request(r#"{"id":31,"method":"detach","topic":"/vizd/alias"}"#)["ok"],
+            true
+        );
+        // A preparation failure remains observable and allows another operation.
+        assert_eq!(client.request(&load.to_string())["ok"], true);
+        let mut failed = Value::Null;
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                failed = client.request(r#"{"id":4,"method":"model_status"}"#);
+                failed["model"]["phase"] == "failed"
+            }),
+            "missing URDF must fail asynchronously: {failed}"
+        );
+        assert!(failed["model"]["error"].is_string());
+        let first_operation = failed["model"]["operation_id"].as_u64().unwrap();
+        // A failed preflight owns no model rows or alias reservation.
+        let alias = client.request(
+            r#"{"id":32,"method":"attach","topic":"/vizd/alias","entity":"world/vizd/joints"}"#,
+        );
+        assert_eq!(
+            alias["ok"], true,
+            "preflight failure must release aliases: {alias}"
+        );
+        assert_eq!(
+            client.request(r#"{"id":33,"method":"detach","topic":"/vizd/alias"}"#)["ok"],
+            true
+        );
+        std::fs::write(&path, r#"<robot name="oracle"><link name="base"/><link name="arm"/><joint name="hinge" type="continuous"><parent link="base"/><child link="arm"/><axis xyz="0 0 1"/></joint><link name="tip"/><joint name="mount" type="fixed"><parent link="arm"/><child link="tip"/><origin xyz="0.25 -0.5 1"/></joint></robot>"#).unwrap();
+        if explicit {
+            let response = client.request(r#"{"id":5,"method":"set_blueprint","layout":{"root":{"type":"view","kind":"spatial3d","name":"Keep operator layout","origin":"world"}}}"#);
+            assert_eq!(response["ok"], true, "{response}");
+            assert!(wait_until(Duration::from_secs(3), || {
+                current_runtime_blueprint_plan()
+                    .is_some_and(|p| plan_has_view_named(&p, "Keep operator layout"))
+            }));
+        }
+        load["id"] = 6.into();
+        let admitted = client.request(&load.to_string());
+        assert_eq!(admitted["ok"], true, "{admitted}");
+        assert!(admitted["model"]["operation_id"].as_u64().unwrap() > first_operation);
+        let mut installed = Value::Null;
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                installed = client.request(r#"{"id":7,"method":"model_status"}"#);
+                installed["model"]["phase"] == "installed"
+            }),
+            "valid model must install: {installed}"
+        );
+        assert_eq!(installed["model"]["root"], "models/demo");
+        assert_eq!(installed["model"]["route_key"], "vizd/joints");
+        assert_eq!(installed["model"]["binding"]["statics_submitted"], true);
+        // Read actual model data from the recording, not just the success flag.
+        // The translated fixed mount must exist before any measured joint frame.
+        flush.flush_blocking().unwrap();
+        let mut translations = Vec::new();
+        for message in storage.take() {
+            let LogMsg::ArrowMsg(_, arrow) = message else {
+                continue;
+            };
+            let chunk = re_chunk::Chunk::from_arrow_msg(&arrow).unwrap();
+            if chunk.entity_path() == &"models/demo/arm/tip".into() {
+                assert!(chunk.is_static(), "fixed mount must be static");
+                translations.extend(
+                    chunk
+                        .iter_component::<rerun::components::Translation3D>(
+                            rerun::Transform3D::descriptor_translation().component,
+                        )
+                        .flat_map(|batch| batch.iter().map(|value| value.0 .0).collect::<Vec<_>>()),
+                );
+            }
+        }
+        assert_eq!(translations, vec![[0.25, -0.5, 1.0]]);
+        assert_eq!(installed["model"]["binding"]["joint_frames_submitted"], 0);
+        assert_eq!(installed["model"]["binding"]["rejected_frames"], 0);
+        assert!(wait_until(Duration::from_secs(3), || counters
+            .layout_signal_generation
+            .load(Ordering::Relaxed)
+            > 0));
+        let poll_mark = daemon.poll_loop_iterations();
+        assert!(wait_until(Duration::from_secs(3), || daemon
+            .poll_loop_iterations()
+            >= poll_mark + 2));
+        if explicit {
+            assert_eq!(
+                daemon.poll_loop_layout_signal_reflows(),
+                0,
+                "installed signal must preserve the explicit layout"
+            );
+        }
+        assert!(wait_until(Duration::from_secs(3), || {
+            current_runtime_blueprint_plan().is_some_and(|p| {
+                plan_has_view_named(
+                    &p,
+                    if explicit {
+                        "Keep operator layout"
+                    } else {
+                        "Robot model"
+                    },
+                )
+            })
+        }));
+        let plan = current_runtime_blueprint_plan().unwrap();
+        assert_eq!(plan_has_view_named(&plan, "Robot model"), !explicit);
+        // Establish a different applied plan in BOTH iterations: seeing the model
+        // pane after reset must prove a new worker emission, not its old auto plan.
+        let before = client.request(r#"{"id":35,"method":"set_blueprint","layout":{"root":{"type":"view","kind":"spatial3d","name":"Before reset","origin":"world"}}}"#);
+        assert_eq!(before["ok"], true, "{before}");
+        assert!(wait_until(Duration::from_secs(3), || {
+            current_runtime_blueprint_plan().is_some_and(|plan| {
+                plan_has_view_named(&plan, "Before reset")
+                    && !plan_has_view_named(&plan, "Robot model")
+            })
+        }));
+        let reset = client.request(r#"{"id":34,"method":"set_blueprint"}"#);
+        assert_eq!(reset["ok"], true, "{reset}");
+        assert_eq!(reset["reset"], true);
+        assert!(wait_until(Duration::from_secs(3), || {
+            current_runtime_blueprint_plan()
+                .is_some_and(|plan| plan_has_view_named(&plan, "Robot model"))
+        }));
+        let reset_plan = current_runtime_blueprint_plan().unwrap();
+        assert!(!plan_has_view_named(&reset_plan, "Before reset"));
+        assert!(!plan_has_view_named(&reset_plan, "Keep operator layout"));
+        assert_eq!(
+            reset["views"].as_u64(),
+            Some(reset_plan.view_count() as u64)
+        );
+        assert_eq!(reset["warnings"], serde_json::json!(["/models/demo"]));
+        for request in [
+            serde_json::json!({"id":8,"method":"detach","topic":topic}),
+            serde_json::json!({"id":9,"method":"attach","topic":"/vizd/alias","entity":"world/vizd/joints"}),
+            serde_json::json!({"id":10,"method":"attach","topic":topic,"entity":"world/other"}),
+        ] {
+            let response = client.request(&request.to_string());
+            assert_eq!(
+                response["ok"], false,
+                "model route must remain stable: {response}"
+            );
+        }
+        let after = client.request(r#"{"id":11,"method":"model_status"}"#);
+        assert_eq!(
+            after["model"]["operation_id"],
+            installed["model"]["operation_id"]
+        );
+        assert_eq!(after["model"]["phase"], "installed");
+        let attached = client.request(r#"{"id":12,"method":"list"}"#);
+        assert_eq!(
+            attached["attached"].as_array().unwrap().len(),
+            1,
+            "{attached}"
+        );
+        daemon.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
