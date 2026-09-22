@@ -94,3 +94,8 @@ No lock spans file reads or SDK calls. Initial SDK failure requires a fresh work
 and recording store; preflight remains retryable. Close independent control handles
 independently; only worker lifetime closes the shared loader. Acquire each handle's
 sender mutex before the loader mutex, never in reverse. Shutdown terminates status.
+
+Bound material-verification XML parsing before indexing: at most 65536 document
+nodes, including text and comments. Bound raw `<` and `=` byte counts before
+parsing too: the parser reserves capacity before checking its node limit.
+Scene limits alone do not bound unused metadata.
