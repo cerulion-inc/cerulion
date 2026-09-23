@@ -123,8 +123,8 @@ trap 'rm -rf "$tmp"' EXIT
 # `--retry-all-errors` and not `--retry` alone, and the difference is the whole
 # reason this line changed. curl's `--retry` covers TRANSIENT errors as curl
 # defines them: a timeout, and the 408 / 429 / 5xx replies. It does not cover a
-# connection that is reset mid-transfer, which exits 56 and is exactly what a
-# hosted runner produced here:
+# connection that is reset mid-transfer, which is what a hosted runner produced
+# here:
 #
 #   curl: (35) Recv failure: Connection reset by peer
 #
