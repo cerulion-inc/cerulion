@@ -234,19 +234,30 @@ impl ServiceDirWatch {
         };
         if changed || self.standing_in {
             let services_id = dir_identity(&self.services);
-            let (target, target_id, standing_in) = match services_id {
-                Some(id) => (&self.services, Some(id), false),
-                None => (&self.root, dir_identity(&self.root), true),
+            let want_services = services_id.is_some();
+            let target_id = if want_services {
+                services_id
+            } else {
+                dir_identity(&self.root)
             };
             // Re-target when the directory this watch SHOULD be on is not the
             // inode it IS on. That one predicate covers all three transitions:
             // the service directory appearing, going away, and being replaced.
+            // (`None` means neither directory is there, which is a real failure
+            // and takes the Broken arm below rather than passing silently.)
             if target_id.is_none() || target_id != self.watched_id {
-                return match imp::DirWatch::open(target) {
+                // Owned, so the assignments below are not fighting a borrow of
+                // `self`. Paid only on a real re-target, never per wait.
+                let target = if want_services {
+                    self.services.clone()
+                } else {
+                    self.root.clone()
+                };
+                return match imp::DirWatch::open(&target) {
                     Ok(w) => {
                         self.imp = w;
-                        self.watched_id = dir_identity(target);
-                        self.standing_in = standing_in;
+                        self.watched_id = dir_identity(&target);
+                        self.standing_in = !want_services;
                         WatchWake::Changed
                     }
                     Err(e) => WatchWake::Broken {
