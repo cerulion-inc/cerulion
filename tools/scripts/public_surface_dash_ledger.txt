@@ -30,7 +30,7 @@
 10 crates/cerulion_bagd/src/anchor_window.rs
 4 crates/cerulion_bagd/src/capture.rs
 6 crates/cerulion_bagd/src/discovery.rs
-3 crates/cerulion_bagd/src/discovery_scan.rs
+0 crates/cerulion_bagd/src/discovery_scan.rs
 28 crates/cerulion_bagd/src/flashback_plane.rs
 201 crates/cerulion_bagd/src/lib.rs
 3 crates/cerulion_bagd/src/producer_labeling.rs
