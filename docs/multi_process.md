@@ -62,8 +62,9 @@ recording's per-edge read log offline).
   fail-loud (`--peer-loss fail`).
 - Unix (Linux + macOS): the barrier is a portable POSIX
   `shm_open` `MAP_SHARED` primitive. The wake shape is per-OS (Linux: a
-  process-shared futex; macOS: a bounded boundary spin then chunked
-  ~100µs sleep-rechecks, never a busy-spin). On non-Unix hosts the SAME
+  process-shared futex; macOS 14.4 and later: a bounded boundary spin
+  then an `os_sync_wait_on_address` kernel wake, with a chunked ~100 µs
+  sleep-recheck as the fallback on older hosts, never a busy-spin). On non-Unix hosts the SAME
   graph runs single-process (monolith fallback) with a loud notice:
   identical results, no process isolation.
 
@@ -396,17 +397,20 @@ Two consequences to know:
 
 ### Barrier boundary spin (default-on)
 
-At every level boundary each worker waits on the shared barrier (a
-process-shared futex on Linux; on macOS a chunked ~100µs sleep-recheck).
-By default that wait first **spins for a bounded,
-per-OS budget: 20µs on Linux, 150µs on macOS** (the chunked sleep-recheck
-observes arrivals with up to ~100µs skew, which a 20µs spin would miss),
-a bounded spin-then-block that rides through the lockstep rendezvous
-instead of paying the kernel sleep/wake round-trip at every boundary, then
-falls back to the kernel wait (futex block / sleep-recheck).
+At every level boundary each worker waits on the shared barrier. The
+blocking tier is a process-shared futex on Linux and, on macOS 14.4 and
+later, an `os_sync_wait_on_address` kernel wake; a chunked ~100 µs
+sleep-recheck is the fallback on older macOS and under
+`CERULION_BARRIER_OS_SYNC=0`. By default that wait first **spins for a
+bounded budget: 20 µs on the kernel-wake tiers, 150 µs on the macOS
+sleep-recheck fallback** (that fallback observes arrivals with up to
+~100 µs skew, which a 20 µs spin would miss). The bounded spin rides
+through the lockstep rendezvous instead of paying a kernel sleep/wake
+round-trip at every boundary, then falls back to the blocking tier.
 
-`CERULION_BARRIER_SPIN_US` overrides the
-budget; `=0` is the kill switch: it restores the legacy 50-iteration
+`CERULION_BARRIER_OS_SYNC=0` selects the sleep-recheck tier on macOS, and
+with it the 150 µs spin default. `CERULION_BARRIER_SPIN_US` overrides the
+budget on every tier; `=0` is the kill switch: it restores the legacy 50-iteration
 pre-block spin + futex path (a hard-bounded read loop with no `Instant`
 reads, then the unchanged kernel block), **not** a pure futex wait, for
 power-sensitive deployments. Values above **100ms** are clamped to 100ms
@@ -755,7 +759,7 @@ For reading a recording's per-edge read log WITHOUT re-executing it, see
 | Host | `process_groups:` graph |
 |---|---|
 | Linux | Multi-process (supervisor + workers); futex-woken barrier + CPU-park primitives |
-| macOS | Multi-process (supervisor + workers). Same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then chunked ~100µs sleep-rechecks (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
+| macOS | Multi-process (supervisor + workers). Same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then an `os_sync_wait_on_address` kernel wake on macOS 14.4 and later, or chunked ~100 µs sleep-rechecks below that and under `CERULION_BARRIER_OS_SYNC=0` (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
 | other (non-Unix) | **Monolith fallback**: the graph runs single-process with a loud notice. Results are identical (determinism firewall); you lose only process isolation. |
 
 `--single-process` forces the monolith path on ANY host (useful for
@@ -765,9 +769,10 @@ externally-clocked run; see below).
 **macOS wake-latency tier:** any host without a CPU monitor-wait
 primitive (macOS included, whether running the real multi-process split
 or a `--single-process` monolith) gets a live-loop park via the
-**degraded sleep-recheck tier**, on by default for live runs. The park
-falls back to a chunked ~100 µs bounded sleep loop (never a busy-spin).
-Measured on macOS: a stable and lower median wake latency than the
+**recheck-nap tier**, on by default for live runs. Each ~100 µs nap is an
+`os_sync_wait_on_address` timed wait on macOS 14.4 and later, and a plain
+sleep-recheck below that or under `CERULION_PARK_OS_SYNC=0` (never a
+busy-spin). Measured on macOS: a stable and lower median wake latency than the
 plain blocking wait, whose median was unstable from run to run. Opt out with
 `CERULION_MONITOR_WAIT=0` or `--no-monitor-wait`; see "Live-loop tuning" under
 "Environment variables" in [`docs/user-api.md`](user-api.md).
