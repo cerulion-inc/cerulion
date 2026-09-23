@@ -15,16 +15,26 @@ set +u; source "/opt/ros/$distro/setup.bash"; set -u
 
 # Expected-state table. Pinned from the 2026-09-23 pre-flight in these exact images (jazzy is the
 # validated distro: it must build and pass its whole suite, the regression guard for every other row):
-#   lyrical: builds from generated bindings (43 s); the lib suite has exactly three known failures,
-#            all the C++ introspection bridge refusing the Lyrical layout (no Lyrical-shaped mirror yet);
+#   lyrical: builds from generated bindings (43 s); eleven known failures, every one the C++
+#            introspection bridge refusing the Lyrical layout (no Lyrical-shaped mirror yet);
 #   humble:  the compile stops at rmw's 24-byte GID storage against the 16-byte one the crate writes;
 #   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 24 more missing symbols).
 case "$distro" in
     jazzy)   expect=build; known_failures="" ;;
     lyrical) expect=build
-             known_failures="api::dispatch_tests::bridge_for_builds_cpp_anybridge_and_flattens_like_native
+             # Every one of these is the C++ typesupport arm refused on the post-Jazzy era
+             # (the lib's dispatch tests and the e2e binaries that register C++ typesupports).
+             known_failures="a_write_through_the_forged_payload_faults_loudly
+api::dispatch_tests::bridge_for_builds_cpp_anybridge_and_flattens_like_native
 api::dispatch_tests::direct_leaf_resolves_without_a_dispatcher
-api::dispatch_tests::resolves_cpp_arm_for_a_cpp_dispatcher" ;;
+api::dispatch_tests::resolves_cpp_arm_for_a_cpp_dispatcher
+cpp_shadow_pool_exhaustion_is_refused_before_consuming_a_frame_and_recovers
+cpp_string_only_type_is_not_take_loanable_through_the_c_abi
+cpp_twin_releases_a_caller_filled_vector_before_the_first_adopted_take
+destroying_a_subscription_with_a_forged_loan_outstanding_unforges_then_finis
+the_resolved_ceiling_governs_real_negotiated_buffers_end_to_end
+the_resolver_calls_the_seams_bypass_warn_on_every_cpp_typesupport_resolve
+two_runs_of_the_forged_take_match_the_hand_oracle" ;;
     humble)  expect=refuse; marker="expected an array with a size of 24, found one with a size of 16" ;;
     foxy)    expect=refuse; marker="cannot find type \`rmw_feature_t\` in module \`ffi\`" ;;
     *) echo "FATAL: no expected state for distro '$distro'"; exit 1 ;;

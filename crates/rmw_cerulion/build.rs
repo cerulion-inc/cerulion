@@ -358,6 +358,12 @@ fn main() {
         // Path 1: bindgen against real headers.
         let mut builder = bindgen::Builder::default()
             .header("wrapper.h")
+            // No doc comments from the C headers: bindgen copies doxygen text
+            // verbatim, and its indented lines become rustdoc code blocks that
+            // `cargo test` then compiles as doctests and fails on (23 of them
+            // on the first real-header lane run). The vendored file carries
+            // none either, so the two paths stay alike.
+            .generate_comments(false)
             .layout_tests(true)
             .derive_default(true)
             .prepend_enum_name(false)
