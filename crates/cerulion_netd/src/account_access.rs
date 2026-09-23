@@ -19,6 +19,35 @@ pub const MAX_ROBOTS: usize = 4096;
 pub const MAX_PROBE_BUDGET_MS: u64 = 4000;
 const MAX_CHAIN_BYTES: usize = 32 * 1024;
 
+/// The controller refused because its own state was locked.
+///
+/// Transient BY CONSTRUCTION: the controller takes its state without waiting so
+/// local-network routing never queues behind account metadata, which means a
+/// caller that arrives during an identity write is refused rather than delayed.
+pub const CONTROLLER_BUSY: &str = "account robot controller is busy; retry the operation";
+
+/// The refusal came from the login store, not the controller: someone is writing
+/// the identity this operation would read. Transient for the same reason.
+pub const IDENTITY_BUSY: &str = "login identity is being updated; retry the operation";
+
+/// Whether a refusal is one of the two self-clearing ones above.
+///
+/// A caller on a first-use path waits these out instead of passing them on: being
+/// told to retry is not an acceptable answer to somebody's first command after
+/// logging in. Every OTHER message is a real refusal and must surface at once,
+/// which is why this matches the two exactly rather than looking for a word like
+/// "busy" anywhere in the text.
+pub fn is_transient_busy(message: &str) -> bool {
+    message == CONTROLLER_BUSY || message == IDENTITY_BUSY
+}
+
+/// How long a first-use caller waits one of those out before reporting it.
+///
+/// It is at least as long as the daemon is willing to stay busy, so a client
+/// never gives up on a condition the daemon still considers normal; the
+/// controller asserts that relationship against its own grace at compile time.
+pub const TRANSIENT_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Reserved identity route carried through existing robot-string fields.
 pub const ACCOUNT_ROUTE_PREFIX: &str = "account:";
 
@@ -313,4 +342,43 @@ pub struct AccountAccessResponse {
     pub id: u64,
     /// Required discriminator; never a default empty list or presence claim.
     pub account_access: AccountAccessReply,
+}
+
+#[cfg(test)]
+mod busy_vocabulary_tests {
+    use super::*;
+
+    /// The two self-clearing refusals are waited out and nothing else is.
+    ///
+    /// A predicate that matched a WORD rather than the whole message would
+    /// swallow a real refusal that happened to mention it, and that is the
+    /// failure that matters: the caller would wait out an error that never
+    /// clears, then report it anyway, having turned a clear answer into a hang.
+    #[test]
+    fn only_the_two_self_clearing_refusals_are_waited_out() {
+        assert!(is_transient_busy(CONTROLLER_BUSY));
+        assert!(is_transient_busy(IDENTITY_BUSY));
+        for real in [
+            "",
+            "account robot controller state is poisoned",
+            "robot has no current pinned WAN endpoint",
+            "account robot access is unavailable in this network daemon",
+            "the account robot controller is busy in a way that never clears",
+        ] {
+            assert!(!is_transient_busy(real), "must not be waited out: {real}");
+        }
+        // A superstring is a different message, not the same one.
+        assert!(!is_transient_busy(&format!("{CONTROLLER_BUSY} (fatal)")));
+        assert!(!is_transient_busy(&CONTROLLER_BUSY[..CONTROLLER_BUSY.len() - 1]));
+    }
+
+    /// The client's patience is a real duration, not a placeholder, and it is at
+    /// least the daemon's own busy grace. The controller asserts the relationship
+    /// at compile time; this states the value so a silent edit to zero, which
+    /// would reinstate the retry message this exists to remove, fails here.
+    #[test]
+    fn the_transient_busy_wait_is_long_enough_to_be_worth_having() {
+        assert!(TRANSIENT_BUSY_WAIT >= std::time::Duration::from_secs(5));
+        assert!(TRANSIENT_BUSY_WAIT <= std::time::Duration::from_secs(30));
+    }
 }

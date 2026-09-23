@@ -26,12 +26,19 @@ use crate::wan::{WanRegistry, WanRobot};
 
 mod operations;
 
-const BUSY: &str = "account robot controller is busy; retry the operation";
-const IDENTITY_BUSY: &str = "login identity is being updated; retry the operation";
+use crate::account_access::{CONTROLLER_BUSY as BUSY, IDENTITY_BUSY};
 const NEED_INSTALL: &str = "account robot identity changed; refresh the account robot list";
 const NETWORK_OFF: &str = "WAN access is disabled by CERULION_NETD_NETWORK=off";
 const QUERY_BUDGET: Duration = Duration::from_millis(account_access::MAX_PROBE_BUDGET_MS);
 const BUSY_GRACE: Duration = Duration::from_secs(5);
+// A first-use caller waits a transient refusal out rather than passing it on, so
+// its patience must cover however long this daemon is willing to stay busy.
+// Raising the grace without raising the wait would put a caller back in the
+// position of being told to retry a condition this daemon still calls normal.
+const _: () = assert!(
+    crate::account_access::TRANSIENT_BUSY_WAIT.as_millis() >= BUSY_GRACE.as_millis(),
+    "the client's transient-busy wait must cover this daemon's busy grace"
+);
 
 /// Resolved production posture, with explicit paths and optional trusted direct
 /// evidence for controlled deployments. No hostname supplies identity evidence.

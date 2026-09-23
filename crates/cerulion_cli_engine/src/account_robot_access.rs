@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use cerulion_netd::account_access::{
-    parse_robot_route, robot_route, AccountAccessReply, AccountAccessRequest, RobotPresence,
+    is_transient_busy, parse_robot_route, robot_route, AccountAccessReply, AccountAccessRequest,
+    RobotPresence, TRANSIENT_BUSY_WAIT,
 };
 use cerulion_netd::NetdClient;
 
@@ -18,6 +19,10 @@ const LIST_PROBE_BUDGET: Duration = Duration::from_secs(4);
 const ROBOT_PROBE_BUDGET: Duration = Duration::from_millis(500);
 // Leave the local daemon time to report a transport timeout within the IPC cap.
 const PROBE_REPLY_ALLOWANCE: Duration = Duration::from_millis(50);
+// How often the install re-asks while waiting a transient refusal out. Short
+// enough that the common case (the identity write finishing in well under a
+// second) costs nothing visible, long enough not to spin on the socket.
+const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// An account directory entry plus independently obtained reachability evidence.
 #[derive(Debug, Clone)]
@@ -85,19 +90,70 @@ pub fn select_account_robot<'a>(
     Ok(matching.first().copied())
 }
 
+/// Decide what to do with one install attempt's outcome.
+///
+/// Split out from the loop so the policy can be driven directly: the loop itself
+/// owns a socket and a clock, and the property that matters is which refusals are
+/// waited out and which are reported at once.
+#[derive(Debug, PartialEq, Eq)]
+enum BusyDecision {
+    /// Report this outcome now, whatever it is.
+    Settle,
+    /// Self-clearing, and there is time left: ask again.
+    WaitAndRetry,
+    /// Self-clearing, but the wait is spent: report it.
+    GaveUp,
+}
+
+fn classify_install_outcome(
+    error: Option<&str>,
+    elapsed: Duration,
+    wait: Duration,
+) -> BusyDecision {
+    match error {
+        // Success, or a refusal that will never clear by waiting. Either way the
+        // caller learns the truth immediately; waiting out a real refusal would
+        // turn a clear error into a hang.
+        None => BusyDecision::Settle,
+        Some(message) if !is_transient_busy(message) => BusyDecision::Settle,
+        Some(_) if elapsed < wait => BusyDecision::WaitAndRetry,
+        Some(_) => BusyDecision::GaveUp,
+    }
+}
+
 /// Install only public identity and membership. Netd independently loads the key
 /// and checks the snapshot against one locked local login transaction.
+///
+/// The daemon refuses rather than waits when its own identity state is locked, so
+/// the first listing after a login can land while that very login is being
+/// installed and be told the controller is busy. That is self-clearing in well
+/// under a second, and it is not an acceptable thing to say to somebody running
+/// their first command after signing in, so this waits it out. The login is
+/// re-validated before every attempt, so a login that changes DURING the wait
+/// aborts instead of installing a snapshot that no longer describes this machine.
 pub fn install_directory(directory: &AccountRobotDirectory) -> CliResult<NetdClient> {
     let snapshot = directory.daemon_snapshot()?;
     let mut client = NetdClient::connect_or_spawn().map_err(access_error)?;
-    // Connecting can wait for startup; refuse stale HTTP results before IPC.
-    directory.validate_current_login()?;
-    client
-        .account_access_once(AccountAccessRequest::Install {
-            snapshot: Box::new(snapshot),
-        })
-        .map_err(access_error)?;
-    Ok(client)
+    let started = Instant::now();
+    loop {
+        // Connecting can wait for startup; refuse stale HTTP results before IPC.
+        directory.validate_current_login()?;
+        let outcome = client.account_access_once(AccountAccessRequest::Install {
+            snapshot: Box::new(snapshot.clone()),
+        });
+        let error = outcome.as_ref().err().map(|e| e.to_string());
+        match classify_install_outcome(
+            error.as_deref(),
+            started.elapsed(),
+            TRANSIENT_BUSY_WAIT,
+        ) {
+            BusyDecision::Settle | BusyDecision::GaveUp => {
+                outcome.map_err(access_error)?;
+                return Ok(client);
+            }
+            BusyDecision::WaitAndRetry => std::thread::sleep(BUSY_RETRY_INTERVAL),
+        }
+    }
 }
 
 /// Fetch owned robots, then probe under one listing budget. Presence never pairs
@@ -382,5 +438,74 @@ mod tests {
         let rendered = render_rows(&rows);
         assert_eq!(rendered, "  robot  (account directory)  unknown: not checked\u{fffd}forged  account:0101010101010101010101010101010101010101010101010101010101010101  endpoint=unknown\n");
         assert!(!rendered.contains("online"));
+    }
+
+    /// The first listing after a login can arrive while that login is still
+    /// being installed, and the daemon answers "busy" rather than waiting. That
+    /// answer is waited out; every other outcome is reported at once.
+    ///
+    /// The third case is the load-bearing one. Waiting out a refusal that will
+    /// never clear would turn a clear error into a five-second hang and then
+    /// report the same thing anyway, so a real refusal must settle on the first
+    /// attempt no matter how much of the wait is left.
+    #[test]
+    fn a_transient_refusal_is_waited_out_and_a_real_one_is_reported_at_once() {
+        use cerulion_netd::account_access::{CONTROLLER_BUSY, IDENTITY_BUSY};
+        let wait = Duration::from_secs(5);
+        let fresh = Duration::from_millis(0);
+        let spent = wait;
+
+        // Success settles, with time left or without.
+        assert_eq!(
+            classify_install_outcome(None, fresh, wait),
+            BusyDecision::Settle
+        );
+        assert_eq!(
+            classify_install_outcome(None, spent, wait),
+            BusyDecision::Settle
+        );
+
+        // Both self-clearing refusals are waited out while time remains.
+        for busy in [CONTROLLER_BUSY, IDENTITY_BUSY] {
+            assert_eq!(
+                classify_install_outcome(Some(busy), fresh, wait),
+                BusyDecision::WaitAndRetry,
+                "{busy}"
+            );
+            // And are reported once the wait is spent, rather than looping on.
+            assert_eq!(
+                classify_install_outcome(Some(busy), spent, wait),
+                BusyDecision::GaveUp,
+                "{busy}"
+            );
+        }
+
+        // A refusal that will never clear settles immediately.
+        for real in [
+            "account robot controller state is poisoned",
+            "robot has no current pinned WAN endpoint",
+            "WAN access is disabled by CERULION_NETD_NETWORK=off",
+        ] {
+            assert_eq!(
+                classify_install_outcome(Some(real), fresh, wait),
+                BusyDecision::Settle,
+                "{real}"
+            );
+        }
+    }
+
+    /// The boundary, on both sides: at the bound the wait is over.
+    #[test]
+    fn the_wait_is_a_threshold_pinned_on_both_sides() {
+        use cerulion_netd::account_access::CONTROLLER_BUSY;
+        let wait = Duration::from_secs(5);
+        assert_eq!(
+            classify_install_outcome(Some(CONTROLLER_BUSY), wait - Duration::from_millis(1), wait),
+            BusyDecision::WaitAndRetry
+        );
+        assert_eq!(
+            classify_install_outcome(Some(CONTROLLER_BUSY), wait, wait),
+            BusyDecision::GaveUp
+        );
     }
 }
