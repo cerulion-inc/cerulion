@@ -208,8 +208,10 @@ node declaration order elsewhere in the graph file.
    seq)`) is then byte-identical to a single-process run of the same graph.
 6. **Join**: the supervisor monitors workers until shutdown (Ctrl-C, a
    clean worker exit, or the peer-loss machinery below). On a clean
-   shutdown every worker gracefully leaves the barrier cohort and exits 0
-   (no poison stalls).
+   shutdown every worker exits 0; under the
+   `CERULION_EXECUTION_MODE=lockstep` opt-out it also gracefully leaves the
+   barrier cohort first (no poison stalls). A free-run run has no cohort to
+   leave.
 
 > **Host tuning for the latency tail:** the millisecond-class MAX you may
 > see on an untuned host is dominated by ambient kernel run-queue delay (the
@@ -793,10 +795,14 @@ For reading a recording's per-edge read log WITHOUT re-executing it, see
 
 ## Platform matrix
 
+The barrier rows describe the `CERULION_EXECUTION_MODE=lockstep` opt-out. A
+free-run run (the default) maps no barrier on any host, so only the
+process model in each row applies to it.
+
 | Host | `process_groups:` graph |
 |---|---|
-| Linux | Multi-process (supervisor + workers); futex-woken barrier + CPU-park primitives |
-| macOS | Multi-process (supervisor + workers). Same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then chunked ~100µs sleep-rechecks (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
+| Linux | Multi-process (supervisor + workers); under the `lockstep` opt-out, futex-woken barrier + CPU-park primitives |
+| macOS | Multi-process (supervisor + workers). Under the `lockstep` opt-out, the same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then chunked ~100µs sleep-rechecks (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
 | other (non-Unix) | **Monolith fallback**: the graph runs single-process with a loud notice. Results are identical (determinism firewall); you lose only process isolation. |
 
 `--single-process` forces the monolith path on ANY host (useful for

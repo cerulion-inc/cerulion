@@ -1021,7 +1021,8 @@ impl GraphTopology {
     /// assignment is FROZEN into the graph yaml (`level_assignments:`) and
     /// every process derives its barrier generations from the same block, so
     /// cross-process consistency holds at ANY count by construction. But
-    /// growth is NOT free for multi-process CADENCE: the level-lockstep
+    /// growth is NOT free for the CADENCE of a multi-process run under the
+    /// `CERULION_EXECUTION_MODE=lockstep` opt-out: the level-lockstep
     /// barrier advances ONE generation per level, so +1 level = +1
     /// cross-process rendezvous per step (measured ~19% chain-cadence cost at
     /// neutral p50; growth still HELPS the monolith, ~−10% p50). Growth is

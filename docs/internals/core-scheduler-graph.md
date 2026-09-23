@@ -315,6 +315,10 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
 
 ## Barrier and multi-process lockstep
 
+(The barrier is what the `CERULION_EXECUTION_MODE=lockstep` opt-out selects. A
+multi-process run free-runs by DEFAULT and maps no barrier, so everything in
+this section is the opt-out's machinery.)
+
 - `BarrierShared` (`src/barrier.rs`) is a lock-free count-down sense-reversing barrier;
   `MappedBarrier` maps the same atomics into a POSIX-SHM `MAP_SHARED` page for
   cross-process use. The step-start wake word (epoch + parked-rank bitmask, offsets
