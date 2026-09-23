@@ -194,6 +194,12 @@ jobs:
         id: apt-repo
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          # The container arms below serve this repository over HTTP on the
+          # runner, so the sources.list the keyring package carries has to name
+          # that server. Left at its default the package would point at the
+          # published repository, and the bootstrap arm would quietly test
+          # production instead of what this job just built.
+          APT_REPO_URL: http://127.0.0.1:8000
         run: |
           debian_version=$(tools/scripts/debian_version.sh "$VERSION")
           export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
@@ -317,6 +323,64 @@ jobs:
                   "$(dirname "$(readlink -f /usr/bin/cerulion-connectd)")"
               '
           done
+          # The bootstrap route the install instructions hand out: install one
+          # package, then update and install. Nothing below writes a
+          # sources.list, which is the whole assertion: if the keyring package
+          # stopped carrying one, `apt-get update` would see no repository at
+          # all and this arm would fail rather than pass quietly.
+          set -- "$RUNNER_TEMP"/apt-repo/pool/main/c/cerulion-archive-keyring/cerulion-archive-keyring_*_all.deb
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "expected exactly one keyring package in the pool, found $#"
+            exit 1
+          fi
+          bootstrap_deb=$1
+          for image in ubuntu:22.04 ubuntu:24.04; do
+            echo "=== bootstrap $image ==="
+            docker run --rm --pull=missing --network host \
+              -v "$bootstrap_deb:/tmp/cerulion-archive-keyring.deb:ro" \
+              "$image" sh -euxc '
+                test ! -e /etc/apt/sources.list.d/cerulion.list
+                dpkg -i /tmp/cerulion-archive-keyring.deb
+                test -f /usr/share/keyrings/cerulion-archive-keyring.gpg
+                dpkg -S /etc/apt/sources.list.d/cerulion.list
+                grep -Fq "http://127.0.0.1:8000" /etc/apt/sources.list.d/cerulion.list
+                if ! apt-get update > /tmp/apt-update.log 2>&1; then
+                  cat /tmp/apt-update.log
+                  exit 1
+                fi
+                cat /tmp/apt-update.log
+                if grep -Eiq "NO_PUBKEY|GPG error|signatures could not be verified|does not have a Release file" /tmp/apt-update.log; then
+                  exit 1
+                fi
+                apt-get install -y --no-install-recommends cerulion
+                cerulion --version
+              '
+          done
+          echo "APT keyring-package bootstrap passed"
+          # A machine that followed the earlier instructions carries a
+          # cerulion.list no package owns. Installing the keyring package over
+          # it has to leave a working repository: dpkg decides what happens to
+          # an unowned file that a package now claims as a conffile, so this
+          # arm is what states the outcome rather than assuming it.
+          docker run --rm --pull=missing --network host \
+            -v "$RUNNER_TEMP/apt-repo:/repo:ro" \
+            -v "$bootstrap_deb:/tmp/cerulion-archive-keyring.deb:ro" \
+            ubuntu:24.04 sh -euxc '
+              install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
+              install -m 0644 /repo/cerulion-archive-keyring.gpg \
+                /usr/share/keyrings/cerulion-archive-keyring.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] http://127.0.0.1:8000 stable main" \
+                > /etc/apt/sources.list.d/cerulion.list
+              dpkg -i /tmp/cerulion-archive-keyring.deb
+              dpkg -S /etc/apt/sources.list.d/cerulion.list
+              if ! apt-get update > /tmp/apt-update.log 2>&1; then
+                cat /tmp/apt-update.log
+                exit 1
+              fi
+              apt-get install -y --no-install-recommends cerulion
+              cerulion --version
+            '
+          echo "APT keyring-package adoption of a hand-written list passed"
           rotation_container=cerulion-apt-rotation
           docker run -d --pull=missing --name "$rotation_container" \
             --network host \
@@ -401,6 +465,10 @@ jobs:
           KEY_A: ${{ steps['apt-repo'].outputs.key_a }}
           KEY_B: ${{ steps['apt-repo'].outputs.key_b }}
           KEY_C: ${{ steps['apt-repo'].outputs.key_c }}
+          # Same reason as the build step: the rotation arms rebuild the
+          # repository, and the package they rebuild has to keep naming the
+          # local server.
+          APT_REPO_URL: http://127.0.0.1:8000
 
   # Fast lint check — gates all other jobs
   lint:
