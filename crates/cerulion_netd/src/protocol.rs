@@ -557,16 +557,6 @@ pub enum ServingPlane {
     Iroh,
 }
 
-impl ServingPlane {
-    /// The lowercase token this plane serializes as, for a message or a log field.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Zenoh => "zenoh",
-            Self::Iroh => "iroh",
-        }
-    }
-}
-
 /// One demand-table row in a [`StatusResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DemandEntry {
@@ -1887,7 +1877,9 @@ mod tests {
             );
             let decoded: StatusResponse = serde_json::from_str(&line).unwrap();
             assert_eq!(decoded.demands[0].plane, Some(expected));
-            assert_eq!(expected.as_str(), token, "the token and the value agree");
+            // The other direction, so the pin is not one-way: this value encodes to
+            // the same token a daemon writes.
+            assert_eq!(serde_json::to_value(expected).unwrap(), token);
         }
     }
 
