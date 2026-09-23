@@ -82,6 +82,8 @@ jobs:
           # a newline the body never carried, and that newline would come
           # back as a spurious edit on every run.
           gh api "repos/${REPO}/pulls/${NUMBER}" > pr.json
+          python3 -B tools/scripts/pr_body_hygiene.py \
+            --from-json pr.json --out original.md --extract-only
 
           # Exit 2 is the stripper refusing a body it cannot model (a marker
           # with no pair). It changes nothing in that case, and `set -e` turns
@@ -89,10 +91,24 @@ jobs:
           # the right outcome: a body nobody can safely edit is a body a
           # person should look at.
           verdict="$(python3 -B tools/scripts/pr_body_hygiene.py \
-            --from-json pr.json --out cleaned.md)"
+            --in original.md --out cleaned.md)"
 
           if [ "${verdict}" != "changed" ]; then
             echo "body carries no review-bot markup; leaving it alone"
+            exit 0
+          fi
+
+          # A body is read, computed over, and written back, and the API offers
+          # no conditional write to make that one operation. So read it again
+          # and write only if it is still the body this run computed from:
+          # anything else silently drops whatever somebody typed in between.
+          # Skipping costs nothing, because their edit raises `edited` and the
+          # next run starts from their text.
+          gh api "repos/${REPO}/pulls/${NUMBER}" > recheck.json
+          python3 -B tools/scripts/pr_body_hygiene.py \
+            --from-json recheck.json --out recheck.md --extract-only
+          if ! cmp -s original.md recheck.md; then
+            echo "body changed while this run was computing; leaving it to the run that edit starts"
             exit 0
           fi
 

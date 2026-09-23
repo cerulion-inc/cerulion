@@ -65,12 +65,19 @@ Usage:
   pr_body_hygiene.py --self-test
   pr_body_hygiene.py --from-json PR.json --out CLEANED
   pr_body_hygiene.py --in BODY --out CLEANED
+  pr_body_hygiene.py --from-json PR.json --out BODY --extract-only
 
 `--from-json` reads the `body` field of a pull request API response, which is
 how the workflow gets the exact bytes: every route through a shell redirect
 appends a newline the body never had, and that newline would come back as a
 spurious edit. Prints `changed` or `unchanged` on stdout. Exit 0 on either,
 1 on a usage or input error, 2 on a refusal.
+
+`--extract-only` writes that field out verbatim and strips nothing. It exists
+so the caller can read the body twice, before computing and again before
+writing, and compare the two byte for byte: a body edited in between is a body
+whose new text this run never saw, and writing a result computed from the
+stale one would silently drop somebody's edit.
 """
 
 import argparse
@@ -86,10 +93,11 @@ MARKER_PAIRS = (
     ("greptile_comment", "/greptile_comment"),
 )
 
-# Markers a bot emits with no closing pair. `greptile_summary` sits INSIDE the
-# greptile block in every body seen so far, so rule 1 already carries it away;
-# this entry is what keeps a stray one out of a commit message.
-STANDALONE_MARKERS = ("greptile_summary",)
+# Markers a bot emits with no closing pair, as regular expressions over the
+# comment's content, because one of them carries a number. Both sit INSIDE the
+# greptile block in every body seen so far, so rule 1 already carries them
+# away; these entries are what keep a stray one out of a commit message.
+STANDALONE_MARKERS = (r"greptile_summary", r"greptile_confidence_score:\d+")
 
 # THE CLOSED LIST. Markup is review-bot markup only when one of these URL
 # prefixes appears inside it. Nothing here is decided by element name, so an
@@ -130,11 +138,16 @@ class Refusal(Exception):
 
 
 def marker_pattern(token):
-    """An HTML comment whose content is exactly `token`."""
+    """An HTML comment whose content is exactly the literal `token`."""
     return re.compile(r"<!--\s*" + re.escape(token) + r"\s*-->")
 
 
-STANDALONE_PATTERNS = tuple(marker_pattern(token) for token in STANDALONE_MARKERS)
+def standalone_pattern(fragment):
+    """An HTML comment whose content matches the regular expression `fragment`."""
+    return re.compile(r"<!--\s*(?:" + fragment + r")\s*-->")
+
+
+STANDALONE_PATTERNS = tuple(standalone_pattern(f) for f in STANDALONE_MARKERS)
 
 
 def strip_bot_markup(text):
@@ -227,7 +240,7 @@ def merge_spans(spans):
 # line, up to three spaces of indent, closed by at least as many of the SAME
 # character on a line of its own. This is the CommonMark rule, less the info
 # string, which nothing here needs to read.
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})[^\r\n]*$", re.MULTILINE)
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)$", re.MULTILINE)
 # A span between single backticks, on one line: the inline way to quote a
 # marker in a sentence.
 INLINE_CODE = re.compile(r"`[^`\r\n]*`")
@@ -242,12 +255,24 @@ def quoted_ranges(body):
     ranges = []
     opener = None
     for fence in FENCE.finditer(body):
-        marker = fence.group(1)
+        marker, trailing = fence.group(1), fence.group(2)
         if opener is None:
+            # An opening backtick fence's info string may not itself contain a
+            # backtick, so such a line opens nothing.
+            if marker[0] == "`" and "`" in trailing:
+                continue
             opener = (fence.start(), marker)
             continue
         open_start, open_marker = opener
-        if marker[0] == open_marker[0] and len(marker) >= len(open_marker):
+        # A CLOSING fence carries no info string: it is the fence characters
+        # and nothing else. Accepting one that does would end the quotation at
+        # a line like ```text sitting INSIDE the block, and expose the rest of
+        # somebody's example to the rules below.
+        if (
+            marker[0] == open_marker[0]
+            and len(marker) >= len(open_marker)
+            and not trailing.strip()
+        ):
             ranges.append((open_start, fence.end()))
             opener = None
     if opener is not None:
@@ -419,6 +444,19 @@ def self_test():
         failures,
     )
 
+    # The same rule over the marker that carries a number.
+    _case(
+        "standalone confidence marker",
+        "Before.\n\n<!-- greptile_confidence_score:4 -->\n\nAfter.",
+        "Before.\n\nAfter.",
+        failures,
+    )
+
+    # CONTROL: the pattern is anchored to the whole comment, so a comment that
+    # merely mentions a marker is not one.
+    near_miss = "Before.\n\n<!-- note: greptile_summary is theirs, not ours -->\n\nAfter."
+    _case("a comment that only mentions a marker", near_miss, near_miss, failures)
+
     # Rule 3: a badge on a line of its own with no markers anywhere.
     _case(
         "undelimited badge line",
@@ -564,6 +602,25 @@ def self_test():
         failures,
     )
 
+    # A line that looks like a fence but carries an info string does not CLOSE
+    # a block, so the example below stays quoted to its real closing fence.
+    # Accepting it would end the quotation early and leave the second marker
+    # outside, which reads as an unpaired closer and refuses the whole body.
+    info_string_close = (
+        "Here:\n\n```\n<!-- greptile_comment -->\n```text\nx\n"
+        "<!-- /greptile_comment -->\n```\n\nDone."
+    )
+    _case("an info string does not close a fence", info_string_close, info_string_close, failures)
+
+    # The opening fence, though, carries an info string in every real body.
+    _case(
+        "an opening fence may carry an info string",
+        "```sh\ncargo test\n```\n\n<!-- greptile_comment -->\nx\n"
+        "<!-- /greptile_comment -->\n\nAfter.",
+        "```sh\ncargo test\n```\n\nAfter.",
+        failures,
+    )
+
     # An empty body is a body.
     _case("empty body", "", "", failures)
 
@@ -628,6 +685,17 @@ def read_body(args):
         return handle.read()
 
 
+def write_out(path, text):
+    """Write `text` to `path` with its bytes and line endings untouched."""
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+    except OSError as problem:
+        sys.stderr.write("pr-body-hygiene: {}\n".format(problem))
+        return EXIT_ERROR
+    return EXIT_OK
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         description="Take review-bot badge markup out of a pull request body."
@@ -636,6 +704,11 @@ def main(argv):
     parser.add_argument("--from-json", metavar="PATH", help="a pull request API response")
     parser.add_argument("--in", dest="input", metavar="PATH", help="a raw body")
     parser.add_argument("--out", metavar="PATH", help="where to write the cleaned body")
+    parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="write the body out verbatim and strip nothing",
+    )
     args = parser.parse_args(argv)
 
     if args.self_test:
@@ -652,18 +725,18 @@ def main(argv):
         sys.stderr.write("pr-body-hygiene: {}\n".format(problem))
         return EXIT_ERROR
 
+    if args.extract_only:
+        return write_out(args.out, body)
+
     try:
         cleaned = clean_body(body)
     except Refusal as refused:
         sys.stderr.write("pr-body-hygiene: refusing to edit this body: {}\n".format(refused))
         return EXIT_REFUSED
 
-    try:
-        with open(args.out, "w", encoding="utf-8", newline="") as handle:
-            handle.write(cleaned)
-    except OSError as problem:
-        sys.stderr.write("pr-body-hygiene: {}\n".format(problem))
-        return EXIT_ERROR
+    written = write_out(args.out, cleaned)
+    if written != EXIT_OK:
+        return written
 
     sys.stdout.write("changed\n" if cleaned != body else "unchanged\n")
     return EXIT_OK
