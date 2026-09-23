@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerulion_bag::BagReader;
-use cerulion_bagd::discovery_scan::{DiscoveryScanner, WakeSource};
+use cerulion_bagd::discovery_scan::{DiscoveryScanner, WakeSource, EVENT_CONFIRM_DELAY};
 use cerulion_bagd::{
     run_bagd, BagdConfig, RecordCoverage, TapSource, TapSpec, RECORD_COVERAGE_ATTACHMENT,
 };
@@ -151,7 +151,7 @@ fn every_walk_the_event_engine_runs_has_a_directory_change_behind_it() {
         "discovery ON must run a worker - an inline fallback here means the spawn failed, and \
          the whole point of the worker is that the drive loop does not enumerate"
     );
-    let event_base = settle_baseline(&mut events, &mgr);
+    settle_baseline(&mut events, &mgr);
     assert_eq!(
         events.wake_source(),
         WakeSource::Events,
@@ -162,8 +162,15 @@ fn every_walk_the_event_engine_runs_has_a_directory_change_behind_it() {
 
     // The control: the SAME cadence, forced onto the timed engine.
     let mut poll = forced_polling_scanner(&mgr, FALLBACK_CADENCE);
-    let poll_base = poll.scans_run();
 
+    // Let any confirmation armed by a wake BEFORE the window land before the
+    // window opens, so it is not counted against a wake the window did not see.
+    std::thread::sleep(EVENT_CONFIRM_DELAY + Duration::from_millis(100));
+    while events.next_scan(&mgr).is_some() {}
+    while poll.next_scan(&mgr).is_some() {}
+
+    let event_base = events.scans_run();
+    let poll_base = poll.scans_run();
     let wakes_before = events.wakes();
     let quiet_start = Instant::now();
     while quiet_start.elapsed() < QUIET_WINDOW {
@@ -209,8 +216,13 @@ fn every_walk_the_event_engine_runs_has_a_directory_change_behind_it() {
     // counts would read as a regression. This ratio raises both sides together,
     // so it cannot be broken by what else is running, while a scanner that walked
     // on a timer has NO wakes at all and fails it on its first tick.
+    //
+    // The `+ 1` is the one confirmation that can straddle the window's opening
+    // edge: a wake microseconds before it arms a walk that lands microseconds
+    // after. It forgives exactly that and nothing else - a timed engine over
+    // this window produces a dozen or more uncaused walks, not one.
     assert!(
-        event_walks <= 2 * event_wakes,
+        event_walks <= 2 * event_wakes + 1,
         "the event-driven engine ran {event_walks} walk(s) from {event_wakes} wake(s). Each \
          wake is worth one walk plus at most one bounded confirmation, so a walk beyond that \
          had no directory change behind it, which is a timer by another name (the polling \
@@ -328,9 +340,9 @@ fn a_burst_of_topics_is_coalesced_into_far_fewer_wakes_than_topics() {
          is 117.5 ms at 86 live topics"
     );
     assert!(
-        walks <= 2 * wakes,
+        walks <= 2 * wakes + 1,
         "{walks} walk(s) from {wakes} wake(s): every walk must be a change plus at most one \
-         bounded confirmation"
+         bounded confirmation, with one allowance for a confirmation armed by the baseline"
     );
 }
 
