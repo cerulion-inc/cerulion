@@ -292,28 +292,26 @@ build.rs layers three era probes on top of the source selection:
   admitted runtime for the duration of the fixture call themselves
   (`EnvVarGuard::unset` / `agreeing_runtime_for(baked_distro())`), because their whole
   subject is the contradiction they then arm.
-- **C++ bridge gate (bounded on both edges)**: `ffi/introspection_cpp.rs` hand-mirrors
-  the JAZZY/KILTED-era C++ introspection shape EXACTLY: `is_key_`/`has_any_key_member_`
-  arrived at Jazzy (lower bound) and `is_rosidl_buffer_` widened the C++ `MessageMember`
-  at Lyrical (upper bound, stride 112 → 120); each field landed in the C and C++ structs
-  in the same rosidl release, so the C capability tokens are the build-time proxies for
-  the C++ mirror's era. Pre-Jazzy and Lyrical/Rolling builds compile the C++ typesupport
-  arm of both resolvers to a loud REGISTRATION refusal: one `error!` per verdict
-  through the single `CppBridgeGate::emit_refusal` seam, each message a per-verdict
-  CONSTANT paragraph with the verdict in a structured `verdict=` field (never a
-  `"{}"` pass-through, which the repo's tracing-discipline walk refuses); the bypass
-  composite is `cfg(test)` SILENTLY (the lib's own unit tests,
-  unreachable by any shipped artifact) or the `test-seams` feature LOUDLY; `test-seams`
-  is a PUBLIC feature a deployable build can enable, so that path emits
-  `era::CPP_BYPASS_SEAMS_WARN` on EVERY resolve ("this build must never deploy"),
-  making production silence impossible while the resolver-routed C++ e2e binaries
-  (fixtures hand-built against the compiled struct, layout-self-consistent by
-  construction) keep their surface; a plain `cargo build` vendored cdylib takes the
-  normal gate and its ROLLING-pinned bits REFUSE live C++ typesupports loudly.
-  `test-seams` is in no default feature set and no shipping recipe enables it. Per-era C++
-  bridge variants (including rosidl-Buffer support) are not
-  implemented. The C introspection path is bindgen-generated and correct on
-  every era, so rclpy and C-typesupport consumers are unaffected.
+- **C++ bridge gate**: `ffi/introspection_cpp.rs` hand-mirrors the C++ introspection shape
+  of the era the build compiles against: the JAZZY/KILTED shape (`is_key_` and
+  `has_any_key_member_` arrived at Jazzy), plus the Lyrical/Rolling tail field
+  `is_rosidl_buffer_` under `cfg(cerulion_has_is_rosidl_buffer)` (stride 112 to 120; each
+  field landed in the C and C++ structs in the same rosidl release, so the C capability
+  tokens are the build-time proxies for the C++ mirror's era, and a compile-time pin holds
+  the mirror's size equal to the bindgen-generated C member's). Pre-Jazzy builds compile
+  the C++ typesupport arm of both resolvers to a loud REGISTRATION refusal: one `error!`
+  through the single `CppBridgeGate::emit_refusal` seam, a CONSTANT paragraph with the
+  verdict in a structured `verdict=` field (never a `"{}"` pass-through, which the repo's
+  tracing-discipline walk refuses); the bypass composite is `cfg(test)` SILENTLY (the lib's
+  own unit tests, unreachable by any shipped artifact) or the `test-seams` feature LOUDLY;
+  `test-seams` is a PUBLIC feature a deployable build can enable, so that path emits
+  `era::CPP_BYPASS_SEAMS_WARN` on EVERY resolve ("this build must never deploy"), making
+  production silence impossible while the resolver-routed C++ e2e binaries (fixtures
+  hand-built against the compiled struct, layout-self-consistent by construction) keep
+  their surface. `test-seams` is in no default feature set and no shipping recipe enables
+  it. The pre-Jazzy C++ bridge variant is not implemented. The C introspection path is
+  bindgen-generated and correct on every era, so rclpy and C-typesupport consumers are
+  unaffected.
 
 ## Runtime
 

@@ -103,12 +103,6 @@ pub enum CppBridgeGate {
     /// registration with [`CPP_BRIDGE_PRE_JAZZY_REFUSAL`] instead of
     /// misreading every rclcpp publisher's introspection structs.
     RefusePreJazzy,
-    /// A Lyrical/Rolling build: the C++ `MessageMember` grew
-    /// `is_rosidl_buffer_` there too (stride 112 → 120), so the
-    /// Jazzy-shaped mirror would misread every member array from the
-    /// second element — the arm REFUSES with
-    /// [`CPP_BRIDGE_POST_JAZZY_REFUSAL`].
-    RefusePostJazzy,
 }
 
 impl CppBridgeGate {
@@ -121,7 +115,6 @@ impl CppBridgeGate {
         match self {
             CppBridgeGate::Supported => None,
             CppBridgeGate::RefusePreJazzy => Some(CPP_BRIDGE_PRE_JAZZY_REFUSAL),
-            CppBridgeGate::RefusePostJazzy => Some(CPP_BRIDGE_POST_JAZZY_REFUSAL),
         }
     }
 
@@ -170,13 +163,9 @@ impl CppBridgeGate {
     /// second verdict the first one's text.
     fn rcl_error_text(self) -> &'static std::ffi::CStr {
         static PRE_JAZZY: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
-        static POST_JAZZY: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
-        let cell = match self {
-            CppBridgeGate::RefusePostJazzy => &POST_JAZZY,
-            // `Supported` is unreachable (see above); sharing the
-            // pre-Jazzy cell keeps this total without an `unwrap`.
-            _ => &PRE_JAZZY,
-        };
+        // `Supported` is unreachable (see above); the one refusing verdict
+        // owns the one cell, which keeps this total without an `unwrap`.
+        let cell = &PRE_JAZZY;
         cell.get_or_init(|| {
             let paragraph = self.refusal_message().unwrap_or("");
             // Through the SAME renderer the `&str` entry point uses, so
@@ -241,29 +230,6 @@ impl CppBridgeGate {
                     rcl_error_channel = %rcl,
                     suppressed_count = suppressed,
                     "{CPP_BRIDGE_PRE_JAZZY_REFUSAL}"
-                ),
-            },
-            CppBridgeGate::RefusePostJazzy => match decision {
-                RegimeDecision::Loud => tracing::error!(
-                    built_for = %built_for(),
-                    verdict = ?self,
-                    rcl_error_channel = %rcl,
-                    "{CPP_BRIDGE_POST_JAZZY_REFUSAL}"
-                ),
-                RegimeDecision::StillFailing { total, suppressed } => tracing::error!(
-                    built_for = %built_for(),
-                    verdict = ?self,
-                    rcl_error_channel = %rcl,
-                    total_failures = total,
-                    suppressed_count = suppressed,
-                    "{CPP_BRIDGE_POST_JAZZY_REFUSAL}"
-                ),
-                RegimeDecision::Suppressed { suppressed } => tracing::debug!(
-                    built_for = %built_for(),
-                    verdict = ?self,
-                    rcl_error_channel = %rcl,
-                    suppressed_count = suppressed,
-                    "{CPP_BRIDGE_POST_JAZZY_REFUSAL}"
                 ),
             },
         }
@@ -394,8 +360,10 @@ pub fn c_introspection_era() -> CIntrospectionEra {
 /// The C++ bridge verdict for THIS build under a given bypass mode — the
 /// call-site seam the resolvers use (`classify_cpp_bridge` over the
 /// build's own [`c_introspection_era`]), split out so the wiring is
-/// pinnable: a vendored build must classify `RefusePostJazzy` with the
-/// bypass `Off` and `Supported` under either bypass.
+/// pinnable: a vendored build (rolling-pinned, post-Jazzy bits) classifies
+/// `Supported` in every bypass mode now that the mirror carries the
+/// Lyrical tail field; a pre-Jazzy build classifies `RefusePreJazzy` with
+/// the bypass `Off` and `Supported` under either bypass.
 pub fn cpp_bridge_gate_for(bypass: CppBypassMode) -> CppBridgeGate {
     classify_cpp_bridge(bypass, c_introspection_era())
 }
@@ -521,23 +489,6 @@ pub const CPP_BRIDGE_PRE_JAZZY_REFUSAL: &str = concat!(
     "against this distro's real headers and correct on every era)."
 );
 
-/// The registration-time refusal for a Lyrical/Rolling build
-/// (`is_key` alone bounds only the LOWER edge — Lyrical appends
-/// `is_rosidl_buffer_` to the C++ `MessageMember` as well, growing the
-/// element stride past the hand mirror's, so `Supported` there would walk a
-/// 120-byte array at a 112-byte stride).
-pub const CPP_BRIDGE_POST_JAZZY_REFUSAL: &str = concat!(
-    "rmw_cerulion: this build targets a Lyrical/Rolling-era distro, whose C++ ",
-    "introspection layout grew past the Jazzy/Kilted shape the C++ bridge ",
-    "currently hand-mirrors (the rosidl-Buffer struct growth widens every ",
-    "MessageMember) — refusing the rclcpp (C++ typesupport) path at registration ",
-    "rather than misreading its member arrays. Per-era C++ bridge variants — ",
-    "including rosidl-Buffer support — are not implemented yet; ",
-    "rclpy and C-typesupport consumers are unaffected (the C ",
-    "introspection path is bindgen-generated against this distro's real headers ",
-    "and correct on every era)."
-);
-
 /// Gate the hand-mirrored C++ introspection bridge on the
 /// build's era — BOUNDED ON BOTH EDGES. `ffi/introspection_cpp.rs`
 /// hardcodes the JAZZY/KILTED-era C++ shape EXACTLY: `is_key_` /
@@ -565,13 +516,13 @@ pub const CPP_BRIDGE_POST_JAZZY_REFUSAL: &str = concat!(
 /// typesupports through the C ABI), whose fixtures are hand-built
 /// against the COMPILED `CppMessageMember` and therefore
 /// layout-self-consistent by construction. The SHIPPED vendored cdylib
-/// (`cargo build`, no test features) takes the normal two-edged gate —
-/// its ROLLING-pinned bits classify RefusePostJazzy, so a deployed
-/// vendored-dev `.so` refuses live C++ typesupports LOUDLY instead of
-/// misreading them (rclpy/C stay available, matching the vendored
-/// snapshot's dev-only contract). SELECTION of the correct gate,
-/// nothing more: per-era C++ variants (incl. rosidl-Buffer support) are
-/// not implemented; the Jazzy container lane executes the
+/// (`cargo build`, no test features) takes the normal gate: its
+/// ROLLING-pinned bits classify `Supported`, because the mirror is
+/// compiled with the Lyrical tail field under the same capability cfg,
+/// and a vendored `.so` under any OTHER named runtime is already refused
+/// at init by the era guard. SELECTION of the correct gate, nothing
+/// more: the pre-Jazzy C++ variant is not implemented; the Jazzy and
+/// Lyrical container lanes execute the
 /// `Supported` arm, a lane for another era would execute its own, and this
 /// classifier's oracle covers every input because one build can only
 /// ever exercise one.
@@ -582,7 +533,7 @@ pub fn classify_cpp_bridge(bypass: CppBypassMode, era: CIntrospectionEra) -> Cpp
     match era {
         CIntrospectionEra::Jazzy => CppBridgeGate::Supported,
         CIntrospectionEra::PreJazzy => CppBridgeGate::RefusePreJazzy,
-        CIntrospectionEra::PostJazzy => CppBridgeGate::RefusePostJazzy,
+        CIntrospectionEra::PostJazzy => CppBridgeGate::Supported,
     }
 }
 
@@ -819,16 +770,8 @@ mod tests {
             std::ptr::eq(a, b),
             "the cached rcl text must be the SAME object on every refusal"
         );
-        // Separate cells per verdict: a test that drives both (the only
-        // place both are reachable in one process) must not be served the
-        // first verdict's text for the second.
-        let post = CppBridgeGate::RefusePostJazzy.rcl_error_text();
-        assert!(!std::ptr::eq(a, post), "each verdict caches its own text");
-        let (a, post) = (a.to_string_lossy(), post.to_string_lossy());
-        for (text, verdict, paragraph) in [
-            (&a, "RefusePreJazzy", CPP_BRIDGE_PRE_JAZZY_REFUSAL),
-            (&post, "RefusePostJazzy", CPP_BRIDGE_POST_JAZZY_REFUSAL),
-        ] {
+        let a = a.to_string_lossy();
+        for (text, verdict, paragraph) in [(&a, "RefusePreJazzy", CPP_BRIDGE_PRE_JAZZY_REFUSAL)] {
             // EXACT, not a prefix: the whole text rcl would report.
             assert_eq!(
                 text.as_ref(),
@@ -1047,13 +990,15 @@ mod tests {
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreJazzy),
             CppBridgeGate::RefusePreJazzy
         );
-        // Upper bound (dropping it fails here): Lyrical/Rolling widened the C++
-        // MessageMember too, so Supported there walks a 120-byte array
-        // at the mirror's 112-byte stride.
+        // Post-Jazzy (Lyrical/Rolling): the mirror carries the appended
+        // `is_rosidl_buffer_` under the same capability cfg that classifies
+        // this era, so its stride is the distro's 120 bytes and the arm is
+        // Supported; the compile-time size pins in `ffi/introspection_cpp.rs`
+        // hold the two in lockstep.
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PostJazzy),
-            CppBridgeGate::RefusePostJazzy,
-            "a Lyrical/Rolling build must refuse the Jazzy-shaped C++ mirror"
+            CppBridgeGate::Supported,
+            "a Lyrical/Rolling build compiles the Lyrical-shaped C++ mirror"
         );
         // The vendored-TEST bypass (test surface only — the
         // bypass mode is TestSilent or SeamsLoud, never Off, on a
@@ -1073,28 +1018,28 @@ mod tests {
                 );
             }
         }
-        // … while a SHIPPED vendored cdylib (no test features — the
-        // bypass is Off) classifies by its ROLLING-pinned bits
-        // and REFUSES live C++ typesupports rather than misreading a
-        // 120-byte member array through the 112-byte mirror.
+        // … and a SHIPPED vendored cdylib (no test features, the bypass
+        // Off) classifies by its ROLLING-pinned bits as Supported too: the
+        // snapshot IS the Lyrical-era layout, and the era guard refuses it
+        // at init under any other named runtime.
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PostJazzy),
-            CppBridgeGate::RefusePostJazzy,
-            "a deployed vendored-dev .so must refuse the C++ arm"
+            CppBridgeGate::Supported,
+            "a vendored-dev .so admits the C++ arm on its own era"
         );
         // Each refusal names the layout boundary, the missing per-era support, and
         // the unaffected consumers — the three things an operator
         // needs — and the verdict-to-message seam agrees.
         // The call-site seam over THIS build (the resolver's wiring needs
         // executing coverage): a vendored build carries the
-        // rolling-era C introspection shape, so with the bypass Off it
-        // refuses PostJazzy; either bypass admits.
+        // rolling-era C introspection shape, so it classifies PostJazzy and
+        // the gate is Supported in every bypass mode.
         if bindings_source() == BindingsSource::Vendored {
             assert_eq!(c_introspection_era(), CIntrospectionEra::PostJazzy);
             assert_eq!(
                 cpp_bridge_gate_for(CppBypassMode::Off),
-                CppBridgeGate::RefusePostJazzy,
-                "a deployed vendored-dev .so must refuse the C++ arm"
+                CppBridgeGate::Supported,
+                "a vendored-dev .so admits the C++ arm on its own era"
             );
         }
         assert_eq!(
@@ -1117,28 +1062,10 @@ mod tests {
                 "pre-Jazzy refusal must contain {phrase:?}"
             );
         }
-        for phrase in [
-            "Lyrical/Rolling-era",
-            "Jazzy/Kilted shape",
-            "rosidl-Buffer struct growth",
-            "refusing the rclcpp (C++ typesupport) path",
-            "including rosidl-Buffer support",
-            "are not implemented yet",
-            "rclpy and C-typesupport consumers are unaffected",
-        ] {
-            assert!(
-                CPP_BRIDGE_POST_JAZZY_REFUSAL.contains(phrase),
-                "post-Jazzy refusal must contain {phrase:?}"
-            );
-        }
         assert_eq!(CppBridgeGate::Supported.refusal_message(), None);
         assert_eq!(
             CppBridgeGate::RefusePreJazzy.refusal_message(),
             Some(CPP_BRIDGE_PRE_JAZZY_REFUSAL)
-        );
-        assert_eq!(
-            CppBridgeGate::RefusePostJazzy.refusal_message(),
-            Some(CPP_BRIDGE_POST_JAZZY_REFUSAL)
         );
     }
 

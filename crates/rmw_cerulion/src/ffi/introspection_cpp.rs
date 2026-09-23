@@ -7,10 +7,15 @@
 //! C++ (namespaced, includes `<string>`), which bindgen handles poorly,
 //! but the two structs we need are plain data + C function pointers —
 //! a stable, documented layout (message_introspection.hpp). The layout
-//! below matches **Jazzy and rolling** (`is_key_` on MessageMember,
+//! below matches **Jazzy and Kilted** (`is_key_` on MessageMember,
 //! `has_any_key_member_` on MessageMembers — both added for Iron+
-//! keyed-topic support). Older distros (Humble) lack those fields and
-//! are NOT supported by this bridge; the deployed .so targets Jazzy.
+//! keyed-topic support) and, under `cfg(cerulion_has_is_rosidl_buffer)`,
+//! the **Lyrical/Rolling** shape, which appends one `bool is_rosidl_buffer_`
+//! to MessageMember (112 to 120 bytes) and changes nothing else. The cfg is
+//! derived by build.rs from the very bindings this build compiles against,
+//! so the mirror and the C-side `era_pins` can never disagree about the
+//! era. Older distros (Humble, Foxy) lack `is_key_` and are NOT supported
+//! by this bridge yet.
 //!
 //! Container access is exclusively through the member's function
 //! pointers (`size/get/get_const/fetch/assign/resize`) — never through
@@ -32,7 +37,7 @@ pub const INTROSPECTION_CPP_IDENTIFIER: &[u8] = b"rosidl_typesupport_introspecti
 pub const CPP_MSG_INIT_ALL: u32 = 0;
 
 /// Mirror of `rosidl_typesupport_introspection_cpp::MessageMember`
-/// (Jazzy/rolling layout).
+/// (Jazzy/Kilted layout, plus the Lyrical/Rolling tail field under its cfg).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CppMessageMember {
@@ -61,6 +66,12 @@ pub struct CppMessageMember {
     pub assign_function: Option<unsafe extern "C" fn(*mut c_void, usize, *const c_void)>,
     /// Resize the sequence (allocates through the C++ container).
     pub resize_function: Option<unsafe extern "C" fn(*mut c_void, usize)>,
+    /// Lyrical/Rolling only: whether the member is a `rosidl_runtime_cpp::Buffer`
+    /// (ros2/rosidl#942, appended last so every earlier offset is unchanged).
+    /// The bridge never reads it; it exists so the stride matches the
+    /// distro's member array.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    pub is_rosidl_buffer_: bool,
 }
 
 /// Mirror of `rosidl_typesupport_introspection_cpp::MessageMembers`
@@ -130,7 +141,20 @@ compile_error!(
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
 
+    #[cfg(not(cerulion_has_is_rosidl_buffer))]
     assert!(size_of::<CppMessageMember>() == 112);
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    assert!(size_of::<CppMessageMember>() == 120);
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    assert!(offset_of!(CppMessageMember, is_rosidl_buffer_) == 112);
+    // The C++ mirror and the bindgen-generated C member must be the same
+    // size in every era the bridge supports: the two introspection
+    // languages grow in lockstep, so a mirror that lags its era is caught
+    // here at compile time, not by a misread member array at runtime.
+    assert!(
+        size_of::<CppMessageMember>()
+            == size_of::<super::rosidl_typesupport_introspection_c__MessageMember>()
+    );
     assert!(align_of::<CppMessageMember>() == 8);
     assert!(offset_of!(CppMessageMember, name_) == 0);
     assert!(offset_of!(CppMessageMember, type_id_) == 8);

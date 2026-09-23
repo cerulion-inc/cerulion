@@ -144,14 +144,15 @@ fn check_refusal_line(
     lines: &[&str],
     gate: CppBridgeGate,
     verdict_token: &str,
-    other: CppBridgeGate,
+    foreign: &str,
 ) -> Result<(), String> {
     let own = gate
         .refusal_message()
         .expect("a refusing verdict carries text");
-    let others = other
-        .refusal_message()
-        .expect("the other verdict carries text");
+    // A paragraph that must never appear on this verdict's line: the
+    // post-Jazzy refusal text that the Lyrical mirror retired, kept as the
+    // regression guard against it returning under any verdict.
+    let others = foreign;
     let hits: Vec<&str> = lines
         .iter()
         .copied()
@@ -537,26 +538,7 @@ fn a_pre_jazzy_verdict_refuses_at_error_with_its_own_constant_paragraph() {
             lines,
             CppBridgeGate::RefusePreJazzy,
             "RefusePreJazzy",
-            CppBridgeGate::RefusePostJazzy,
-        )
-    });
-}
-
-#[traced_test]
-#[test]
-#[serial]
-fn a_post_jazzy_verdict_refuses_at_error_with_its_own_constant_paragraph() {
-    rearm();
-    assert!(
-        CppBridgeGate::RefusePostJazzy.emit_refusal(),
-        "a post-Jazzy verdict must tell the caller to refuse"
-    );
-    logs_assert(|lines: &[&str]| {
-        check_refusal_line(
-            lines,
-            CppBridgeGate::RefusePostJazzy,
-            "RefusePostJazzy",
-            CppBridgeGate::RefusePreJazzy,
+            "rosidl-Buffer struct growth",
         )
     });
 }
