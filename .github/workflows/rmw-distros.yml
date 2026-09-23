@@ -1,6 +1,7 @@
 name: rmw distro lanes
 
-# One hosted lane per ROS 2 distro in the support set, inside the stock ros:<distro>-ros-base image,
+# One hosted lane per ROS 2 distro in the support set (Jazzy, the validated distro, as the regression
+# guard; Lyrical, Humble and Foxy as they land), inside the stock ros:<distro>-ros-base image,
 # building rmw_cerulion against that distro's REAL headers (bindgen; the vendored fallback is refused).
 # Each lane asserts the distro's KNOWN state through tools/ci/rmw-distros/gate.sh, so the lane is
 # green while the state is true and turns red the moment the truth moves in either direction.
@@ -34,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [lyrical, humble, foxy]
+        distro: [jazzy, lyrical, humble, foxy]
     container:
       image: ros:${{ matrix.distro }}-ros-base
       options: --shm-size=1g

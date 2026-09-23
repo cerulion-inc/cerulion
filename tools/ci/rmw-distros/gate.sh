@@ -13,12 +13,14 @@ set +u; source "/opt/ros/$distro/setup.bash"; set -u
 [ -n "${AMENT_PREFIX_PATH:-}" ] || { echo "FATAL: AMENT_PREFIX_PATH unset after sourcing /opt/ros/$distro"; exit 1; }
 [ "${ROS_DISTRO:-}" = "$distro" ] || { echo "FATAL: ROS_DISTRO='${ROS_DISTRO:-}' is not '$distro'"; exit 1; }
 
-# Expected-state table. Pinned from the 2026-09-23 pre-flight in these exact images:
+# Expected-state table. Pinned from the 2026-09-23 pre-flight in these exact images (jazzy is the
+# validated distro: it must build and pass its whole suite, the regression guard for every other row):
 #   lyrical: builds from generated bindings (43 s); the lib suite has exactly three known failures,
 #            all the C++ introspection bridge refusing the Lyrical layout (no Lyrical-shaped mirror yet);
 #   humble:  the compile stops at rmw's 24-byte GID storage against the 16-byte one the crate writes;
 #   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 24 more missing symbols).
 case "$distro" in
+    jazzy)   expect=build; known_failures="" ;;
     lyrical) expect=build
              known_failures="api::dispatch_tests::bridge_for_builds_cpp_anybridge_and_flattens_like_native
 api::dispatch_tests::direct_leaf_resolves_without_a_dispatcher
