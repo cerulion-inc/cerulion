@@ -64,9 +64,9 @@ recording's per-edge read log offline).
   `shm_open` `MAP_SHARED` primitive. The wake shape is per-OS (Linux: a
   process-shared futex; macOS 14.4 and later: a bounded boundary spin
   then an `os_sync_wait_on_address` kernel wake, with a chunked ~100 µs
-  sleep-recheck as the fallback on older hosts, never a busy-spin). On non-Unix hosts the SAME
-  graph runs single-process (monolith fallback) with a loud notice:
-  identical results, no process isolation.
+  sleep-recheck as the fallback on older hosts, never a busy-spin). On
+  non-Unix hosts the SAME graph runs single-process (monolith fallback)
+  with a loud notice: identical results, no process isolation.
 
 ## When does a run go multi-process? (the auto-partition default)
 
@@ -410,8 +410,8 @@ round-trip at every boundary, then falls back to the blocking tier.
 
 `CERULION_BARRIER_OS_SYNC=0` selects the sleep-recheck tier on macOS, and
 with it the 150 µs spin default. `CERULION_BARRIER_SPIN_US` overrides the
-budget on every tier; `=0` is the kill switch: it restores the legacy 50-iteration
-pre-block spin + futex path (a hard-bounded read loop with no `Instant`
+budget on every tier; `=0` is the kill switch: it restores the legacy
+50-iteration pre-block spin + futex path (a hard-bounded read loop with no `Instant`
 reads, then the unchanged kernel block), **not** a pure futex wait, for
 power-sensitive deployments. Values above **100ms** are clamped to 100ms
 with a loud warning (still far below the ~5s barrier
