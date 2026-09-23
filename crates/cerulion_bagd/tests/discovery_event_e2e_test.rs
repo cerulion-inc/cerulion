@@ -655,8 +655,11 @@ fn measure_idle_discovery_cost_at_one_hundred_topics() {
 
     let mgr: Arc<TransportManager> = make_manager(8);
     let mut held = Vec::with_capacity(TOPICS);
+    let mut names = Vec::with_capacity(TOPICS);
     for i in 0..TOPICS {
-        held.push(publisher(&mgr, &unique_topic(&format!("measure-{i}")), 64));
+        let topic = unique_topic(&format!("measure-{i}"));
+        held.push(publisher_with_provisioning(&mgr, &topic, 8, 16, 4096));
+        names.push(topic);
     }
 
     // What ONE walk costs on this machine, at this topic count.
@@ -686,15 +689,21 @@ fn measure_idle_discovery_cost_at_one_hundred_topics() {
     let out = unique_out("measure");
     let ready = unique_out("measure_ready");
     let shutdown = Arc::new(AtomicBool::new(false));
-    let mut cfg = BagdConfig::new(out.clone(), Vec::new());
+    // One DECLARED tap so the recorder has a topic it was asked for; discovery
+    // finds the other ninety-nine, which is the shape being measured.
+    let mut cfg = BagdConfig::new(out.clone(), vec![TapSpec::attach(&names[0])]);
     cfg.flush_interval = Duration::from_millis(20);
     cfg.ready_file = Some(ready.clone());
     cfg.status_period = None;
+    cfg.schema_wait = Duration::from_millis(3000);
     cfg.discover_live = true;
     let mgr_for_bagd = mgr.clone();
     let flag = shutdown.clone();
     let handle = std::thread::spawn(move || run_bagd(mgr_for_bagd, cfg, flag));
-    assert!(wait_for_file(&ready, Duration::from_secs(20)), "bagd ready");
+    assert!(
+        wait_for_file(&ready, Duration::from_secs(60)),
+        "bagd ready (a hundred taps and a mirror gather take a while to arm)"
+    );
     std::thread::sleep(Duration::from_secs(10));
     shutdown.store(true, Ordering::Relaxed);
     let summary = handle.join().expect("bagd thread").expect("clean finalize");
