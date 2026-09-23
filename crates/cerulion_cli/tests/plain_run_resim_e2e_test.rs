@@ -2269,6 +2269,20 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         // step 0 needs no anchor and would not exercise the admission.
         await_the_worker_has_stepped(&format!("/{prefix}/ticker/cmd"));
         std::thread::sleep(Duration::from_secs(2));
+        // run.json's `gating` label follows the SAME predicate the
+        // worker keys its clock discipline on ("this run mints trace rings"),
+        // so a plain free-run run reads `recorded_wall` -- never `wall`, the
+        // read-only RealClock arm that is now `--no-rings` only. Read while the
+        // run is LIVE (`live_run_manifest`: the directory goes on exit). This
+        // is the one place the supervisor's call site is observable, so it is
+        // what kills a call site that hands the classifier `--record`.
+        let run_json = live_run_manifest(&home);
+        assert_eq!(
+            run_json["gating"],
+            serde_json::json!("recorded_wall"),
+            "a plain free-run run mints its trace rings, so every rank runs the controlled \
+             wall-following clock and run.json must say so: {run_json}"
+        );
 
         // ------------------------------------------------------------ leg 2
         // CAPTURE, through the operator's own verb.
