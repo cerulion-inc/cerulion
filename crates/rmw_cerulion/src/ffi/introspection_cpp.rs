@@ -148,9 +148,12 @@ const _: () = {
     #[cfg(cerulion_has_is_rosidl_buffer)]
     assert!(offset_of!(CppMessageMember, is_rosidl_buffer_) == 112);
     // The C++ mirror and the bindgen-generated C member must be the same
-    // size in every era the bridge supports: the two introspection
-    // languages grow in lockstep, so a mirror that lags its era is caught
-    // here at compile time, not by a misread member array at runtime.
+    // size in every era the bridge supports (Jazzy onward, where `is_key_`
+    // exists): the two introspection languages grow in lockstep, so a
+    // mirror that lags its era is caught here at compile time, not by a
+    // misread member array at runtime. Pre-Jazzy builds refuse the C++ arm
+    // at registration instead, so the check is not asserted there.
+    #[cfg(cerulion_has_is_key)]
     assert!(
         size_of::<CppMessageMember>()
             == size_of::<super::rosidl_typesupport_introspection_c__MessageMember>()
