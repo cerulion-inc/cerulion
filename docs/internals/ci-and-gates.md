@@ -380,7 +380,7 @@ on PRs).
 Six Linux jobs run on push / `workflow_dispatch` only and never
 on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `msrv`, `fuzz`, `miri` and
 `machete` each carry a job-level `if: github.event_name != 'pull_request' && github.event_name
-!= 'merge_group'`; the second
+!= 'merge_group'`; `deb-smoke` carries one exception, below; the second
 conjunct is required because a bare `!= 'pull_request'` ADMITS a merge-queue batch,
 which would run the same work a second time over the same commits (`main`'s push run is the
 control), with their `needs: [lint]` (`fuzz`, `miri`) and
@@ -390,6 +390,16 @@ They run on every merge to `main` (the push run is where their breakage
 surfaces, revert-on-red), and the coverage walk drops any job behind a job-level `if:`
 from its PR-blocking view, so none of the six can credit pull-request coverage it does not
 provide.
+
+The `changes` job classifies a pull request's changed paths (rules and a
+`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) and
+`deb-smoke` reads one class: a pull request that touches the packaging inputs
+themselves runs the 22-minute Debian and APT smoke instead of skipping it, because
+those are the only pull requests that can break it and "caught on the merge to main"
+means a revert rather than a red check. The direction is the safe one: a class only
+ever makes a job RUN that would otherwise skip, so no rule in that script can weaken a
+gate a pull request has today, and every class is `false` on `push`, `merge_group` and
+`workflow_dispatch`, where there is no pull request to diff.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.
