@@ -89,7 +89,7 @@ and each trigger has its own switch, `CERULION_FLASHBACK_ON_<TRIGGER>`, set to
 | `PANIC_DISABLE` | A node is disabled after repeated panics, or its entry mutex is poisoned. The process is alive and one node has stopped. | on |
 | `RUN_VANISHED` | The run this recorder was bound to disappeared without announcing anything: a hard crash. | on |
 | `ESTOP` | A human engaged the e-stop over the ops plane. | on |
-| `DECLARED` | Something declared an incident. | on |
+| `DECLARED` | The robot's own safety logic declared an incident: a bumper, a safety PLC, a domain e-stop topic, a grasp-failure detector. | on |
 | `STALL` | A topic stops producing while its process stays alive. | on |
 | `RATE` | A topic's rate collapses inside the window. | on |
 | `SILENT` | A route that has never produced at all. Off by default: on a robot where that is ordinary, it would capture on every boot. | off |

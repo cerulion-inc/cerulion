@@ -53,9 +53,10 @@ Three nodes forming a reactive pipeline:
 
   The install script above provisions that compiler. On Homebrew and apt, run
   `cerulion-install-rust` once and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your
-  PATH. The workspace you create in Step 1 records the compiler in its own
-  `rust-toolchain.toml` when it is installed, so the builds below select it with no
-  environment variable. When your rustup default is a different compiler, name it:
+  PATH. The workspace you create in Step 1 records that compiler in its own
+  `rust-toolchain.toml` when a rustup toolchain matching it is already installed,
+  so the builds below select it with no environment variable. When your rustup
+  default is a different compiler, name it:
   `RUSTUP_TOOLCHAIN=1.93.0 cerulion node build <node>`.
 
 Every step below is a `cerulion` verb. You never run `cargo` yourself and you never
