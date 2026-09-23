@@ -984,8 +984,7 @@ before it reaches the robot again. In CI the nonzero exit is the gate.
 
 ## How it works underneath
 
-Now that you have a working system, let's review what's happening under the
-hood.
+You have a working system. This is what the runtime did to make it work.
 
 ### Message flow
 
