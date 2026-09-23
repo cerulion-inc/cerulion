@@ -56,7 +56,7 @@ mod tests {
             resolve_from(
                 Some(OsStr::new("/srv/robot")),
                 Some(OsStr::new("/config")),
-                Some(Path::new("/home/operator"))
+                Some(Path::new("/opt/robot-owner"))
             ),
             Some(PathBuf::from("/srv/robot"))
         );
@@ -72,7 +72,7 @@ mod tests {
             resolve_from(
                 None,
                 Some(OsStr::new("/config")),
-                Some(Path::new("/home/operator"))
+                Some(Path::new("/opt/robot-owner"))
             ),
             Some(PathBuf::from("/config/robot-state"))
         );
@@ -80,9 +80,9 @@ mod tests {
             resolve_from(
                 None,
                 Some(OsStr::new("")),
-                Some(Path::new("/home/operator"))
+                Some(Path::new("/opt/robot-owner"))
             ),
-            Some(PathBuf::from("/home/operator/.cerulion/robot-state"))
+            Some(PathBuf::from("/opt/robot-owner/.cerulion/robot-state"))
         );
         assert_eq!(resolve_from(None, None, None), None);
     }
