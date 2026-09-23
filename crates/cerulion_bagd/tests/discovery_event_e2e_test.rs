@@ -707,7 +707,10 @@ fn measure_idle_discovery_cost_at_one_hundred_topics() {
     std::thread::sleep(Duration::from_secs(10));
     shutdown.store(true, Ordering::Relaxed);
     let summary = handle.join().expect("bagd thread").expect("clean finalize");
-    let mean_pass = summary
+    // Span over passes is the loop's PERIOD, which includes the backlog-aware
+    // pacing sleep between passes. It is NOT a mean pass duration, and printing
+    // it as one puts a number larger than the measured worst pass next to it.
+    let mean_period = summary
         .drive_span
         .checked_div(summary.drive_passes.max(1) as u32)
         .unwrap_or_default();
@@ -730,8 +733,11 @@ fn measure_idle_discovery_cost_at_one_hundred_topics() {
     println!("recorder drive loop over {TOPICS} discovered topics:");
     println!("  passes                 : {}", summary.drive_passes);
     println!("  span                   : {:?}", summary.drive_span);
-    println!("  mean pass              : {mean_pass:?}");
-    println!("  worst pass             : {:?}", summary.max_pass_duration);
+    println!("  mean period            : {mean_period:?} (work plus the pacing sleep)");
+    println!(
+        "  worst pass             : {:?} (work only, the high water)",
+        summary.max_pass_duration
+    );
 
     cleanup(&out);
 }
