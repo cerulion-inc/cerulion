@@ -184,8 +184,9 @@ Every validated `rmw_cerulion` execution used ROS 2 Jazzy:
 
 The packaged measurements are the
 [latency campaign](benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/);
-the last two rows above, the distro guard, the Go2 attach and the Foxy fault
-have no retained artifact in this repository.
+the last two rows above, the distro guard, the Foxy fault and both attach runs,
+the Go2 on Foxy and the Humble peers, have no retained artifact in this
+repository.
 
 The stock ROS 2 lanes in the benchmark suite name distributions other than
 Jazzy. Those are stock nodes under stock RMWs, measured as the comparison side;
