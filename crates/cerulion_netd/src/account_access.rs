@@ -369,7 +369,9 @@ mod busy_vocabulary_tests {
         }
         // A superstring is a different message, not the same one.
         assert!(!is_transient_busy(&format!("{CONTROLLER_BUSY} (fatal)")));
-        assert!(!is_transient_busy(&CONTROLLER_BUSY[..CONTROLLER_BUSY.len() - 1]));
+        assert!(!is_transient_busy(
+            &CONTROLLER_BUSY[..CONTROLLER_BUSY.len() - 1]
+        ));
     }
 
     /// The client's patience is a real duration, not a placeholder, and it is at

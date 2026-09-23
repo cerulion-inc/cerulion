@@ -142,11 +142,7 @@ pub fn install_directory(directory: &AccountRobotDirectory) -> CliResult<NetdCli
             snapshot: Box::new(snapshot.clone()),
         });
         let error = outcome.as_ref().err().map(|e| e.to_string());
-        match classify_install_outcome(
-            error.as_deref(),
-            started.elapsed(),
-            TRANSIENT_BUSY_WAIT,
-        ) {
+        match classify_install_outcome(error.as_deref(), started.elapsed(), TRANSIENT_BUSY_WAIT) {
             BusyDecision::Settle | BusyDecision::GaveUp => {
                 outcome.map_err(access_error)?;
                 return Ok(client);
