@@ -771,14 +771,15 @@ mod tests {
             "the cached rcl text must be the SAME object on every refusal"
         );
         let a = a.to_string_lossy();
-        for (text, verdict, paragraph) in [(&a, "RefusePreJazzy", CPP_BRIDGE_PRE_JAZZY_REFUSAL)] {
-            // EXACT, not a prefix: the whole text rcl would report.
-            assert_eq!(
-                text.as_ref(),
-                format!("{paragraph} built_for={} verdict={verdict}", built_for()),
-                "the cached rcl text for {verdict} is wrong"
-            );
-        }
+        // EXACT, not a prefix: the whole text rcl would report.
+        assert_eq!(
+            a.as_ref(),
+            format!(
+                "{CPP_BRIDGE_PRE_JAZZY_REFUSAL} built_for={} verdict=RefusePreJazzy",
+                built_for()
+            ),
+            "the cached rcl text for RefusePreJazzy is wrong"
+        );
     }
 
     #[test]
