@@ -239,18 +239,6 @@ impl std::fmt::Debug for WanRegistry {
     }
 }
 
-impl std::fmt::Debug for WanRegistry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let public =
-            cerulion_pairing::client::DeviceIdentity::from_seed(&self.desk_seed).public_key();
-        f.write_str("WanRegistry { desk_seed: \"[REDACTED]\", desk_public_key: \"")?;
-        for byte in public.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        f.write_str("\" }")
-    }
-}
-
 impl WanRegistry {
     /// Build a registry directly (the test / dependency-injection entry). The
     /// account defaults to `None` — set it with [`with_account`] (the production
