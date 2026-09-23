@@ -111,10 +111,13 @@ upstream `mcap` crate, never only our own reader; the format claim is
   directory does not justify a watcher engine). The worker blocks on it and
   walks only when something changed, so a settled machine runs **zero**
   enumerations rather than four a second forever. A burst is coalesced
-  (`EVENT_COALESCE_WINDOW`), `SCAN_RATE_FLOOR` bounds a chatty directory, and one
-  bounded confirmation walk (`EVENT_CONFIRM_DELAY`) closes the gap between a
-  static-config file appearing and its permissions being finalized, which is when
-  `Service::list` starts reporting it. The worker still wakes ten times a second
+  (`EVENT_COALESCE_WINDOW`), `SCAN_RATE_FLOOR` bounds a chatty directory, and a
+  fixed tail of `CONFIRM_WALKS` confirmation walks spaced `EVENT_CONFIRM_DELAY`
+  apart closes the gap between a static-config file appearing and its
+  permissions being finalized, which is when `Service::list` starts reporting
+  it. The watch is armed BEFORE the worker's baseline walk, so a producer that
+  registers during that walk queues an event rather than falling between the
+  two. The worker still wakes ten times a second
   to check its stop flag and stamp a heartbeat; those wakes do no work.
 - **A background scanner can fail where an inline call could not, so every
   degradation is loud and observable.** Three tiers, each with its own report:

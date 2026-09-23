@@ -35,7 +35,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerulion_bag::BagReader;
-use cerulion_bagd::discovery_scan::{DiscoveryScanner, WakeSource, EVENT_CONFIRM_DELAY};
+use cerulion_bagd::discovery_scan::{
+    DiscoveryScanner, WakeSource, CONFIRM_WALKS, EVENT_CONFIRM_DELAY,
+};
 use cerulion_bagd::{
     run_bagd, BagdConfig, RecordCoverage, TapSource, TapSpec, RECORD_COVERAGE_ATTACHMENT,
 };
@@ -165,7 +167,7 @@ fn every_walk_the_event_engine_runs_has_a_directory_change_behind_it() {
 
     // Let any confirmation armed by a wake BEFORE the window land before the
     // window opens, so it is not counted against a wake the window did not see.
-    std::thread::sleep(EVENT_CONFIRM_DELAY + Duration::from_millis(100));
+    std::thread::sleep(EVENT_CONFIRM_DELAY * (CONFIRM_WALKS + 1) + Duration::from_millis(100));
     while events.next_scan(&mgr).is_some() {}
     while poll.next_scan(&mgr).is_some() {}
 
@@ -221,11 +223,12 @@ fn every_walk_the_event_engine_runs_has_a_directory_change_behind_it() {
     // edge: a wake microseconds before it arms a walk that lands microseconds
     // after. It forgives exactly that and nothing else - a timed engine over
     // this window produces a dozen or more uncaused walks, not one.
+    let per_wake = u64::from(1 + CONFIRM_WALKS);
     assert!(
-        event_walks <= 2 * event_wakes + 1,
+        event_walks <= per_wake * event_wakes + 1,
         "the event-driven engine ran {event_walks} walk(s) from {event_wakes} wake(s). Each \
-         wake is worth one walk plus at most one bounded confirmation, so a walk beyond that \
-         had no directory change behind it, which is a timer by another name (the polling \
+         wake is worth one walk plus a tail of {CONFIRM_WALKS} confirmations, so a walk beyond \
+         that had no directory change behind it, which is a timer by another name (the polling \
          control ran {poll_walks} such walks in the same window)"
     );
 
@@ -340,9 +343,10 @@ fn a_burst_of_topics_is_coalesced_into_far_fewer_wakes_than_topics() {
          is 117.5 ms at 86 live topics"
     );
     assert!(
-        walks <= 2 * wakes + 1,
-        "{walks} walk(s) from {wakes} wake(s): every walk must be a change plus at most one \
-         bounded confirmation, with one allowance for a confirmation armed by the baseline"
+        walks <= u64::from(1 + CONFIRM_WALKS) * wakes + 1,
+        "{walks} walk(s) from {wakes} wake(s): every walk must be a change plus a tail of at \
+         most {CONFIRM_WALKS} confirmations, with one allowance for a confirmation armed by \
+         the baseline"
     );
 }
 
@@ -442,6 +446,52 @@ fn a_disabled_scanner_arms_no_watch_and_serves_no_scans() {
             "call {i}: a disabled scanner must serve nothing"
         );
     }
+}
+
+// ===========================================================================
+// The ordering the worker cannot be tested into behaviourally.
+// ===========================================================================
+
+/// The watch is ARMED before the baseline walk, never after it.
+///
+/// # Why this is a source walk and not a behavioural arm
+///
+/// The failure it guards is a race against the single most expensive operation
+/// in the module: with the walk first, a producer registering DURING that walk
+/// (117.5 ms at 86 live topics) is in neither the walk's result nor any event,
+/// because its file appeared before anything was watching. On a settled machine
+/// nothing ever changes that directory again, so the topic is never enumerated,
+/// never tapped, never named in the coverage manifest - and `wakes()` stays 0,
+/// the heartbeat keeps stamping and `wake_source()` still reads `Events`, so
+/// not one of the three loud degradation paths fires.
+///
+/// Winning that race deliberately would mean creating a service inside a window
+/// the test cannot see the edges of, which is not a test but a coin flip. The
+/// ordering IS the property, and the source states it exactly.
+#[test]
+fn the_watch_is_armed_before_the_workers_baseline_walk() {
+    let src = code_only(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/discovery_scan.rs"
+        ))
+        .expect("read cerulion_bagd/src/discovery_scan.rs"),
+    );
+    let body = fn_body(&src, "scan_loop");
+
+    let arm_at = body.find("ServiceDirWatch::arm").unwrap_or_else(|| {
+        panic!("`scan_loop` must arm the watch - the walk is reading the wrong text. Body:\n{body}")
+    });
+    let walk_at = body.find("publish(").unwrap_or_else(|| {
+        panic!("`scan_loop` must publish a baseline enumeration. Body:\n{body}")
+    });
+    assert!(
+        arm_at < walk_at,
+        "the watch must be armed BEFORE the baseline walk. With the walk first, a producer that \
+         registers during it is in neither the walk's result nor any event, and is never \
+         enumerated for the life of the recording while every observable reads healthy. Body:\n\
+         {body}"
+    );
 }
 
 // ===========================================================================

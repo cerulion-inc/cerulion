@@ -147,6 +147,27 @@ pub struct ServiceDirWatch {
     services: PathBuf,
     /// Whether the current watch is on the ROOT rather than on `services`.
     standing_in: bool,
+    /// `(device, inode)` of the directory the kernel watch is bound to.
+    ///
+    /// The watch is re-targeted by IDENTITY, not by existence, and the
+    /// difference is not academic. A kernel watch is bound to an INODE: delete
+    /// the watched directory and the watch is destroyed (Linux removes the
+    /// descriptor outright), so a directory that is removed and RECREATED
+    /// between two waits leaves a live-looking handle bound to nothing. An
+    /// existence check cannot see that - the path exists, it is simply not the
+    /// thing being watched - and the recorder would go silently blind while
+    /// every observable still read healthy.
+    watched_id: Option<(u64, u64)>,
+}
+
+/// `(device, inode)` of `dir`, or `None` if it is not a directory right now.
+fn dir_identity(dir: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(dir).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    Some((meta.dev(), meta.ino()))
 }
 
 impl ServiceDirWatch {
@@ -156,19 +177,25 @@ impl ServiceDirWatch {
         let services = root.join(service_dir);
         let root = root.to_path_buf();
         if services.is_dir() {
+            let imp = imp::DirWatch::open(&services)?;
+            let watched_id = dir_identity(&services);
             return Ok(Self {
-                imp: imp::DirWatch::open(&services)?,
+                imp,
                 root,
                 services,
                 standing_in: false,
+                watched_id,
             });
         }
         if root.is_dir() {
+            let imp = imp::DirWatch::open(&root)?;
+            let watched_id = dir_identity(&root);
             return Ok(Self {
-                imp: imp::DirWatch::open(&root)?,
+                imp,
                 root,
                 services,
                 standing_in: true,
+                watched_id,
             });
         }
         Err(WatchError::NoDirectory {
@@ -206,17 +233,20 @@ impl ServiceDirWatch {
             }
         };
         if changed || self.standing_in {
-            let services_exist = self.services.is_dir();
-            if services_exist == self.standing_in {
-                let target = if services_exist {
-                    &self.services
-                } else {
-                    &self.root
-                };
+            let services_id = dir_identity(&self.services);
+            let (target, target_id, standing_in) = match services_id {
+                Some(id) => (&self.services, Some(id), false),
+                None => (&self.root, dir_identity(&self.root), true),
+            };
+            // Re-target when the directory this watch SHOULD be on is not the
+            // inode it IS on. That one predicate covers all three transitions:
+            // the service directory appearing, going away, and being replaced.
+            if target_id.is_none() || target_id != self.watched_id {
                 return match imp::DirWatch::open(target) {
                     Ok(w) => {
                         self.imp = w;
-                        self.standing_in = !services_exist;
+                        self.watched_id = dir_identity(target);
+                        self.standing_in = standing_in;
                         WatchWake::Changed
                     }
                     Err(e) => WatchWake::Broken {
@@ -313,7 +343,13 @@ mod imp {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+            // Round UP, never down: a sub-millisecond remainder truncated to
+            // zero makes `poll` return immediately, and a caller waiting out a
+            // deadline in a loop would spin on it until the deadline expired.
+            let ms = timeout
+                .as_millis()
+                .min(i32::MAX as u128)
+                .max(u128::from(!timeout.is_zero())) as libc::c_int;
             // SAFETY: one initialized `pollfd` is passed with a count of 1.
             let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
             if rc < 0 {

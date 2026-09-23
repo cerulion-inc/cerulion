@@ -56,9 +56,10 @@
 //!   AFTER the file appears. On Linux that chmod is itself an event; on macOS a
 //!   chmod of a file inside a directory is not a change to the directory, so it
 //!   is not. Rather than ship two behaviours, every event-driven walk is
-//!   followed by exactly ONE confirmation walk [`EVENT_CONFIRM_DELAY`] later
-//!   (absorbed if another event arrives first). It is a bounded tail on a real
-//!   change, not a cadence: nothing happening means neither walk happens.
+//!   followed by a fixed tail of [`CONFIRM_WALKS`] confirmation walks spaced
+//!   [`EVENT_CONFIRM_DELAY`] apart, re-armed from scratch if another event
+//!   arrives first. It is a bounded tail on a real change, not a cadence:
+//!   nothing happening means none of those walks happens.
 //!
 //! A [`SCAN_RATE_FLOOR`] bounds the worst case from the other side. However
 //! chatty the directory becomes, two walks are never started closer together
@@ -141,13 +142,27 @@ pub const SCANNER_STOP_SLICE: Duration = Duration::from_millis(100);
 /// creations, short enough that a single new topic is discovered promptly.
 pub const EVENT_COALESCE_WINDOW: Duration = Duration::from_millis(50);
 
-/// How long after an event-driven walk the single confirmation walk runs.
+/// The spacing of the confirmation walks that follow an event-driven one.
 ///
 /// Closes the visibility lag between a service's static-config file appearing
 /// and its permissions being finalized, which is when `Service::list` starts
-/// reporting it. One walk, on a real change, absorbed if another event arrives
-/// first - never a repeating tick.
+/// reporting it. On a real change only - never a repeating tick.
 pub const EVENT_CONFIRM_DELAY: Duration = Duration::from_millis(250);
+
+/// How many confirmation walks follow an event-driven one.
+///
+/// TWO rather than one, and the reason is a platform asymmetry. On Linux the
+/// permissions change is itself an event (`IN_ATTRIB`), so a late one produces
+/// its own wake and the design is self-correcting. On macOS `EVFILT_VNODE`
+/// watches the DIRECTORY, and a chmod of a file inside it is not a change to
+/// the directory - so the confirmation is the entire cover. A single shot that
+/// landed before an unusually slow producer finished writing would leave that
+/// topic unenumerated with nothing behind it, and the second walk is paid only
+/// by a machine that really did change.
+///
+/// It stays a TAIL, not a cadence: the count is fixed, it is armed only by a
+/// real event, and a settled machine runs none of them.
+pub const CONFIRM_WALKS: u32 = 2;
 
 /// The closest together two walks are ever STARTED.
 ///
@@ -295,9 +310,9 @@ impl ScanSilenceLatch {
 /// confirmation, and on nothing else", and that is a decision, not a syscall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanStep {
-    /// Walk the directory now, then arm a confirmation.
+    /// Walk the directory now, then arm the confirmation tail.
     WalkAndConfirm,
-    /// Walk the directory now; this WAS the confirmation.
+    /// Walk the directory now; this is one of the confirmations.
     WalkConfirming,
     /// Do nothing. The overwhelmingly common step on a settled machine.
     Idle,
@@ -399,10 +414,19 @@ impl ThreadedScanner {
     }
 
     /// Take the newest completed scan, if the worker has published one since the
-    /// last call. A poisoned mailbox is treated as "nothing new": a diagnostic
-    /// mutex must never wedge the recording it is only describing.
+    /// last call.
+    ///
+    /// A poisoned mailbox is RECOVERED rather than read as "nothing new". The
+    /// data behind it is one `Option` with no invariant a panic could break,
+    /// and discarding scans on poison would stop discovery dead while
+    /// `scans_run` kept climbing and the heartbeat kept stamping - every
+    /// observable reading healthy while nothing was being delivered.
     fn take(&self) -> Option<TopicScan> {
-        self.latest.lock().ok().and_then(|mut slot| slot.take())
+        let mut slot = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.take()
     }
 }
 
@@ -421,13 +445,15 @@ fn scan_loop(
     ch: WorkerChannels,
 ) {
     let origin = Instant::now();
-    // The BASELINE enumeration. Unconditional and immediate: the worker cannot
-    // be woken by a producer that registered before it started watching, so the
-    // recorder would otherwise never learn about anything already live. (The
-    // arm-time inline scan in `Recorder::setup` covers the tap set; this covers
-    // the worker's own view.)
-    publish(&ch, &mgr, &origin);
 
+    // ARM FIRST, then walk. The order is load-bearing, not tidiness: the
+    // baseline walk is the single most expensive operation this worker performs
+    // (117.5 ms at 86 live topics), and a producer that registers DURING it is
+    // in neither the walk's result nor - if the watch were armed afterwards -
+    // any event, because its file appeared before anything was watching. That
+    // topic would then never be enumerated, with every observable reading
+    // healthy. Arming first costs a config read and one syscall, and turns that
+    // window into a queued event the first wait converts into a second walk.
     let identity = mgr.iox_shm_identity();
     let root = watch_root.unwrap_or_else(|| PathBuf::from(&identity.root_path));
     let mut watch = match ServiceDirWatch::arm(&root, &identity.service_dir) {
@@ -445,7 +471,14 @@ fn scan_loop(
         }
     };
 
+    // The BASELINE enumeration. Unconditional and immediate: an event only ever
+    // reports a CHANGE, so nothing that was already live when the watch was
+    // armed would otherwise be seen. (The arm-time inline scan in
+    // `Recorder::setup` covers the tap set; this covers the worker's own view.)
+    publish(&ch, &mgr, &origin);
+
     let mut confirm_due: Option<Instant> = None;
+    let mut confirms_left: u32 = 0;
     let mut last_walk_started = Instant::now();
     while !ch.stop.load(Ordering::Relaxed) {
         let Some(w) = watch.as_mut() else {
@@ -464,14 +497,27 @@ fn scan_loop(
             return;
         }
         let step = next_step(&wake, confirm_due, Instant::now());
+        let mut broke_while_coalescing = None;
         if step == ScanStep::WalkAndConfirm {
             ch.wakes.fetch_add(1, Ordering::Relaxed);
             // Absorb the rest of the burst. Seventy routes opening back to back
             // are one logical change and deserve one walk.
-            coalesce(w, &ch.stop, &ch.heartbeat_ms, &origin);
+            broke_while_coalescing = coalesce(w, &ch.stop, &ch.heartbeat_ms, &origin);
             if ch.stop.load(Ordering::Relaxed) {
                 return;
             }
+        }
+        // A watch that broke DURING the absorption degrades HERE, not after one
+        // more walk. The re-target failure arm cannot reproduce itself on the
+        // next wait - it leaves the watch bound to a directory it has already
+        // decided is wrong - so a dropped break there is permanent blindness
+        // rather than a report one pass late.
+        if let Some(reason) = broke_while_coalescing {
+            degrade_to_poll(&ch, &reason, "stopped working mid-recording", interval);
+            watch = None;
+            confirm_due = None;
+            confirms_left = 0;
+            continue;
         }
 
         // Everything below is done with the watch borrow, which is what lets
@@ -495,12 +541,16 @@ fn scan_loop(
                 }
                 last_walk_started = Instant::now();
                 publish(&ch, &mgr, &origin);
+                // A burst arriving while a confirmation is pending supersedes
+                // it, and re-arms the full tail behind the fresher walk.
+                confirms_left = CONFIRM_WALKS;
                 confirm_due = Some(Instant::now() + EVENT_CONFIRM_DELAY);
             }
             ScanStep::WalkConfirming => {
-                confirm_due = None;
                 last_walk_started = Instant::now();
                 publish(&ch, &mgr, &origin);
+                confirms_left = confirms_left.saturating_sub(1);
+                confirm_due = (confirms_left > 0).then(|| Instant::now() + EVENT_CONFIRM_DELAY);
             }
         }
     }
@@ -520,7 +570,13 @@ fn broken_reason(wake: &WatchWake) -> String {
 /// take the scan that moved it.
 fn publish(ch: &WorkerChannels, mgr: &TransportManager, origin: &Instant) {
     let result = mgr.list_topics().map_err(|e| e.to_string());
-    if let Ok(mut slot) = ch.latest.lock() {
+    {
+        // Recovered on poison for the reason `take` recovers: a scan discarded
+        // here is invisible, because the counter below moves either way.
+        let mut slot = ch
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(TopicScan { result });
     }
     ch.scans_run.fetch_add(1, Ordering::Relaxed);
@@ -547,25 +603,28 @@ fn degrade_to_poll(ch: &WorkerChannels, reason: &str, what_happened: &str, inter
 }
 
 /// Keep absorbing events for [`EVENT_COALESCE_WINDOW`] so one burst is one walk.
+///
+/// Returns the reason the watch broke, if it broke. A break swallowed here
+/// would leave the caller walking with a watch that has already stopped
+/// working, and on the re-target-failure path it would never be reported at
+/// all.
 fn coalesce(
     w: &mut ServiceDirWatch,
     stop: &AtomicBool,
     heartbeat_ms: &AtomicU64,
     origin: &Instant,
-) {
+) -> Option<String> {
     let deadline = Instant::now() + EVENT_COALESCE_WINDOW;
     loop {
         if stop.load(Ordering::Relaxed) {
-            return;
+            return None;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return;
+            return None;
         }
-        // A Broken watch during coalescing is handled on the next loop pass,
-        // which is where the degrade lives; here it just ends the absorption.
-        if matches!(w.wait(remaining), WatchWake::Broken { .. }) {
-            return;
+        if let WatchWake::Broken { reason } = w.wait(remaining) {
+            return Some(reason);
         }
         stamp_heartbeat(heartbeat_ms, origin);
     }
