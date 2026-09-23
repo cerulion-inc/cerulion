@@ -41,11 +41,23 @@
 //! 5. **THE CO-TENANT** and the D4 run-half (`a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts`,
 //!    `a_run_writes_its_window_recorder_decision_into_run_json`); see their docs.
 //! 6. **THE ONE-RANK FREE-RUN LOOP** (`a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant`):
-//!    the same run under `CERULION_EXECUTION_MODE=free_run` (the free-run
-//!    default is not on `main` yet, so the opt-in is set explicitly), a capture taken
-//!    MID-RUN, `bag play --resim all --verify` exit 0 twice with one report, and the
-//!    perturbed ticker caught at exit 1 naming its topic. The negative control is
-//!    the base tree: without the admission the same arm exits 2 by name at the resim.
+//!    the same run under the explicit `CERULION_EXECUTION_MODE=free_run`
+//!    spelling, a capture taken MID-RUN, `bag play --resim all --verify` exit 0
+//!    twice with one report, and the perturbed ticker caught at exit 1 naming
+//!    its topic. The negative control is the base tree: without the admission
+//!    the same arm exits 2 by name at the resim.
+//! 7. **THE DEFAULT TWIN** (`a_default_one_rank_capture_free_runs_and_resims_and_verifies_byte_exact`):
+//!    arm 6 with the variable REMOVED from the run's environment. Free-run is
+//!    the default for a multi-process run, so the capture must stamp
+//!    `coordination: free_run`, the run must read `gating: recorded_wall`, and
+//!    the whole loop must hold with nothing exported. A default that fell back
+//!    to lockstep fails it at the stamp.
+//! 8. **THE OPT-OUT TWIN** (`a_lockstep_opt_out_one_rank_capture_stamps_lockstep_and_resims_and_verifies_byte_exact`):
+//!    the same loop under `CERULION_EXECUTION_MODE=lockstep`: the capture
+//!    stamps `coordination: lockstep`, the run reads `gating: quantum`, and the
+//!    mid-run resume is the ordinary lockstep one. Arms 7 and 8 are each
+//!    other's positive control: both read the stamp and the label, and the two
+//!    answers differ.
 //!
 //! # What each arm alone catches
 //!
@@ -425,6 +437,12 @@ fn spawn_run(
     let mut args = vec!["graph", "run", "plainrun", "--no-validate"];
     args.extend_from_slice(extra);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    // HERMETIC on the execution mode: the supervisor reads
+    // `CERULION_EXECUTION_MODE` from ITS environment, which this spawn
+    // forwards, so a value exported by the developer's shell would otherwise
+    // decide every arm. Removed first; an arm that names a mode passes it in
+    // `env`, which is applied after this line.
+    cmd.env_remove("CERULION_EXECUTION_MODE");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -3051,30 +3069,32 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
     Some(reported)
 }
 
-/// **ARM 6: THE ONE-RANK FREE-RUN LOOP (the mid-run resume).**
+/// **ARMS 6 to 8: THE ONE-RANK LOOP (the mid-run resume), under each execution mode.**
 ///
-/// The SAME plain 1-group run as arm 1, executed under
-/// `CERULION_EXECUTION_MODE=free_run`, set EXPLICITLY here because the
-/// free-run DEFAULT is not on `main` yet (that flip rebases onto this change);
-/// on `main` the env opt-in is what selects the free-run supervisor path for a
-/// `process_groups` graph. What the capture then is: `coordination: free_run`,
-/// ONE worker rank, a recording that begins MID-RUN (the capture is taken after
-/// the worker has stepped, and the window trims the head), and a complete
-/// anchor at `S`: exactly the one-worker-rank bag `resolve_resume` admits by rank count
+/// The SAME plain 1-group run as arm 1, executed under `env` (arm 6: the
+/// explicit `CERULION_EXECUTION_MODE=free_run` spelling; arm 7: the variable
+/// REMOVED, the default; arm 8: the `lockstep` opt-out). What a free-run
+/// capture then is: `coordination: free_run`, ONE worker rank, a recording
+/// that begins MID-RUN (the capture is taken after the worker has stepped, and
+/// the window trims the head), and a complete anchor at `S`: exactly the
+/// one-worker-rank bag `resolve_resume` admits by rank count
 /// (`FreeRunResumeUnsupported`) while the capture's own manifest claimed
 /// `resimmable: true`. For one worker rank the three assumptions that refusal
-/// named hold trivially, so the bag now takes the ordinary resume.
+/// named hold trivially, so the bag takes the ordinary resume, the same one a
+/// lockstep capture (arm 8) takes.
 ///
-/// The claims, in the order the sibling arms settled on: the recorded frames
-/// match the fixture HAND ORACLE; the capture is genuinely free-run AND
-/// genuinely mid-run (a lockstep or from-start capture would pass the rest of
-/// this arm without exercising the admission) AND claims `resimmable: true`;
-/// then `bag play --resim all --verify` exits 0 TWICE with byte-identical
-/// `--report` JSON whose `resume` block names the anchor step the capture's own
-/// first boundary implies (the restore, the seed, the clock placement and the
-/// prefix skip are functions of the recording); and (the anti-tautology) the
-/// SAME capture re-executed against the PERTURBED ticker exits 1 with a
-/// `FRAME-CONTENT DIVERGENCE` naming the ticker's topic.
+/// The claims, in the order the sibling arms settled on: the run's `run.json`
+/// reads the `gating` label the mode implies (`want_gating`); the recorded
+/// frames match the fixture HAND ORACLE; the capture stamps the coordination
+/// the mode implies (`want_coordination`) AND is genuinely mid-run (a
+/// from-start capture would pass the rest of this arm without exercising the
+/// resume) AND claims `resimmable: true`; then `bag play --resim all --verify`
+/// exits 0 TWICE with byte-identical `--report` JSON whose `resume` block names
+/// the anchor step the capture's own first boundary implies (the restore, the
+/// seed, the clock placement and the prefix skip are functions of the
+/// recording); and (the anti-tautology) the SAME capture re-executed against
+/// the PERTURBED ticker exits 1 with a `FRAME-CONTENT DIVERGENCE` naming the
+/// ticker's topic.
 ///
 /// `--verify` IS driven here, unlike arm 1, and arm 1's reason for not driving
 /// it does not apply: that arm's capture may begin at step 0 with a lossy head,
@@ -3095,14 +3115,17 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
 /// BOTH halves of the change: the engine's admission and the worker's clock.
 ///
 /// Prerequisite beyond the file's: `cargo build -p test_node_macro_period_perturbed_cdylib`.
-#[test]
-#[serial]
-fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant() {
+fn one_rank_capture_resims_and_verifies_under(
+    stem: &str,
+    env: &[(&str, &str)],
+    want_coordination: &str,
+    want_gating: &str,
+) {
     let mut last_retry = String::new();
     for attempt in 1..=CLEAN_CAPTURE_ATTEMPTS {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
-        let prefix = unique_prefix("plainfr");
+        let prefix = unique_prefix(stem);
         build_workspace(root, &prefix);
         let home = root.join("home");
         let flashbacks = root.join("flashbacks");
@@ -3110,14 +3133,8 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         std::fs::create_dir_all(&flashbacks).unwrap();
 
         // ------------------------------------------------------------ leg 1
-        // The run, opted into free-run EXPLICITLY (the flip is not on main).
-        let (mut run, stderr_path) = spawn_run(
-            root,
-            &home,
-            &flashbacks,
-            &[],
-            &[("CERULION_EXECUTION_MODE", "free_run")],
-        );
+        // The run, under this arm's execution-mode environment.
+        let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], env);
         wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
         // THE MID-RUN RENDEZVOUS (arm 3's, deepened): a capture whose trace
         // begins at step 0 needs no anchor and would not exercise the
@@ -3128,16 +3145,18 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         // run.json's `gating` label follows the SAME predicate the
         // worker keys its clock discipline on ("this run mints trace rings"),
         // so a plain free-run run reads `recorded_wall` -- never `wall`, the
-        // read-only RealClock arm that is now `--no-rings` only. Read while the
-        // run is LIVE (`live_run_manifest`: the directory goes on exit). This
-        // is the one place the supervisor's call site is observable, so it is
-        // what kills a call site that hands the classifier `--record`.
+        // read-only RealClock arm that is now `--no-rings` only -- and a
+        // lockstep run reads `quantum`. Read while the run is LIVE
+        // (`live_run_manifest`: the directory goes on exit). This is the one
+        // place the supervisor's call site is observable, so it is what kills
+        // a call site that hands the classifier `--record`, and what kills a
+        // default that resolved the wrong mode.
         let run_json = live_run_manifest(&home);
         assert_eq!(
             run_json["gating"],
-            serde_json::json!("recorded_wall"),
-            "a plain free-run run mints its trace rings, so every rank runs the controlled \
-             wall-following clock and run.json must say so: {run_json}"
+            serde_json::json!(want_gating),
+            "run.json must name the gating clock the execution mode implies (env={env:?}): \
+             {run_json}"
         );
 
         // ------------------------------------------------------------ leg 2
@@ -3164,8 +3183,8 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
             .unwrap_or_else(|| panic!("`cerulion flashback` never returned"));
         assert!(
             flash_status.success(),
-            "a free-run `graph run` holds a rolling window too, so `cerulion flashback` must \
-             capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}\nrun log:\n{}",
+            "a `graph run` holds a rolling window under either execution mode, so `cerulion \
+             flashback` must capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}\nrun log:\n{}",
             read_file(&root.join("flash.stdout")),
             read_file(&root.join("flash.stderr")),
             read_file(&stderr_path)
@@ -3216,9 +3235,9 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         .expect("the recorder identity is valid JSON");
         assert_eq!(
             recorder["coordination"],
-            serde_json::json!("free_run"),
-            "this arm is about the FREE-RUN capture; a lockstep stamp here means the env \
-             opt-in did not reach the supervisor: {recorder}"
+            serde_json::json!(want_coordination),
+            "the capture must stamp the coordination the execution mode implies (env={env:?}); \
+             a wrong stamp means the resolver chose the other mode: {recorder}"
         );
         let first = first_rank0_boundary_step(&capture)
             .expect("a capture with a trace carries a rank-0 STEP_BOUNDARY");
@@ -3263,11 +3282,11 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         assert_eq!(
             code,
             Some(0),
-            "THE ADMISSION: a one-rank free-run capture beginning mid-run (first rank-0 \
-             boundary {first}) must resume and verify byte-exact. Exit 2 naming \
-             `coordination: free_run` is the refusal of every free-run mid-run bag itself; exit 1 is a \
-             frame the re-execution produced that the capture does not hold (foreign \
-             topics: {foreign:?}).\nstderr:\n{resim_err}"
+            "THE RESUME: a one-rank capture beginning mid-run (first rank-0 boundary \
+             {first}, coordination {want_coordination}) must resume and verify byte-exact. \
+             Exit 2 naming `coordination: free_run` is the refusal of every free-run mid-run \
+             bag itself; exit 1 is a frame the re-execution produced that the capture does \
+             not hold (foreign topics: {foreign:?}).\nstderr:\n{resim_err}"
         );
         assert!(
             executed_steps(&resim_err) > 0,
@@ -3310,7 +3329,7 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         );
         assert_eq!(
             report["coordination"]["mode"],
-            serde_json::json!("free_run"),
+            serde_json::json!(want_coordination),
             "the contract applied is the one the capture stamped: {report}"
         );
         assert_eq!(
@@ -3350,5 +3369,41 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
     panic!(
         "could not obtain a LOSS-FREE, MID-RUN capture in {CLEAN_CAPTURE_ATTEMPTS} attempts; \
          REFUSING to weaken the `--verify` exit-0 oracle. Last: {last_retry}"
+    );
+}
+
+/// Arm 6: the explicit `free_run` spelling.
+#[test]
+#[serial]
+fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant() {
+    one_rank_capture_resims_and_verifies_under(
+        "plainfr",
+        &[("CERULION_EXECUTION_MODE", "free_run")],
+        "free_run",
+        "recorded_wall",
+    );
+}
+
+/// Arm 7: the DEFAULT. Nothing exported, and the loop must read exactly as
+/// arm 6 does: free-run is the default for a multi-process run, so the stamp
+/// is `free_run` and the label `recorded_wall`. A default that resolved
+/// lockstep fails at the label, before any capture is taken.
+#[test]
+#[serial]
+fn a_default_one_rank_capture_free_runs_and_resims_and_verifies_byte_exact() {
+    one_rank_capture_resims_and_verifies_under("plaindef", &[], "free_run", "recorded_wall");
+}
+
+/// Arm 8: the `lockstep` OPT-OUT, arm 7's positive control. The same loop
+/// reads the other answer at both witnesses (`lockstep`, `quantum`), and the
+/// mid-run resume is the ordinary lockstep one.
+#[test]
+#[serial]
+fn a_lockstep_opt_out_one_rank_capture_stamps_lockstep_and_resims_and_verifies_byte_exact() {
+    one_rank_capture_resims_and_verifies_under(
+        "plainls",
+        &[("CERULION_EXECUTION_MODE", "lockstep")],
+        "lockstep",
+        "quantum",
     );
 }
