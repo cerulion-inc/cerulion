@@ -1,0 +1,102 @@
+# Keeps review-bot badge markup out of the squash-merge commit message.
+#
+# This repository squash-merges and takes the squash commit message from the
+# pull request BODY. Two review apps edit that body after the pull request
+# opens, each appending a badge block wrapped in HTML comment markers. Left
+# alone, that markup lands verbatim in the history of `main` and is the first
+# thing anyone sees in `git log`. Nobody should have to remember to delete it
+# by hand, so this removes it for them.
+#
+# The `edited` trigger is the one that matters: the bots insert their blocks
+# AFTER the pull request opens, so `opened` alone would run before there is
+# anything to remove. The other three are there so a body that arrives dirty,
+# or a pull request reopened later, is still covered.
+#
+# STEADY STATE, not a loop. The edit this workflow makes uses GITHUB_TOKEN,
+# and an event raised by GITHUB_TOKEN starts no further workflow run, so the
+# workflow cannot retrigger itself. Even if it could, the stripper is
+# idempotent: running it again over an already-clean body finds no markers
+# and changes nothing. The bots re-insert their blocks on their next review and
+# this removes them again; removal, re-insertion, removal is the expected
+# shape, and what matters is only that the body is clean at merge time.
+#
+# Security posture (per the launch CI-hardening rules):
+# - every action pinned by commit SHA
+# - no permission beyond writing a pull request body
+# - pull_request_target is what lets this run on a fork's pull request at all,
+#   because the token on a `pull_request` run from a fork is read-only. It is
+#   safe here ONLY because nothing from the head is checked out or executed:
+#   the checkout below pins the BASE commit, which is code that already passed
+#   review. A pull request that edits the stripper is therefore checked by the
+#   version already on the base branch, which is the point.
+# - the body is never interpolated into a shell command. It is fetched over
+#   the API into a file and read from there, so no `${{ }}` ever carries
+#   attacker-controlled text into a `run:` block.
+name: Pull request body hygiene
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+# One run per pull request. A superseded run is cancelled: the next event's
+# run reads the body fresh and reaches the same place.
+concurrency:
+  group: pr-body-hygiene-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  strip-bot-markup:
+    # The public repository is the only place these review apps run.
+    if: github.repository == 'cerulion-inc/cerulion'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # `contents: read` is what lets the checkout below read the base tree;
+      # naming any permission sets every unnamed one to none, so this pair is
+      # the whole grant: read this repository, write a pull request body.
+      contents: read
+      pull-requests: write
+    steps:
+      # The BASE commit, explicitly. Under pull_request_target the default ref
+      # is already the base, but naming it is what makes the security posture
+      # above readable rather than inherited. Credentials are not persisted
+      # because nothing here uses git to talk to the remote.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Remove review-bot markup from the pull request body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Read the body out of the API response rather than out of the
+          # event payload or a shell redirect: every other route either
+          # interpolates attacker-controlled text into this script or appends
+          # a newline the body never carried, and that newline would come
+          # back as a spurious edit on every run.
+          gh api "repos/${REPO}/pulls/${NUMBER}" > pr.json
+
+          # Exit 2 is the stripper refusing a body it cannot model (a marker
+          # with no pair). It changes nothing in that case, and `set -e` turns
+          # the refusal into a red check with the reason on stderr, which is
+          # the right outcome: a body nobody can safely edit is a body a
+          # person should look at.
+          verdict="$(python3 -B tools/scripts/pr_body_hygiene.py \
+            --from-json pr.json --out cleaned.md)"
+
+          if [ "${verdict}" != "changed" ]; then
+            echo "body carries no review-bot markup; leaving it alone"
+            exit 0
+          fi
+
+          # jq builds the request so the body is never quoted by hand.
+          jq -Rs '{body: .}' < cleaned.md > patch.json
+          gh api -X PATCH "repos/${REPO}/pulls/${NUMBER}" --input patch.json --silent
+          echo "removed review-bot markup from the body of pull request ${NUMBER}"

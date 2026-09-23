@@ -127,3 +127,5 @@
 2 plan-step tools/ros2_migrate/fixtures/src/migrate_fixture_pkg/src/unsafe_shadowed_publisher.cpp
 23 plan-step tools/ros2_migrate/run_matrix.sh
 5 plan-step tools/ros2_migrate/run_matrix_selftest.sh
+8 review-round tools/scripts/pr_body_hygiene.py
+16 review-actor tools/scripts/pr_body_hygiene.py
