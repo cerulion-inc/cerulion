@@ -66,8 +66,8 @@ upstream `mcap` crate, never only our own reader; the format claim is
 - Taps are **listener-less `DataOnlySubscriber`s**; they add no event-service
   load to the producer and are structurally un-attachable to a wait set.
   A data-only tap has **no back-fill**: frames published before the tap
-  attached are gone, which is why tests rendezvous with `await_rescan_tap`
-  (a condition poll on `topic_subscriber_count`) rather than a sleep.
+  attached are gone, which is why tests rendezvous on `topic_subscriber_count`
+  (a condition poll) rather than a sleep.
 - **bagd never evicts.** Both `room == 0` arms of the tap drain WAIT. The
   recording loss boundary is the topic's own provisioned SHM queue depth; no
   recorder-side policy discards a frame it has seen.
@@ -100,17 +100,36 @@ upstream `mcap` crate, never only our own reader; the format claim is
   own thread and publishes an immutable snapshot the drive loop takes in O(1)
   (`next_scan`). What the recorder DECIDES from that snapshot lives in
   `apply_discovery` → `plan_discovery`; `next_scan` TAKES the snapshot, so one
-  enumeration yields exactly one applied scan and the settle counters count what
-  they say they count. Never put a directory walk back on that loop.
-- **A background scanner can fail where an inline call could not, so both
-  failures are loud.** If the thread cannot be SPAWNED, the scanner degrades to
-  the inline path (correct, just slow) with one `warn!` naming the
-  degradation. If it spawns and then stops producing, the silence is classified
-  by `classify_scanner_silence` and reported once per regime through
-  `ScanSilenceLatch`. Neither failure may be silent: a scanner that has stopped
-  producing lets the recorder settle on a tap set that is already stale and
-  report it as complete, which is the outcome the settle contract exists to
-  prevent.
+  enumeration yields exactly one applied scan. Never put a directory walk back
+  on that loop.
+- **Enumeration is driven by EVENTS, not a cadence.** iceoryx2 0.9.1 exposes no
+  discovery event, but a service's static config is a FILE under
+  `global.root_path` + `global.service.directory`, and `Service::list` is a walk
+  of exactly that directory - so a producer registering is a file appearing, and
+  the kernel reports it. `service_dir_watch` is that watch (`inotify` on Linux,
+  `kqueue` on macOS, hand-written over `libc` because one flag from one
+  directory does not justify a watcher engine). The worker blocks on it and
+  walks only when something changed, so a settled machine runs **zero**
+  enumerations rather than four a second forever. A burst is coalesced
+  (`EVENT_COALESCE_WINDOW`), `SCAN_RATE_FLOOR` bounds a chatty directory, and one
+  bounded confirmation walk (`EVENT_CONFIRM_DELAY`) closes the gap between a
+  static-config file appearing and its permissions being finalized, which is when
+  `Service::list` starts reporting it. The worker still wakes ten times a second
+  to check its stop flag and stamp a heartbeat; those wakes do no work.
+- **A background scanner can fail where an inline call could not, so every
+  degradation is loud and observable.** Three tiers, each with its own report:
+  the watch cannot be ARMED, or BREAKS mid-run, and the worker falls back to
+  walking on `DISCOVERY_RESCAN_INTERVAL` with one `warn!` and
+  `DiscoveryScanner::wake_source` flipping to `Poll`; or the thread cannot be
+  SPAWNED and the scanner degrades to the inline walk on the drive loop
+  (correct, just costly) with one `warn!`. A worker that spawned and then
+  stopped is caught by the HEARTBEAT, never by scan silence - an event-driven
+  worker is legitimately silent on a settled machine, so classifying that as a
+  stall would warn on every healthy recording. The heartbeat verdict is
+  classified by `classify_scanner_silence` and reported once per regime through
+  `ScanSilenceLatch`. Nothing here may be silent: a scanner that has stopped
+  working lets the recorder settle on a tap set that is already stale and report
+  it as complete, which is the outcome the settle contract exists to prevent.
 - **Defaults.** Live topic discovery is ON for `--topics-json` (the argv shape
   `graph run --record` generates) and for `--run`; OFF for `--topic`, `--all`,
   `--regex`, and `BagdConfig::new`. Rationale: a derived tap set (inferred from
@@ -121,11 +140,17 @@ upstream `mcap` crate, never only our own reader; the format claim is
   flags (`--no-live-discovery`, `--discovery-settle-ms`) are unreachable from
   that path; the env switches `CERULION_RECORD_DISCOVERY=off` and
   `CERULION_RECORD_DISCOVERY_SETTLE_MS` reach every path.
-- **Settle window.** Bag creation is held until discovery settles: cap
-  `DEFAULT_DISCOVERY_SETTLE_MS`, absolute floor `DISCOVERY_SETTLE_MIN`
-  (derived as `DISCOVERY_RESCAN_INTERVAL × DISCOVERY_SETTLE_QUIET_SCANS`).
-  Even a quiet graph pays the floor, and the arm-time scan does NOT count as a
-  quiet scan. `--discovery-settle-ms 0` disables the hold entirely.
+- **Settle window.** Bag creation is held until `DISCOVERY_SETTLE_MIN` has
+  passed with NOTHING NEW DISCOVERED, measured from the later of the drive
+  loop's start and the last discovered tap, capped at
+  `DEFAULT_DISCOVERY_SETTLE_MS`. It is a WALL, not a count of quiet
+  enumerations: an event-driven enumeration produces no scans on a settled
+  machine, so a counting rule could never be satisfied there and every plain
+  recording would pay the whole cap - and the wall is the unit the guarantee was
+  always about. Even a quiet graph pays the window, and an arm-time find does
+  NOT start it (the recorder arms before the graph is released to step 0, so
+  what it saw then says nothing about the run's producers).
+  `--discovery-settle-ms 0` disables the hold entirely.
 - **Schema wait.** Schema learning can hold creation past the settle cap; the
   two holds **max together, they do not add**. The realized hold is reported
   as `BagdSummary::channel_set_closed_after`; measure it from the recorder's
@@ -431,7 +456,8 @@ per-instance transport):
 |---|---|---|---|
 | `e2e_test.rs` | In-process `run_bagd` end-to-end: hand-built frames/trace records, independent `mcap` re-read, backlog-aware drain no-loss, signal-path finalize | yes | none |
 | `wire_gap_frame_e2e_test.rs` | rmw borrow-window gap-frame byte-fidelity: a page-aligned, gap-carrying frame records + reads back byte-identical (both readers), wire stamps verbatim | yes | none |
-| `discovery_e2e_test.rs` | Coverage (an undeclared live producer is recorded) + disclosure (an unrecorded one is named with its reason); `await_rescan_tap` rendezvous | yes | none |
+| `discovery_e2e_test.rs` | Coverage (an undeclared live producer is recorded) + disclosure (an unrecorded one is named with its reason); tap-attach rendezvous | yes | none |
+| `discovery_event_e2e_test.rs` | Enumeration is event-driven: every walk has a directory change behind it while the timed engine's are uncaused, a real topic still wakes the worker, a burst is coalesced, and an unarmable watch degrades loudly to the timed walk | no | none |
 | `prefix_loss_e2e_test.rs` | The head-loss marker: `prove_prefix_loss` + `armed_before_producers` gating, `is_incomplete()` escalation | yes | none |
 | `run_lifetime_e2e_test.rs` | A bound recorder finalizes when its run ends without ever being signalled; the unbound control keeps that meaningful | yes | none |
 | `schema_resolve_e2e_test.rs` | Channels named from the wire hash via the local corpus; wire-size derivation; explicit `Unresolved`; the non-waiting-verb source walk | yes | none |
