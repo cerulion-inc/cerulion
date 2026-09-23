@@ -485,6 +485,59 @@ fn a_disabled_scanner_arms_no_watch_and_serves_no_scans() {
 // The ordering the worker cannot be tested into behaviourally.
 // ===========================================================================
 
+/// `wakes` can only be bumped by a real directory CHANGE.
+///
+/// The behavioural arms correlate walks with this counter, so a scanner that
+/// incremented it on a timer would satisfy every one of them while polling. What
+/// the counter actually counts is not something those arms can see, because they
+/// read it through the same object they are testing - so it is stated at source:
+/// the increment sits in the `WalkAndConfirm` branch, which `next_step` answers
+/// for `WatchWake::Changed` and for nothing else.
+#[test]
+fn the_wake_counter_is_bumped_only_on_a_directory_change() {
+    let src = code_only(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/discovery_scan.rs"
+        ))
+        .expect("read cerulion_bagd/src/discovery_scan.rs"),
+    );
+
+    // Exactly one increment in the whole module, and it is guarded by the step
+    // that only a change produces.
+    let bumps = src.matches("wakes.fetch_add").count();
+    assert_eq!(
+        bumps, 1,
+        "`wakes` must have exactly ONE increment, or the arms that read it cannot say what it \
+         counts; found {bumps}"
+    );
+    let at = src
+        .find("wakes.fetch_add")
+        .expect("the increment was just counted");
+    let guard = &src[..at];
+    let step_at = guard
+        .rfind("if step == ScanStep::WalkAndConfirm")
+        .expect("the increment must sit inside the WalkAndConfirm branch");
+    assert!(
+        !guard[step_at..].contains('}'),
+        "the increment must still be INSIDE the `WalkAndConfirm` branch - a timer tick reaching \
+         it would make every behavioural arm in this file vacuous"
+    );
+
+    // And that step is answered for a change alone.
+    let decide = fn_body(&src, "next_step");
+    assert!(
+        decide.contains("WatchWake::Changed => ScanStep::WalkAndConfirm"),
+        "`next_step` must answer `WalkAndConfirm` for `Changed`. Body:\n{decide}"
+    );
+    for uncaused in ["WatchWake::Idle => ScanStep::WalkAndConfirm"] {
+        assert!(
+            !decide.contains(uncaused),
+            "`next_step` must never answer `WalkAndConfirm` for `{uncaused}`. Body:\n{decide}"
+        );
+    }
+}
+
 /// The watch is ARMED before the baseline walk, never after it.
 ///
 /// # Why this is a source walk and not a behavioural arm
@@ -538,6 +591,13 @@ fn the_watch_is_armed_before_the_workers_baseline_walk() {
 /// step 0, so the producers it exists to capture do not exist when it looks.
 /// Nothing on the drive loop enumerates - the walk that found this topic
 /// happened on the worker, woken by the topic's own service file appearing.
+///
+/// The ready file proves `Recorder::setup` finished, not that the worker's
+/// watch is armed - the scanner is built later, in the drive loop. That is not
+/// a race this arm has to close, and the reason is the ordering the sibling
+/// source walk pins: the watch is armed BEFORE the baseline walk, so a producer
+/// created before arming is found by that walk and one created after it is
+/// found by its own event. There is no third case for the stimulus to land in.
 ///
 /// The frame oracle is EXACT (`== FRAMES`), which is only meaningful because
 /// the publishing starts after a rendezvous on the tap actually being attached:

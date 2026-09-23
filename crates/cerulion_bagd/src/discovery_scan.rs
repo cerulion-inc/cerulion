@@ -350,6 +350,13 @@ struct ThreadedScanner {
     /// Milliseconds since the worker started, stamped on every wait return. The
     /// liveness signal a silent-but-healthy event-driven worker still produces.
     heartbeat_ms: Arc<AtomicU64>,
+    /// Whether the worker has been WOKEN and has not yet finished answering.
+    ///
+    /// True from the moment a directory change is seen until the walk it caused
+    /// and its confirmation tail have all published. The settle hold reads it,
+    /// because "something changed and we have not looked yet" is the one state
+    /// in which freezing the channel set is knowably premature.
+    walk_pending: Arc<AtomicBool>,
     /// The LIVE wake source, so a mid-run degrade is observable and not merely
     /// logged.
     source: Arc<AtomicU8>,
@@ -362,6 +369,7 @@ struct WorkerChannels {
     scans_run: Arc<AtomicU64>,
     wakes: Arc<AtomicU64>,
     heartbeat_ms: Arc<AtomicU64>,
+    walk_pending: Arc<AtomicBool>,
     source: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
 }
@@ -376,6 +384,7 @@ impl ThreadedScanner {
         let scans_run = Arc::new(AtomicU64::new(0));
         let wakes = Arc::new(AtomicU64::new(0));
         let heartbeat_ms = Arc::new(AtomicU64::new(0));
+        let walk_pending = Arc::new(AtomicBool::new(false));
         let source = Arc::new(AtomicU8::new(WakeSource::Events as u8));
         let stop = Arc::new(AtomicBool::new(false));
         let channels = WorkerChannels {
@@ -383,6 +392,7 @@ impl ThreadedScanner {
             scans_run: Arc::clone(&scans_run),
             wakes: Arc::clone(&wakes),
             heartbeat_ms: Arc::clone(&heartbeat_ms),
+            walk_pending: Arc::clone(&walk_pending),
             source: Arc::clone(&source),
             stop: Arc::clone(&stop),
         };
@@ -396,6 +406,7 @@ impl ThreadedScanner {
                 scans_run,
                 wakes,
                 heartbeat_ms,
+                walk_pending,
                 source,
                 stop,
             }),
@@ -459,9 +470,15 @@ fn scan_loop(
     let mut watch = match ServiceDirWatch::arm(&root, &identity.service_dir) {
         Ok(w) => {
             let watching = w.watched_path();
-            tracing::debug!(
+            // At `info!`, and once per recording: the DEGRADED engines announce
+            // themselves loudly, so without this the healthy case is the only
+            // one an operator cannot confirm from the log. Which engine ran
+            // decides whether a settled machine cost nothing or a directory
+            // walk on every cadence, which is the whole point of the change.
+            tracing::info!(
                 watching = %watching.display(),
-                "bagd live-topic discovery is watching the iceoryx2 service directory for changes"
+                "bagd live-topic discovery is EVENT-driven: it watches the iceoryx2 service \
+                 directory and enumerates only when that directory changes"
             );
             Some(w)
         }
@@ -482,7 +499,9 @@ fn scan_loop(
     let mut last_walk_started = Instant::now();
     while !ch.stop.load(Ordering::Relaxed) {
         let Some(w) = watch.as_mut() else {
-            // The degraded engine: the earlier timed walk, unchanged.
+            // The degraded engine: the earlier timed walk, unchanged. It owes no
+            // pending answer, because it answers on every cadence regardless.
+            ch.walk_pending.store(false, Ordering::Relaxed);
             sleep_unless_stopped(interval, &ch.stop, &ch.heartbeat_ms, &origin);
             if ch.stop.load(Ordering::Relaxed) {
                 return;
@@ -500,6 +519,10 @@ fn scan_loop(
         let mut broke_while_coalescing = None;
         if step == ScanStep::WalkAndConfirm {
             ch.wakes.fetch_add(1, Ordering::Relaxed);
+            // Something changed and we have not looked yet. Said BEFORE the
+            // absorption and the rate floor, because that delay is exactly the
+            // window in which the settle hold must not freeze the channel set.
+            ch.walk_pending.store(true, Ordering::Relaxed);
             // Absorb the rest of the burst. Seventy routes opening back to back
             // are one logical change and deserve one walk.
             broke_while_coalescing = coalesce(w, &ch.stop, &ch.heartbeat_ms, &origin);
@@ -517,6 +540,8 @@ fn scan_loop(
             watch = None;
             confirm_due = None;
             confirms_left = 0;
+            // The timed engine answers every cadence, so nothing is owed.
+            ch.walk_pending.store(false, Ordering::Relaxed);
             continue;
         }
 
@@ -551,6 +576,11 @@ fn scan_loop(
                 publish(&ch, &mgr, &origin);
                 confirms_left = confirms_left.saturating_sub(1);
                 confirm_due = (confirms_left > 0).then(|| Instant::now() + EVENT_CONFIRM_DELAY);
+                // The tail is what covers a service that was not listable yet,
+                // so the answer is not complete until the tail is spent.
+                if confirm_due.is_none() {
+                    ch.walk_pending.store(false, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -819,6 +849,24 @@ impl DiscoveryScanner {
         match &self.engine {
             ScanEngine::Threaded(t) => t.wakes.load(Ordering::Relaxed),
             _ => 0,
+        }
+    }
+
+    /// Whether the worker has SEEN a change it has not finished answering.
+    ///
+    /// True from a directory event until the walk it caused and its confirmation
+    /// tail have published. The settle hold reads it, because an event inside
+    /// the window is positive evidence that the live topic set is still moving,
+    /// and freezing the channel set on the quiet boundary while that answer is
+    /// in flight omits exactly the producer the event was about - which is the
+    /// defect live discovery exists to prevent, arriving by a new route.
+    ///
+    /// `false` on the timed and inline engines, which owe no pending answer:
+    /// they walk on every cadence whether or not anything happened.
+    pub fn walk_pending(&self) -> bool {
+        match &self.engine {
+            ScanEngine::Threaded(t) => t.walk_pending.load(Ordering::Relaxed),
+            _ => false,
         }
     }
 

@@ -216,8 +216,12 @@ impl ServiceDirWatch {
     /// enumerate.
     ///
     /// The re-check runs on a CHANGE and while standing in, never on an idle
-    /// tick: an idle tick is the answer on a settled machine and must cost
-    /// nothing. Residual, stated plainly: on Linux, deleting the WATCHED service
+    /// tick once the real directory is watched: an idle tick is the answer on a
+    /// settled machine and must cost nothing. Running it on every tick WHILE
+    /// STANDING IN is what covers a NESTED `service_dir` (`a/b/services`): the
+    /// root watch sees `a` appear but not `a/b/services`, so the promotion
+    /// comes from the stat rather than from an event. That state is transient
+    /// and its stat is bounded, where an idle tick's would be forever. Residual, stated plainly: on Linux, deleting the WATCHED service
     /// directory invalidates the inotify watch, so no further event arrives and
     /// nothing prompts the re-check. iceoryx2 removes service FILES and never
     /// the directory that holds them, so this is unreachable through the

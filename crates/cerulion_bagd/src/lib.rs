@@ -13212,8 +13212,14 @@ impl Recorder {
     /// pays exactly the floor; a robot whose bridge is still opening routes
     /// keeps the window open until it stops finding them or the cap expires.
     ///
+    /// `walk_pending` says the enumerator has SEEN a change it has not finished
+    /// answering, which also holds: quiet time is the ABSENCE of evidence, and
+    /// an event is evidence. Releasing on the boundary while that answer is in
+    /// flight would freeze the channel set against a topic set already known to
+    /// have moved, omitting exactly the producer the event was about.
+    ///
     /// `elapsed` is measured from the drive loop's start.
-    fn discovery_hold_active(&self, elapsed: Duration) -> bool {
+    fn discovery_hold_active(&self, elapsed: Duration, walk_pending: bool) -> bool {
         // Clamped to the cap so `--discovery-settle-ms 0` - and any cap below
         // the window - still means what it says.
         let quiet = DISCOVERY_SETTLE_MIN.min(self.cfg.discovery_settle);
@@ -13223,6 +13229,7 @@ impl Recorder {
             self.cfg.discovery_settle,
             quiet,
             self.discovery_last_add.map(|at| at.elapsed()),
+            walk_pending,
         )
     }
 
@@ -18949,7 +18956,13 @@ fn drive_loop(
         // is created on pass 1 and discovery can only ever report.
         //
         // Shutdown always wins: a SIGINT must never wait out a discovery window.
-        let discovery_hold = !shutting && rec.discovery_hold_active(start.elapsed());
+        //
+        // A walk the enumerator has been woken for but not yet published also
+        // holds: that is positive evidence the live topic set is moving, and
+        // releasing on the quiet boundary while the answer is in flight omits
+        // the very producer the event was about.
+        let discovery_hold =
+            !shutting && rec.discovery_hold_active(start.elapsed(), scanner.walk_pending());
         // The SECOND, independent hold. The settle above asks "has the
         // live topic set stopped changing?" — which a multi-second gap in a
         // bursty route build answers WRONGLY, freezing a 4-topic bag while 98

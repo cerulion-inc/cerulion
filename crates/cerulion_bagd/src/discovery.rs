@@ -774,17 +774,27 @@ pub fn resolve_mirror_snapshot<E>(
 /// `since_last_find` is `None` when discovery has never added a tap on this
 /// run, which is the common case: a graph whose live set was complete before the
 /// recorder armed pays exactly the window and nothing more.
+///
+/// # The pending term
+///
+/// `walk_pending` says the enumerator has SEEN a change and has not finished
+/// answering. Quiet time is the ABSENCE of evidence, and an event is evidence;
+/// releasing on the boundary while the answer is in flight freezes the channel
+/// set against a topic set already known to have moved, and omits exactly the
+/// producer the event was about. So a pending answer holds, and the `cap` still
+/// outranks it - a walk that never lands cannot hold a recording open forever.
 pub fn discovery_hold_open(
     discover_live: bool,
     elapsed: Duration,
     cap: Duration,
     quiet_window: Duration,
     since_last_find: Option<Duration>,
+    walk_pending: bool,
 ) -> bool {
     if !discover_live || elapsed >= cap {
         return false;
     }
-    if elapsed < quiet_window {
+    if elapsed < quiet_window || walk_pending {
         return true;
     }
     since_last_find.is_some_and(|since| since < quiet_window)
@@ -1690,41 +1700,54 @@ mod tests {
     /// only honoured the last find, each satisfy several rows on their own.
     #[test]
     fn the_settle_hold_is_the_window_since_the_later_of_start_and_the_last_find() {
-        // (discovery on, elapsed ms, since-last-find ms, expected hold)
+        // (discovery on, elapsed ms, since-last-find ms, walk pending, hold)
         let oracle = [
             // Discovery off: nothing settles, ever.
-            (false, 0u64, None, false),
-            (false, 100, Some(0u64), false),
+            (false, 0u64, None, false, false),
+            (false, 100, Some(0u64), false, false),
             // No find yet: the window alone holds, and releases at it.
-            (true, 0, None, true),
-            (true, 499, None, true),
-            (true, 500, None, false),
-            (true, 1999, None, false),
+            (true, 0, None, false, true),
+            (true, 499, None, false, true),
+            (true, 500, None, false, false),
+            (true, 1999, None, false, false),
             // A find RESTARTS the window from the find, not from the start.
-            (true, 600, Some(100), true),
-            (true, 900, Some(400), true),
-            (true, 1000, Some(499), true),
-            (true, 1000, Some(500), false),
+            (true, 600, Some(100), false, true),
+            (true, 900, Some(400), false, true),
+            (true, 1000, Some(499), false, true),
+            (true, 1000, Some(500), false, false),
             // A find LATE in the run still extends, right up to the cap.
-            (true, 1500, Some(1), true),
+            (true, 1500, Some(1), false, true),
             // The cap outranks a stream of finds: a machine that never stops
             // producing topics must not hold the channel set open forever.
-            (true, 2000, Some(0), false),
-            (true, 2500, Some(0), false),
+            (true, 2000, Some(0), false, false),
+            (true, 2500, Some(0), false, false),
             // An OLD find on a settled machine is not a reason to hold.
-            (true, 1800, Some(1700), false),
+            (true, 1800, Some(1700), false, false),
+            // A PENDING answer holds where quiet alone would have released:
+            // the enumerator has seen a change and has not reported it yet.
+            (true, 1800, Some(1700), true, true),
+            (true, 500, None, true, true),
+            (true, 1000, Some(500), true, true),
+            // ...but the cap still outranks it, so a walk that never lands
+            // cannot hold a recording open forever.
+            (true, 2000, Some(0), true, false),
+            (true, 2500, None, true, false),
+            // ...and discovery being off outranks everything.
+            (false, 100, None, true, false),
         ];
-        for (i, (on, elapsed, since, want)) in oracle.into_iter().enumerate() {
+        for (i, (on, elapsed, since, pending, want)) in oracle.into_iter().enumerate() {
             let got = discovery_hold_open(
                 on,
                 Duration::from_millis(elapsed),
                 CAP,
                 WINDOW,
                 since.map(Duration::from_millis),
+                pending,
             );
             assert_eq!(
                 got, want,
-                "row {i}: discovery={on} elapsed={elapsed}ms since_find={since:?} must hold={want}"
+                "row {i}: discovery={on} elapsed={elapsed}ms since_find={since:?} \
+                 pending={pending} must hold={want}"
             );
         }
     }
@@ -1736,10 +1759,19 @@ mod tests {
     #[test]
     fn a_zero_cap_never_holds() {
         for since in [None, Some(Duration::ZERO), Some(Duration::from_millis(10))] {
-            assert!(
-                !discovery_hold_open(true, Duration::ZERO, Duration::ZERO, Duration::ZERO, since),
-                "a zero cap must release immediately (since_find {since:?})"
-            );
+            for pending in [false, true] {
+                assert!(
+                    !discovery_hold_open(
+                        true,
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        since,
+                        pending
+                    ),
+                    "a zero cap must release immediately (since_find {since:?}, pending {pending})"
+                );
+            }
         }
     }
 
@@ -1756,14 +1788,16 @@ mod tests {
             Duration::from_millis(199),
             cap,
             cap,
-            None
+            None,
+            false
         ));
         assert!(!discovery_hold_open(
             true,
             Duration::from_millis(200),
             cap,
             cap,
-            None
+            None,
+            false
         ));
     }
 }

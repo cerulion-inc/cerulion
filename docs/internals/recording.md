@@ -146,7 +146,11 @@ upstream `mcap` crate, never only our own reader; the format claim is
 - **Settle window.** Bag creation is held until `DISCOVERY_SETTLE_MIN` has
   passed with NOTHING NEW DISCOVERED, measured from the later of the drive
   loop's start and the last discovered tap, capped at
-  `DEFAULT_DISCOVERY_SETTLE_MS`. It is a WALL, not a count of quiet
+  `DEFAULT_DISCOVERY_SETTLE_MS`. A walk the enumerator has been WOKEN for and
+  not yet published also holds (`DiscoveryScanner::walk_pending`): quiet time is
+  the absence of evidence and an event is evidence, so releasing on the boundary
+  while that answer is in flight would freeze the channel set against a topic
+  set already known to have moved. The cap still outranks it. It is a WALL, not a count of quiet
   enumerations: an event-driven enumeration produces no scans on a settled
   machine, so a counting rule could never be satisfied there and every plain
   recording would pay the whole cap - and the wall is the unit the guarantee was

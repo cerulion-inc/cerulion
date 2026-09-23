@@ -46,7 +46,7 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
 - Live discovery defaults ON only for `--topics-json` and `--run`; OFF for
   `--topic`/`--all`/`--regex` and `BagdConfig::new`. `graph run --record` builds bagd's argv
   itself: retune with `CERULION_RECORD_DISCOVERY=off` / `CERULION_RECORD_DISCOVERY_SETTLE_MS`.
-- The settle window is a WALL, not a scan count: creation is held until `DISCOVERY_SETTLE_MIN` passes with nothing new found; an arm-time find does NOT start it.
+- The settle window is a WALL, not a scan count: creation is held until `DISCOVERY_SETTLE_MIN` passes with nothing new found, AND no woken walk is still pending; an arm-time find does NOT start it.
 - Bag creation is held for max(discovery settle, schema wait) - measure it from
   `BagdSummary::channel_set_closed_after`, never the bag file's appearance (reads short).
 - Both record paths run on the default `iox2_` namespace: discovery also taps
