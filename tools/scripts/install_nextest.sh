@@ -119,8 +119,23 @@ trap 'rm -rf "$tmp"' EXIT
 
 # `--fail` so an HTTP error is an ERROR and not a tarball made of an error
 # page; `--location` because the pinned URL redirects to the release asset.
+#
+# `--retry-all-errors` and not `--retry` alone, and the difference is the whole
+# reason this line changed. curl's `--retry` covers TRANSIENT errors as curl
+# defines them: a timeout, and the 408 / 429 / 5xx replies. It does not cover a
+# connection that is reset mid-transfer, which exits 56 and is exactly what a
+# hosted runner produced here:
+#
+#   curl: (35) Recv failure: Connection reset by peer
+#
+# so the retry budget went unspent and the job died on the first reset.
+# `--retry-all-errors` retries the transport failures too. The cost is that a
+# genuine 404 (a version that does not exist) is now attempted 4 times before
+# the `die` below names it, which is 6 seconds on a path that is already
+# failing. The checksum gate is untouched: a retry re-downloads bytes that are
+# still verified before anything is extracted.
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-    --retry 3 --retry-delay 2 --max-time 180 \
+    --retry 3 --retry-delay 2 --retry-all-errors --max-time 180 \
     "$url" -o "$tmp/nextest.tar.gz" \
     || die "download failed for $url (version '$NEXTEST_VERSION' may not exist)"
 
