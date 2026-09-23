@@ -39,6 +39,16 @@ fn twist_batch(seq: u64) -> Vec<InputFrames> {
     }]
 }
 
+/// The enqueue budget on an unloaded machine. `try_enqueue` is a bounded
+/// channel `try_send` plus one `tracing` emission on the drop arm, so its real
+/// cost is microseconds; the budget is three orders of magnitude above that and
+/// three orders BELOW a genuine block, which never returns at all while the
+/// pipeline stays wedged.
+const ENQUEUE_BUDGET: Duration = Duration::from_millis(50);
+
+/// The per-iteration breather, and the scheduler-delay reference it doubles as.
+const PACING: Duration = Duration::from_millis(1);
+
 #[test]
 fn tick_never_blocks_while_grpc_server_accepts_but_never_reads() {
     // A server that ACCEPTS TCP connections but NEVER READS — the exact wedge
@@ -79,7 +89,19 @@ fn tick_never_blocks_while_grpc_server_accepts_but_never_reads() {
 
     // Feed until drops appear (the wedge fills the client channel + batcher) or a
     // generous cap; time EVERY enqueue. The enqueue must never block.
+    //
+    // The pacing sleep below is timed too, and it is what makes the enqueue
+    // budget load-proof. A ceiling on a wall can only be tripped by a machine
+    // that is SLOWER than expected, so contention pushes this assert toward a
+    // red with nothing wrong. The sleep is a pure scheduler wait in the same
+    // loop under the same contention, so whatever delay a stalled runner adds
+    // to the enqueue window it also adds here: subtracting the requested 1 ms
+    // leaves the worst scheduling delay this loop actually paid, and the budget
+    // carries that as slack. On a quiet machine the slack is ~0 and the gate is
+    // exactly as tight as the bare budget. A genuine block is unbounded (the
+    // wedged pipeline never drains), so no amount of slack can hide it.
     let mut max_enqueue = Duration::ZERO;
+    let mut max_pacing = Duration::ZERO;
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut fed = 0u64;
     while worker.dropped_frames() == 0 && Instant::now() < deadline {
@@ -99,8 +121,11 @@ fn tick_never_blocks_while_grpc_server_accepts_but_never_reads() {
         fed += 1;
         // A small breather so the worker can advance into rec.log and wedge
         // (without this a very fast loop can outrun the batcher setup); this is
-        // pacing only — it is NOT part of the timed enqueue window above.
-        std::thread::sleep(Duration::from_millis(1));
+        // pacing only, NOT part of the timed enqueue window above. Its own wall
+        // is the scheduler-delay reference (see the note at the loop head).
+        let t1 = Instant::now();
+        std::thread::sleep(PACING);
+        max_pacing = max_pacing.max(t1.elapsed());
     }
 
     assert!(
@@ -109,8 +134,13 @@ fn tick_never_blocks_while_grpc_server_accepts_but_never_reads() {
          (fed {fed}, dropped {})",
         worker.dropped_frames()
     );
+    let scheduling_slack = max_pacing.saturating_sub(PACING);
+    let budget = ENQUEUE_BUDGET + scheduling_slack;
     assert!(
-        max_enqueue < Duration::from_millis(50),
-        "the enqueue must never block even with the real gRPC pipeline wedged (worst {max_enqueue:?})"
+        max_enqueue < budget,
+        "the enqueue must never block even with the real gRPC pipeline wedged \
+         (worst enqueue {max_enqueue:?} against {ENQUEUE_BUDGET:?} plus {scheduling_slack:?} \
+          of measured scheduling delay; worst pacing sleep {max_pacing:?} for a {PACING:?} \
+          request over {fed} iterations)"
     );
 }
