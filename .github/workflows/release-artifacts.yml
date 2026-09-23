@@ -567,13 +567,14 @@ jobs:
       # three that already exist on crates.io: `cargo publish --workspace`
       # publishes in dependency order and cerulion_cli depends on every other
       # publishable crate, so its presence at this version proves the whole
-      # workspace landed — except cerulion_wsd, which nothing depends on and
-      # which publishes beside it, so it is waited for by name. A publish that
-      # stops at one of the eleven never-published names (the crates.io new-crate
-      # rate-limit shape) would otherwise leave this smoke GREEN while
-      # `cargo install cerulion_cli` resolves nothing.
+      # workspace landed — except cerulion_wsd and the cerulion umbrella,
+      # which nothing depends on and which publish beside it, so they are
+      # waited for by name. A publish that stops at one of the eleven
+      # never-published names (the crates.io new-crate rate-limit shape) would
+      # otherwise leave this smoke GREEN while `cargo install cerulion_cli`
+      # resolves nothing.
       - name: Wait for crates.io publication
-        run: source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd
+        run: source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd cerulion
 
       - name: Run README quick-start
         run: |
