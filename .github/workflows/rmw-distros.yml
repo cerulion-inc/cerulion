@@ -1,0 +1,63 @@
+name: rmw distro lanes
+
+# One hosted lane per ROS 2 distro in the support set, inside the stock ros:<distro>-ros-base image,
+# building rmw_cerulion against that distro's REAL headers (bindgen; the vendored fallback is refused).
+# Each lane asserts the distro's KNOWN state through tools/ci/rmw-distros/gate.sh, so the lane is
+# green while the state is true and turns red the moment the truth moves in either direction.
+# Runs on PRs that touch the rmw path and on every push to main.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/rmw_cerulion/**'
+      - 'crates/cerulion_heaphook/**'
+      - 'crates/native_ros2_messages/**'
+      - 'tools/ci/rmw-distros/**'
+      - '.github/workflows/rmw-distros.yml'
+      - 'Cargo.lock'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: rmw-distros-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lane:
+    name: rmw distro lane (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [lyrical, humble, foxy]
+    container:
+      image: ros:${{ matrix.distro }}-ros-base
+      options: --shm-size=1g
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the bindgen toolchain
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git clang libclang-dev pkg-config procps
+      - name: Install Rust (stable)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-rmw-distros-${{ matrix.distro }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-rmw-distros-${{ matrix.distro }}-
+      - name: Gate (expected state for this distro)
+        run: bash tools/ci/rmw-distros/gate.sh "${{ matrix.distro }}"
