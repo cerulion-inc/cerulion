@@ -1114,6 +1114,28 @@ jobs:
   # checks the file it downloaded against
   # `needs.test-archive.outputs.archive_sha256` BEFORE extracting it, which
   # also catches a torn or short download for free.
+  # MEASUREMENT IN FLIGHT: the shards below no longer consume this archive.
+  #
+  # The job stays because `Test archive (Linux, build once)` is a required
+  # status context on `main`, and a required context that stops reporting
+  # blocks every pull request. Removing it is a branch-protection change and is
+  # deliberately not made here.
+  #
+  # WHAT IS BEING MEASURED. This job costs 9.6 to 13.4 min and sits IN FRONT of
+  # the four shards, which cannot start until it has uploaded. Its own steps
+  # say what it saves them: `Archive the test binaries` builds EVERY
+  # `cerulion_core` test binary in 5.63 min on top of a workspace build, so one
+  # shard's quarter is worth roughly 1.4 to 2.5 min, against the 0.7 to 3.5 min
+  # each shard currently spends downloading and verifying the artifact.
+  #
+  # If that reading is right, the archive costs the run about 11 to 12 min of
+  # wall and about 7 min of runner time, and the shard durations in this run
+  # against the same shards in a run that used the archive are what decides it.
+  #
+  # The reading it replaces was taken on 4 CPU containers with a shared archive
+  # directory on local disk, where a shard was CPU starved and the archive
+  # never crossed a network. On hosted runners every shard is its own VM and
+  # the archive travels as an artifact, which is a different trade.
   test-archive:
     name: Test archive (Linux, build once)
     runs-on: ubuntu-latest
@@ -1266,12 +1288,11 @@ jobs:
     # itself, in that same job, so by the time it reports success the archive is
     # ready and these shards start immediately.
     #
-    # `test-archive` and NOT `[lint, test-archive]`: the archive is a real data
-    # dependency (these shards RUN the binaries it built), a `lint` verdict is
-    # not, and leaving `lint` in this list would have held the shards at the
-    # start line anyway now that the job they wait on no longer does. See the
-    # note on `test-archive` for the measurement.
-    needs: [test-archive]
+    # NO `needs:` AT ALL, for this measurement. These shards BUILD the
+    # `cerulion_core` test binaries they run instead of downloading the
+    # archive, so `test-archive` stops being a data dependency and the shards
+    # start at t=0 with everything else. See the block above `test-archive` for
+    # what this is measuring and what decides it.
     strategy:
       # One shard's failure must not cancel the other three: the whole point of
       # the split is that the shards report independently, and a red shard 2
@@ -1535,24 +1556,6 @@ jobs:
       # archive job uploaded, checked against the sha256 it exported before a
       # byte is extracted. Hashing the file AFTER it lands in `$RUNNER_TEMP`
       # also catches a torn or short download for free.
-      - name: Download the test archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: nextest-archive-linux
-          path: ${{ runner.temp }}
-
-      - name: Verify the downloaded archive
-        env:
-          WANT_SHA: ${{ needs.test-archive.outputs.archive_sha256 }}
-        run: |
-          set -euo pipefail
-          got=$(sha256sum "$RUNNER_TEMP/nextest-archive.tar.zst" | awk '{print $1}')
-          [ "$got" = "$WANT_SHA" ] || {
-            echo "::error::downloaded archive sha256 '$got' != '$WANT_SHA'"
-            exit 1
-          }
-          echo "downloaded archive verified: $got"
-
       # WHERE THE ARCHIVE LANDS, and it was not a detail: an early run of this
       # died on ALL FOUR shards with `No space left on device (os error 28)` on
       # a machine with hundreds of GB free, because the extract went to a
@@ -1581,20 +1584,11 @@ jobs:
           done
 
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
-        env:
-          # Archive mode. `ci_test_shard.sh` asserts the two provenance facts
-          # below against its own before it runs anything, so a drifted toolchain
-          # or profile fails loudly rather than running one compiler's binaries
-          # under another — or silently rebuilding, which would undo the job.
-          CI_TEST_SHARD_ARCHIVE: ${{ runner.temp }}/nextest-archive.tar.zst
-          CI_TEST_SHARD_ARCHIVE_RUSTC: ${{ needs.test-archive.outputs.rustc }}
-          CI_TEST_SHARD_ARCHIVE_PROFILE_DEBUG: ${{ needs.test-archive.outputs.profile_debug }}
-          # Unpack onto the WORK VOLUME, not the `/tmp` nextest would otherwise
-          # pick via $TMPDIR (see the step above). Setting $TMPDIR instead would
-          # move the tests' own scratch as well, including iceoryx2's, which is
-          # an unmeasured change, so the extract is redirected by name and
-          # nothing else moves.
-          CI_TEST_SHARD_EXTRACT_DIR: ${{ runner.temp }}/nextest-extract
+        # BUILD MODE for this measurement: no `CI_TEST_SHARD_ARCHIVE`, so the
+        # script passes `-p cerulion_core --test <member> ...` and cargo builds
+        # exactly this shard's quarter of the test binaries before running them.
+        # The archive-mode provenance assertions are unreachable here by
+        # construction, because there is no archive to assert about.
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
