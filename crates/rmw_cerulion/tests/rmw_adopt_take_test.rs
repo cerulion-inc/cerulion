@@ -2414,6 +2414,8 @@ fn cpp_member(name: &str, type_id: u8, offset: u32) -> CppMessageMember {
         fetch_function: None,
         assign_function: None,
         resize_function: None,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer_: false,
     }
 }
 

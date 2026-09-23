@@ -226,6 +226,8 @@ fn cpp_seq_ts(namespace: &str, name: &str) -> *const ffi::rosidl_message_type_su
         fetch_function: None,
         assign_function: None,
         resize_function: Some(vecf64_resize),
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer_: false,
     }]));
     let mm = Box::leak(Box::new(CppMessageMembers {
         message_namespace_: cstr(namespace),
