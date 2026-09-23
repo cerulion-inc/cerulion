@@ -881,7 +881,9 @@ impl crate::mirror::MirrorPlane for DualMirrorPlane {
     /// The picker is pure over `(key, registry)` and this registry is fixed for the
     /// daemon's lifetime, so the plane it names here is the one that ensured the
     /// mirror, not a fresh guess: the same argument that lets `release_mirror`
-    /// re-pick instead of remembering.
+    /// re-pick instead of remembering. A picker error reports unknown rather than
+    /// guessing; `release_mirror` is where that same error is logged loudly, because
+    /// there it changes what happens rather than only what is reported.
     fn serving_plane(&self, key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
         match pick_plane(key, &self.registry).ok()? {
             Plane::Zenoh => Some(crate::protocol::ServingPlane::Zenoh),

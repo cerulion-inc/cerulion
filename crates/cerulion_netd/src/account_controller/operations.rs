@@ -203,6 +203,11 @@ impl MirrorPlane for AccountWanController {
     /// it would choose again: membership is mutable here, so a fresh decision could
     /// name a plane that never carried a frame for this key. An unpinned key has no
     /// live mirror, so it has no serving plane to report.
+    ///
+    /// A poisoned route lock also reports unknown rather than propagating. This is
+    /// a diagnostic read on the status path: refusing the whole demand table because
+    /// one row cannot be attributed would lose the rows that can be, and the caller
+    /// already has to handle unknown for every older daemon.
     fn serving_plane(&self, key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
         match self.pins().ok()?.get(key)? {
             Route::Lan => Some(crate::protocol::ServingPlane::Zenoh),
