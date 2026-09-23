@@ -325,6 +325,89 @@ everything else to zenoh (`wan.rs` unit test
   `iroh_plane.rs` module docs; the automatic prefer-LAN-when-also-reachable
   picker: `wan.rs` module docs ("the plane-picker's scope").
 
+## 8b. The account-first path: register at first serve, reach by account
+
+The ceremony above (a chassis secret, a pairing code, an operator typing at the
+robot) is the path for a machine nobody has an account for. A machine that IS
+logged in needs none of it, because `cerulion login` already proved which
+account owns it. **This path is proven against the in-tree `cerulion_accountd`
+only; the hosted issuer is identity-only today, so nothing here works against
+it until that service issues device certificates and registers robots.**
+
+**On the robot, `cerulion login` is the only account step.** The first
+network-serving run registers the machine. The gate is the LISTEN locator
+(`CERULION_NETD_LISTEN`): it is what makes netd a standing gateway, and only a
+standing gateway starts `robot_supervisor`. netd is spawn-once, so the variable
+must be in netd's OWN environment before the first command that spawns it; a
+netd already running without it must be stopped, and a failed registration is
+not retried until netd restarts.
+
+The supervisor resolves two SIBLINGS of the running netd binary and runs them in
+turn: `cerulion bootstrap-robot --state-root <root>`, a hidden login-gated
+worker whose stdout is a machine-readable result, then `cerulion-remoted
+--provision-bundle <path>` to write the robot state, then `cerulion-remoted` to
+serve. The hidden worker exists so netd reuses the CLI engine's login and
+registration code without a `netd -> cli_engine` package edge; no operator ever
+runs either by hand. All three binaries must therefore sit in one directory,
+which today means a build from source: `cerulion-remoted` is in no release
+archive, no installer path and no Debian package, so no published artifact puts
+a robot daemon on a robot.
+
+The robot's identity is the login device key, so the endpoint id a desk dials is
+the key registration proved possession of. Roots come from the issuer's
+well-known endpoint. Registration is idempotent: an already-registered machine
+does nothing. If the account service is unreachable at first serve the WAN plane
+refuses loudly with the reason and the LAN plane keeps serving; there is no
+retry loop that hides the outage.
+
+**On the desk, there is no pairing step.** `topic list` and `viz --robot` read
+the account's robots from the issuer's owner-only list endpoint and mark each
+one with a bounded presence probe. Selection is by exact, case-sensitive display
+name, or by the reserved `account:<robot id>` route; a display name shared with a
+LAN robot is reported as a collision and refused rather than guessed. A
+directory entry is never reachability evidence by itself. The first demand of a
+remote account robot dials it through netd's internet plane with the login key
+and presents the owner's certificate chain ONCE, and only on a classified
+unpaired refusal: never after expiry, revocation or a denied permission, and
+never as a silent fallback to a code. On the robot side the `pair` verb admits a
+chain whose account equals the owner account with no robot-scoped grant; every
+other account still needs the full grant presentation.
+
+**Code pairing cannot name an account.** Possession of a code and of the device
+keys proves neither, so `code-pair-finish` binds the guest to the self-account
+derived from the authenticated transport key and refuses any other value; a
+cloud account requires the full roots-verified chain whose device key equals the
+transport peer key. The owner row is never preserved for a guest, because that
+would hand the guest the owner's authority outright
+(`crates/cerulion_remoted/tests/code_pair_account_test.rs`).
+
+**One endpoint per machine.** A machine whose netd hosts a LISTEN gateway owns
+its endpoint through the sibling remoted, so netd's OUTGOING demands from that
+machine are refused at the point of demand with the reason, never by opening a
+second endpoint. Robot-to-robot over the internet, and a desk that also serves,
+are the documented restriction.
+
+### Which plane served a mirror
+
+Both planes re-inject into the same local shared memory under the same topic
+name, with the same wire bytes, so nothing downstream can tell a locally
+mirrored robot from one dialed over the internet. A robot on the same network is
+reachable over both, which is exactly how a test that checks only that the
+frames arrived can pass with the internet path never exercised: a serving
+machine opens the LAN plane on every interface it has, so a desk that learns one
+locator gets the topic locally.
+
+`MirrorPlane::serving_plane` is the answer, and the `status` demand table
+reports it per row as `plane`. A composing plane answers from the route it
+PINNED when it ensured the mirror, not from a fresh decision, so the field
+describes what happened rather than what a picker would choose now. The field is
+optional on the wire: absent means the daemon does not report a plane, never
+that the local plane served it, because a daemon that predates the field omits
+it and any default would be a routing claim it never made.
+`crates/cerulion_netd/tests/wan_plane_iroh_test/serving_plane.rs` pins it
+against the delivery it describes, on a desk whose local plane cannot mirror at
+all.
+
 ## 9. Revocation epochs: mint, carry, apply, evict
 
 The full lifecycle is `docs/revocation.md`; the contributor invariants:
@@ -432,6 +515,8 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerud/tests/*` | Protocol/authz/receipt/lease/deploy/verbs oracles + the constants doc pins |
 | `crates/cerulion_accountd/tests/*` | Account-plane acceptance over a real server, CA↔shipped-verifier byte-compat, device-code state, 5xx error-leak ban |
 | `crates/cerulion_netd/tests/wan_plane_iroh_test.rs` | The WAN plane against a real in-process robot (see `network-daemons.md` §12) |
+| `crates/cerulion_netd/tests/wan_plane_iroh_test/serving_plane.rs` | Which plane carried a mirror, asserted against the delivery it describes |
+| `crates/cerulion_remoted/tests/code_pair_account_test.rs` | Code pairing binds the self-account only; a named owner account is refused |
 
 Running: `cargo test -p <crate>` for each of `cerulion_pairing`,
 `cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`, `cerulion_remoted`,
