@@ -14,8 +14,11 @@
 //! to MessageMember (112 to 120 bytes) and changes nothing else. The cfg is
 //! derived by build.rs from the very bindings this build compiles against,
 //! so the mirror and the C-side `era_pins` can never disagree about the
-//! era. Older distros (Humble, Foxy) lack `is_key_` and are NOT supported
-//! by this bridge yet.
+//! era. Under `cfg(not(cerulion_has_is_key))` the mirror takes the Humble and
+//! Iron shape (no `is_key_`, `has_any_key_member_` or `event_members_`:
+//! 112, 56 and 32 bytes). Foxy and Galactic (96-byte members, no
+//! fetch/assign functions) have no mirror yet and are refused at
+//! registration.
 //!
 //! Container access is exclusively through the member's function
 //! pointers (`size/get/get_const/fetch/assign/resize`) — never through
@@ -47,6 +50,9 @@ pub struct CppMessageMember {
     /// For ROS_TYPE_MESSAGE: the nested type's typesupport handle
     /// (same `rosidl_message_type_support_t` shape as the C side).
     pub members_: *const super::rosidl_message_type_support_t,
+    /// Jazzy onward (keyed topics); absent on Humble and Iron, where
+    /// `is_array_` sits at this offset instead.
+    #[cfg(cerulion_has_is_key)]
     pub is_key_: bool,
     pub is_array_: bool,
     pub array_size_: usize,
@@ -83,6 +89,8 @@ pub struct CppMessageMembers {
     pub message_name_: *const c_char,
     pub member_count_: u32,
     pub size_of_: usize,
+    /// Jazzy onward; absent on Humble and Iron (56-byte `MessageMembers`).
+    #[cfg(cerulion_has_is_key)]
     pub has_any_key_member_: bool,
     pub members_: *const CppMessageMember,
     /// rosidl init (takes a MessageInitialization enum). The
@@ -108,6 +116,7 @@ pub struct CppServiceMembers {
     /// but it is part of the real struct, so the mirror carries it for
     /// layout parity (a by-value copy of a truncated mirror would read
     /// past its end). Matches the C side's `event_members_`.
+    #[cfg(cerulion_has_is_key)]
     pub event_members_: *const CppMessageMembers,
 }
 
@@ -153,7 +162,7 @@ const _: () = {
     // mirror that lags its era is caught here at compile time, not by a
     // misread member array at runtime. Pre-Jazzy builds refuse the C++ arm
     // at registration instead, so the check is not asserted there.
-    #[cfg(cerulion_has_is_key)]
+    #[cfg(cerulion_has_fetch_function)]
     assert!(
         size_of::<CppMessageMember>()
             == size_of::<super::rosidl_typesupport_introspection_c__MessageMember>()
@@ -163,8 +172,12 @@ const _: () = {
     assert!(offset_of!(CppMessageMember, type_id_) == 8);
     assert!(offset_of!(CppMessageMember, string_upper_bound_) == 16);
     assert!(offset_of!(CppMessageMember, members_) == 24);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMember, is_key_) == 32);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMember, is_array_) == 33);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(offset_of!(CppMessageMember, is_array_) == 32);
     assert!(offset_of!(CppMessageMember, array_size_) == 40);
     assert!(offset_of!(CppMessageMember, is_upper_bound_) == 48);
     assert!(offset_of!(CppMessageMember, offset_) == 52);
@@ -176,23 +189,40 @@ const _: () = {
     assert!(offset_of!(CppMessageMember, assign_function) == 96);
     assert!(offset_of!(CppMessageMember, resize_function) == 104);
 
+    #[cfg(cerulion_has_is_key)]
     assert!(size_of::<CppMessageMembers>() == 64);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(size_of::<CppMessageMembers>() == 56);
     assert!(align_of::<CppMessageMembers>() == 8);
     assert!(offset_of!(CppMessageMembers, message_namespace_) == 0);
     assert!(offset_of!(CppMessageMembers, message_name_) == 8);
     assert!(offset_of!(CppMessageMembers, member_count_) == 16);
     assert!(offset_of!(CppMessageMembers, size_of_) == 24);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMembers, has_any_key_member_) == 32);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMembers, members_) == 40);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMembers, init_function) == 48);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMembers, fini_function) == 56);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(offset_of!(CppMessageMembers, members_) == 32);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(offset_of!(CppMessageMembers, init_function) == 40);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(offset_of!(CppMessageMembers, fini_function) == 48);
 
+    #[cfg(cerulion_has_is_key)]
     assert!(size_of::<CppServiceMembers>() == 40);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(size_of::<CppServiceMembers>() == 32);
     assert!(align_of::<CppServiceMembers>() == 8);
     assert!(offset_of!(CppServiceMembers, service_namespace_) == 0);
     assert!(offset_of!(CppServiceMembers, service_name_) == 8);
     assert!(offset_of!(CppServiceMembers, request_members_) == 16);
     assert!(offset_of!(CppServiceMembers, response_members_) == 24);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppServiceMembers, event_members_) == 32);
 };
 

@@ -298,7 +298,7 @@ build.rs layers three era probes on top of the source selection:
   `is_rosidl_buffer_` under `cfg(cerulion_has_is_rosidl_buffer)` (stride 112 to 120; each
   field landed in the C and C++ structs in the same rosidl release, so the C capability
   tokens are the build-time proxies for the C++ mirror's era, and a compile-time pin holds
-  the mirror's size equal to the bindgen-generated C member's). Pre-Jazzy builds compile
+  the mirror's size equal to the bindgen-generated C member's), and the Humble and Iron shape (no `is_key_`, `has_any_key_member_` or `event_members_`) under `cfg(not(cerulion_has_is_key))`. Pre-Galactic builds (Foxy, Galactic: 96-byte members) compile
   the C++ typesupport arm of both resolvers to a loud REGISTRATION refusal: one `error!`
   through the single `CppBridgeGate::emit_refusal` seam, a CONSTANT paragraph with the
   verdict in a structured `verdict=` field (never a `"{}"` pass-through, which the repo's
@@ -309,7 +309,7 @@ build.rs layers three era probes on top of the source selection:
   production silence impossible while the resolver-routed C++ e2e binaries (fixtures
   hand-built against the compiled struct, layout-self-consistent by construction) keep
   their surface. `test-seams` is in no default feature set and no shipping recipe enables
-  it. The pre-Jazzy C++ bridge variant is not implemented. The C introspection path is
+  it. The pre-Galactic C++ bridge variant is not implemented. The C introspection path is
   bindgen-generated and correct on every era, so rclpy and C-typesupport consumers are
   unaffected.
 

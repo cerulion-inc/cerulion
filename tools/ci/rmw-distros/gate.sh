@@ -17,12 +17,13 @@ set +u; source "/opt/ros/$distro/setup.bash"; set -u
 # validated distro: it must build and pass its whole suite, the regression guard for every other row):
 #   lyrical: builds from generated bindings and its whole suite is green (the C++ mirror carries the
 #            Lyrical tail field under cfg(cerulion_has_is_rosidl_buffer));
-#   humble:  the compile stops at rmw's 24-byte GID storage against the 16-byte one the crate writes;
+#   humble:  builds from generated bindings and its whole suite is green (24-byte GID storage padded,
+#            int8 request guids cast, the C++ mirror in its pre-Iron shape under cfg(not(cerulion_has_is_key)));
 #   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 24 more missing symbols).
 case "$distro" in
     jazzy)   expect=build; known_failures="" ;;
     lyrical) expect=build; known_failures="" ;;
-    humble)  expect=refuse; marker="expected an array with a size of 24, found one with a size of 16" ;;
+    humble)  expect=build; known_failures="" ;;
     foxy)    expect=refuse; marker="cannot find type \`rmw_feature_t\` in module \`ffi\`" ;;
     *) echo "FATAL: no expected state for distro '$distro'"; exit 1 ;;
 esac

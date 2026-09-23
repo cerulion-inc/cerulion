@@ -99,10 +99,10 @@ pub enum CppBridgeGate {
     /// The build's era matches the hand-mirrored C++ layout — resolve
     /// the C++ arm as always.
     Supported,
-    /// A pre-Jazzy build: the C++ typesupport arm REFUSES at
-    /// registration with [`CPP_BRIDGE_PRE_JAZZY_REFUSAL`] instead of
-    /// misreading every rclcpp publisher's introspection structs.
-    RefusePreJazzy,
+    /// A pre-Galactic build (Foxy, Galactic): the C++ typesupport arm
+    /// REFUSES at registration with [`CPP_BRIDGE_PRE_GALACTIC_REFUSAL`]
+    /// instead of misreading every rclcpp publisher's 96-byte members.
+    RefusePreGalactic,
 }
 
 impl CppBridgeGate {
@@ -114,7 +114,7 @@ impl CppBridgeGate {
     pub fn refusal_message(self) -> Option<&'static str> {
         match self {
             CppBridgeGate::Supported => None,
-            CppBridgeGate::RefusePreJazzy => Some(CPP_BRIDGE_PRE_JAZZY_REFUSAL),
+            CppBridgeGate::RefusePreGalactic => Some(CPP_BRIDGE_PRE_GALACTIC_REFUSAL),
         }
     }
 
@@ -209,12 +209,12 @@ impl CppBridgeGate {
         match self {
             // Unreachable: `refusal_message()` returned above.
             CppBridgeGate::Supported => {}
-            CppBridgeGate::RefusePreJazzy => match decision {
+            CppBridgeGate::RefusePreGalactic => match decision {
                 RegimeDecision::Loud => tracing::error!(
                     built_for = %built_for(),
                     verdict = ?self,
                     rcl_error_channel = %rcl,
-                    "{CPP_BRIDGE_PRE_JAZZY_REFUSAL}"
+                    "{CPP_BRIDGE_PRE_GALACTIC_REFUSAL}"
                 ),
                 RegimeDecision::StillFailing { total, suppressed } => tracing::error!(
                     built_for = %built_for(),
@@ -222,14 +222,14 @@ impl CppBridgeGate {
                     rcl_error_channel = %rcl,
                     total_failures = total,
                     suppressed_count = suppressed,
-                    "{CPP_BRIDGE_PRE_JAZZY_REFUSAL}"
+                    "{CPP_BRIDGE_PRE_GALACTIC_REFUSAL}"
                 ),
                 RegimeDecision::Suppressed { suppressed } => tracing::debug!(
                     built_for = %built_for(),
                     verdict = ?self,
                     rcl_error_channel = %rcl,
                     suppressed_count = suppressed,
-                    "{CPP_BRIDGE_PRE_JAZZY_REFUSAL}"
+                    "{CPP_BRIDGE_PRE_GALACTIC_REFUSAL}"
                 ),
             },
         }
@@ -330,40 +330,47 @@ pub fn test_surface() -> TestSurface {
     }
 }
 
-/// The C introspection era the compiled bindings carry — derived ONCE
-/// from the two capability cfgs (`is_key_` arrived at Jazzy, the lower
-/// bound; `is_rosidl_buffer_` at Lyrical, the upper), so the bridge
-/// classifier cannot receive them swapped.
+/// The C introspection era the compiled bindings carry, derived ONCE
+/// from three capability cfgs (`fetch_function` arrived at Galactic,
+/// `is_key_` at Jazzy, `is_rosidl_buffer_` at Lyrical), so the bridge
+/// classifier cannot receive them swapped. The hand-mirrored C++ bridge is
+/// shaped by the SAME cfgs, so every era from Humble onward is admitted;
+/// only the pre-Galactic shape (96-byte member, no fetch/assign) has no
+/// mirror yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CIntrospectionEra {
-    /// Before `is_key_` (Foxy … Iron).
+    /// Before `fetch_function` (Foxy, Galactic): 96-byte members.
+    PreGalactic,
+    /// `fetch_function` without `is_key_` (Humble, Iron): 112-byte members,
+    /// 56-byte `MessageMembers`, 32-byte `ServiceMembers`.
     PreJazzy,
-    /// `is_key_` without `is_rosidl_buffer_` (Jazzy, Kilted) — the era the
-    /// hand-mirrored C++ bridge is shaped for.
+    /// `is_key_` without `is_rosidl_buffer_` (Jazzy, Kilted).
     Jazzy,
-    /// `is_rosidl_buffer_` present (Lyrical, Rolling).
+    /// `is_rosidl_buffer_` present (Lyrical, Rolling): 120-byte members.
     PostJazzy,
 }
 
-/// The introspection era of THIS build's bindings — the ONE derivation.
+/// The introspection era of THIS build's bindings, the ONE derivation.
 pub fn c_introspection_era() -> CIntrospectionEra {
     match (
+        cfg!(cerulion_has_fetch_function),
         cfg!(cerulion_has_is_key),
         cfg!(cerulion_has_is_rosidl_buffer),
     ) {
-        (false, _) => CIntrospectionEra::PreJazzy,
-        (true, false) => CIntrospectionEra::Jazzy,
-        (true, true) => CIntrospectionEra::PostJazzy,
+        (false, _, _) => CIntrospectionEra::PreGalactic,
+        (true, false, _) => CIntrospectionEra::PreJazzy,
+        (true, true, false) => CIntrospectionEra::Jazzy,
+        (true, true, true) => CIntrospectionEra::PostJazzy,
     }
 }
 
 /// The C++ bridge verdict for THIS build under a given bypass mode — the
 /// call-site seam the resolvers use (`classify_cpp_bridge` over the
 /// build's own [`c_introspection_era`]), split out so the wiring is
-/// pinnable: a vendored build (rolling-pinned, post-Jazzy bits) classifies
-/// `Supported` in every bypass mode now that the mirror carries the
-/// Lyrical tail field; a pre-Jazzy build classifies `RefusePreJazzy` with
-/// the bypass `Off` and `Supported` under either bypass.
+/// pinnable: every build from Humble onward classifies `Supported` in
+/// every bypass mode, since the mirror is shaped by the same cfgs that
+/// classify the era; a pre-Galactic build classifies `RefusePreGalactic`
+/// with the bypass `Off` and `Supported` under either bypass.
 pub fn cpp_bridge_gate_for(bypass: CppBypassMode) -> CppBridgeGate {
     classify_cpp_bridge(bypass, c_introspection_era())
 }
@@ -475,34 +482,36 @@ pub fn cpp_bypass_warns_fired() -> u64 {
 }
 
 /// The registration-time refusal the C++ typesupport arm emits on a
-/// pre-Jazzy build (the generated path builds and
-/// claims Foxy/Humble bindings, but `ffi/introspection_cpp.rs`
-/// hand-mirrors the JAZZY-era C++ `MessageMember`/`MessageMembers`
-/// shape, so the resolvers must not accept C++ typesupports there).
-pub const CPP_BRIDGE_PRE_JAZZY_REFUSAL: &str = concat!(
-    "rmw_cerulion: this build targets a pre-Jazzy distro, whose C++ introspection ",
-    "layout differs from the Jazzy/Rolling shape the C++ bridge currently ",
-    "hand-mirrors — refusing the rclcpp (C++ typesupport) path at registration ",
-    "rather than misreading its introspection structs. Per-era C++ bridge variants ",
-    "are not implemented yet; rclpy and C-typesupport ",
-    "consumers are unaffected (the C introspection path is bindgen-generated ",
-    "against this distro's real headers and correct on every era)."
+/// pre-Galactic build (Foxy, Galactic): the generated path builds, but the
+/// C++ `MessageMember` there predates `fetch_function` and `assign_function`
+/// (96 bytes) and `ffi/introspection_cpp.rs` mirrors no such shape yet, so
+/// the arm refuses at registration instead of misreading member arrays.
+pub const CPP_BRIDGE_PRE_GALACTIC_REFUSAL: &str = concat!(
+    "rmw_cerulion: this build targets a pre-Galactic distro (Foxy or Galactic), whose ",
+    "C++ introspection MessageMember predates fetch_function and assign_function ",
+    "(96 bytes against the 112 the C++ bridge mirrors from Humble onward); ",
+    "refusing the rclcpp (C++ typesupport) path at registration rather than misreading ",
+    "its member arrays. The pre-Galactic C++ mirror is not implemented yet; rclpy and ",
+    "C-typesupport consumers are unaffected (the C introspection path is ",
+    "bindgen-generated against this distro's real headers and correct on every era)."
 );
 
 /// Gate the hand-mirrored C++ introspection bridge on the
-/// build's era — BOUNDED ON BOTH EDGES. `ffi/introspection_cpp.rs`
-/// hardcodes the JAZZY/KILTED-era C++ shape EXACTLY: `is_key_` /
-/// `has_any_key_member_` arrived at Jazzy (the lower bound) and
-/// `is_rosidl_buffer_` widened the C++ `MessageMember` at Lyrical (the
-/// upper bound — stride 112 → 120, so a `Supported` verdict there
-/// would walk rclcpp member arrays at the wrong stride). Every one of
-/// those fields was added to the C AND C++ introspection structs by
-/// the same rosidl release, so the C capability tokens
-/// (`cerulion_has_is_key`, `cerulion_has_is_rosidl_buffer`) are the
+/// build's era, BOUNDED BELOW ONLY. `ffi/introspection_cpp.rs` takes
+/// its shape from the same capability cfgs that select the era:
+/// `fetch_function` / `assign_function` arrived at Galactic (the lower
+/// bound; before it the C++ `MessageMember` is 96 bytes and has no
+/// mirror), `is_key_` / `has_any_key_member_` at Jazzy and
+/// `is_rosidl_buffer_` at Lyrical, each widening the mirror under its
+/// own cfg. Every one of those fields was added to the C AND C++
+/// introspection structs by the same rosidl release, so the C
+/// capability tokens (`cerulion_has_fetch_function`,
+/// `cerulion_has_is_key`, `cerulion_has_is_rosidl_buffer`) are the
 /// build-time proxies for the C++ mirror's era, folded ONCE into
-/// [`c_introspection_era`] — a compile-time constant, so the gated arm
-/// compiles to the right refusal per build (never a runtime sniff);
-/// [`cpp_bridge_gate_for`] is the resolver's seam over it.
+/// [`c_introspection_era`], a compile-time constant, so the gated arm
+/// compiles to the right verdict per build (never a runtime sniff);
+/// [`cpp_bridge_gate_for`] is the resolver's seam over it. The mirror
+/// and the classifier read the same cfgs, so they cannot disagree.
 ///
 /// The VENDORED-TEST BYPASS (see [`classify_cpp_bypass`] — by design
 /// the bypass rides `cfg(test)` silently or `test-seams` LOUDLY, with
@@ -521,8 +530,8 @@ pub const CPP_BRIDGE_PRE_JAZZY_REFUSAL: &str = concat!(
 /// compiled with the Lyrical tail field under the same capability cfg,
 /// and a vendored `.so` under any OTHER named runtime is already refused
 /// at init by the era guard. SELECTION of the correct gate, nothing
-/// more: the pre-Jazzy C++ variant is not implemented; the Jazzy and
-/// Lyrical container lanes execute the
+/// more: the pre-Galactic C++ variant is not implemented; the Jazzy,
+/// Lyrical and Humble container lanes execute the
 /// `Supported` arm, a lane for another era would execute its own, and this
 /// classifier's oracle covers every input because one build can only
 /// ever exercise one.
@@ -531,8 +540,9 @@ pub fn classify_cpp_bridge(bypass: CppBypassMode, era: CIntrospectionEra) -> Cpp
         return CppBridgeGate::Supported;
     }
     match era {
+        CIntrospectionEra::PreGalactic => CppBridgeGate::RefusePreGalactic,
+        CIntrospectionEra::PreJazzy => CppBridgeGate::Supported,
         CIntrospectionEra::Jazzy => CppBridgeGate::Supported,
-        CIntrospectionEra::PreJazzy => CppBridgeGate::RefusePreJazzy,
         CIntrospectionEra::PostJazzy => CppBridgeGate::Supported,
     }
 }
@@ -764,8 +774,8 @@ mod tests {
         // rendered ONCE, not formatted per refusal. Pointer identity is
         // the oracle a `format!`-per-call cannot satisfy — it could not
         // even return `&'static`.
-        let a = CppBridgeGate::RefusePreJazzy.rcl_error_text();
-        let b = CppBridgeGate::RefusePreJazzy.rcl_error_text();
+        let a = CppBridgeGate::RefusePreGalactic.rcl_error_text();
+        let b = CppBridgeGate::RefusePreGalactic.rcl_error_text();
         assert!(
             std::ptr::eq(a, b),
             "the cached rcl text must be the SAME object on every refusal"
@@ -775,10 +785,10 @@ mod tests {
         assert_eq!(
             a.as_ref(),
             format!(
-                "{CPP_BRIDGE_PRE_JAZZY_REFUSAL} built_for={} verdict=RefusePreJazzy",
+                "{CPP_BRIDGE_PRE_GALACTIC_REFUSAL} built_for={} verdict=RefusePreGalactic",
                 built_for()
             ),
-            "the cached rcl text for RefusePreJazzy is wrong"
+            "the cached rcl text for RefusePreGalactic is wrong"
         );
     }
 
@@ -981,15 +991,18 @@ mod tests {
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::Jazzy),
             CppBridgeGate::Supported
         );
-        // Lower bound (pre-Jazzy), contradictory-bits arm included:
+        // Humble/Iron: the mirror drops `is_key_`, `has_any_key_member_` and
+        // `event_members_` under the same cfg that classifies this era.
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreJazzy),
-            CppBridgeGate::RefusePreJazzy,
-            "a pre-Jazzy build must refuse the hand-mirrored C++ bridge"
+            CppBridgeGate::Supported,
+            "a Humble/Iron build compiles the pre-Iron-shaped C++ mirror"
         );
+        // Lower bound: no pre-Galactic mirror exists (96-byte members).
         assert_eq!(
-            classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreJazzy),
-            CppBridgeGate::RefusePreJazzy
+            classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreGalactic),
+            CppBridgeGate::RefusePreGalactic,
+            "a pre-Galactic build must refuse the hand-mirrored C++ bridge"
         );
         // Post-Jazzy (Lyrical/Rolling): the mirror carries the appended
         // `is_rosidl_buffer_` under the same capability cfg that classifies
@@ -1008,6 +1021,7 @@ mod tests {
         // Supported whatever the capability bits say …
         for bypass in [CppBypassMode::TestSilent, CppBypassMode::SeamsLoud] {
             for era in [
+                CIntrospectionEra::PreGalactic,
                 CIntrospectionEra::PreJazzy,
                 CIntrospectionEra::Jazzy,
                 CIntrospectionEra::PostJazzy,
@@ -1052,21 +1066,21 @@ mod tests {
             CppBridgeGate::Supported
         );
         for phrase in [
-            "pre-Jazzy",
-            "Jazzy/Rolling shape",
-            "refusing the rclcpp (C++ typesupport) path",
-            "are not implemented yet",
-            "rclpy and C-typesupport consumers are unaffected",
+            "pre-Galactic distro",
+            "predates fetch_function and assign_function",
+            "refusing the rclcpp (C++ typesupport) path at registration",
+            "is not implemented yet",
+            "C-typesupport consumers are unaffected",
         ] {
             assert!(
-                CPP_BRIDGE_PRE_JAZZY_REFUSAL.contains(phrase),
-                "pre-Jazzy refusal must contain {phrase:?}"
+                CPP_BRIDGE_PRE_GALACTIC_REFUSAL.contains(phrase),
+                "pre-Galactic refusal must contain {phrase:?}"
             );
         }
         assert_eq!(CppBridgeGate::Supported.refusal_message(), None);
         assert_eq!(
-            CppBridgeGate::RefusePreJazzy.refusal_message(),
-            Some(CPP_BRIDGE_PRE_JAZZY_REFUSAL)
+            CppBridgeGate::RefusePreGalactic.refusal_message(),
+            Some(CPP_BRIDGE_PRE_GALACTIC_REFUSAL)
         );
     }
 
@@ -1274,10 +1288,15 @@ mod tests {
         // vendored-only arm would be vacuous in a generated
         // lane, where a swapped cfg pair would refuse PreJazzy
         // unnoticed).
-        let expected_era = match (caps.contains(&"is_key"), caps.contains(&"is_rosidl_buffer")) {
-            (false, _) => CIntrospectionEra::PreJazzy,
-            (true, false) => CIntrospectionEra::Jazzy,
-            (true, true) => CIntrospectionEra::PostJazzy,
+        let expected_era = match (
+            caps.contains(&"fetch_function"),
+            caps.contains(&"is_key"),
+            caps.contains(&"is_rosidl_buffer"),
+        ) {
+            (false, _, _) => CIntrospectionEra::PreGalactic,
+            (true, false, _) => CIntrospectionEra::PreJazzy,
+            (true, true, false) => CIntrospectionEra::Jazzy,
+            (true, true, true) => CIntrospectionEra::PostJazzy,
         };
         assert_eq!(c_introspection_era(), expected_era);
         assert_eq!(
