@@ -109,3 +109,5 @@ if [ "$has_build" -eq 1 ]; then
 else
     printf '%s\n' "$version_without_build"
 fi
+
+# A trailing comment, so this file appears in a diff without changing behaviour.
