@@ -889,6 +889,26 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `src/completion_wiring_tests.rs` | Wired-completer inventory (set equality + spelled-out create-verb guard), free-form inventory walk, `.mcap` path filter; run via `cargo test -p cerulion_cli --bin cerulion` | file-local mutex | none |
 | `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the orphan port-tag reclaim between exactly two sweeps with the verb's mode as its dry-run bit and the SECOND sweep's convergence handed to the gate, the report-only fork placed after the registry block and returning before the summary, plus hand-oracle pins of the three pure renderers and a call-count seam over `sweep_one_node` proving a report never calls the removal. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
 
+**Execution mode in these spawns (hermetic in three directions).** A `graph
+run` that reaches the SUPERVISOR route (a `process_groups:` graph, or any
+unpartitioned graph the non-TTY floor derives a partition for) FREE-RUNS by
+default, and `CERULION_EXECUTION_MODE=lockstep` opts out, so no e2e spawn may
+INHERIT the variable from the developer's shell: one exported value would move
+a whole binary onto the other contract without a single assertion changing. The
+rule is `mp_support::SpawnExecutionMode` (pin `lockstep`, spell out `free_run`,
+or REMOVE the variable). `mp_execution_mode` drives all three directions, and
+`mp_record`, `plain_run_resim` and `credit_death` carry per-arm pins.
+`mp_split_pair` and `mp_supervisor_box_test` pin the `lockstep` OPT-OUT,
+because their whole property is the barrier and a free-run deployment has none.
+Every other binary whose spawn can reach the supervisor REMOVES the variable,
+so that it exercises the shipped default: `mp_auto_partition`,
+`mp_default_ns`, `mp_consumer_first_spawn`, `network_gateway_mp`,
+`graph_run_validate_gate` (its no-`--single-process` recovery arms),
+`wedge_alarm`, and `ros2_graph` (its multi-process default arm, through the
+sandbox helper). `flashback_resim` removes it on a `--single-process` run,
+where the variable is inert and removing it only keeps the inert-request warn
+out of a log the test reads.
+
 ## 10. `cerulion clean`: dead-node sweep, orphan port-tag reclaim, state-file gate
 
 `cerulion clean` walks iceoryx2's node registry ONCE with its trace lines
