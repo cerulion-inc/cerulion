@@ -793,7 +793,15 @@ mod tests {
                 );
             }
             Err(WatchError::Unsupported) => {}
-            other => panic!("a nonexistent root must be refused, got {other:?}"),
+            Err(e) => panic!(
+                "a nonexistent root must be refused as NoDirectory so the message names what \
+                 was looked for; got {e:?}"
+            ),
+            Ok(w) => panic!(
+                "a nonexistent root must be REFUSED, not armed - a watch on nothing never \
+                 fires, and the caller would read that as a settled machine. It armed on {}",
+                w.watched_path().display()
+            ),
         }
     }
 }
