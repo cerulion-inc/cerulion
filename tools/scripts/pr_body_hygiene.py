@@ -81,9 +81,13 @@ stale one would silently drop somebody's edit.
 """
 
 import argparse
+import contextlib
+import io
 import json
+import os
 import re
 import sys
+import tempfile
 
 # Paired markers, as (opening token, closing token). Each token is matched as
 # an HTML comment whose content is exactly that token, with any amount of
@@ -405,6 +409,50 @@ def _case(name, body, expected, failures):
         )
 
 
+def _json_case(name, payload, expect_exit, expect_body, failures):
+    """Drive `main` over a `--from-json` file and check the exit and the bytes.
+
+    The reading half needs its own oracle: a body that is not a string reaches
+    the stripper, and a FALSY one would otherwise be written back as an empty
+    body over a real one.
+    """
+    work = tempfile.mkdtemp(prefix="pr-body-hygiene-")
+    source = os.path.join(work, "pr.json")
+    target = os.path.join(work, "out.md")
+    with open(source, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--from-json", source, "--out", target, "--extract-only"])
+    except Exception as raised:  # noqa: BLE001 - a raise here IS the failure
+        # Reading a response must fail with a reason, never with a traceback:
+        # the caller is a workflow step, and a traceback says nothing about
+        # which response was wrong.
+        failures.append(
+            "{}: raised {}: {}".format(name, type(raised).__name__, raised)
+        )
+        return
+    if code != expect_exit:
+        failures.append(
+            "{}: expected exit {}, got {} ({})".format(
+                name, expect_exit, code, err.getvalue().strip()
+            )
+        )
+    elif expect_body is None:
+        if os.path.exists(target):
+            failures.append("{}: wrote a file for input it should have refused".format(name))
+        elif not err.getvalue().strip():
+            failures.append("{}: refused without saying why".format(name))
+    else:
+        with open(target, encoding="utf-8", newline="") as handle:
+            got = handle.read()
+        if got != expect_body:
+            failures.append(
+                "{}:\n  expected {!r}\n  got      {!r}".format(name, expect_body, got)
+            )
+
+
 def _refuses(name, body, failures):
     try:
         got = clean_body(body)
@@ -659,6 +707,20 @@ def self_test():
     if clean_body(loaded) == loaded:
         failures.append("the stripper returned a body that carried a block unchanged")
 
+    # READING THE RESPONSE. A body is a string, or null when there is none.
+    _json_case("a string body", '{"body": "text"}', EXIT_OK, "text", failures)
+    _json_case("a null body", '{"body": null}', EXIT_OK, "", failures)
+    # A TRUTHY non-string reaches the stripper and raises where nothing catches
+    # it; a FALSY one would become the empty string and be written back over a
+    # real body. Both are refused, with a reason, having written nothing.
+    for literal in ("true", "0", "[]", "{}"):
+        _json_case(
+            "a body that is " + literal, '{"body": %s}' % literal, EXIT_ERROR, None, failures
+        )
+    _json_case("a response with no body field", "{}", EXIT_ERROR, None, failures)
+    _json_case("a response that is not an object", "[]", EXIT_ERROR, None, failures)
+    _json_case("a file that is not JSON", "not json", EXIT_ERROR, None, failures)
+
     for failure in failures:
         sys.stderr.write("pr-body-hygiene self-test FAILED: {}\n".format(failure))
     if failures:
@@ -680,7 +742,22 @@ def read_body(args):
                     args.from_json
                 )
             )
-        return payload["body"] or ""
+        body = payload["body"]
+        # A pull request body is a string, or null when there is none. Anything
+        # else is not the response this claims to be, and the two ways of
+        # carrying on are both bad: a truthy non-string reaches the stripper and
+        # raises where nothing catches it, and a FALSY one (0, [], {}, false)
+        # becomes the empty string, is reported as `changed`, and would have the
+        # caller write an empty body over a real one.
+        if body is None:
+            return ""
+        if not isinstance(body, str):
+            raise ValueError(
+                "{}: the 'body' field is {}, not a string or null".format(
+                    args.from_json, type(body).__name__
+                )
+            )
+        return body
     with open(args.input, encoding="utf-8", newline="") as handle:
         return handle.read()
 
