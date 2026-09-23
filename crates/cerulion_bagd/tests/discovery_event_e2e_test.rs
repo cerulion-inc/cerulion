@@ -359,14 +359,28 @@ fn a_burst_of_topics_is_coalesced_into_far_fewer_wakes_than_topics() {
 /// A watch that cannot be ARMED degrades to the timed walk, says so, and keeps
 /// discovering.
 ///
-/// Three assertions, because the degradation has three distinct ways to go
-/// wrong and each would be invisible without its own: it could go silent (no
-/// warn), it could be unobservable (`wake_source` still claiming `Events`), or
-/// it could simply stop discovering. The last is the one that matters to a
-/// recording, so the arm ends by proving a topic created after the degrade is
-/// still enumerated.
+/// The degradation has three distinct ways to go wrong and each would be
+/// invisible without its own check: it could be unobservable (`wake_source`
+/// still claiming `Events`), it could go silent, or it could simply stop
+/// discovering. The last is the one that matters to a recording, so the arm
+/// ends by proving a topic created after the degrade is still enumerated.
+///
+/// # Why the loudness half is split in two
+///
+/// The warn is emitted on the WORKER thread, and `tracing_test` matches lines
+/// by the test's own span prefix - an event with no span is never matched, so
+/// `logs_contain` returns false for a line it can be watched printing. Rather
+/// than assert something the harness cannot see, the property is decomposed
+/// into the two halves that together mean it:
+///
+/// * `wake_source()` flipping to `Poll` proves `degrade_to_poll` RAN, because
+///   that function is the only thing that writes it; and
+/// * a source walk proves `degrade_to_poll` reports at `warn!` with the text an
+///   operator would grep for.
+///
+/// Together those are "the degrade was reported, loudly, with that wording",
+/// deterministically and without a subprocess.
 #[test]
-#[tracing_test::traced_test]
 fn a_watch_that_cannot_be_armed_falls_back_to_a_timed_walk_loudly() {
     let mgr: Arc<TransportManager> = make_manager(8);
     let topic = unique_topic("fallback");
@@ -390,11 +404,28 @@ fn a_watch_that_cannot_be_armed_falls_back_to_a_timed_walk_loudly() {
         "an unarmable watch must be OBSERVABLE as a degrade, not merely logged - an operator \
          reading a recording's CPU cost has to be able to tell which engine ran"
     );
-    assert!(
-        logs_contain("falls back to RE-ENUMERATING the directory on a timer"),
-        "the degrade must be LOUD. A recorder that silently stopped watching would keep its \
-         coverage and quietly pay a full service-directory walk on every cadence"
+    // The other half of "loudly": the function that just ran reports it at
+    // `warn!`, with the wording an operator would grep for.
+    let src = code_only(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/discovery_scan.rs"
+        ))
+        .expect("read cerulion_bagd/src/discovery_scan.rs"),
     );
+    let reporter = fn_body(&src, "degrade_to_poll");
+    for required in [
+        "tracing::warn!",
+        "falls back to RE-ENUMERATING the directory on a timer",
+        "WakeSource::Poll",
+    ] {
+        assert!(
+            reporter.contains(required),
+            "`degrade_to_poll` must contain `{required}`. The degrade must be LOUD AND \
+             observable: a recorder that silently stopped watching would keep its coverage and \
+             quietly pay a full service-directory walk on every cadence. Body:\n{reporter}"
+        );
+    }
 
     // And it still works: the degraded engine is slow, never blind.
     let late = unique_topic("fallback-late");

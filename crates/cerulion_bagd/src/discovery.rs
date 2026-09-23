@@ -1705,7 +1705,8 @@ mod tests {
             (true, 900, Some(400), true),
             (true, 1000, Some(499), true),
             (true, 1000, Some(500), false),
-            (true, 1500, Some(1400), true),
+            // A find LATE in the run still extends, right up to the cap.
+            (true, 1500, Some(1), true),
             // The cap outranks a stream of finds: a machine that never stops
             // producing topics must not hold the channel set open forever.
             (true, 2000, Some(0), false),
