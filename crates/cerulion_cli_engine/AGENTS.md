@@ -15,9 +15,26 @@ TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
 `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
 Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
+- Account-directory listing and viewer selection live in `account_robot_access`;
+  only netd opens WAN endpoints. Listing probes share a four-second budget with
+  a 500 ms cap per robot and never pair or demand. Directory rows are not presence.
+  Keep LAN/account identities distinct until both robot ID and endpoint key match.
+  Once an account target is selected, failures never retry it as a LAN name.
 - Enforce invariants at the engine boundary; CLI checks are UX.
 - `node build`'s PATH rustc probe is advisory: Cargo compiler overrides may differ.
   Only the built cdylib's full fingerprint is authoritative, checked at load.
+- Network-serving graph/node runs and non-dry-run ROS attach require a persisted
+  prior login, including offline with expired tokens. Network-off and inert clocks
+  remain exempt. Keep the shared local reader in `cerulion_netd::serving_login`;
+  never prompt or refresh from background serving startup.
+- Authentication retains `/v1/me.account_id`; UUID identities map through
+  `account_identity::pairing_account_id` for pairing. Hosted certificate login
+  checks the advertised mapping, challenge, registration, leaf account and key
+  before publishing any auth/cache state. Opaque auth labels never become pairing IDs.
+- Login stages `device-chain.json` with its leaf caches and commits it last under
+  the auth store lock. `owner_certificate::load` requires its leaf to match
+  `device.cert`, the login account, and `desk.key`; partial or identity-only logins
+  cannot reuse an old chain. The robot still verifies trust, expiry and revocation.
 - `node_metadata::parse_node_metadata` is the sole port/trigger source. Raw-FFI markers optional; only `INFO_END` before `INFO_START` is fatal.
 - Never hand-compute pinned schema hashes; run `pinned_hashes` after a recipe change
   and copy its values into `topic_cmd.rs`.
@@ -43,11 +60,19 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
 pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.
 ## Testing
+- `owner_certificate::tests::login_writer_excludes_std_shared_snapshot_lock_on_the_same_sibling`
+  pins the CLI writer's flock interoperability with netd's consistent shared reader.
 - `cargo test -p cerulion_cli_engine` covers most binaries.
+- `account_robot_access_e2e_test` runs actual account HTTP and local netd IPC in
+  isolated homes; run it alone with `-- --test-threads=1` (it changes the environment).
 - Run `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`
   individually with `-- --test-threads=1`; the latter two share iceoryx2's ns.
 - Build `test_node_macro_period_cdylib` + `test_node_macro_data_trigger_cdylib`
   before `graph_profile_iox2_test`; `mdns_live_test` is hardware-only, ignored.
+- Shared pairing-v1, chain and grants JSON oracles must stay byte-identical to the
+  app fixtures. Run `pairing_protocol_parity_test`, `pairing_chain_parity_test` and
+  `pairing_grants_parity_test` individually; never generate expected bytes from the
+  implementation under test.
 ## Gotchas
 - `proc_macro2::Literal::to_string()` preserves `100_000`, `100u64`, `0xff`; use
   `parse_int_literal` or `syn::LitInt::base10_parse`.

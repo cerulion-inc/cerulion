@@ -62,6 +62,7 @@ use serial_test::serial;
 // send_signal, read_file, the prebuilt-fixture resolvers). `#![allow(dead_code)]`
 // in the module covers the helpers this binary does not use.
 mod mp_support;
+mod serving_login_support;
 use mp_support::{
     dylib_file, fixture_cdylib, read_file, send_signal, wait_for_bag_state, ChildGuard,
     RECORDED_WINDOW_TIMEOUT,
@@ -320,12 +321,20 @@ fn spawn_graph_run(
     netd_sock: &Path,
     extra: &[&str],
 ) -> (ChildGuard, PathBuf, PathBuf) {
+    let login_home = if network_off {
+        root.join("never-logged-in")
+    } else {
+        serving_login_support::expired_login(root)
+    };
     let stdout_path = root.join(format!("{graph}.stdout"));
     let stderr_path = root.join(format!("{graph}.stderr"));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
     cmd.args(["graph", "run", graph, "--single-process"])
         .args(extra)
         .current_dir(root)
+        .env("CERULION_HOME", &login_home)
+        .env_remove("CERULION_LOGIN_GATE")
+        .env_remove("CERULION_NETWORK")
         .env_remove("CARGO_TARGET_DIR")
         .env(
             "RUST_LOG",

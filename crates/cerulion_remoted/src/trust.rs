@@ -47,7 +47,8 @@ use cerulion_pairing::format::{
 };
 use cerulion_pairing::pake::CpaceConfirmed;
 use cerulion_pairing::verify::{
-    EpochOutcome, OwnerGrantPresentation, PairingPresentation, TrustStore,
+    EpochOutcome, OwnerCertificatePresentationWire, OwnerGrantPresentation, PairingPresentation,
+    TrustStore,
 };
 use cerulion_pairing::PairingError;
 
@@ -292,6 +293,24 @@ impl SharedTrust {
             .store
             .verify_and_establish(presentation, &peer, now_ns, name)?;
         let account = verified.account();
+        self.commit(guard, authenticated_peer_key, account)?;
+        Ok(account)
+    }
+
+    /// Admit a certified device of the current owner without rewriting its access
+    /// row. The verified binding is published only after store and index persist.
+    pub fn verify_owner_certificate_and_establish(
+        &self,
+        presentation: &OwnerCertificatePresentationWire,
+        authenticated_peer_key: &[u8; 32],
+        now_ns: u64,
+    ) -> Result<AccountId, TrustError> {
+        let peer = PublicKey(*authenticated_peer_key);
+        let _writer = self.writer_lock();
+        let mut guard = self.lock();
+        let account = guard
+            .store
+            .verify_owner_certificate(presentation, &peer, now_ns)?;
         self.commit(guard, authenticated_peer_key, account)?;
         Ok(account)
     }
@@ -592,6 +611,88 @@ mod tests {
     fn set_mode(dir: &std::path::Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn owner_certificate(key: [u8; 32]) -> OwnerCertificatePresentationWire {
+        let chain = pair_chain(OWNER, key, Scope::OWNER_FULL);
+        OwnerCertificatePresentationWire::new(chain.intermediate, chain.device_cert)
+    }
+
+    #[test]
+    fn owner_certificate_adds_durable_binding_without_changing_owner_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        let before = postcard::to_stdvec(shared.lock().store.access_rows()).unwrap();
+        let key = pubkey(&SigningKey::from_bytes(&[8; 32])).0;
+        assert_eq!(shared.snapshot_for_key(&key).1, KeyAccess::Unpaired);
+        assert_eq!(
+            shared
+                .verify_owner_certificate_and_establish(&owner_certificate(key), &key, T_NOW + 1)
+                .unwrap(),
+            OWNER
+        );
+        assert_eq!(
+            shared.snapshot_for_key(&key).1,
+            KeyAccess::Allowed(Scope::OWNER_FULL)
+        );
+        assert_eq!(
+            postcard::to_stdvec(shared.lock().store.access_rows()).unwrap(),
+            before
+        );
+        let loaded = reload(
+            &dir.path().join("trust_store"),
+            &dir.path().join("device_index.json"),
+        );
+        assert_eq!(
+            loaded.snapshot_for_key(&key).1,
+            KeyAccess::Allowed(Scope::OWNER_FULL)
+        );
+        assert_eq!(
+            postcard::to_stdvec(loaded.lock().store.access_rows()).unwrap(),
+            before
+        );
+        assert_eq!(loaded.lock().store.high_water_ns(), T_NOW + 1);
+    }
+
+    #[test]
+    fn owner_certificate_store_and_index_failures_never_publish_new_binding() {
+        for fail_store in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let shared = provision(dir.path());
+            shared
+                .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+                .unwrap();
+            // A directory at the serializer's temp path deterministically fails
+            // writes without relying on uid-dependent permission behavior.
+            let blocker = if fail_store {
+                "trust_store.tmp"
+            } else {
+                "device_index.json.tmp"
+            };
+            std::fs::create_dir(dir.path().join(blocker)).unwrap();
+            let key = pubkey(&SigningKey::from_bytes(&[8; 32])).0;
+            assert!(matches!(
+                shared.verify_owner_certificate_and_establish(
+                    &owner_certificate(key),
+                    &key,
+                    T_NOW + 1
+                ),
+                Err(TrustError::Persist(_))
+            ));
+            assert_eq!(shared.snapshot_for_key(&key).1, KeyAccess::Unpaired);
+            let loaded = reload(
+                &dir.path().join("trust_store"),
+                &dir.path().join("device_index.json"),
+            );
+            assert_eq!(loaded.snapshot_for_key(&key).1, KeyAccess::Unpaired);
+            assert_eq!(
+                loaded.snapshot_for_key(&[7; 32]).1,
+                KeyAccess::Allowed(Scope::OWNER_FULL)
+            );
+        }
     }
 
     #[test]

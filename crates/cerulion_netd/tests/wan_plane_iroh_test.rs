@@ -627,12 +627,12 @@ fn dual_plane_routes_wan_robot_to_iroh_and_delivers() {
 
     // The routing decision (the picker through the DualMirrorPlane surface).
     assert_eq!(
-        dual.plane_for(&TopicKey::new("ubuntu", &topic)),
+        dual.plane_for(&TopicKey::new("ubuntu", &topic)).unwrap(),
         Plane::Iroh,
         "a WAN-registered robot routes to iroh"
     );
     assert_eq!(
-        dual.plane_for(&TopicKey::new("lan-bot", "/tf")),
+        dual.plane_for(&TopicKey::new("lan-bot", "/tf")).unwrap(),
         Plane::Zenoh,
         "an unregistered robot routes to the zenoh LAN default"
     );
@@ -2034,3 +2034,9 @@ fn the_desk_account_is_resolved_at_the_dial_not_before() {
     let _ = producer.join();
     drop(plane);
 }
+
+#[path = "wan_plane_iroh_test/owner_pair.rs"]
+mod owner_pair;
+
+#[path = "wan_plane_iroh_test/poison_retirement.rs"]
+mod poison_retirement;

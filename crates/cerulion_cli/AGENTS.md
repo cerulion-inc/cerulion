@@ -5,6 +5,10 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 
 ## Invariants
 
+- Account robot lookup stays in the engine. `topic list --no-network` and
+  completions never fetch account data. Resolve `viz --robot` before starting
+  vizd, retain its daemon hold through command dispatch, and show lookup failures.
+
 - `clap_complete::CompleteEnv::with_factory(Cli::command).complete()` is the FIRST
   statement of `main()` - it owns stdout for a completion invocation. Nothing may print
   before it, and completion output must stay bare candidates with zero stderr bytes
@@ -30,6 +34,10 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   `cargo test -p cerulion_cli --bin cerulion`. They move the process cwd + `HOME` under
   a file-local mutex declared as the fixture's LAST field - Rust drops fields in
   declaration order, so a mutex declared first releases before the env guards restore.
+- `account_offline_dispatch_test` exercises the real binary with positive-control
+  HTTP/spawn sentinels. Run it alone with `-- --test-threads=1`; offline topic
+  listing and hostile-env robot completion must make no account request or
+  netd spawn. Its project-local iceoryx config isolates both root and prefix.
 - The e2e binaries drive the REAL binary; run each `#[serial]` one individually with
   `-- --test-threads=1`. Build fixtures first:
   - `replay_cli_test`: `cargo build -p test_node_macro_period_cdylib

@@ -32,6 +32,10 @@ struct Cli {
     #[arg(long, env = "CERULION_STATE_ROOT")]
     state_root: Option<PathBuf>,
 
+    /// Internal registration writer used by the automatic bootstrap worker.
+    #[arg(long, hide = true, conflicts_with_all = ["key_file", "store_file", "store_mac_key_file", "index_file"])]
+    provision_bundle: Option<PathBuf>,
+
     /// Override the device-key file (32 raw bytes; public half = EndpointId).
     #[arg(long)]
     key_file: Option<PathBuf>,
@@ -145,7 +149,14 @@ async fn main() -> ExitCode {
     // (a per-linked-copy static — see `init_iceoryx_log_level`), before the SHM
     // tap path can touch iceoryx2.
     cerulion_core::iceoryx_logger::init_iceoryx_log_level_from_env();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if let Some(registration_bundle) = cli.provision_bundle.take() {
+        let state_root = cli
+            .state_root
+            .take()
+            .unwrap_or_else(|| PathBuf::from(cerud::constants::DEFAULT_STATE_ROOT));
+        return provision_registered_robot(state_root, registration_bundle);
+    }
     let config = match cli.into_config() {
         Ok(c) => c,
         Err(e) => {
@@ -162,6 +173,85 @@ async fn main() -> ExitCode {
         Err(e) => {
             tracing::error!(error = %e, "cerulion_remoted: failed");
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn provision_registered_robot(state_root: PathBuf, registration_bundle: PathBuf) -> ExitCode {
+    use cerulion_remoted::provision::{provision, ProvisionConfig};
+    use std::io::Write;
+
+    let config = ProvisionConfig {
+        state_root,
+        registration_bundle,
+    };
+    let now_ns = cerulion_remoted::RemotedClock::wall().now_ns();
+    match provision(&config, now_ns) {
+        Ok(registered) => {
+            let output = serde_json::json!({
+                "version": 1,
+                "robot_id": hex::encode(registered.robot_id.0),
+                "endpoint_id": hex::encode(registered.endpoint_id.0),
+                "owner_account": hex::encode(registered.owner_account.0),
+            });
+            let mut stdout = std::io::stdout().lock();
+            if serde_json::to_writer(&mut stdout, &output).is_err()
+                || stdout.write_all(b"\n").is_err()
+                || stdout.flush().is_err()
+            {
+                tracing::error!(
+                    "registered robot state is durable, but the result could not be written"
+                );
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "automatic robot provisioning failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn automatic_writer_argument_is_hidden_and_parses_as_a_path() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--provision-bundle"));
+        let cli = Cli::try_parse_from([
+            "cerulion-remoted",
+            "--state-root",
+            "/state",
+            "--provision-bundle",
+            "/state/registration.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.provision_bundle,
+            Some(PathBuf::from("/state/registration.json"))
+        );
+    }
+
+    #[test]
+    fn automatic_writer_cannot_silently_ignore_individual_state_overrides() {
+        for argument in [
+            "--key-file",
+            "--store-file",
+            "--store-mac-key-file",
+            "--index-file",
+        ] {
+            assert!(Cli::try_parse_from([
+                "cerulion-remoted",
+                "--provision-bundle",
+                "/state/registration.json",
+                argument,
+                "/different-state",
+            ])
+            .is_err());
         }
     }
 }

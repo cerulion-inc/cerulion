@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 
 use super::access::{AccessRow, EpochOutcome, OwnershipState, PairingSource};
 use super::chain;
-use super::{OwnerGrantPresentation, PairingPresentation, VerifiedPairing};
+use super::{
+    OwnerCertificatePresentationWire, OwnerGrantPresentation, PairingPresentation, VerifiedPairing,
+};
 use crate::crypto::{self, VerifyResult};
 use crate::error::{ser_err, CertKind, PairingError};
 use crate::format::canonical::checked_len_u32;
@@ -409,6 +411,66 @@ impl TrustStore {
             return Err(PairingError::RobotUnclaimed);
         }
         self.verify_chain(pres, authenticated_peer_key, now_ns)
+    }
+
+    /// Verify an owner's certificate chain for a new device binding. The existing
+    /// owner row is preserved byte-for-byte; only the rollback floor advances.
+    /// Certificate and issuer scopes must cover that row, because the access index
+    /// maps devices to account-wide permissions, not per-device permissions.
+    pub fn verify_owner_certificate(
+        &mut self,
+        pres: &OwnerCertificatePresentationWire,
+        authenticated_peer_key: &PublicKey,
+        now_ns: u64,
+    ) -> Result<AccountId, PairingError> {
+        pres.validate_version()?;
+        let owner = self.owner().ok_or(PairingError::RobotUnclaimed)?;
+        if now_ns < self.inner.high_water_ns {
+            return Err(PairingError::RollbackDetected {
+                now_ns,
+                high_water_ns: self.inner.high_water_ns,
+            });
+        }
+        chain::verify_intermediate(&self.inner.root_set, &pres.intermediate, now_ns)?;
+        chain::verify_device_cert(
+            &pres.device_cert,
+            &pres.intermediate.cert.intermediate_key,
+            &pres.intermediate.cert.max_scope,
+            authenticated_peer_key,
+            now_ns,
+        )?;
+        if pres.device_cert.cert.account != owner {
+            return Err(PairingError::NotOwner);
+        }
+        if self.inner.revoked_accounts.contains(&owner) {
+            return Err(PairingError::RevokedByEpoch {
+                epoch: self.inner.current_epoch,
+            });
+        }
+        if self.inner.revoked_devices.contains(authenticated_peer_key) {
+            return Err(PairingError::RevokedDeviceByEpoch {
+                epoch: self.inner.current_epoch,
+            });
+        }
+        let row = self
+            .inner
+            .access_rows
+            .iter()
+            .find(|row| row.account == owner)
+            .ok_or(PairingError::StoreCorrupt(
+                "claimed owner has no access row",
+            ))?;
+        if row.revoked {
+            return Err(PairingError::RevokedByOwner);
+        }
+        if row.expires_at_ns.is_some_and(|expiry| now_ns >= expiry) {
+            return Err(PairingError::OwnerAccessExpired);
+        }
+        if !row.scope.is_attenuation_of(&pres.device_cert.cert.scope) {
+            return Err(PairingError::OwnerCertificateScopeInsufficient);
+        }
+        self.inner.high_water_ns = now_ns;
+        Ok(owner)
     }
 
     /// The pure offline chain verification shared by [`TrustStore::verify_new_pairing`]
@@ -1144,4 +1206,106 @@ fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod owner_certificate_state_tests {
+    use super::*;
+    use crate::format::{DeviceCert, IntermediateCert, PrincipalKind, Validity, FORMAT_VERSION};
+    use ed25519_dalek::SigningKey;
+
+    fn fixture() -> (TrustStore, OwnerCertificatePresentationWire) {
+        let root = SigningKey::from_bytes(&[1; 32]);
+        let issuer = SigningKey::from_bytes(&[2; 32]);
+        let issuer_key = PublicKey(issuer.verifying_key().to_bytes());
+        let device = SigningKey::from_bytes(&[3; 32]);
+        let device_key = PublicKey(device.verifying_key().to_bytes());
+        let validity = Validity {
+            not_before_ns: 0,
+            not_after_ns: 100,
+        };
+        let proof = OwnerCertificatePresentationWire::new(
+            IntermediateCert {
+                version: FORMAT_VERSION,
+                intermediate_key: issuer_key,
+                validity,
+                issued_at_ns: 0,
+                max_scope: Scope::OWNER_FULL,
+            }
+            .sign_by_roots(&[&root]),
+            DeviceCert {
+                version: FORMAT_VERSION,
+                device_key,
+                account: AccountId([4; 32]),
+                principal_kind: PrincipalKind::Human,
+                scope: Scope::OWNER_FULL,
+                validity,
+                issued_at_ns: 0,
+                issuer_key,
+            }
+            .sign(&issuer),
+        );
+        let mut store = TrustStore::provision(
+            RobotId([5; 32]),
+            device_key,
+            RootSet::new(vec![PublicKey(root.verifying_key().to_bytes())], 1).unwrap(),
+            b"unit recovery",
+            1,
+        )
+        .unwrap();
+        store
+            .claim(
+                AccountId([4; 32]),
+                b"unit recovery",
+                PrincipalKind::Human,
+                1,
+            )
+            .unwrap();
+        (store, proof)
+    }
+
+    #[test]
+    fn owner_certificate_cannot_clear_a_sticky_revoked_owner_row() {
+        let (mut store, proof) = fixture();
+        // owner_revoke intentionally prevents self-lockout. A persisted revoked
+        // owner row must still fail closed if imported or loaded from older state.
+        store.inner.access_rows[0].revoked = true;
+        assert!(matches!(
+            store.verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 2),
+            Err(PairingError::RevokedByOwner)
+        ));
+        assert!(store.access_rows()[0].revoked);
+        assert_eq!(store.high_water_ns(), 1);
+    }
+
+    #[test]
+    fn owner_certificate_never_synthesizes_a_missing_owner_row() {
+        let (mut store, proof) = fixture();
+        store.inner.access_rows.clear();
+        assert!(matches!(
+            store.verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 2),
+            Err(PairingError::StoreCorrupt(
+                "claimed owner has no access row"
+            ))
+        ));
+        assert!(store.access_rows().is_empty());
+        assert_eq!(store.high_water_ns(), 1);
+    }
+
+    #[test]
+    fn owner_certificate_preserves_finite_row_and_refuses_its_expiry_boundary() {
+        let (mut store, proof) = fixture();
+        store.inner.access_rows[0].expires_at_ns = Some(3);
+        let original = store.access_rows().to_vec();
+        store
+            .verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 2)
+            .unwrap();
+        assert_eq!(store.access_rows(), original);
+        assert!(matches!(
+            store.verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 3),
+            Err(PairingError::OwnerAccessExpired)
+        ));
+        assert_eq!(store.access_rows(), original);
+        assert_eq!(store.high_water_ns(), 2);
+    }
 }

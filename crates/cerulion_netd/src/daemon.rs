@@ -148,6 +148,13 @@ pub struct NetdConfig {
     /// a failed gateway boot leaves a loudly-warned daemon a later
     /// `register_egress` can heal, rather than a silent exit-and-never-respawn.
     pub idle_self_exit: bool,
+    /// Production network daemons require prior login before a raw local
+    /// registration can boot egress. Injected library daemons default to no gate.
+    pub egress_login: crate::serving_login::EgressLoginPolicy,
+    /// Recheck installed account identity every 250 ms. Production enables this;
+    /// injected daemons opt in explicitly. The watch checks local state and
+    /// retires stale readers; it never dials or fetches account-service data.
+    pub account_identity_watch: bool,
 }
 
 impl Default for NetdConfig {
@@ -158,6 +165,8 @@ impl Default for NetdConfig {
             change_coalesce_window: crate::catalog_events::CHANGE_COALESCE_WINDOW,
             connect_endpoints: Vec::new(),
             idle_self_exit: true,
+            egress_login: crate::serving_login::EgressLoginPolicy::default(),
+            account_identity_watch: false,
         }
     }
 }
@@ -200,6 +209,7 @@ struct Ctx {
     /// shared embedded gateway over the SAME session the mirror plane owns), or the
     /// [`NoopEgressPlane`] for a mirror-only daemon.
     egress_plane: Arc<dyn EgressPlane>,
+    egress_login: crate::serving_login::EgressLoginPolicy,
     /// The query plane — the CATALOG/SCHEMA query surface over the SAME
     /// session, or the [`NoopQueryPlane`] for a mirror-only daemon (an explicit
     /// no-network refusal the consumer degrades on).
@@ -284,6 +294,36 @@ impl Ctx {
     /// Dispatch one request from connection `conn` into its response.
     fn dispatch(&self, conn: ConnId, req: Request) -> Response {
         match req {
+            Request::ServingSchemaSnapshot { id } => {
+                match self.egress_plane.serving_schema_snapshot() {
+                    Ok(serving_schema) => Response::ServingSchemaSnapshot(
+                        crate::protocol::ServingSchemaSnapshotResponse { id, serving_schema },
+                    ),
+                    Err(error) => Response::error(Some(id), error, None, None),
+                }
+            }
+            Request::AccountAccess { id, action } => {
+                match action.validate().and_then(|()| match &action {
+                    crate::account_access::AccountAccessRequest::Install { snapshot } => self
+                        .plane
+                        .install_account_snapshot(snapshot, &mut lock_registry(&self.registry)),
+                    _ => self.plane.account_access(&action),
+                }) {
+                    Ok(reply) if action.accepts(&reply) => {
+                        Response::AccountAccess(crate::account_access::AccountAccessResponse {
+                            id,
+                            account_access: reply,
+                        })
+                    }
+                    Ok(_) => Response::error(
+                        Some(id),
+                        "account controller returned a mismatched operation",
+                        None,
+                        None,
+                    ),
+                    Err(error) => Response::error(Some(id), error, None, None),
+                }
+            }
             Request::Demand {
                 id,
                 robot,
@@ -339,6 +379,43 @@ impl Ctx {
     /// which rides out on the response so the consumer can tell "nobody has this"
     /// from "netd cannot answer yet" (the cold-start false not-found).
     fn query_catalog(&self, id: u64, robot: Option<String>) -> Response {
+        match robot
+            .as_deref()
+            .map(crate::account_access::parse_robot_route)
+            .transpose()
+        {
+            Err(error) => return Response::error(Some(id), error, robot, None),
+            Ok(Some(Some(robot_id))) => {
+                let action = crate::account_access::AccountAccessRequest::Catalog { robot_id };
+                return match self.plane.account_access(&action) {
+                    Ok(crate::account_access::AccountAccessReply::Catalog {
+                        robot_id: returned_id,
+                        mut catalog,
+                    }) if returned_id == robot_id
+                        && catalog.version
+                            == cerulion_core::transport::cerulion_q::CATALOG_WIRE_VERSION =>
+                    {
+                        // Correlate the authenticated target by its stable route, not its
+                        // mutable display name. The controller retains the original catalog.
+                        catalog.robot = crate::account_access::robot_route(&robot_id);
+                        Response::CatalogQuery(CatalogQueryResponse {
+                            id,
+                            catalogs: vec![catalog],
+                            discovery: crate::protocol::DiscoveryState::Settled,
+                            plane_unsettled_ms: None,
+                        })
+                    }
+                    Ok(_) => Response::error(
+                        Some(id),
+                        "account catalog response did not match its request",
+                        robot,
+                        None,
+                    ),
+                    Err(error) => Response::error(Some(id), error, robot, None),
+                };
+            }
+            Ok(_) => {}
+        }
         match self.query_plane.query_catalog(robot.as_deref()) {
             Ok(gather) => Response::CatalogQuery(CatalogQueryResponse {
                 id,
@@ -368,6 +445,38 @@ impl Ctx {
                 robot,
                 None,
             );
+        }
+        match robot
+            .as_deref()
+            .map(crate::account_access::parse_robot_route)
+            .transpose()
+        {
+            Err(error) => return Response::error(Some(id), error, robot, None),
+            Ok(Some(Some(robot_id))) => {
+                return match self.plane.account_schema_by_type(robot_id, &requested) {
+                    Ok(mut reply)
+                        if reply.requested == requested
+                            && reply.version
+                                == cerulion_core::transport::cerulion_q::SCHEMA_WIRE_VERSION =>
+                    {
+                        reply.robot = crate::account_access::robot_route(&robot_id);
+                        Response::SchemaQuery(SchemaQueryResponse {
+                            id,
+                            replies: vec![reply],
+                            discovery: crate::protocol::DiscoveryState::Settled,
+                            plane_unsettled_ms: None,
+                        })
+                    }
+                    Ok(_) => Response::error(
+                        Some(id),
+                        "account schema response did not match its request",
+                        robot,
+                        None,
+                    ),
+                    Err(error) => Response::error(Some(id), error, robot, None),
+                };
+            }
+            Ok(_) => {}
         }
         match self.query_plane.query_schema(robot.as_deref(), &requested) {
             Ok(gather) => Response::SchemaQuery(SchemaQueryResponse {
@@ -402,6 +511,22 @@ impl Ctx {
     /// whether the LAN was searched at all, and a robot that answered
     /// nothing is absent from the list rather than present with an empty run set.
     fn query_runs(&self, id: u64, robot: Option<String>) -> Response {
+        match robot
+            .as_deref()
+            .map(crate::account_access::parse_robot_route)
+            .transpose()
+        {
+            Err(error) => return Response::error(Some(id), error, robot, None),
+            Ok(Some(Some(_))) => {
+                return Response::error(
+                    Some(id),
+                    "live run queries are not supported over account robot access",
+                    robot,
+                    None,
+                )
+            }
+            Ok(_) => {}
+        }
         match self.query_plane.query_runs(robot.as_deref()) {
             Ok(gather) => Response::RunsQuery(RunsQueryResponse {
                 id,
@@ -436,6 +561,9 @@ impl Ctx {
         topic: String,
         schema_hash: u64,
     ) -> Response {
+        if let Err(error) = crate::account_access::parse_robot_route(&robot) {
+            return Response::error(Some(id), error, Some(robot), Some(topic));
+        }
         let key = TopicKey::new(&robot, &topic);
         if key.robot.is_empty() || key.topic.is_empty() {
             return Response::error(
@@ -449,6 +577,9 @@ impl Ctx {
         let deadline = Instant::now() + DEMAND_TEARDOWN_WAIT;
         loop {
             let mut reg = lock_registry(&self.registry);
+            if let Err(error) = self.plane.prepare_demand(&key, &mut reg) {
+                return Response::error(Some(id), error, Some(key.robot), Some(key.topic));
+            }
             match reg.demand(conn, key.clone(), schema_hash, Instant::now()) {
                 DemandOutcome::FirstDemand { refcount } => {
                     // Register the shared mirror while STILL holding the lock (race-free
@@ -571,6 +702,9 @@ impl Ctx {
     /// WITHOUT the registry lock held (a blocking zenoh undeclare must
     /// never stall the idle-watch or a new connection).
     fn release(&self, conn: ConnId, id: u64, robot: String, topic: String) -> Response {
+        if let Err(error) = crate::account_access::parse_robot_route(&robot) {
+            return Response::error(Some(id), error, Some(robot), Some(topic));
+        }
         let key = TopicKey::new(&robot, &topic);
         let mut reg = lock_registry(&self.registry);
         match reg.release(conn, &key, Instant::now()) {
@@ -662,6 +796,11 @@ impl Ctx {
                 None,
             );
         }
+        // Read local policy before any registry mutation or lazy gateway boot.
+        // This is the production dispatch boundary, not a pure plane concern.
+        if let Err(reason) = self.egress_login.check() {
+            return Response::error(Some(id), reason, None, None);
+        }
         // Step 1: record + loop-guard UNDER the lock.
         let (added, total) = {
             let mut reg = lock_registry(&self.registry);
@@ -746,6 +885,7 @@ pub struct RunningNetd {
     self_exit: Arc<AtomicBool>,
     accept_handle: Option<JoinHandle<()>>,
     idle_handle: Option<JoinHandle<()>>,
+    identity_handle: Option<JoinHandle<()>>,
     conns: Arc<Mutex<Vec<JoinHandle<()>>>>,
     registry: Arc<Mutex<DemandRegistry>>,
     /// The socket-cleanup guard, SHARED with the idle-watch thread: the
@@ -905,6 +1045,9 @@ impl RunningNetd {
         if let Some(h) = self.idle_handle.take() {
             let _ = h.join();
         }
+        if let Some(handle) = self.identity_handle.take() {
+            let _ = handle.join();
+        }
         // The announce-watch thread observes the same shutdown flag; join it
         // here so a stopped daemon leaves no thread holding a zenoh subscription.
         self.events.shutdown();
@@ -1049,6 +1192,7 @@ pub fn start_with_planes_and_events(
         egress_plane,
         query_plane,
         self_exit: Arc::clone(&self_exit),
+        egress_login: config.egress_login.clone(),
         events: Arc::clone(&events),
         conn_loop_iterations: Arc::clone(&conn_loop_iterations),
         conn_push_wakes: Arc::clone(&conn_push_wakes),
@@ -1112,6 +1256,27 @@ pub fn start_with_planes_and_events(
         }
     };
 
+    let identity_handle = if config.account_identity_watch {
+        let watch_ctx = ctx.clone();
+        let watch_shutdown = Arc::clone(&shutdown);
+        match std::thread::Builder::new()
+            .name("netd-account-identity".into())
+            .spawn(move || account_identity_watch(watch_ctx, watch_shutdown))
+        {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                shutdown.store(true, Ordering::SeqCst);
+                let _ = accept_handle.join();
+                if let Some(handle) = idle_handle {
+                    let _ = handle.join();
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     tracing::info!(
         socket = %socket_path.display(),
         idle_grace_secs = config.idle_grace.as_secs(),
@@ -1122,6 +1287,7 @@ pub fn start_with_planes_and_events(
         self_exit,
         accept_handle: Some(accept_handle),
         idle_handle,
+        identity_handle,
         conns,
         registry,
         guard,
@@ -1132,6 +1298,40 @@ pub fn start_with_planes_and_events(
         conn_waker_max_drain,
         conn_waker_total_drain,
     })
+}
+
+fn account_identity_watch(ctx: Ctx, shutdown: Arc<AtomicBool>) {
+    use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+    let mut failures = FailureRegimeLatch::new();
+    while !shutdown.load(Ordering::SeqCst) && !ctx.self_exit.load(Ordering::SeqCst) {
+        let result = match ctx.registry.try_lock() {
+            Ok(mut registry) => Some(ctx.plane.refresh_identity(&mut registry)),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Some(Err("daemon registry is poisoned".into()))
+            }
+        };
+        match result {
+            Some(Err(error)) => match failures.on_failure() {
+                RegimeDecision::Loud => {
+                    tracing::warn!(%error, "netd: account identity refresh refused")
+                }
+                RegimeDecision::StillFailing { total, suppressed } => {
+                    tracing::warn!(%error, total, suppressed, "netd: account identity refresh remains unavailable")
+                }
+                RegimeDecision::Suppressed { suppressed } => {
+                    tracing::debug!(%error, suppressed, "netd: account identity refresh still unavailable")
+                }
+            },
+            Some(Ok(())) => {
+                if let Some(suppressed) = failures.on_success() {
+                    tracing::info!(suppressed, "netd: account identity refresh recovered");
+                }
+            }
+            None => {}
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// The idle-watch loop: on a grace-elapsed idle state, commit `self_exit`, UNLINK
@@ -1703,7 +1903,9 @@ fn process_released_key(registry: &Mutex<DemandRegistry>, plane: &dyn MirrorPlan
     let mut reg = lock_registry(registry);
     match outcome {
         crate::mirror::MirrorRelease::Retired => {
-            reg.retire(key);
+            if reg.retire(key) {
+                plane.mirror_retired(key);
+            }
         }
         crate::mirror::MirrorRelease::Lingering => {
             reg.clear_tearing(key);
@@ -1905,6 +2107,7 @@ mod tests {
             registry: Arc::new(Mutex::new(DemandRegistry::new(Instant::now()))),
             plane: Arc::new(TestSpy::default()),
             egress_plane: Arc::new(NoopEgressPlane),
+            egress_login: Default::default(),
             query_plane: Arc::new(NoopQueryPlane),
             self_exit: Arc::new(AtomicBool::new(false)),
             events: Arc::new(CatalogEventHub::new(
@@ -2039,6 +2242,7 @@ mod tests {
             registry: Arc::new(Mutex::new(DemandRegistry::new(Instant::now()))),
             plane: Arc::new(TestSpy::default()),
             egress_plane: Arc::new(NoopEgressPlane),
+            egress_login: Default::default(),
             query_plane: Arc::new(NoopQueryPlane),
             self_exit: Arc::new(AtomicBool::new(false)),
             events: waker_hub(),

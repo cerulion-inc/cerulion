@@ -18,6 +18,10 @@ own scoped file - the root map points here).
   owner-signed grant / CPace witness); the pairing subject is ALWAYS the
   TLS-authenticated device key, never a client arg; validity/TTL/rollback
   checks use the robot's `RemotedClock`, never a client-supplied time.
+- `pair` takes exactly one proof: `owner_certificate_postcard` or `presentation_postcard`.
+  The shared versioned owner envelope rejects trailing bytes. Verify TLS key, owner,
+  chain, scope, clocks and revocation; preserve the owner row and persist before binding.
+  Refuse narrower certs: permissions are per-account (`owner_certificate_test`).
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so a hostile session cannot starve it
   (`estop_starvation_test.rs`).
@@ -40,7 +44,17 @@ own scoped file - the root map points here).
   `cerulion_pairing::verify` - ONE resolver shared by the writer and both desk
   readers; never hand-roll the path (a divergence silently stops revocations).
 
+- Production metadata reads the existing local netd serving snapshot, with its full
+  SHM namespace checked before use. It never starts netd or queries discovery.
+  Catalog and Schema reauthorize CAP_OBSERVE after asynchronous provider work.
+  Keep the netd dependency lean; test both current custom closures and built-in
+  hash bindings (`local_schema_provider_test`).
+
 ## Testing
+
+- Run `wire_plane_test` with `-- --test-threads=1`: a parallel run with the
+  macOS 256-file soft limit hit iceoryx service/port errors; the unchanged suite
+  passed serially. Keep this real-SHM binary serial in local focused gates.
 
 - The whole family is parallel-safe: `cargo test -p <crate>` for pairing /
   link / wireclient / connectd / remoted / cerud / accountd / cerulion-wire -

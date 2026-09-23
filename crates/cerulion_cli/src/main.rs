@@ -92,6 +92,18 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    // This background worker requires an existing login in its engine boundary.
+    // It must never launch an interactive browser flow or pollute its JSON stdout.
+    #[cfg(unix)]
+    if let Commands::BootstrapRobot { state_root } = &cli.command {
+        return match bootstrap_robot(state_root) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // bagd is folded into `cerulion` as a subcommand: dispatch
     // the recorder subcommand BEFORE `init_logging` so `bagd_cli_main` installs
     // its own logging default (the old standalone binary's exact behavior; its
@@ -959,8 +971,15 @@ fn ros2_migrate_exit_code(workspace: PathBuf, write: bool, yes: bool) -> ExitCod
     }
 }
 
+#[cfg(unix)]
+fn bootstrap_robot(state_root: &std::path::Path) -> CliResult<()> {
+    cerulion_cli_engine::robot_bootstrap::run(state_root, &mut std::io::stdout().lock())
+}
+
 fn run(cli: Cli) -> CliResult<()> {
     match cli.command {
+        #[cfg(unix)]
+        Commands::BootstrapRobot { state_root } => bootstrap_robot(&state_root),
         Commands::Workspace { action } => match action {
             WorkspaceAction::Create { name } => {
                 let cwd = std::env::current_dir()?;
@@ -1844,6 +1863,25 @@ fn run(cli: Cli) -> CliResult<()> {
                 // `--no-network` and even when the network query fails — or a
                 // partitioned-out mirror would vanish entirely. `remote_rendered`
                 // tracks whether an Ok remote render already folded them in.
+                #[cfg(unix)]
+                let account_rows = if no_network {
+                    String::new()
+                } else {
+                    match cerulion_cli_engine::account_robot_access::list() {
+                        Ok(listing) => {
+                            if let Some(diagnostic) = &listing.diagnostic {
+                                eprintln!("cerulion topic list: {diagnostic}");
+                            }
+                            cerulion_cli_engine::account_robot_access::render_rows(&listing.rows)
+                        }
+                        Err(error) => {
+                            eprintln!("cerulion topic list: {error}");
+                            String::new()
+                        }
+                    }
+                };
+                #[cfg(not(unix))]
+                let account_rows = String::new();
                 let mut remote_rendered = false;
                 if let Some(opts) = topic_cmd::remote_discovery_options(no_network, connect, listen)
                 {
@@ -1856,10 +1894,11 @@ fn run(cli: Cli) -> CliResult<()> {
                         Ok(disc) => {
                             print!(
                                 "{}",
-                                topic_cmd::render_remote_topics_section_with_mirrors(
+                                topic_cmd::render_remote_topics_section_with_mirrors_and_robot_rows(
                                     &disc,
                                     opts.has_endpoints(),
-                                    &streaming
+                                    &streaming,
+                                    &account_rows
                                 )
                             );
                             remote_rendered = true;
@@ -1880,14 +1919,15 @@ fn run(cli: Cli) -> CliResult<()> {
                 // Render the LOCAL mirror-streaming rows if an Ok remote
                 // render did not already fold them in (--no-network, or a remote
                 // query failure). A mirror is REMOTE regardless of the network
-                // query, since its provenance is read from local SHM.
-                if !remote_rendered && !streaming.is_empty() {
+                // query, since its provenance is read from local SHM. Account rows also
+                // survive independently; a failed/skipped gather is not evidence
+                // that LAN discovery completed with no topics.
+                if !remote_rendered && (!streaming.is_empty() || !account_rows.is_empty()) {
                     print!(
                         "{}",
-                        topic_cmd::render_remote_topics_section_with_mirrors(
-                            &topic_cmd::RemoteDiscovery::empty(),
-                            false,
-                            &streaming
+                        topic_cmd::render_remote_evidence_without_discovery(
+                            &streaming,
+                            &account_rows
                         )
                     );
                 }
@@ -2283,6 +2323,9 @@ fn run(cli: Cli) -> CliResult<()> {
                 };
                 // The live ros2-client/rustdds backend is wired HERE (the
                 // composition root); the engine stays DDS-free over the seam.
+                if !opts.dry_run && !graph_cmd::remote_network_suppressed() {
+                    login_cmd::require_serving_login()?;
+                }
                 let discovery = cerulion_dds::LiveDiscovery;
                 // Compose the production schema-acquisition
                 // ladder — the wire-native `~/get_type_description` rung FIRST
@@ -2579,6 +2622,20 @@ fn run_viz_unix(
     } else {
         Some(topics.iter().map(|a| parse_viz_topic_arg(a)).collect())
     };
+
+    // Resolve account identity before starting the viewer. Keep the control
+    // connection alive until vizd owns its demand; no CLI WAN endpoint is opened.
+    let account_target = robot
+        .map(|selector| {
+            cerulion_cli_engine::account_robot_access::prepare_viz_target(selector, connect, listen)
+        })
+        .transpose()?;
+    if let Some(target) = &account_target {
+        for diagnostic in &target.diagnostics {
+            eprintln!("cerulion viz: {diagnostic}");
+        }
+    }
+    let robot = account_target.as_ref().map(|target| target.route.as_str());
 
     // 1. Ensure the daemon is running (spawn it detached if absent), then connect.
     //    When THIS command starts the daemon, the --connect/--listen locators are

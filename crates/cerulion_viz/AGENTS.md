@@ -20,6 +20,9 @@ job enforces it); build with `-p <crate>`.
   releases ONLY the event subscription.
 - Every attach seam (remote/local/compose) opens a wake listener
   (`WakeMode::Listener`); drain before waiting - a wake is a signal, not a count.
+- Reserved `account:<robot-id>` routes keep netd catalog/schema refusals and never
+  fall back to vizd's LAN session. Validate before pinned-schema fast paths;
+  `account_route_test` covers real control requests with no network configuration.
 - All four topic surfaces (discover/list/status/attach) read ONE attribution map
   (`Ctx::attribution_snapshot`); post-attach attribution is cached - poll, never read once.
 - Dump-companion panes are gated on `RenderProof` (per input, sticky); a new
@@ -44,6 +47,9 @@ cargo test -p go2_tf                             # pure codec, no globals
   a poll interval (macOS CI timer coalescing); bound conditions in whole seconds
   and reproduce locally with `taskpolicy -b`.
 - Exact-value frame oracles: per-frame lockstep (one frame in flight), never publish-N-then-drain.
+- `account_viz_loopback_test` is its own serial binary: real account HTTP, owner
+  enrollment, controller, schema provider, vizd attach, exact rendered scalar
+  values, and physical mirror retirement. Its WAN edges remain dev-only.
 
 ## Gotchas
 

@@ -535,7 +535,7 @@ async fn code_pair_start_finish_establishes_a_row_via_a_cpace_witness() {
     const CODE: &str = "SWAN-42";
     r.sessions.arm(CODE, CeremonyConfig::default());
 
-    let guest = AccountId([77; 32]);
+    let guest = AccountId(client_key);
     let finish = with_serving(&r, &robot, async {
         run_client(&client, robot_addr, move |c| {
             run_cpace(c, CODE, robot_key, client_key, guest, "guest")
@@ -574,7 +574,7 @@ async fn code_pair_wrong_code_denies_and_burns_bounded_attempts() {
         "RIGHT-CODE",
         CeremonyConfig::new(2, 60_000_000_000).unwrap(),
     );
-    let guest = AccountId([88; 32]);
+    let guest = AccountId(client_key);
 
     let (a1, a2, a3) = with_serving(&r, &robot, async {
         run_client(&client, robot_addr, move |c| {
@@ -646,7 +646,7 @@ async fn code_pair_expired_ttl_denies() {
     let ttl = 10_000_000; // 10 ms
     r.sessions
         .arm("TTL-CODE", CeremonyConfig::new(3, ttl).unwrap());
-    let guest = AccountId([99; 32]);
+    let guest = AccountId(client_key);
     let clock = r.clock.clone();
 
     let finish = with_serving(&r, &robot, async {

@@ -43,7 +43,7 @@ pub struct DeviceBinding {
 }
 
 impl DeviceBinding {
-    /// The bound account as `base64url` (the shape [`crate::auth::AuthState`] stores).
+    /// The bound pairing account as base64url. Hosted auth state keeps its UUID.
     pub fn account_b64(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.account.0)
     }
@@ -120,7 +120,10 @@ pub fn resolve_device_binding() -> CliResult<DeviceBinding> {
     // is a cert cached under a different account than the current login (e.g. after an
     // account switch) — surface it LOUDLY; the cert stays the source of truth.
     let store_names_this_account = match auth::load().state() {
-        Some(state) if state.account_id != binding.account_b64() => {
+        Some(state)
+            if crate::account_identity::pairing_account_id(&state.account_id).ok()
+                != Some(binding.account) =>
+        {
             tracing::warn!(
                 cert_account = %binding.account_b64(),
                 session_account = %state.account_id,
@@ -177,7 +180,7 @@ fn relocated_cert_for_this_desk(device_key: &[u8; 32]) -> CliResult<Option<Strin
         let Ok(binding) = verify_device_binding(cert_b64.trim(), device_key) else {
             continue;
         };
-        if binding.account_b64() != *account {
+        if crate::account_identity::pairing_account_id(account).ok() != Some(binding.account) {
             continue;
         }
         tracing::info!(

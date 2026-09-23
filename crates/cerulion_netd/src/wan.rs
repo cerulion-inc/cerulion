@@ -16,10 +16,9 @@
 //! 2. **Which plane serves a given demand?** [`pick_plane`] is a PURE, deterministic
 //!    decision: a robot present in the WAN registry (the operator configured a WAN
 //!    iroh endpoint for it) is reached over IROH; every other robot defaults to the
-//!    ZENOH LAN plane. Because the registry is static for netd's lifetime, the
-//!    picker yields the SAME plane for a key's ensure AND its later release — no
-//!    per-key assignment bookkeeping is needed (the caller re-picks in
-//!    `release_mirror`).
+//!    ZENOH LAN plane. The legacy router keeps a static registry and re-picks on
+//!    release. The account controller owns separate mutable membership and must
+//!    pin each demand's route until release; registry failures never select LAN.
 //!
 //! # The plane-picker's scope
 //!
@@ -40,7 +39,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
+
+use cerulion_pairing::verify::OwnerCertificatePresentationWire;
 
 use cerulion_link::{EndpointId, RelayConfig};
 
@@ -107,7 +108,7 @@ pub const RELAY_URL_ENV: &str = cerulion_link::CERULION_RELAY_URL_ENV;
 /// One WAN robot's iroh dial parameters. The desk seed + relay are shared across
 /// all robots (they are the DESK's identity + posture), so they live on the
 /// [`WanRegistry`], not here.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WanRobot {
     /// The robot's iroh endpoint id (== its 32-byte device key's public half — the
     /// pinned identity the dial authenticates against, preserving the pairing's
@@ -191,7 +192,7 @@ pub struct DeskPathInputs {
 /// [`from_env`]: WanRegistry::from_env
 #[derive(Clone)]
 pub struct WanRegistry {
-    robots: HashMap<String, WanRobot>,
+    robots: Arc<RwLock<HashMap<String, WanRobot>>>,
     desk_seed: [u8; 32],
     relay: RelayConfig,
     /// The logged-in cloud account (32 bytes) the WAN dial presents, bound to
@@ -223,6 +224,19 @@ pub struct WanRegistry {
     /// facts to `None` exactly as it did before, so a DI registry never touches the
     /// ambient environment or filesystem.
     desk_paths: Option<DeskPathInputs>,
+    owner_certificate: Arc<RwLock<Option<Arc<OwnerCertificatePresentationWire>>>>,
+}
+
+impl std::fmt::Debug for WanRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let public =
+            cerulion_pairing::client::DeviceIdentity::from_seed(&self.desk_seed).public_key();
+        f.write_str("WanRegistry { desk_seed: \"[REDACTED]\", desk_public_key: \"")?;
+        for byte in public.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str("\" }")
+    }
 }
 
 impl std::fmt::Debug for WanRegistry {
@@ -250,13 +264,66 @@ impl WanRegistry {
     /// [`from_env`]: WanRegistry::from_env
     pub fn new(robots: HashMap<String, WanRobot>, desk_seed: [u8; 32], relay: RelayConfig) -> Self {
         Self {
-            robots,
+            robots: Arc::new(RwLock::new(robots)),
             desk_seed,
             relay,
             account: OnceLock::new(),
             epoch_dir: OnceLock::new(),
             desk_paths: None,
+            owner_certificate: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Replace the login proof used for first-demand owner admission.
+    ///
+    /// Clears the previous proof before validating its replacement. The account
+    /// and transport key are immutable for this registry; changing either requires
+    /// a new registry and plane. The caller must invalidate active connections
+    /// before changing the login account.
+    pub fn replace_owner_certificate(
+        &self,
+        proof: Option<Arc<OwnerCertificatePresentationWire>>,
+    ) -> Result<(), String> {
+        let mut current = self
+            .owner_certificate
+            .write()
+            .map_err(|_| "owner certificate state is poisoned".to_string())?;
+        *current = None;
+        if let Some(proof) = proof {
+            let device = &proof.device_cert.cert;
+            let key =
+                cerulion_pairing::client::DeviceIdentity::from_seed(&self.desk_seed).public_key();
+            if device.device_key != key || Some(device.account.0) != self.account() {
+                return Err(
+                    "owner certificate does not match the current desk key and account".into(),
+                );
+            }
+            *current = Some(proof);
+        }
+        Ok(())
+    }
+
+    /// Snapshot the injected login proof without reading ambient files.
+    pub fn owner_certificate(
+        &self,
+    ) -> Result<Option<Arc<OwnerCertificatePresentationWire>>, String> {
+        let proof = self
+            .owner_certificate
+            .read()
+            .map_err(|_| "owner certificate state is poisoned".to_string())?
+            .clone();
+        if let Some(proof) = &proof {
+            let key =
+                cerulion_pairing::client::DeviceIdentity::from_seed(&self.desk_seed).public_key();
+            if proof.device_cert.cert.device_key != key
+                || Some(proof.device_cert.cert.account.0) != self.account()
+            {
+                return Err(
+                    "owner certificate does not match the current desk key and account".into(),
+                );
+            }
+        }
+        Ok(proof)
     }
 
     /// Attach the logged-in account the WAN dial presents — bound to the
@@ -397,14 +464,40 @@ impl WanRegistry {
     }
 
     /// The WAN dial params for `robot`, if it has a configured WAN endpoint.
-    pub fn get(&self, robot: &str) -> Option<&WanRobot> {
-        self.robots.get(robot.trim())
+    pub fn get(&self, robot: &str) -> Result<Option<WanRobot>, String> {
+        self.robots
+            .read()
+            .map(|robots| robots.get(robot.trim()).cloned())
+            .map_err(|_| "WAN robot membership lock is poisoned".into())
     }
 
     /// Whether `robot` is reachable over the iroh WAN plane (has a configured WAN
     /// endpoint). The [`pick_plane`] selector.
-    pub fn is_wan_robot(&self, robot: &str) -> bool {
-        self.robots.contains_key(robot.trim())
+    pub fn is_wan_robot(&self, robot: &str) -> Result<bool, String> {
+        self.robots
+            .read()
+            .map(|robots| robots.contains_key(robot.trim()))
+            .map_err(|_| "WAN robot membership lock is poisoned".into())
+    }
+
+    pub(crate) fn membership_snapshot(&self) -> Result<HashMap<String, WanRobot>, String> {
+        self.robots
+            .read()
+            .map(|robots| robots.clone())
+            .map_err(|_| "WAN robot membership lock is poisoned".into())
+    }
+
+    /// Called only by the account plane while holding its Iroh state lock.
+    pub(crate) fn replace_membership(
+        &self,
+        robots: HashMap<String, WanRobot>,
+    ) -> Result<(), String> {
+        let mut current = self
+            .robots
+            .write()
+            .map_err(|_| "WAN robot membership lock is poisoned".to_owned())?;
+        *current = robots;
+        Ok(())
     }
 
     /// The desk's 32-byte ed25519 device seed (its iroh identity for every WAN dial).
@@ -418,10 +511,9 @@ impl WanRegistry {
     }
 
     /// The logged-in cloud account (32 bytes) the WAN dial presents, bound to the
-    /// desk device key per A3's PoP model, or `None` when no device cert binds this
-    /// desk. The account is CARRIED here; the WAN-dial seam that
-    /// PRESENTS it on the wire + the robot-side `is_allowed(account)` DemandAuthorizer
-    /// that consumes it land separately — this is the config half.
+    /// desk device key, or `None` when no device cert binds this desk. An owner
+    /// certificate injected through [`Self::replace_owner_certificate`] must
+    /// match this account before the first-demand admission path can use it.
     ///
     /// Resolved on the FIRST call, not at
     /// [`from_env`](WanRegistry::from_env) — see [`WanRegistry`]'s boot-cost note. The
@@ -466,8 +558,11 @@ impl WanRegistry {
     }
 
     /// The number of configured WAN robots (diagnostics / tests).
-    pub fn robot_count(&self) -> usize {
-        self.robots.len()
+    pub fn robot_count(&self) -> Result<usize, String> {
+        self.robots
+            .read()
+            .map(|robots| robots.len())
+            .map_err(|_| "WAN robot membership lock is poisoned".into())
     }
 
     /// Resolve the WAN registry from the process environment:
@@ -546,12 +641,13 @@ impl WanRegistry {
             );
         }
         Ok(Self {
-            robots,
+            robots: Arc::new(RwLock::new(robots)),
             desk_seed,
             relay,
             account: OnceLock::new(),
             epoch_dir: OnceLock::new(),
             desk_paths: Some(desk_paths),
+            owner_certificate: Arc::new(RwLock::new(None)),
         })
     }
 }
@@ -716,15 +812,23 @@ pub fn parse_robots_spec(raw: &str) -> Result<HashMap<String, WanRobot>, String>
 
 /// The dual-plane PICKER: a robot present in the WAN registry is reached over IROH;
 /// every other robot defaults to the ZENOH LAN plane. Pure + deterministic over
-/// `(key, registry)` — the registry is static for netd's lifetime, so a key's
-/// ensure and its later release re-pick the SAME plane (no assignment bookkeeping).
+/// `(key, registry snapshot)`. The legacy router's registry is static; mutable
+/// account membership requires the controller to retain per-topic assignments.
 /// Oracle-tested.
-pub fn pick_plane(key: &TopicKey, registry: &WanRegistry) -> Plane {
-    if registry.is_wan_robot(&key.robot) {
-        Plane::Iroh
+pub fn pick_plane(key: &TopicKey, registry: &WanRegistry) -> Result<Plane, String> {
+    if registry.is_wan_robot(&key.robot)? {
+        Ok(Plane::Iroh)
     } else {
-        Plane::Zenoh
+        Ok(Plane::Zenoh)
     }
+}
+
+/// Refusal used when remoted owns this serving machine's single WAN endpoint.
+pub const SERVING_MACHINE_WAN_REFUSAL: &str = "this machine serves the WAN plane; consuming other robots over the WAN from a serving machine is not supported in this version; use the LAN plane";
+
+enum WanConsumer {
+    Desk(Box<crate::iroh_plane::IrohMirrorPlane>),
+    ServingMachine,
 }
 
 /// The DUAL-plane mirror: composes the zenoh LAN plane
@@ -742,7 +846,7 @@ pub fn pick_plane(key: &TopicKey, registry: &WanRegistry) -> Plane {
 /// assignment map to drift out of sync with the daemon's registry).
 pub struct DualMirrorPlane {
     zenoh: crate::mirror::GatewayMirrorPlane,
-    iroh: crate::iroh_plane::IrohMirrorPlane,
+    iroh: WanConsumer,
     registry: std::sync::Arc<WanRegistry>,
 }
 
@@ -757,13 +861,30 @@ impl DualMirrorPlane {
     ) -> Self {
         Self {
             zenoh,
-            iroh,
+            // hot-path-alloc-ok: daemon construction stores this client once.
+            iroh: WanConsumer::Desk(Box::new(iroh)),
+            registry,
+        }
+    }
+
+    /// Build a serving machine's mirror router without a WAN client runtime.
+    ///
+    /// The sibling remoted owns this machine's endpoint. Registered WAN targets
+    /// remain WAN targets and fail explicitly at demand, rather than falling back
+    /// to LAN. No IrohMirrorPlane, Tokio runtime, or outgoing endpoint is created.
+    pub fn for_serving_machine(
+        zenoh: crate::mirror::GatewayMirrorPlane,
+        registry: Arc<WanRegistry>,
+    ) -> Self {
+        Self {
+            zenoh,
+            iroh: WanConsumer::ServingMachine,
             registry,
         }
     }
 
     /// The plane `key` routes to (diagnostics / tests) — the [`pick_plane`] result.
-    pub fn plane_for(&self, key: &TopicKey) -> Plane {
+    pub fn plane_for(&self, key: &TopicKey) -> Result<Plane, String> {
         pick_plane(key, &self.registry)
     }
 }
@@ -774,19 +895,42 @@ impl crate::mirror::MirrorPlane for DualMirrorPlane {
         key: &TopicKey,
         schema_hash: u64,
     ) -> Result<(), crate::mirror::MirrorError> {
-        match pick_plane(key, &self.registry) {
+        match pick_plane(key, &self.registry).map_err(|reason| {
+            crate::mirror::MirrorError::Iroh {
+                key: key.clone(),
+                reason,
+            }
+        })? {
             Plane::Zenoh => self.zenoh.ensure_mirror(key, schema_hash),
-            Plane::Iroh => self.iroh.ensure_mirror(key, schema_hash),
+            Plane::Iroh => match &self.iroh {
+                WanConsumer::Desk(iroh) => iroh.ensure_mirror(key, schema_hash),
+                WanConsumer::ServingMachine => Err(crate::mirror::MirrorError::Iroh {
+                    key: key.clone(),
+                    reason: SERVING_MACHINE_WAN_REFUSAL.to_owned(),
+                }),
+            },
         }
     }
 
     fn release_mirror(&self, key: &TopicKey) -> crate::mirror::MirrorRelease {
         match pick_plane(key, &self.registry) {
-            Plane::Zenoh => self.zenoh.release_mirror(key),
-            Plane::Iroh => self.iroh.release_mirror(key),
+            Ok(Plane::Zenoh) => self.zenoh.release_mirror(key),
+            Ok(Plane::Iroh) => match &self.iroh {
+                WanConsumer::Desk(iroh) => iroh.release_mirror(key),
+                WanConsumer::ServingMachine => crate::mirror::MirrorRelease::Retired,
+            },
+            Err(error) => {
+                tracing::error!(robot = %key.robot, topic = %key.topic, error = %error,
+                    "could not select the mirror plane for release");
+                crate::mirror::MirrorRelease::Lingering
+            }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wan_membership_tests.rs"]
+mod membership_tests;
 
 #[cfg(test)]
 mod tests {
@@ -907,28 +1051,28 @@ mod tests {
 
         // The WAN-registered robot → iroh.
         assert_eq!(
-            pick_plane(&TopicKey::new("ubuntu", "/utlidar/robot_odom"), &registry),
+            pick_plane(&TopicKey::new("ubuntu", "/utlidar/robot_odom"), &registry).unwrap(),
             Plane::Iroh
         );
         // A robot NOT in the registry → the zenoh LAN default.
         assert_eq!(
-            pick_plane(&TopicKey::new("lan-bot", "/tf"), &registry),
+            pick_plane(&TopicKey::new("lan-bot", "/tf"), &registry).unwrap(),
             Plane::Zenoh
         );
         // Topic does not matter — the robot identity selects the plane.
         assert_eq!(
-            pick_plane(&TopicKey::new("ubuntu", "/tf"), &registry),
+            pick_plane(&TopicKey::new("ubuntu", "/tf"), &registry).unwrap(),
             Plane::Iroh
         );
-        assert!(registry.is_wan_robot("ubuntu"));
-        assert!(!registry.is_wan_robot("lan-bot"));
+        assert!(registry.is_wan_robot("ubuntu").unwrap());
+        assert!(!registry.is_wan_robot("lan-bot").unwrap());
         // An empty registry routes everything to zenoh (a LAN-only daemon).
         let empty = WanRegistry::new(HashMap::new(), [1u8; 32], RelayConfig::Disabled);
         assert_eq!(
-            pick_plane(&TopicKey::new("ubuntu", "/tf"), &empty),
+            pick_plane(&TopicKey::new("ubuntu", "/tf"), &empty).unwrap(),
             Plane::Zenoh
         );
-        assert_eq!(empty.robot_count(), 0);
+        assert_eq!(empty.robot_count().unwrap(), 0);
     }
 
     /// `RELAY_URL_ENV` is a compile-time alias of `cerulion_link`'s const (so they

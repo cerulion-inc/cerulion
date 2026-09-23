@@ -131,4 +131,13 @@ re_log_channel = "=0.34.1"
 re_log_types = "=0.34.1"
 re_chunk = "=0.34.1"
 re_uri = "=0.34.1"
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
+# Real account-to-viz loopback acceptance; all edges below are test-only.
+serial_test = "3"
+cerulion_cli_engine = { path = "../../../cerulion_cli_engine" }
+cerulion_accountd = { path = "../../../cerulion_accountd" }
+cerulion_remoted = { path = "../../../cerulion_remoted" }
+cerulion_pairing = { path = "../../../cerulion_pairing" }
+cerulion_link = { path = "../../../cerulion_link" }
+cerud = { path = "../../../cerud" }
+cerulion_netd = { path = "../../../cerulion_netd", default-features = false, features = ["wan"] }

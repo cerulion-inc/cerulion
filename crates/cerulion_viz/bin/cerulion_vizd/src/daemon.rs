@@ -2264,8 +2264,8 @@ impl Ctx {
     ///    (the "no schema pin!" product bar), then resolve locally if the desk
     ///    already has that type, else fetch + seed as in (2).
     ///
-    /// A hard, precise error is returned ONLY when the robot genuinely does not
-    /// serve the topic/type, or the daemon is not network-configured.
+    /// Resolution errors include account authorization refusals, unavailable
+    /// metadata, and a daemon that is not network-configured.
     fn resolve_remote_type(
         &self,
         topic: &str,
@@ -2298,8 +2298,9 @@ impl Ctx {
 
     /// Learn a remote `topic`'s qualified ROS type from `robot`'s served CATALOG
     /// (the catalog verb). The query runs over the shared `cerulion-netd` query
-    /// plane (ONE zenoh session per computer) — a netd-unreachable error LOUDLY
-    /// degrades to vizd's OWN transient session (never a hard failure). A precise
+    /// plane (ONE zenoh session per computer). An ordinary LAN name may fall back
+    /// to vizd's OWN transient session on a netd-unreachable error; an account
+    /// route preserves the netd refusal instead. A precise
     /// error when the robot does not answer, or answers without a type name.
     ///
     /// The "no type for this topic" answer is an ABSENCE CLAIM, so it rides
@@ -2316,6 +2317,7 @@ impl Ctx {
     /// answered, netd reports `Settled` and a NON-empty gather while B's topics are
     /// still undiscovered, and that answer is a snapshot, not a verdict about the future.
     fn catalog_resolve_type(&self, robot: &str, topic: &str) -> Result<String, AttachError> {
+        let account_route = cerulion_netd::account_access::parse_robot_route(robot)?.is_some();
         match self.gather_catalog(Some(robot)) {
             Ok(gather) => {
                 let (catalogs, discovery) = (&gather.catalogs, gather.discovery);
@@ -2331,6 +2333,7 @@ impl Ctx {
                     AttachError::not_found_yet(message, &gather)
                 })
             }
+            Err(e) if account_route => Err(AttachError::from(e)),
             Err(e) => {
                 tracing::warn!(
                     robot = %robot, topic = %topic, error = %e,
@@ -2358,10 +2361,12 @@ impl Ctx {
 
     /// Fetch `name`'s `.msg` closure from `robot` (the `schema` verb), seed the
     /// walker with it, and return the now-resolvable `(name, hash)`. The
-    /// fetch runs over the shared `cerulion-netd` query plane — a netd-unreachable
-    /// error LOUDLY degrades to vizd's OWN transient session. A precise error when the
+    /// fetch runs over the shared `cerulion-netd` query plane. An ordinary LAN
+    /// name may fall back to vizd's OWN transient session; an account route
+    /// preserves the refusal instead. A precise error when the
     /// robot does not serve the type.
     fn fetch_and_seed_type(&self, robot: &str, name: &str) -> Result<(String, u64), String> {
+        let account_route = cerulion_netd::account_access::parse_robot_route(robot)?.is_some();
         match self.demand_plane.query_schema(robot, name) {
             // netd answered authoritatively — classify: the first reply carrying docs
             // wins (seed + resolve); an all-empty answer surfaces the robot's OWN
@@ -2370,6 +2375,7 @@ impl Ctx {
             Ok(replies) => {
                 self.seed_and_resolve_schema(robot, name, classify_schema_replies(replies))
             }
+            Err(e) if account_route => Err(e),
             Err(e) => {
                 tracing::warn!(
                     robot = %robot, name = %name, error = %e,
@@ -3826,6 +3832,12 @@ impl Ctx {
         robot: String,
         schema: Option<String>,
     ) -> Response {
+        // Validate before a pinned built-in can bypass catalog/schema lookup.
+        // Account identity routes must never become ordinary LAN robot names.
+        if let Err(error) = cerulion_netd::account_access::parse_robot_route(&robot) {
+            return Response::error(Some(id), error, Some(topic));
+        }
+
         // Guardrail 5: entity-override stability, checked EARLY (before any
         // network round-trip). A re-attach whose override resolves to a DIFFERENT
         // render entity than the one this topic is already known under is refused —
@@ -3849,8 +3861,8 @@ impl Ctx {
         // 1. Resolve the topic's ROS type → the wire hash. A pinned schema the
         //    walker already knows is a network-free fast path; otherwise the type
         //    is catalog-resolved (schema-less) and/or its closure fetched + seeded
-        //    over the daemon's ONE zenoh session. Precise errors on a
-        //    genuinely-unserved topic/type or a network-less daemon.
+        //    over netd's query plane. An account route keeps its authorization
+        //    and metadata errors without opening vizd's transient LAN session.
         let (schema_name, schema_hash) =
             match self.resolve_remote_type(&topic, &robot, schema.as_deref()) {
                 Ok(pair) => pair,
@@ -5232,8 +5244,8 @@ pub trait DemandPlane: Send + Sync {
     fn release(&self, robot: &str, topic: &str) -> Result<(), String>;
     /// Query `robot`'s topic CATALOG over netd's shared session (the
     /// schema-less attach's type resolve). An `Err` means netd could not RUN the query
-    /// (unreachable / not network-configured), so the caller LOUDLY degrades to its OWN
-    /// transient zenoh session. Folds vizd's per-daemon catalog GET onto netd's ONE
+    /// (unreachable / not network-configured). Ordinary LAN names may use the
+    /// transient zenoh fallback; account routes preserve the refusal. Folds onto netd's ONE
     /// session.
     ///
     /// **An `Ok` is NOT on its own authoritative.** Reading
@@ -5303,7 +5315,8 @@ pub trait DemandPlane: Send + Sync {
     }
     /// Fetch `requested`'s `.msg`/YAML closure from `robot` over netd's
     /// shared session (the schema fetch + seed). `Ok` (possibly empty) is
-    /// authoritative; an `Err` triggers the transient-session fallback.
+    /// authoritative; an `Err` may use the transient fallback for ordinary LAN names
+    /// only. Account routes preserve the error without querying another transport.
     fn query_schema(&self, robot: &str, requested: &str) -> Result<Vec<SchemaReply>, String>;
     /// Ask which runs are LIVE on `robot` (or on every announcing
     /// robot, `None`) over netd's shared session — the REMOTE arm of the `runs`

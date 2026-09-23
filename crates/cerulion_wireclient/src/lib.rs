@@ -29,6 +29,7 @@
 //! - [`epoch`]: the shared revocation-epoch push logic (what to send, what the
 //!   robot's answer meant), so netd's internet plane and the `cerulion connect` verb
 //!   carry the epoch through one implementation.
+//! - [`owner_pair`] - bounded owner-certificate admission over an existing ops stream.
 //! - [`error`]: the unified [`ConnectError`] enum.
 //!
 //! Design notes for contributors live in `docs/internals/remote-access.md` in the
@@ -44,6 +45,8 @@
 pub mod config;
 pub mod epoch;
 pub mod error;
+pub mod identity_cache;
+pub mod owner_pair;
 pub mod protocol;
 pub mod reader;
 
