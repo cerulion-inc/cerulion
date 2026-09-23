@@ -31,6 +31,17 @@ WHAT IT REMOVES, and only this:
      (the markdown paragraph break). Where it sat at the start or the end of
      the body, the gap closes to nothing.
 
+QUOTED MARKUP IS NOT BOT MARKUP. A fenced code block, and a span between
+single backticks, is somebody QUOTING markup in order to talk about it, which
+is what any body explaining this file looks like. Markers and badges inside
+one are invisible to all three rules: not removed, and not counted when
+markers are paired off, so quoting a whole pair unbalances nothing. Without
+this the stripper deletes the middle of somebody's own example, which is the
+silent corruption it exists to avoid. An unclosed fence runs to the end of the
+body, which is how the body renders, so everything after it is quoted too; the
+cost is that a badge appended after an unclosed fence survives, and it is
+already inside the rendered code block at that point.
+
 WHAT IT NEVER TOUCHES: everything else, byte for byte. A body carrying no bot
 markers comes back as the identical object, and the self-test asserts that on
 a body full of the shapes this script knows how to find. Blank lines inside
@@ -163,12 +174,25 @@ def line_is_bot_only(line):
     return strip_bot_markup(remainder).strip() == ""
 
 
-def block_spans(body):
-    """Spans of every delimited bot block, or raise `Refusal`."""
+def block_spans(body, quoted):
+    """Spans of every delimited bot block, or raise `Refusal`.
+
+    A marker inside `quoted` is somebody writing the marker down rather than a
+    bot emitting one, so it is skipped on BOTH sides of the count: quoting a
+    whole pair in an example leaves the pairing balanced.
+    """
     spans = []
     for open_token, close_token in MARKER_PAIRS:
-        opens = list(marker_pattern(open_token).finditer(body))
-        closes = list(marker_pattern(close_token).finditer(body))
+        opens = [
+            found
+            for found in marker_pattern(open_token).finditer(body)
+            if not inside(quoted, *found.span())
+        ]
+        closes = [
+            found
+            for found in marker_pattern(close_token).finditer(body)
+            if not inside(quoted, *found.span())
+        ]
         if len(opens) != len(closes):
             raise Refusal(
                 "marker '{}' appears {} time(s) and its pair '{}' appears {}: "
@@ -199,20 +223,62 @@ def merge_spans(spans):
     return merged
 
 
+# A fenced code block: three or more backticks or tildes at the start of a
+# line, up to three spaces of indent, closed by at least as many of the SAME
+# character on a line of its own. This is the CommonMark rule, less the info
+# string, which nothing here needs to read.
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})[^\r\n]*$", re.MULTILINE)
+# A span between single backticks, on one line: the inline way to quote a
+# marker in a sentence.
+INLINE_CODE = re.compile(r"`[^`\r\n]*`")
+
+
+def quoted_ranges(body):
+    """Spans holding quoted markup: fenced blocks first, then inline spans.
+
+    A fence that is never closed runs to the end of the body, which is how the
+    body renders.
+    """
+    ranges = []
+    opener = None
+    for fence in FENCE.finditer(body):
+        marker = fence.group(1)
+        if opener is None:
+            opener = (fence.start(), marker)
+            continue
+        open_start, open_marker = opener
+        if marker[0] == open_marker[0] and len(marker) >= len(open_marker):
+            ranges.append((open_start, fence.end()))
+            opener = None
+    if opener is not None:
+        ranges.append((opener[0], len(body)))
+    inline = [
+        found.span()
+        for found in INLINE_CODE.finditer(body)
+        if not any(start <= found.start() and found.end() <= end for start, end in ranges)
+    ]
+    return merge_spans(ranges + inline)
+
+
+def inside(spans, start, end):
+    """True when [start, end) lies wholly within one of `spans`."""
+    return any(low <= start and end <= high for low, high in spans)
+
+
 # Lines break at these three terminators and nowhere else. `str.splitlines`
 # also breaks at form feed and at the Unicode separators, which in a pull
 # request body are ordinary text somebody typed.
 LINE_BREAK = re.compile(r"\r\n|\n|\r")
 
 
-def badge_line_spans(body, blocks):
-    """Spans of bot-only lines lying wholly outside every block span."""
+def badge_line_spans(body, blocks, quoted):
+    """Spans of bot-only lines outside every block span and every quotation."""
     spans = []
     start = 0
     for terminator in list(LINE_BREAK.finditer(body)) + [None]:
         end = len(body) if terminator is None else terminator.start()
         content = body[start:end]
-        if content.strip() and line_is_bot_only(content):
+        if content.strip() and not inside(quoted, start, end) and line_is_bot_only(content):
             if not any(
                 start < block_end and block_start < end
                 for block_start, block_end in blocks
@@ -239,8 +305,9 @@ def clean_body(body):
     """Return `body` with bot markup removed. Raises `Refusal` unchanged."""
     if SENTINEL in body:
         raise Refusal("body holds a NUL byte: refusing to edit a body this cannot model")
-    blocks = merge_spans(block_spans(body))
-    spans = merge_spans(list(blocks) + badge_line_spans(body, blocks))
+    quoted = quoted_ranges(body)
+    blocks = merge_spans(block_spans(body, quoted))
+    spans = merge_spans(list(blocks) + badge_line_spans(body, blocks, quoted))
     if not spans:
         return body
     eol = "\r\n" if "\r\n" in body else "\n"
@@ -441,6 +508,59 @@ def self_test():
         "carriage returns are preserved",
         "Before.\r\n\r\n<!-- greptile_comment -->\r\nx\r\n<!-- /greptile_comment -->\r\n\r\nAfter.",
         "Before.\r\n\r\nAfter.",
+        failures,
+    )
+
+    # QUOTED MARKUP. A body explaining this file quotes the markers in a fenced
+    # block, and every rule has to be blind to that: rule 3 would otherwise
+    # empty a line of somebody's example, and rules 1 and 2 would delete the
+    # middle of it. Found by running this stripper over the body of the pull
+    # request that introduced it.
+    fenced = (
+        "How the markers look:\n"
+        "\n"
+        "```\n"
+        "<!-- devin-review-badge-begin -->\n"
+        + DEVIN_BADGE
+        + "\n<!-- devin-review-badge-end -->\n"
+        "```\n"
+        "\n"
+        "That is the whole shape."
+    )
+    _case("a fenced block quoting a whole marker pair", fenced, fenced, failures)
+
+    fenced_greptile = (
+        "The greptile pair:\n\n~~~text\n<!-- greptile_comment -->\n"
+        "<!-- greptile_summary -->\n" + GREPTILE_HEADING + "\n"
+        "<!-- /greptile_comment -->\n~~~\n"
+    )
+    _case("a tilde fence quoting the other pair", fenced_greptile, fenced_greptile, failures)
+
+    inline = "The opener is `<!-- greptile_comment -->` and it closes with `<!-- /greptile_comment -->`."
+    _case("markers quoted inline in a sentence", inline, inline, failures)
+
+    # A fence nobody closed runs to the end of the body, which is how the body
+    # renders, so what follows it is quoted too.
+    unclosed = "Here:\n\n```\n<!-- greptile_comment -->\nx\n<!-- /greptile_comment -->\n"
+    _case("an unclosed fence quotes everything after it", unclosed, unclosed, failures)
+
+    # ANTI-TAUTOLOGY for the rule above: the SAME markup outside a fence is
+    # still removed, so blindness to quotation is not blindness to bots.
+    _case(
+        "the same pair outside a fence is still removed",
+        "How the markers look:\n\n<!-- devin-review-badge-begin -->\n"
+        + DEVIN_BADGE
+        + "\n<!-- devin-review-badge-end -->\n\nThat is the whole shape.",
+        "How the markers look:\n\nThat is the whole shape.",
+        failures,
+    )
+
+    # A real block BELOW a closed fence is still reached: closing the fence
+    # ends the quotation.
+    _case(
+        "a fence that closes does not shield what follows it",
+        "```\nquoted\n```\n\n<!-- greptile_comment -->\nx\n<!-- /greptile_comment -->\n\nAfter.",
+        "```\nquoted\n```\n\nAfter.",
         failures,
     )
 
