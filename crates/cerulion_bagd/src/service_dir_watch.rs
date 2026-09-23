@@ -31,6 +31,19 @@
 //! of them carries a license the workspace's `deny.toml` does not allow, for
 //! machinery none of which is used. `libc` is already in the tree.
 //!
+//! # The assumption the design rests on
+//!
+//! The caller's answer to every event is to WALK this directory, so a walk must
+//! not itself be a change - otherwise the worker wakes itself forever and the
+//! poll is back with a watch bolted on. It is not: reading a directory
+//! generates access-class events, which are not in the mask, while the
+//! attribute-class event that IS in the mask is a `chmod`/`chown`/`utimes`.
+//! Checked against iceoryx2's `config_scheme.rs`, nothing but a service's
+//! static config lives in this directory either - dynamic config, connections,
+//! event sockets and data segments all hang off the root, node files off
+//! `nodes/` - so opening a tap, publishing a frame and draining a queue leave
+//! it untouched. Pinned by `walking_the_watched_directory_does_not_wake_the_watch`.
+//!
 //! # What an event does and does not mean
 //!
 //! An event means "something in that directory changed", never "a new topic is
@@ -611,6 +624,65 @@ mod tests {
             watch.wait(Duration::from_secs(5)),
             WatchWake::Changed,
             "the promoted watch must see files in the directory it was promoted to"
+        );
+    }
+
+    /// READING the directory does not wake the watch.
+    ///
+    /// This is the assumption the whole design rests on and the one that would
+    /// be most expensive to be wrong about: the caller's answer to every event
+    /// is to WALK this directory (`Service::list` opens it, reads its entries
+    /// and stats each one), so if a walk were itself a change the worker would
+    /// wake itself forever and the poll would be back with a watch bolted on.
+    ///
+    /// The walk is reproduced exactly - `read_dir` plus a `metadata` per entry -
+    /// and the watch must still report Idle. A reading watch generates
+    /// access-class events, which are deliberately not in the mask; an
+    /// attribute-class event is a `chmod`/`chown`/`utimes`, which a read is not.
+    #[test]
+    fn walking_the_watched_directory_does_not_wake_the_watch() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let services = root.path().join("services");
+        std::fs::create_dir(&services).expect("create services dir");
+        for i in 0..8 {
+            std::fs::write(services.join(format!("svc-{i}.service")), b"x").expect("write");
+        }
+
+        let mut watch = match ServiceDirWatch::arm(root.path(), "services") {
+            Ok(w) => w,
+            Err(WatchError::Unsupported) => return,
+            Err(e) => panic!("arming on a real directory must succeed: {e}"),
+        };
+        // Drain whatever the setup above may have queued before the watch
+        // existed, so the walks below are the only thing under test.
+        while watch.wait(Duration::from_millis(120)) == WatchWake::Changed {}
+
+        for round in 0..5 {
+            let mut entries = 0usize;
+            for entry in std::fs::read_dir(&services).expect("read the watched directory") {
+                let entry = entry.expect("entry");
+                let _ = entry.metadata().expect("stat the entry");
+                entries += 1;
+            }
+            assert_eq!(
+                entries, 8,
+                "round {round}: the walk must have read the directory"
+            );
+            assert_eq!(
+                watch.wait(Duration::from_millis(120)),
+                WatchWake::Idle,
+                "round {round}: walking the directory must NOT wake the watch. If it does, the \
+                 worker wakes itself on every walk and event-driven discovery is a busy loop"
+            );
+        }
+
+        // ANTI-TAUTOLOGY: the watch is still armed and a real change still wakes
+        // it, so the Idle results above are a property and not a dead watch.
+        std::fs::write(services.join("new.service"), b"x").expect("write");
+        assert_eq!(
+            watch.wait(Duration::from_secs(5)),
+            WatchWake::Changed,
+            "after all those walks the watch must still fire on a genuine change"
         );
     }
 
