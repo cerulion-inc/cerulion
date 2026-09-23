@@ -1117,7 +1117,25 @@ jobs:
   test-archive:
     name: Test archive (Linux, build once)
     runs-on: ubuntu-latest
-    needs: [lint]
+    # NO `needs: [lint]`, and the omission is the point. `lint` takes 7.6 min on
+    # a quiet runner and 12 min on a contended one, and it used to gate every
+    # test job in this file, so the wall was `lint` PLUS the longest test job
+    # rather than the longest test job. Measured on the last green push run:
+    # `lint` 7.6, macOS shard 1 46.1, wall 54.0.
+    #
+    # It was never a DATA dependency. This job compiles test binaries; a
+    # formatting or clippy verdict changes nothing about what it compiles, and
+    # nothing it produces is derived from `lint`'s output. What the gate bought
+    # was runner minutes on a run whose `lint` fails. What it cost was the same
+    # minutes of WALL on every run whose `lint` passes, which is almost all of
+    # them.
+    #
+    # The cheap jobs keep `needs: [lint]` deliberately (`docs`, `netd-wan`,
+    # `crate-tests`, `viz-tests`, and the push-only `fuzz` / `miri` /
+    # latency jobs): none of them sets the wall, so gating them still saves
+    # minutes on a red-lint run and costs nothing on a green one. The three
+    # jobs that DO set the wall are this one, `test-linux` (which keeps its real
+    # dependency on this job) and `test-macos`.
     # The build half of a shard's work, without the test execution.
     timeout-minutes: 60
     # SAME value as `test-linux` below, and the shards ASSERT it rather than
@@ -1247,7 +1265,13 @@ jobs:
     # There is no third job to wait on: `test-archive` uploads the artifact
     # itself, in that same job, so by the time it reports success the archive is
     # ready and these shards start immediately.
-    needs: [lint, test-archive]
+    #
+    # `test-archive` and NOT `[lint, test-archive]`: the archive is a real data
+    # dependency (these shards RUN the binaries it built), a `lint` verdict is
+    # not, and leaving `lint` in this list would have held the shards at the
+    # start line anyway now that the job they wait on no longer does. See the
+    # note on `test-archive` for the measurement.
+    needs: [test-archive]
     strategy:
       # One shard's failure must not cancel the other three: the whole point of
       # the split is that the shards report independently, and a red shard 2
@@ -1959,7 +1983,11 @@ jobs:
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
-    needs: [lint]
+    # NO `needs: [lint]`: see the note on `test-archive` for why the gate was
+    # never a data dependency. This is the job the omission is aimed at. It is
+    # the longest in the workflow (46.1 min of the 54.0 min wall on the last
+    # green push run), so every minute `lint` spent in front of it was a minute
+    # on the wall of every green run.
     strategy:
       # 2 shards, NOT `test-linux`'s 4: see the note above.
       # `fail-fast: false` for the same reason as `test-linux`: one red shard
