@@ -2098,7 +2098,7 @@ jobs:
       # multi-gigabyte archive that is then rejected ("another job may be
       # creating this cache"), and the archive that lands is whichever leg's
       # `target/` happened to be newest — arbitrary, and different run to run.
-      # Shard 0 saves; shard 1 restores only. (This job runs two shards; the
+      # Shard 0 saves; shards 1-2 restore only. (This job runs three shards; the
       # Linux twin above runs four, and its copy of this block says "four".)
       #
       # NOT a per-shard key, deliberately: `target/` for this workspace runs to
