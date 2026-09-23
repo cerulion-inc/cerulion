@@ -31,7 +31,7 @@ default + gateway, the discovery ladder, and pairing.
   block's locators VERBATIM (no scouting, no bind ladder). The block is
   how you RESTRICT a robot, not how you enable networking.
 - **One robot = one network peer.** The gateway is a SEPARATE process that
-  owns the entire network plane (Principle #8). The graph/worker processes
+  owns the entire network plane: one process, one zenoh session. The graph/worker processes
   stay network-free: they publish into and read from shared memory only.
   The gateway taps their SHM zero-copy (listener-less capture subscribers)
   and forwards frames; the tap adds no copy of its own.
@@ -86,7 +86,7 @@ resolves to exactly one of these, in evaluation order:
 | Condition | Result |
 |---|---|
 | `--network off` **or** `CERULION_NETWORK=off` | LOCAL-ONLY: no gateway, no session; loud kill-switch notice. |
-| `--time-source virtual` **or** `external` | Network INERT (replay-class: a zenoh session is a live side effect that would break replay byte-identity, Principle #7). Silent, no gateway. |
+| `--time-source virtual` **or** `external` | Network INERT (replay-class: a zenoh session is a live side effect that would break replay byte-identity). Silent, no gateway. |
 | Enabled `network:` block + `--record` + declared `ingress:` | **Refused**, naming the topics + both workarounds. |
 | Enabled `network:` block (egress-only under `--record`, or any non-record) | **Strict** gateway: verbatim locators, egress allow-list, declared ingress. |
 | No / disabled block (incl. `--record`) | **Permissive**: scouting ON, announce every produced topic. Egress rides the machine's shared `cerulion-netd` session on Unix (see below); the synthesized 7683 listen + bind ladder appear only on the permissive FALLBACK child (netd unreachable, or non-Unix). |
@@ -95,7 +95,7 @@ resolves to exactly one of these, in evaluation order:
 not a deployment, so it stays LOCAL-ONLY by design (its transport is built
 `network: None`; it never resolves a network). Re-execution
 (`cerulion bag play <bag> --resim all`) is likewise network-inert by
-construction (the bag is the input, Principle #7).
+construction: the bag is the input, so there is nothing live to be faithful to.
 
 ## Egress converges onto cerulion-netd
 
@@ -103,7 +103,7 @@ Every PERMISSIVE real-clock live `graph run` on a Unix machine routes its egress
 through that machine's ONE `cerulion-netd` session **by default**, NOT a per-run
 gateway child. There is no desk/robot branch in the routing: a robot running a
 bare permissive `graph run` joins netd exactly like a desk does. This is
-Principle #8 applied to the whole machine: N graphs + N remote consumers share ONE
+One session per process, applied to the whole machine: N graphs + N remote consumers share ONE
 zenoh session instead of one per graph.
 
 A **desk**, a machine that both produces topics and consumes remote ones
@@ -339,7 +339,7 @@ serialized plan + the run's iceoryx2 namespace.
   the expiry. The two paths never fight on removal either: the reconciler
   absence-disables only topics IT enabled, the expiry disables only GET-granted
   topics, and every GET re-affirms egress so any spurious lower self-heals
-  within one GET interval. Principle #3 counters (`demand_grant_count` /
+  within one GET interval. Counters (`demand_grant_count` /
   `demand_expiry_count` on the producer; `demand_enabled_ack_count` /
   `harvested_identity_count` on the demander) attribute each flip. Like the
   reconciler, the queryable + GET loop exist ONLY on a gateway (never under
@@ -419,7 +419,7 @@ not a block knob.
 
 ### The egress/ingress model
 
-The graph file stays the single source of truth (Principle #5): under a
+The graph file stays the single source of truth: under a
 Strict block, which topics cross the machine boundary is declared in YAML.
 
 > **Egress lists are a per-graph SCOPING filter, NOT authorization.**
@@ -492,7 +492,7 @@ workarounds:
 - drop `--record` to keep the network live.
 
 Re-execution (`cerulion bag play <bag> --resim all`) is structurally
-network-inert (the bag is the input, Principle #7).
+network-inert: the bag is the input.
 
 ## CLI introspection: `topic list`
 

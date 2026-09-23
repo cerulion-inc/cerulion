@@ -4,7 +4,7 @@ A "how it works and why" reference. A graph that declares
 `process_groups:` in its YAML runs as N OS **processes** (one per group)
 instead of one, with the SAME deterministic execution contract as the
 single-process monolith: the merged cross-process fire trace is
-byte-identical to the monolith's (the determinism firewall, Principle #7).
+byte-identical to the monolith's: the determinism firewall.
 Multi-process buys you **fault isolation** (a crashed group takes down only
 its own nodes) and OS-level resource separation, not latency: intra-process
 fusion remains the fastest path.
@@ -321,7 +321,7 @@ A multi-process run is network-viewable exactly like a monolith. The
 **workers carry NO zenoh session**: they publish into and read from shared
 memory only. The deployment's produced topics reach the network through a
 GATEWAY, which taps them on the deployment's iceoryx2 namespace.
-One robot = one network peer (Principle #8).
+One robot = one network peer, and one process owns that session.
 
 - **Which gateway you get follows the posture.** A run with NO `network:`
   block is PERMISSIVE (every produced topic is announced + egressable), and on

@@ -174,15 +174,15 @@ Unmarked crates have no scoped file: use this page plus the area dossier
 - **Ask first**: new dependencies (license + real-time fit; `deny.toml` gates CI), any
   user-API surface change, anything `unsafe`.
 - **Never**: hand-edit generated sources (`native_ros2_messages` types are `build.rs` output in `OUT_DIR`;
-  vendored `.msg` edits go via `tools/scripts/refresh_upstream_msg_manifest.sh`); commit
-  credentials; name a machine, address, path, login or person (public;
-  `docs/leak_guard.md`); fabricate data; leave dead code.
+  vendored `.msg` edits via `tools/scripts/refresh_upstream_msg_manifest.sh`); commit credentials;
+  name a machine, address, path, login or person (public; `docs/internals/leak-guard.md`);
+  fabricate data; leave dead code.
 
 ## Deeper context
 
 - `docs/user-api.md` - the user API reference (CLI, macros, YAML, env vars).
 - `crates/<crate>/AGENTS.md` - scoped invariants, serial-test lists, gotchas.
-- `docs/internals/*.md` - contributor dossiers (test maps, module contracts); each crate
-  names its own; `ci-and-gates.md`: the repo-wide gates.
+- `docs/internals/*.md` - dossiers (test maps, contracts) + maintainer runbooks;
+  each crate names its own; `ci-and-gates.md`: the gates.
 - `docs/` - user guides (networking, multi-process, recording/replay, tutorials).
 - https://docs.cerulion.com - hosted docs; index at `/llms.txt`.

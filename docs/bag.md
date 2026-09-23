@@ -40,7 +40,7 @@ else, so re-simulating a `ros2 attach` bag on a desk with no DDS robot produces
 **no output**: its `dds_bridge` node still needs its external DDS inputs. Use
 plain playback to view an attached ROS 2 recording without the robot.
 Re-simulation is also unpaced: its loop never reads the wall clock, which is
-what makes it deterministic (Principle #7). Together those two properties mean
+what makes it deterministic. Together those two properties mean
 `--resim` cannot drive a viewer.
 
 ### `--resim` is NEUTRAL; `--verify` is the verdict

@@ -255,7 +255,7 @@ whole string; a regex match is never a registered secret). The scanner's own sou
 matchable literal from fragments and scans itself to zero with no allowlist entry, a self-test
 arm pinned both ways. "Found something" and "could not run" never share an exit code, a
 built-in control per class must hit before any scan, and an allowlist entry that matches no
-file or excused nothing fails a full-tree run. Contributor-facing detail: `docs/leak_guard.md`.
+file or excused nothing fails a full-tree run. Contributor-facing detail: `docs/internals/leak-guard.md`.
 
 ## The public-surface review (`.github/workflows/public-surface-review.yml`)
 

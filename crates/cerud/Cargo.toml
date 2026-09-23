@@ -12,7 +12,8 @@ rust-version.workspace = true
 description = "Robot-side operations service for Cerulion: mechanical verbs (inventory, log-tail, restart) over a versioned framed protocol, deny-by-default per-verb authorization, a hash-chained receipt audit log, deploy-bundle types, and a control-lease, deadman and e-stop state machine. Transport-agnostic."
 # Not published to crates.io: `cerud` is the robot-side ops SERVICE — a daemon
 # operators deploy and talk to over its framed protocol, not a library anyone
-# adds with `cargo add`. It is outside the publish set in `docs/PUBLISHING.md`.
+# adds with `cargo add`. It is outside the publish set in
+# `docs/internals/publishing.md`.
 publish = false
 
 [lints]
