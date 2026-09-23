@@ -57,15 +57,16 @@ const POLL: Duration = Duration::from_millis(5);
 
 /// The FALLBACK cadence the scanner arms drive at.
 ///
-/// Short enough that a POLLING scanner would run a visible number of walks in
-/// the observation windows below, which is exactly what makes the zero-walk
-/// assertion an observation rather than a window too small to see anything.
+/// Short enough that the POLLING control runs a visible number of walks inside
+/// the observation window, which is what makes the contrast below an
+/// observation rather than a window too small to see anything.
 const FALLBACK_CADENCE: Duration = Duration::from_millis(100);
 
 /// How long an "and then nothing happened" window lasts.
 ///
-/// Fifteen fallback cadences: a polled scanner would run roughly fifteen walks
-/// inside it, an event-driven one exactly zero.
+/// Fifteen fallback cadences: the polling control runs roughly fifteen uncaused
+/// walks inside it, while an event-driven engine runs only what it was woken
+/// for - none at all on a machine nobody else is using.
 const QUIET_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Block until `cond` holds, or fail LOUDLY with `what`.
@@ -80,20 +81,20 @@ fn await_condition(what: &str, mut cond: impl FnMut() -> bool) {
     panic!("timed out after {DEADLINE:?} waiting for {what}");
 }
 
-/// Drive the scanner until it has published its baseline enumeration and armed
-/// its watch, then return the enumeration count that state is worth.
+/// Drive the scanner until its baseline enumeration and any tail behind it have
+/// landed, then return the enumeration count that state is worth.
 ///
-/// The baseline walk is unconditional (the worker cannot be woken by a producer
-/// that registered before it started watching), so every "how many walks did
-/// this cost?" assertion has to be relative to it.
+/// The baseline walk is unconditional - an event reports only a CHANGE, so
+/// nothing already live when the watch was armed would be seen otherwise - so
+/// every "how many walks did this cost?" assertion has to be relative to it.
 fn settle_baseline(scanner: &mut DiscoveryScanner, mgr: &TransportManager) -> u64 {
     await_condition("the worker's baseline enumeration", || {
         scanner.next_scan(mgr).is_some()
     });
-    // The watch is armed immediately after the baseline walk, and an event-driven
-    // walk arms one confirmation behind it. Give both room to finish so the
-    // window measured afterwards is genuinely idle.
-    std::thread::sleep(Duration::from_millis(600));
+    // Anything the arming itself woke arms a full confirmation tail behind it.
+    // Wait the whole tail out, derived from the shipped constants rather than
+    // guessed, so the window measured afterwards is genuinely idle.
+    std::thread::sleep(EVENT_CONFIRM_DELAY * (CONFIRM_WALKS + 1) + Duration::from_millis(100));
     while scanner.next_scan(mgr).is_some() {}
     scanner.scans_run()
 }
@@ -165,8 +166,9 @@ fn every_walk_the_event_engine_runs_has_a_directory_change_behind_it() {
     // The control: the SAME cadence, forced onto the timed engine.
     let mut poll = forced_polling_scanner(&mgr, FALLBACK_CADENCE);
 
-    // Let any confirmation armed by a wake BEFORE the window land before the
-    // window opens, so it is not counted against a wake the window did not see.
+    // Standing up the control takes time, so let any confirmation armed by a
+    // wake BEFORE the window land before the window opens - otherwise it is
+    // counted against a wake the window never saw.
     std::thread::sleep(EVENT_CONFIRM_DELAY * (CONFIRM_WALKS + 1) + Duration::from_millis(100));
     while events.next_scan(&mgr).is_some() {}
     while poll.next_scan(&mgr).is_some() {}
