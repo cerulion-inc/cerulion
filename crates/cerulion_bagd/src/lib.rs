@@ -422,7 +422,9 @@ const _: () = assert!(DEFAULT_SCHEMA_DEMAND_MS < DEFAULT_SCHEMA_WAIT_MS);
 /// It is no longer a count of scans anything compares against. Enumeration is
 /// driven by filesystem events now, so a settled machine produces no scans to
 /// count; the window is measured as a WALL instead (see
-/// [`Recorder::discovery_hold_active`]) and this constant sizes it.
+/// [`discovery::discovery_hold_open`], which is the rule, and
+/// `Recorder::discovery_hold_active`, which applies it) and this constant sizes
+/// it.
 pub const DISCOVERY_SETTLE_QUIET_SCANS: u32 = 2;
 
 /// How often the drive loop LOOKS at the run it is bound to.
