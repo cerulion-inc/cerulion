@@ -100,7 +100,7 @@ fn the_composed_plane_attributes_a_delivered_topic_to_the_internet_and_a_lan_nam
 
     // The control, on a topic nothing else touches: this desk's local plane cannot
     // mirror at all, so nothing below can have arrived over it.
-    let local_probe = TopicKey::new("lan-bot", &format!("/wan/plane/probe/{}", unique_id()));
+    let local_probe = TopicKey::new("lan-bot", format!("/wan/plane/probe/{}", unique_id()));
     let refusal = GatewayMirrorPlane::new(manager_b.clone())
         .ensure_mirror(&local_probe, ORACLE_SCHEMA_HASH)
         .expect_err("a network-less desk cannot register a local mirror");
