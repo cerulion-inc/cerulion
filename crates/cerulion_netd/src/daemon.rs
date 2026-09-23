@@ -751,6 +751,9 @@ impl Ctx {
             .snapshot()
             .into_iter()
             .map(|(k, refcount)| DemandEntry {
+                // The plane is asked BEFORE the key is consumed: it is the one fact
+                // about a mirror that the frames themselves cannot carry.
+                plane: self.plane.serving_plane(&k),
                 robot: k.robot,
                 topic: k.topic,
                 refcount,

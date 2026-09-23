@@ -2040,3 +2040,6 @@ mod owner_pair;
 
 #[path = "wan_plane_iroh_test/poison_retirement.rs"]
 mod poison_retirement;
+
+#[path = "wan_plane_iroh_test/serving_plane.rs"]
+mod serving_plane;

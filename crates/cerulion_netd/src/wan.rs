@@ -890,6 +890,17 @@ impl DualMirrorPlane {
 }
 
 impl crate::mirror::MirrorPlane for DualMirrorPlane {
+    /// The picker is pure over `(key, registry)` and this registry is fixed for the
+    /// daemon's lifetime, so the plane it names here is the one that ensured the
+    /// mirror, not a fresh guess: the same argument that lets `release_mirror`
+    /// re-pick instead of remembering.
+    fn serving_plane(&self, key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
+        match pick_plane(key, &self.registry).ok()? {
+            Plane::Zenoh => Some(crate::protocol::ServingPlane::Zenoh),
+            Plane::Iroh => Some(crate::protocol::ServingPlane::Iroh),
+        }
+    }
+
     fn ensure_mirror(
         &self,
         key: &TopicKey,

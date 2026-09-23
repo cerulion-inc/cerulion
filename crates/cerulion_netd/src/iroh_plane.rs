@@ -1588,6 +1588,12 @@ fn finish_retirement(state: tokio::sync::MutexGuard<'_, IrohState>, cleanup: imp
 mod cleanup_tests;
 
 impl MirrorPlane for IrohMirrorPlane {
+    /// This plane has exactly one transport, so every key it serves crossed the
+    /// internet plane.
+    fn serving_plane(&self, _key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
+        Some(crate::protocol::ServingPlane::Iroh)
+    }
+
     fn ensure_mirror(&self, key: &TopicKey, schema_hash: u64) -> Result<(), MirrorError> {
         self.rt
             .block_on(self.ensure_async(key, schema_hash))

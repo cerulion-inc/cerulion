@@ -540,6 +540,33 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
     }
 }
 
+/// Which transport carried a mirror's frames.
+///
+/// The two planes are not interchangeable and an operator cannot tell them apart
+/// from the frames: both re-inject into the same local shared memory under the
+/// same topic name. A robot on the same local network is reachable over BOTH, so
+/// "the robot is on the internet plane" is a claim about routing that only the
+/// daemon can make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServingPlane {
+    /// The local-network plane: the shared gateway session, mirrored by name.
+    Zenoh,
+    /// The internet plane: dial the robot's endpoint id directly, authenticated by
+    /// its device key, and re-inject what that one connection carries.
+    Iroh,
+}
+
+impl ServingPlane {
+    /// The lowercase token this plane serializes as, for a message or a log field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Zenoh => "zenoh",
+            Self::Iroh => "iroh",
+        }
+    }
+}
+
 /// One demand-table row in a [`StatusResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DemandEntry {
@@ -550,6 +577,17 @@ pub struct DemandEntry {
     /// How many connections currently demand this `(robot, topic)` (the shared
     /// mirror's refcount).
     pub refcount: usize,
+    /// Which plane serves this row, when the daemon can say.
+    ///
+    /// `Option`, not a bare [`ServingPlane`], for the reason `connect_endpoints`
+    /// is optional: a daemon that predates this field omits it, and any default
+    /// value would be a POSITIVE claim about routing that such a daemon never
+    /// made. `None` means "this daemon does not report the plane"; a reader must
+    /// never read it as "the local-network plane". A mirror plane that cannot
+    /// attribute a key (a test double, a plane whose route pin is gone) also
+    /// answers `None` rather than guessing.
+    #[serde(default)]
+    pub plane: Option<ServingPlane>,
 }
 
 /// The response to [`Request::Demand`].
@@ -1785,6 +1823,7 @@ mod tests {
                 robot: "ubuntu".to_string(),
                 topic: "/tf".to_string(),
                 refcount: 2,
+                plane: Some(ServingPlane::Iroh),
             }],
             active_connections: 3,
             idle: false,
@@ -1795,6 +1834,8 @@ mod tests {
         assert_eq!(v["idle"], false);
         assert_eq!(v["demands"][0]["refcount"], 2);
         assert_eq!(v["demands"][0]["topic"], "/tf");
+        // The plane rides the same row, as the lowercase token operators grep for.
+        assert_eq!(v["demands"][0]["plane"], "iroh");
         // The folded connect set rides the same response.
         assert_eq!(v["connect_endpoints"][0], "tcp/10.0.0.5:7683");
     }
@@ -1823,6 +1864,31 @@ mod tests {
             Some(Vec::new()),
             "an explicitly empty set means 'nothing folded', which is a real answer"
         );
+    }
+
+    /// A daemon that predates the plane field omits it, and that absence must stay
+    /// UNKNOWN. Reading it as the local-network plane would be a routing claim the
+    /// old daemon never made, and it is the wrong one exactly when it matters: a
+    /// robot reachable over both planes. Hand-written wire lines, so the pin cannot
+    /// be satisfied by round-tripping our own encoder.
+    #[test]
+    fn a_status_row_without_a_plane_decodes_as_unknown_never_as_the_local_plane() {
+        let older = r#"{"id":1,"demands":[{"robot":"r","topic":"/t","refcount":1}],"active_connections":1,"idle":false}"#;
+        let decoded: StatusResponse = serde_json::from_str(older).unwrap();
+        assert_eq!(
+            decoded.demands[0].plane, None,
+            "an absent plane is UNKNOWN, never a claim that the local plane served it"
+        );
+        // The anti-tautology half: a daemon that DOES report a plane is
+        // distinguishable from the one above, on both values.
+        for (token, expected) in [("zenoh", ServingPlane::Zenoh), ("iroh", ServingPlane::Iroh)] {
+            let line = format!(
+                r#"{{"id":1,"demands":[{{"robot":"r","topic":"/t","refcount":1,"plane":"{token}"}}],"active_connections":1,"idle":false}}"#
+            );
+            let decoded: StatusResponse = serde_json::from_str(&line).unwrap();
+            assert_eq!(decoded.demands[0].plane, Some(expected));
+            assert_eq!(expected.as_str(), token, "the token and the value agree");
+        }
     }
 
     #[test]

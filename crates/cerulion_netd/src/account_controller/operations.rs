@@ -199,6 +199,17 @@ impl MirrorPlane for AccountWanController {
         self.refresh(registry)
     }
 
+    /// The route this controller PINNED when it ensured the mirror, never the route
+    /// it would choose again: membership is mutable here, so a fresh decision could
+    /// name a plane that never carried a frame for this key. An unpinned key has no
+    /// live mirror, so it has no serving plane to report.
+    fn serving_plane(&self, key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
+        match self.pins().ok()?.get(key)? {
+            Route::Lan => Some(crate::protocol::ServingPlane::Zenoh),
+            Route::Wan => Some(crate::protocol::ServingPlane::Iroh),
+        }
+    }
+
     fn prepare_demand(&self, key: &TopicKey, registry: &mut DemandRegistry) -> Result<(), String> {
         if self.route(key)? == Route::Lan {
             return Ok(());

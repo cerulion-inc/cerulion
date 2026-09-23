@@ -219,6 +219,22 @@ pub trait MirrorPlane: Send + Sync {
     /// Release a route pin only after the daemon has retired its registry entry.
     fn mirror_retired(&self, _key: &TopicKey) {}
 
+    /// Which plane serves `key`, when this plane can say.
+    ///
+    /// The frames carry no evidence of the transport that brought them: both
+    /// planes re-inject into the same local shared memory under the same topic
+    /// name, so nothing downstream can tell a locally mirrored robot from one
+    /// dialed over the internet. This is the only place that answer exists, and it
+    /// is what `status` reports.
+    ///
+    /// The default is `None`, which means "this plane does not attribute keys",
+    /// never "the local plane". A composing plane answers from the route it
+    /// actually pinned when it ensured the mirror, so the answer describes what
+    /// happened rather than what a picker would decide again now.
+    fn serving_plane(&self, _key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
+        None
+    }
+
     /// Resolve an exact schema type through an authorized account robot catalog.
     fn account_schema_by_type(
         &self,
@@ -401,6 +417,11 @@ impl GatewayMirrorPlane {
 }
 
 impl MirrorPlane for GatewayMirrorPlane {
+    /// This plane has exactly one transport, so every key it serves is local.
+    fn serving_plane(&self, _key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
+        Some(crate::protocol::ServingPlane::Zenoh)
+    }
+
     fn ensure_mirror(&self, key: &TopicKey, schema_hash: u64) -> Result<(), MirrorError> {
         // Register the shared ingress bridge at the CANONICAL topic name (mirror
         // by topic — the `robot` is provenance, see the module docs). This creates
