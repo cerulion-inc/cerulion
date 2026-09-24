@@ -49,6 +49,158 @@ pub fn iceoryx_test_config() -> iceoryx2::config::Config {
     iceoryx2::testing::generate_isolated_config()
 }
 
+/// Environment variable carrying [`IsolatedRoot::root`] to a child process.
+pub const CHILD_IOX2_ROOT_ENV: &str = "CER_TEST_IOX2_ROOT";
+/// Environment variable carrying [`IsolatedRoot::prefix`] to a child process.
+pub const CHILD_IOX2_PREFIX_ENV: &str = "CER_TEST_IOX2_PREFIX";
+
+/// An iceoryx2 root path and prefix a PARENT and a CHILD process can both name.
+///
+/// [`iceoryx_test_config`] mints its root and prefix internally, which is right
+/// for a single-process test and useless for one that has to hand the same
+/// namespace to a child. This carries both halves explicitly and removes the
+/// directory on drop, so a failing run leaves nothing behind.
+pub struct IsolatedRoot {
+    dir: std::path::PathBuf,
+    /// The `global.root_path` both processes configure, with its trailing slash.
+    pub root: String,
+    /// The `global.prefix` both processes configure.
+    pub prefix: String,
+}
+
+impl IsolatedRoot {
+    /// Mint a fresh root under the iceoryx2 test directory, tagged so a leftover
+    /// is attributable to the test that made it.
+    pub fn mint(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock before the epoch")
+            .as_nanos();
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/iceoryx2/{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the isolated iceoryx2 root");
+        let root = format!("{}/", dir.display());
+        let prefix = format!("{tag}{}_", std::process::id());
+        Self { dir, root, prefix }
+    }
+
+    /// The iceoryx2 `Config` for this root, for either process.
+    pub fn config(&self) -> iceoryx2::config::Config {
+        iceoryx2::config::Config::default().pipe_root(&self.root, &self.prefix)
+    }
+}
+
+impl Drop for IsolatedRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Apply a root path and prefix to an iceoryx2 `Config`, as a method so the
+/// builder above reads in one expression.
+trait ConfigRoot {
+    fn pipe_root(self, root: &str, prefix: &str) -> Self;
+}
+
+impl ConfigRoot for iceoryx2::config::Config {
+    fn pipe_root(mut self, root: &str, prefix: &str) -> Self {
+        use iceoryx2::prelude::{FileName, Path as IoxPath, SemanticString};
+        self.global
+            .set_root_path(&IoxPath::new(root.as_bytes()).expect("iceoryx2 root path"));
+        self.global.prefix = FileName::new(prefix.as_bytes()).expect("iceoryx2 prefix");
+        self
+    }
+}
+
+/// Run an `#[ignore]`d test in THIS binary as a child process over `root`, wait
+/// for it to print `ready_marker`, then KILL it.
+///
+/// The child is killed with `SIGKILL`, so nothing it owns is dropped and
+/// nothing it registered is deregistered: its iceoryx2 ports stay in the
+/// services' dynamic configs until a dead-node sweep reaps them. That is the
+/// one condition under iceoryx2 0.10 in which a notify reaches FEWER listeners
+/// than the service reports, because the notifier's send to a socket with no
+/// live reader is refused and the connection is dropped. (Saturating a live
+/// listener no longer does it: 0.10 swallows a full doorbell and a notify into
+/// an already-notified state skips the send, so both return success.)
+///
+/// `settle` is time given to the namespace after the kill before the caller
+/// reads anything, because the child's death is asynchronous.
+///
+/// Panics with the child's captured output if it never reports ready, which is
+/// the only way this can fail silently.
+pub fn kill_child_holding_ports(
+    child_test_name: &str,
+    root: &IsolatedRoot,
+    ready_marker: &str,
+    settle: core::time::Duration,
+) {
+    use std::io::{BufRead, BufReader};
+    let exe = std::env::current_exe().expect("the running test binary");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            child_test_name,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_IOX2_ROOT_ENV, &root.root)
+        .env(CHILD_IOX2_PREFIX_ENV, &root.prefix)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn the child test `{child_test_name}`: {e}"));
+
+    let stdout = child.stdout.take().expect("child stdout is piped");
+    let mut reader = BufReader::new(stdout);
+    let mut seen = String::new();
+    let mut ready = false;
+    // Bounded: a child that dies before printing closes the pipe, which ends
+    // the loop at once rather than hanging.
+    for _ in 0..4096 {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        seen.push_str(&line);
+        if line.contains(ready_marker) {
+            ready = true;
+            break;
+        }
+    }
+    if !ready {
+        let _ = child.kill();
+        let out = child.wait_with_output().ok();
+        let stderr = out
+            .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+            .unwrap_or_default();
+        panic!(
+            "the child test `{child_test_name}` never printed `{ready_marker}`, so the \
+             condition under test was never established.\n--- child stdout ---\n{seen}\n\
+             --- child stderr ---\n{stderr}"
+        );
+    }
+
+    // SIGKILL: no unwinding, no Drop, no deregistration.
+    child.kill().expect("kill the child test");
+    let _ = child.wait();
+    std::thread::sleep(settle);
+}
+
+/// The config a CHILD spawned by [`kill_child_holding_ports`] must use, read
+/// back out of its environment. `None` when the variables are absent, which is
+/// how an `#[ignore]`d child body detects that it was run directly rather than
+/// by its parent and returns without doing anything.
+pub fn child_iceoryx_config() -> Option<iceoryx2::config::Config> {
+    let root = std::env::var(CHILD_IOX2_ROOT_ENV).ok()?;
+    let prefix = std::env::var(CHILD_IOX2_PREFIX_ENV).ok()?;
+    Some(iceoryx2::config::Config::default().pipe_root(&root, &prefix))
+}
+
 /// Re-export of
 /// [`crate::spill_fault_injection`] for source compatibility with
 /// test code that imports via `cerulion_core::testing::...`.

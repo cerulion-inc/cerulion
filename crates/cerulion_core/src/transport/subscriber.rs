@@ -519,27 +519,29 @@ const _: fn() = || {
 /// A **data-only** subscriber for the record/replay capture tap — a
 /// zero-copy SHM reader with NO event `Listener` and NO `Notifier`.
 ///
-/// # Why it exists (the storm, killed structurally)
+/// # Why it exists (a listener the tap never needed)
 ///
 /// The recorder (`bagd`) and the replay engine's capture taps drain SHM samples
 /// exclusively via a POLLING loop ([`Self::drain_owned`]); they never wait on an
 /// event listener. A [`CerulionSubscriber`], however, MANDATES a `Listener` (it
-/// bundles a data receiver AND a WaitSet event listener), and iceoryx2's notifier
-/// sends an 8-byte `SentSample` datagram to EVERY connected listener on every
-/// publish. A tap that never drains that listener lets its `AF_UNIX SOCK_DGRAM`
-/// socket fill; once full, every publisher notify pays iceoryx2's
-/// `FailedToDeliverSignal` path (~12 µs + a ~2 KB warn dump per notify) — the
-/// notify warn storm (10–150 MB/s of stderr, enough to fill a disk
-/// during a long replay).
+/// bundles a data receiver AND a WaitSet event listener), so attaching one puts
+/// a connection in every publisher's notifier send loop that nothing will ever
+/// wait on.
 ///
 /// A `DataOnlySubscriber` opens ONLY the data pub/sub service (never the topic's
 /// event service), so it registers NO listener connection: the notifier's
-/// per-listener send loop finds ZERO tap connections → ZERO sends → ZERO failed
-/// sends, STRUCTURALLY, at DEFAULT sysctls, under any drain stall or publish
-/// rate. There is no queue, no ceiling, and no `net.unix.max_dgram_qlen` to hit.
-/// This makes a drain-listener, a receive-buffer deepening and a
-/// sender-buffer sweep all unnecessary — each of those would only be
-/// treating the symptom of a listener the tap never needed.
+/// per-listener send loop finds ZERO tap connections → ZERO sends, STRUCTURALLY,
+/// under any drain stall or publish rate. Every publish on a recorded topic
+/// keeps the per-tap notify cost it would otherwise pay.
+///
+/// Under iceoryx2 0.9.1 the cost of getting this wrong was far worse than a
+/// send: a tap that never drained its listener filled its `AF_UNIX SOCK_DGRAM`
+/// socket, after which every publisher notify took a failure path (~12 µs plus a
+/// ~2 KB warning per notify, 10 to 150 MB/s of stderr, enough to fill a disk
+/// during a long replay). 0.10 removed that failure mode — a full doorbell is
+/// swallowed and a notify into an already-notified listener skips the send — so
+/// what remains is the ordinary per-publish cost, which is the reason this type
+/// still exists rather than a historical one.
 ///
 /// # No late-joiner history
 ///

@@ -13844,12 +13844,12 @@ impl GraphRuntime {
         if self.node_death.has_pending() {
             self.report_node_deaths();
         }
-        // The `bagd` recording tap is now a DATA-ONLY subscriber with
-        // no event listener, so the graph publishers' notifier send loop has zero
-        // tap connections — no `FailedToDeliverSignal` storm is possible against
-        // it. The process-wide notifier SO_SNDBUF sweep that used to run here
-        // (the mitigation for that storm) is therefore no longer needed and has
-        // been removed.
+        // The `bagd` recording tap is a DATA-ONLY subscriber with no event
+        // listener, so the graph publishers' notifier send loop has zero tap
+        // connections and pays nothing per publish for it. The process-wide
+        // notifier SO_SNDBUF sweep that used to run here (a mitigation for the
+        // undrained-listener failure iceoryx2 0.10 later removed outright) is
+        // gone with it.
     }
 
     /// Run ONE DAG level — drain its trigger inputs,

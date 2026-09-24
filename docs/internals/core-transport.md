@@ -97,16 +97,20 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   exit; consume at commit. The symptom of getting this wrong is phantom loss:
   sequence-gap detectors fire at the abort rate while completed-work counters match
   recorded artifacts exactly.
-- **Self-drain**: iceoryx2 0.9.1's notifier delivers to EVERY listener on a topic's event
-  service, including the publisher's own (each `CerulionPublisher` owns one for
-  `SubscriberConnected`). Every path that notifies must drain it: `loan_proxy` drains
-  per loan; `publish_raw` calls `check_subscriber_events()`. Forgetting this saturates
-  the publisher's own AF_UNIX socket after a few hundred publishes, after which every
-  notify fails and iceoryx2 logs a warning per publish (a disk-filling flood on a
-  many-topic robot). Oracle: `CerulionPublisher::notify_undelivered_count()`
+- **Self-drain**: the notifier delivers to EVERY listener on a topic's event service,
+  including the publisher's own (each `CerulionPublisher` owns one for
+  `SubscriberConnected`). `loan_proxy` and `publish_raw` both call
+  `check_subscriber_events()`, which is GATED on the topic's live listener count: a
+  change in that count arms a bounded run of drains, a drain that sees a transition
+  disarms it, and a steady topic pays one relaxed load per publish. Under iceoryx2
+  0.9.1 the drain was unconditional because an undrained listener filled its own
+  AF_UNIX socket, after which every notify failed and was logged once per publish (a
+  disk-filling flood on a many-topic robot); 0.10 removed that failure mode, and the
+  remaining job of the call is late-joiner history. Oracle for a notify that does not
+  reach every listener: `CerulionPublisher::notify_undelivered_count()`
   (log-level-independent); off-thread via `NodeHandle::notify_undelivered_count(output)`.
-  Pinned by `notify_self_drain_iox2_test` (includes the anti-tautology arm proving
-  saturation is real).
+  Pinned by `notify_shortfall_iox2_test`, whose apparatus arm kills a consumer process
+  to prove the condition is still reachable.
 - **Notify elision**: the per-publish notify is skipped while the topic's live listener
   count equals the count the runtime has proven it owns; over- or under-count both fail
   safe to never-elide. A foreign listener attaching resumes notifies within one publish
@@ -417,7 +421,7 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 | Test file | Pins |
 |---|---|
 | `output_proxy_test.rs` | proxy/view round-trips; commit-time sequence; discard-count observability |
-| `notify_self_drain_iox2_test.rs` | publisher self-drain on `publish_raw`; latch lifecycle |
+| `notify_shortfall_iox2_test.rs` | undelivered-notify accounting; a killed consumer as the apparatus; latch lifecycle |
 | `notify_elision_iox2_test.rs` + `notify_elision_resweep_iox2_test.rs` | elision self-heal gate; boundary resweep debt semantics |
 | `data_only_tap_iox2_test.rs` | listener-less tap; non-consuming `has_samples()` |
 | `topic_liveness_iox2_test.rs` | dating rule, baselines, epoch reset, rate estimate (observer plane) |

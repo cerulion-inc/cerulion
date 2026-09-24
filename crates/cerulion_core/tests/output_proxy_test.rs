@@ -802,13 +802,19 @@ fn output_discard_count_is_observable_through_node_handle_e2e() {
 // `CerulionPublisher`, reachable only from the node's OWN tick code (via
 // `AnyPublisher::notify_undelivered_count`). An operator reads a `NodeHandle`,
 // which cannot reach the publisher, and the iceoryx2 log-level default (correctly)
-// silences iceoryx2's own per-publish complaint about this exact condition, so
-// without this wiring a sustained degraded wake path is invisible to anything
-// but a `debug!`. This test drives a real graph whose output topic carries a
-// FOREIGN listener nobody drains (a `create_subscriber_open_only` handle held
-// and never received from — the shape a wedged `topic hz` / a stalled sibling
-// process presents) and reads the count back through
-// `NodeHandle::notify_undelivered_count`.
+// silences iceoryx2's own complaint about this condition, so without this
+// wiring a sustained degraded wake path is invisible to anything but a
+// `debug!`.
+//
+// The STIMULUS is a consumer process that was killed: its listener is still
+// registered on the output topic's event service while its doorbell has no
+// reader, so every notify reaches fewer listeners than the service reports.
+// That is the one condition under iceoryx2 0.10 that produces a shortfall; a
+// live listener nobody drains no longer does, because a full doorbell is
+// swallowed and a notify into an already-notified listener skips the send. A
+// wedged-but-alive consumer as the stimulus would make this test assert on a
+// count that can never move — see `notify_shortfall_iox2_test` for the
+// measurements and for the apparatus arm.
 // ============================================================
 
 /// A `Vector3` producer that publishes a complete frame on every fire and
@@ -862,32 +868,76 @@ impl NodeEntry for NotifyingProducer {
     }
 }
 
-/// Publishes to issue while trying to saturate the foreign listener's event
-/// socket. Sized well past any plausible `AF_UNIX SOCK_DGRAM` capacity for
-/// 8-byte datagrams (crib: `notify_self_drain_iox2_test::SATURATING_NOTIFIES`);
-/// the loop breaks as soon as the counter moves, so the full bound is only paid
-/// on a platform where saturation never happens (which fails loudly below).
-const NOTIFY_SATURATING_STEPS: usize = 20_000;
+/// Steps to run while waiting for the shortfall to be counted. A killed
+/// consumer's first shortfall only ARMS the latch's persistence rule (the
+/// count is read after the notify, where an ATTACHING listener would look
+/// identical), so at least two publishes are needed; the bound is generous and
+/// the loop breaks as soon as the counter moves.
+const NOTIFY_SHORTFALL_STEPS: usize = 2_000;
+
+/// Printed by the child once its subscriber holds a listener on the graph's
+/// output topic and that listener has been drained to idle.
+const CHILD_READY: &str = "CHILD_SUBSCRIBER_READY";
+
+/// The topic the graph publishes on and the child subscribes to.
+const SHORTFALL_TOPIC: &str = "/nodehandle/shortfall";
+
+/// Ticks the child spends draining before the parent kills it.
+const CHILD_DRAIN_TICKS: usize = 120_000;
+
+/// The child: hold a subscriber on the graph's output topic over the parent's
+/// namespace and keep draining its event listener until killed.
+///
+/// Draining matters: a listener killed while holding an unconsumed wake sits in
+/// iceoryx2's notified state, where a later notify returns success without
+/// touching the doorbell, and no shortfall would ever be observed.
+#[test]
+#[ignore = "child process entry point — driven by the NodeHandle test in this file"]
+fn subprocess_child_holds_a_subscriber() {
+    let Some(config) = cerulion_core::testing::child_iceoryx_config() else {
+        return;
+    };
+    let transport = TransportManager::init_for_test(
+        cerulion_core::transport::TransportConfig {
+            node_name: "nodehandle_child".to_string(),
+            clock: Arc::new(cerulion_core::clock::RealClock),
+            subscriber_buffer_size: 4,
+            network: None,
+        },
+        config,
+    )
+    .expect("child transport on the parent's namespace");
+    let subscriber = transport
+        .create_subscriber(SHORTFALL_TOPIC)
+        .expect("child subscriber on the graph's output topic");
+    subscriber
+        .drain_event_notifications()
+        .expect("drain the child's listener to idle");
+    println!("{CHILD_READY}");
+    use std::io::Write;
+    std::io::stdout().flush().expect("flush the ready marker");
+    for _ in 0..CHILD_DRAIN_TICKS {
+        let _ = subscriber.drain_event_notifications();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 
 #[test]
 fn notify_undelivered_count_is_observable_through_node_handle_e2e() {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let topic = format!("/nodehandle/{nanos}");
+    let topic = SHORTFALL_TOPIC.to_string();
 
-    // An ISOLATED transport we also hold, so the test can attach the foreign
-    // listener to the very same SHM root the graph publishes on.
+    // A namespace the CHILD can be handed, so its listener lands on the very
+    // same event service the graph's output publishes on.
+    let root = cerulion_core::testing::IsolatedRoot::mint("nodehandle");
     let clock = Arc::new(VirtualClock::new());
     let transport = TransportManager::init_for_test(
         cerulion_core::transport::TransportConfig {
-            node_name: format!("nodehandle_{nanos}"),
+            node_name: "nodehandle_parent".to_string(),
             clock: clock.clone(),
             subscriber_buffer_size: 16,
             network: None,
         },
-        cerulion_core::testing::iceoryx_test_config(),
+        root.config(),
     )
     .expect("isolated transport");
 
@@ -928,15 +978,23 @@ fn notify_undelivered_count_is_observable_through_node_handle_e2e() {
     let mut runtime = GraphRuntime::build(config, factories, &transport, clock)
         .expect("build notifying-producer graph");
 
-    // THE STIMULUS: a foreign listener on the producer's topic that NOBODY ever
-    // drains. Held for the whole run — dropping it would deregister the listener
-    // and heal the condition.
-    let _wedged = transport
-        .create_subscriber_open_only(&topic)
-        .expect("foreign subscriber on the producer's topic");
+    // THE STIMULUS: a consumer process attaches a listener to the producer's
+    // topic, drains it, and is then KILLED. `SIGKILL` runs no destructor, so
+    // the listener stays registered while its doorbell loses its reader, and
+    // every later notify reaches fewer listeners than the service reports.
+    //
+    // One step first, so the graph's publisher exists and its event service is
+    // open before the child tries to subscribe to it.
+    runtime.step(Duration::from_millis(1));
+    cerulion_core::testing::kill_child_holding_ports(
+        "subprocess_child_holds_a_subscriber",
+        &root,
+        CHILD_READY,
+        Duration::from_millis(200),
+    );
 
     let mut steps = 0_usize;
-    for _ in 0..NOTIFY_SATURATING_STEPS {
+    for _ in 0..NOTIFY_SHORTFALL_STEPS {
         runtime.step(Duration::from_millis(1));
         steps += 1;
         // Stop as soon as the condition is real — keeps the test fast and the
@@ -957,10 +1015,10 @@ fn notify_undelivered_count_is_observable_through_node_handle_e2e() {
         .notify_undelivered_count("out");
     assert!(
         observed > 0,
-        "after {steps} publishes with a foreign listener that is never drained, its \
-         AF_UNIX event socket must be full and notifies must start failing — got 0, so \
-         either the platform's socket is unexpectedly unbounded or the \
-         NodeHandle wiring is not hooked up"
+        "after {steps} publishes with a KILLED consumer's listener still registered on \
+         the output topic, notifies must be reaching fewer listeners than the service \
+         reports and the count must show it — got 0, so either the registration was \
+         already reaped or the NodeHandle wiring is not hooked up"
     );
 
     // THE PIN: the off-thread NodeHandle value and the node's OWN

@@ -161,7 +161,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `overflow_iox2_test.rs` | Overflow re-loan path: history push when a payload outgrows its slot; counter on Drop re-loan failure. | tt1 | none |
 | `publisher_pool_sizing_test.rs` | Per-schema slot sizing for typed publisher creation. | parallel | none |
 | `publisher_recon_teardown_iox2_test.rs` | Node-side producer-reconciliation teardown log (cdylib-parity, no FFI export); at-most-once with the host harvest; a planning-only build is silent while a never-stepped execution build still reports. | `#[serial]` | none |
-| `notify_self_drain_iox2_test.rs` | Publishers drain their own event listener on every notify path (`publish_raw` included); anti-tautology saturation arm; latch lifecycle. | parallel | none |
+| `notify_shortfall_iox2_test.rs` | A notify that reaches fewer listeners than the topic reports is counted and reported; the apparatus arm kills a consumer process to prove the condition is reachable; latch lifecycle through a dead-node sweep. | `#[serial]` (spawns child processes) | none |
 | `notify_elision_iox2_test.rs` | The notify-elision self-healing gate (owned-listener counting; foreign attach resumes notifies). | `#[serial]` tt1 | none |
 | `notify_elision_resweep_iox2_test.rs` | Live-loop boundary resweep: fires only on outstanding debt + foreign listener; firing spends the debt. | `#[serial]` tt1 | none |
 | `data_only_tap_iox2_test.rs` | Listener-less capture tap: event-level zero proof; frame completeness; NON-consuming `has_samples()` (a consuming probe fails it). | `#[serial]` | none |

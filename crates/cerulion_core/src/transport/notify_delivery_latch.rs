@@ -11,23 +11,18 @@
 //! # Why (the failure it makes observable)
 //!
 //! iceoryx2 delivers an event notification over a per-listener `AF_UNIX
-//! SOCK_DGRAM` socket, and — because `notify_with_custom_event_id` passes
+//! SOCK_DGRAM` doorbell, and — because `notify_with_custom_event_id` passes
 //! `skip_self_deliver = false` — a publisher's notify is delivered to EVERY
 //! listener on the topic's event service, **including the publisher's own**
 //! (each [`CerulionPublisher`](super::publisher::CerulionPublisher) owns one,
-//! to hear `SubscriberConnected`). Any listener that is never drained fills its
-//! socket; from then on every notify to it fails with
-//! `NotifierNotifyError::FailedToDeliverSignal` and iceoryx2 logs a `warn!`
-//! (`iceoryx2-0.9.1/src/port/notifier.rs:525`) **once per publish per stuck
-//! connection**. On a Go2 that is ~2500 lines/s ≈ 5 MB/s, and a long serve
-//! session fills the root disk.
+//! to hear `SubscriberConnected`).
 //!
-//! That flood is iceoryx2's own log line, so the log-level setting
-//! (`init_iceoryx_log_level`) SILENCES it — which is correct for the disk, and
-//! exactly why this latch exists: a saturated listener is a genuinely degraded
-//! wake path (Principle #6 — the consumer stops being woken and falls back to
-//! the heartbeat), and once iceoryx2's warning is filtered out, Cerulion must
-//! carry the signal ITSELF or the condition becomes invisible (Principle #3).
+//! A listener that cannot be delivered to is a genuinely degraded wake path
+//! (Principle #6 — the consumer stops being woken and falls back to the
+//! heartbeat), and iceoryx2's own complaint about it is filtered out by the
+//! log-level default (`init_iceoryx_log_level`), which is correct for the disk
+//! and exactly why this latch exists: Cerulion must carry the signal ITSELF or
+//! the condition is invisible (Principle #3).
 //!
 //! # Detection
 //!
@@ -36,17 +31,33 @@
 //! exact, cheap test: `triggered < listeners` ⇒ at least one connection could
 //! not be delivered to.
 //!
-//! Two distinct conditions produce `triggered < listeners`, and the caller's
-//! diagnostic must name BOTH (they have different remedies):
+//! **A stale registration** is the condition that produces it: the listener's
+//! process died (SIGKILL, crash) without deregistering, so its doorbell has no
+//! reader. The next notify's send is refused, iceoryx2 drops that connection
+//! and does not count it, and the topic's dynamic-config entry is still there.
+//! Remedy: nothing from the producer; a dead-node sweep removes the entry.
+//! `notify_shortfall_iox2_test` drives exactly that and is where the numbers
+//! below were measured.
 //!
-//! 1. **A saturated listener** — the consumer is registered and alive but
-//!    nobody drains its `AF_UNIX SOCK_DGRAM` event socket, so `sendto` fails.
-//!    Remedy: drain it (a Cerulion subscriber does this on every receive; the
-//!    original root cause was a *publisher* not draining its own listener).
-//! 2. **A stale registration** — the listener's process died (SIGKILL, crash)
-//!    and iceoryx2 removed the dead connection from the notifier's connection
-//!    list while the topic's dynamic-config entry has not been reaped yet.
-//!    Remedy: none needed from the producer; a dead-node cleanup removes it.
+//! ## The condition this latch was BUILT for, and no longer sees
+//!
+//! Until iceoryx2 0.10 the event id rode IN the datagram, so a listener nobody
+//! drained filled its socket and every later notify to it failed and was logged
+//! once per publish — measured at ~2500 lines/s ≈ 5 MB/s on a robot, enough to
+//! fill a root disk. 0.10 removed that at the source: the id and its repeat
+//! count live in a shared-memory counting bitset, the doorbell carries one
+//! byte, a full doorbell is SWALLOWED rather than refused, and a notify into a
+//! listener that already holds an unconsumed wake skips the send entirely. A
+//! live listener nobody drains is therefore reached forever and counted as
+//! reached, and no drain anywhere exists to prevent it.
+//!
+//! ## And one shape it cannot see
+//!
+//! A listener killed while holding an UNCONSUMED wake sits in the notified
+//! state, where a notify returns success without touching the doorbell. That
+//! registration reads as reached for as long as it survives. A consumer that
+//! was draining when it died leaves the state idle and IS seen, which is the
+//! common shape; the blind one is a consumer that was already not draining.
 //!
 //! # Race windows (both directions, and what absorbs each)
 //!
@@ -77,8 +88,8 @@
 //!   it: an `AfterNotify` shortfall observed while the latch is healthy only
 //!   ARMS a suspicion (nothing logged, nothing counted) and forces the NEXT
 //!   notify to be classified. The regime opens only if the shortfall REPEATS
-//!   there. An attach race heals on that very next notify; a saturated or
-//!   dead-but-unreaped listener does not.
+//!   there. An attach race heals on that very next notify; a dead-but-unreaped
+//!   listener does not.
 //!
 //! # Cost discipline (the notify is on the publish path)
 //!
@@ -105,8 +116,8 @@
 //! 1. **The cost gate.** A listener this publisher has NEVER once reached —
 //!    i.e. one already unreachable at the moment it joined, while `triggered`
 //!    happens to stay constant — is not classified until `triggered` next
-//!    moves. The saturation regime (a listener that WAS reachable and then
-//!    saturates, which is every observed case: `triggered` drops) is always
+//!    moves. The regime that matters (a listener that WAS reachable and then
+//!    stops being, which is every observed case: `triggered` drops) is always
 //!    classified, and the first notify of a publisher's life is always
 //!    classified (the sentinel).
 //! 2. **The persistence rule**, whose confirming notify is PUBLISH-CADENCE
@@ -234,7 +245,7 @@ pub struct NotifyDeliveryLatch {
     /// regardless of log-level regime, NEVER reset on recovery. This is the
     /// Principle #3 queryability signal: with iceoryx2's own `warn!` correctly
     /// filtered at `IOX2_LOG_LEVEL=error` and sustained repeats
-    /// `debug!`-downgraded here, a persistently saturated listener would
+    /// `debug!`-downgraded here, a persistently unreachable listener would
     /// otherwise be completely invisible. Surfaced through
     /// [`CerulionPublisher::notify_undelivered_count`](super::publisher::CerulionPublisher::notify_undelivered_count).
     ///
@@ -252,7 +263,7 @@ pub struct NotifyDeliveryLatch {
     /// notify. Purely a suspicion: nothing has been logged or counted for it.
     ///
     /// It also forces [`Self::needs_classification`] — without that, a
-    /// persistent shortfall whose `triggered` never moves again (a saturated
+    /// persistent shortfall whose `triggered` never moves again (an unreachable
     /// listener at a steady publish rate) would be skipped by the cost gate
     /// forever and the suspicion would never be confirmed.
     pending_shortfall: AtomicBool,
@@ -369,7 +380,7 @@ impl NotifyDeliveryLatch {
         // PERSISTENCE before believing it: the first such observation on a
         // healthy latch only arms the suspicion — nothing logged, nothing
         // counted — and `needs_classification` then forces the next notify to
-        // be classified. A saturated / dead-but-unreaped listener reproduces
+        // be classified. A dead-but-unreaped listener reproduces
         // the shortfall there and opens the regime one notify later; an attach
         // race resolves healthy and costs nothing. Inside an OPEN regime every
         // repeat is believed (the condition is already established), and a
@@ -596,7 +607,7 @@ mod tests {
 
     /// The cost gate ([`NotifyDeliveryLatch::needs_classification`]) — hand
     /// oracle over the exact sequence a steady healthy publisher produces, then
-    /// a saturation, then a recovery.
+    /// a shortfall, then a recovery.
     ///
     /// A `false` here means the caller skips reading the topic's listener count
     /// from shared memory, so this is the pin that the skip only ever happens on
@@ -691,7 +702,7 @@ mod tests {
     }
 
     /// The other half of the persistence rule: a shortfall that REPEATS on the
-    /// next classified notify is real (a saturated listener, or a dead one whose
+    /// next classified notify is real (an unreachable listener, or a dead one whose
     /// registration lingers) and opens the regime loudly at that second
     /// observation.
     #[test]
@@ -726,7 +737,7 @@ mod tests {
     }
 
     /// The pin for the `pending_shortfall` term in
-    /// [`NotifyDeliveryLatch::needs_classification`]: without it, a saturated
+    /// [`NotifyDeliveryLatch::needs_classification`]: without it, an unreachable
     /// listener at a steady publish rate is invisible FOREVER — the suspicion is
     /// armed, `triggered` never moves again, the cost gate skips every
     /// subsequent notify, and the suspicion is never confirmed.
@@ -811,7 +822,7 @@ mod tests {
     /// identical.
     ///
     /// Hand oracle for the `AfterNotify` (elision-unarmed) path: 3 healthy
-    /// (1 of 1) → 4 saturated (0 of 1) → 3 healthy again. The FIRST saturated
+    /// (1 of 1) → 4 unreachable (0 of 1) → 3 healthy again. The FIRST unreachable
     /// observation is deferred by the persistence rule, so the regime opens on
     /// the second and the total is 3 — one less than the four shortfalls
     /// observed.

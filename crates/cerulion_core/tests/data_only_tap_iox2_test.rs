@@ -8,10 +8,10 @@
 //!   tap: the producer's event service `number_of_listeners()` stays at the
 //!   same-process consumer count (the tap contributes ZERO). Attaching the OLD
 //!   listener-full open-only tap raises the count by one, so reverting the
-//!   recorder/replay tap wiring fails test A. Because iceoryx2's
-//!   `FailedToDeliverSignal` storm can only exist when a listener is connected,
-//!   `listener-count == consumer-count` is a DIRECT, log-independent proof of
-//!   zero failed sends to the tap, which is the bar this tap must clear.
+//!   recorder/replay tap wiring fails test A. A notify is sent once per
+//!   CONNECTED listener, so `listener-count == consumer-count` is a DIRECT,
+//!   log-independent proof that the tap costs every publisher on the topic
+//!   nothing, which is the bar this tap must clear.
 //! - **(B) Record completeness (Principle #6/#7).** The data-only tap captures a
 //!   published burst byte-identical to a hand oracle via `drain_owned` polling
 //!   alone (no listener), including a STALLED-then-resumed drain, byte-identical

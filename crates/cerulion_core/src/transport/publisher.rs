@@ -441,13 +441,14 @@ pub struct CerulionPublisher {
     /// this counter is also the storm oracle (`N` silent passes ⇒ still 1).
     /// `None` when elision is not armed (armed together with the elided counter).
     resweep_notify_count: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// Flood-suppression latch + log-level-independent counter for
-    /// notifies that could NOT be delivered to every live listener (a saturated
-    /// `AF_UNIX SOCK_DGRAM` event socket ⇒ iceoryx2
-    /// `NotifierNotifyError::FailedToDeliverSignal`). Always armed — see
-    /// [`NotifyDeliveryLatch`] for why this signal must exist on OUR side once
-    /// `IOX2_LOG_LEVEL=error` correctly filters iceoryx2's own per-publish
-    /// `warn!`. Read via [`Self::notify_undelivered_count`].
+    /// Flood-suppression latch + log-level-independent counter for notifies
+    /// that could NOT be delivered to every live listener (a consumer whose
+    /// process died without deregistering, so its doorbell has no reader while
+    /// its registration stands). Always armed — see [`NotifyDeliveryLatch`] for
+    /// why this signal must exist on OUR side once `IOX2_LOG_LEVEL=error`
+    /// correctly filters iceoryx2's own complaint, and for the condition the
+    /// latch was built for that iceoryx2 0.10 made unreachable. Read via
+    /// [`Self::notify_undelivered_count`].
     notify_delivery_latch: NotifyDeliveryLatch,
     /// SHARED mirror of [`notify_delivery_latch`](Self::notify_delivery_latch)'s
     /// `total_undelivered`, so the count is observable EXTERNALLY
@@ -2185,35 +2186,34 @@ impl CerulionPublisher {
         // for graph outputs / service / rmw — they notify on their own schedule,
         // so this never double-notifies.
         if self.notify_on_publish_raw {
-            // Drain OUR OWN event listener before
-            // notifying. iceoryx2's `notify_with_custom_event_id` passes
-            // `skip_self_deliver = false`, so a notify is delivered to EVERY
-            // listener on the topic's event service — including this
-            // publisher's own (every `CerulionPublisher` owns one, to hear
-            // `SubscriberConnected`). The typed loan path drains it on every
-            // `loan_proxy` (see the `check_subscriber_events()` call there);
-            // `publish_raw` did NOT, so once this notify was armed the
-            // publisher started filling its OWN `AF_UNIX SOCK_DGRAM` socket:
-            // after a few hundred publishes it is full and EVERY subsequent
-            // notify fails with `FailedToDeliverSignal`, which iceoryx2 logs
-            // once per publish. On a Go2 `cerulion graph run attach`
-            // (~90 `RawIngressRoute`s, each a `create_ingress_publisher` +
-            // `publish_raw`) that is ~2500 lines/s ≈ 5 MB/s, enough to fill the
-            // root disk. Draining here keeps our own queue at ≤1 event and
-            // costs nothing on the zero-copy loan hot path (this branch is
-            // raw-ingress only).
+            // Service any subscriber transition before notifying, the same
+            // call the typed loan path makes. iceoryx2's
+            // `notify_with_custom_event_id` passes `skip_self_deliver = false`,
+            // so a notify is delivered to EVERY listener on the topic's event
+            // service, this publisher's own included (every
+            // `CerulionPublisher` owns one, to hear `SubscriberConnected`).
+            //
+            // This call used to drain that listener on EVERY raw publish, and
+            // under iceoryx2 0.9.1 it had to: an undrained listener filled its
+            // own `AF_UNIX SOCK_DGRAM` socket within a few hundred publishes,
+            // after which every notify failed and was logged once per publish
+            // (~90 raw ingress routes on an attached robot, ~2500 lines/s,
+            // ~5 MB/s, enough to fill a root disk). 0.10 removed that failure
+            // at the source, so `check_subscriber_events` is now gated on the
+            // topic's live listener count and does nothing at all on a steady
+            // topic — see its own doc for the gate and for the race it arms
+            // across.
             //
             // `check_subscriber_events` rather than a bare listener drain
-            // because it is the ONE drain primitive that also CLASSIFIES what
-            // it pulled — the same call `loan_proxy` makes, so there is one
-            // drain path to reason about instead of a second bespoke one. Be
-            // precise about its `SubscriberConnected` arm here: the only
-            // publishers reaching this branch are `create_ingress_publisher`'s
-            // (the sole `arm_publish_raw_notify` caller) and those are built
-            // with `history_size = 0`, so the `deliver_history` it drives is a
-            // no-op TODAY. It is not dead weight — it is what keeps this drain
-            // correct if an ingress publisher ever requests history — but it is
-            // not the reason to prefer this call over a raw drain.
+            // because it is the ONE primitive that also CLASSIFIES what it
+            // pulled, so there is one path to reason about instead of a second
+            // bespoke one. Be precise about its `SubscriberConnected` arm here:
+            // the only publishers reaching this branch are
+            // `create_ingress_publisher`'s (the sole `arm_publish_raw_notify`
+            // caller) and those are built with `history_size = 0`, so the
+            // `deliver_history` it drives is a no-op TODAY. It is not dead
+            // weight — it is what keeps this call correct if an ingress
+            // publisher ever requests history.
             self.check_subscriber_events();
             let _ = self.notify_sent_sample();
         } else {
