@@ -661,7 +661,7 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config)
     // exactly where it is most likely to: a corrupted registry refuses the
     // creation, which is the case the sweep exists for. Returning a 0/0
     // `CleanupState` there would read as "nothing was dead", so the refusal is
-    // reported as a REGISTRY error instead — the field whose contract is
+    // reported as a REGISTRY error instead, the field whose contract is
     // already "the scan could not run, so the counters are a lower bound".
     let sweep_config = cerulion_core::transport::dead_node_sweep::sweep_node_config(config);
     let ((state, node_refusal), captured) = capture_iceoryx_logs(|| {
@@ -1357,7 +1357,7 @@ pub(crate) mod tests {
     pub(crate) const SWEEP_ORIGIN: &str =
         "Node::<iceoryx2::service::ipc_threadsafe::Service>::cleanup_dead_nodes()";
 
-    /// A node token exactly as iceoryx2 renders `UniqueNodeId` under `{:?}` —
+    /// A node token exactly as iceoryx2 renders `UniqueNodeId` under `{:?}`:
     /// parens AND braces inside, which is why the refusal line is parsed from
     /// its end.
     ///
@@ -1399,7 +1399,7 @@ pub(crate) mod tests {
         assert!(
             live.starts_with(NODE_TOKEN_PREFIX),
             "the node identity no longer renders as `{NODE_TOKEN_PREFIX}…` but as \
-             `{live}` — every refusal line, sub-cause origin and detection line is \
+             `{live}`. Every refusal line, sub-cause origin and detection line is \
              keyed on that prefix, so the classifier would stop attributing anything"
         );
 
@@ -1433,7 +1433,7 @@ pub(crate) mod tests {
             shape(&fixture),
             shape(&live),
             "the hand node-token fixture no longer has the shape iceoryx2 renders \
-             (fixture `{fixture}`, live `{live}`) — re-derive it before trusting any \
+             (fixture `{fixture}`, live `{live}`). Re-derive it before trusting any \
              oracle built on it"
         );
     }

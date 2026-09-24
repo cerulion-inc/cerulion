@@ -427,7 +427,7 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 - The global management segment's name carries the iceoryx2 version:
   `<prefix><id>_node.0_10_0.global_mgmt`. Two iceoryx2 versions on one machine therefore
   keep SEPARATE node registries and cannot see each other's services at all, with no
-  error on either side — the discriminator is the PATCH level, so a future 0.10.1 fleet
+  error on either side. The discriminator is the PATCH level, so a future 0.10.1 fleet
   would partition from a 0.10.0 one the same way. The practical rule is that every
   Cerulion process and every node library on a machine must be built against the same
   `cerulion_core`, which `CERULION_ABI_VERSION` now refuses at load. The mapping lives

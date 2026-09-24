@@ -1597,7 +1597,7 @@ fn publish_subscribe_open_env_hint(
         }
         PublishSubscribeOpenError::VersionMismatch => {
             "; the existing service was created by a process linking a \
-             DIFFERENT iceoryx2 version — every Cerulion process and every \
+             DIFFERENT iceoryx2 version. Every Cerulion process and every \
              node cdylib on one machine must be built against the same \
              `cerulion_core`, because each links its own iceoryx2 and the \
              two cannot share a service. Rebuild the node libraries against \
@@ -1658,7 +1658,7 @@ fn event_env_hint(e: &iceoryx2::service::builder::event::EventOpenOrCreateError)
         }
         EventOpenOrCreateError::EventOpenError(EventOpenError::VersionMismatch) => {
             "; the existing event service was created by a process linking a \
-             DIFFERENT iceoryx2 version — every Cerulion process and every \
+             DIFFERENT iceoryx2 version. Every Cerulion process and every \
              node cdylib on one machine must be built against the same \
              `cerulion_core`, because each links its own iceoryx2 and the \
              two cannot share a service. Rebuild the node libraries against \
@@ -1669,7 +1669,7 @@ fn event_env_hint(e: &iceoryx2::service::builder::event::EventOpenOrCreateError)
             EventOpenError::DoesNotSupportRequestedMaxEventId,
         ) => {
             "; the existing event service carries a SMALLER event-id ceiling \
-             than this process needs — it was created by an older Cerulion \
+             than this process needs. It was created by an older Cerulion \
              whose event enum was shorter. Stop the older process and let \
              this one create the service"
         }

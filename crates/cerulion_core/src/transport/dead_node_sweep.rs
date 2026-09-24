@@ -171,9 +171,9 @@ pub fn run_budgeted_sweep<T>(
 /// The first is a reporting defect: the implicit sweep does the work, so the
 /// explicit call that follows finds nothing and reports `0` cleaned and `0`
 /// refused for a namespace it just emptied. Anything built on those counts (the
-/// classified report `cerulion clean` prints, the convergence check that
-/// decides whether a second pass is needed) is then describing a sweep that did
-/// not happen.
+/// classified report `cerulion clean` prints, the check that decides whether
+/// the namespace has converged) is then describing a sweep that did not
+/// happen.
 ///
 /// The second is the reason `TransportManager` disables the same three flags on
 /// every node it builds: iceoryx2's liveness probe can judge a LIVE node dead

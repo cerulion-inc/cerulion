@@ -77,8 +77,8 @@ fn all_iceoryx2_deps_are_exact_pinned() {
             );
         }
     }
-    // iceoryx2 0.10 spike: iceoryx2 + iceoryx2-log + the 20-crate sub-family
-    // = 22 (0.10.0 adds `iceoryx2-bb-flatbuffers` to the family).
+    // iceoryx2 + iceoryx2-log + the 20-crate sub-family = 22
+    // (`iceoryx2-bb-flatbuffers` joined the family in 0.10.0).
     assert!(
         count >= 22,
         "expected the full iceoryx2 family exact-pinned (>=22), found {count}"
