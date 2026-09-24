@@ -72,6 +72,15 @@ const UMBRELLA: &str = "cerulion";
 /// `::cerulion::core::graph` and `::cerulion_core::graph` are the same path.
 const UMBRELLA_RUNTIME_MODULE: &str = "core";
 
+/// The version the missing-dependency message tells a user to add.
+///
+/// This crate's own, read at compile time rather than written out. The
+/// workspace releases in lockstep with every internal dependency pinned
+/// exactly, so the macro crate's version IS the runtime's and the umbrella's,
+/// and advice derived from it cannot go stale the first time the workspace is
+/// bumped.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Which crate the consuming package reaches the runtime through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Root {
@@ -256,9 +265,9 @@ fn unresolved_message() -> String {
          its own Cargo.toml, because the generated code reaches the runtime by \
          an absolute path. Either add the umbrella crate, which brings the \
          runtime, the macros and the message types together:\n\
-         \n    [dependencies]\n    {UMBRELLA} = \"1.0.0\"\n\
+         \n    [dependencies]\n    {UMBRELLA} = \"{VERSION}\"\n\
          \nor name the runtime crate directly:\n\
-         \n    [dependencies]\n    {RUNTIME} = \"1.0.0\"\n\
+         \n    [dependencies]\n    {RUNTIME} = \"{VERSION}\"\n\
          \nA re-export in a crate you already depend on cannot stand in for \
          either of those: Cargo does not hand a package its transitive \
          dependencies, so the name has to be in this package's own manifest."
@@ -539,11 +548,31 @@ mod tests {
     #[test]
     fn the_diagnostic_names_both_manifests_and_the_reason() {
         let text = unresolved_message();
-        assert!(text.contains("cerulion = \"1.0.0\""), "{text}");
-        assert!(text.contains("cerulion_core = \"1.0.0\""), "{text}");
+        assert!(
+            text.contains(&format!("cerulion = \"{VERSION}\"")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("cerulion_core = \"{VERSION}\"")),
+            "{text}"
+        );
         assert!(
             text.contains("transitive dependencies"),
             "the message must say why a re-export cannot stand in: {text}"
+        );
+    }
+
+    /// The version in the advice is this crate's own, not a literal.
+    ///
+    /// A literal would tell a user to add an outdated dependency from the
+    /// first workspace bump onwards, and the assertion above would keep
+    /// passing because it would be reading the same literal back.
+    #[test]
+    fn the_recommended_version_follows_this_crate() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(
+            unresolved_message().contains(env!("CARGO_PKG_VERSION")),
+            "the message must recommend the version this crate ships at"
         );
     }
 }
