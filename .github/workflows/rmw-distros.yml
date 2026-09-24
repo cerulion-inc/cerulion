@@ -5,7 +5,8 @@ name: rmw distro lanes
 # building rmw_cerulion against that distro's REAL headers (bindgen; the vendored fallback is refused).
 # Each lane asserts the distro's KNOWN state through tools/ci/rmw-distros/gate.sh, so the lane is
 # green while the state is true and turns red the moment the truth moves in either direction.
-# Runs on PRs that touch the rmw path and on every push to main.
+# Runs on PRs and pushes to main that touch the rmw path. No lane is a required context on main, so a
+# path-filtered lane that does not run can never leave a PR pending.
 
 on:
   pull_request:
@@ -18,6 +19,13 @@ on:
       - 'Cargo.lock'
   push:
     branches: [main]
+    paths:
+      - 'crates/rmw_cerulion/**'
+      - 'crates/cerulion_heaphook/**'
+      - 'crates/native_ros2_messages/**'
+      - 'tools/ci/rmw-distros/**'
+      - '.github/workflows/rmw-distros.yml'
+      - 'Cargo.lock'
   workflow_dispatch:
 
 concurrency:
@@ -40,25 +48,34 @@ jobs:
       image: ros:${{ matrix.distro }}-ros-base
       options: --shm-size=1g
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the bindgen toolchain
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential curl ca-certificates git clang libclang-dev pkg-config procps
       - name: Install Rust (stable, with rustfmt for the bindgen layout-test reader)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Fingerprint the distro headers
+        # The image tag floats; bindgen's input is the header tree, so the cache follows the headers,
+        # never a tag that may have been republished.
+        id: headers
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --component rustfmt
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          hh=$(find "/opt/ros/${{ matrix.distro }}/include" -type f \( -name '*.h' -o -name '*.hpp' \) -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+          echo "hash=$hh" >> "$GITHUB_OUTPUT"
+          echo "distro header tree hash: $hh"
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-rmw-distros-${{ matrix.distro }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-rmw-distros-${{ matrix.distro }}-
+            cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-
       - name: Gate (expected state for this distro)
         run: bash tools/ci/rmw-distros/gate.sh "${{ matrix.distro }}"
