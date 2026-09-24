@@ -2298,3 +2298,91 @@ fn a_cert_that_cannot_be_read_is_held_at_its_aside_until_the_login_publishes() {
         "and consumes the aside rather than leaving a second copy"
     );
 }
+
+#[test]
+#[serial]
+fn logout_revokes_the_session_and_the_gate_then_refuses() {
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let _svc = EnvGuard::set("CERULION_ACCOUNT_SERVICE", &base);
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+
+    let buf = SharedBuf::new();
+    let worker = std::thread::spawn({
+        let mut b = buf.clone();
+        move || login_cmd::run_login(&mut b)
+    });
+    let code = wait_for(
+        || extract_user_code(&buf.snapshot()),
+        Duration::from_secs(15),
+    )
+    .expect("run_login printed a user_code");
+    authorize_via_magic_link(port, &email, &code);
+    let signed_in = worker.join().unwrap().expect("run_login");
+
+    let outcome = login_cmd::run_logout().expect("logout against a live service");
+    assert_eq!(
+        outcome,
+        login_cmd::LogoutOutcome::SignedOut {
+            account_id: signed_in.account_id.clone()
+        }
+    );
+
+    let loaded = auth::load();
+    match &loaded {
+        LoadedAuth::SignedOut { account_id } => {
+            assert_eq!(account_id.as_deref(), Some(signed_in.account_id.as_str()));
+        }
+        other => panic!("expected SignedOut, got {other:?}"),
+    }
+    assert_eq!(
+        auth::local_gate(&loaded, auth::now_unix_ns()),
+        LocalGate::RefuseSignedOut
+    );
+    let text = std::fs::read_to_string(home.path().join("auth.json")).unwrap();
+    assert!(
+        !text.contains(&signed_in.session_token) && !text.contains(&signed_in.refresh_token),
+        "no credential may survive a sign-out: {text}"
+    );
+
+    // The service retired the pair: the old refresh token no longer mints a session.
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": signed_in.refresh_token }))
+        .send()
+        .expect("refresh reachable");
+    assert!(
+        !resp.status().is_success(),
+        "a revoked refresh token must be refused, got {}",
+        resp.status()
+    );
+
+    let err = login_cmd::ensure_login_gate_with(&mut Vec::new(), false)
+        .expect_err("a signed-out machine is refused");
+    assert!(err.to_string().contains("signed out"), "{err}");
+
+    assert_eq!(
+        login_cmd::run_logout().expect("a second logout is a no-op"),
+        login_cmd::LogoutOutcome::NotSignedIn
+    );
+}
+
+#[test]
+#[serial]
+fn logout_without_the_service_still_signs_the_machine_out_and_says_so() {
+    let home = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(home.path(), "acct-offline-logout").unwrap();
+    let _svc = EnvGuard::set("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1");
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+
+    let err = login_cmd::run_logout().expect_err("the revoke cannot be confirmed");
+    let msg = err.to_string();
+    assert!(msg.contains("signed out on this machine"), "{msg}");
+    assert!(msg.contains("stays valid there until it expires"), "{msg}");
+    assert!(matches!(
+        auth::load(),
+        LoadedAuth::SignedOut { account_id: Some(ref a) } if a == "acct-offline-logout"
+    ));
+}

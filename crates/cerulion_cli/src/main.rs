@@ -1969,6 +1969,19 @@ fn run(cli: Cli) -> CliResult<()> {
             login_cmd::run_login(&mut std::io::stderr())?;
             Ok(())
         }
+        Commands::Logout => {
+            match login_cmd::run_logout()? {
+                login_cmd::LogoutOutcome::SignedOut { account_id } => {
+                    println!("signed_out: account={account_id}");
+                    eprintln!("Signed out. Run `cerulion login` to sign in again.");
+                }
+                login_cmd::LogoutOutcome::NotSignedIn => {
+                    println!("not_signed_in");
+                    eprintln!("This machine was not signed in; nothing changed.");
+                }
+            }
+            Ok(())
+        }
         // Account self-service device management (list / revoke). The
         // session is resolved (+ refreshed) here — the login gate already guaranteed a
         // logged-in-ever account for this identity-needing command.
@@ -3680,6 +3693,9 @@ fn command_needs_identity(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::Login
+            // Signing out must work on a machine whose session is gone or
+            // expired, and must never start a sign-in.
+            | Commands::Logout
             // Emitting a completion script is a pure local text
             // render — gating it behind the login flow would make `cerulion
             // completions zsh` in a shell rc file block startup on a device
@@ -3871,6 +3887,7 @@ mod login_gate_exemption_tests {
     #[test]
     fn login_verb_is_exempt() {
         assert!(!command_needs_identity(&Commands::Login));
+        assert!(!command_needs_identity(&Commands::Logout));
     }
 
     #[test]
