@@ -19,13 +19,13 @@ grep -q "$(printf '\033')\[" "$fixture" || { echo "SELFTEST FAIL: the fixture ca
 grep -q "$(printf '\033')\[" "$plain" && { echo "SELFTEST FAIL: colour survived strip_ansi"; fail=1; }
 # 2. The raw (coloured) log defeats the Running rule; the plain log does not.
 raw_bins=$(grep -cE '^ *Running ' "$fixture"); plain_bins=$(grep -cE '^ *Running ' "$plain")
-[ "$raw_bins" -eq 0 ] && [ "$plain_bins" -eq 3 ] || { echo "SELFTEST FAIL: Running lines raw=$raw_bins plain=$plain_bins (want 0 and 3)"; fail=1; }
+if [ "$raw_bins" -ne 0 ] || [ "$plain_bins" -ne 3 ]; then echo "SELFTEST FAIL: Running lines raw=$raw_bins plain=$plain_bins (want 0 and 3)"; fail=1; fi
 # 3. The harvested set is exactly the expected one, binary-qualified, the own-line FAILED included.
 got="$(qualified_failures "$plain")"
 if [ "$got" != "$(cat "$expected")" ]; then echo "SELFTEST FAIL: harvested set differs"; echo "-- expected:"; cat "$expected"; echo "-- got:"; echo "$got"; fail=1; fi
 # 4. The counts come from the summaries: 4 targets, 10 tests run (6 + 2 + 3... as the summaries say), 4 failed.
 read -r summaries ran failed_total <<< "$(suite_counts "$plain")"
-[ "$summaries" -eq 4 ] && [ "$ran" -eq 10 ] && [ "$failed_total" -eq 4 ] || { echo "SELFTEST FAIL: counts summaries=$summaries ran=$ran failed=$failed_total (want 4 10 4)"; fail=1; }
+if [ "$summaries" -ne 4 ] || [ "$ran" -ne 10 ] || [ "$failed_total" -ne 4 ]; then echo "SELFTEST FAIL: counts summaries=$summaries ran=$ran failed=$failed_total (want 4 10 4)"; fail=1; fi
 # 5. The failures-list count agrees with the summaries' count (the cross-check the gate makes).
 [ "$(printf '%s\n' "$got" | grep -c .)" -eq "$failed_total" ] || { echo "SELFTEST FAIL: harvested $(printf '%s\n' "$got" | grep -c .) names against $failed_total summary failures"; fail=1; }
 # 6. A clean fixture is not a crash; a compile failure and a signal death are.
