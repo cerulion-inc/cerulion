@@ -63,7 +63,10 @@ log="/tmp/rmw_build_${distro}.log"
 echo "== rmw distro lane: $distro (expected: $expect) =="
 cargo build -p rmw_cerulion --release 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
-if grep -q -F "VENDORED" "$log"; then
+# Everything below reads the build log with terminal colour stripped (see harvest.sh), the same
+# way the suite log is read, so a change in cargo's colour setting can never hide a marker.
+plain_log="${log}.plain"; strip_ansi "$log" > "$plain_log"
+if grep -q -F "VENDORED" "$plain_log"; then
     echo "GATE FAIL: build.rs took the VENDORED-bindings path inside a ROS container"
     exit 1
 fi
@@ -105,8 +108,8 @@ case "$expect" in
         ;;
     refuse)
         [ "$rc" -ne 0 ] || { echo "GATE FAIL: $distro BUILT, but the table says it is refused today; flip its row in the PR that lands $distro support"; exit 1; }
-        grep -q -F -- "$marker" "$log" || { echo "GATE FAIL: $distro failed WITHOUT the known marker; last lines:"; tail -n 40 "$log"; exit 1; }
-        count=$(grep -oE 'due to [0-9]+ previous errors?' "$log" | grep -oE '[0-9]+' | tail -n 1)
+        grep -q -F -- "$marker" "$plain_log" || { echo "GATE FAIL: $distro failed WITHOUT the known marker; last lines:"; tail -n 40 "$plain_log"; exit 1; }
+        count=$(grep -oE 'due to [0-9]+ previous errors?' "$plain_log" | grep -oE '[0-9]+' | tail -n 1)
         [ "${count:-0}" -eq "$errors" ] || { echo "GATE FAIL: $distro stopped with ${count:-0} errors, the table pins $errors; the refusal moved, update the table in the PR that changes $distro"; exit 1; }
         echo "GATE PASS (expected refusal): $distro stops at the known marker with exactly $errors errors"
         ;;
