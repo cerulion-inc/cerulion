@@ -59,10 +59,10 @@ States: **validated** means an artifact above shows it running; **expected, unva
 
 | distro | state | detail |
 |---|---|---|
-| Foxy, Galactic | blocked | pre-Iron rmw API (104-byte init options, 24-byte GID); a Jazzy-built library faulted on a Foxy robot (`era.rs` lines 5 to 11); a Foxy or Humble build fails at compile by design |
+| Foxy, Galactic | blocked | pre-Iron rmw API (104-byte init options, 24-byte GID); a Jazzy-built library faulted on a Foxy robot (`era.rs` lines 5 to 11); a Foxy build fails at compile by design (Humble builds; see its row) |
 | Humble | built and tested in CI, unvalidated on a robot | pre-Iron rmw API (24-byte GID storage padded, int8 request guids cast); the rclcpp bridge mirrors the Humble and Iron introspection shape under `cfg(not(cerulion_has_is_key))`; the `humble` lane builds against real Humble headers and runs the rmw suite |
 | Iron | expected, unvalidated | 16-byte GID and the 168-byte init options match Jazzy, and the `MessageMember` arm is the Humble and Iron 112-byte one (`era_pins.rs` lines 76 to 85); the rclcpp bridge takes the same pre-Iron mirror shape as Humble, so both typesupport paths compile; never built or run (rclpy) would run; never built or run in this tree |
-| Jazzy | validated | section 2; the only distro the rmw has executed against, and the one the release packages ship a library for (Linux x86_64 and arm64) |
+| Jazzy | validated | section 2; the only distro ROS 2 nodes have run over the rmw, and the one the release packages ship a library for (Linux x86_64 and arm64); Humble runs the crate's own test suite in CI against real Humble headers, with no ROS 2 node over it yet |
 | Kilted | expected, unvalidated | its own claim (160-byte init options, `crates/rmw_cerulion/src/era_check.rs` line 512) and otherwise the Jazzy era; a Jazzy-built library is refused under Kilted by name (`tests/rmw_era_guard_test.rs` lines 9 to 15); `docs/internals/rmw.md` line 259 keeps it outside the support matrix; never run |
 | Rolling (Lyrical era) | expected, unvalidated | the vendored snapshot is pinned to rolling and compiles and unit-tests in CI, but a deployed library must be built against current rolling headers; an outdated rolling tree fails as a Jazzy-era contradiction (`docs/internals/rmw.md` lines 262 to 263); the rclcpp bridge admits the Lyrical/Rolling layout (the C++ mirror carries `is_rosidl_buffer_` under its capability cfg); never run against a rolling node |
 
@@ -103,7 +103,7 @@ Some runs cited above have no artifact in this repository: the four ROS 2 regres
 
 ## 5. Evidence behind the matrix
 
-Every validated `rmw_cerulion` execution used ROS 2 Jazzy: a `ros:jazzy` container on an x86-64 Linux desktop and on an aarch64 Jetson-class machine, a hosted amd64 CI runner, arm64 Docker on an Apple Silicon workstation, and a native RoboStack Jazzy environment on that workstation. No other distro has run it. The one time an `rmw_cerulion` library was loaded under another distro, ROS 2 Foxy, it passed `rmw_init` and then failed at the first typed operation, and a rebuild against real Foxy headers stopped at bindgen. The non-Jazzy ROS hosts and containers that appear in benchmark records ran stock RMWs or the DDS bridge, never `rmw_cerulion`.
+Every validated `rmw_cerulion` execution used ROS 2 Jazzy: a `ros:jazzy` container on an x86-64 Linux desktop and on an aarch64 Jetson-class machine, a hosted amd64 CI runner, arm64 Docker on an Apple Silicon workstation, and a native RoboStack Jazzy environment on that workstation. No other distro has run ROS 2 nodes over it; Humble runs the crate's own test suite in CI against real Humble headers, with no ROS 2 node over it yet. The one time an `rmw_cerulion` library was loaded under another distro, ROS 2 Foxy, it passed `rmw_init` and then failed at the first typed operation, and a rebuild against real Foxy headers stopped at bindgen. The non-Jazzy ROS hosts and containers that appear in benchmark records ran stock RMWs or the DDS bridge, never `rmw_cerulion`.
 
 ### What the tree carries for the other distros
 
