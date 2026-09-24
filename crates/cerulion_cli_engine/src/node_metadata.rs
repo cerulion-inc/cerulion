@@ -27,6 +27,15 @@ use crate::error::{CliError, CliResult};
 pub struct NodeMetadata {
     pub node_type: String,
     pub policy: Option<MacroPolicy>,
+    /// The node-level `throttle_ms = N` rate cap, when the type declares one.
+    ///
+    /// Read from SOURCE for the same reason the per-input `backpressure` below
+    /// is: a rate cap is a fire-deferral decision, the chain-fusion analysis
+    /// refuses to fuse a consumer that declares one, and that analysis runs
+    /// well ahead of the first node library load, so source is the only truth
+    /// available to it. Dropping the parsed value here would leave the rule
+    /// decidable in principle and never decided.
+    pub throttle_ms: Option<u64>,
     pub inputs: Vec<PortDef>,
     pub outputs: Vec<PortDef>,
 }
@@ -89,6 +98,7 @@ impl NodeMetadata {
         Self {
             node_type: node_type.to_string(),
             policy,
+            throttle_ms: None,
             inputs: vec![],
             outputs: vec![],
         }
@@ -594,6 +604,7 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
     Ok(Some(NodeMetadata {
         node_type: node_type.to_string(),
         policy,
+        throttle_ms: macro_attr.and_then(macro_attr_throttle_ms),
         inputs,
         outputs,
     }))
@@ -729,6 +740,10 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
         outputs: Vec<String>,
         #[serde(default)]
         policy: Option<PolicyJson>,
+        /// The node-level rate cap. Absent on a node that declares none, and
+        /// on an info block written before the key existed.
+        #[serde(default)]
+        throttle_ms: Option<u64>,
     }
     // The SECOND host parser of this document. `graph::node`'s
     // parser reports an unknown envelope key; this one reports it too, or
@@ -768,11 +783,13 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
         ))
     })?;
     let policy = info.policy.and_then(PolicyJson::into_macro_policy);
+    let throttle_ms = info.throttle_ms;
     let (inputs, outputs) = (info.inputs, info.outputs);
 
     Ok(Some(NodeMetadata {
         node_type: node_type.to_string(),
         policy,
+        throttle_ms,
         inputs: inputs
             .into_iter()
             .map(|entry| match entry {
@@ -2431,6 +2448,35 @@ fn macro_attr_to_policy(attr: &syn::Attribute) -> Option<MacroPolicy> {
     None
 }
 
+/// Read the node-level `throttle_ms = N` rate cap off the
+/// `#[cerulion_node(...)]` attribute, or `None` when the node declares none.
+///
+/// A sibling of [`macro_attr_to_policy`] rather than part of it: a rate cap is
+/// not a trigger policy, it STACKS with one, and the macro rejects it only
+/// beside `period_ms`. Same token walk, same numeric-literal handling
+/// (underscores and a type suffix are both legal in the source).
+fn macro_attr_throttle_ms(attr: &syn::Attribute) -> Option<u64> {
+    let syn::Meta::List(meta_list) = &attr.meta else {
+        return None;
+    };
+    use proc_macro2::TokenTree;
+    let tokens: Vec<TokenTree> = meta_list.tokens.clone().into_iter().collect();
+    for i in 0..tokens.len() {
+        let TokenTree::Ident(ident) = &tokens[i] else {
+            continue;
+        };
+        if ident != "throttle_ms" || i + 2 >= tokens.len() {
+            continue;
+        }
+        if let (TokenTree::Punct(p), TokenTree::Literal(lit)) = (&tokens[i + 1], &tokens[i + 2]) {
+            if p.as_char() == '=' {
+                return parse_int_literal(&lit.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2492,6 +2538,58 @@ struct CameraNode {
     // co-location constraint — so a policy this parser drops is a partition
     // that splits a `block` edge and a worker that dies at graph build.
     // ======================================================================
+
+    /// A node-level rate cap is read off the macro attribute, beside the
+    /// trigger policy it stacks with.
+    ///
+    /// The chain-fusion census refuses to fuse a consumer that defers its own
+    /// fire, and it runs before any node library is loaded, so a cap this
+    /// parser dropped would leave that rule decidable and never decided.
+    #[test]
+    fn a_macro_nodes_rate_cap_is_read_beside_its_trigger_policy() {
+        let tmp = TempDir::new().unwrap();
+        let capped = r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(throttle_ms = 5)]
+#[derive(Default)]
+struct CappedNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#;
+        let node_dir = write_node(&tmp, "capped", capped);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.throttle_ms, Some(5));
+        // The cap STACKS: it does not replace the policy the trigger input
+        // synthesizes.
+        assert_eq!(
+            metadata.policy,
+            Some(MacroPolicy::DataTrigger {
+                input_name: "inp".to_string()
+            })
+        );
+
+        // Source-level numeric spellings the compiler accepts, which the
+        // policy walk already handles and this one must too.
+        let spelled = capped.replace(
+            "throttle_ms = 5",
+            "sync_window_ms = 25, throttle_ms = 1_000u64",
+        );
+        let node_dir = write_node(&tmp, "spelled", &spelled);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.throttle_ms, Some(1000));
+        assert_eq!(metadata.policy, Some(MacroPolicy::Sync { window_ms: 25 }));
+
+        // ANTI-TAUTOLOGY: a node that declares no cap reports none, so the
+        // arms above cannot be satisfied by a parser that always answers.
+        let bare = capped.replace("#[cerulion_node(throttle_ms = 5)]", "#[cerulion_node]");
+        let node_dir = write_node(&tmp, "bare", &bare);
+        assert_eq!(parse_node_metadata(&node_dir).unwrap().throttle_ms, None);
+    }
 
     #[test]
     fn a_macro_nodes_declared_backpressure_lands_on_its_port() {
