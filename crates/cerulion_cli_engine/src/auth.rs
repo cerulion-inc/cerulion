@@ -424,7 +424,7 @@ fn signed_out_account(bytes: &[u8]) -> Option<(Option<String>, Option<MachineRol
 }
 
 /// The `auth.json` bytes after a sign-out of the store holding `prior`: the
-/// credential keys ([`SIGNED_OUT_REMOVED_KEYS`]) are gone, every other key is
+/// credential keys (`SIGNED_OUT_REMOVED_KEYS`) are gone, every other key is
 /// kept as it was. The result reads back as [`LoadedAuth::SignedOut`].
 ///
 /// # Errors
