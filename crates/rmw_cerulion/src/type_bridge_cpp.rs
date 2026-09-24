@@ -1626,8 +1626,17 @@ fn cpp_op_var_idx(op: &CppFieldOp) -> usize {
 /// plus the C++-only precondition: the process's `std::vector` really is
 /// the three-pointer triplet ([`vector_triplet_layout_verified`]). A
 /// BOUNDED sequence is additionally a different C++ type here (rosidl's
-/// `BoundedVector`), which is reason enough on its own.
+/// `BoundedVector`), which is reason enough on its own; and on Lyrical and
+/// Rolling a `rosidl::Buffer` member is refused first (no triplet exists).
 fn is_forgeable_sequence_cpp(member: &CppMessageMember, triplet_layout_ok: bool) -> bool {
+    // Lyrical and Rolling: a `rosidl::Buffer` member (`is_rosidl_buffer_`)
+    // carries no in-struct triplet at all (its storage sits in a
+    // heap-allocated impl behind a pointer), so there is nothing to aim: a
+    // forge would overwrite the two pointers and 8 bytes past the object.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    if member.is_rosidl_buffer_ {
+        return false;
+    }
     triplet_layout_ok
         && member.is_array_
         && member.array_size_ == 0
@@ -2446,6 +2455,45 @@ impl CppBridgedMessage {
 
 #[cfg(test)]
 mod cpp_package_tests {
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    fn u8_sequence_member(is_rosidl_buffer: bool) -> super::CppMessageMember {
+        super::CppMessageMember {
+            name_: c"data".as_ptr(),
+            type_id_: super::ros_type::UINT8,
+            string_upper_bound_: 0,
+            members_: std::ptr::null(),
+            is_key_: false,
+            is_array_: true,
+            array_size_: 0,
+            is_upper_bound_: false,
+            offset_: 0,
+            default_value_: std::ptr::null(),
+            size_function: None,
+            get_const_function: None,
+            get_function: None,
+            fetch_function: None,
+            assign_function: None,
+            resize_function: None,
+            is_rosidl_buffer_: is_rosidl_buffer,
+        }
+    }
+
+    /// Lyrical and Rolling: a `uint8[]` member flagged as a rosidl Buffer is
+    /// never forged and never handed to the `std::vector` shim, while the
+    /// same member without the flag (a real vector) is both. The flag is
+    /// the ONLY difference between the two fixtures.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    #[test]
+    fn a_rosidl_buffer_member_is_never_forged_nor_treated_as_a_u8_vector() {
+        use crate::ffi::introspection_cpp::is_unbounded_u8_vector;
+        let buffer = u8_sequence_member(true);
+        assert!(!super::is_forgeable_sequence_cpp(&buffer, true));
+        assert!(!is_unbounded_u8_vector(&buffer));
+        let vector = u8_sequence_member(false);
+        assert!(super::is_forgeable_sequence_cpp(&vector, true));
+        assert!(is_unbounded_u8_vector(&vector));
+    }
+
     use super::cpp_package;
 
     /// Both accepted namespace spellings normalize to ONE

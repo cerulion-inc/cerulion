@@ -546,6 +546,25 @@ fn a_pre_jazzy_verdict_refuses_at_error_with_its_own_constant_paragraph() {
 #[traced_test]
 #[test]
 #[serial]
+fn a_vendored_unnamed_runtime_verdict_refuses_at_error_with_its_own_constant_paragraph() {
+    rearm();
+    assert!(
+        CppBridgeGate::RefuseVendoredUnnamedRuntime.emit_refusal(),
+        "a vendored build under an unnamed runtime must tell the caller to refuse"
+    );
+    logs_assert(|lines: &[&str]| {
+        check_refusal_line(
+            lines,
+            CppBridgeGate::RefuseVendoredUnnamedRuntime,
+            "RefuseVendoredUnnamedRuntime",
+            "pre-Jazzy distro",
+        )
+    });
+}
+
+#[traced_test]
+#[test]
+#[serial]
 fn a_supported_verdict_emits_nothing_and_does_not_refuse() {
     rearm();
     assert!(
