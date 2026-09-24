@@ -25,7 +25,7 @@
 //!
 //! The budgeted depth is asserted as `63` rather than as
 //! `flashback_tap_buffer_depth(..)`, because calling the rule to check the rule
-//! is a self-compare. 63 is `4 MiB / (64 KiB + 40)` floored — and the arm ALSO
+//! is a self-compare. 63 is `4 MiB / (64 KiB + 48)` floored — and the arm ALSO
 //! asserts it is strictly under the NOMINAL `4 MiB / 64 KiB = 64`, which is the
 //! discriminator for the real-vs-nominal divisor through the production path.
 //!
@@ -59,7 +59,7 @@ use common::{
 /// The slice every topic in this file is provisioned with.
 ///
 /// 64 KiB is chosen so the budget arithmetic lands JUST under a power of two:
-/// `4 MiB / 65_576` is 63 while `4 MiB / 65_536` is 64, so the real-slot divisor
+/// `4 MiB / 65_584` is 63 while `4 MiB / 65_536` is 64, so the real-slot divisor
 /// and the nominal one give measurably different answers. A slice where they
 /// agreed would make every assertion below pass under either implementation.
 const SLICE: u32 = 64 * 1024;
@@ -71,7 +71,7 @@ const SLICE: u32 = 64 * 1024;
 const BUDGET: u64 = 4 * 1024 * 1024;
 
 /// The depth the budget buys at [`SLICE`], HAND-COMPUTED:
-/// `4 * 1024 * 1024 / (64 * 1024 + 40)` = `4_194_304 / 65_576` = 63.
+/// `4 * 1024 * 1024 / (64 * 1024 + 48)` = `4_194_304 / 65_584` = 63.
 const BUDGETED_DEPTH: u64 = 63;
 
 /// What a NOMINAL divisor would have answered — `4 MiB / 64 KiB`. Asserted
@@ -266,7 +266,7 @@ fn a_record_tap_stays_ceiling_deep_while_a_window_only_tap_takes_its_budget() {
     assert_eq!(
         depth_of(&win, &win_topic),
         BUDGETED_DEPTH,
-        "a window-only tap must take the byte budget: {BUDGET} / (64 KiB + 40 B \
+        "a window-only tap must take the byte budget: {BUDGET} / (64 KiB + 48 B \
          of iceoryx2 sample header) = {BUDGETED_DEPTH}"
     );
     // THE REAL-vs-NOMINAL DISCRIMINATOR, through the production path. A divisor
@@ -333,7 +333,7 @@ fn a_budget_too_small_for_one_slot_still_leaves_a_usable_tap() {
     let dir = temp_dir("floor");
     let topic = unique_topic("floor");
 
-    // One slot at this slice costs 65_576 bytes; the budget is 4 096.
+    // One slot at this slice costs 65_584 bytes; the budget is 4 096.
     let summary = run_one(
         &mgr,
         &topic,
@@ -661,11 +661,13 @@ fn a_discovered_tap_on_a_window_only_recorder_is_budgeted_too() {
     );
 }
 
-/// One slot at [`SLICE`]: 64 KiB of payload plus iceoryx2's 40-byte
+/// One slot at [`SLICE`]: 64 KiB of payload plus iceoryx2's 48-byte
 /// publish-subscribe sample header, already a multiple of the header's 8-byte
 /// alignment. Written out rather than called from the production rule, so this
-/// file's oracles are arithmetic it states itself.
-const SLOT: u64 = 64 * 1024 + 40;
+/// file's oracles are arithmetic it states itself. The header was 40 bytes
+/// before iceoryx2 0.10 added `payload_offset`; `transport::tap_depth_tests`
+/// reads the size off the type and is where that number is pinned.
+const SLOT: u64 = 64 * 1024 + 48;
 
 /// `shm_pinned_bytes` is a HIGH-WATER that does NOT recede when the queues
 /// drain — asserted LIVE off `/bagd/status`, which is also the surface an
@@ -961,17 +963,17 @@ fn parse_status_batch(
 const NARROW_SLICE: u32 = 64;
 /// The WIDE publisher's slice — the one that joins afterwards.
 const WIDE_SLICE: u32 = 4096;
-/// One slot at [`WIDE_SLICE`]: `align(40 + 4096, 8)` = 4136.
-const WIDE_SLOT: u64 = 4136;
-/// One slot at [`NARROW_SLICE`]: `align(40 + 64, 8)` = 104. Never an expected
+/// One slot at [`WIDE_SLICE`]: `align(48 + 4096, 8)` = 4144.
+const WIDE_SLOT: u64 = 4144;
+/// One slot at [`NARROW_SLICE`]: `align(48 + 64, 8)` = 112. Never an expected
 /// value — it is what a CACHED price quotes, and the headline arm
 /// asserts the figure is NOT this.
-const NARROW_SLOT: u64 = 104;
+const NARROW_SLOT: u64 = 112;
 /// The budget of this shape: 64 KiB, the shipped ingress number over
 /// 1024 so a modest ceiling is reachable.
 const SHAPE_BUDGET: u64 = 64 * 1024;
 /// The service ceiling of this shape, which is what the budgeted depth clamps to
-/// (64 KiB / 104 = 630 slots, far past any sane ceiling).
+/// (64 KiB / 112 = 585 slots, far past any sane ceiling).
 const SHAPE_CEILING: usize = 16;
 
 /// Open a topic whose FIRST publisher is narrow, so the service ceiling and the
@@ -997,9 +999,9 @@ fn wide_publisher(
 /// the pinned figure, because the price of a queued chunk is not fixed.
 ///
 /// The shape is exact, and its numbers are the oracle: the tap opens at depth 16
-/// against a 104-byte slot; a 4096-byte publisher joins; 16 of ITS samples
-/// occupy `16 x 4136` = 66,176 B — OVER the 64 KiB budget — while a cached
-/// price reports `16 x 104` = 1,664 B.
+/// against a 112-byte slot; a 4096-byte publisher joins; 16 of ITS samples
+/// occupy `16 x 4144` = 66,304 B — OVER the 64 KiB budget — while a cached
+/// price reports `16 x 112` = 1,792 B.
 ///
 /// Both numbers are asserted: the equality says the live price is used, and the
 /// explicit inequality against 1,664 names the defect, so a future reader can

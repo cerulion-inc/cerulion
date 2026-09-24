@@ -1612,7 +1612,12 @@ fn publish_subscribe_open_env_hint(
              the process exhausts its open-file (fd) limit — every \
              node's services/ports consume fds, so a many-node graph \
              can blow past the default 1024; raise it with \
-             `ulimit -n 65536` and retry before assuming corruption"
+             `ulimit -n 65536` and retry before assuming corruption. \
+             A machine UPGRADED from an older Cerulion reads the same \
+             way: a service whose on-disk static config was written by \
+             an older iceoryx2 cannot be parsed by this one, so it is \
+             reported as corrupted rather than as a version skew. \
+             Sweep the iceoryx2 root once after the upgrade"
         }
         _ => "",
     }
@@ -6363,29 +6368,33 @@ mod tap_depth_tests {
         // change upstream is visible as a NUMBER in a failing test rather than
         // only as a shifted depth three assertions later.
         assert_eq!(
-            IOX2_SAMPLE_HEADER_BYTES, 40,
-            "iceoryx2 0.9.1's publish-subscribe Header is 40 bytes \
-             (UniqueNodeId 16 + UniquePublisherId 16 + u64 8) — if this moved, \
-             every depth below moves with it and that is the point of reading it"
+            IOX2_SAMPLE_HEADER_BYTES, 48,
+            "iceoryx2's publish-subscribe Header is 48 bytes (UniqueNodeId 16 + \
+             UniquePublisherId 16 + number_of_elements 8 + payload_offset 8). It \
+             WAS 40: 0.10 added `payload_offset`, so every slot is eight bytes \
+             bigger and a fixed shared-memory budget buys marginally fewer of \
+             them. The production arithmetic reads the size off the type and \
+             needed no change; this number is here so the next such move is \
+             visible as a failing NUMBER rather than as a quietly shifted depth"
         );
         assert_eq!(IOX2_SAMPLE_HEADER_ALIGN, 8);
 
         // Aligned slices: the overhead is FLATLY the header.
-        assert_eq!(iceoryx2_slot_bytes(0), 40);
-        assert_eq!(iceoryx2_slot_bytes(256), 296);
-        assert_eq!(iceoryx2_slot_bytes(4096), 4136);
-        assert_eq!(iceoryx2_slot_bytes(1024 * 1024), 1_048_616);
-        assert_eq!(iceoryx2_slot_bytes(16 * 1024 * 1024), 16_777_256);
+        assert_eq!(iceoryx2_slot_bytes(0), 48);
+        assert_eq!(iceoryx2_slot_bytes(256), 304);
+        assert_eq!(iceoryx2_slot_bytes(4096), 4144);
+        assert_eq!(iceoryx2_slot_bytes(1024 * 1024), 1_048_624);
+        assert_eq!(iceoryx2_slot_bytes(16 * 1024 * 1024), 16_777_264);
 
         // UNALIGNED slices round UP. 157 is a real `/tf` frame size,
-        // so this is not a synthetic number: 40 + 157 = 197 → 200.
-        assert_eq!(iceoryx2_slot_bytes(157), 200);
+        // so this is not a synthetic number: 48 + 157 = 205 → 208.
+        assert_eq!(iceoryx2_slot_bytes(157), 208);
         // One byte either side of a multiple of 8, to pin the rounding on both
         // edges rather than at one convenient point.
-        assert_eq!(iceoryx2_slot_bytes(1), 48);
-        assert_eq!(iceoryx2_slot_bytes(7), 48);
-        assert_eq!(iceoryx2_slot_bytes(8), 48);
-        assert_eq!(iceoryx2_slot_bytes(9), 56);
+        assert_eq!(iceoryx2_slot_bytes(1), 56);
+        assert_eq!(iceoryx2_slot_bytes(7), 56);
+        assert_eq!(iceoryx2_slot_bytes(8), 56);
+        assert_eq!(iceoryx2_slot_bytes(9), 64);
 
         // The property every caller relies on: a slot is never SMALLER than its
         // payload, at any size, so a budget divided by it can never admit more
@@ -6414,13 +6423,13 @@ mod tap_depth_tests {
         const BUDGET: u64 = 64 * 1024 * 1024;
         const CEILING: usize = 4096;
 
-        // 1 MiB slice: 64 MiB / 1_048_616 = 63. A nominal divisor says 64.
+        // 1 MiB slice: 64 MiB / 1_048_624 = 63. A nominal divisor says 64.
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 1024 * 1024, CEILING),
             63,
             "a nominal divisor would answer 64 and over-commit the budget by a slot"
         );
-        // 16 MiB slice: 64 MiB / 16_777_256 = 3. A nominal divisor says 4.
+        // 16 MiB slice: 64 MiB / 16_777_264 = 3. A nominal divisor says 4.
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 16 * 1024 * 1024, CEILING),
             3,
@@ -6437,7 +6446,7 @@ mod tap_depth_tests {
         }
 
         // A small slice is bounded by the CEILING, not the budget: 64 MiB of
-        // 296-byte slots is 226 719 slots, and no service is that deep.
+        // 304-byte slots is 220 752 slots, and no service is that deep.
         assert_eq!(flashback_tap_buffer_depth(BUDGET, 256, CEILING), CEILING);
         assert_eq!(flashback_tap_buffer_depth(BUDGET, 256, 16), 16);
     }
@@ -6455,19 +6464,24 @@ mod tap_depth_tests {
             flashback_tap_buffer_depth(BUDGET, 128 * 1024 * 1024, 4096),
             FLASHBACK_TAP_BUFFER_DEPTH_FLOOR
         );
-        // Exactly AT the budget is one slot, which the floor lifts to two — the
-        // boundary on the side the floor is for.
+        // A slice EXACTLY the size of the budget also buys zero, because a slot
+        // is the slice PLUS the header: the boundary sits on the SLOT and never
+        // on the slice, which is the whole reason this rule exists.
+        assert_eq!(BUDGET / iceoryx2_slot_bytes(64 * 1024 * 1024) as u64, 0);
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 64 * 1024 * 1024, 4096),
-            2
+            FLASHBACK_TAP_BUFFER_DEPTH_FLOOR
         );
-        // And just under it, two slots, which the floor does not touch: the
-        // other side of the same boundary, so the floor cannot be mistaken for a
-        // constant answer.
+        // HALF the budget buys exactly one slot, which the floor lifts to two —
+        // the boundary on the side the floor is for.
+        assert_eq!(BUDGET / iceoryx2_slot_bytes(32 * 1024 * 1024) as u64, 1);
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 32 * 1024 * 1024, 4096),
             2
         );
+        // And a slice that buys THREE is left alone: the other side of the same
+        // boundary, so the floor cannot be mistaken for a constant answer.
+        assert_eq!(BUDGET / iceoryx2_slot_bytes(16 * 1024 * 1024) as u64, 3);
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 16 * 1024 * 1024, 4096),
             3

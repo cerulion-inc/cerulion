@@ -3452,36 +3452,42 @@ mod notify_delivery_wiring_tests {
         assert!(publisher.notify_delivery_latch.is_degraded());
     }
 
-    /// The boundary resweep FEEDS the latch — end to end over real
-    /// transport, with NO per-publish notify involved at any point.
+    /// The boundary resweep FEEDS the latch — end to end over real transport,
+    /// with NO per-publish notify involved at any point.
     ///
-    /// SCOPE: this pins that the resweep classifies its notify AT ALL.
-    /// It does NOT discriminate WHICH count the resweep passes: once the
-    /// foreign listener's socket is full every sweep falls short, so a variant
-    /// passing `ReadHere` instead of its already-read count would merely defer
-    /// the count by one sweep inside a 20_000-iteration loop and still pass.
-    /// The already-paid-count decision is pinned by
+    /// SCOPE: this pins that the resweep classifies its notify AT ALL. It does
+    /// NOT discriminate WHICH count the resweep passes; the already-paid-count
+    /// decision is pinned by
     /// `known_listener_count_is_always_classified_even_when_triggered_never_moves`,
     /// and the declared-timing decision by
     /// `declared_timing_governs_classification_not_the_presence_of_a_count`.
     ///
     /// This is the site the resweep's own docs call the one that matters most
     /// for the signal: it runs only when a FOREIGN listener is present and the
-    /// producer holds an UN-ANNOUNCED frame, so a saturated foreign listener on
-    /// a producer that never notifies for itself is observable HERE AND NOWHERE
-    /// ELSE.
+    /// producer holds an UN-ANNOUNCED frame, so a producer that never notifies
+    /// for itself is observable HERE AND NOWHERE ELSE.
     ///
-    /// The debt-keyed trigger changed WHAT this loop must do, not what it pins: the resweep
-    /// announces a DEBT, so each round has to create one. It does that the way
-    /// the shape actually arises in production — an off-gate `publish_raw` on a
-    /// publisher that is not `notify_on_publish_raw`-armed (the graph-output /
-    /// DDS-bridge raw-route shape, the resweep docs' case 2). A round that merely swept
-    /// again would now correctly do nothing.
+    /// Each round has to create a debt, the way the shape actually arises in
+    /// production: an off-gate `publish_raw` on a publisher that is not
+    /// `notify_on_publish_raw`-armed (the graph-output raw-route shape, the
+    /// resweep docs' case 2). A round that merely swept again would correctly
+    /// do nothing.
     ///
-    /// Truthful observable: the publisher's own listener is drained every round
-    /// (so it can never be the one missing), the foreign listener never is, and
-    /// the count moves only after the foreign listener's `AF_UNIX SOCK_DGRAM`
-    /// socket fills.
+    /// TRUTHFUL OBSERVABLE, and it moved. It used to be a SHORTFALL: leave the
+    /// foreign listener undrained, let its datagram socket fill, and watch the
+    /// undelivered count rise. iceoryx2 0.10 made that unreachable, because a
+    /// full doorbell is swallowed and a notify into an already-notified
+    /// listener skips the send, so a live listener is reached forever however
+    /// long it goes undrained (`notify_shortfall_iox2_test` measures that and
+    /// drives the condition that IS still reachable). Waiting for a shortfall
+    /// here would wait forever, and asserting its absence would pass whether or
+    /// not the resweep ever touched the latch.
+    ///
+    /// So the observable is the latch's own CLASSIFICATION state instead, which
+    /// is what "feeds the latch" meant all along: before the first sweep the
+    /// latch has never classified anything and says so, and after one sweep it
+    /// has classified that exact notify. A resweep wired past
+    /// `record_notify_delivery` leaves the sentinel standing and fails here.
     #[test]
     fn boundary_resweep_feeds_the_delivery_latch_on_a_quiescent_producer() {
         let mgr = test_manager("resweep_latch_test");
@@ -3495,7 +3501,8 @@ mod notify_delivery_wiring_tests {
             Arc::new(AtomicU64::new(0)),
         );
 
-        // A foreign listener (a `topic hz`-shaped attacher) that NOBODY drains.
+        // A foreign listener (a `topic hz`-shaped attacher), which is what makes
+        // the resweep fire at all: live 2 > expected 1.
         let foreign = mgr
             .create_trigger_listener_for_test(topic, mgr.default_topic_config())
             .expect("attach a foreign listener on the topic's event service");
@@ -3505,47 +3512,66 @@ mod notify_delivery_wiring_tests {
             0,
             "precondition: nothing undelivered before the sweeps start"
         );
+        // The sentinel: nothing has been classified, so the latch demands
+        // classification of ANY count. This is the anti-tautology half of the
+        // assertion below, which would otherwise pass on a latch nobody feeds.
+        assert!(
+            publisher.notify_delivery_latch.needs_classification(2),
+            "precondition: a publisher that has never notified must classify its \
+             next notify whatever it triggers"
+        );
 
-        // Drive ONLY the boundary sweep — the per-publish notify path never runs
-        // (an off-gate `publish_raw` on this publisher notifies nobody; it only
-        // records the debt). Each sweep therefore announces that debt (live 2 >
-        // expected 1); our own listener is drained every round, the foreign one
-        // is not.
+        // Drive ONLY the boundary sweep. The per-publish notify path never runs:
+        // an off-gate `publish_raw` on this publisher notifies nobody, it only
+        // records the debt the sweep then announces.
         // hot-path-alloc-ok: test-only fixture frame, built once outside any
         // measured window (this whole module is `#[cfg(test)]`).
         let mut frame = vec![0u8; WireHeader::SIZE];
         WireHeader::new(0xFEED_FACE, 0, 0).write_to_buf(&mut frame);
-        let mut swept = 0_usize;
-        let mut saturated = false;
-        for _ in 0..20_000 {
-            publisher.check_subscriber_events();
+        publisher
+            .publish_raw(&frame)
+            .expect("off-gate raw publish (creates the un-announced debt)");
+        let triggered = publisher.resweep_notify_elision();
+        assert_eq!(
+            triggered, 2,
+            "the boundary sweep must fire a real notify reaching BOTH listeners \
+             while a foreign one is present and a frame is un-announced"
+        );
+
+        // THE PIN: that notify went through `record_notify_delivery`, so the
+        // latch now holds this classification and no longer demands one for the
+        // same count. A resweep that notified without classifying leaves the
+        // sentinel and fails here.
+        assert!(
+            !publisher
+                .notify_delivery_latch
+                .needs_classification(triggered),
+            "the boundary sweep's notify must be CLASSIFIED by the delivery latch, \
+             not merely sent: this is the only site that observes a quiescent \
+             producer's foreign listener at all"
+        );
+        // And it was classified HEALTHY: the notify reached every listener the
+        // service reports, so no regime opened and nothing was counted.
+        assert!(
+            !publisher.notify_delivery_latch.is_degraded(),
+            "a notify that reached every listener must not open a degraded regime"
+        );
+        assert_eq!(
+            publisher.notify_undelivered_count(),
+            0,
+            "and must not be counted as undelivered"
+        );
+
+        // Repeating it is still classified and still healthy, so the first round
+        // was not a one-off of the sentinel.
+        for _ in 0..16 {
             publisher
                 .publish_raw(&frame)
-                .expect("off-gate raw publish (creates the un-announced debt)");
-            let triggered = publisher.resweep_notify_elision();
-            swept += 1;
-            assert!(
-                triggered >= 1,
-                "the boundary sweep must fire a real notify while a foreign \
-                 listener is present and a frame is un-announced"
-            );
-            if publisher.notify_undelivered_count() > 0 {
-                saturated = true;
-                break;
-            }
+                .expect("off-gate raw publish (a fresh debt)");
+            assert_eq!(publisher.resweep_notify_elision(), 2);
         }
-
-        assert!(
-            saturated,
-            "after {swept} boundary sweeps with the foreign listener never drained, \
-             its event socket must be full and the resweep's notify must start \
-             falling short — got 0, so either the platform's socket is unexpectedly \
-             unbounded or the resweep no longer feeds the delivery latch"
-        );
-        assert!(
-            publisher.notify_delivery_latch.is_degraded(),
-            "the resweep's shortfall opens a real regime, not a silent count"
-        );
+        assert!(!publisher.notify_delivery_latch.is_degraded());
+        assert_eq!(publisher.notify_undelivered_count(), 0);
         drop(foreign);
     }
 }
