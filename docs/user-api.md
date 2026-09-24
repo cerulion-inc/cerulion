@@ -472,6 +472,46 @@ You shouldn't need to hand-edit `Cargo.toml` or `.cargo/config.toml`; the CLI ke
 
 ## Node author API (the macros)
 
+### What a node crate depends on
+
+A node needs the runtime and the message types, and there are two manifests
+that provide them.
+
+One dependency, which is what `cargo add cerulion` writes:
+
+```toml
+[dependencies]
+cerulion = "1.0.0"
+```
+
+`cerulion` is an umbrella crate that re-exports the other three at a single
+version. A node written against it imports `cerulion::prelude::*` and takes
+its port types from `cerulion::msgs`.
+
+Or the crates themselves, which is what `cerulion workspace create` scaffolds
+and what every example in this document uses:
+
+```toml
+[dependencies]
+cerulion_core = "1.0.0"
+native_ros2_messages = "1.0.0"
+```
+
+Either works, and a package that names both gets the same generated code it
+got from the second. The macros read the package's own `Cargo.toml` at
+expansion time to decide how to spell the paths they emit, because Rust
+resolves the first segment of an absolute path only against a crate the
+package names in its own manifest. That is also why a package that names
+neither is refused: Cargo does not hand a package its transitive
+dependencies, so a re-export in some crate further down cannot stand in. The
+macros report that by name, with both manifests spelled out, rather than
+leaving a resolution error against a path nobody wrote.
+
+`cerulion_macros` is never a direct dependency. The macros arrive with the
+prelude.
+
+### The shape of a node
+
 A node lives in `nodes/<type>/src/lib.rs` and looks like this:
 
 ```rust

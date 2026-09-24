@@ -2442,6 +2442,27 @@ jobs:
         run: cargo test -p cerulion_wsd
       - name: cerulion_hygiene tests
         run: cargo test -p cerulion_hygiene
+      # The umbrella crate's test is not a unit test: it writes a bin crate
+      # into a temporary directory OUTSIDE this workspace, whose only
+      # dependency is the umbrella, and asks cargo to check it. That is the
+      # only way to exercise the claim `cargo add cerulion` makes, because
+      # every package inside this workspace also names the runtime crate
+      # directly. It runs here rather than in a test shard because it drives
+      # cargo itself, and this job's cache namespace is the one that carries
+      # its dependency closure. The doctests in the same package run with it.
+      # Named for the crate rather than starting with it: a step name whose
+      # first word is `cerulion` followed by a lowercase word parses as an
+      # invocation of the binary to the login-gate walk in `cerulion_hygiene`,
+      # which every other step here dodges only because its package name
+      # carries an underscore.
+      - name: Umbrella crate tests (cerulion)
+        env:
+          # The scratch project's artifacts live outside `target/`, which this
+          # job caches. They are about 1.6 GB and belong to a package set
+          # nothing else here builds, so caching them would cost every run an
+          # upload and a restore to save one cold check.
+          CERULION_SCRATCH_TARGET_DIR: ${{ runner.temp }}/cerulion-one-dependency-scratch
+        run: cargo test -p cerulion
 
   # Release-mode latency threshold (Linux-only)
   #

@@ -542,7 +542,16 @@ def check_docs_refs(root, files):
         raise CannotRun("%s is not in the tree: the verb check cannot run" % CLI_FILE)
     tree = parse_cli_tree(cli_src)
     crate_names = sorted({f.split("/")[1] for f in files if f.startswith("crates/") and f.count("/") >= 2})
-    stale_names = crate_names + ["test_fixtures", "scripts"]
+    # The umbrella crate is excluded from the stale set, and only it. This rule
+    # catches a doc that still spells a crate path the way the tree spelled it
+    # before the crates moved under crates/, and no crate was ever at a
+    # top-level cerulion/ -- the pre-move names were cerulion_core/,
+    # cerulion_cli/ and their siblings. What "cerulion/" does mean in this
+    # tree's prose is the checkout directory ("cd cerulion/examples/...") and
+    # the ALPN protocol identifiers ("cerulion/wire/1", "cerulion/ops/1"),
+    # neither of which is a path. Leaving the umbrella in the set makes the
+    # rule fire on every one of them.
+    stale_names = [n for n in crate_names if n != "cerulion"] + ["test_fixtures", "scripts"]
     stale_re = re.compile(r"(?<![\w/.-])(" + "|".join(re.escape(n) for n in stale_names) + r")/(?=[\w.])")
     user_api_re = re.compile(r"\bUSER_API\.md\b")
     for f in files:

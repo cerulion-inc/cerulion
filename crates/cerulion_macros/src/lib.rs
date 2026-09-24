@@ -70,6 +70,9 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 mod codegen;
+// Resolves the crate root every generated path hangs off, so that a package
+// naming only the umbrella crate builds a node. See the module header.
+mod crate_root;
 // MUST stay private (`mod`, not `pub mod`): a `proc-macro = true` crate cannot
 // export any item other than its macros — `pub mod determinism;` is a HARD
 // COMPILE ERROR here ("proc-macro crate types currently cannot export any items
@@ -123,7 +126,33 @@ use syn::{parse_macro_input, DeriveInput};
 #[proc_macro_derive(CerulionState, attributes(cerulion))]
 pub fn derive_cerulion_state(item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
-    state_derive::derive(&input).into()
+    let expansion = state_derive::derive(&input);
+    with_root_diagnostic(expansion, input.ident.span())
+}
+
+/// Hand back the expansion, with the missing-dependency diagnostic in front
+/// of it when the crate root did not resolve.
+///
+/// The expansion is returned untouched in the ordinary case, so a package
+/// that names the runtime crate gets exactly the tokens it got before the
+/// root was resolvable at all.
+///
+/// The diagnostic goes BESIDE the expansion rather than instead of it.
+/// Generated paths fall back to the pre-resolver spelling, so the compiler
+/// still reports what it always did for such a package; this adds one named
+/// error in front of that, pointing at the manifest rather than at a path the
+/// user never wrote.
+fn with_root_diagnostic(
+    expansion: proc_macro2::TokenStream,
+    span: proc_macro2::Span,
+) -> TokenStream {
+    match crate_root::unresolved_diagnostic(span) {
+        None => expansion.into(),
+        Some(diagnostic) => TokenStream::from(quote! {
+            #diagnostic
+            #expansion
+        }),
+    }
 }
 
 /// Prepare the user's struct for re-emission on an ERROR path.
@@ -390,7 +419,13 @@ pub fn cerulion_node(attr: TokenStream, item: TokenStream) -> TokenStream {
         });
     }
 
-    codegen::generate(&node_attr, &field_attrs, &input).into()
+    // Emitted BESIDE the expansion, never instead of it. When the root does
+    // not resolve, generated paths fall back to the spelling this crate used
+    // before it was resolvable, so the compiler reports exactly what it
+    // always did, with one named diagnostic in front of it saying which
+    // dependency is missing.
+    let expansion = codegen::generate(&node_attr, &field_attrs, &input);
+    with_root_diagnostic(expansion, input.ident.span())
 }
 
 /// Declares a node's behaviour. Goes on the `impl` block of a
@@ -492,5 +527,15 @@ pub fn cerulion_node_impl(
     attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    impl_macro::cerulion_node_impl(attr, item)
+    let expansion = impl_macro::cerulion_node_impl(attr, item);
+    match crate_root::unresolved_diagnostic(proc_macro2::Span::call_site()) {
+        None => expansion,
+        Some(diagnostic) => {
+            let expansion = proc_macro2::TokenStream::from(expansion);
+            TokenStream::from(quote! {
+                #diagnostic
+                #expansion
+            })
+        }
+    }
 }
