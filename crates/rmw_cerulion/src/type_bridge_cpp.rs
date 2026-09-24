@@ -1025,7 +1025,15 @@ impl CppBridgedMessage {
                         let dst = cur.append_zeroed(count).map_err(|d| self.encode_err(d))?;
                         for (i, b) in dst.iter_mut().enumerate() {
                             let mut v: bool = false;
-                            fetch(field, i, &mut v as *mut bool as *mut c_void);
+                            if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                                fetch,
+                                field,
+                                i,
+                                &mut v as *mut bool as *mut c_void,
+                            ) != 0
+                            {
+                                return Err(self.encode_err("sequence accessor threw"));
+                            }
                             *b = v as u8;
                         }
                     } else if count == 0 {
@@ -1738,7 +1746,15 @@ unsafe fn write_prim_seq_cpp(
         };
         for (i, &b) in bytes.iter().enumerate() {
             let v: bool = b != 0;
-            assign(field, i, &v as *const bool as *const c_void);
+            if ffi::introspection_cpp::rmw_cerulion_member_assign(
+                assign,
+                field,
+                i,
+                &v as *const bool as *const c_void,
+            ) != 0
+            {
+                return false;
+            }
         }
         true
     } else {
@@ -1820,7 +1836,13 @@ unsafe fn element_ptr(
     let get = member
         .get_const_function
         .ok_or("sequence missing get_const_function")?;
-    let p = get(field, i);
+    // Every introspection accessor is called through its noexcept catcher:
+    // a throwing accessor (a rosidl Buffer on a non-CPU backend) is a
+    // refused frame, never a foreign unwind.
+    let mut p: *const c_void = std::ptr::null();
+    if ffi::introspection_cpp::rmw_cerulion_member_get_const(get, field, i, &mut p) != 0 {
+        return Err("sequence accessor threw (a rosidl Buffer on a non-CPU backend)");
+    }
     if p.is_null() {
         return Err("sequence element pointer is null");
     }
@@ -1833,7 +1855,10 @@ unsafe fn element_ptr_mut(
     i: usize,
 ) -> Option<*mut c_void> {
     let get = member.get_function?;
-    let p = get(field, i);
+    let mut p: *mut c_void = std::ptr::null_mut();
+    if ffi::introspection_cpp::rmw_cerulion_member_get(get, field, i, &mut p) != 0 {
+        return None;
+    }
     if p.is_null() {
         None
     } else {
@@ -1927,7 +1952,15 @@ unsafe fn encode_message_payload_cpp(
                 buf.resize(count, 0);
                 for (i, b) in buf.iter_mut().enumerate() {
                     let mut v: bool = false;
-                    fetch(field_ptr, i, &mut v as *mut bool as *mut c_void);
+                    if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                        fetch,
+                        field_ptr,
+                        i,
+                        &mut v as *mut bool as *mut c_void,
+                    ) != 0
+                    {
+                        return Err("sequence accessor threw");
+                    }
                     *b = v as u8;
                 }
             } else if count > 0 {
@@ -2073,7 +2106,9 @@ unsafe fn prepare_seq_cpp(member: &CppMessageMember, field: *mut c_void, count: 
     let Some(resize) = member.resize_function else {
         return false;
     };
-    resize(field, count);
+    if ffi::introspection_cpp::rmw_cerulion_member_resize(resize, field, count) != 0 {
+        return false;
+    }
     true
 }
 
@@ -2274,7 +2309,17 @@ impl CppBridgedMessage {
                             owned.resize(start + count, 0);
                             for (i, b) in owned[start..].iter_mut().enumerate() {
                                 let mut v: bool = false;
-                                fetch(field, i, &mut v as *mut bool as *mut c_void);
+                                if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                                    fetch,
+                                    field,
+                                    i,
+                                    &mut v as *mut bool as *mut c_void,
+                                ) != 0
+                                {
+                                    return Err(SealRefusal::Encode(
+                                        self.encode_err("sequence accessor threw"),
+                                    ));
+                                }
                                 *b = v as u8;
                             }
                             items.push(SealItem::CopyOwned {

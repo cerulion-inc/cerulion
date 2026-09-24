@@ -169,6 +169,26 @@ int rmw_cerulion_member_resize(void (*f)(void *, size_t), void *m, size_t size) 
     return 1;
   }
 }
+// fetch and assign (the vector<bool> element copies) are wrapped as well, so
+// that no introspection accessor pointer is ever called directly from Rust.
+int rmw_cerulion_member_fetch(void (*f)(const void *, size_t, void *), const void *m, size_t index,
+                              void *out) noexcept {
+  try {
+    f(m, index, out);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+int rmw_cerulion_member_assign(void (*f)(void *, size_t, const void *), void *m, size_t index,
+                               const void *value) noexcept {
+  try {
+    f(m, index, value);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
 // Test fixture for the Rust unit test of the wrappers: an accessor that
 // always throws, so the catch is proven rather than assumed.
 const void *rmw_cerulion_throwing_get_const(const void *, size_t) { throw 1; }
