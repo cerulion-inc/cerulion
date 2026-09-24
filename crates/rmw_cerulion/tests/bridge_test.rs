@@ -122,6 +122,10 @@ struct CDoubleSeq {
     data: *mut f64,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 /// std_msgs/String-like: { data: string }
@@ -358,6 +362,10 @@ fn double_seq(values: &[f64]) -> CDoubleSeq {
         data,
         size: len,
         capacity: len,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     }
 }
 
@@ -425,6 +433,10 @@ fn mixed_fixed_and_variable_fields_roundtrip() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -473,6 +485,10 @@ fn malformed_frames_are_rejected() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -592,6 +608,10 @@ fn corrupt_sequence_header_errors_instead_of_panicking() {
             data: std::ptr::NonNull::<f64>::dangling().as_ptr(),
             size: usize::MAX, // corrupt
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -1361,6 +1381,10 @@ fn flatten_into_matches_flatten_for_empty_sequences() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -1478,6 +1502,10 @@ fn frame_size_rejects_hostile_counts() {
             data: std::ptr::NonNull::<f64>::dangling().as_ptr(),
             size: usize::MAX,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -1496,6 +1524,10 @@ fn frame_size_rejects_hostile_counts() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::NonNull::<u8>::dangling().as_ptr(),
@@ -1613,6 +1645,10 @@ struct CU8Seq {
     data: *mut u8,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -1638,6 +1674,10 @@ fn u8_seq(values: &[u8]) -> CU8Seq {
         data,
         size: len,
         capacity: len,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     }
 }
 
@@ -1666,6 +1706,10 @@ fn c_uint8_sequence_decode_is_byte_exact() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let ok = unsafe {
@@ -1714,6 +1758,10 @@ fn c_uint8_decode_fully_replaces_prior_buffer_no_stale_tail() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     // First decode the LONG payload (allocates 400 malloc'd bytes).
@@ -1781,6 +1829,10 @@ fn c_uint8_empty_sequence_decodes_to_size_zero() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     // Prime with the non-empty payload (bridge mallocs the buffer).
