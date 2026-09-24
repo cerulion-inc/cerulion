@@ -417,6 +417,8 @@ fn a_watch_that_cannot_be_armed_falls_back_to_a_timed_walk_loudly() {
     for required in [
         "tracing::warn!",
         "falls back to RE-ENUMERATING the directory on a timer",
+        "watch_failure = failure.as_str()",
+        "reason = %reason",
         "WakeSource::Poll",
     ] {
         assert!(

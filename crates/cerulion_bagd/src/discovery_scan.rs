@@ -483,7 +483,7 @@ fn scan_loop(
             Some(w)
         }
         Err(e) => {
-            degrade_to_poll(&ch, &e.to_string(), "could not be armed", interval);
+            degrade_to_poll(&ch, &e.to_string(), WatchFailure::NotArmed, interval);
             None
         }
     };
@@ -536,7 +536,7 @@ fn scan_loop(
         // decided is wrong - so a dropped break there is permanent blindness
         // rather than a report one pass late.
         if let Some(reason) = broke_while_coalescing {
-            degrade_to_poll(&ch, &reason, "stopped working mid-recording", interval);
+            degrade_to_poll(&ch, &reason, WatchFailure::BrokeMidRun, interval);
             watch = None;
             confirm_due = None;
             confirms_left = 0;
@@ -553,7 +553,7 @@ fn scan_loop(
                 degrade_to_poll(
                     &ch,
                     &broken_reason(&wake),
-                    "stopped working mid-recording",
+                    WatchFailure::BrokeMidRun,
                     interval,
                 );
                 watch = None;
@@ -618,13 +618,35 @@ fn stamp_heartbeat(heartbeat_ms: &AtomicU64, origin: &Instant) {
     heartbeat_ms.store(origin.elapsed().as_millis() as u64, Ordering::Relaxed);
 }
 
+/// Which way the watch failed. A FIELD rather than a phrase spliced into the
+/// message: an operator greps by key, and a message that changes shape with its
+/// data cannot be grepped for at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchFailure {
+    /// The watch could never be established for this recording.
+    NotArmed,
+    /// The watch was working and stopped.
+    BrokeMidRun,
+}
+
+impl WatchFailure {
+    /// The stable token the log line carries.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotArmed => "could_not_be_armed",
+            Self::BrokeMidRun => "broke_mid_recording",
+        }
+    }
+}
+
 /// Report the fall back to a timed walk, and flip the observable engine.
-fn degrade_to_poll(ch: &WorkerChannels, reason: &str, what_happened: &str, interval: Duration) {
+fn degrade_to_poll(ch: &WorkerChannels, reason: &str, failure: WatchFailure, interval: Duration) {
     ch.source.store(WakeSource::Poll as u8, Ordering::Relaxed);
     tracing::warn!(
+        watch_failure = failure.as_str(),
         reason = %reason,
         cadence_ms = interval.as_millis() as u64,
-        "bagd's watch on the iceoryx2 service directory {what_happened} - live-topic discovery \
+        "bagd's watch on the iceoryx2 service directory FAILED - live-topic discovery \
          falls back to RE-ENUMERATING the directory on a timer. Coverage is unaffected and the \
          walk still runs off the recorder's drive loop, so no frames are at risk; the cost is \
          that a settled machine now pays a full service-directory walk on every cadence instead \
