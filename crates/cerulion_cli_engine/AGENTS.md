@@ -36,9 +36,6 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
   (SIG_IGN/blocks survive exec); self_exe excepted.
 - After changing `templates.rs`, regenerate its fixture from the repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
-- `orphan_port_tags::reclaim_orphan_port_tags` removes only `.port_tag` files of a provably-dead
-  node from a directory re-listed then, holding nothing else; extend its
-  refusals, never its acceptance (`docs/internals/cli.md` §10; pin `clean_orphan_port_tag_test`).
 ## Workspace dependency contract
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
 pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.

@@ -620,11 +620,10 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics() -> CleanupReport {
 /// config instead of the global one.
 ///
 /// The global config is what every CLI path wants; the explicit one is what
-/// lets the orphan-port-tag pin (`tests/clean_orphan_port_tag_test.rs`) run the
-/// SAME sweep-and-classify path over an isolated registry root, so a real
-/// dead node can be minted, refused, reclaimed and re-swept without touching
-/// the desk's `/tmp/iceoryx2`. Same log-level guard, same capture, same
-/// classifier — the global variant is this one applied to
+/// lets a test run the SAME sweep-and-classify path over an isolated registry
+/// root, so a real dead node can be minted, swept and re-swept without touching
+/// the machine's shared `/tmp/iceoryx2`. Same log-level guard, same capture,
+/// same classifier: the global variant is this one applied to
 /// `Config::global_config()`.
 pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config) -> CleanupReport {
     use cerulion_core::iceoryx_logger::{capture_iceoryx_logs, init_iceoryx_log_level_from_env};

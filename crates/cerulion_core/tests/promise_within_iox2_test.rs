@@ -274,7 +274,7 @@ fn send_overflow_frame_resets_promise_within() {
 ///
 /// `send_raw_loan` is the rmw bridge's publish (flatten-into-loan, plus the
 /// loaned-message borrow window). It had ZERO test callers anywhere in the tree:
-/// `max_loaned_samples_test` and `clean_orphan_port_tag_test` loan and DROP
+/// `max_loaned_samples_test` loans and DROPS
 /// without sending, and every other caller is in `rmw_cerulion`'s own `api`
 /// module. The reason nobody noticed is that `record_promise_within_published`'s
 /// own doc asserted it was "covered e2e by `promise_within_iox2_test`" — the

@@ -913,9 +913,8 @@ pub enum CreatorVerdict {
 /// The ONE liveness answer for the CREATOR of a registry entry — `(pid,
 /// creation stamp)` — reached through this module's own predicate
 /// ([`SystemProbe::process_liveness`] on [`LibcProbe`], i.e. `kill(pid, 0)`),
-/// so the orphan port-tag reclaim (`crate::orphan_port_tags`) and
-/// `cerulion clean` route through the same evidence the `.shm_state`
-/// reclamation trusts and carry no second spelling of it.
+/// so `cerulion clean` routes through the same evidence the `.shm_state`
+/// reclamation trusts and carries no second spelling of it.
 ///
 /// `created_at_unix_s` is the entry's `creation_time` on a `Realtime` clock,
 /// or `None` when the stamp is on a clock that cannot be compared to wall time

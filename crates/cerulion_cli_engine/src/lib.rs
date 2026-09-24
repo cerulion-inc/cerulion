@@ -68,9 +68,6 @@ pub mod graph_cmd;
 // The hostname-convention discovery rung (well-known robot names).
 pub mod hostname_peers;
 pub mod ipc_cleanup;
-// The orphan port-tag reclaim (selector + descriptor-pinned removal) — the one
-// removal `cerulion clean` performs itself, kept OUT of the wiring module.
-pub mod orphan_port_tags;
 // The mDNS discovery rung (pure-Rust `mdns-sd` browse — the primary rung).
 pub mod mdns_discovery;
 // The LOCAL ament harvest rung — a filesystem-only
