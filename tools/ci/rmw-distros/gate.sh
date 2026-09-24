@@ -61,7 +61,7 @@ source "$(dirname "$0")/harvest.sh"
 
 log="/tmp/rmw_build_${distro}.log"
 echo "== rmw distro lane: $distro (expected: $expect) =="
-cargo build -p rmw_cerulion --release 2>&1 | tee "$log"
+cargo build --locked -p rmw_cerulion --release 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
 # Everything below reads the build log with terminal colour stripped (see harvest.sh), the same
 # way the suite log is read, so a change in cargo's colour setting can never hide a marker.
@@ -77,7 +77,7 @@ case "$expect" in
         ls target/release/build/rmw_cerulion-*/out/bindings.rs >/dev/null 2>&1 || { echo "GATE FAIL: no generated bindings.rs, the build did not run bindgen"; exit 1; }
         tlog="/tmp/rmw_test_${distro}.log"
         echo "== rmw serial suite on $distro (every target, no fail-fast) =="
-        cargo test -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
+        cargo test --locked -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
         rc_test=${PIPESTATUS[0]}
         # Everything below reads the log with terminal colour stripped (see harvest.sh).
         plain="${tlog}.plain"; strip_ansi "$tlog" > "$plain"
