@@ -2591,10 +2591,8 @@ mod tests {
         // Names carry iceoryx2's version between the id and the suffix, as the
         // library writes them; the evidence is keyed on the PREFIX, which is
         // what this arm proves is still true with the version present.
-        let live_ns =
-            write_state_file(&dir, "iox2_abc_node.0_10_0.global_mgmt", "100_1_1_1");
-        let dead_ns =
-            write_state_file(&dir, "cer_p_dead_node.0_10_0.global_mgmt", "101_1_1_1");
+        let live_ns = write_state_file(&dir, "iox2_abc_node.0_10_0.global_mgmt", "100_1_1_1");
+        let dead_ns = write_state_file(&dir, "cer_p_dead_node.0_10_0.global_mgmt", "101_1_1_1");
 
         let probe = FakeProbe::all_dead()
             .with_size("100_1_1_1", 4_096)
@@ -2977,8 +2975,16 @@ mod tests {
         plant_registered_node(&root, Some("tests"), "test_prefix_live");
 
         let files = tempdir("scan_files");
-        let live = write_state_file(&files, "test_prefix_live_node.0_10_0.global_mgmt", "100_1_1_1");
-        let dead = write_state_file(&files, "test_prefix_dead_node.0_10_0.global_mgmt", "101_1_1_1");
+        let live = write_state_file(
+            &files,
+            "test_prefix_live_node.0_10_0.global_mgmt",
+            "100_1_1_1",
+        );
+        let dead = write_state_file(
+            &files,
+            "test_prefix_dead_node.0_10_0.global_mgmt",
+            "101_1_1_1",
+        );
 
         let probe = RootSearchProbe::at(&root);
         let report = scan(

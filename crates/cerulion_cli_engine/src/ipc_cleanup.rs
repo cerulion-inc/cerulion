@@ -664,9 +664,11 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config)
     // reported as a REGISTRY error instead — the field whose contract is
     // already "the scan could not run, so the counters are a lower bound".
     let sweep_config = cerulion_core::transport::dead_node_sweep::sweep_node_config(config);
-    let ((state, node_refusal), captured) =
-        capture_iceoryx_logs(
-            || match NodeBuilder::new().config(&sweep_config).create::<CerService>() {
+    let ((state, node_refusal), captured) = capture_iceoryx_logs(|| {
+        match NodeBuilder::new()
+            .config(&sweep_config)
+            .create::<CerService>()
+        {
             Ok(node) => (node.try_cleanup_dead_nodes(), None),
             Err(e) => (
                 CleanupState {
@@ -678,8 +680,8 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config)
                      be created in the namespace being swept ({e:?})."
                 )),
             ),
-            },
-        );
+        }
+    });
     // `_guard` restores the ENV-DERIVED level on drop at end-of-scope (or on
     // panic-unwind through `_guard`'s Drop) — `IOX2_LOG_LEVEL` if set, else
     // `error`. See the guard's own docs: a hardcoded `Error` restore here is
@@ -1412,7 +1414,10 @@ pub(crate) mod tests {
         );
         let (parsed_node, variant) =
             parse_failure_line(&refusal_line).expect("a refusal line parses");
-        assert_eq!(parsed_node, live, "the parsed node must be the live identity");
+        assert_eq!(
+            parsed_node, live,
+            "the parsed node must be the live identity"
+        );
         assert_eq!(variant, "InternalError");
 
         // And the hand fixture must be the same SHAPE, so every oracle built
