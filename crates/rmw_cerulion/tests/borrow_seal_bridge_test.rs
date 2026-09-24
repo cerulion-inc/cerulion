@@ -125,6 +125,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 /// Fixed f32 + an unbounded `float32[]` (forgeable) + a string (copied).
@@ -247,6 +251,10 @@ unsafe fn build_scanish_in_slot(
         data: ranges_ptr,
         size: ranges_len,
         capacity: ranges_len,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     };
     let sdata = calloc(frame_id.len() + 1, 1) as *mut u8;
     std::ptr::copy_nonoverlapping(frame_id.as_ptr(), sdata, frame_id.len());
@@ -1258,6 +1266,10 @@ struct CU8Seq {
     data: *mut u8,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 unsafe extern "C" fn scancaps_init(
@@ -1345,11 +1357,19 @@ fn empty_members_count_by_forgeability_never_inflating_adopted() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         };
         m.caps = CU8Seq {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         };
         let s = calloc(2, 1) as *mut u8;
         *s = b'e';

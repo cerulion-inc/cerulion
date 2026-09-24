@@ -635,6 +635,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 #[repr(C)]
 struct CScan {
@@ -771,11 +775,19 @@ unsafe fn publish_scan(publisher: *const ffi::rmw_publisher_t, o: &ScanOracle) {
             data: rdata,
             size: o.ranges.len(),
             capacity: o.ranges.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         intensities: CF32Seq {
             data: idata,
             size: o.intensities.len(),
             capacity: o.intensities.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         frame_id: CRosString {
             data: sdata,
@@ -1377,11 +1389,19 @@ fn c_misaligned_forge_target_on_the_wire_is_refused_and_counted() {
                 data: rdata,
                 size: o.ranges.len(),
                 capacity: o.ranges.len(),
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                is_rosidl_buffer: false,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                owns_rosidl_buffer: false,
             },
             intensities: CF32Seq {
                 data: idata,
                 size: o.intensities.len(),
                 capacity: o.intensities.len(),
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                is_rosidl_buffer: false,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                owns_rosidl_buffer: false,
             },
             frame_id: CRosString {
                 data: sdata,
@@ -1592,11 +1612,19 @@ unsafe fn serialized_scan(
             data: rdata,
             size: o.ranges.len(),
             capacity: o.ranges.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         intensities: CF32Seq {
             data: idata,
             size: o.intensities.len(),
             capacity: o.intensities.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         frame_id: CRosString {
             data: sdata,

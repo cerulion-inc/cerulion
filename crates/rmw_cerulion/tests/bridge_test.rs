@@ -611,7 +611,7 @@ fn corrupt_sequence_header_errors_instead_of_panicking() {
 /// { names: string[] } — sequence of strings (Complex op).
 #[repr(C)]
 struct CStringSeqMsg {
-    names: CRosSeqRaw,
+    names: CPrimSeqRaw,
 }
 
 /// Generic rosidl sequence header for complex tests.
@@ -620,6 +620,20 @@ struct CRosSeqRaw {
     data: *mut c_void,
     size: usize,
     capacity: usize,
+}
+
+/// Primitive and string sequences carry the two Lyrical Buffer flags after
+/// the header (message sequences do not); the flags exist on the era the
+/// crate is built for, so this fixture is exactly the distro's struct.
+#[repr(C)]
+struct CPrimSeqRaw {
+    data: *mut c_void,
+    size: usize,
+    capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 fn string_seq_members() -> *const rosidl_typesupport_introspection_c__MessageMembers {
@@ -700,20 +714,28 @@ fn complex_codec_sequence_of_strings_roundtrips() {
     let mut elems: Vec<CRosString> =
         vec![heap_string("alpha"), heap_string(""), heap_string("γréek")];
     let msg = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: elems.as_mut_ptr() as *mut c_void,
             size: elems.len(),
             capacity: elems.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let frame =
         unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) }.expect("flatten");
 
     let mut out = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let ok = unsafe {
@@ -826,10 +848,14 @@ fn complex_codec_flatten_is_deterministic() {
     let bridge = unsafe { BridgedMessage::new(string_seq_members()) }.expect("bridge");
     let mut elems = vec![heap_string("repeat")];
     let msg = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: elems.as_mut_ptr() as *mut c_void,
             size: 1,
             capacity: 1,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let a = unsafe { bridge.flatten(&msg as *const _ as *const c_void, 5, 50) }.expect("a");
@@ -845,10 +871,14 @@ fn hostile_element_count_is_rejected_on_decode() {
 
     // Well-formed empty message → valid frame, then poison the count.
     let msg = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let mut frame =
@@ -862,10 +892,14 @@ fn hostile_element_count_is_rejected_on_decode() {
     frame[abs..abs + 4].copy_from_slice(&u32::MAX.to_le_bytes());
 
     let mut out = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let ok = unsafe {
@@ -1099,7 +1133,7 @@ fn channel_float32_alignment_interops_with_native_reader() {
     #[repr(C)]
     struct CChannel {
         name: CRosString,
-        values: CRosSeqRaw,
+        values: CPrimSeqRaw,
     }
     let members = make_members(
         "sensor_msgs__msg",
@@ -1126,10 +1160,14 @@ fn channel_float32_alignment_interops_with_native_reader() {
     let mut values = [1.5f32, -2.5, 4.25];
     let msg = CChannel {
         name: heap_string("rgb"), // odd length 3 → alignment padding needed
-        values: CRosSeqRaw {
+        values: CPrimSeqRaw {
             data: values.as_mut_ptr() as *mut c_void,
             size: values.len(),
             capacity: values.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let frame =
@@ -1148,10 +1186,14 @@ fn channel_float32_alignment_interops_with_native_reader() {
 fn hostile_count_with_small_buffer_is_rejected_deterministically() {
     let bridge = unsafe { BridgedMessage::new(string_seq_members()) }.expect("bridge");
     let msg = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let mut frame =
@@ -1163,10 +1205,14 @@ fn hostile_count_with_small_buffer_is_rejected_deterministically() {
     frame[abs..abs + 4].copy_from_slice(&1000u32.to_le_bytes());
 
     let mut out = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let ok = unsafe {
@@ -1248,7 +1294,7 @@ fn flatten_into_matches_flatten_for_uint8_payload() {
     #[repr(C)]
     struct CByteSeqMsg {
         stamp: u32,
-        data: CRosSeqRaw,
+        data: CPrimSeqRaw,
     }
     let members = make_members(
         "test_msgs__msg",
@@ -1273,10 +1319,14 @@ fn flatten_into_matches_flatten_for_uint8_payload() {
         .collect();
     let msg = CByteSeqMsg {
         stamp: 99,
-        data: CRosSeqRaw {
+        data: CPrimSeqRaw {
             data: payload.as_mut_ptr() as *mut c_void,
             size: payload.len(),
             capacity: payload.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let frame = assert_flatten_into_identical(&bridge, &msg as *const _ as *const c_void);

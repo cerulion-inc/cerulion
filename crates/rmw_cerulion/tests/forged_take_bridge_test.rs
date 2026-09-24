@@ -108,6 +108,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -115,6 +119,10 @@ struct CU8Seq {
     data: *mut u8,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 /// LaserScan-shaped: fixed f32 + an unbounded `float32[]` + a string.
@@ -247,6 +255,10 @@ unsafe fn make_scanish(angle_min: f32, ranges: &[f32], frame_id: &str) -> CScani
             data: rdata,
             size: ranges.len(),
             capacity: ranges.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         frame_id: CRosString {
             data: sdata,
