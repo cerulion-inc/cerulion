@@ -39,20 +39,8 @@ case "$distro" in
     *) echo "FATAL: no expected state for distro '$distro'"; exit 1 ;;
 esac
 
-# The failing set as cargo itself reports it: for each target, the names in the FINAL `failures:` list
-# (the one followed by that target's `test result:` line), qualified by the target binary. This never
-# depends on a `test <name> ... FAILED` line surviving the test's own stdout.
-qualified_failures() {
-    awk '
-        /^ *Running / { if (match($0, /\([^)]*\)/)) { p = substr($0, RSTART + 1, RLENGTH - 2); sub(/.*\//, "", p); sub(/-[0-9a-f]+$/, "", p); bin = p } }
-        /^ *Doc-tests / { bin = "doctests" }
-        /^failures:$/ { collecting = 1; n = 0; next }
-        collecting && /^    [^ ]+$/ { names[++n] = $1; next }
-        collecting && /^$/ { next }
-        collecting && /^test result: / { for (k = 1; k <= n; k++) print bin "::" names[k]; collecting = 0; n = 0; next }
-        collecting { n = 0 }
-    ' "$1" | sort -u
-}
+# shellcheck source=tools/ci/rmw-distros/harvest.sh
+source "$(dirname "$0")/harvest.sh"
 
 log="/tmp/rmw_build_${distro}.log"
 echo "== rmw distro lane: $distro (expected: $expect) =="
@@ -71,17 +59,17 @@ case "$expect" in
         echo "== rmw serial suite on $distro (every target, no fail-fast) =="
         cargo test -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
         rc_test=${PIPESTATUS[0]}
+        # Everything below reads the log with terminal colour stripped (see harvest.sh).
+        plain="${tlog}.plain"; strip_ansi "$tlog" > "$plain"
         # "Green" must mean the suite RAN: a crash or a test target that does not compile fails here,
         # every target must report a summary, and the counts must clear the floors.
-        if grep -qE "process didn't exit successfully|\(signal: |^error: could not compile|^error\[E[0-9]+\]" "$tlog"; then
+        if crashed "$plain"; then
             echo "GATE FAIL: $distro suite crashed or a test target did not compile (rc=$rc_test)"; exit 1
         fi
-        summaries=$(grep -cE '^test result: ' "$tlog")
+        read -r summaries ran failed_total <<< "$(suite_counts "$plain")"
         [ "$summaries" -ge "$min_targets" ] || { echo "GATE FAIL: $distro suite reported $summaries target summaries, floor $min_targets"; exit 1; }
-        ran=$(grep -E '^test result: ' "$tlog" | awk '{ p += $4; f += $6; i += $8 } END { print p + f + i }')
         [ "$ran" -ge "$min_tests" ] || { echo "GATE FAIL: $distro suite ran $ran tests, floor $min_tests"; exit 1; }
-        failed_total=$(grep -E '^test result: ' "$tlog" | awk '{ f += $6 } END { print f + 0 }')
-        failed="$(qualified_failures "$tlog")"
+        failed="$(qualified_failures "$plain")"
         expected="$(printf '%s\n' "${known_failures:-}" | sed '/^$/d' | sort -u)"
         expected_n=$(printf '%s\n' "$expected" | sed '/^$/d' | wc -l | tr -d ' ')
         if [ -z "$expected" ]; then

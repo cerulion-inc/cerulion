@@ -47,6 +47,10 @@ jobs:
     container:
       image: ros:${{ matrix.distro }}-ros-base
       options: --shm-size=1g
+    env:
+      # The toolchain action exports CARGO_TERM_COLOR=always; the gate harvests cargo's status lines,
+      # so colour stays off (harvest.sh also strips escapes, belt and braces).
+      CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the bindgen toolchain
@@ -61,12 +65,21 @@ jobs:
           components: rustfmt
       - name: Fingerprint the distro headers
         # The image tag floats; bindgen's input is the header tree, so the cache follows the headers,
-        # never a tag that may have been republished.
+        # never a tag that may have been republished. Every ament prefix's include tree is hashed,
+        # and an empty find fails the step rather than keying the cache on the hash of nothing.
         id: headers
+        shell: bash
         run: |
-          hh=$(find "/opt/ros/${{ matrix.distro }}/include" -type f \( -name '*.h' -o -name '*.hpp' \) -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+          set -euo pipefail
+          set +u; source "/opt/ros/${{ matrix.distro }}/setup.bash"; set -u
+          files=$(for p in ${AMENT_PREFIX_PATH//:/ }; do [ -d "$p/include" ] && find "$p/include" -type f \( -name '*.h' -o -name '*.hpp' \); done | sort)
+          n=$(printf '%s\n' "$files" | grep -c . || true)
+          [ "$n" -gt 0 ] || { echo "::error::no headers found under any ament prefix ($AMENT_PREFIX_PATH)"; exit 1; }
+          hh=$(printf '%s\n' "$files" | xargs sha256sum | sha256sum | cut -c1-16)
           echo "hash=$hh" >> "$GITHUB_OUTPUT"
-          echo "distro header tree hash: $hh"
+          echo "distro header tree hash: $hh over $n files"
+      - name: Self-test the gate's log harvester
+        run: bash tools/ci/rmw-distros/gate_selftest.sh
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
