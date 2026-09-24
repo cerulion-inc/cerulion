@@ -381,23 +381,22 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
         // other: put back when the store still names the account it certifies,
         // dropped when it does not.
         auth::recover_superseded_device_certs();
-        let prior = auth::load_from(&auth_path).state().cloned();
+        let prior = auth::load_from(&auth_path);
+        let (prior_account, prior_role) = prior.prior_identity();
         let state = AuthState {
             account_id,
             session_token: tokens.session_token,
             refresh_token: tokens.refresh_token,
             expires_at_ns: now.saturating_add(tokens.expires_in.saturating_mul(1_000_000_000)),
             logged_in_ever: true,
-            role: prior.as_ref().and_then(|s| s.role),
+            role: prior_role,
         };
         // Nothing is published yet, so a clear that refuses needs no rollback of
         // the store: the previous sign-in is still the one on disk, untouched,
         // including a corrupt `auth.json` (a recovery artifact, never deleted).
-        let switching_accounts = prior
-            .as_ref()
-            .is_none_or(|p| p.account_id != state.account_id);
+        let switching_accounts = prior_account.is_none_or(|p| p != state.account_id);
         let cleared = if discard_cert || (issued_cert.is_some() && switching_accounts) {
-            match auth::clear_device_cert(prior.as_ref().map(|p| p.account_id.as_str())) {
+            match auth::clear_device_cert(prior_account) {
                 Ok(cleared) => {
                     if cleared.any() {
                         tracing::info!(

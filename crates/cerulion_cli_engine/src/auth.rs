@@ -222,6 +222,9 @@ pub enum LoadedAuth {
     SignedOut {
         /// The account the machine was signed in to, when the record names one.
         account_id: Option<String>,
+        /// The install-time role the record still carries, so the next sign-in
+        /// keeps it (an unrecognized value reads as `None`, as in [`AuthState`]).
+        role: Option<MachineRole>,
     },
     /// `auth.json` exists but could not be parsed. Carries the parse error for a
     /// LOUD log at the boundary. Treated as never-logged-in by the gate
@@ -232,6 +235,18 @@ pub enum LoadedAuth {
 
 impl LoadedAuth {
     /// Borrow the parsed state when present (Absent/Corrupt ⇒ `None`).
+    /// The account id and role the store names, whether it holds a session
+    /// ([`Self::Present`]) or is signed out ([`Self::SignedOut`]): what a new
+    /// sign-in carries over from the previous one.
+    #[must_use]
+    pub fn prior_identity(&self) -> (Option<&str>, Option<MachineRole>) {
+        match self {
+            LoadedAuth::Present(state) => (Some(state.account_id.as_str()), state.role),
+            LoadedAuth::SignedOut { account_id, role } => (account_id.as_deref(), *role),
+            LoadedAuth::Absent | LoadedAuth::Corrupt(_) => (None, None),
+        }
+    }
+
     pub fn state(&self) -> Option<&AuthState> {
         match self {
             LoadedAuth::Present(s) => Some(s),
@@ -371,7 +386,7 @@ pub fn load_from(path: &Path) -> LoadedAuth {
     match serde_json::from_slice::<AuthState>(&bytes) {
         Ok(state) => LoadedAuth::Present(state),
         Err(e) => match signed_out_account(&bytes) {
-            Some(account_id) => LoadedAuth::SignedOut { account_id },
+            Some((account_id, role)) => LoadedAuth::SignedOut { account_id, role },
             None => LoadedAuth::Corrupt(format!("parse {}: {e}", path.display())),
         },
     }
@@ -389,17 +404,22 @@ const SIGNED_OUT_REMOVED_KEYS: [&str; 5] = [
     "supabase",
 ];
 
-/// `Some(account_id)` when `bytes` is a signed-out record: a JSON object with
-/// `logged_in_ever: true` and neither a session nor a refresh token.
-fn signed_out_account(bytes: &[u8]) -> Option<Option<String>> {
+/// `Some((account_id, role))` when `bytes` is a signed-out record: a JSON
+/// object with `logged_in_ever: true` and neither a session nor a refresh token.
+fn signed_out_account(bytes: &[u8]) -> Option<(Option<String>, Option<MachineRole>)> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let obj = value.as_object()?;
     let signed_in_before = obj.get("logged_in_ever") == Some(&serde_json::Value::Bool(true));
     let holds_a_credential = obj.contains_key("session_token") || obj.contains_key("refresh_token");
     (signed_in_before && !holds_a_credential).then(|| {
-        obj.get("account_id")
+        let account_id = obj
+            .get("account_id")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
+            .map(str::to_owned);
+        let role = obj
+            .get("role")
+            .and_then(|v| serde_json::from_value::<MachineRole>(v.clone()).ok());
+        (account_id, role)
     })
 }
 
@@ -1908,11 +1928,12 @@ mod tests {
 
         let loaded = load_from(&path);
         match &loaded {
-            LoadedAuth::SignedOut { account_id } => {
+            LoadedAuth::SignedOut { account_id, role } => {
                 assert_eq!(
                     account_id.as_deref(),
                     Some(prior["account_id"].as_str().unwrap())
                 );
+                assert_eq!(*role, Some(MachineRole::Robot));
             }
             other => panic!("expected SignedOut, got {other:?}"),
         }
@@ -1936,7 +1957,7 @@ mod tests {
         std::fs::write(&path, br#"{"account_id":"acct","logged_in_ever":true}"#).unwrap();
         assert!(matches!(
             load_from(&path),
-            LoadedAuth::SignedOut { account_id: Some(ref a) } if a == "acct"
+            LoadedAuth::SignedOut { account_id: Some(ref a), role: None } if a == "acct"
         ));
     }
 

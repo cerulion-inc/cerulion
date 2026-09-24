@@ -2332,7 +2332,7 @@ fn logout_revokes_the_session_and_the_gate_then_refuses() {
 
     let loaded = auth::load();
     match &loaded {
-        LoadedAuth::SignedOut { account_id } => {
+        LoadedAuth::SignedOut { account_id, .. } => {
             assert_eq!(account_id.as_deref(), Some(signed_in.account_id.as_str()));
         }
         other => panic!("expected SignedOut, got {other:?}"),
@@ -2383,6 +2383,47 @@ fn logout_without_the_service_still_signs_the_machine_out_and_says_so() {
     assert!(msg.contains("stays valid there until it expires"), "{msg}");
     assert!(matches!(
         auth::load(),
-        LoadedAuth::SignedOut { account_id: Some(ref a) } if a == "acct-offline-logout"
+        LoadedAuth::SignedOut { account_id: Some(ref a), .. } if a == "acct-offline-logout"
     ));
+}
+
+#[test]
+#[serial]
+fn a_robot_that_logs_out_and_back_in_stays_a_robot() {
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+    let auth_path = home.path().join("auth.json");
+    std::fs::write(
+        &auth_path,
+        br#"{"account_id":"prior-account","logged_in_ever":true,"role":"robot"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        auth::load_from(&auth_path).prior_identity(),
+        (Some("prior-account"), Some(auth::MachineRole::Robot))
+    );
+
+    let buf = SharedBuf::new();
+    let worker = std::thread::spawn({
+        let mut b = buf.clone();
+        move || login_cmd::run_login(&mut b)
+    });
+    let code = wait_for(
+        || extract_user_code(&buf.snapshot()),
+        Duration::from_secs(15),
+    )
+    .expect("run_login printed a user_code");
+    authorize_via_magic_link(port, &email, &code);
+    let state = worker.join().unwrap().expect("run_login");
+    assert_eq!(state.role, Some(auth::MachineRole::Robot));
+    match auth::load_from(&auth_path) {
+        LoadedAuth::Present(p) => assert_eq!(p.role, Some(auth::MachineRole::Robot)),
+        other => panic!("expected Present, got {other:?}"),
+    }
 }
