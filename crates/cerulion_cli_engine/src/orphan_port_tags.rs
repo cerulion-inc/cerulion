@@ -906,7 +906,73 @@ pub fn reclaim_orphan_port_tags(
 mod tests {
     use super::*;
     use crate::ipc_cleanup::classify_cleanup_failures;
-    use crate::ipc_cleanup::tests::{detected, line, node_token, refusal, sub_cause, view_origin};
+    use crate::ipc_cleanup::tests::{detected, line, refusal, sub_cause, view_origin};
+
+    /// A node identity as iceoryx2 0.9.1 rendered it: a `UniqueSystemId` with a
+    /// `pid` and a `creation_time` inside.
+    ///
+    /// [`parse_node_identity`] keys on BOTH of those and neither exists in the
+    /// current rendering, so the selector can act on this shape and only on
+    /// this shape. That is not a fictional input: the node registry directory
+    /// is not version-scoped, so a machine upgraded from the older library can
+    /// still be holding node directories it left behind. Which shape the
+    /// CURRENT library renders, and what the selector does with it, is
+    /// `a_current_node_identity_selects_no_candidate`.
+    fn legacy_node_token(value: u128, pid: u32) -> String {
+        format!(
+            "UniqueNodeId(UniqueSystemId {{ value: {value}, pid: {pid}, creation_time: \
+             Time {{ clock_type: Monotonic, seconds: 91, nanoseconds: 12 }} }})"
+        )
+    }
+
+    /// The identity the CURRENT library renders carries no pid and no creation
+    /// stamp, so nothing can be selected from it.
+    ///
+    /// MEASURED against a live node rather than copied from a header: 0.10's
+    /// `UniqueNodeId` wraps `UniqueId { payload_value, unique_value }`, two
+    /// fixed-width integers. [`parse_node_identity`] needs a `pid:` to decide
+    /// whether the owning process is still alive, which is the refusal that
+    /// keeps this reclaim from deleting a running node's resources, so with no
+    /// pid there is nothing safe to do and the selector yields nothing. That is
+    /// the correct direction to fail, and this arm is what says so out loud
+    /// rather than leaving a caller to wonder why a sweep found no candidates.
+    ///
+    /// The shape this module heals is also gone: the current library removes a
+    /// dead port's on-disk tag with the rest of its stale resources, so a
+    /// leaked sample no longer strands a node directory.
+    #[test]
+    fn a_current_node_identity_selects_no_candidate() {
+        let current = format!(
+            "UniqueNodeId(UniqueId {{ payload_value: {}, unique_value: {} }})",
+            195_704_481_599_776_682u64, 99_125u64
+        );
+        assert_eq!(
+            parse_node_identity(&current),
+            None,
+            "the current node identity carries no pid, and the liveness refusal this \
+             reclaim rests on cannot be made without one"
+        );
+        assert_eq!(
+            parse_creation_unix_s(&current),
+            None,
+            "and no creation stamp either"
+        );
+
+        let cfg = rooted_config("/tmp/iceoryx2/", "iox2_");
+        let captured = vec![
+            detected(&current),
+            refusal(&current, "InternalError"),
+            sub_cause(
+                &current,
+                "stale resources of the port PortId(9) could not be removed due to an \
+                 internal failure.",
+            ),
+        ];
+        assert!(
+            candidates_of(&captured, &cfg).is_empty(),
+            "a refusal chain carrying a CURRENT identity must select nothing"
+        );
+    }
     use cerulion_core::iceoryx_logger::CapturedLog;
     use iceoryx2::prelude::{FileName, LogLevel, Path as IoxPath};
 
@@ -1001,8 +1067,8 @@ mod tests {
     /// (MEASURED, isolated root, macOS): the probe pair from `Node::list`'s
     /// classification, the detected line, the probe pair again from the
     /// cleaner acquisition, the four `rmdir` lines, the refusal.
-    fn orphan_tag_chain(cfg: &Config, node_id: u128) -> Vec<CapturedLog> {
-        let node = node_token(node_id);
+    fn orphan_tag_chain(cfg: &Config, node_id: u128, pid: u32) -> Vec<CapturedLog> {
+        let node = legacy_node_token(node_id, pid);
         let dir = node_dir_string(cfg, node_id);
         let mut captured = monitor_probe_lines(cfg, node_id);
         captured.push(detected(&node));
@@ -1020,8 +1086,8 @@ mod tests {
     /// The chain as a RE-SWEEP emits it — the `.details` storage is already
     /// gone, so `Node::list`'s details open logs the static-storage line first
     /// (MEASURED, verbatim from the pin's dry-run arm on a second sweep).
-    fn resweep_orphan_tag_chain(cfg: &Config, node_id: u128) -> Vec<CapturedLog> {
-        let node = node_token(node_id);
+    fn resweep_orphan_tag_chain(cfg: &Config, node_id: u128, pid: u32) -> Vec<CapturedLog> {
+        let node = legacy_node_token(node_id, pid);
         let dir = node_dir_string(cfg, node_id);
         let mut captured = vec![
             line(
@@ -1050,8 +1116,8 @@ mod tests {
 
     /// The chain WITHOUT the probe lines — what a future iceoryx2 that stops
     /// logging them (or a capture that missed them) would yield.
-    fn bare_orphan_tag_chain(cfg: &Config, node_id: u128) -> Vec<CapturedLog> {
-        let node = node_token(node_id);
+    fn bare_orphan_tag_chain(cfg: &Config, node_id: u128, pid: u32) -> Vec<CapturedLog> {
+        let node = legacy_node_token(node_id, pid);
         let dir = node_dir_string(cfg, node_id);
         vec![
             detected(&node),
@@ -1077,13 +1143,13 @@ mod tests {
     fn the_exact_orphan_tag_chain_selects_the_node() {
         let cfg = rooted_config("/tmp/iceoryx2/orphan_unit/", "orphan_");
         let expected = vec![OrphanTagNode {
-            node: node_token(4242),
+            node: legacy_node_token(4242, 77),
             node_id: 4242,
             pid: 77,
             dir: PathBuf::from(node_dir_string(&cfg, 4242)),
         }];
 
-        let captured = orphan_tag_chain(&cfg, 4242);
+        let captured = orphan_tag_chain(&cfg, 4242, 77);
         let parts = classify_cleanup_failures(&captured);
         assert_eq!(
             parts.failures[0].causes.len(),
@@ -1097,7 +1163,7 @@ mod tests {
             "the measured shape"
         );
         assert_eq!(
-            candidates_of(&bare_orphan_tag_chain(&cfg, 4242), &cfg),
+            candidates_of(&bare_orphan_tag_chain(&cfg, 4242, 77), &cfg),
             expected,
             "the bare chain"
         );
@@ -1121,8 +1187,8 @@ mod tests {
             (14857966915340887985112488300u128, 6508u32),
             (244818821161215785235151591808u128, 6528u32),
         );
-        let mut captured = resweep_orphan_tag_chain(&cfg, a.0);
-        captured.extend(resweep_orphan_tag_chain(&cfg, b.0));
+        let mut captured = resweep_orphan_tag_chain(&cfg, a.0, a.1);
+        captured.extend(resweep_orphan_tag_chain(&cfg, b.0, b.1));
         // The messages are the captured ones, byte for byte.
         let parts = classify_cleanup_failures(&captured);
         assert_eq!(parts.failures.len(), 2, "{:?}", parts.failures);
@@ -1156,7 +1222,7 @@ mod tests {
         // The same capture, with a port-resource failure inside node A's
         // attempt: A is refused, B still selects.
         let port_line = sub_cause(
-            &node_token(a.0),
+            &legacy_node_token(a.0, a.1),
             "stale resources of the port PortId(9) could not be removed due to an internal failure.",
         );
         let mut poisoned = captured.clone();
@@ -1233,9 +1299,9 @@ mod tests {
     #[test]
     fn every_disqualifier_refuses_an_otherwise_exact_chain() {
         let cfg = rooted_config("/tmp/iceoryx2/orphan_unit/", "orphan_");
-        let node = node_token(4242);
+        let node = legacy_node_token(4242, 77);
         for fragment in ORPHAN_TAG_DISQUALIFIERS {
-            let mut captured = resweep_orphan_tag_chain(&cfg, 4242);
+            let mut captured = resweep_orphan_tag_chain(&cfg, 4242, 77);
             captured.insert(
                 7,
                 sub_cause(&node, &format!("something about the {fragment} happened.")),
@@ -1247,7 +1313,7 @@ mod tests {
         }
         // The control: the unpoisoned re-sweep chain selects.
         assert_eq!(
-            candidates_of(&resweep_orphan_tag_chain(&cfg, 4242), &cfg).len(),
+            candidates_of(&resweep_orphan_tag_chain(&cfg, 4242, 77), &cfg).len(),
             1
         );
     }
@@ -1259,7 +1325,7 @@ mod tests {
     #[test]
     fn the_monitor_probe_run_admits_only_the_two_probe_shapes_before_the_chain() {
         let cfg = rooted_config("/tmp/iceoryx2/orphan_unit/", "orphan_");
-        let node = node_token(4242);
+        let node = legacy_node_token(4242, 77);
         let dir = node_dir_string(&cfg, 4242);
         let chain = |lead: Vec<CapturedLog>, tail: Vec<CapturedLog>| {
             let mut c = lead;
@@ -1334,7 +1400,7 @@ mod tests {
 
         // The control: the measured shape selects.
         assert_eq!(
-            candidates_of(&orphan_tag_chain(&cfg, 4242), &cfg).len(),
+            candidates_of(&orphan_tag_chain(&cfg, 4242, 77), &cfg).len(),
             1
         );
     }
@@ -1346,9 +1412,9 @@ mod tests {
     #[test]
     fn a_port_resource_failure_in_the_chain_is_not_a_candidate() {
         let cfg = rooted_config("/tmp/iceoryx2/orphan_unit/", "orphan_");
-        let mut captured = orphan_tag_chain(&cfg, 4242);
+        let mut captured = orphan_tag_chain(&cfg, 4242, 77);
         let port_line = sub_cause(
-            &node_token(4242),
+            &legacy_node_token(4242, 77),
             "stale resources of the port PortId(9) could not be removed due to an internal failure.",
         );
         captured.insert(1, port_line);
@@ -1365,7 +1431,7 @@ mod tests {
     #[test]
     fn two_interleaved_nodes_select_only_the_one_with_the_exact_chain() {
         let cfg = rooted_config("/tmp/iceoryx2/orphan_unit/", "orphan_");
-        let (a, b) = (node_token(1), node_token(2));
+        let (a, b) = (legacy_node_token(1, 10), legacy_node_token(2, 20));
         let dir_a = node_dir_string(&cfg, 1);
         let captured = vec![
             detected(&a),
@@ -1396,7 +1462,7 @@ mod tests {
     #[test]
     fn a_directory_outside_the_configured_registry_is_not_a_candidate() {
         let cfg = rooted_config("/tmp/iceoryx2/orphan_unit/", "orphan_");
-        let node = node_token(4242);
+        let node = legacy_node_token(4242, 77);
         let foreign = "/somewhere/else/nodes/4242";
         let captured = vec![
             detected(&node),
@@ -1411,7 +1477,7 @@ mod tests {
         // Same directory NAME under a different root — the id matches, the
         // root does not.
         let other_root = rooted_config("/tmp/iceoryx2/orphan_other/", "orphan_");
-        let captured = orphan_tag_chain(&other_root, 4242);
+        let captured = orphan_tag_chain(&other_root, 4242, 77);
         assert!(
             candidates_of(&captured, &cfg).is_empty(),
             "a node under another root must not be selected against this config"
@@ -1425,7 +1491,7 @@ mod tests {
     #[test]
     fn anything_but_the_exact_chain_is_not_a_candidate() {
         let cfg = rooted_config("/tmp/iceoryx2/orphan_unit/", "orphan_");
-        let node = node_token(4242);
+        let node = legacy_node_token(4242, 77);
         let dir = node_dir_string(&cfg, 4242);
 
         // Three of the four lines.
@@ -1439,7 +1505,7 @@ mod tests {
         assert!(candidates_of(&short, &cfg).is_empty(), "a missing line");
 
         // The four lines plus an extra sub-cause about the service.
-        let mut long = orphan_tag_chain(&cfg, 4242);
+        let mut long = orphan_tag_chain(&cfg, 4242, 77);
         long.insert(
             1,
             sub_cause(
@@ -1450,7 +1516,7 @@ mod tests {
         assert!(candidates_of(&long, &cfg).is_empty(), "an extra line");
 
         // The same lines under another variant.
-        let mut other_variant = orphan_tag_chain(&cfg, 4242);
+        let mut other_variant = orphan_tag_chain(&cfg, 4242, 77);
         other_variant.pop();
         other_variant.push(refusal(&node, "InsufficientPermissions"));
         assert!(
@@ -1482,7 +1548,7 @@ mod tests {
 
         // The control: the exact chain still selects.
         assert_eq!(
-            candidates_of(&orphan_tag_chain(&cfg, 4242), &cfg).len(),
+            candidates_of(&orphan_tag_chain(&cfg, 4242, 77), &cfg).len(),
             1
         );
     }
@@ -1496,7 +1562,7 @@ mod tests {
             Some(1788909140)
         );
         assert_eq!(
-            parse_creation_unix_s(&node_token(1)),
+            parse_creation_unix_s(&legacy_node_token(1, 2)),
             None,
             "a Monotonic stamp cannot be compared to wall time"
         );
@@ -1509,7 +1575,10 @@ mod tests {
 
     #[test]
     fn the_node_identity_parser_reads_value_and_pid_and_nothing_else() {
-        assert_eq!(parse_node_identity(&node_token(4242)), Some((4242, 77)));
+        assert_eq!(
+            parse_node_identity(&legacy_node_token(4242, 77)),
+            Some((4242, 77))
+        );
         assert_eq!(
             parse_node_identity(
                 "UniqueNodeId(UniqueSystemId { value: 8517378255348516775436287364, pid: 64900, creation_time: Time { clock_type: Monotonic, seconds: 1, nanoseconds: 2 } })"
@@ -1551,7 +1620,7 @@ mod tests {
             _root: root,
             cfg,
             candidate: OrphanTagNode {
-                node: node_token(node_id),
+                node: legacy_node_token(node_id, pid),
                 node_id,
                 pid,
                 dir,
@@ -1716,7 +1785,7 @@ mod tests {
             "precondition: the tag lives under the real root"
         );
         let candidate = OrphanTagNode {
-            node: node_token(4242),
+            node: legacy_node_token(4242, 77),
             node_id: 4242,
             pid: 77,
             dir: node_dir,
@@ -1990,7 +2059,7 @@ mod tests {
                 std::fs::write(dir.join("stray"), b"").expect("stray");
             }
             candidates.push(OrphanTagNode {
-                node: node_token(id),
+                node: legacy_node_token(id, 1),
                 node_id: id,
                 pid: 1,
                 dir,

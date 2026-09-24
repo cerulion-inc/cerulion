@@ -1361,13 +1361,18 @@ pub(crate) mod tests {
     /// parens AND braces inside, which is why the refusal line is parsed from
     /// its end.
     ///
-    /// The inner type changed in 0.10 (`UniqueSystemId { value, pid,
-    /// creation_time }` became `UniqueId { value }`), which is exactly the kind
-    /// of drift that leaves a hand fixture describing a shape the library no
-    /// longer emits. `the_node_token_fixture_matches_the_live_rendering` builds
-    /// a REAL node and compares, so the next such rename fails a test.
+    /// The inner type CHANGED in 0.10: `UniqueSystemId { value, pid,
+    /// creation_time: Time { .. } }` became `UniqueId { payload_value,
+    /// unique_value }`. Two fixed-width integers, no pid and no creation stamp.
+    /// That is exactly the drift that leaves a hand fixture describing a shape
+    /// the library no longer emits, and
+    /// `the_node_token_fixture_matches_the_live_rendering` builds a REAL node
+    /// and compares against it, so the next such rename fails a test instead of
+    /// quietly making every oracle built on this fictional.
     pub(crate) fn node_token(value: u128) -> String {
-        format!("UniqueNodeId(UniqueId {{ value: {value} }})")
+        format!(
+            "UniqueNodeId(UniqueId {{ payload_value: 195704481599776682, unique_value: {value} }})"
+        )
     }
 
     /// The `from self` origin of a `DeadNodeView` — the derived Debug
@@ -1424,10 +1429,26 @@ pub(crate) mod tests {
         // on it is still describing reality. Compared structurally (the live
         // value is whatever the process was handed), not byte for byte.
         let fixture = node_token(4242);
+        // Collapse each RUN of digits to one marker: the fixture's numbers are
+        // arbitrary and the live ones are whatever the process was handed, so
+        // comparing digit widths would fail on nothing but luck. What must
+        // match is the field names, their order and the punctuation around
+        // them, which is everything the parser walks.
         let shape = |t: &str| -> String {
-            t.chars()
-                .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                .collect()
+            let mut out = String::new();
+            let mut in_digits = false;
+            for c in t.chars() {
+                if c.is_ascii_digit() {
+                    if !in_digits {
+                        out.push('#');
+                        in_digits = true;
+                    }
+                } else {
+                    in_digits = false;
+                    out.push(c);
+                }
+            }
+            out
         };
         assert_eq!(
             shape(&fixture),

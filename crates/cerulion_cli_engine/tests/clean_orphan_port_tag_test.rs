@@ -2,84 +2,108 @@
 // `LibcProbe` (the real `kill(2)` liveness oracle) and the self-re-exec
 // child both need a Unix process model.
 #![cfg(unix)]
-//! `cerulion clean`'s orphan port-tag reclaim heals the ONE
-//! dead-node shape iceoryx2's sweep can never clear — end to end, over a REAL
-//! shape minted by a real process, on an ISOLATED registry root.
+//! The leaked port-tag shape: iceoryx2 0.10 heals it by itself, and
+//! `cerulion clean`'s reclaim still refuses everything that is not exactly it
+//! — end to end, over a REAL shape minted by a real process, on an ISOLATED
+//! registry root.
 //!
 //! # The shape
 //!
 //! A publisher destroyed while one of its loaned samples had been leaked
-//! (`mem::forget` of the loan — the rmw destroy path does not do this,
-//! but any leaked loan can) deregisters its port but leaves the port's on-disk tag under
-//! `<root>/nodes/<node id>/`: the tag is owned by the publisher's shared
-//! state, which every forgotten sample keeps alive until the process dies.
-//! iceoryx2's dead-node sweep then reclaims the port's resources but never
-//! deletes the tag, removes the node's `.details`, and fails the final
-//! `rmdir` with `ENOTEMPTY` — on EVERY sweep, forever, so `cerulion clean`
-//! never converges and the `.shm_state` reclamation stands down for good
-//! (measured: 43 of 43 refusals in one test run were this chain; one
-//! machine held eleven such directories behind 13,647 stale mappings).
+//! (`mem::forget` of the loan — the rmw destroy path does not do this, but any
+//! leaked loan can) deregisters its port but leaves the port's on-disk tag
+//! under `<root>/nodes/<node id>/`: the tag is owned by the publisher's shared
+//! state, which every forgotten sample keeps alive until the process dies, and
+//! a dead process removes nothing. The leak is still real under 0.10 — the
+//! headline arm asserts the tag is on disk before it sweeps, so it cannot pass
+//! because nothing was minted.
 //!
-//! # Shape of the pin
+//! # What 0.10 changed, and what this binary pins now
 //!
-//! Self-re-exec (the `cerulion_core/tests/cdylib_iox2_log_level_test.rs`
-//! shape): the PARENT mints a unique iceoryx2 root + prefix (removed by a
-//! `Drop` guard), spawns THIS binary as a child on that config, and the child
-//! — a plain `cerulion_core` publisher, no rmw — loans a raw sample,
-//! `mem::forget`s the loan, DROPS the publisher (port deregistered, tag
-//! alive: the exact production shape), `mem::forget`s the transport manager
-//! and `process::exit(0)`s. The parent then drives the SAME engine path
-//! `cerulion clean` runs, over the isolated config:
+//! Under 0.9.1 the dead-node sweep reclaimed a dead port's data segment and its
+//! connections but never deleted the TAG
+//! (`service/stale_resource_cleanup.rs::remove_stale_port_resources` took
+//! `(port_id, config)` and stopped there), so `remove_node`'s final `rmdir`
+//! failed `ENOTEMPTY` on EVERY sweep, forever: `failed_cleanups` never reached
+//! 0, the `.shm_state` reclamation stood down for good, and the desk filled up
+//! (13,647 stale mappings behind eleven such directories on a development
+//! machine). `cerulion clean`'s orphan port-tag reclaim
+//! (`cerulion_cli_engine::orphan_port_tags`) is what healed it.
 //!
-//! 1. the diagnostics sweep (`ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config`)
-//!    refuses the node with `InternalError` and the four-line chain, and
-//!    `orphan_port_tags::orphan_port_tag_candidates` selects exactly that node;
-//! 2. `reclaim_orphan_port_tags` removes exactly the one tag;
-//! 3. a second sweep reports `cleanups == 1, failed_cleanups == 0` and the
-//!    node directory is gone.
+//! In 0.10 the same function takes `(node_id, port_id, config)` and ends in
+//! `remove_port_tag::<Service>(node_id, port_id, config)`, so the tag goes with
+//! the port and the node directory is removed on the FIRST sweep. The headline
+//! arm is now the REGRESSION TEST for that upstream fix — one child, one sweep,
+//! `cleanups == 1`, `failed_cleanups == 0`, no refusal, no surviving
+//! `<prefix>*.port_tag` and no surviving directory — so an iceoryx2 that
+//! regresses it is caught on the next run rather than after a desk fills up.
 //!
-//! ANTI-TAUTOLOGY arms, each naming the change that fails it:
+//! # The reclaim's refusals, over a HAND-PLANTED shape
 //!
-//! * a stray file planted in the directory AFTER selection and BEFORE the
-//!   reclaim is refused, named, and nothing is removed — the second sweep
-//!   still fails, and removing the stray by hand is what lets it converge
-//!   (skipping the offender refusal in `orphan_tags_in`);
-//! * a node whose process is ALIVE is never a candidate, and a hand-built
-//!   candidate carrying a live pid is refused by the death guard with its
-//!   tags untouched (treating `CreatorVerdict::Alive` as gone);
-//! * `dry_run` lists the tag and removes nothing — the second sweep still
-//!   fails until a real reclaim runs;
-//! * the node directory swapped for a SYMBOLIC LINK to a sibling directory
-//!   outside the root that holds the real tag is refused, the link named, the
-//!   outside tag untouched, and the next sweep still refuses the node — the
-//!   reclaim binds identity by descriptor, never by path.
+//! The remaining arms are about what the RECLAIM refuses, not about who
+//! produced the shape, so they plant the directory themselves
+//! (`plant_orphan_tags`) instead of waiting for one the library will no longer
+//! leave standing. Each names the change that fails it:
+//!
+//! * a directory holding a stray entry is refused whole, the stray named, and
+//!   nothing is removed — not even the tags that do qualify (skipping the
+//!   offender refusal in `orphan_tags_in`);
+//! * a candidate carrying a LIVE pid is refused by the death guard with its
+//!   tags untouched (treating `CreatorVerdict::Alive` as gone) — beside the two
+//!   facts the sweep supplies for a live process: its node's directory survives
+//!   a sweep untouched, and once it dies the library heals that node too;
+//! * `dry_run` lists the tags and takes nothing off disk;
+//! * a node directory replaced by a SYMBOLIC LINK to a directory outside the
+//!   root is refused, the link named and the outside tag untouched — the
+//!   reclaim binds identity by descriptor, never by path;
+//! * an ALREADY-EMPTY directory is `AlreadyEmpty` — not a refusal, nothing
+//!   removed, and the directory left standing for a sweep's `remove_node`.
+//!
+//! A planted directory is INERT to the sweep by construction, which is why
+//! those arms assert on the reclaim and on the disk rather than on a following
+//! sweep: `Node::list` enumerates nodes from the MONITOR entries beside the
+//! detail directories (`<root>/nodes/<prefix><node id><monitor suffix>`, built
+//! by `node_monitoring_config`), so a directory with no monitor entry beside it
+//! is never listed, never classified dead, and never swept.
 //!
 //! The child also has a DEFAULT-ROOT mode (`CER_ORPHAN_PORT_TAG_DEFAULT_ROOT=1`),
 //! never used by these tests, so an operator can mint exactly ONE such
-//! directory on a desk's real registry and watch `cerulion clean --report-only`
-//! then `cerulion clean` heal it.
+//! directory on a desk's real registry and watch what the library does with it.
+//!
+//! # The identity an arm hands the reclaim
+//!
+//! 0.10's node identity is `UniqueNodeId(UniqueId { payload_value, unique_value })`:
+//! it carries NO pid and NO creation stamp, where 0.9.1's carried both
+//! (`UniqueSystemId { value, pid, creation_time }`). Two consequences, both
+//! read off the linked library rather than assumed:
+//!
+//! * a refusal can be attributed to a node by its ID only, never by the pid
+//!   that minted it, so the arms here scope their sweep assertions with the
+//!   whole of `CleanupReport::failures` (empty, over a root that holds exactly
+//!   the arm's own nodes) and name the node in the failure message;
+//! * `orphan_port_tags::orphan_port_tag_candidates` cannot select ANYTHING
+//!   under 0.10 — it reads `pid:` out of the identity and gives up when it is
+//!   absent — so the arms build their `OrphanTagNode` directly, rendering the
+//!   identity exactly as `Node::list` does for a given id (`node_identity`).
+//!   The reclaim reads that string only to look for a `Realtime` creation
+//!   stamp; it finds none and falls through to `kill(2)` on the candidate's
+//!   pid, which is what every arm here turns on.
 //!
 //! # ONE isolated root per test PROCESS, and it IS the process's global config
 //!
-//! MEASURED: with a per-test root that is NOT
-//! the global config, every second sweep reports `cleanups == 1` while the
-//! node directory — tag, stray and all — survives. The cause is in
-//! `iceoryx2-0.9.1/src/node/mod.rs:605-609`: the first sweep removes the
-//! node's `.details` storage before the `rmdir` fails, so the node is listed
-//! `Dead` WITHOUT details next time, and `remove_stale_resources_impl` then
-//! falls back to `Config::global_config()` — the cleaner acquisition against
-//! the wrong root answers `DoesNotExist`, which `blocking_remove_stale_resources`
-//! counts as `ResourcesAlreadyCleanedUp == Ok`. A phantom success, on every
-//! later sweep, forever. On a real machine the global config IS the node's
-//! config, so that fallback is correct there (the CI oracle's node was refused
-//! on all 22 later sweeps, as modelled); the phantom is an artefact of sweeping
-//! a non-global root twice. So this binary mints ONE root, writes it as an
-//! `iceoryx2.toml`, and installs it as the process's global config through
-//! `Config::setup_global_config_from_file` before anything touches iceoryx2 —
-//! asserted, not assumed. Every arm then keeps its assertions NODE-SCOPED (its
-//! own child's pid and directory), so an arm that fails cannot cascade into the
-//! next one's counts — which is what keeps a failure attributable to
-//! exactly the arm that names it.
+//! A node listed `Dead` WITHOUT its details storage is cleaned against
+//! `Config::global_config()` rather than the swept config
+//! (`iceoryx2-0.10.0/src/node/mod.rs:622-626`), so a per-test root that is not
+//! the process's global config aims part of a sweep at the DESK's registry, and
+//! a cleaner acquisition against the wrong root answers `DoesNotExist`, which
+//! `blocking_remove_stale_resources` counts as `ResourcesAlreadyCleanedUp ==
+//! Ok` — a phantom success (MEASURED under 0.9.1: every second sweep reported
+//! `cleanups == 1` while the node directory, tag and all, survived). So this
+//! binary mints ONE root, writes it as an `iceoryx2.toml`, and installs it as
+//! the process's global config through `Config::setup_global_config_from_file`
+//! before anything touches iceoryx2 — asserted, not assumed. Every arm keeps
+//! its assertions scoped to its own nodes and its own directories, so an arm
+//! that fails cannot cascade into the next one's counts.
 //!
 //! `#[serial]`: one root, one process-global log level (the diagnostics sweep
 //! pins iceoryx2 at `Trace` for its duration and restores it after — two
@@ -97,11 +121,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::ipc_cleanup::{
-    cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config, CleanupReport, FailedNodeCleanup,
+    cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config, CleanupReport,
 };
 use cerulion_cli_engine::orphan_port_tags::{
-    orphan_port_tag_candidates, reclaim_orphan_port_tags, OrphanTagNode, OrphanTagReclaim,
-    ReclaimVerdict,
+    reclaim_orphan_port_tags, OrphanTagNode, OrphanTagReclaim, ReclaimVerdict,
 };
 use cerulion_cli_engine::shm_state::{creator_verdict, CreatorVerdict};
 use cerulion_core::prelude::MaxSliceLen;
@@ -302,7 +325,9 @@ impl IsolatedRoot {
             .expect("install the isolated config as the process's global config");
             // PRECONDITION, asserted: the global config really is the isolated
             // root. If anything in this process had initialised the global
-            // config first, every second sweep below would be a phantom success.
+            // config first, a sweep that met a node without its details storage
+            // would be aimed at the DESK's registry instead of this one (see the
+            // module docs) — and would answer with a phantom success.
             assert!(
                 Path::new(&String::from(global.global.root_path()))
                     .components()
@@ -702,19 +727,20 @@ fn new_node_dir(root: &IsolatedRoot, before: &[PathBuf], who: &str) -> PathBuf {
     new[0].clone()
 }
 
-/// The refusal a sweep attributed to the node minted by `pid`, if any — the
-/// node token renders `pid: <pid>,`.
-fn own_failure(report: &CleanupReport, pid: u32) -> Option<&FailedNodeCleanup> {
-    let key = format!("pid: {pid},");
-    report.failures.iter().find(|f| f.node.contains(&key))
-}
-
-/// The candidates a sweep's refusals yield for the node minted by `pid`.
-fn own_candidates(report: &CleanupReport, root: &IsolatedRoot, pid: u32) -> Vec<OrphanTagNode> {
-    orphan_port_tag_candidates(&report.failures, &root.config())
-        .into_iter()
-        .filter(|c| c.pid == pid)
-        .collect()
+/// The node identity `Node::list` renders for `node_id` under iceoryx2 0.10.
+/// The walk rebuilds the identity from the directory name —
+/// `UniqueNodeId(UniqueId::from_raw_id(value))`, `iceoryx2-0.10.0/src/node/mod.rs:1212-1215`
+/// — and `UniqueId`'s derived `Debug` prints the two halves it stores: the low
+/// 64 bits of the value as `payload_value`, the high 64 as `unique_value`
+/// (`iceoryx2-0.10.0/src/unique_id_generator/mod.rs:33-54`). Neither a pid nor
+/// a creation stamp appears in it, which is why the arms below carry the pid in
+/// the candidate's own field and name a node by its ID.
+fn node_identity(node_id: u128) -> String {
+    format!(
+        "UniqueNodeId(UniqueId {{ payload_value: {}, unique_value: {} }})",
+        node_id as u64,
+        (node_id >> 64) as u64
+    )
 }
 
 /// The diagnostics sweep, exactly as `cerulion clean` runs it, over the
@@ -747,6 +773,9 @@ fn render_report(report: &CleanupReport) -> String {
         "cleanups={} failed_cleanups={} failures_by_cause={:?} unclassified={:?}",
         report.cleanups, report.failed_cleanups, report.failures_by_cause, report.unclassified
     );
+    for e in &report.registry_errors {
+        s.push_str(&format!("\n  registry_error {e}"));
+    }
     for f in &report.failures {
         s.push_str(&format!(
             "\n  node {} variant {:?} causes:",
@@ -759,21 +788,173 @@ fn render_report(report: &CleanupReport) -> String {
     s
 }
 
-/// Mint the shape with an exit-mode child and run the FIRST sweep, asserting
-/// the preconditions every arm shares — all NODE-SCOPED to the child's pid
-/// and directory: exactly one node directory appeared for the child and it
-/// carries a `<prefix>*.port_tag` (the child's port outlived it), the sweep
-/// refuses THAT node with `InternalError`, the selector picks exactly it, and
-/// after the sweep the directory holds NOTHING but port tags (the `.details`
-/// storage is gone — the `rmdir` was the only thing that failed).
-struct MintedShape {
-    child: ChildRun,
-    node_dir: PathBuf,
-    first: CleanupReport,
+// =====================================================================
+// A HAND-PLANTED orphan shape — the directory 0.9.1's sweep used to leave
+// standing, built by this binary because 0.10's no longer produces one.
+// =====================================================================
+
+/// A libtest filter that selects nothing, so the process runs no test at all
+/// and exits 0. Its only product is a pid this process has reaped.
+const NO_SUCH_TEST: &str = "subprocess_no_test_matches_this_filter";
+
+/// A pid that is PROVABLY gone: a child of this process, spawned on this test
+/// binary with a filter that selects no test, then WAITED on — which reaps it,
+/// so `kill(pid, 0)` answers `ESRCH` rather than finding a zombie. Asserted
+/// through the same predicate the reclaim's death guard uses, so a candidate
+/// built on it starts from a measured death rather than a chosen number.
+///
+/// Pid reuse between here and the reclaim would read `Alive` and REFUSE: a
+/// false red, never a false green.
+fn reaped_pid() -> u32 {
+    let exe = std::env::current_exe().expect("current_exe");
+    let child = std::process::Command::new(exe)
+        .args(["--exact", NO_SUCH_TEST])
+        .env_remove(ENV_CHILD)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn a short-lived child for its pid");
+    let pid = child.id();
+    let out = child
+        .wait_with_output()
+        .expect("wait for the short-lived child");
+    assert!(
+        out.status.success(),
+        "a run that selects no test exits 0 ({:?});\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        liveness(pid),
+        CreatorVerdict::Gone,
+        "a reaped child's pid must read Gone — a zombie would still read Alive and the \
+         death guard would refuse every arm below for the wrong reason"
+    );
+    pid
+}
+
+/// The registry's node directory as the LIBRARY derives it: the reclaim
+/// re-checks every candidate against `<config.global.node_dir()>/<node id>`, so
+/// a planted directory has to land exactly there. The assertion holds this
+/// binary's own idea of the layout (`<root>/nodes`) against the library's
+/// answer, so a layout change fails here rather than turning every planted arm
+/// into a refusal nobody expected.
+fn registry_nodes_dir(root: &IsolatedRoot) -> PathBuf {
+    let config = root.config();
+    let from_config = PathBuf::from(String::from(&config.global.node_dir()));
+    assert!(
+        from_config.components().eq(root.nodes_dir().components()),
+        "the library keeps node directories in `{}`; this binary plants and lists them in `{}`",
+        from_config.display(),
+        root.nodes_dir().display()
+    );
+    from_config
+}
+
+/// The configured port-tag suffix, read off the config rather than spelled out,
+/// so a planted tag is named the way the library names one and the reclaim's
+/// `<prefix><port id><suffix>` proof is exercised against the real spelling.
+fn port_tag_suffix(root: &IsolatedRoot) -> String {
+    let config = root.config();
+    String::from_utf8_lossy(config.global.node.port_tag_suffix.as_bytes()).into_owned()
+}
+
+/// Node ids for planted directories: the high half is this process's pid, the
+/// low half a per-process counter. That is the exact split
+/// `UniqueId::from_raw_id` makes of a value (low 64 bits `payload_value`, high
+/// 64 `unique_value`), so [`node_identity`] renders a planted id the way the
+/// library would, and no two plants — in this process or a concurrent one —
+/// can name the same directory.
+static PLANTED_NODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn planted_node_id() -> u128 {
+    let n = PLANTED_NODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (u128::from(std::process::id()) << 64) | u128::from(n + 1)
+}
+
+/// A node directory planted by hand, and the candidate that aims the reclaim at
+/// it.
+struct PlantedShape {
+    /// The directory's name, and what the reclaim re-derives
+    /// `<node dir>/<node id>` from.
+    node_id: u128,
+    dir: PathBuf,
+    /// The planted tag names, sorted — an arm asserts against these to say
+    /// "untouched" without re-deriving them.
+    tag_names: Vec<String>,
     candidate: OrphanTagNode,
 }
 
-fn mint_and_first_sweep(root: &IsolatedRoot, arm: &str) -> MintedShape {
+/// Plant a node directory holding one `<prefix><port id><suffix>` per entry of
+/// `port_ids` AND NOTHING ELSE — the shape 0.9.1's sweep left behind and 0.10
+/// removes on the spot, so an arm about the reclaim's refusals can no longer
+/// get it from the library.
+///
+/// The candidate carries a REAPED pid, so the death guard passes for the right
+/// reason; an arm that wants that guard to bite overrides the pid with a live
+/// one. The directory is invisible to `Node::list` (no monitor entry beside
+/// it), so nothing sweeps it out from under the arm.
+fn plant_orphan_tags(root: &IsolatedRoot, port_ids: &[u128]) -> PlantedShape {
+    let node_id = planted_node_id();
+    let dir = registry_nodes_dir(root).join(node_id.to_string());
+    std::fs::create_dir_all(&dir).expect("plant the node directory");
+    let suffix = port_tag_suffix(root);
+    let mut tag_names: Vec<String> = port_ids
+        .iter()
+        .map(|port_id| {
+            let name = format!("{}{port_id}{suffix}", root.prefix);
+            std::fs::write(dir.join(&name), b"").expect("plant a port tag");
+            name
+        })
+        .collect();
+    tag_names.sort();
+    assert_eq!(
+        names_in(&dir),
+        tag_names,
+        "the planted directory must hold the tags and nothing else"
+    );
+    assert_eq!(
+        port_tags(&dir, &root.prefix).len(),
+        port_ids.len(),
+        "a planted tag must be recognisable as one to this binary's own listing: {:?}",
+        names_in(&dir)
+    );
+    PlantedShape {
+        node_id,
+        dir: dir.clone(),
+        tag_names,
+        candidate: OrphanTagNode {
+            node: node_identity(node_id),
+            node_id,
+            pid: reaped_pid(),
+            dir,
+        },
+    }
+}
+
+// =====================================================================
+// The REAL shape, minted by a real process.
+// =====================================================================
+
+/// Mint the shape with an exit-mode child and assert the preconditions the
+/// headline arm needs — all NODE-SCOPED to the child's own directory: exactly
+/// one node directory appeared for the child, it is named after a node id, it
+/// carries a `<prefix>*.port_tag` (the child's port outlived it — MEASURED on
+/// the linked library, never assumed from what 0.9.1 did), and the child is
+/// dead. No sweep happens here: the arm is what sweeps, once, and the sweep is
+/// what is under test.
+struct MintedShape {
+    child: ChildRun,
+    node_dir: PathBuf,
+    node_id: u128,
+    /// The tags on disk BEFORE the sweep — quoted back when the sweep is
+    /// supposed to have removed them and did not.
+    tags_before: Vec<PathBuf>,
+}
+
+fn mint_leaked_tag_shape(root: &IsolatedRoot, arm: &str) -> MintedShape {
     let before = node_dirs(root);
     let child = run_exit_child(root, arm);
     let node_dir = new_node_dir(root, &before, arm);
@@ -787,61 +968,28 @@ fn mint_and_first_sweep(root: &IsolatedRoot, arm: &str) -> MintedShape {
         child.stdout,
         child.stderr
     );
-
-    let first = sweep(root);
-    let refusal = own_failure(&first, child.pid).unwrap_or_else(|| {
-        panic!(
-            "the first sweep must refuse the child's node (pid {}): {}",
-            child.pid,
-            render_report(&first)
-        )
-    });
-    assert_eq!(
-        refusal.variant,
-        "InternalError",
-        "{}",
-        render_report(&first)
-    );
-    let candidates = own_candidates(&first, root, child.pid);
-    assert_eq!(
-        candidates.len(),
-        1,
-        "the refusal must classify as the orphan-tag chain (exactly one candidate for pid {}): {}",
-        child.pid,
-        render_report(&first)
-    );
-    let candidate = candidates[0].clone();
-    assert_eq!(
-        candidate.dir.components().collect::<Vec<_>>(),
-        node_dir.components().collect::<Vec<_>>(),
-        "the candidate's directory is the node's directory"
-    );
-    assert_eq!(
-        node_dir.file_name().and_then(|n| n.to_str()),
-        Some(candidate.node_id.to_string().as_str()),
-        "the directory is named after the node id"
-    );
-    // After the sweep the directory holds ONLY port tags: everything else
-    // was removed on the way to the failing `rmdir`.
-    let names = names_in(&node_dir);
-    assert!(
-        !names.is_empty()
-            && names
-                .iter()
-                .all(|n| n.starts_with(&root.prefix) && n.ends_with(".port_tag")),
-        "after the first sweep the directory must hold nothing but port tags: {names:?}"
-    );
+    let node_id = node_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.parse::<u128>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "a node directory is named after its node id in decimal: {}",
+                node_dir.display()
+            )
+        });
     assert_eq!(
         liveness(child.pid),
         CreatorVerdict::Gone,
-        "the exit-mode child is dead by now"
+        "the exit-mode child is dead by now;\n--- child stderr ---\n{}",
+        child.stderr
     );
 
     MintedShape {
         child,
         node_dir,
-        first,
-        candidate,
+        node_id,
+        tags_before,
     }
 }
 
@@ -849,80 +997,81 @@ fn mint_and_first_sweep(root: &IsolatedRoot, arm: &str) -> MintedShape {
 // THE ARMS
 // =====================================================================
 
-/// THE HEADLINE: mint → first sweep refuses → reclaim removes exactly the
-/// one tag → the next sweep no longer refuses the node and its directory is
-/// gone.
+/// THE UPSTREAM FIX, pinned: the LIBRARY removes a leaked port tag and
+/// converges the node on the FIRST sweep.
+///
+/// Until iceoryx2 0.10 this was Cerulion's job. `remove_stale_port_resources`
+/// reclaimed a dead port's data segment and its connections and left the
+/// port's on-disk tag where it was, so `remove_node`'s `rmdir` failed
+/// `ENOTEMPTY` on every sweep and the node directory stood forever; what healed
+/// it was `cerulion clean`'s orphan port-tag reclaim, which removed the tag and
+/// let the next sweep finish. 0.10's
+/// `remove_stale_port_resources(node_id, port_id, config)` ends in
+/// `remove_port_tag`, and this arm is the proof of that over a real minted
+/// shape: the tag IS on disk when the sweep starts (asserted, so the arm cannot
+/// pass because nothing leaked), and after ONE sweep the node is counted
+/// cleaned, nothing is refused, no `<prefix>*.port_tag` survives, and the
+/// directory itself is gone.
+///
+/// It stays here so an iceoryx2 that regresses the fix is caught on the next
+/// run: the failure mode it replaces announced itself only after a desk had
+/// accumulated 13,647 stale mappings behind eleven stranded directories.
 #[test]
 #[serial]
-fn the_orphan_port_tag_shape_is_reclaimed_and_the_next_sweep_converges() {
+fn the_library_removes_a_leaked_port_tag_and_the_sweep_converges() {
     let _use = RootUse::acquire();
     let root = IsolatedRoot::get();
-    let shape = mint_and_first_sweep(root, "headline");
-    // The minting child is dead before anything is reclaimed — the death
-    // guard's premise, re-proved on the child's own pid.
-    assert_eq!(
-        liveness(shape.child.pid),
-        CreatorVerdict::Gone,
-        "the minting child (pid {}) must be dead before the reclaim;\n--- child stderr ---\n{}",
-        shape.child.pid,
+    let shape = mint_leaked_tag_shape(root, "headline");
+
+    let report = sweep(root);
+    assert!(
+        report.failures.is_empty(),
+        "the sweep must refuse nothing; the node it just met is {}: {}\n--- child stderr ---\n{}",
+        node_identity(shape.node_id),
+        render_report(&report),
         shape.child.stderr
     );
-
-    let reclaims = reclaim(root, std::slice::from_ref(&shape.candidate), false);
-    assert_eq!(reclaims.len(), 1);
+    assert_eq!(report.failed_cleanups, 0, "{}", render_report(&report));
     assert_eq!(
-        reclaims[0].refused(),
-        None,
-        "the reclaim must not refuse a directory holding only orphan tags: {reclaims:?}"
-    );
-    assert_eq!(
-        reclaims[0].removed.len(),
+        report.cleanups,
         1,
-        "one publisher, one port, one tag removed: {reclaims:?}"
+        "the child's node is the only node under this root, and it is cleaned: {}",
+        render_report(&report)
     );
     assert!(
         port_tags(&shape.node_dir, &root.prefix).is_empty(),
-        "the tag is gone from disk: {:?}",
+        "the library must remove the tag it used to leave behind (on disk before the sweep: \
+         {:?}); the directory now holds {:?}",
+        shape.tags_before,
         names_in(&shape.node_dir)
     );
     assert!(
-        shape.node_dir.is_dir(),
-        "the reclaim leaves the directory for the sweep's `remove_node`"
-    );
-
-    let second = sweep(root);
-    assert!(
-        own_failure(&second, shape.child.pid).is_none(),
-        "the second sweep must not refuse the node any more: {}\n--- child stderr ---\n{}",
-        render_report(&second),
-        shape.child.stderr
-    );
-    assert!(second.cleanups >= 1, "{}", render_report(&second));
-    assert!(
         !shape.node_dir.exists(),
-        "the node directory must be gone after the second sweep"
-    );
-    assert!(
-        shape.first.failed_cleanups >= 1,
-        "(first sweep, for the record)"
+        "the node directory must be gone after the sweep; it holds {:?}",
+        names_in(&shape.node_dir)
     );
 }
 
-/// ANTI-TAUTOLOGY (skipping the offender refusal in `orphan_tags_in`):
-/// a stray entry planted AFTER selection and BEFORE the reclaim — the window
-/// a concurrent session can write into — refuses the whole directory, names
-/// the stray, removes nothing; the next sweep still refuses the node; and
-/// removing the stray by hand is exactly what lets the reclaim + sweep
-/// converge.
+/// ANTI-TAUTOLOGY (skipping the offender refusal in `orphan_tags_in`): a node
+/// directory holding anything that is not an orphan port tag is refused WHOLE,
+/// the offender is named, and nothing is removed — not even the tags that do
+/// qualify. A concurrent session can write into that directory between the
+/// selection and the reclaim, and the reclaim's safety argument covers a
+/// directory of pure residue only.
+///
+/// The shape is planted by hand: 0.10 removes a leaked tag on the first sweep,
+/// so a directory of nothing but tags is no longer something the library will
+/// hold still for. The control is that the stray was the ONLY obstacle —
+/// remove it by hand and the same call reclaims.
 #[test]
 #[serial]
 fn a_stray_entry_planted_before_the_reclaim_is_refused_named_and_nothing_is_removed() {
     let _use = RootUse::acquire();
     let root = IsolatedRoot::get();
-    let shape = mint_and_first_sweep(root, "stray");
-    let stray = shape.node_dir.join("stray.txt");
+    let shape = plant_orphan_tags(root, &[7]);
+    let stray = shape.dir.join("stray.txt");
     std::fs::write(&stray, b"not a tag").expect("plant the stray");
-    let before = names_in(&shape.node_dir);
+    let before = names_in(&shape.dir);
 
     let reclaims = reclaim(root, std::slice::from_ref(&shape.candidate), false);
     let refused = reclaims[0]
@@ -933,50 +1082,51 @@ fn a_stray_entry_planted_before_the_reclaim_is_refused_named_and_nothing_is_remo
         "the refusal must name the stray: {refused}"
     );
     assert!(reclaims[0].removed.is_empty(), "{reclaims:?}");
-    assert_eq!(names_in(&shape.node_dir), before, "nothing removed");
-
-    let second = sweep(root);
-    assert!(
-        own_failure(&second, shape.child.pid).is_some(),
-        "with the stray in place the node is still unreclaimable: {}",
-        render_report(&second)
-    );
-    assert!(
-        shape.node_dir.is_dir(),
-        "the directory survives with the stray in it"
+    assert_eq!(names_in(&shape.dir), before, "nothing removed");
+    assert_eq!(
+        port_tags(&shape.dir, &root.prefix).len(),
+        1,
+        "the qualifying tag is refused along with the rest: {:?}",
+        names_in(&shape.dir)
     );
 
     // The control: the refusal was the ONLY obstacle.
     std::fs::remove_file(&stray).expect("remove the stray by hand");
-    let candidates = own_candidates(&second, root, shape.child.pid);
-    assert_eq!(candidates.len(), 1, "{}", render_report(&second));
-    let reclaims = reclaim(root, &candidates, false);
+    let reclaims = reclaim(root, std::slice::from_ref(&shape.candidate), false);
     assert_eq!(reclaims[0].refused(), None, "{reclaims:?}");
-    assert_eq!(reclaims[0].removed.len(), 1);
-    let third = sweep(root);
-    assert!(
-        own_failure(&third, shape.child.pid).is_none(),
-        "{}",
-        render_report(&third)
+    assert_eq!(
+        reclaims[0].removed,
+        vec![7_u128],
+        "the reclaim reports the port id it removed: {reclaims:?}"
     );
-    assert!(!shape.node_dir.exists());
+    assert!(
+        names_in(&shape.dir).is_empty(),
+        "the tag is gone from disk: {:?}",
+        names_in(&shape.dir)
+    );
+    assert!(
+        shape.dir.is_dir(),
+        "the reclaim leaves the directory for a sweep's `remove_node`"
+    );
 }
 
-/// ANTI-TAUTOLOGY (treating `CreatorVerdict::Alive` as gone): a node
-/// whose process is ALIVE is never a candidate — the sweep does not even
-/// count it as dead — and a hand-built candidate that points the reclaimer at
-/// a real orphan directory but carries a LIVE pid is refused by the death
-/// guard with the tags untouched. The lingering child mints the SAME shape
-/// (it too drops its publisher with a leaked loan), so once it dies it is
-/// refused by the sweep, selected, reclaimed and converged like any other —
-/// the second minting path through the same pin.
+/// ANTI-TAUTOLOGY (treating `CreatorVerdict::Alive` as gone): a candidate whose
+/// pid is ALIVE is refused by the death guard, the pid named, its tags
+/// untouched — the guard is what stands between the reclaim and a running
+/// process's registry state, and a pid reused by an unrelated process is
+/// refused with it, which is the safe direction.
+///
+/// Around that, the two things the 0.10 sweep says about a live process, both
+/// measured here rather than assumed: a LIVE node is not swept at all (its
+/// directory and its own leaked tag survive untouched, `cleanups == 0`), and
+/// once that same process dies the library heals its node exactly as it heals
+/// the headline's — the linger child mints the same leaked-loan shape, so this
+/// is the second minting path through this pin.
 #[test]
 #[serial]
-fn a_live_process_is_never_a_candidate_and_its_pid_refuses_the_reclaim() {
+fn a_live_nodes_directory_survives_the_sweep_and_its_pid_refuses_the_reclaim() {
     let _use = RootUse::acquire();
     let root = IsolatedRoot::get();
-    // A live node on the root: its process lingers until this test drops
-    // the handle.
     let before = node_dirs(root);
     let linger = LingerChild::spawn(root, "linger");
     let linger_dir = new_node_dir(root, &before, "the linger child");
@@ -985,38 +1135,36 @@ fn a_live_process_is_never_a_candidate_and_its_pid_refuses_the_reclaim() {
         CreatorVerdict::Alive,
         "the linger child is alive"
     );
-    // And a real orphan directory beside it, minted by a dead child.
-    let before = node_dirs(root);
-    let dead = run_exit_child(root, "live-arm-orphan");
-    let dead_dir = new_node_dir(root, &before, "the dead child");
+    let linger_tags = port_tags(&linger_dir, &root.prefix);
+    assert_eq!(
+        linger_tags.len(),
+        1,
+        "the linger child leaked exactly one port tag: {:?}",
+        names_in(&linger_dir)
+    );
 
+    // A live node is none of a sweep's business.
     let first = sweep(root);
-    assert!(
-        own_failure(&first, linger.pid).is_none(),
-        "the LIVE node is not even attempted, let alone refused: {}",
+    assert!(first.failures.is_empty(), "{}", render_report(&first));
+    assert_eq!(
+        first.cleanups,
+        0,
+        "the only node under this root is ALIVE, so nothing is cleaned: {}",
         render_report(&first)
     );
-    assert!(
-        own_failure(&first, dead.pid).is_some(),
-        "the DEAD node is refused: {}",
-        render_report(&first)
-    );
-    assert!(
-        own_candidates(&first, root, linger.pid).is_empty(),
-        "the live child's node is never a candidate"
-    );
-    let candidates = own_candidates(&first, root, dead.pid);
-    assert_eq!(candidates.len(), 1, "{}", render_report(&first));
-    let orphan = candidates[0].clone();
-    assert!(orphan.dir.components().eq(dead_dir.components()));
-    let tags_before = port_tags(&orphan.dir, &root.prefix);
-    assert_eq!(tags_before.len(), 1);
     assert!(linger_dir.is_dir(), "the live node's directory stands");
+    assert_eq!(
+        port_tags(&linger_dir, &root.prefix),
+        linger_tags,
+        "and so does its tag"
+    );
 
-    // THE DEATH GUARD: the same directory, a live pid.
+    // THE DEATH GUARD: an orphan directory that is real, aimed at with a pid
+    // that is alive.
+    let shape = plant_orphan_tags(root, &[11]);
     let live_pid_candidate = OrphanTagNode {
         pid: linger.pid,
-        ..orphan.clone()
+        ..shape.candidate.clone()
     };
     let reclaims = reclaim(root, &[live_pid_candidate], false);
     let refused = reclaims[0]
@@ -1028,113 +1176,102 @@ fn a_live_process_is_never_a_candidate_and_its_pid_refuses_the_reclaim() {
     );
     assert!(reclaims[0].removed.is_empty(), "{reclaims:?}");
     assert_eq!(
-        port_tags(&orphan.dir, &root.prefix),
-        tags_before,
+        names_in(&shape.dir),
+        shape.tag_names,
         "the tags must survive a refused reclaim"
     );
 
-    // The control: the genuine candidate (its pid really is gone) reclaims
-    // and its node converges while the live node still stands.
-    let reclaims = reclaim(root, std::slice::from_ref(&orphan), false);
+    // The control: the SAME directory, carrying the pid this binary reaped.
+    let reclaims = reclaim(root, std::slice::from_ref(&shape.candidate), false);
     assert_eq!(reclaims[0].refused(), None, "{reclaims:?}");
-    assert_eq!(reclaims[0].removed.len(), 1);
-    let second = sweep(root);
+    assert_eq!(reclaims[0].removed, vec![11_u128], "{reclaims:?}");
     assert!(
-        own_failure(&second, dead.pid).is_none(),
-        "{}",
-        render_report(&second)
+        names_in(&shape.dir).is_empty(),
+        "the tag is gone once the pid is provably dead: {:?}",
+        names_in(&shape.dir)
     );
-    assert!(!orphan.dir.exists(), "the orphan's directory is gone");
-    assert!(
-        linger_dir.is_dir(),
-        "the live node's directory still stands"
-    );
-    assert!(own_failure(&second, linger.pid).is_none());
 
-    // The linger child dies: its node is now the same shape, and the same
-    // path heals it.
+    // The linger child dies: the library heals its node the way it healed the
+    // headline's, and the planted directory beside it is invisible to the sweep
+    // (no monitor entry), so the counters below are about the linger node alone.
     let linger_pid = linger.pid;
     drop(linger);
-    let third = sweep(root);
-    let linger_candidates = own_candidates(&third, root, linger_pid);
     assert_eq!(
-        linger_candidates.len(),
-        1,
-        "once dead, the linger child's node is refused with the exact chain: {}",
-        render_report(&third)
+        liveness(linger_pid),
+        CreatorVerdict::Gone,
+        "the linger child is killed AND reaped when its handle drops"
     );
-    let reclaims = reclaim(root, &linger_candidates, false);
-    assert_eq!(reclaims[0].refused(), None, "{reclaims:?}");
-    assert_eq!(reclaims[0].removed.len(), 1);
-    let fourth = sweep(root);
-    assert!(
-        own_failure(&fourth, linger_pid).is_none(),
-        "{}",
-        render_report(&fourth)
+    let second = sweep(root);
+    assert!(second.failures.is_empty(), "{}", render_report(&second));
+    assert_eq!(
+        second.cleanups,
+        1,
+        "the now-dead linger node, tag and all, is cleaned: {}",
+        render_report(&second)
     );
     assert!(!linger_dir.exists(), "the linger node's directory is gone");
 }
 
-/// `dry_run` lists the tag and removes nothing: the next sweep still refuses
-/// the node until a real reclaim runs.
+/// `dry_run` LISTS the tags it would remove and takes nothing off disk. Under
+/// 0.9.1 the proof of "heals nothing" was that the next sweep still refused the
+/// node; 0.10's sweep refuses nothing and never sees a planted directory
+/// anyway, so the oracle is the disk itself — the tags are still there, and the
+/// same call without `dry_run` is what removes them.
 #[test]
 #[serial]
 fn a_dry_run_lists_the_tag_and_removes_nothing() {
     let _use = RootUse::acquire();
     let root = IsolatedRoot::get();
-    let shape = mint_and_first_sweep(root, "dry-run");
-    let before = names_in(&shape.node_dir);
+    let shape = plant_orphan_tags(root, &[3, 5]);
 
     let reclaims = reclaim(root, std::slice::from_ref(&shape.candidate), true);
+    assert_eq!(reclaims.len(), 1);
     assert_eq!(reclaims[0].refused(), None, "{reclaims:?}");
-    assert_eq!(reclaims[0].removed.len(), 1, "listed: {reclaims:?}");
     assert_eq!(
-        names_in(&shape.node_dir),
-        before,
+        reclaims[0].removed,
+        vec![3_u128, 5],
+        "both port ids are listed: {reclaims:?}"
+    );
+    assert_eq!(
+        names_in(&shape.dir),
+        shape.tag_names,
         "nothing removed under dry_run"
     );
 
-    let second = sweep(root);
-    assert!(
-        own_failure(&second, shape.child.pid).is_some(),
-        "a dry run heals nothing: {}",
-        render_report(&second)
-    );
-    assert!(shape.node_dir.is_dir());
-
     // The control: the real reclaim does.
-    let candidates = own_candidates(&second, root, shape.child.pid);
-    assert_eq!(candidates.len(), 1, "{}", render_report(&second));
-    let reclaims = reclaim(root, &candidates, false);
+    let reclaims = reclaim(root, std::slice::from_ref(&shape.candidate), false);
     assert_eq!(reclaims[0].refused(), None, "{reclaims:?}");
-    let third = sweep(root);
+    assert_eq!(reclaims[0].removed, vec![3_u128, 5], "{reclaims:?}");
     assert!(
-        own_failure(&third, shape.child.pid).is_none(),
-        "{}",
-        render_report(&third)
+        names_in(&shape.dir).is_empty(),
+        "both tags are gone: {:?}",
+        names_in(&shape.dir)
     );
-    assert!(!shape.node_dir.exists());
+    assert!(
+        shape.dir.is_dir(),
+        "the reclaim leaves the directory for a sweep's `remove_node`"
+    );
 }
 
-/// An ALREADY-EMPTY candidate directory — the tag came off by other means
-/// between the sweep that selected it and the reclaim (a concurrent session's
-/// reclaim, or an earlier `cerulion clean` interrupted after its unlinks and
-/// before its second sweep) — is `AlreadyEmpty`: not a refusal, nothing
-/// removed, and the NEXT sweep converges it, directory gone. This is the
-/// verdict that makes the verb's second sweep run whenever candidates
-/// EXISTED: a sweep gated on "a tag came off" would leave this node standing
-/// for one more run.
+/// An ALREADY-EMPTY candidate directory — the tags came off by other means
+/// between the selection and the reclaim (a concurrent session's reclaim, or an
+/// earlier `cerulion clean` interrupted after its unlinks and before its second
+/// sweep) — is `AlreadyEmpty`: not a refusal, nothing removed, and the
+/// directory LEFT STANDING, because removing it is a sweep's `remove_node`'s
+/// job and never the reclaim's. This is the verdict that makes the verb run its
+/// second sweep whenever candidates EXISTED: a sweep gated on "a tag came off"
+/// would leave exactly this node standing for one more run.
 #[test]
 #[serial]
-fn an_already_empty_candidate_is_converged_pending_sweep_and_the_next_sweep_removes_it() {
+fn an_already_empty_candidate_is_converged_pending_sweep_and_the_directory_is_left_standing() {
     let _use = RootUse::acquire();
     let root = IsolatedRoot::get();
-    let shape = mint_and_first_sweep(root, "already-empty");
-    for tag in port_tags(&shape.node_dir, &root.prefix) {
+    let shape = plant_orphan_tags(root, &[9]);
+    for tag in port_tags(&shape.dir, &root.prefix) {
         std::fs::remove_file(&tag).expect("remove the tag by other means");
     }
     assert!(
-        names_in(&shape.node_dir).is_empty() && shape.node_dir.is_dir(),
+        names_in(&shape.dir).is_empty() && shape.dir.is_dir(),
         "precondition: an empty directory still standing"
     );
 
@@ -1147,17 +1284,13 @@ fn an_already_empty_candidate_is_converged_pending_sweep_and_the_next_sweep_remo
     );
     assert_eq!(reclaims[0].refused(), None, "not a refusal: {reclaims:?}");
     assert!(reclaims[0].removed.is_empty(), "{reclaims:?}");
-    assert!(shape.node_dir.is_dir(), "left for the sweep");
-
-    let second = sweep(root);
     assert!(
-        own_failure(&second, shape.child.pid).is_none(),
-        "the next sweep converges an already-empty directory: {}",
-        render_report(&second)
+        shape.dir.is_dir(),
+        "the reclaim never removes a directory, empty or not"
     );
-    assert!(
-        !shape.node_dir.exists(),
-        "the node directory must be gone after the sweep"
+    assert_eq!(
+        reclaims[0].node_id, shape.node_id,
+        "the verdict is reported against the candidate it was asked about: {reclaims:?}"
     );
 }
 
@@ -1188,29 +1321,29 @@ impl Drop for OutsideDir {
     }
 }
 
-/// IDENTITY, not path, over the REAL shape: after the child minted it and
-/// the first sweep refused it, the node directory is MOVED — real tag and
-/// all — to a sibling directory OUTSIDE the isolated root and a symbolic
-/// link is planted in its place. A path-driven reclaim would follow the
-/// link and delete the tag out there. The reclaim must refuse naming the
-/// link, the outside tag must survive, the link must be left alone, and the
-/// next sweep must still refuse the node. Putting the directory back is the
-/// control that converges.
+/// ANTI-TAUTOLOGY (resolving the node directory by PATH): IDENTITY, not path.
+/// The node directory is moved — real tag and all — to a sibling directory
+/// OUTSIDE the isolated root, and a symbolic link is planted in its place. A
+/// path-driven reclaim would follow the link and delete the tag out there; this
+/// one `openat`s the node directory from the registry root by bare name with
+/// `O_DIRECTORY|O_NOFOLLOW`, so the link fails `ELOOP` (or `ENOTDIR` on macOS,
+/// whose `O_DIRECTORY` check answers first) and the whole candidate is refused
+/// and named. The outside tag must survive, the link must be left alone, and
+/// putting the directory back is the control that reclaims.
+///
+/// The directory is planted by hand rather than minted: 0.10 removes a leaked
+/// tag on the first sweep, so the library no longer leaves one standing to be
+/// swapped.
 #[test]
 #[serial]
 fn a_node_directory_swapped_for_a_symlink_is_refused_and_the_outside_tag_survives() {
     let _use = RootUse::acquire();
     let root = IsolatedRoot::get();
-    let shape = mint_and_first_sweep(root, "symlink-swap");
+    let shape = plant_orphan_tags(root, &[13]);
     let outside = OutsideDir::mint();
-    let moved = outside.dir.join(
-        shape
-            .node_dir
-            .file_name()
-            .expect("the node directory has a name"),
-    );
-    std::fs::rename(&shape.node_dir, &moved).expect("move the node directory outside the root");
-    std::os::unix::fs::symlink(&moved, &shape.node_dir).expect("plant the link in its place");
+    let moved = outside.dir.join(shape.node_id.to_string());
+    std::fs::rename(&shape.dir, &moved).expect("move the node directory outside the root");
+    std::os::unix::fs::symlink(&moved, &shape.dir).expect("plant the link in its place");
     let outside_tags = port_tags(&moved, &root.prefix);
     assert_eq!(
         outside_tags.len(),
@@ -1223,8 +1356,7 @@ fn a_node_directory_swapped_for_a_symlink_is_refused_and_the_outside_tag_survive
         .refused()
         .unwrap_or_else(|| panic!("a node directory that is a link must be refused: {reclaims:?}"));
     assert!(
-        refused.contains("symbolic link")
-            && refused.contains(&shape.node_dir.display().to_string()),
+        refused.contains("symbolic link") && refused.contains(&shape.dir.display().to_string()),
         "the refusal must say the directory is a link and name it: {refused}"
     );
     assert!(reclaims[0].removed.is_empty(), "{reclaims:?}");
@@ -1234,33 +1366,21 @@ fn a_node_directory_swapped_for_a_symlink_is_refused_and_the_outside_tag_survive
         "the tag outside the root must survive untouched"
     );
     assert!(
-        std::fs::symlink_metadata(&shape.node_dir)
+        std::fs::symlink_metadata(&shape.dir)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false),
         "the link itself is left alone"
     );
 
-    let second = sweep(root);
-    assert!(
-        own_failure(&second, shape.child.pid).is_some(),
-        "with a link in the directory's place the node is still refused: {}",
-        render_report(&second)
-    );
-
-    // The control: put the directory back, and the same path heals it.
-    std::fs::remove_file(&shape.node_dir).expect("remove the link");
-    std::fs::rename(&moved, &shape.node_dir).expect("move the node directory back");
-    let third = sweep(root);
-    let candidates = own_candidates(&third, root, shape.child.pid);
-    assert_eq!(candidates.len(), 1, "{}", render_report(&third));
-    let reclaims = reclaim(root, &candidates, false);
+    // The control: put the directory back, and the same call heals it.
+    std::fs::remove_file(&shape.dir).expect("remove the link");
+    std::fs::rename(&moved, &shape.dir).expect("move the node directory back");
+    let reclaims = reclaim(root, std::slice::from_ref(&shape.candidate), false);
     assert_eq!(reclaims[0].refused(), None, "{reclaims:?}");
-    assert_eq!(reclaims[0].removed.len(), 1);
-    let fourth = sweep(root);
+    assert_eq!(reclaims[0].removed, vec![13_u128], "{reclaims:?}");
     assert!(
-        own_failure(&fourth, shape.child.pid).is_none(),
-        "{}",
-        render_report(&fourth)
+        names_in(&shape.dir).is_empty(),
+        "the tag is gone once the directory is a directory again: {:?}",
+        names_in(&shape.dir)
     );
-    assert!(!shape.node_dir.exists());
 }
