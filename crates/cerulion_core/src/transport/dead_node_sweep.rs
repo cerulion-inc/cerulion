@@ -185,6 +185,9 @@ pub fn run_budgeted_sweep<T>(
 /// cleaner build their node from this.
 #[must_use]
 pub fn sweep_node_config(config: &Config) -> Config {
+    // hot-path-alloc-ok: a dead-node sweep is startup hygiene and the `clean`
+    // verb, never the publish or receive path. It runs once per sweep, and the
+    // sweep it is about to pay for walks the whole node registry.
     crate::transport::disable_auto_dead_node_cleanup(config.clone())
 }
 
