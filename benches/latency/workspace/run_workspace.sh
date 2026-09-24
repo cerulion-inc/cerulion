@@ -1125,7 +1125,7 @@ run_size_once() {
         echo "!!! binary<->cdylib version-skew flood: the SHM event protocol is broken" >&2
         echo "!!! and no data flows. The rebuild step should prevent this; if it" >&2
         echo "!!! persists, workspace/Cargo.lock disagrees with the repo lockfile" >&2
-        echo "!!! on the iceoryx2 family (must be =0.9.1 everywhere)." >&2
+        echo "!!! on the iceoryx2 family (must be =0.10.0 everywhere)." >&2
         exit 1
     fi
 

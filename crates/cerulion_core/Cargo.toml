@@ -27,8 +27,8 @@ path = "src/lib.rs"
 # / `iceoryx2-log-types` entries below are DECLARED ON PURPOSE and are not
 # `use`d from this crate's source. They exist so every member of the iceoryx2
 # dependency FAMILY is exact-pinned to one version: a sub-crate skew between
-# the host runtime and a node cdylib (e.g. `iceoryx2-bb-elementary` 0.9.1 vs
-# 0.9.2) makes `PackageVersion` disagree across the shared-memory connection
+# the host runtime and a node cdylib (e.g. `iceoryx2-bb-elementary` 0.10.0 vs
+# 0.10.1) makes `PackageVersion` disagree across the shared-memory connection
 # and the data plane dies SILENTLY — no node fires, no error. That contract is
 # enforced by `cerulion_core/tests/iceoryx2_version_lockstep_test.rs`, which
 # would FAIL if any of these were removed, so an unused-dependency tool must be
@@ -70,24 +70,27 @@ tracing = { version = "0.1.44", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 # Transport layer - local IPC
-# Upgraded 0.8.1 → 0.9.1 to unlock per-publisher
-# allocation_strategy (the 1-line solution) + BackpressureStrategy
-# rename + set_backpressure_handler (backpressure enforcement in iceoryx2) +
-# the upstream fix for native blocking that no longer deadlocks on
-# subscriber disconnect.
+# 0.10.0 replaced the event mechanism (the id and its repeat count moved
+# into a shared-memory counting bitset; the datagram is a one-byte
+# doorbell), added the iceoryx2 version to the static service config so a
+# cross-version open is a NAMED refusal, version-suffixed the global
+# management segment so two versions partition instead of colliding, and
+# removed the unsound `iceoryx2-bb-container` string methods
+# (RUSTSEC-2026-0294). It also removes a dead port's on-disk port tag with
+# the rest of its stale resources.
 #
-# PINNED to EXACT `=0.10.0` (not `^0.9`/`~0.9.1`): a user's freshly
+# PINNED to EXACT `=0.10.0` (not `^0.10`/`~0.10.0`): a user's freshly
 # scaffolded workspace (no Cargo.lock) would otherwise re-resolve to
-# the newest 0.9.x patch (e.g. 0.9.2) while the installed `cerulion`
-# binary links 0.9.1 — the two patch releases stamp incompatible
+# the newest 0.10.x patch (e.g. 0.10.1) while the installed `cerulion`
+# binary links 0.10.0 — two patch releases stamp incompatible
 # `iceoryx2-bb-elementary::PackageVersion`s into every shared-memory
 # zero-copy connection segment, producing a `VersionMismatch` → an
 # "Unable to establish connection" flood with no data flow.
 # NOTE: `=0.10.0` on the top-level
 # crate is necessary but NOT sufficient — iceoryx2's deps on its own
 # sub-crates (`iceoryx2-bb-elementary`, `iceoryx2-cal`, the `*-pal-*`
-# set, …) are loose `0.9`, so a fresh lock floats THEM to 0.9.2 even
-# while the top-level stays 0.9.1, and `bb-elementary::PackageVersion`
+# set, …) are loose `0.10`, so a fresh lock floats THEM to 0.10.1 even
+# while the top-level stays 0.10.0, and `bb-elementary::PackageVersion`
 # is stamped into every zero-copy connection's SHM segment → a
 # sub-crate skew alone triggers `ZeroCopyCreationError::VersionMismatch`
 # → the same silent data-plane death. The full sub-crate family is

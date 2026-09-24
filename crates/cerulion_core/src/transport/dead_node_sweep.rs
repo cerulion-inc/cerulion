@@ -161,6 +161,33 @@ pub fn run_budgeted_sweep<T>(
 /// hygiene sweep — and the whole startup path — down with it. `AssertUnwindSafe`
 /// is sound because on unwind nothing from inside the closure is observed:
 /// everything is discarded and a zeroed report returned.
+/// The iceoryx2 `Config` a dead-node sweep must mint its NODE from.
+///
+/// iceoryx2 carries `try_cleanup_dead_nodes` on `&Node`, so a sweep of a
+/// namespace needs a node in it, and a node created with iceoryx2's defaults
+/// sweeps that namespace ITSELF, on creation and again on destruction. Two
+/// things go wrong if it does.
+///
+/// The first is a reporting defect: the implicit sweep does the work, so the
+/// explicit call that follows finds nothing and reports `0` cleaned and `0`
+/// refused for a namespace it just emptied. Anything built on those counts (the
+/// classified report `cerulion clean` prints, the convergence check that
+/// decides whether a second pass is needed) is then describing a sweep that did
+/// not happen.
+///
+/// The second is the reason `TransportManager` disables the same three flags on
+/// every node it builds: iceoryx2's liveness probe can judge a LIVE node dead
+/// when the probing linkage unit is not the one that created it, so an implicit
+/// reap can remove a running process's services. A sweep must be one deliberate
+/// call whose result is reported, never a side effect of opening a namespace.
+///
+/// Both sweep entry points in the CLI engine and the transport's own liveliness
+/// cleaner build their node from this.
+#[must_use]
+pub fn sweep_node_config(config: &Config) -> Config {
+    crate::transport::disable_auto_dead_node_cleanup(config.clone())
+}
+
 pub fn cleanup_dead_nodes_bounded(config: &Config, budget: Duration) -> BoundedCleanup {
     let started = Instant::now();
     let swept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

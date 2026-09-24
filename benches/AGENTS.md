@@ -42,7 +42,7 @@ nothing about delivery: a misconfigured bench runs to completion flowing ZERO da
 
 ## Gotchas
 
-- iceoryx2 version skew HANGS, it does not error: exact-pin iceoryx2 (`=0.9.1`) in every
+- iceoryx2 version skew HANGS, it does not error: exact-pin iceoryx2 (`=0.10.0`) in every
   bench workspace - a loose `"0.9"` floats, and a binary<->cdylib skew breaks the SHM
   event protocol ("Unable to establish connection" flood / 0 samples). Rebuild binary +
   cdylibs under ONE lock; give scripts a per-size watchdog + flood guard so a skew

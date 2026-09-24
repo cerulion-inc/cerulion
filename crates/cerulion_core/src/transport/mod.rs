@@ -1878,15 +1878,18 @@ impl LivelinessCleaner {
         #[cfg(any(test, feature = "test-helpers"))]
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
-        // iceoryx2 0.10: `try_cleanup_dead_nodes` moved from an associated
-        // function taking a `&Config` to a METHOD on `&Node`, so the sweep needs
-        // a node in the namespace it is cleaning. SPIKE STAND-IN: mint a
-        // transient node from the captured config for the call. That is a real
-        // per-sweep cost and a design question for the migration proper (the
-        // cleaner deliberately does NOT hold the transport); a node that cannot
-        // be created is the same non-fatal skip a failed cleanup already was.
+        // iceoryx2 carries `try_cleanup_dead_nodes` on `&Node`, so the sweep
+        // needs a node in the namespace it is cleaning, and this cleaner
+        // deliberately does not hold the transport. Mint a transient one, from
+        // a config whose implicit sweeps are OFF: a node built with iceoryx2's
+        // defaults reaps on creation and again on destruction, which would make
+        // the explicit call below report zero for work it had already done, and
+        // which is the runtime auto-reap `disable_auto_dead_node_cleanup`
+        // exists to forbid. A node that cannot be created is the same non-fatal
+        // skip a failed cleanup already was.
+        let sweep_config = dead_node_sweep::sweep_node_config(&self.config);
         let Ok(node) = NodeBuilder::new()
-            .config(&self.config)
+            .config(&sweep_config)
             .create::<CerService>()
         else {
             tracing::trace!("liveliness sweep: dead-node cleanup skipped (no node)");

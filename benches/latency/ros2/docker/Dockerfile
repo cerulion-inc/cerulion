@@ -103,7 +103,7 @@ RUN if [ -x "/opt/ros/${ROS_DISTRO}/bin/iox-roudi" ]; then \
 # is carried by every image so that the tag means one thing.
 #
 # `stable`, matching tools/ros2_toolchain/Dockerfile: the workspace pins no
-# toolchain file, and the pinned iceoryx2 0.9.1 does not build on current
+# toolchain file, and the pinned iceoryx2 0.10.0 does not build on current
 # nightlies.
 #   clang + libclang-dev: bindgen (build-dependency) needs libclang to
 #     parse the distro's rmw/rosidl headers.

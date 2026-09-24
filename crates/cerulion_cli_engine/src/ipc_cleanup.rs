@@ -663,8 +663,10 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config)
     // `CleanupState` there would read as "nothing was dead", so the refusal is
     // reported as a REGISTRY error instead — the field whose contract is
     // already "the scan could not run, so the counters are a lower bound".
+    let sweep_config = cerulion_core::transport::dead_node_sweep::sweep_node_config(config);
     let ((state, node_refusal), captured) =
-        capture_iceoryx_logs(|| match NodeBuilder::new().config(config).create::<CerService>() {
+        capture_iceoryx_logs(
+            || match NodeBuilder::new().config(&sweep_config).create::<CerService>() {
             Ok(node) => (node.try_cleanup_dead_nodes(), None),
             Err(e) => (
                 CleanupState {
@@ -676,7 +678,8 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config)
                      be created in the namespace being swept ({e:?})."
                 )),
             ),
-        });
+            },
+        );
     // `_guard` restores the ENV-DERIVED level on drop at end-of-scope (or on
     // panic-unwind through `_guard`'s Drop) — `IOX2_LOG_LEVEL` if set, else
     // `error`. See the guard's own docs: a hardcoded `Error` restore here is
@@ -745,8 +748,10 @@ pub fn cleanup_dead_iceoryx2_nodes() -> CleanupState {
     // advisory sweep did not run, and a caller that saw 0/0 must not conclude
     // the namespace was clean.
     contained_sweep(|| {
+        let sweep_config =
+            cerulion_core::transport::dead_node_sweep::sweep_node_config(Config::global_config());
         match NodeBuilder::new()
-            .config(Config::global_config())
+            .config(&sweep_config)
             .create::<CerService>()
         {
             Ok(node) => node.try_cleanup_dead_nodes(),
