@@ -74,7 +74,11 @@ pub struct CppMessageMember {
     pub resize_function: Option<unsafe extern "C" fn(*mut c_void, usize)>,
     /// Lyrical/Rolling only: whether the member is a `rosidl_runtime_cpp::Buffer`
     /// (ros2/rosidl#942, appended last so every earlier offset is unchanged).
-    /// The bridge never reads it; it exists so the stride matches the
+    /// Read by `is_unbounded_u8_vector` and by the C++ forge classifier:
+    /// a Buffer member is a 16-byte pimpl object whose bytes live behind a
+    /// heap-allocated impl, never a `std::vector`, so it takes the
+    /// introspection accessor path (resize, get, copy) and is never forged
+    /// or handed to the vector shim. It also keeps the stride matching the
     /// distro's member array.
     #[cfg(cerulion_has_is_rosidl_buffer)]
     pub is_rosidl_buffer_: bool,
@@ -312,8 +316,18 @@ extern "C" {
 /// excludes a rosidl `BoundedVector<uint8_t, N>`, whose layout differs
 /// from `std::vector`. The caller additionally checks `!is_bool` and
 /// that this is a dynamic (non-fixed) array; a fixed `uint8[N]` array is
-/// classified elsewhere and never reaches this predicate's fast path.
+/// classified elsewhere and never reaches this predicate's fast path. On
+/// Lyrical and Rolling a member flagged `is_rosidl_buffer_` is a rosidl
+/// Buffer, never a vector, and is excluded first.
 pub(crate) fn is_unbounded_u8_vector(member: &CppMessageMember) -> bool {
+    // Lyrical and Rolling: an unbounded `uint8[]` member is a
+    // `rosidl::Buffer<uint8_t>` (16 bytes, storage behind a heap pimpl), not
+    // a `std::vector`; the shim's `static_cast` would read its two pointers
+    // and the 8 bytes past the object as a vector triplet. Never a vector.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    if member.is_rosidl_buffer_ {
+        return false;
+    }
     member.type_id_ == crate::type_bridge::ros_type::UINT8 && !member.is_upper_bound_
 }
 
