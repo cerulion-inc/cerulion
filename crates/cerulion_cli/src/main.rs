@@ -1975,6 +1975,14 @@ fn run(cli: Cli) -> CliResult<()> {
                     println!("signed_out: account={account_id}");
                     eprintln!("Signed out. Run `cerulion login` to sign in again.");
                 }
+                login_cmd::LogoutOutcome::SignedOutUnrevoked { account_id, reason } => {
+                    println!("signed_out: account={account_id}");
+                    return Err(cerulion_cli_engine::error::CliError::Login(format!(
+                        "signed out on this machine, but the account service did not confirm \
+                         the session was revoked, so it stays valid there until it expires: \
+                         {reason}"
+                    )));
+                }
                 login_cmd::LogoutOutcome::NotSignedIn => {
                     println!("not_signed_in");
                     eprintln!("This machine was not signed in; nothing changed.");

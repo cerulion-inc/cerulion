@@ -240,7 +240,8 @@ fn logout_signs_the_machine_out_and_the_next_command_is_refused() {
         )
     };
 
-    let (code, _, stderr) = run(&["logout"]);
+    let (code, stdout, stderr) = run(&["logout"]);
+    assert_eq!(stdout.trim(), "signed_out: account=acct-logout-e2e");
     assert_eq!(
         code,
         Some(1),
@@ -262,4 +263,23 @@ fn logout_signs_the_machine_out_and_the_next_command_is_refused() {
     let (code, stdout, stderr) = run(&["logout"]);
     assert_eq!(code, Some(0), "stderr={stderr}");
     assert_eq!(stdout.trim(), "not_signed_in");
+}
+
+/// Signing out a machine that never signed in writes nothing, not even the
+/// store's lock file.
+#[test]
+fn logout_on_a_machine_that_never_signed_in_leaves_no_trace() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("cerulion-home");
+    let out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .arg("logout")
+        .current_dir(root.path())
+        .env_remove("CERULION_LOGIN_GATE")
+        .env("CERULION_HOME", &home)
+        .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
+        .output()
+        .expect("spawn cerulion");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "not_signed_in");
+    assert!(!home.exists(), "logout created {}", home.display());
 }

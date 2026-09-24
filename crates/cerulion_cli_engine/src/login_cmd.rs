@@ -781,6 +781,14 @@ pub enum LogoutOutcome {
         /// The account this machine was signed in to.
         account_id: String,
     },
+    /// The local session was removed, but the account service did not confirm
+    /// the revoke, so the session stays valid there until it expires.
+    SignedOutUnrevoked {
+        /// The account this machine was signed in to.
+        account_id: String,
+        /// Why the revoke was not confirmed.
+        reason: String,
+    },
 }
 
 /// Sign this machine out: remove the session from `~/.cerulion/auth.json`,
@@ -797,18 +805,23 @@ pub enum LogoutOutcome {
 /// is left in place: it is revoked with `cerulion account devices revoke`,
 /// and the next `cerulion login` replaces it.
 ///
+/// A machine with no `auth.json` is left untouched (not even the store lock
+/// file is created).
+///
 /// # Errors
 ///
-/// The store could not be read or rewritten (nothing was signed out), or the
-/// service did not confirm the revoke. In the second case the machine IS
-/// signed out; the message says so and that the session stays valid at the
-/// service until it expires.
+/// The store could not be read or rewritten; nothing was signed out. A revoke
+/// the service did not confirm is [`LogoutOutcome::SignedOutUnrevoked`], not
+/// an error: the machine IS signed out.
 pub fn run_logout() -> CliResult<LogoutOutcome> {
     let auth_path = auth::auth_json_path().ok_or_else(|| {
         CliError::Login(
             "no home directory (set CERULION_HOME) to locate ~/.cerulion/auth.json".to_string(),
         )
     })?;
+    if !auth_path.try_exists().unwrap_or(true) {
+        return Ok(LogoutOutcome::NotSignedIn);
+    }
     let signed_out = auth::with_store_lock(&auth_path, || {
         let state = match auth::load_from(&auth_path) {
             auth::LoadedAuth::Present(state) => state,
@@ -832,14 +845,14 @@ pub fn run_logout() -> CliResult<LogoutOutcome> {
     let Some(state) = signed_out else {
         return Ok(LogoutOutcome::NotSignedIn);
     };
-    revoke_session(&state).map_err(|e| {
-        CliError::Login(format!(
-            "signed out on this machine, but the account service did not confirm the \
-             session was revoked, so it stays valid there until it expires: {e}"
-        ))
-    })?;
-    Ok(LogoutOutcome::SignedOut {
-        account_id: state.account_id,
+    Ok(match revoke_session(&state) {
+        Ok(()) => LogoutOutcome::SignedOut {
+            account_id: state.account_id,
+        },
+        Err(e) => LogoutOutcome::SignedOutUnrevoked {
+            account_id: state.account_id,
+            reason: e.to_string(),
+        },
     })
 }
 
@@ -948,6 +961,17 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     })
     .map_err(|e| CliError::Login(format!("could not persist the refreshed session: {e}")))?;
     if !published {
+        // A sign-out that landed while the exchange was in flight revoked the
+        // pair we exchanged, not the one just minted: retire that one too, so
+        // the sign-out leaves no live session behind.
+        if matches!(
+            auth::load_from(&auth_path),
+            auth::LoadedAuth::SignedOut { .. }
+        ) {
+            if let Err(e) = revoke_session(&new_state) {
+                tracing::warn!(error = %e, "could not revoke the session minted during a sign-out");
+            }
+        }
         tracing::warn!(
             path = %auth_path.display(),
             "the local account state changed while the session was being refreshed — the \
