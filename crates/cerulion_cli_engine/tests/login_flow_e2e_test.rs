@@ -2377,10 +2377,13 @@ fn logout_without_the_service_still_signs_the_machine_out_and_says_so() {
     let _svc = EnvGuard::set("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1");
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
-    let err = login_cmd::run_logout().expect_err("the revoke cannot be confirmed");
-    let msg = err.to_string();
-    assert!(msg.contains("signed out on this machine"), "{msg}");
-    assert!(msg.contains("stays valid there until it expires"), "{msg}");
+    match login_cmd::run_logout().expect("a local sign-out is not an error") {
+        login_cmd::LogoutOutcome::SignedOutUnrevoked { account_id, reason } => {
+            assert_eq!(account_id, "acct-offline-logout");
+            assert!(reason.contains("unreachable"), "{reason}");
+        }
+        other => panic!("expected SignedOutUnrevoked, got {other:?}"),
+    }
     assert!(matches!(
         auth::load(),
         LoadedAuth::SignedOut { account_id: Some(ref a), .. } if a == "acct-offline-logout"
@@ -2409,19 +2412,39 @@ fn a_robot_that_logs_out_and_back_in_stays_a_robot() {
         (Some("prior-account"), Some(auth::MachineRole::Robot))
     );
 
-    let buf = SharedBuf::new();
-    let worker = std::thread::spawn({
-        let mut b = buf.clone();
-        move || login_cmd::run_login(&mut b)
-    });
-    let code = wait_for(
-        || extract_user_code(&buf.snapshot()),
-        Duration::from_secs(15),
-    )
-    .expect("run_login printed a user_code");
-    authorize_via_magic_link(port, &email, &code);
-    let state = worker.join().unwrap().expect("run_login");
-    assert_eq!(state.role, Some(auth::MachineRole::Robot));
+    let log_in = || {
+        let buf = SharedBuf::new();
+        let worker = std::thread::spawn({
+            let mut b = buf.clone();
+            move || login_cmd::run_login(&mut b)
+        });
+        let code = wait_for(
+            || extract_user_code(&buf.snapshot()),
+            Duration::from_secs(15),
+        )
+        .expect("run_login printed a user_code");
+        authorize_via_magic_link(port, &email, &code);
+        let state = worker.join().unwrap().expect("run_login");
+        assert_eq!(state.role, Some(auth::MachineRole::Robot));
+        state
+    };
+
+    let signed_in = log_in();
+    assert_eq!(
+        login_cmd::run_logout().expect("logout against a live service"),
+        login_cmd::LogoutOutcome::SignedOut {
+            account_id: signed_in.account_id.clone()
+        }
+    );
+    assert_eq!(
+        auth::load_from(&auth_path).prior_identity(),
+        (
+            Some(signed_in.account_id.as_str()),
+            Some(auth::MachineRole::Robot)
+        )
+    );
+
+    log_in();
     match auth::load_from(&auth_path) {
         LoadedAuth::Present(p) => assert_eq!(p.role, Some(auth::MachineRole::Robot)),
         other => panic!("expected Present, got {other:?}"),
