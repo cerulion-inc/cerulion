@@ -241,6 +241,37 @@ extern "C" {
     pub fn rmw_cerulion_vector_u8_capacity(v: *const c_void) -> usize;
     /// `data()` of a `std::vector<uint8_t>` (test fixtures).
     pub fn rmw_cerulion_vector_u8_data(v: *const c_void) -> *const u8;
+
+    /// The three throwing introspection accessors, each called inside a
+    /// `noexcept` C++ wrapper that catches every exception (Lyrical's
+    /// `rosidl::Buffer` accessors throw on a non-CPU backend) and returns
+    /// 0 on success, nonzero when the accessor threw. A nonzero status is a
+    /// refused frame on the Rust side, never a foreign unwind.
+    pub(crate) fn rmw_cerulion_member_get_const(
+        f: unsafe extern "C" fn(*const c_void, usize) -> *const c_void,
+        m: *const c_void,
+        index: usize,
+        out: *mut *const c_void,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_get(
+        f: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void,
+        m: *mut c_void,
+        index: usize,
+        out: *mut *mut c_void,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_resize(
+        f: unsafe extern "C" fn(*mut c_void, usize),
+        m: *mut c_void,
+        size: usize,
+    ) -> std::os::raw::c_int;
+    /// Test fixture: an accessor that always throws (proves the catch).
+    #[cfg(test)]
+    pub(crate) fn rmw_cerulion_throwing_get_const(m: *const c_void, index: usize) -> *const c_void;
+    /// `sizeof(rosidl_typesupport_introspection_cpp::MessageMember)` from the
+    /// distro's own C++ header, or 0 when that header was not on the shim's
+    /// include path (a vendored build). Read by a test only.
+    #[cfg(test)]
+    pub(crate) fn rmw_cerulion_cpp_message_member_sizeof() -> usize;
     /// Adopt-take: release a primitive `std::vector`'s
     /// BUFFER through `::operator delete` — the pair `std::allocator`
     /// allocates with — never libc `free`. The one production caller is the
@@ -510,4 +541,55 @@ pub unsafe fn cppstring_bytes<'a>(s: *const c_void, max: usize) -> Result<&'a [u
         return Err("std::string with null data and nonzero size (corrupt)");
     }
     Ok(std::slice::from_raw_parts(data as *const u8, len))
+}
+
+#[cfg(test)]
+mod accessor_wrapper_tests {
+    use super::*;
+
+    /// An accessor that throws is caught by the wrapper and reported as a
+    /// nonzero status with the out pointer untouched; the process neither
+    /// aborts nor unwinds into Rust.
+    #[test]
+    fn a_throwing_accessor_is_a_nonzero_status_not_an_unwind() {
+        let mut out: *const c_void = std::ptr::null();
+        let status = unsafe {
+            rmw_cerulion_member_get_const(
+                rmw_cerulion_throwing_get_const,
+                std::ptr::null(),
+                0,
+                &mut out,
+            )
+        };
+        assert_ne!(status, 0, "the throw must surface as a status");
+        assert!(out.is_null());
+    }
+
+    /// On a real-header build the hand-written mirror is exactly the C++
+    /// header's `MessageMember`; a vendored build has no header to compare
+    /// with and reports 0, which this test treats as "not applicable" rather
+    /// than as agreement.
+    #[test]
+    fn the_cpp_member_mirror_matches_the_distro_header_where_one_exists() {
+        let from_header = unsafe { rmw_cerulion_cpp_message_member_sizeof() };
+        if from_header == 0 {
+            return;
+        }
+        assert_eq!(std::mem::size_of::<CppMessageMember>(), from_header);
+    }
+
+    /// A non-throwing accessor passes its value through with status 0.
+    #[test]
+    fn a_plain_accessor_passes_through_with_status_zero() {
+        unsafe extern "C" fn first(m: *const c_void, _i: usize) -> *const c_void {
+            m
+        }
+        let marker = 7u8;
+        let mut out: *const c_void = std::ptr::null();
+        let status = unsafe {
+            rmw_cerulion_member_get_const(first, &marker as *const u8 as *const c_void, 0, &mut out)
+        };
+        assert_eq!(status, 0);
+        assert_eq!(out as usize, &marker as *const u8 as usize);
+    }
 }

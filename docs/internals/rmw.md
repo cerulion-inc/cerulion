@@ -309,8 +309,11 @@ build.rs layers three era probes on top of the source selection:
   production silence impossible while the resolver-routed C++ e2e binaries (fixtures
   hand-built against the compiled struct, layout-self-consistent by construction) keep
   their surface. `test-seams` is in no default feature set and no shipping recipe enables
-  it. The pre-Jazzy C++ bridge variant is not implemented. The C introspection path is
-  bindgen-generated and correct on every era, so rclpy and C-typesupport consumers are
+  it. The pre-Jazzy C++ bridge variant is not implemented. The C introspection path reads
+  bindgen-generated members; its hand-written sequence mirrors are pinned to their bindgen
+  twins on every era (primitive and string sequences carry the Lyrical Buffer flags,
+  message sequences never do), and a Buffer-backed member or instance is never forged,
+  freed, or read as bytes by the bridge, so rclpy and C-typesupport consumers are
   unaffected.
 
 ## Runtime

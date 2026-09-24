@@ -300,21 +300,6 @@ fn main() {
         })
         .filter(|s| !s.is_empty());
 
-    // std::string ABI shim (introspection_cpp bridge).
-    // Compiled C++ — the platform's REAL string ABI, never a guess.
-    // Unconditional: pure libstdc++/libc++, no ROS headers required,
-    // so the cpp bridge is unit-testable on dev machines too.
-    cc::Build::new()
-        .cpp(true)
-        // Pin the C++ standard: the shim uses `noexcept` + `std::string`
-        // (C++11). Linux g++ defaults high enough to hide this, but macOS
-        // clang rejects `noexcept` without an explicit -std.
-        // flag_if_supported keeps it
-        // portable across compilers that spell the flag differently.
-        .flag_if_supported("-std=c++14")
-        .file("shim/cppstring_shim.cpp")
-        .compile("rmw_cerulion_cppstring_shim");
-
     let include_dirs = collect_include_dirs();
 
     let (bindings_path, generated) = if include_dirs.is_empty() {
@@ -426,6 +411,31 @@ fn main() {
         )
     });
     let observed_caps = emit_capability_cfgs(&bindings_contents);
+
+    // std::string ABI shim (introspection_cpp bridge).
+    // Compiled C++: the platform's REAL string ABI, never a guess.
+    // Unconditional: pure libstdc++/libc++, no ROS headers required,
+    // so the cpp bridge is unit-testable on dev machines too. Built AFTER
+    // the capability set is known: it carries a static_assert of the
+    // hand-mirrored C++ MessageMember against the distro's own C++ header
+    // (active wherever that header is on the include path, i.e. the
+    // real-header builds), and the era with the Lyrical tail field is told
+    // through a define. The distro include roots are passed so the header
+    // is found; the shim itself needs no ROS header to compile.
+    let mut shim = cc::Build::new();
+    // Pin the C++ standard: the shim uses `noexcept` + `std::string`
+    // (C++11). Linux g++ defaults high enough to hide this, but macOS
+    // clang rejects `noexcept` without an explicit -std. flag_if_supported
+    // keeps it portable across compilers that spell the flag differently.
+    shim.cpp(true).flag_if_supported("-std=c++14");
+    for dir in &include_dirs {
+        shim.include(dir);
+    }
+    if observed_caps.contains(&"is_rosidl_buffer") {
+        shim.define("RMW_CERULION_HAS_IS_ROSIDL_BUFFER", None);
+    }
+    shim.file("shim/cppstring_shim.cpp")
+        .compile("rmw_cerulion_cppstring_shim");
     // The layout discriminator the fingerprint lacks:
     // jazzy/kilted share one capability fingerprint while
     // their rmw_init_options_t layouts DIFFER (168 vs 160 — kilted

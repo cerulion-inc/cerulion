@@ -1038,7 +1038,20 @@ impl CppBridgedMessage {
                         let get = member.get_const_function.ok_or_else(|| {
                             self.encode_err("sequence missing get_const_function")
                         })?;
-                        let base = get(field, 0) as *const u8;
+                        // Through the noexcept wrapper: a rosidl Buffer on a
+                        // non-CPU backend THROWS from this accessor, and a
+                        // throw across the accessor pointer would be a
+                        // foreign unwind; a nonzero status refuses the frame.
+                        let mut elem: *const c_void = std::ptr::null();
+                        if ffi::introspection_cpp::rmw_cerulion_member_get_const(
+                            get, field, 0, &mut elem,
+                        ) != 0
+                        {
+                            return Err(self.encode_err(
+                                "sequence accessor threw (a rosidl Buffer on a non-CPU backend)",
+                            ));
+                        }
+                        let base = elem as *const u8;
                         if base.is_null() {
                             return Err(self.encode_err("sequence element pointer is null"));
                         }
@@ -1710,7 +1723,11 @@ unsafe fn write_prim_seq_cpp(
         let Some(resize) = member.resize_function else {
             return false;
         };
-        resize(field, count);
+        // Through the noexcept wrapper (see the encode twin): a throwing
+        // accessor is a refused frame, never a foreign unwind.
+        if ffi::introspection_cpp::rmw_cerulion_member_resize(resize, field, count) != 0 {
+            return false;
+        }
     }
     if count == 0 {
         return true;
@@ -1728,7 +1745,11 @@ unsafe fn write_prim_seq_cpp(
         let Some(get) = member.get_function else {
             return false;
         };
-        let base = get(field, 0) as *mut u8;
+        let mut elem: *mut c_void = std::ptr::null_mut();
+        if ffi::introspection_cpp::rmw_cerulion_member_get(get, field, 0, &mut elem) != 0 {
+            return false;
+        }
+        let base = elem as *mut u8;
         if base.is_null() {
             return false;
         }

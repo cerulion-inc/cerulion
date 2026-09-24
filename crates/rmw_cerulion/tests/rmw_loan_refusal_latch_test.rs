@@ -146,6 +146,10 @@ struct CU8Seq {
     data: *mut u8,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -195,6 +199,10 @@ unsafe fn publish_blob(publisher: *const ffi::rmw_publisher_t, x: u32, n: usize)
             data: buf,
             size: n,
             capacity: n,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     assert_eq!(
@@ -716,6 +724,10 @@ unsafe fn publish_serialized_blob(
             data: buf,
             size: 4,
             capacity: 4,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let mut ser: ffi::rmw_serialized_message_t = std::mem::zeroed();

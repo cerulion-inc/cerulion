@@ -21,14 +21,15 @@ set -u
 # for every other row):
 #   lyrical: builds from generated bindings and its whole suite is green (the C++ mirror carries the
 #            Lyrical tail field under cfg(cerulion_has_is_rosidl_buffer)); first run at this state:
-#            31 targets, 441 passed, 0 failed;
+#            33 targets, 479 tests run, 0 failed;
 #   humble:  the compile stops at rmw's 24-byte GID storage against the 16-byte one the crate writes
 #            (4 errors);
 #   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 24 more missing symbols,
 #            25 errors).
 # A `build` row also pins floors the suite must clear before "green" means anything: at least
 # min_targets target summaries and min_tests tests run (ok, failed or ignored), pinned PER ROW from
-# that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run) with margin for
+# that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run; 33 and 479
+# with the two vendored-gate binaries) with margin for
 # targets that come and go; a lane that silently loses half its binaries lands below the floor.
 case "$distro" in
     jazzy)   expect=build; min_targets=25; min_tests=400; known_failures="" ;;
