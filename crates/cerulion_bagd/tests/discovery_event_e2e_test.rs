@@ -530,12 +530,14 @@ fn the_wake_counter_is_bumped_only_on_a_directory_change() {
         decide.contains("WatchWake::Changed => ScanStep::WalkAndConfirm"),
         "`next_step` must answer `WalkAndConfirm` for `Changed`. Body:\n{decide}"
     );
-    for uncaused in ["WatchWake::Idle => ScanStep::WalkAndConfirm"] {
-        assert!(
-            !decide.contains(uncaused),
-            "`next_step` must never answer `WalkAndConfirm` for `{uncaused}`. Body:\n{decide}"
-        );
-    }
+    // And for NOTHING else: exactly one arm may produce that step, so no
+    // second wake shape can reach the increment by another route.
+    let answers = decide.matches("ScanStep::WalkAndConfirm").count();
+    assert_eq!(
+        answers, 1,
+        "`next_step` must answer `WalkAndConfirm` from exactly ONE arm, the one `Changed` takes; \
+         found {answers}. Body:\n{decide}"
+    );
 }
 
 /// The watch is ARMED before the baseline walk, never after it.
