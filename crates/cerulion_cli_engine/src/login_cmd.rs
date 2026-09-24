@@ -961,16 +961,13 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     })
     .map_err(|e| CliError::Login(format!("could not persist the refreshed session: {e}")))?;
     if !published {
-        // A sign-out that landed while the exchange was in flight revoked the
-        // pair we exchanged, not the one just minted: retire that one too, so
-        // the sign-out leaves no live session behind.
-        if matches!(
-            auth::load_from(&auth_path),
-            auth::LoadedAuth::SignedOut { .. }
-        ) {
-            if let Err(e) = revoke_session(&new_state) {
-                tracing::warn!(error = %e, "could not revoke the session minted during a sign-out");
-            }
+        // The exchange rotated the session onto `new_state` (refresh is
+        // single-use), and nothing on this machine holds that pair: a sign-out
+        // revoked only the pair we exchanged, and a login or a peer's refresh
+        // holds a different session. Retire it whatever replaced it, so no
+        // session stays live at the service that this machine cannot sign out.
+        if let Err(e) = revoke_session(&new_state) {
+            tracing::warn!(error = %e, "could not revoke the unpublished refreshed session");
         }
         tracing::warn!(
             path = %auth_path.display(),
