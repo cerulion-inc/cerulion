@@ -4,14 +4,13 @@
      A pull request body is read by people outside the project, so write it for a
      stranger: plain language, no internal shorthand, no first person, no questions.
      Keep the whole body to about 40 lines. -->
+<!-- Name the related issue in that paragraph, for example: Closes #123 -->
 
 ## What changed
 
 <!-- 3 to 8 bullets, each naming a file or a behaviour. No checkpoint tables, no
      to-do or follow-up lists, no HTML, and no pasted test output: CI is the record. -->
 
--
--
 -
 
 ## How to verify
@@ -28,12 +27,13 @@ cargo test -p <crate>
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+<!-- Optional: when the change moves latency or CI time, uncomment the section below,
+     fill in the table, and add one line saying where the numbers came from (machine,
+     build, sample count). Leave it commented out otherwise.
+
 ## Measurements
 
-<!-- Optional: keep this section only when the change moves latency or CI time. One
-     compact before and after table, then one line of provenance (machine, build,
-     sample count). Delete the section otherwise. -->
-
 | Metric | Before | After |
-| --- | --- | --- |
-|  |  |  |
+| - | - | - |
+| | | |
+-->
