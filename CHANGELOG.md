@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cargo add cerulion` is now the whole dependency list for writing a node. The new `cerulion` crate re-exports the runtime, the node macros and the ROS 2 message types at a single version, as `cerulion::prelude`, `cerulion::msgs`, `cerulion::core` and `cerulion::macros`.
+
+### Fixed
+- The node macros resolve their own crate root. They read your package's `Cargo.toml` at expansion time and emit paths through whichever of `cerulion` or `cerulion_core` your package names, instead of always emitting `cerulion_core`. A package that names `cerulion_core`, which is every package written so far and everything `cerulion workspace create` scaffolds, gets exactly the code it got before. A package that names neither is told which dependency to add, rather than being shown a resolution error against a path it never wrote.
+
 ## [1.0.0] - 2026-09-21
 
 The first release of Cerulion. Its crates, binaries and Debian packages come from this tree.

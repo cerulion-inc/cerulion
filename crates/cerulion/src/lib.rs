@@ -27,24 +27,19 @@
 //! let _layout = Vector3::default();
 //! ```
 //!
-//! # A package that writes nodes also names `cerulion_core`
+//! # Writing a node
 //!
-//! The node macros expand to absolute paths into the runtime crate, of the
-//! form `::cerulion_core::graph::node::NodeEntry`. Rust resolves the first
-//! segment of such a path only against a crate the consuming package names in
-//! its own manifest, and a re-export cannot put one there, so a package that
-//! uses the macros lists both:
+//! This crate is the whole dependency list:
 //!
 //! ```toml
 //! [dependencies]
 //! cerulion = "1.0.0"
-//! cerulion_core = "1.0.0"
 //! ```
 //!
-//! With those two, a node is a struct whose fields are its ports and whose
-//! `tick` runs when the trigger policy says so. Writing a port field writes
-//! straight into the loaned shared-memory slot; the frame is published when
-//! `tick` returns `Ok`.
+//! A node is a struct whose fields are its ports and whose `tick` runs when
+//! the trigger policy says so. Writing a port field writes straight into the
+//! loaned shared-memory slot; the frame is published when `tick` returns
+//! `Ok`.
 //!
 //! ```
 //! use cerulion::msgs::geometry_msgs::Vector3;
@@ -68,6 +63,22 @@
 //! }
 //! # fn main() {}
 //! ```
+//!
+//! The node macros expand to absolute paths into the runtime, and they read
+//! the consuming package's `Cargo.toml` to decide how to spell the first
+//! segment: a package that names `cerulion` gets `::cerulion::core`, one that
+//! names `cerulion_core` gets `::cerulion_core`. Either manifest works, and a
+//! package that names both gets the second. What does not work is naming
+//! neither and relying on somebody else's re-export: Cargo does not hand a
+//! package its transitive dependencies, so the name has to be in the
+//! manifest. The macros say so by name if it is missing.
+//!
+//! The example above does not exercise that, and cannot. A doctest runs with
+//! `CARGO_MANIFEST_DIR` pointing at this package, whose manifest names
+//! `cerulion_core` directly because it has to in order to re-export it, so it
+//! resolves through the runtime like everything else in this workspace. The
+//! umbrella spelling is exercised by `tests/one_dependency_build_test.rs`,
+//! which builds a package outside the workspace that names only this crate.
 //!
 //! # Depending on the crates directly
 //!
