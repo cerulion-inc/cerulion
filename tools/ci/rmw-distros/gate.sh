@@ -20,8 +20,8 @@ set -u
 # images (jazzy is the validated distro: it must build and pass its whole suite, the regression guard
 # for every other row):
 #   lyrical: builds from generated bindings and its whole suite is green (the C++ mirror carries the
-#            Lyrical tail field under cfg(cerulion_has_is_rosidl_buffer)); first lane run at this
-#            state: 31 targets, 441 passed, 0 failed;
+#            Lyrical tail field under cfg(cerulion_has_is_rosidl_buffer)); first run at this state:
+#            31 targets, 441 passed, 0 failed;
 #   humble:  the compile stops at rmw's 24-byte GID storage against the 16-byte one the crate writes
 #            (4 errors);
 #   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 24 more missing symbols,
@@ -43,9 +43,12 @@ source "$(dirname "$0")/harvest.sh"
 
 log="/tmp/rmw_build_${distro}.log"
 echo "== rmw distro lane: $distro (expected: $expect) =="
-cargo build -p rmw_cerulion --release 2>&1 | tee "$log"
+cargo build --locked -p rmw_cerulion --release 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
-if grep -q -F "VENDORED" "$log"; then
+# Everything below reads the build log with terminal colour stripped (see harvest.sh), the same
+# way the suite log is read, so a change in cargo's colour setting can never hide a marker.
+plain_log="${log}.plain"; strip_ansi "$log" > "$plain_log"
+if grep -q -F "VENDORED" "$plain_log"; then
     echo "GATE FAIL: build.rs took the VENDORED-bindings path inside a ROS container"
     exit 1
 fi
@@ -56,7 +59,7 @@ case "$expect" in
         ls target/release/build/rmw_cerulion-*/out/bindings.rs >/dev/null 2>&1 || { echo "GATE FAIL: no generated bindings.rs, the build did not run bindgen"; exit 1; }
         tlog="/tmp/rmw_test_${distro}.log"
         echo "== rmw serial suite on $distro (every target, no fail-fast) =="
-        cargo test -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
+        cargo test --locked -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
         rc_test=${PIPESTATUS[0]}
         # Everything below reads the log with terminal colour stripped (see harvest.sh).
         plain="${tlog}.plain"; strip_ansi "$tlog" > "$plain"
@@ -87,8 +90,8 @@ case "$expect" in
         ;;
     refuse)
         [ "$rc" -ne 0 ] || { echo "GATE FAIL: $distro BUILT, but the table says it is refused today; flip its row in the PR that lands $distro support"; exit 1; }
-        grep -q -F -- "$marker" "$log" || { echo "GATE FAIL: $distro failed WITHOUT the known marker; last lines:"; tail -n 40 "$log"; exit 1; }
-        count=$(grep -oE 'due to [0-9]+ previous errors?' "$log" | grep -oE '[0-9]+' | tail -n 1)
+        grep -q -F -- "$marker" "$plain_log" || { echo "GATE FAIL: $distro failed WITHOUT the known marker; last lines:"; tail -n 40 "$plain_log"; exit 1; }
+        count=$(grep -oE 'due to [0-9]+ previous errors?' "$plain_log" | grep -oE '[0-9]+' | tail -n 1)
         [ "${count:-0}" -eq "$errors" ] || { echo "GATE FAIL: $distro stopped with ${count:-0} errors, the table pins $errors; the refusal moved, update the table in the PR that changes $distro"; exit 1; }
         echo "GATE PASS (expected refusal): $distro stops at the known marker with exactly $errors errors"
         ;;

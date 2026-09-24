@@ -5,31 +5,37 @@ name: rmw distro lanes
 # building rmw_cerulion against that distro's REAL headers (bindgen; the vendored fallback is refused).
 # Each lane asserts the distro's KNOWN state through tools/ci/rmw-distros/gate.sh, so the lane is
 # green while the state is true and turns red the moment the truth moves in either direction.
-# Runs on PRs and pushes to main that touch the rmw path. No lane is a required context on main, so a
+# Runs on PRs and pushes to main that touch the rmw path (the crate, its in-tree dependencies, the workspace manifests). No lane is a required context on main, so a
 # path-filtered lane that does not run can never leave a PR pending.
 
 on:
   pull_request:
     paths:
       - 'crates/rmw_cerulion/**'
+      - 'crates/cerulion_core/**'
       - 'crates/cerulion_heaphook/**'
       - 'crates/native_ros2_messages/**'
       - 'tools/ci/rmw-distros/**'
       - '.github/workflows/rmw-distros.yml'
+      - 'Cargo.toml'
       - 'Cargo.lock'
   push:
     branches: [main]
     paths:
       - 'crates/rmw_cerulion/**'
+      - 'crates/cerulion_core/**'
       - 'crates/cerulion_heaphook/**'
       - 'crates/native_ros2_messages/**'
       - 'tools/ci/rmw-distros/**'
       - '.github/workflows/rmw-distros.yml'
+      - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
 
 concurrency:
-  group: rmw-distros-${{ github.workflow }}-${{ github.ref }}
+  # A pull request's runs supersede each other; every main push and every dispatch keeps its own run,
+  # so a later push can never replace a pending result for an earlier main commit.
+  group: rmw-distros-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

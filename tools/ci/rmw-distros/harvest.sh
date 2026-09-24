@@ -14,7 +14,7 @@ strip_ansi() {
 }
 
 # qualified_failures <plain log>: the failing set as cargo itself reports it, one "<binary>::<test>"
-# per line, sorted and unique. For each target, the names come from the FINAL `failures:` list (the
+# per line, sorted and unique (a doc test's name carries spaces and is taken whole). For each target, the names come from the FINAL `failures:` list (the
 # one followed by that target's `test result:` line), qualified by the target binary read off the
 # preceding `Running ... (path)` line (the lib's unit tests are the crate name; doc tests are
 # "doctests"). This never depends on a `test <name> ... FAILED` line surviving the test's own stdout.
@@ -23,7 +23,7 @@ qualified_failures() {
         /^ *Running / { if (match($0, /\([^)]*\)/)) { p = substr($0, RSTART + 1, RLENGTH - 2); sub(/.*\//, "", p); sub(/-[0-9a-f]+$/, "", p); bin = p } }
         /^ *Doc-tests / { bin = "doctests" }
         /^failures:$/ { collecting = 1; n = 0; next }
-        collecting && /^    [^ ]+$/ { names[++n] = $1; next }
+        collecting && /^    [^ ]/ { names[++n] = substr($0, 5); next }
         collecting && /^$/ { next }
         collecting && /^test result: / { for (k = 1; k <= n; k++) print bin "::" names[k]; collecting = 0; n = 0; next }
         collecting { n = 0 }
@@ -36,6 +36,8 @@ suite_counts() {
 }
 
 # crashed <plain log>: exit 0 when the log carries a crash or a compile failure of a test target.
+# Only cargo's own "could not compile" line marks a compile failure: a failing doc test prints the
+# compiler's "error[E...]" lines inside its stdout dump, and that is a counted failure, not a crash.
 crashed() {
-    grep -qE "process didn't exit successfully|\(signal: |^error: could not compile|^error\[E[0-9]+\]" "$1"
+    grep -qE "process didn't exit successfully|\(signal: |^error: could not compile" "$1"
 }
