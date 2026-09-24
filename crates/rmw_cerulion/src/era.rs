@@ -1176,8 +1176,10 @@ mod tests {
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::Jazzy),
             CppBridgeGate::Supported
         );
-        // Humble/Iron: the mirror drops `is_key_`, `has_any_key_member_` and
-        // `event_members_` under the same cfg that classifies this era.
+        // Humble/Iron: the message mirrors drop `is_key_` and
+        // `has_any_key_member_` under the same cfg that classifies this
+        // era; the service mirror's `event_members_` hangs on its own
+        // capability (Iron has it, Humble does not).
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreJazzy),
             CppBridgeGate::Supported,
@@ -1427,6 +1429,7 @@ mod tests {
             ("fetch_function", cfg!(cerulion_has_fetch_function)),
             ("is_key", cfg!(cerulion_has_is_key)),
             ("any_key_member", cfg!(cerulion_has_any_key_member)),
+            ("event_members", cfg!(cerulion_has_event_members)),
             ("is_rosidl_buffer", cfg!(cerulion_has_is_rosidl_buffer)),
             (
                 "content_filter_options",
@@ -1452,10 +1455,11 @@ mod tests {
         // The token set is CLOSED: a 16th capability
         // added to build.rs must land here too, and the `"none"` spelling
         // is correct only when every cfg is really off.
-        const KNOWN: [&str; 15] = [
+        const KNOWN: [&str; 16] = [
             "fetch_function",
             "is_key",
             "any_key_member",
+            "event_members",
             "is_rosidl_buffer",
             "content_filter_options",
             "event_callback",

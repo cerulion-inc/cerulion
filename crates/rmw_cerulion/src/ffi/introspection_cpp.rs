@@ -14,11 +14,13 @@
 //! to MessageMember (112 to 120 bytes) and changes nothing else. The cfg is
 //! derived by build.rs from the very bindings this build compiles against,
 //! so the mirror and the C-side `era_pins` can never disagree about the
-//! era. Under `cfg(not(cerulion_has_is_key))` the mirror takes the Humble and
-//! Iron shape (no `is_key_`, `has_any_key_member_` or `event_members_`:
-//! 112, 56 and 32 bytes). Foxy and Galactic (96-byte members, no
-//! fetch/assign functions) have no mirror yet and are refused at
-//! registration.
+//! era. Under `cfg(not(cerulion_has_is_key))` the message mirrors take the
+//! Humble and Iron shape (no `is_key_` or `has_any_key_member_`: 112 and
+//! 56 bytes); the service mirror carries `event_members_` under its own
+//! `cfg(cerulion_has_event_members)` (40 bytes from Iron on, 32 on Humble),
+//! since Iron appended it a release before `is_key_`. Foxy and Galactic
+//! (96-byte members, no fetch/assign functions) have no mirror yet and are
+//! refused at registration.
 //!
 //! Container access is exclusively through the member's function
 //! pointers (`size/get/get_const/fetch/assign/resize`) — never through
@@ -115,12 +117,14 @@ pub struct CppServiceMembers {
     pub service_name_: *const c_char,
     pub request_members_: *const CppMessageMembers,
     pub response_members_: *const CppMessageMembers,
-    /// Action/service-event introspection (Jazzy+). The bridge never reads it —
+    /// Service-event introspection (Iron+: Iron appended it while `is_key_`
+    /// only arrived with Jazzy, so it hangs on its own capability). The
+    /// bridge never reads it —
     /// it only touches `request_members_`/`response_members_` —
     /// but it is part of the real struct, so the mirror carries it for
     /// layout parity (a by-value copy of a truncated mirror would read
     /// past its end). Matches the C side's `event_members_`.
-    #[cfg(cerulion_has_is_key)]
+    #[cfg(cerulion_has_event_members)]
     pub event_members_: *const CppMessageMembers,
 }
 
@@ -217,16 +221,16 @@ const _: () = {
     #[cfg(not(cerulion_has_is_key))]
     assert!(offset_of!(CppMessageMembers, fini_function) == 48);
 
-    #[cfg(cerulion_has_is_key)]
+    #[cfg(cerulion_has_event_members)]
     assert!(size_of::<CppServiceMembers>() == 40);
-    #[cfg(not(cerulion_has_is_key))]
+    #[cfg(not(cerulion_has_event_members))]
     assert!(size_of::<CppServiceMembers>() == 32);
     assert!(align_of::<CppServiceMembers>() == 8);
     assert!(offset_of!(CppServiceMembers, service_namespace_) == 0);
     assert!(offset_of!(CppServiceMembers, service_name_) == 8);
     assert!(offset_of!(CppServiceMembers, request_members_) == 16);
     assert!(offset_of!(CppServiceMembers, response_members_) == 24);
-    #[cfg(cerulion_has_is_key)]
+    #[cfg(cerulion_has_event_members)]
     assert!(offset_of!(CppServiceMembers, event_members_) == 32);
 };
 
