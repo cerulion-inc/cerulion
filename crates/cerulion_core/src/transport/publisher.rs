@@ -81,6 +81,26 @@ enum NotifyListenerCount {
     ReadHere,
 }
 
+/// Calls to [`CerulionPublisher::check_subscriber_events`] that keep draining
+/// the publisher's own event listener after the topic's live listener count
+/// moves.
+///
+/// Exactly one would race. The count rises when a late joiner's `Listener` is
+/// created, and its `SubscriberConnected` notify lands after that, so a single
+/// gated drain can fall in the window between the two, see nothing, and never
+/// look again. Staying armed across a run of calls closes that window: on the
+/// quiescent-publisher path the runtime's `pump_history` cadence spends this
+/// budget over as many steps, and on a publishing path a drain that observes a
+/// transition clears the arming immediately.
+///
+/// The bound is what stops the opposite failure. A listener that attaches or
+/// dies WITHOUT ever sending a transition — a foreign observer, a consumer that
+/// crashed — would otherwise arm every publish for the life of the process.
+/// While armed the cost is what every publish paid before this gate existed, so
+/// the budget is set well past any plausible create-then-notify gap rather than
+/// trimmed: it is spent only when the listener count actually moves.
+const SELF_DRAIN_ARMED_CALLS: u8 = 64;
+
 /// Zero-copy publisher for a single topic.
 ///
 /// Holds an iceoryx2 data publisher, an event notifier (to signal subscribers),
@@ -113,6 +133,16 @@ pub struct CerulionPublisher {
     publisher: Publisher<CerService, [u8], ()>,
     notifier: Notifier<CerService>,
     listener: Listener<CerService>,
+    /// Live listener count on this topic's event service as of the last
+    /// [`Self::check_subscriber_events`] — the cheap gate on the per-publish
+    /// self drain. `usize::MAX` until the first call, so the first publish
+    /// always drains.
+    last_listener_count: usize,
+    /// Armed self drains still owed. A change in `last_listener_count` sets it
+    /// to [`SELF_DRAIN_ARMED_CALLS`]; a drain that observes a subscriber
+    /// transition clears it early. While zero, a publish costs one relaxed load
+    /// instead of a listener drain.
+    self_drains_armed: u8,
     sequence: AtomicU32,
     /// The value `sequence` was CONSTRUCTED with — 0 on every
     /// live path, and the recorded stream's next sequence on a restored replay.
@@ -558,6 +588,10 @@ impl CerulionPublisher {
             publisher: config.publisher,
             notifier: config.notifier,
             listener: config.listener,
+            // `usize::MAX` can never equal a real listener count, so the first
+            // publish always drains and establishes the baseline.
+            last_listener_count: usize::MAX,
+            self_drains_armed: 0,
             sequence: AtomicU32::new(config.initial_sequence),
             initial_sequence: config.initial_sequence,
             clock: config.clock,
@@ -2210,6 +2244,44 @@ impl CerulionPublisher {
     /// rmw bridge publish via `publish_raw` / `send_raw_loan` + notify and
     /// must drain their own listener to service late joiners.
     pub fn check_subscriber_events(&mut self) {
+        // iceoryx2 0.10: gate the drain on the topic's LIVE listener count.
+        //
+        // This function's only action is `deliver_history()` on a
+        // `SubscriberConnected`, which happens when a subscriber attaches and
+        // at no other time — yet it ran a full listener drain on EVERY
+        // `loan_proxy` and every `publish_raw`. Under iceoryx2 0.9.1 the
+        // unconditional drain had a second job: an undrained listener filled
+        // its datagram socket, after which every later notify from any
+        // publisher on the topic failed and logged. 0.10 removed that hazard at
+        // the source, so the drain is now paying two `recvmsg` calls, two
+        // sequentially consistent atomic operations and a counting-bitset walk
+        // per publish to ask a question whose answer is almost always no.
+        //
+        // The gate is `number_of_listeners()` on the event service the
+        // publisher already holds — `self.listeners.len()` on a shared-memory
+        // container, one relaxed load. A `CerulionSubscriber` bundles a
+        // listener, so any late joiner owed history moves that count. A
+        // listener-less `DataOnlySubscriber` does not move it and does not need
+        // to: iceoryx2's own `update_connections()` inside the next `send()`
+        // flushes retained history into a new tap.
+        //
+        // A count change ARMS several drains rather than one, because the
+        // count rises when the subscriber's listener is created and the
+        // `SubscriberConnected` notify lands after it — a single gated drain
+        // could fall in that window and see nothing. Staying armed until a
+        // transition is actually observed closes that race; the bounded count
+        // is what stops a listener that attaches or dies WITHOUT an event (a
+        // foreign observer, a crashed consumer) from arming every later publish
+        // forever. While disarmed the cost is the one load.
+        let live = self.event_service.dynamic_config().number_of_listeners();
+        if live != self.last_listener_count {
+            self.last_listener_count = live;
+            self.self_drains_armed = SELF_DRAIN_ARMED_CALLS;
+        }
+        if self.self_drains_armed == 0 {
+            return;
+        }
+        self.self_drains_armed -= 1;
         // iceoryx2 0.10: `try_wait_one` is gone and `try_wait`'s callback borrows
         // `self.listener` for the whole call, while `deliver_history()` below
         // needs `&mut self`. So the callback only FLAGS what it saw and the act
@@ -2218,13 +2290,18 @@ impl CerulionPublisher {
         let mut connected = false;
         let mut disconnected = false;
         // A listener error is still "stop polling": nothing is flagged.
-        let _ = self.listener.try_wait(|activation| {
-            match PubSubEvent::try_from(activation.id) {
+        let _ = self
+            .listener
+            .try_wait(|activation| match PubSubEvent::try_from(activation.id) {
                 Ok(PubSubEvent::SubscriberConnected) => connected = true,
                 Ok(PubSubEvent::SubscriberDisconnected) => disconnected = true,
                 _ => {}
-            }
-        });
+            });
+        if connected || disconnected {
+            // The transition this arming was waiting for: stop draining on
+            // every publish until the listener count moves again.
+            self.self_drains_armed = 0;
+        }
         if connected {
             tracing::debug!(topic = %self.topic, "subscriber connected");
             // ONE `deliver_history()` per drain, where 0.9.1 ran one per queued

@@ -3004,7 +3004,35 @@ impl CerulionSubscriber {
     /// The single drain-and-account implementation behind BOTH consume modes
     /// (`limit_one = false` ⇒ drain-to-latest; `true` ⇒ pop-one FIFO).
     fn drain_with_accounting_impl(&mut self, limit_one: bool) -> DrainOutcome {
-        self.drain_stale_events();
+        // iceoryx2 0.10: this path does NOT drain the event listener, and that
+        // is the change, not an omission.
+        //
+        // Under 0.9.1 every read drained first for two reasons. The first was
+        // saturation: an undrained listener filled its `AF_UNIX SOCK_DGRAM`
+        // socket and every later notify took the failure path, which on a live
+        // robot meant a warning line per publish. 0.10 removed that hazard at
+        // the source — the doorbell is one byte, a full doorbell is
+        // swallowed into the NOTIFIED state, and a notify into that state skips
+        // the send entirely — so an undrained listener costs a publisher
+        // nothing and `notify_undelivered_count` stays 0. The second was stale
+        // wakes: an event left in the queue makes the live loop's idle poll
+        // read "data pending" when there is none, which is what makes a live
+        // graph free-run instead of waiting. That reason still holds, and every listener the live loop actually
+        // polls is still drained inside the step — a `DrainSource::Unified`
+        // binding's standalone `ListenerOnly` by `GraphRuntime::drain_level`,
+        // a `Separate` or Sync binding's trigger subscriber by
+        // `try_receive_for_drain`, and a caller that blocks on this
+        // subscriber's own fd by `wait_for_message` / `drain_event_notifications`
+        // before it waits. The listener reached from HERE is the node's BODY
+        // subscriber on a unified binding, which is attached to no WaitSet and
+        // polled by nothing, so draining it bought only the hazard 0.10 deleted.
+        //
+        // What it COST is the point: on 0.10 a drain of an empty listener is
+        // two `recvmsg` calls, two sequentially consistent atomic operations
+        // and a walk of the shared-memory counting bitset, where 0.9.1 was one
+        // `recvmsg`. This path runs once per trigger drain per hop and once per
+        // turn of every `try_view` spin, so it is the single most-repeated drain
+        // in the system.
 
         // Drain to the latest message ("latest wins": drop older
         // messages in favour of the most recent — predictable for control
