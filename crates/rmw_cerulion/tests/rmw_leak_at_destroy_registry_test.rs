@@ -68,7 +68,7 @@ use std::time::{Duration, Instant};
 
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use iceoryx2::config::Config;
-use iceoryx2::node::Node;
+use iceoryx2::node::NodeBuilder;
 use iceoryx2::prelude::{FileName, Path as IoxPath, SemanticString};
 use iceoryx2::service::ipc_threadsafe::Service as CerService;
 use rmw_cerulion::ffi::{self, RMW_RET_OK};
@@ -624,7 +624,15 @@ fn a_leaking_destroy_keeps_the_port_registered_so_the_dead_node_sweep_converges(
     // THE SWEEP — exactly what `cerulion clean` and the exit
     // hygiene run (`ipc_cleanup.rs`), on the isolated config.
     let cfg = isolated_config(&root.root, &root.prefix);
-    let state = Node::<CerService>::try_cleanup_dead_nodes(&cfg);
+    // iceoryx2 carries the sweep on `&Node`, so it needs a node in the
+    // namespace it cleans, exactly as `cerulion clean` now mints one. This
+    // node is alive, so it is never a candidate for its own sweep, and the
+    // dead-node assertions below name the CHILD's directory explicitly.
+    let sweeper = NodeBuilder::new()
+        .config(&cfg)
+        .create::<CerService>()
+        .expect("a node in the isolated namespace to sweep from");
+    let state = sweeper.try_cleanup_dead_nodes();
 
     let tags_after = port_tags(&node_dir, &root.prefix);
     let mut violations: Vec<String> = Vec::new();

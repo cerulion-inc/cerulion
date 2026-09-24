@@ -660,7 +660,31 @@ pub mod wire;
 ///   `cerulion_node_pump_history` bump established for a missing symbol.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 22;
+/// - v23: the whole iceoryx2 family moves to 0.10.0, and `CerulionPublisher`
+///   gains two fields (`last_listener_count`, `self_drains_armed`) for the
+///   gate on its self drain.
+///
+///   Either half alone would bump this constant; the iceoryx2 half is the one
+///   that MUST. A node cdylib statically links its own `cerulion_core` and
+///   therefore its own iceoryx2, and 0.10 partitions a machine by version:
+///   iceoryx2 0.9.3 added the package version to the global management
+///   segment's name, so a 0.9.1 process and a 0.10.0 process on one box keep
+///   SEPARATE node registries and cannot see each other's services at all.
+///   Mixing a host and a cdylib across that line gives no data, no node fires
+///   and no actionable error. Nothing detected it at load time before this
+///   bump: the `RUSTC_FINGERPRINT` check (v22) compares compilers, not linked
+///   library versions, and the `abi_layout` pin holds every iceoryx2-embedding
+///   struct `FieldSetOnly` precisely because those layouts are not ours to
+///   assert. Bumping here converts a silent data-plane death into a loud load
+///   refusal naming the rebuild.
+///
+///   The field-set half is the ordinary M1 shape: both new fields live in
+///   `CerulionPublisher`, which is pinned `FieldSetOnly` (it embeds iceoryx2
+///   ports by value), so the `abi_layout` row re-snapshots its field list and
+///   asserts no offset.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 23;
 
 // Re-export commonly used types
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};

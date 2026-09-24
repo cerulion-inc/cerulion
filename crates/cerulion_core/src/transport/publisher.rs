@@ -2203,7 +2203,7 @@ impl CerulionPublisher {
             // costs nothing on the zero-copy loan hot path (this branch is
             // raw-ingress only).
             //
-            // `check_subscriber_events` rather than a bare `try_wait_one` loop
+            // `check_subscriber_events` rather than a bare listener drain
             // because it is the ONE drain primitive that also CLASSIFIES what
             // it pulled — the same call `loan_proxy` makes, so there is one
             // drain path to reason about instead of a second bespoke one. Be
@@ -2282,11 +2282,10 @@ impl CerulionPublisher {
             return;
         }
         self.self_drains_armed -= 1;
-        // iceoryx2 0.10: `try_wait_one` is gone and `try_wait`'s callback borrows
-        // `self.listener` for the whole call, while `deliver_history()` below
-        // needs `&mut self`. So the callback only FLAGS what it saw and the act
-        // happens after the drain returns. One call empties the queue, which is
-        // what the old loop did.
+        // One `try_wait` empties the queue. Its callback borrows `self.listener`
+        // for the whole call while `deliver_history()` below needs `&mut self`,
+        // so the callback only FLAGS what it saw and the act happens after the
+        // drain returns.
         let mut connected = false;
         let mut disconnected = false;
         // A listener error is still "stop polling": nothing is flagged.
@@ -2732,6 +2731,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
         publisher,
         notifier,
         listener,
+        last_listener_count,
+        self_drains_armed,
         sequence,
         initial_sequence,
         clock,
@@ -2794,6 +2795,24 @@ mod notify_elision_gate_tests {
     use super::*;
     use crate::transport::{TransportConfig, TransportManager};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    /// Drain a raw event listener, returning one entry per NOTIFY.
+    ///
+    /// iceoryx2 0.10 calls the drain callback once per DISTINCT event id,
+    /// carrying how many times that id was activated since the last drain,
+    /// where 0.9.1's socket queue held one datagram per notify and was popped
+    /// one at a time. Expanding by `count` keeps these oracles counting
+    /// notifies, which is what they are about; reading the number of CALLBACK
+    /// invocations instead would silently collapse a burst to one.
+    fn drain_notifies(listener: &Listener<CerService>) -> Vec<iceoryx2::prelude::EventId> {
+        let mut seen = Vec::new();
+        let _ = listener.try_wait(|activation| {
+            for _ in 0..activation.count {
+                seen.push(activation.id);
+            }
+        });
+        seen
+    }
 
     #[test]
     fn elision_gate_skips_the_real_notify_and_self_heals_at_the_boundary() {
@@ -2918,7 +2937,7 @@ mod notify_elision_gate_tests {
     /// receives the `SentSample`); a "did not notify since the last boundary"
     /// trigger fails the SILENT-PASS arm (the resweep
     /// fire count climbs with the passes instead of staying at the frame count).
-    /// Truthful observables: the foreign listener's own `try_wait_one()`, and
+    /// Truthful observables: the foreign listener's own drained events, and
     /// the shared `resweep` fire counter the runtime exposes to tests.
     #[test]
     fn resweep_announces_each_unannounced_frame_once_and_a_silent_pass_never() {
@@ -2993,7 +3012,7 @@ mod notify_elision_gate_tests {
         let foreign = mgr
             .create_trigger_listener_for_test(topic, mgr.default_topic_config())
             .expect("attach a foreign listener on the topic's event service");
-        while foreign.try_wait_one().ok().flatten().is_some() {}
+        drain_notifies(&foreign);
 
         // HEADLINE (the LATE-ATTACH heal): the debt survived, the listener is
         // here, so the boundary announces it. The exact wake the per-publish path
@@ -3008,14 +3027,12 @@ mod notify_elision_gate_tests {
         // The foreign listener actually received the SentSample event — the wake
         // that unblocks a `topic hz`. (A no-op resweep leaves this
         // `None`.)
-        let event = foreign
-            .try_wait_one()
-            .expect("listener wait ok")
-            .expect("the boundary sweep's notify reached the foreign listener");
+        let seen = drain_notifies(&foreign);
         assert_eq!(
-            event,
-            crate::transport::events::PubSubEvent::SentSample.into(),
-            "the boundary wake is a SentSample event (a data wake, not history)"
+            seen,
+            vec![crate::transport::events::PubSubEvent::SentSample.into()],
+            "the boundary sweep's notify must reach the foreign listener, exactly once, \
+             as a SentSample event (a data wake, not history)"
         );
 
         // The sweep is NOT a publish — the elided counter is still untouched.
@@ -3047,7 +3064,7 @@ mod notify_elision_gate_tests {
              trigger is an un-announced frame, never a quiet pass)"
         );
         assert!(
-            foreign.try_wait_one().ok().flatten().is_none(),
+            drain_notifies(&foreign).is_empty(),
             "and the foreign listener received nothing across all of them"
         );
 
@@ -3064,7 +3081,7 @@ mod notify_elision_gate_tests {
             publisher.resweep_notify_elision() >= 1,
             "a NEW un-announced frame (off-gate publish_raw) must be announced"
         );
-        while foreign.try_wait_one().ok().flatten().is_some() {}
+        drain_notifies(&foreign);
         assert_eq!(
             publisher.resweep_notify_elision(),
             0,
@@ -3082,7 +3099,7 @@ mod notify_elision_gate_tests {
             n >= 1,
             "per-publish path notifies while foreign present (got {n})"
         );
-        while foreign.try_wait_one().ok().flatten().is_some() {} // drain that wake
+        drain_notifies(&foreign); // drain that wake
         assert_eq!(
             publisher.resweep_notify_elision(),
             0,
@@ -3090,7 +3107,7 @@ mod notify_elision_gate_tests {
              sweep must SKIP (no redundant second notify)"
         );
         assert!(
-            foreign.try_wait_one().ok().flatten().is_none(),
+            drain_notifies(&foreign).is_empty(),
             "the skipped boundary sweep fired NO notify to the foreign listener"
         );
 
@@ -3140,14 +3157,14 @@ mod notify_elision_gate_tests {
         let foreign = mgr
             .create_trigger_listener_for_test("resweep_unarmed/out", mgr.default_topic_config())
             .expect("attach a foreign listener");
-        while foreign.try_wait_one().ok().flatten().is_some() {}
+        drain_notifies(&foreign);
         assert_eq!(
             publisher.resweep_notify_elision(),
             0,
             "an unarmed publisher's boundary sweep is a strict no-op"
         );
         assert!(
-            foreign.try_wait_one().ok().flatten().is_none(),
+            drain_notifies(&foreign).is_empty(),
             "the unarmed sweep fired NO notify to the foreign listener"
         );
         drop(foreign);

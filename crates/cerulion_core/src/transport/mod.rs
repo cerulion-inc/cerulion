@@ -1595,6 +1595,15 @@ fn publish_subscribe_open_env_hint(
              the stale iceoryx2 shared-memory artifacts (or reboot) \
              before reopening"
         }
+        PublishSubscribeOpenError::VersionMismatch => {
+            "; the existing service was created by a process linking a \
+             DIFFERENT iceoryx2 version — every Cerulion process and every \
+             node cdylib on one machine must be built against the same \
+             `cerulion_core`, because each links its own iceoryx2 and the \
+             two cannot share a service. Rebuild the node libraries against \
+             the installed `cerulion` (`cerulion node build`), or stop the \
+             process left over from the previous version"
+        }
         PublishSubscribeOpenError::ServiceInCorruptedState => {
             "; the service's shared state is corrupted (a peer \
              likely crashed mid-operation) — remove the stale \
@@ -1640,13 +1649,29 @@ fn event_env_hint(e: &iceoryx2::service::builder::event::EventOpenOrCreateError)
              can blow past the default 1024; raise it with \
              `ulimit -n 65536` and retry before assuming corruption"
         }
-        // iceoryx2 0.10 removed `EventCreateError::HangsInCreation` (it survives
-        // on the Open half and on the publish-subscribe errors), so only the
-        // open arm remains.
+        // iceoryx2 0.10 carries `HangsInCreation` on the Open half only (the
+        // create-side variant was removed upstream).
         EventOpenOrCreateError::EventOpenError(EventOpenError::HangsInCreation) => {
             "; a peer crashed while creating this event service — \
              remove the stale iceoryx2 shared-memory artifacts (or \
              reboot) before reopening"
+        }
+        EventOpenOrCreateError::EventOpenError(EventOpenError::VersionMismatch) => {
+            "; the existing event service was created by a process linking a \
+             DIFFERENT iceoryx2 version — every Cerulion process and every \
+             node cdylib on one machine must be built against the same \
+             `cerulion_core`, because each links its own iceoryx2 and the \
+             two cannot share a service. Rebuild the node libraries against \
+             the installed `cerulion` (`cerulion node build`), or stop the \
+             process left over from the previous version"
+        }
+        EventOpenOrCreateError::EventOpenError(
+            EventOpenError::DoesNotSupportRequestedMaxEventId,
+        ) => {
+            "; the existing event service carries a SMALLER event-id ceiling \
+             than this process needs — it was created by an older Cerulion \
+             whose event enum was shorter. Stop the older process and let \
+             this one create the service"
         }
         _ => "",
     }
@@ -7397,7 +7422,15 @@ mod tests {
                 | O::ServiceInCorruptedState
                 | O::HangsInCreation
                 | O::ExceedsMaxNumberOfNodes
-                | O::IsMarkedForDestruction => false,
+                | O::IsMarkedForDestruction
+                // iceoryx2 0.10 additions. `VersionMismatch` is the named
+                // refusal when the incumbent service was created by a
+                // different iceoryx2 version: a skew, not a ceiling.
+                | O::Interrupt
+                | O::UnableToCreateServiceTag
+                | O::VersionMismatch
+                | O::UnableToAcquireTypeDefinition
+                | O::InvalidTypeDefinition => false,
             }
         }
 
@@ -7422,10 +7455,15 @@ mod tests {
             O::HangsInCreation,
             O::ExceedsMaxNumberOfNodes,
             O::IsMarkedForDestruction,
+            O::Interrupt,
+            O::UnableToCreateServiceTag,
+            O::VersionMismatch,
+            O::UnableToAcquireTypeDefinition,
+            O::InvalidTypeDefinition,
         ];
         assert_eq!(
             all_open.len(),
-            17,
+            22,
             "the sweep must cover every open variant — extend BOTH this list \
              and `want_open` when iceoryx2 adds one"
         );
@@ -7455,6 +7493,12 @@ mod tests {
             C::InternalFailure,
             C::IsBeingCreatedByAnotherInstance,
             C::HangsInCreation,
+            C::Interrupt,
+            C::UnableToCreateServiceTag,
+            C::ServiceConfigCouldNotBeCreated,
+            C::UnableToAcquireTypeDefinition,
+            C::InvalidTypeDefinition,
+            C::UnableToGenerateUniqueServiceId,
         ] {
             assert!(
                 !is_buffer_ceiling_refusal(&E::PublishSubscribeCreateError(v)),
