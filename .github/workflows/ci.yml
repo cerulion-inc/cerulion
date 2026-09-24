@@ -481,10 +481,16 @@ jobs:
           # `tools/hooks` carries the leak guard's git hooks, which have no
           # extension (git looks them up by bare name), so that tree is matched
           # by path rather than by suffix.
-          files=$(find tools/scripts tools/hooks -type f \( -name '*.sh' -o -path 'tools/hooks/*' \) | sort)
+          # `tools/ci` carries the CI-only gates (the rmw distro lanes).
+          files=$(find tools/scripts tools/hooks tools/ci -type f \( -name '*.sh' -o -path 'tools/hooks/*' \) | sort)
           count=$(printf '%s\n' "$files" | grep -c . || true)
-          if [ "$count" -lt 19 ]; then
-            echo "::error::shellcheck swept only ${count} script(s): the find is not reaching the trees"
+          # The find must reach every tracked regular-file script in those trees: the expected
+          # count is derived from git (symlinks excluded, as the find excludes them), never a
+          # hand-kept floor that the real count leaves behind.
+          expected=0
+          while IFS= read -r f; do [ -f "$f" ] && [ ! -L "$f" ] && expected=$((expected + 1)); done < <(git ls-files 'tools/scripts/*.sh' 'tools/hooks/*' 'tools/ci/*.sh' | sort -u)
+          if [ "$count" -ne "$expected" ] || [ "$count" -eq 0 ]; then
+            echo "::error::shellcheck swept ${count} script(s) but git tracks ${expected}: the find is not reaching the trees"
             exit 1
           fi
           # shellcheck disable=SC2086  # $files is a newline list of paths, split on purpose

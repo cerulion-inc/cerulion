@@ -1,0 +1,5 @@
+doctests::crates/rmw_cerulion/src/era.rs - era::classify_cpp_bridge (line 40)
+rmw_cerulion::api::dispatch_tests::direct_leaf_resolves_without_a_dispatcher
+rmw_cerulion::api::dispatch_tests::resolves_cpp_arm_for_a_cpp_dispatcher
+rmw_shadow_take_test::cpp_image_loaned_take_aims_data_into_the_held_sample_and_recycles_the_shadow
+rmw_shadow_take_test::two_runs_of_the_forged_take_match_the_hand_oracle
