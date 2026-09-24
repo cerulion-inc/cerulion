@@ -1264,11 +1264,13 @@ fn pump_loop(
 ) {
     while !exit.load(Ordering::Relaxed) {
         match doorbell.as_ref() {
-            Some(listener) => match listener.timed_wait_one(interval) {
+            // iceoryx2 0.10: `timed_wait_one` is gone — a ring is `Ok(n > 0)`,
+            // the timeout `Ok(0)` (see `run_registry::pump_loop`).
+            Some(listener) => match listener.timed_wait(|_a| {}, interval) {
                 // A ring: somebody is gathering and wants this writer's answer.
-                Ok(Some(_)) => inner.note_doorbell_ring(),
+                Ok(n) if n > 0 => inner.note_doorbell_ring(),
                 // The fallback timeout — republish on the interval as before.
-                Ok(None) => {}
+                Ok(_) => {}
                 // A broken listener must degrade to the interval, never spin:
                 // without this sleep a persistently-failing wait would return
                 // instantly and republish in a tight loop.

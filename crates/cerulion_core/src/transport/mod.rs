@@ -1624,8 +1624,10 @@ fn event_env_hint(e: &iceoryx2::service::builder::event::EventOpenOrCreateError)
              can blow past the default 1024; raise it with \
              `ulimit -n 65536` and retry before assuming corruption"
         }
-        EventOpenOrCreateError::EventOpenError(EventOpenError::HangsInCreation)
-        | EventOpenOrCreateError::EventCreateError(EventCreateError::HangsInCreation) => {
+        // iceoryx2 0.10 removed `EventCreateError::HangsInCreation` (it survives
+        // on the Open half and on the publish-subscribe errors), so only the
+        // open arm remains.
+        EventOpenOrCreateError::EventOpenError(EventOpenError::HangsInCreation) => {
             "; a peer crashed while creating this event service — \
              remove the stale iceoryx2 shared-memory artifacts (or \
              reboot) before reopening"
@@ -1835,7 +1837,21 @@ impl LivelinessCleaner {
         #[cfg(any(test, feature = "test-helpers"))]
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
-        let state = Node::<CerService>::try_cleanup_dead_nodes(&self.config);
+        // iceoryx2 0.10: `try_cleanup_dead_nodes` moved from an associated
+        // function taking a `&Config` to a METHOD on `&Node`, so the sweep needs
+        // a node in the namespace it is cleaning. SPIKE STAND-IN: mint a
+        // transient node from the captured config for the call. That is a real
+        // per-sweep cost and a design question for the migration proper (the
+        // cleaner deliberately does NOT hold the transport); a node that cannot
+        // be created is the same non-fatal skip a failed cleanup already was.
+        let Ok(node) = NodeBuilder::new()
+            .config(&self.config)
+            .create::<CerService>()
+        else {
+            tracing::trace!("liveliness sweep: dead-node cleanup skipped (no node)");
+            return;
+        };
+        let state = node.try_cleanup_dead_nodes();
         tracing::trace!(
             cleanups = state.cleanups,
             failed_cleanups = state.failed_cleanups,

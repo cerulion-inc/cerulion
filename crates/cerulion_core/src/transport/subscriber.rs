@@ -2135,39 +2135,50 @@ impl CerulionSubscriber {
                 return self.drain_samples(&mut callback, ReadSiteRole::Body);
             }
 
-            // Block on event listener (or remaining timeout)
-            let event =
-                self.listener
-                    .timed_wait_one(remaining)
-                    .map_err(|e| TransportError::Receive {
-                        topic: self.topic.clone(),
-                        reason: format!("{}", e),
-                    })?;
+            // Block on event listener (or remaining timeout).
+            //
+            // iceoryx2 0.10: `timed_wait_one` is gone. `timed_wait` unblocks on
+            // the first activation and then hands the callback EVERY queued
+            // activation (one call per DISTINCT event id, carrying its count),
+            // returning how many were delivered. So the dispatch moves after the
+            // call: classify the whole batch, then act. `Ok(0)` is the old
+            // `Ok(None)` timeout. Draining the batch in one call rather than one
+            // id per loop turn is the same outcome the old loop reached by
+            // re-waiting, with no re-wait.
+            let mut saw_data_event = false;
+            let activations = self
+                .listener
+                .timed_wait(
+                    |activation| {
+                        if matches!(
+                            PubSubEvent::try_from(activation.id),
+                            Ok(PubSubEvent::SentSample) | Ok(PubSubEvent::SentHistory)
+                        ) {
+                            saw_data_event = true;
+                        }
+                    },
+                    remaining,
+                )
+                .map_err(|e| TransportError::Receive {
+                    topic: self.topic.clone(),
+                    reason: format!("{}", e),
+                })?;
 
-            match event {
-                Some(event_id) => {
-                    let parsed = PubSubEvent::try_from(event_id);
-                    match parsed {
-                        Ok(PubSubEvent::SentSample) | Ok(PubSubEvent::SentHistory) => {
-                            // Data event — drain samples and return
-                            return self.drain_samples(&mut callback, ReadSiteRole::Body);
-                        }
-                        _ => {
-                            // Non-data event. Drain to check for any pending data
-                            // (send→notify race), but only return if we got data.
-                            let count = self.drain_samples(&mut callback, ReadSiteRole::Body)?;
-                            if count > 0 {
-                                return Ok(count);
-                            }
-                            continue;
-                        }
-                    }
-                }
-                None => {
-                    // Timeout — drain any pending samples (send→notify race)
-                    return self.drain_samples(&mut callback, ReadSiteRole::Body);
-                }
+            if activations == 0 {
+                // Timeout — drain any pending samples (send→notify race)
+                return self.drain_samples(&mut callback, ReadSiteRole::Body);
             }
+            if saw_data_event {
+                // Data event — drain samples and return
+                return self.drain_samples(&mut callback, ReadSiteRole::Body);
+            }
+            // Only non-data events. Drain to check for any pending data
+            // (send→notify race), but only return if we got data.
+            let count = self.drain_samples(&mut callback, ReadSiteRole::Body)?;
+            if count > 0 {
+                return Ok(count);
+            }
+            continue;
         }
     }
 
@@ -2266,20 +2277,18 @@ impl CerulionSubscriber {
                 reason: "fault-injected listener drain failure (test seam)".to_string(),
             });
         }
-        loop {
-            match self.listener.try_wait_one() {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(e) => {
-                    return Err(TransportError::Receive {
-                        // hot-path-alloc-ok: cold error arm — a listener
-                        // whose try_wait_one fails is already off the
-                        // healthy path.
-                        topic: self.topic.clone(),
-                        reason: format!("listener try_wait_one: {e:?}"),
-                    });
-                }
-            }
+        // iceoryx2 0.10: one `try_wait` empties the queue, so the old
+        // drain-to-`Ok(None)` loop collapses to a single call with the same
+        // outcome (this site always drained to empty).
+        match self.listener.try_wait(|_a| {}) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(TransportError::Receive {
+                // hot-path-alloc-ok: cold error arm — a listener
+                // whose try_wait fails is already off the
+                // healthy path.
+                topic: self.topic.clone(),
+                reason: format!("listener try_wait: {e:?}"),
+            }),
         }
     }
 
@@ -2298,11 +2307,17 @@ impl CerulionSubscriber {
         // hot-path-alloc-ok: cfg-gated test helper (test / test-helpers
         // feature only) — never compiled into the production hot path
         let mut events = Vec::new();
-        while let Ok(Some(event_id)) = self.listener.try_wait_one() {
-            if let Ok(parsed) = super::events::PubSubEvent::try_from(event_id) {
-                events.push(parsed);
+        // iceoryx2 0.10: the callback fires once per DISTINCT event id carrying
+        // `count` repeats, so push `count` copies to keep this helper's
+        // "one entry per notify" contract (the 0.9.1 queue held one datagram
+        // per notify and this loop popped them one at a time).
+        let _ = self.listener.try_wait(|activation| {
+            if let Ok(parsed) = super::events::PubSubEvent::try_from(activation.id) {
+                for _ in 0..activation.count {
+                    events.push(parsed);
+                }
             }
-        }
+        });
         events
     }
 

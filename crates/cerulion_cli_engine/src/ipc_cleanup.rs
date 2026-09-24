@@ -99,7 +99,7 @@ use core::time::Duration;
 
 use cerulion_core::iceoryx_logger::CapturedLog;
 use iceoryx2::config::Config;
-use iceoryx2::node::{CleanupState, Node};
+use iceoryx2::node::{CleanupState, NodeBuilder};
 
 // Route stale-resource cleanup through the same
 // Service type the core transport now uses (`ipc_threadsafe::Service`). The
@@ -653,7 +653,19 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config)
     set_log_level(LogLevel::Trace);
     let _guard = LogLevelGuard;
     let (state, captured) =
-        capture_iceoryx_logs(|| Node::<CerService>::try_cleanup_dead_nodes(config));
+        // iceoryx2 0.10: `try_cleanup_dead_nodes` is a METHOD on `&Node`, so the
+        // sweep now needs a node in the namespace it is cleaning. SPIKE
+        // STAND-IN: mint a transient node on the given config. This is the
+        // design question section 1.5 of the upgrade note raises — `ipc_cleanup`
+        // exists to sweep a namespace WITHOUT a node, and creating one in a
+        // corrupted namespace in order to clean it is not obviously right.
+        capture_iceoryx_logs(|| match NodeBuilder::new().config(config).create::<CerService>() {
+            Ok(node) => node.try_cleanup_dead_nodes(),
+            Err(_) => CleanupState {
+                cleanups: 0,
+                failed_cleanups: 0,
+            },
+        });
     // `_guard` restores the ENV-DERIVED level on drop at end-of-scope (or on
     // panic-unwind through `_guard`'s Drop) — `IOX2_LOG_LEVEL` if set, else
     // `error`. See the guard's own docs: a hardcoded `Error` restore here is
@@ -711,7 +723,21 @@ pub fn cleanup_dead_iceoryx2_nodes() -> CleanupState {
     // reads and parses `iceoryx2.toml` on first use and can panic on a corrupt
     // file, and a panic there is exactly the advisory-sweep failure this wrap
     // exists to contain (pinned by `the_global_sweep_resolves_its_config_inside_the_panic_boundary`).
-    contained_sweep(|| Node::<CerService>::try_cleanup_dead_nodes(Config::global_config()))
+    // iceoryx2 0.10: see the note in `capture_iceoryx_logs`'s caller above —
+    // the sweep is a node method now, so this mints a transient node on the
+    // global config inside the SAME panic boundary.
+    contained_sweep(|| {
+        match NodeBuilder::new()
+            .config(Config::global_config())
+            .create::<CerService>()
+        {
+            Ok(node) => node.try_cleanup_dead_nodes(),
+            Err(_) => CleanupState {
+                cleanups: 0,
+                failed_cleanups: 0,
+            },
+        }
+    })
 }
 
 /// The ONE panic boundary both sweep entry points share: run the sweep, and on

@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-const PIN: &str = "0.9.1";
+const PIN: &str = "0.10.0";
 
 /// Extract the version string from an inline dependency line — both the bare
 /// `name = "X"` and the inline-table `name = { version = "X", .. }` forms —
@@ -77,10 +77,11 @@ fn all_iceoryx2_deps_are_exact_pinned() {
             );
         }
     }
-    // iceoryx2 + iceoryx2-log + the 19-crate sub-family = 21.
+    // iceoryx2 0.10 spike: iceoryx2 + iceoryx2-log + the 20-crate sub-family
+    // = 22 (0.10.0 adds `iceoryx2-bb-flatbuffers` to the family).
     assert!(
-        count >= 21,
-        "expected the full iceoryx2 family exact-pinned (>=21), found {count}"
+        count >= 22,
+        "expected the full iceoryx2 family exact-pinned (>=22), found {count}"
     );
 }
 

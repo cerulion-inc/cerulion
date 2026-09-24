@@ -2210,21 +2210,32 @@ impl CerulionPublisher {
     /// rmw bridge publish via `publish_raw` / `send_raw_loan` + notify and
     /// must drain their own listener to service late joiners.
     pub fn check_subscriber_events(&mut self) {
-        loop {
-            match self.listener.try_wait_one() {
-                Ok(Some(event_id)) => match PubSubEvent::try_from(event_id) {
-                    Ok(PubSubEvent::SubscriberConnected) => {
-                        tracing::debug!(topic = %self.topic, "subscriber connected");
-                        self.deliver_history();
-                    }
-                    Ok(PubSubEvent::SubscriberDisconnected) => {
-                        tracing::debug!(topic = %self.topic, "subscriber disconnected");
-                    }
-                    _ => {}
-                },
-                Ok(None) => break, // No more events
-                Err(_) => break,   // Listener error, stop polling
+        // iceoryx2 0.10: `try_wait_one` is gone and `try_wait`'s callback borrows
+        // `self.listener` for the whole call, while `deliver_history()` below
+        // needs `&mut self`. So the callback only FLAGS what it saw and the act
+        // happens after the drain returns. One call empties the queue, which is
+        // what the old loop did.
+        let mut connected = false;
+        let mut disconnected = false;
+        // A listener error is still "stop polling": nothing is flagged.
+        let _ = self.listener.try_wait(|activation| {
+            match PubSubEvent::try_from(activation.id) {
+                Ok(PubSubEvent::SubscriberConnected) => connected = true,
+                Ok(PubSubEvent::SubscriberDisconnected) => disconnected = true,
+                _ => {}
             }
+        });
+        if connected {
+            tracing::debug!(topic = %self.topic, "subscriber connected");
+            // ONE `deliver_history()` per drain, where 0.9.1 ran one per queued
+            // `SubscriberConnected`. `deliver_history` drives iceoryx2's
+            // `update_connections()`, which services EVERY newly-connected
+            // subscriber in one call, so N connects in one batch still get their
+            // history from one call.
+            self.deliver_history();
+        }
+        if disconnected {
+            tracing::debug!(topic = %self.topic, "subscriber disconnected");
         }
     }
 
