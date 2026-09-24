@@ -854,6 +854,7 @@ fn a_starting_run_sweeps_a_dead_one_and_never_itself() {
 fn start_descriptor(name: &str) -> cerulion_cli_engine::run_dir::RunDescriptor {
     cerulion_cli_engine::run_dir::start_run_descriptor(
         cerulion_cli_engine::run_dir::RunDescriptorSpec {
+            chains: None,
             run_id: cerulion_cli_engine::run_dir::mint_run_id(),
             graph_name: name,
             run_started_at_ns: 1_753_000_000_000_000_000,

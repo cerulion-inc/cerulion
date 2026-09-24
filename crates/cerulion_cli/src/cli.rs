@@ -647,6 +647,7 @@ impl Commands {
                 | GraphAction::Validate { .. }
                 | GraphAction::List
                 | GraphAction::Levels { .. }
+                | GraphAction::Chains { .. }
                 | GraphAction::Partition { .. } => OneShot,
             },
             // `node run` is a runtime loop; every other node verb runs-and-exits.
@@ -1530,6 +1531,25 @@ pub enum GraphAction {
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]
         name: String,
     },
+    /// Show which trigger edges of a graph could run as one fused chain
+    /// (read-only).
+    ///
+    /// A fused chain is a linear single-consumer trigger chain inside one
+    /// process: the producer's publish is unchanged and the consumer is called
+    /// directly with the bytes just committed, instead of the frame crossing a
+    /// level boundary and being received again. Prints the chains that
+    /// qualify and, for every other consumer edge, the reason it keeps the
+    /// queued path. The census is judged against the graph's declared
+    /// colocation (its `process_groups:` block, or one process); a run writes
+    /// its own census into its run directory.
+    ///
+    /// Nothing in the runtime fuses chains yet: this verb reports what the
+    /// graph would allow.
+    Chains {
+        /// Graph name
+        #[arg(add = ArgValueCandidates::new(completion::graph_names))]
+        name: String,
+    },
     /// Profile a graph LIVE and write its cost snapshot.
     ///
     /// Runs the graph on the real clock until every node reaches its fire
@@ -2123,6 +2143,33 @@ mod graph_levels_dispatch_tests {
             Cli::try_parse_from(["cerulion", "graph", "levels"]).is_err(),
             "`graph levels` without a graph name must be rejected"
         );
+    }
+
+    /// `graph chains <name>` parses to `GraphAction::Chains` with the
+    /// positional graph name, and refuses a missing one.
+    #[test]
+    fn graph_chains_parses_name_and_requires_it() {
+        let cli = Cli::try_parse_from(["cerulion", "graph", "chains", "perception"])
+            .expect("`graph chains perception` must parse");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Chains { name },
+            } => assert_eq!(name, "perception"),
+            _ => panic!("expected Graph::Chains"),
+        }
+        assert!(
+            Cli::try_parse_from(["cerulion", "graph", "chains"]).is_err(),
+            "`graph chains` without a graph name must be rejected"
+        );
+    }
+
+    /// The census runs and exits, so it keeps the quiet one-shot filter: a
+    /// lifecycle breadcrumb on top of a report is noise.
+    #[test]
+    fn graph_chains_is_a_one_shot_verb() {
+        let cli =
+            Cli::try_parse_from(["cerulion", "graph", "chains", "perception"]).expect("parse");
+        assert_eq!(cli.command.log_verb_class(), VerbLogClass::OneShot);
     }
 }
 

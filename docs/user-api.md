@@ -121,6 +121,7 @@ no command that rewrites an existing workspace's manifest in place.
 | `graph validate <NAME> [--release]` | Parse + validate without running. The report names the node library it found for each node and its profile; `--release` makes it look for release-profile libraries only, matching `node build --release` and `graph run --release`. |
 | `graph list` | List all graphs in the workspace. |
 | `graph levels <NAME>` | Read-only view of the derived DAG levelization: one row per level (nodes + trigger policies), the triggering edges leaving each level, and, when the graph declares `process_groups:`, the group → owned-level band mapping with the spawner-consumability verdict (an invalid partition still prints in full, then exits nonzero: CI-gateable). That verdict also NAMES any split `block` edge it found CREDITABLE, so this is the verb that answers "will my hand-written split work?". It says which edges depend on a supervisor-minted credit word. Judged on SOURCE metadata; `graph run` re-checks the built cdylibs and refuses on drift. |
+| `graph chains <NAME>` | Read-only census of the trigger edges that could run as one FUSED chain (a linear single-consumer chain inside one process, where the consumer is called directly with the bytes the producer just committed instead of the frame crossing a level boundary and being received again). Prints each chain with its nodes, hop topics and level band, and for every other consumer edge the reason it keeps the queued path: `latest-value-read`, `no-in-graph-producer`, `multiple-producers`, `fan-out`, `producer-branches`, `separate-processes`, `block`, `sample`, `consumer-policy`, `join`, `throttle`, `block-involved`, `late-context-input`, `length-ceiling`. The two add up to every consumer edge in the graph. Judged against the graph's DECLARED colocation (its `process_groups:` block, or one process), which a run may not use: every `graph run` writes its own census into its run directory. Nothing in the runtime fuses chains yet. See [Fused chains](#fused-chains). |
 | `graph profile <NAME> [--duration SECS] [--fires N] [-o/--out PATH]` | Profile the graph LIVE and write its cost snapshot to `graphs/<NAME>.costs.yaml` (`-o/--out` overrides). An output whose `schema:` the workspace defines more than once is refused before profiling, naming every source (the resolver's refusal, the same as `graph run`'s: a profile executes the graph and never runs the validation report). Runs on the real clock; measures per-node p50 tick durations + per-edge fire rates, and FREEZES the core-count default budget into the v2 artifact (`derived_budget_ns` = `ceil(Σ p50 / profile_cores)`, from the profiling machine's permitted cores), the input of the cost-aware auto-partitioner (see `docs/auto_partitioning.md`). **Default: per-node fire targets are AUTO-DERIVED**: a warm-up of `clamp(cap/10, 1s, 3s)` observes each node's rate, projects its fires over the cap, halves that (rate-droop tolerance) and clamps into [20, 1000]; the run stops when every warm-up-active node meets its OWN target, at the `--duration` cap (default 30 s), or on Ctrl+C. Harvest isolation is judged against the same observation re-projected to the ACTUAL observed window: an early Ctrl+C isolates only genuinely under-sampled nodes, never everything against a cap-length projection. `--fires N` overrides with ONE uniform target for every node (the escape hatch for nodes whose first fire lands after the warm-up, e.g. a period > 3 s). A node that falls short of its target is **ISOLATED**: no cost is recorded (never fabricated) and it stays in its own process group, warned loudly per node (a node silent through warm-up carries the "no target derived" marker, and a never-fired node whose triggering inputs saw a zero-rate topic gets the starved-trigger hint: profile under representative load, running the driver graph alongside), but exit 0 (isolation is a valid outcome; raise `--duration`, or force uniform mode with `--fires N`). The artifact is user-editable; its `hop:` block (per-platform defaults) can be overwritten with hop costs measured on your machine. See [Splitting a `block` edge across processes](#splitting-a-block-edge-across-processes-the-credit-word). |
 | `graph partition <NAME> [--costs PATH] [--budget-ns N] [--dry-run] [--yes]` | Derive and WRITE the graph's `process_groups:` partition: a cost-aware greedy fusion when a cost snapshot exists (the default `graphs/<NAME>.costs.yaml`, or an explicit `--costs`, which must exist and parse; a present-but-malformed artifact is a hard error, never a silent baseline fallback), else the process-per-node baseline. With a cost snapshot the DAG levels are refined first, and a `level_assignments:` block is written beside the partition only when that refinement moves at least one node (no snapshot, or a refinement that changes nothing, writes none and removes a stale one); see [Deployment keys](#deployment-keys-process_groups-process_group_order-level_assignments). `--budget-ns` caps each group's summed p50. **Default: the artifact's FROZEN `derived_budget_ns`** (`ceil(Σ p50 / profile_cores)`, computed at profile time on the profiling machine and never re-derived by a reader; re-profile on the TARGET machine to re-derive); an explicit value always overrides, and an earlier (v1) artifact or absent frozen value falls back to unbounded fusion with a loud re-profile info. The `graph run` default resolves the budget through the SAME point (the two surfaces cannot diverge). The rewrite is SURGICAL: only the `process_groups:` and `level_assignments:` blocks change (a stale `process_group_order:` block is also removed, because the emitted listing order IS the rank order); comments and formatting are preserved byte-for-byte and the prior file is backed up to `<file>.bak`. NEVER writes without consent: a TTY run shows the proposed bands + a block-scoped diff and asks y/N; non-TTY requires `--yes` (else a loud refusal naming `--yes` and `--dry-run`); `--dry-run` previews only (wins over `--yes`). Uses replace-scoped validation (every check EXCEPT the partition blocks being replaced), so it is also the recovery tool for a stale/broken `process_groups:` block. |
 
@@ -1763,6 +1764,100 @@ it takes three steps, not one:
    addition until the manifest is refreshed.
 
 ---
+
+## Fused chains
+
+A **fused chain** is a linear single-consumer trigger chain inside one process, executed as one
+synchronous call sequence. The producer's publish is unchanged: it still loans a shared-memory
+slot, writes into it and commits, so `topic echo`, `topic hz`, a recorder tap and any external
+attach see the same frames, in the same bytes, with gap-free sequences. What the chain removes is
+the consumer's trip back through the step machinery to collect a frame the executor already has:
+instead of ending the producer's level, crossing a level boundary and receiving the frame out of
+the consumer's own queue, the executor calls the consumer directly with a read-only view of the
+bytes just committed.
+
+**Nothing in the runtime fuses chains yet.** `cerulion graph chains` reports which edges of your
+graph would qualify, and for every other consumer edge the reason it keeps the queued path. The
+two add up to every consumer edge in the graph.
+
+```bash
+$ cd examples/perception && cerulion graph chains perception
+graph: perception  prefix: percep
+levels source: derived (trigger-aware Kahn levelization)
+colocation: one process (this graph declares no process_groups:; `cerulion graph run` may derive a partition, and each run writes its own census into its run directory)
+nodes: 4  levels: 3  consumer edges: 2
+fusable: 1 chain(s), 2 hop(s)  queued: 0 edge(s)
+
+chain 0  levels 0-2  3 nodes, 2 hop(s)
+  camera -> detector  on /percep/camera/image_raw
+  detector -> tracker  on /percep/detector/detections
+```
+
+A graph that fuses nothing says why, edge by edge:
+
+```bash
+$ cd examples/go2 && cerulion graph chains teleop
+graph: teleop  prefix: go2
+levels source: derived (trigger-aware Kahn levelization)
+colocation: one process (this graph declares no process_groups:; `cerulion graph run` may derive a partition, and each run writes its own census into its run directory)
+nodes: 4  levels: 2  consumer edges: 3
+fusable: 1 chain(s), 1 hop(s)  queued: 2 edge(s)
+
+chain 0  levels 0-1  2 nodes, 1 hop(s)
+  teleop_mux -> sport_driver  on /go2/cmd_vel
+
+queued edges by reason:
+  latest-value-read  2
+
+queued edges:
+  /go2/cmd_vel/joystick  joystick_teleop -> teleop_mux.joy_cmd
+    latest-value-read: the consumer reads this topic as a latest value and is not woken by it
+  /go2/cmd_vel/keyboard  keyboard_teleop -> teleop_mux.key_cmd
+    latest-value-read: the consumer reads this topic as a latest value and is not woken by it
+```
+
+An edge qualifies when all of these hold. Each is decided from your declarations, once, at graph
+build: the set never varies with load, because a fusion set that did would make a replay a
+different program.
+
+| Rule | Reason printed when it fails |
+|---|---|
+| The consumer is WOKEN by the edge (`#[input(trigger)]`, or the one input of a data-triggered node). | `latest-value-read` |
+| Exactly one node in the graph publishes the topic. | `no-in-graph-producer`, `multiple-producers` |
+| The topic has exactly one consumer edge, and the producer feeds exactly one qualifying edge. A chain ends at a fan-out: the second consumer would otherwise wait for the first consumer's whole chain. | `fan-out`, `producer-branches` |
+| Producer and consumer run in the same process. Another address space has no slot to hand over. | `separate-processes` |
+| The input declares neither `block` nor `sample(N)`. `block` defers the producer while the consumer is at threshold, and a consumer that runs inside the producer's own fire never reaches it; `sample(N)` says the consumer reads less often than the producer publishes, and a direct call reads in lockstep. | `block`, `sample` |
+| The consumer fires on THIS frame: a data trigger, not `period_ms`, `sync_window_ms`, `unbounded_sync` or `external`, and this edge is its only trigger. | `consumer-policy`, `join` |
+| The consumer declares no `throttle_ms`. A rate cap defers a fire, and a direct call has nowhere to defer to. | `throttle` |
+| Neither end is on a `block` topic; those nodes are already fired serially against a shared outstanding count. | `block-involved` |
+| The consumer reads no latest-value input written by a node at or after the CHAIN HEAD's level. Everything below the head has ticked before the head fires, so its values are final; a node at the head's level has not. | `late-context-input` |
+| The chain holds at most 32 nodes, which bounds the call depth. | `length-ceiling` |
+
+A refused edge CUTS its chain rather than killing it: the refused consumer heads a new chain,
+judged against its own level.
+
+**Which colocation the census is judged against.** `graph chains` uses the graph's DECLARED shape:
+its `process_groups:` block, or one process when it declares none. A run may place the nodes
+differently, because an unpartitioned graph derives a partition by default on Unix (see
+[`graph run`](#cerulion-graph)), and a process-per-node partition fuses nothing. So every
+`cerulion graph run` also writes its own census, under the colocation it actually executes, into
+the run directory's `run.json`:
+
+```json
+"chains": {
+  "fusable_chains": 1,
+  "fusable_hops": 2,
+  "consumer_edges": 4,
+  "longest_chain_nodes": 3,
+  "queued_by_reason": [{ "reason": "fan-out", "edges": 2 }],
+  "chains": [{ "nodes": ["cam", "rect", "det"],
+               "topics": ["/percep/cam/out", "/percep/rect/out"],
+               "head_level": 0 }]
+}
+```
+
+`"chains": null` means the census could not be computed for that run (node source that does not
+parse), never that the graph has no chains.
 
 ## Backpressure
 
