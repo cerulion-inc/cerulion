@@ -242,11 +242,13 @@ extern "C" {
     /// `data()` of a `std::vector<uint8_t>` (test fixtures).
     pub fn rmw_cerulion_vector_u8_data(v: *const c_void) -> *const u8;
 
-    /// The three throwing introspection accessors, each called inside a
-    /// `noexcept` C++ wrapper that catches every exception (Lyrical's
-    /// `rosidl::Buffer` accessors throw on a non-CPU backend) and returns
-    /// 0 on success, nonzero when the accessor threw. A nonzero status is a
-    /// refused frame on the Rust side, never a foreign unwind.
+    /// The introspection accessors, each called inside a `noexcept` C++
+    /// wrapper that catches every exception (Lyrical's `rosidl::Buffer`
+    /// accessors throw on a non-CPU backend) and returns 0 on success,
+    /// nonzero when the accessor threw. A nonzero status is a refused frame
+    /// on the Rust side, never a foreign unwind. No accessor pointer is
+    /// called directly from Rust; `size_function` is the one exception,
+    /// documented as non-throwing on every backend.
     pub(crate) fn rmw_cerulion_member_get_const(
         f: unsafe extern "C" fn(*const c_void, usize) -> *const c_void,
         m: *const c_void,
@@ -263,6 +265,18 @@ extern "C" {
         f: unsafe extern "C" fn(*mut c_void, usize),
         m: *mut c_void,
         size: usize,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_fetch(
+        f: unsafe extern "C" fn(*const c_void, usize, *mut c_void),
+        m: *const c_void,
+        index: usize,
+        out: *mut c_void,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_assign(
+        f: unsafe extern "C" fn(*mut c_void, usize, *const c_void),
+        m: *mut c_void,
+        index: usize,
+        value: *const c_void,
     ) -> std::os::raw::c_int;
     /// Test fixture: an accessor that always throws (proves the catch).
     #[cfg(test)]
