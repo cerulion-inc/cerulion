@@ -96,6 +96,7 @@ use syn::{
     ImplItemFn, ItemImpl, Member, Type,
 };
 
+use crate::crate_root;
 use crate::determinism;
 use crate::registry::{self, NodePortEntry};
 
@@ -1518,6 +1519,7 @@ pub fn cerulion_node_impl(
     attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
+    let __cer_root = crate_root::root();
     // `#[cerulion_node_impl]` takes NO arguments. The
     // port list is discovered from the registry that `#[cerulion_node]`
     // populates from its sibling struct's `#[input]`/`#[output]` field
@@ -1949,8 +1951,8 @@ pub fn cerulion_node_impl(
             #[inline]
             fn __cer_user_init(
                 &mut self,
-                _ctx: &mut ::cerulion_core::graph::node::NodeContext,
-            ) -> ::cerulion_core::error::TransportResult<()> {
+                _ctx: &mut #__cer_root::graph::node::NodeContext,
+            ) -> #__cer_root::error::TransportResult<()> {
                 ::std::result::Result::Ok(())
             }
         };
@@ -1962,7 +1964,7 @@ pub fn cerulion_node_impl(
             #[inline]
             fn __cer_user_shutdown(
                 &mut self,
-            ) -> ::cerulion_core::error::TransportResult<()> {
+            ) -> #__cer_root::error::TransportResult<()> {
                 ::std::result::Result::Ok(())
             }
         };
@@ -2006,8 +2008,8 @@ pub fn cerulion_node_impl(
             #[inline]
             fn __cer_user_external_source(
                 &mut self,
-            ) -> ::cerulion_core::graph::node::ExternalSource {
-                ::cerulion_core::graph::node::ExternalSource::HostDriven
+            ) -> #__cer_root::graph::node::ExternalSource {
+                #__cer_root::graph::node::ExternalSource::HostDriven
             }
         };
         item_impl.items.push(stub);
@@ -2130,20 +2132,21 @@ fn rewrite_user_external_source_method(method: &mut ImplItemFn) {
 /// the same closure-then-map_err pattern `tick` uses: `NodeError::into_transport`
 /// keeps the error's kind as a typed value (`TransportError::NodeFailed`).
 fn rewrite_user_init_method(method: &mut ImplItemFn) {
+    let __cer_root = crate_root::root();
     let user_body = method.block.clone();
     let new_block: Block = parse_quote! {
         {
             let __cer_user_result: ::std::result::Result<
                 (),
-                ::cerulion_core::error::NodeError,
+                #__cer_root::error::NodeError,
             > = (|| #user_body)();
-            __cer_user_result.map_err(|e| ::cerulion_core::error::NodeError::into_transport(e, "user_init"))
+            __cer_user_result.map_err(|e| #__cer_root::error::NodeError::into_transport(e, "user_init"))
         }
     };
     method.block = new_block;
     method.sig.ident = format_ident!("__cer_user_init");
     method.sig.output = parse_quote! {
-        -> ::cerulion_core::error::TransportResult<()>
+        -> #__cer_root::error::TransportResult<()>
     };
     // Hide from rustdoc — the user-facing name is `init`, the renamed
     // version is implementation detail.
@@ -2153,20 +2156,21 @@ fn rewrite_user_init_method(method: &mut ImplItemFn) {
 /// Same as `rewrite_user_init_method` but for the
 /// optional `fn shutdown(&mut self) -> Result<(), NodeError>` method.
 fn rewrite_user_shutdown_method(method: &mut ImplItemFn) {
+    let __cer_root = crate_root::root();
     let user_body = method.block.clone();
     let new_block: Block = parse_quote! {
         {
             let __cer_user_result: ::std::result::Result<
                 (),
-                ::cerulion_core::error::NodeError,
+                #__cer_root::error::NodeError,
             > = (|| #user_body)();
-            __cer_user_result.map_err(|e| ::cerulion_core::error::NodeError::into_transport(e, "user_shutdown"))
+            __cer_user_result.map_err(|e| #__cer_root::error::NodeError::into_transport(e, "user_shutdown"))
         }
     };
     method.block = new_block;
     method.sig.ident = format_ident!("__cer_user_shutdown");
     method.sig.output = parse_quote! {
-        -> ::cerulion_core::error::TransportResult<()>
+        -> #__cer_root::error::TransportResult<()>
     };
     method.attrs.push(parse_quote!(#[doc(hidden)]));
 }
@@ -2212,6 +2216,7 @@ fn rewrite_helper_method(
     helper_port_args: &HashMap<String, Vec<(String, PortKind)>>,
     port_type_by_name: &HashMap<String, (Type, PortKind)>,
 ) {
+    let __cer_root = crate_root::root();
     // Walk the body — same visitor as tick. The visitor handles both
     // `self.<port>` rewrites and `self.<other_helper>(args)` argument
     // injection.
@@ -2278,10 +2283,10 @@ fn rewrite_helper_method(
             // helper body route through `__cer_<port>.__cer_loan()?`
             // identically to the tick frame (see `output_write_receiver`).
             PortKind::Output => parse_quote! {
-                #local: &mut ::cerulion_core::graph::node::LazyOutput<'_, #ty>
+                #local: &mut #__cer_root::graph::node::LazyOutput<'_, #ty>
             },
             PortKind::Input => parse_quote! {
-                #local: &::cerulion_core::transport::input_view::InputView<'_, #ty>
+                #local: &#__cer_root::transport::input_view::InputView<'_, #ty>
             },
             PortKind::Accumulate => parse_quote! {
                 #local: &::cerulion_core::transport::accumulate::Accumulated<'_, #ty>
@@ -2318,6 +2323,7 @@ fn rewrite_helper_method(
 /// touch, so a missing publisher is a wiring bug. (This check stays at the
 /// preamble; only the LOAN moves to first write.)
 fn build_ctx_split_and_output_loans(impl_attr: &ImplAttr) -> TokenStream2 {
+    let __cer_root = crate_root::root();
     let split = quote! {
         let (__cer_pubs_map, __cer_subs_map) =
             ctx.split_publishers_subscribers_mut();
@@ -2366,12 +2372,12 @@ fn build_ctx_split_and_output_loans(impl_attr: &ImplAttr) -> TokenStream2 {
             let ty = &p.ty;
             let idx = syn::LitInt::new(&i.to_string(), Span::call_site());
             quote! {
-                let mut #lazy_local: ::cerulion_core::graph::node::LazyOutput<'_, #ty> =
+                let mut #lazy_local: #__cer_root::graph::node::LazyOutput<'_, #ty> =
                     match __cer_out_pubs[#idx].take() {
                         Some(pub_port) =>
-                            ::cerulion_core::graph::node::LazyOutput::new(pub_port),
+                            #__cer_root::graph::node::LazyOutput::new(pub_port),
                         None => {
-                            return Err(::cerulion_core::error::TransportError::NodeError {
+                            return Err(#__cer_root::error::TransportError::NodeError {
                                 node_id: #port_name.into(),
                                 reason: concat!(
                                     "zero-copy tick: missing publisher for output `",
@@ -2389,7 +2395,7 @@ fn build_ctx_split_and_output_loans(impl_attr: &ImplAttr) -> TokenStream2 {
                 // exactly as the earlier `&mut OutputProxy` reborrow relied
                 // on. The owning `#lazy_local` is always used (the tail
                 // arms/traces it).
-                let #local: &mut ::cerulion_core::graph::node::LazyOutput<'_, #ty> =
+                let #local: &mut #__cer_root::graph::node::LazyOutput<'_, #ty> =
                     &mut #lazy_local;
             }
         })
@@ -2398,7 +2404,7 @@ fn build_ctx_split_and_output_loans(impl_attr: &ImplAttr) -> TokenStream2 {
     quote! {
         #split
         let mut __cer_out_pubs: [::std::option::Option<
-            &mut ::cerulion_core::graph::node::AnyPublisher,
+            &mut #__cer_root::graph::node::AnyPublisher,
         >; #n_out_lit] = __cer_pubs_map.get_disjoint_mut([#(#out_names_lit),*]);
         #(#take_loans)*
     }
@@ -2424,6 +2430,7 @@ fn build_ctx_split_and_output_loans(impl_attr: &ImplAttr) -> TokenStream2 {
 /// fixed-schema outputs would be armed and publish a fabricated zero-init
 /// frame.
 fn build_nested_try_view(inputs: &[TypedPort], start: usize, leaf: TokenStream2) -> TokenStream2 {
+    let __cer_root = crate_root::root();
     if start >= inputs.len() {
         return leaf;
     }
@@ -2441,19 +2448,19 @@ fn build_nested_try_view(inputs: &[TypedPort], start: usize, leaf: TokenStream2)
     quote! {
         {
             let __cer_step: ::std::result::Result<
-                ::std::result::Result<bool, ::cerulion_core::error::NodeError>,
-                ::cerulion_core::error::TransportError,
+                ::std::result::Result<bool, #__cer_root::error::NodeError>,
+                #__cer_root::error::TransportError,
             > = match #sub_local.take() {
                 Some(__cer_sub_ref) => {
                     let __cer_view_outcome = __cer_sub_ref
                         .try_view::<#ty, _>(|view| {
                             let #view_local = view;
-                            let #local: &::cerulion_core::transport::input_view::InputView<
+                            let #local: &#__cer_root::transport::input_view::InputView<
                                 '_, #ty,
                             > = &#view_local;
                             let __cer_layer: ::std::result::Result<
                                 bool,
-                                ::cerulion_core::error::NodeError,
+                                #__cer_root::error::NodeError,
                             > = #inner;
                             __cer_layer
                         });
@@ -2508,6 +2515,7 @@ fn rewrite_tick_method(
     helper_port_args: &HashMap<String, Vec<(String, PortKind)>>,
     event_handlers: &[EventHandler],
 ) {
+    let __cer_root = crate_root::root();
     let mut rewriter = SelfPortRewriter {
         port_idents,
         helper_port_args,
@@ -2645,7 +2653,7 @@ fn rewrite_tick_method(
             {
                 #split_and_loans
                 let _ = __cer_subs_map;
-                let __cer_user_result: ::std::result::Result<(), ::cerulion_core::error::NodeError> =
+                let __cer_user_result: ::std::result::Result<(), #__cer_root::error::NodeError> =
                     (|| #user_body)();
                 #arm_on_ok
                 #trace_calls
@@ -2717,8 +2725,8 @@ fn rewrite_tick_method(
             {
                 #split_and_loans
                 #take_subs
-                let __cer_tick_outcome: ::cerulion_core::error::TransportResult<
-                    ::std::result::Result<bool, ::cerulion_core::error::NodeError>,
+                let __cer_tick_outcome: #__cer_root::error::TransportResult<
+                    ::std::result::Result<bool, #__cer_root::error::NodeError>,
                 > = (|| ::std::result::Result::Ok(#nested))();
                 #arm_on_ok_two_layer
                 // Trace skipped ports BEFORE the `?` below re-raises a
@@ -2732,7 +2740,7 @@ fn rewrite_tick_method(
                 // Ok-vs-Err, never ran-vs-collapsed.
                 let __cer_user_result: ::std::result::Result<
                     (),
-                    ::cerulion_core::error::NodeError,
+                    #__cer_root::error::NodeError,
                 > = __cer_tick_outcome?.map(|_ran| ());
                 __cer_user_result
             }
@@ -2767,10 +2775,10 @@ fn rewrite_tick_method(
         {
             let __cer_user_result: ::std::result::Result<
                 (),
-                ::cerulion_core::error::NodeError,
+                #__cer_root::error::NodeError,
             > = #inner;
             #dispatch_block
-            __cer_user_result.map_err(|e| ::cerulion_core::error::NodeError::into_transport(e, #err_label))
+            __cer_user_result.map_err(|e| #__cer_root::error::NodeError::into_transport(e, #err_label))
         }
     };
 
@@ -2783,7 +2791,7 @@ fn rewrite_tick_method(
     // the generated body.
     method.sig.ident = format_ident!("__cer_zero_copy_tick");
     let ctx_arg: FnArg = parse_quote! {
-        ctx: &mut ::cerulion_core::graph::node::NodeContext
+        ctx: &mut #__cer_root::graph::node::NodeContext
     };
     method.sig.inputs.push(ctx_arg);
     let acc_arg: FnArg = parse_quote! {
@@ -2791,7 +2799,7 @@ fn rewrite_tick_method(
     };
     method.sig.inputs.push(acc_arg);
     method.sig.output = parse_quote! {
-        -> ::cerulion_core::error::TransportResult<()>
+        -> #__cer_root::error::TransportResult<()>
     };
 }
 
@@ -2806,6 +2814,7 @@ fn rewrite_tick_method(
 /// `IndexMap::get_disjoint_mut`'s panic-on-duplicate is unreachable in
 /// generated code.
 fn build_input_subscriber_takes(input_names: &[String]) -> TokenStream2 {
+    let __cer_root = crate_root::root();
     let n = input_names.len();
     let names_lit: Vec<TokenStream2> = input_names.iter().map(|n| quote! { #n }).collect();
     let n_lit = syn::LitInt::new(&n.to_string(), Span::call_site());
@@ -2815,14 +2824,14 @@ fn build_input_subscriber_takes(input_names: &[String]) -> TokenStream2 {
             let idx = syn::LitInt::new(&i.to_string(), Span::call_site());
             quote! {
                 let mut #local: ::std::option::Option<
-                    &mut ::cerulion_core::graph::node::AnySubscriber,
+                    &mut #__cer_root::graph::node::AnySubscriber,
                 > = __cer_subs_array[#idx].take();
             }
         })
         .collect();
     quote! {
         let mut __cer_subs_array: [::std::option::Option<
-            &mut ::cerulion_core::graph::node::AnySubscriber,
+            &mut #__cer_root::graph::node::AnySubscriber,
         >; #n_lit] = __cer_subs_map.get_disjoint_mut([#(#names_lit),*]);
         #(#takes)*
     }

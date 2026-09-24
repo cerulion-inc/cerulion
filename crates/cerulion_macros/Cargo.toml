@@ -24,6 +24,14 @@ proc-macro = true
 workspace = true
 
 [dependencies]
+# Reads the CONSUMING package's Cargo.toml at expansion time and reports the
+# name that package gave a dependency, so generated code can point at the
+# crate root the package actually named. Already in this workspace's lockfile
+# at this version through four other proc-macro crates, so it adds no package
+# and no license to the tree. Pinned exactly because it decides where every
+# generated path points: a version move is a reviewed event, not a lockfile
+# refresh.
+proc-macro-crate = "=3.5.0"
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "parsing", "visit", "visit-mut", "extra-traits"] }
