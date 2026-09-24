@@ -25,8 +25,9 @@ set -u
 #   humble:  builds from generated bindings and its whole suite is green (24-byte GID storage padded,
 #            int8 request guids cast, the C++ mirror in its pre-Iron shape under
 #            cfg(not(cerulion_has_is_key)));
-#   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 24 more missing symbols,
-#            25 errors).
+#   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 20 more missing symbols,
+#            21 errors on this branch: the four pre-Iron type mismatches Foxy shared with Humble are
+#            fixed here, so the count moved from 25 and the row moved with it).
 # A `build` row also pins floors the suite must clear before "green" means anything: at least
 # min_targets target summaries and min_tests tests run (ok, failed or ignored), pinned PER ROW from
 # that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run) with margin for
@@ -35,7 +36,7 @@ case "$distro" in
     jazzy)   expect=build; min_targets=25; min_tests=400; known_failures="" ;;
     lyrical) expect=build; min_targets=25; min_tests=400; known_failures="" ;;
     humble)  expect=build; min_targets=25; min_tests=400; known_failures="" ;;
-    foxy)    expect=refuse; errors=25; marker="cannot find type \`rmw_feature_t\` in module \`ffi\`" ;;
+    foxy)    expect=refuse; errors=21; marker="cannot find type \`rmw_feature_t\` in module \`ffi\`" ;;
     *) echo "FATAL: no expected state for distro '$distro'"; exit 1 ;;
 esac
 
