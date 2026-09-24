@@ -405,13 +405,37 @@ pub fn c_introspection_era() -> CIntrospectionEra {
 /// build classifies `RefusePreJazzy` with the bypass `Off` and `Supported`
 /// under either bypass.
 pub fn cpp_bridge_gate_for(bypass: CppBypassMode) -> CppBridgeGate {
-    let runtime = std::env::var_os("ROS_DISTRO").map(|v| v.to_string_lossy().into_owned());
     gate_vendored_cpp_arm(
         classify_cpp_bridge(bypass, c_introspection_era()),
         bypass,
         cfg!(cerulion_rmw_vendored_bindings),
-        runtime.as_deref(),
+        vendored_runtime_admits(),
     )
+}
+
+/// Whether the running process names a distro the vendored snapshot admits,
+/// read from `ROS_DISTRO` ONCE per process and cached: this seam sits on the
+/// per-MESSAGE resolve path (`rmw_serialize` and `rmw_deserialize` resolve
+/// the typesupport per message), so it must not read the environment or
+/// allocate per call. The launch environment is what rcl itself reads
+/// once at init, so a process-lifetime snapshot is the right granularity.
+/// The pure decision is [`runtime_admits_vendored_snapshot`].
+pub fn vendored_runtime_admits() -> bool {
+    static ADMITS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ADMITS.get_or_init(|| {
+        let value = std::env::var_os("ROS_DISTRO");
+        runtime_admits_vendored_snapshot(value.as_deref().and_then(|v| v.to_str()))
+    })
+}
+
+/// Pure: does a runtime `ROS_DISTRO` value name a distro the vendored
+/// snapshot's era admits (`lyrical`, `rolling`, case-insensitive, trimmed)?
+/// Unset, empty, blank, or any other name: no.
+pub fn runtime_admits_vendored_snapshot(runtime: Option<&str>) -> bool {
+    let Some(raw) = runtime else { return false };
+    let named = crate::era_check::normalize_distro_claim(raw);
+    !named.is_empty()
+        && crate::era_check::era_claim_admits(crate::era_check::VENDORED_SNAPSHOT_ERA_TOKEN, &named)
 }
 
 /// A VENDORED build's C++ arm needs a POSITIVE runtime claim (pure, oracle
@@ -424,32 +448,25 @@ pub fn cpp_bridge_gate_for(bypass: CppBypassMode) -> CppBridgeGate {
 /// Kilted typesupport (112-byte members) by a process that never said which
 /// distro it is, the arm would walk the member array at the wrong stride,
 /// silently. So with the bypass `Off` and a `Supported` verdict, a vendored
-/// build admits the C++ arm only when `ROS_DISTRO` names a distro the
-/// snapshot's era admits (`lyrical`, `rolling`); anything else, including
-/// no name at all, refuses with its own paragraph. A generated build and
-/// every bypass mode pass through untouched, as does any other verdict.
+/// build admits the C++ arm only when the runtime names a distro the
+/// snapshot's era admits (`lyrical`, `rolling`; the pure decision is
+/// [`runtime_admits_vendored_snapshot`], read once per process by
+/// [`vendored_runtime_admits`]); anything else, including no name at all,
+/// refuses with its own paragraph. A generated build and every bypass mode
+/// pass through untouched, as does any other verdict.
 pub fn gate_vendored_cpp_arm(
     gate: CppBridgeGate,
     bypass: CppBypassMode,
     vendored: bool,
-    runtime: Option<&str>,
+    runtime_admits: bool,
 ) -> CppBridgeGate {
     if gate != CppBridgeGate::Supported || bypass != CppBypassMode::Off || !vendored {
         return gate;
     }
-    let named = runtime
-        .map(crate::era_check::normalize_distro_claim)
-        .filter(|r| !r.is_empty());
-    match named {
-        Some(r)
-            if crate::era_check::era_claim_admits(
-                crate::era_check::VENDORED_SNAPSHOT_ERA_TOKEN,
-                &r,
-            ) =>
-        {
-            CppBridgeGate::Supported
-        }
-        _ => CppBridgeGate::RefuseVendoredUnnamedRuntime,
+    if runtime_admits {
+        CppBridgeGate::Supported
+    } else {
+        CppBridgeGate::RefuseVendoredUnnamedRuntime
     }
 }
 
@@ -884,52 +901,42 @@ mod tests {
     #[test]
     fn the_vendored_cpp_arm_needs_a_positive_runtime_claim() {
         // Hand oracle over every input of the pure gate: a vendored build
-        // with the bypass off admits the C++ arm only for a runtime the
-        // snapshot's era admits; everything else passes through.
+        // with the bypass off admits the C++ arm only when the runtime
+        // admits; everything else passes through.
         use CppBridgeGate::{RefusePreJazzy, RefuseVendoredUnnamedRuntime, Supported};
         use CppBypassMode::{Off, TestSilent};
-        let cases: &[(
-            CppBridgeGate,
-            CppBypassMode,
-            bool,
-            Option<&str>,
-            CppBridgeGate,
-        )] = &[
-            (Supported, Off, true, None, RefuseVendoredUnnamedRuntime),
-            (Supported, Off, true, Some(""), RefuseVendoredUnnamedRuntime),
-            (
-                Supported,
-                Off,
-                true,
-                Some("   "),
-                RefuseVendoredUnnamedRuntime,
-            ),
-            (
-                Supported,
-                Off,
-                true,
-                Some("jazzy"),
-                RefuseVendoredUnnamedRuntime,
-            ),
-            (
-                Supported,
-                Off,
-                true,
-                Some("kilted"),
-                RefuseVendoredUnnamedRuntime,
-            ),
-            (Supported, Off, true, Some("lyrical"), Supported),
-            (Supported, Off, true, Some("LYRICAL"), Supported),
-            (Supported, Off, true, Some("rolling"), Supported),
-            (Supported, Off, false, None, Supported),
-            (Supported, TestSilent, true, None, Supported),
-            (RefusePreJazzy, Off, true, None, RefusePreJazzy),
+        let cases: &[(CppBridgeGate, CppBypassMode, bool, bool, CppBridgeGate)] = &[
+            (Supported, Off, true, false, RefuseVendoredUnnamedRuntime),
+            (Supported, Off, true, true, Supported),
+            (Supported, Off, false, false, Supported),
+            (Supported, TestSilent, true, false, Supported),
+            (RefusePreJazzy, Off, true, false, RefusePreJazzy),
+            (RefusePreJazzy, Off, true, true, RefusePreJazzy),
         ];
-        for (gate, bypass, vendored, runtime, want) in cases {
+        for (gate, bypass, vendored, admits, want) in cases {
             assert_eq!(
-                gate_vendored_cpp_arm(*gate, *bypass, *vendored, *runtime),
+                gate_vendored_cpp_arm(*gate, *bypass, *vendored, *admits),
                 *want,
-                "gate={gate:?} bypass={bypass:?} vendored={vendored} runtime={runtime:?}"
+                "gate={gate:?} bypass={bypass:?} vendored={vendored} admits={admits}"
+            );
+        }
+        // The pure admission over the runtime names: only the snapshot's
+        // era members, case-insensitively and trimmed, admit.
+        for (runtime, want) in [
+            (None, false),
+            (Some(""), false),
+            (Some("   "), false),
+            (Some("jazzy"), false),
+            (Some("kilted"), false),
+            (Some("humble"), false),
+            (Some("lyrical"), true),
+            (Some("LYRICAL"), true),
+            (Some(" rolling "), true),
+        ] {
+            assert_eq!(
+                runtime_admits_vendored_snapshot(runtime),
+                want,
+                "runtime={runtime:?}"
             );
         }
     }
@@ -958,42 +965,6 @@ mod tests {
         // key on.
         assert!(CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL
             .contains("refusing the rclcpp (C++ typesupport) path"));
-    }
-
-    #[cfg(cerulion_rmw_vendored_bindings)]
-    #[test]
-    #[serial]
-    fn a_vendored_build_refuses_the_cpp_arm_under_an_unnamed_runtime_and_admits_lyrical() {
-        // The wired seam, on the vendored (desk) build: the env decides.
-        {
-            let _g = EnvVarGuard::unset("ROS_DISTRO");
-            assert_eq!(
-                cpp_bridge_gate_for(CppBypassMode::Off),
-                CppBridgeGate::RefuseVendoredUnnamedRuntime
-            );
-        }
-        {
-            let _g = EnvVarGuard::set("ROS_DISTRO", "lyrical");
-            assert_eq!(
-                cpp_bridge_gate_for(CppBypassMode::Off),
-                CppBridgeGate::Supported
-            );
-        }
-        {
-            let _g = EnvVarGuard::set("ROS_DISTRO", "jazzy");
-            assert_eq!(
-                cpp_bridge_gate_for(CppBypassMode::Off),
-                CppBridgeGate::RefuseVendoredUnnamedRuntime
-            );
-        }
-        {
-            // The bypass the crate's own tests ride keeps admitting.
-            let _g = EnvVarGuard::unset("ROS_DISTRO");
-            assert_eq!(
-                cpp_bridge_gate_for(CppBypassMode::TestSilent),
-                CppBridgeGate::Supported
-            );
-        }
     }
 
     #[test]
@@ -1184,7 +1155,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn the_cpp_bridge_gate_is_bounded_on_both_edges() {
         // One build can only exercise one input combination (the cfgs
         // are fixed at compile time), so the classifier is pinned on
@@ -1255,16 +1225,15 @@ mod tests {
         // `ROS_DISTRO` the process carries.
         if bindings_source() == BindingsSource::Vendored {
             assert_eq!(c_introspection_era(), CIntrospectionEra::PostJazzy);
-            let runtime = std::env::var("ROS_DISTRO").ok();
             assert_eq!(
                 cpp_bridge_gate_for(CppBypassMode::Off),
                 gate_vendored_cpp_arm(
                     CppBridgeGate::Supported,
                     CppBypassMode::Off,
                     true,
-                    runtime.as_deref()
+                    vendored_runtime_admits()
                 ),
-                "the wired seam must agree with the pure vendored gate over the current env"
+                "the wired seam must agree with the pure vendored gate over the cached admission"
             );
         }
         assert_eq!(
@@ -1430,7 +1399,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn the_capability_fingerprint_names_exactly_the_cfgs_this_build_carries() {
         // `built_for()` is pinned here against the cfgs, not
         // against itself. Each capability token is present in the fingerprint iff
@@ -1510,16 +1478,15 @@ mod tests {
         };
         assert_eq!(c_introspection_era(), expected_era);
         // The wired seam is the pure classification plus the vendored
-        // runtime gate over the current environment (a no-op on a
+        // runtime gate over the once-per-process admission (a no-op on a
         // generated build).
-        let runtime = std::env::var("ROS_DISTRO").ok();
         assert_eq!(
             cpp_bridge_gate_for(CppBypassMode::Off),
             gate_vendored_cpp_arm(
                 classify_cpp_bridge(CppBypassMode::Off, expected_era),
                 CppBypassMode::Off,
                 bindings_source() == BindingsSource::Vendored,
-                runtime.as_deref()
+                vendored_runtime_admits()
             )
         );
         // The vendored snapshot's era token is pinned to the snapshot's

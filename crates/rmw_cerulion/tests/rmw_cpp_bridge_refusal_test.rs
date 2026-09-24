@@ -557,7 +557,7 @@ fn a_vendored_unnamed_runtime_verdict_refuses_at_error_with_its_own_constant_par
             lines,
             CppBridgeGate::RefuseVendoredUnnamedRuntime,
             "RefuseVendoredUnnamedRuntime",
-            "pre-Jazzy distro",
+            "rosidl-Buffer struct growth",
         )
     });
 }
