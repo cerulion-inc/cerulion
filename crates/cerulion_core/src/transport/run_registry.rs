@@ -725,6 +725,10 @@ fn open_doorbell_service(
             })?;
     node.service_builder(&name)
         .event()
+        // Same event-id ceiling as every other event service; see
+        // `CERULION_MAX_EVENT_ID`. This doorbell's listener sits in a timed
+        // wait that returns on every interval, so the ceiling is paid per tick.
+        .event_id_max_value(super::CERULION_MAX_EVENT_ID)
         .max_listeners(RUN_DOORBELL_MAX_LISTENERS)
         .max_notifiers(RUN_DOORBELL_MAX_NOTIFIERS)
         .open_or_create()

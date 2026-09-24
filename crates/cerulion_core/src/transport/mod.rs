@@ -72,6 +72,22 @@ use iceoryx2::prelude::*;
 // `unsafe impl Send/Sync`).
 pub(crate) use iceoryx2::service::ipc_threadsafe::Service as CerService;
 
+/// The `event_id_max_value` EVERY Cerulion event service is created with.
+///
+/// The highest `EventId` the transport mints is
+/// `PubSubEvent::PublisherDisconnected` (6), and iceoryx2's default ceiling is
+/// 255. The ceiling sizes a shared-memory counting bitset that a listener walks
+/// entry by entry on every wait, so the default charges each wait 256 atomic
+/// read-modify-writes to carry 7 ids. Sized from the event enum itself, so a
+/// new variant moves the ceiling with it.
+///
+/// A service is created with the ceiling of whichever process gets there first,
+/// and an open only fails when the EXISTING ceiling is below the one requested,
+/// so every creation site in the transport passes this and none may be left
+/// out: one uncapped creator restores the 255-wide walk for every later opener.
+/// `event_services_are_created_with_the_event_id_ceiling` pins that.
+const CERULION_MAX_EVENT_ID: usize = crate::transport::events::PubSubEvent::MAX_ID;
+
 use crate::clock::{Clock, RealClock};
 use crate::error::{NodeNameRefusal, TransportError, TransportResult};
 use crate::message::ShmMessage;
@@ -4791,10 +4807,13 @@ impl TransportManager {
                 map_err(format!("{e}{hint}"))
             })?;
 
+        // Size the event-id space to the ids this transport mints; see
+        // `CERULION_MAX_EVENT_ID`.
         let event_service = self
             .node
             .service_builder(&event_service_name)
             .event()
+            .event_id_max_value(CERULION_MAX_EVENT_ID)
             .open_or_create()
             .map_err(|e| map_err(format!("{e}{}", event_env_hint(&e))))?;
 
@@ -5004,10 +5023,14 @@ impl TransportManager {
             .as_str()
             .try_into()
             .map_err(|e| map_err(format!("{e}")))?;
+        // Same event-id ceiling as every other event service; see
+        // `CERULION_MAX_EVENT_ID`. This doorbell's listener is on a blocking
+        // wait, which is exactly the path the ceiling makes cheap.
         let event_service = self
             .node
             .service_builder(&event_service_name)
             .event()
+            .event_id_max_value(CERULION_MAX_EVENT_ID)
             .open_or_create()
             .map_err(|e| map_err(format!("{e}{}", event_env_hint(&e))))?;
         let notifier = event_service.notifier_builder().create().map_err(|e| {
@@ -6137,7 +6160,13 @@ impl TransportManager {
                 ports
             }
         });
-        let mut event_builder = self.node.service_builder(&event_service_name).event();
+        // Same event-id ceiling as the sibling open above; see
+        // `CERULION_MAX_EVENT_ID`.
+        let mut event_builder = self
+            .node
+            .service_builder(&event_service_name)
+            .event()
+            .event_id_max_value(CERULION_MAX_EVENT_ID);
         if let Some(event_ports) = armed_event_ports {
             event_builder = event_builder
                 .max_listeners(event_ports)
