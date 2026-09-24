@@ -2450,7 +2450,12 @@ jobs:
       # directly. It runs here rather than in a test shard because it drives
       # cargo itself, and this job's cache namespace is the one that carries
       # its dependency closure. The doctests in the same package run with it.
-      - name: cerulion umbrella tests
+      # Named for the crate rather than starting with it: a step name whose
+      # first word is `cerulion` followed by a lowercase word parses as an
+      # invocation of the binary to the login-gate walk in `cerulion_hygiene`,
+      # which every other step here dodges only because its package name
+      # carries an underscore.
+      - name: Umbrella crate tests (cerulion)
         env:
           # The scratch project's artifacts live outside `target/`, which this
           # job caches. They are about 1.6 GB and belong to a package set
