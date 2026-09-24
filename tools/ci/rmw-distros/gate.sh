@@ -26,8 +26,8 @@ set -u
 #            int8 request guids cast, the C++ mirror in its pre-Iron shape under
 #            cfg(not(cerulion_has_is_key)));
 #   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 20 more missing symbols,
-#            21 errors on this branch: the four pre-Iron type mismatches Foxy shared with Humble are
-#            fixed here, so the count moved from 25 and the row moved with it).
+#            21 errors: the four pre-Iron type mismatches Foxy shared with Humble no longer occur once
+#            Humble builds, so Foxy's count is 21 where it was 25 before Humble support).
 # A `build` row also pins floors the suite must clear before "green" means anything: at least
 # min_targets target summaries and min_tests tests run (ok, failed or ignored), pinned PER ROW from
 # that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run) with margin for
