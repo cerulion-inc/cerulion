@@ -271,11 +271,11 @@ fn hosted_sub(account_id: &str) -> Option<String> {
 
 /// The anonymous id to carry into a device login, so the account service can
 /// merge this machine's anonymous events into the account that signs in.
-/// `None` when this process sends nothing, and when `auth.json` already names
-/// an account: the id has then been merged into THAT account, and carrying it
+/// `None` when this process sends nothing, and when `auth.json` records a
+/// completed login: the id has then been merged into THAT account, and carrying it
 /// into a login as someone else would merge the two people.
 pub fn login_anon_id() -> Option<String> {
-    if auth::load().state().is_some() {
+    if auth::load().state().is_some_and(|s| s.logged_in_ever) {
         return None;
     }
     if SENDING.load(Ordering::Relaxed) {

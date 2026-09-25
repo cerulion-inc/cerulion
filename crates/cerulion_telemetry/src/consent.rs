@@ -218,8 +218,12 @@ mod enabled {
     /// answered from a lock-free read and leaves the file untouched.
     pub fn show_notice_once(show: impl FnOnce()) -> Result<bool, Error> {
         let path = file_path()?;
-        if read(&path)?.is_some_and(|f| f.notice_shown) {
-            return Ok(false);
+        match read(&path) {
+            Ok(Some(f)) if f.notice_shown => return Ok(false),
+            // A malformed file resolves to the default, as in `status`, and
+            // is rewritten fresh under the lock below.
+            Ok(_) | Err(Error::Json(_)) => {}
+            Err(e) => return Err(e),
         }
         let mut shown = false;
         update(|f| {
