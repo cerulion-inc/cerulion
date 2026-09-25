@@ -197,10 +197,10 @@ impl Telemetry {
             .name("vizd-telemetry-start".into())
             .spawn(move || {
                 // A start that finishes after shutdown gave up on it stops
-                // its own heartbeat and flushes what it queued.
+                // at once, with no budget, so nothing it queued is sent.
                 if let Err(mpsc::SendError(Some(late))) = ready.send(Telemetry::start_unless(&flag))
                 {
-                    late.shutdown();
+                    late.shutdown_by(Instant::now());
                 }
             });
         Starting {
