@@ -620,8 +620,10 @@ pub struct WorkerPlan {
     #[serde(default)]
     pub graph_identity: String,
     /// The cross-process rank (index in `process_group_order`, else the
-    /// `process_groups` declaration order) — the barrier ordering + trace-merge
-    /// tiebreaker. Mirrors [`ProcessGroup::rank`].
+    /// `process_groups` declaration order): this group's DEPLOYMENT POSITION,
+    /// and the cross-process trace-merge tiebreaker. Under
+    /// [`ExecutionMode::Lockstep`] it is also the barrier ordering; a free-run
+    /// deployment creates no barrier to order. Mirrors [`ProcessGroup::rank`].
     pub rank: usize,
     /// The barrier participant-map against the GLOBAL levelization: length =
     /// the global level count. `Some(local)` at global level `g` iff this group

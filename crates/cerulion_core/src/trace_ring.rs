@@ -481,24 +481,49 @@ pub const TRACE_RANK_MASK: u32 = 0x7FFF_FFFF; // bits [0..31)
 /// [`TRACE_DISCARD_BIT`].
 pub const DEPARTURE_RING_RANK: u32 = u32::MAX;
 
-/// The rank whose `STEP_BOUNDARY` records ARE the recording's clock
-/// trajectory — the one every reader of a boundary target walks.
+/// The ONE rank whose `STEP_BOUNDARY` records a boundary-target reader walks: 0.
 ///
 /// It is 0, and it always was; what is new is that it has a NAME. `replay_cmd`
 /// and `replay_engine` spell it as a bare `0` at half a dozen call sites
 /// (`BoundaryCursor::for_rank(trace, 0)`, `first_recorded_boundary`,
-/// `last_replayed_step`, the per-topic consistency cursor), each carrying its own
-/// copy of the same justification: *"rank 0's boundary targets are the
-/// authoritative clock trajectory — every graph publish stamps the SHARED gating
-/// clock, and `validate_step_boundaries` phase 2 PINS the peer ranks' targets to
-/// rank 0's on every shared step"*.
+/// `last_replayed_step`, the per-topic consistency cursor).
 ///
-/// The value now has a SECOND kind of reader: the RECORDER, which must
-/// measure the last boundary target its capture carries so the bag can state the
-/// range a resume covers. A recorder-side literal `0` and a replay-side literal
-/// `0` are two derivations of one fact, and the whole point of the covered range
-/// is that the two sides answer identically; so the constant lives in the crate
-/// both already depend on, beside the wire form it describes.
+/// # What it selects, and what it does NOT assert
+///
+/// It picks one rank's stream out of a multi-rank recording. Whether that stream
+/// is the recording's CLOCK is decided by the bag's `coordination` stamp, not
+/// here:
+///
+/// - Under the `CERULION_EXECUTION_MODE=lockstep` opt-out it IS the authoritative
+///   clock trajectory: every rank advances the same handed quantum, and the
+///   replay engine's `validate_step_boundaries` phase 2 refuses a bag whose peer
+///   targets differ from rank 0's at a shared step, so rank 0's target is every
+///   rank's target. The consumer that reads it that way is the replay engine's
+///   `last_recorded_boundary_target`, whose result is the upper edge a produced
+///   frame's timestamp is adjudicated against.
+/// - Under the FREE-RUN default there is no authoritative rank. Each rank's
+///   gating clock is placed at the shared `real_ns()` epoch and then wall-follows
+///   once per step with no barrier, so cross-rank targets differ on essentially
+///   every step BY DESIGN, and that same phase 2 is mode-gated off for exactly
+///   that reason; a replay drives each pass off its OWN rank's boundary cursor.
+///   What this constant selects is then rank 0's own stream and nothing wider: a
+///   peer rank's records can carry LATER targets, so the value read through it is
+///   not the capture's maximum.
+///
+/// The NAME is the lockstep-era spelling of that pick and is kept because writer
+/// and reader must spell it the same; it is not itself a claim about the mode.
+///
+/// # Why it lives HERE
+///
+/// The value has a SECOND kind of reader: the RECORDER, which must measure the
+/// last boundary target its capture carries so the bag can state the range a
+/// resume covers. A recorder-side literal `0` and a replay-side literal `0` are
+/// two derivations of one fact, and the covered range is only meaningful if the
+/// two sides answer identically IN BOTH MODES: `cerulion_bagd`'s
+/// `TrimmedTrace::last_boundary_target_ns` writes it and the replay engine's
+/// `last_recorded_boundary_target` reads it back, neither of them mode-gated. So
+/// the constant lives in the crate both already depend on, beside the wire form
+/// it describes.
 pub const AUTHORITATIVE_TRACE_RANK: u32 = 0;
 
 /// **A record-level refusal `bag play --resim` applies to every trace

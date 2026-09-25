@@ -4716,11 +4716,24 @@ fn graph_produced_topics(config: &GraphConfig) -> Vec<String> {
     produced
 }
 
-/// The first rank-0 `STEP_BOUNDARY` in the trace, if any.
+/// The first `STEP_BOUNDARY` on rank 0's stream, if any.
 ///
-/// Rank 0 is the authoritative clock source (see [`RankBoundaryCursors`]), so
-/// its first boundary is the step the recording begins at and the target it
-/// begins at. Peeked BEFORE `validate_step_boundaries` deliberately: a from-
+/// Called in BOTH modes, and what it names differs, so read it through
+/// [`PassBoundaries`] rather than as "the clock". Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out rank 0's stream IS the one stream
+/// every pass is driven from ([`PassBoundaries::Lockstep`]), so its first
+/// boundary is the step the recording begins at and the target it begins at.
+/// Under the free-run default each pass is driven off its OWN rank's cursor
+/// ([`PassBoundaries::Rank`]) and this is rank 0's own first boundary: the
+/// run-wide origin is taken elsewhere, as the MINIMUM first-boundary target
+/// across the ranks ([`crate::replay_rank::run_epoch_ns`]). Both of its callers
+/// are sound on that reading: the mid-run probe asks only whether rank 0's
+/// stream begins past step 0, and `resolve_resume` refuses a multi-rank free-run
+/// bag by name ([`ReplayError::FreeRunResumeUnsupported`]) before it places a
+/// clock off this value, leaving the one-rank case where rank 0's first boundary
+/// IS the recording's.
+///
+/// Peeked BEFORE `validate_step_boundaries` deliberately: a from-
 /// start bag must reach that validation with its error precedence unchanged,
 /// and this peek cannot fail a bag (a trace with no boundary reads as `None`
 /// and falls straight through to the existing `BagNoStepBoundaries` refusal).
@@ -16620,10 +16633,12 @@ fn validate_step_boundaries(
         prev[rank] = Some(b);
         Ok(())
     })?;
-    // Rank 0's boundaries are the authoritative replay clock, so THEY are the
-    // required stream (peer ranks' fires are checked against their own
-    // boundaries by consistency check 2; cross-rank boundary AGREEMENT is
-    // phase 2, below).
+    // Rank 0's stream is REQUIRED in both modes: under the lockstep opt-out it
+    // is the authoritative replay clock, and under the free-run default it is
+    // still the stream every rank-0-keyed derivation walks (the covered range's
+    // endpoint, the mid-run probe). Peer ranks' fires are checked against their
+    // own boundaries by consistency check 2; cross-rank boundary AGREEMENT is
+    // phase 2 below, and that phase is the mode-gated one.
     if !seen_rank0 {
         return Err(ReplayError::BagNoStepBoundaries);
     }

@@ -3321,9 +3321,10 @@ pub struct GraphRuntime {
     /// `external_sources_collected = true`), so `external_source()` is never
     /// re-queried on the refused resume path either.
     external_refusal: Option<Vec<(String, InertReason)>>,
-    /// A cross-process DAG-level barrier participant. `None` in
-    /// single-process builds, where `step` runs byte-identically to today; set to
-    /// `Some` AFTER build — in PRODUCTION by
+    /// A cross-process DAG-level barrier participant. `None` wherever no barrier
+    /// is mapped: a single-process build, where `step` runs byte-identically to
+    /// today, AND a multi-process worker on the free-run default, which maps
+    /// none. Set to `Some` AFTER build, in PRODUCTION by
     /// [`Self::build_live_deterministic_with_manager_and_barrier`] (the
     /// cross-process entrypoint), or in tests via
     /// [`Self::set_barrier_participant_for_test`]. UNCONDITIONAL (never `#[cfg]`-gate
@@ -3435,10 +3436,11 @@ pub struct GraphRuntime {
     /// Set true when a barrier boundary wait timed out (a peer
     /// crashed/stalled past the deadline). TERMINAL — a poisoned runtime refuses
     /// to step further (it must NEVER replay levels 0..g or re-arrive a corrupted
-    /// barrier generation). `false` in single-process builds (no barrier
-    /// participant); set `true` only when a cross-process barrier participant —
-    /// installed in PRODUCTION by
-    /// [`Self::build_live_deterministic_with_manager_and_barrier`] — hits a boundary
+    /// barrier generation). `false` wherever there is no barrier participant to
+    /// time out on: a single-process build, and a multi-process worker on the
+    /// free-run default. Set `true` only when a cross-process barrier participant
+    /// (installed in PRODUCTION by
+    /// [`Self::build_live_deterministic_with_manager_and_barrier`]) hits a boundary
     /// timeout. Observe it via [`Self::is_barrier_failed`] (the host contract).
     barrier_failed: bool,
     /// The per-topic iceoryx2 provisioning requirements this build
@@ -9010,10 +9012,15 @@ impl GraphRuntime {
     /// graph with no split same-level non-trigger edge reports — which is why
     /// every earlier generation pin still holds unchanged.
     ///
-    /// `None` on a single-process runtime (no barrier participant, so no
-    /// generations at all) — deliberately not `Some(0)`, which would read as
-    /// "this run crosses zero generations per step" and invite a caller to
-    /// multiply by it.
+    /// `None` wherever no barrier participant is installed, so there are no
+    /// generations at all to count: a single-process runtime, AND a
+    /// multi-process worker on the free-run default, which opens no barrier and
+    /// builds through [`Self::build_live_deterministic_free_run`] or
+    /// [`Self::build_live_free_run`] rather than through
+    /// [`Self::build_live_deterministic_with_manager_and_barrier`], the only
+    /// production path that installs one. Deliberately not `Some(0)`, which
+    /// would read as "this run crosses zero generations per step" and invite a
+    /// caller to multiply by it.
     ///
     /// **Identical on every participant by construction**: both terms come from
     /// the supervisor-stamped plan, and `install_barrier_participant` refuses a

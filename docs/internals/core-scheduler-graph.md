@@ -242,11 +242,15 @@ naming here because they are easy to get wrong:
   order with the same data (`polled_vs_live_iox2_test`, hand-oracle-anchored).
   `fire_time_ns` is the one legitimate difference on the default live path (wall-delta
   advancement).
-- Deterministic-live: `GraphRuntime::build_live_deterministic*` runs the live loop on a
-  Barrier gating clock advancing a fixed run-independent logical quantum (the graph's
-  tightest timing, floored at 1 ms) per `live_step`; recorded `fire_time_ns` is
-  replay-deterministic. Wall-clock health (liveliness sweeps, silence deadlines) rides a
-  DEDICATED `RealClock` watch clock; the two never mix.
+- Deterministic-live: the live loop runs on a CONTROLLED gating clock, advanced once per
+  `live_step`, so recorded `fire_time_ns` is replay-deterministic. HOW it advances is the
+  execution mode's: under the `CERULION_EXECUTION_MODE=lockstep` opt-out
+  (`build_live_deterministic_with_manager_and_barrier`, and the single-process
+  `build_live_deterministic*` builders) by a fixed run-independent logical quantum, the
+  graph's tightest timing floored at 1 ms; under the free-run default
+  (`build_live_deterministic_free_run`) by wall-following once per step from the shared
+  epoch, with no barrier. Wall-clock health (liveliness sweeps, silence deadlines) rides a
+  DEDICATED `RealClock` watch clock in both; the two never mix.
 - Replay never touches external sources: `external_source()` is queried exactly once, at
   `run_live` entry, never under polled `step()` or replay (provably: a panicking
   fixture + a query counter at zero while the replay leg delivers the oracle sequence).

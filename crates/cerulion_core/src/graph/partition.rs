@@ -84,7 +84,10 @@ use crate::graph::node::{BackpressurePolicy, NodeInfo};
 use crate::graph::topology::{resolve_levels, CreditBar, GraphTopology, Levels, TriggerEdges};
 use crate::scheduler::TraceEntry;
 
-/// One process group's derived barrier participation.
+/// One process group's derived DEPLOYMENT POSITION and barrier participation.
+///
+/// Both halves are derived in every execution mode; only the lockstep opt-out
+/// creates a barrier for the participation half to be used by.
 ///
 /// Produced by [`derive_process_groups`] from a validated
 /// [`GraphConfig::process_groups`] + the graph's global [`Levels`]. The
@@ -95,10 +98,12 @@ use crate::scheduler::TraceEntry;
 pub struct ProcessGroup {
     /// The declared group name (e.g. `"perception"`).
     pub name: String,
-    /// The group's cross-process rank — the index of `name` in the rank
-    /// order: the `process_groups` DECLARATION (listing) order by default, or
-    /// the explicit `process_group_order` list when one is provided. The
-    /// cross-process trace-merge tiebreaker + barrier ordering.
+    /// The group's cross-process rank: the index of `name` in the rank order,
+    /// which is the `process_groups` DECLARATION (listing) order by default, or
+    /// the explicit `process_group_order` list when one is provided. It is this
+    /// group's DEPLOYMENT POSITION, and with it the cross-process trace-merge
+    /// tiebreaker. It is the barrier ordering only under the lockstep execution
+    /// mode, the one mode whose supervisor creates a barrier at all.
     pub rank: usize,
     /// The barrier participant-map: length = the global level count.
     /// `Some(local)` at global level `g` iff this group owns ≥1 node at `g`
