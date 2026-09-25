@@ -31,6 +31,7 @@ def test_released_typed_views_return_their_slot_without_cyclic_gc(session):
     pub, sub = _pair(session, schemas, "GcProbe", "typed-gc")
     was_enabled = gc.isenabled()
     gc.disable()
+    held = []
     try:
         for i in range(3 * sub.max_borrowed_samples + 1):
             pub.publish({"id": i, "values": [i, i + 1]})
@@ -40,7 +41,9 @@ def test_released_typed_views_return_their_slot_without_cyclic_gc(session):
             assert message.id == i
             assert bytes(message.values) == bytes([i, i + 1])
             frame.release()
-            del message, frame
+            held.append((frame, message))
+            if len(held) > sub.max_borrowed_samples:
+                held.pop(0)
     finally:
         if was_enabled:
             gc.enable()

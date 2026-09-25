@@ -5,6 +5,7 @@ that delegate to the native objects and add iteration / context-manager
 / NumPy conveniences.
 """
 
+import numbers
 import threading
 import weakref
 
@@ -168,7 +169,12 @@ class Publisher:
                 raise TypeError(f"unknown variable field(s): {', '.join(sorted(unknown))}")
             lengths = []
             for field in layout.variable_fields:
-                length = int(variable_lengths.get(field.name, 0))
+                length = variable_lengths.get(field.name, 0)
+                if isinstance(length, bool) or not isinstance(length, numbers.Integral):
+                    raise TypeError(
+                        f"length for {field.name} must be an int, not {type(length).__name__}"
+                    )
+                length = int(length)
                 if length < 0:
                     raise ValueError(f"length for {field.name} must be non-negative")
                 lengths.append(_wire_length(field.field_type, length))
@@ -189,6 +195,8 @@ class Publisher:
 
     def publish_frame(self, frame_bytes, timestamp_ns=None):
         """Publish a complete wire frame, preserving its offset table."""
+        if self._schema is not None:
+            self._check_schema_binding()
         self._native.publish_frame(frame_bytes, timestamp_ns)
 
 

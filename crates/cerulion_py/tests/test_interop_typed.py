@@ -106,7 +106,10 @@ def test_rust_laserscan_decodes_as_typed_message(session, fixture_bin):
     frame.release()
 
 
-def _python_to_rust(schema, payload, session, fixture_bin, schemas, name):
+def _python_to_rust(schema, payload, session, fixture_bin, schemas, name, expected_values):
+    """Publish ``payload`` from Python; the Rust fixture's decoded field
+    values must match the hand-written ``expected_values`` oracle, and its
+    frame bytes must match the frame a Python subscriber received."""
     topic = unique_topic(name)
     proc = spawn_fixture(
         fixture_bin,
@@ -132,6 +135,7 @@ def _python_to_rust(schema, payload, session, fixture_bin, schemas, name):
     finish_proc(proc)
     output = proc.stdout.read() if proc.stdout else ""
     frame.release()
+    assert f"schema={schema} values={expected_values}\n" in output, output
     assert output_frame_hex(output) == expected_hex
 
 
@@ -177,6 +181,7 @@ def test_python_dict_pins_vector3_bytes(session, fixture_bin):
         fixture_bin,
         schemas,
         "interop-python-dict-vector3",
+        "x=1.5 y=-2.25 z=0.001",
     )
 
 
@@ -247,6 +252,10 @@ def test_python_dict_pins_laserscan_bytes(session, fixture_bin):
         fixture_bin,
         schemas,
         "interop-python-dict-laserscan",
+        "angle_min=-1.5 angle_max=1.5 angle_increment=0.25 time_increment=0.001 "
+        "scan_time=0.1 range_min=0.2 range_max=30 ranges=[1.5, 2.25, 3.0, 0.5] "
+        "intensities=[10.0, 20.0, 30.0, 40.0] header_stamp_sec=7 "
+        "header_stamp_nanosec=9 frame_id=laser",
     )
 
 
