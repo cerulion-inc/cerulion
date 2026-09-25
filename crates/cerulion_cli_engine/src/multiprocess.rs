@@ -2110,7 +2110,14 @@ pub(crate) fn subgraph_for(
         .collect();
 
     GraphConfig {
-        execution: None,
+        // The parent's execution shape travels with the worker. A worker that
+        // resolved the built-in default instead would decide differently from
+        // the deployment it belongs to, and a decision that varied per process
+        // within one run is exactly what makes a replay a different program.
+        // The block is graph-wide rather than per-group, so it passes through
+        // whole; the per-node `fuse:` keys ride along on the node entries this
+        // subgraph keeps.
+        execution: config.execution.clone(),
         // A parent `level_assignments` override is
         // RESTRICTED to this group's members and COMPRESSED to the group's
         // 0-based local band (`compress_group_level_assignments` — the SAME
