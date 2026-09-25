@@ -46,6 +46,28 @@ def test_released_typed_views_return_their_slot_without_cyclic_gc(session):
             gc.enable()
 
 
+def test_release_detaches_views_from_every_schema_binding(session):
+    yaml = "schemas:\n  TwoSets:\n    fields:\n      uint32 id: {}\n"
+    first = cerulion.SchemaSet()
+    first.add_yaml(yaml)
+    second = cerulion.SchemaSet()
+    second.add_yaml(yaml)
+    pub, sub = _pair(session, first, "TwoSets", "typed-two-sets")
+    kept = []
+    for i in range(3 * sub.max_borrowed_samples + 1):
+        pub.publish({"id": i})
+        frame = sub.receive(1000)
+        assert frame is not None, f"iteration {i}"
+        views = (frame.view(first, "TwoSets"), frame.view(second, "TwoSets"))
+        assert [view.id for view in views] == [i, i]
+        frame.release()
+        kept.append(views)
+    for views in kept:
+        for view in views:
+            with pytest.raises(cerulion.ReleasedFrame):
+                view.id
+
+
 def test_view_on_a_released_frame_raises_even_when_cached(session):
     schemas = cerulion.SchemaSet()
     schemas.add_yaml("schemas:\n  Cached:\n    fields:\n      uint32 id: {}\n")
