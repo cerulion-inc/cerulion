@@ -41,6 +41,7 @@ native_ros2_messages = {{ workspace = true }}
 
 /// Generate the standalone manifest for an embedded Python node.
 pub fn generate_python_cargo_toml(node_type: &str, pynode_path: &str) -> String {
+    let pynode_path = toml::Value::String(pynode_path.to_string());
     format!(
         r#"[package]
 name = "{node_type}"
@@ -51,7 +52,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-cerulion_pynode = {{ path = "{pynode_path}" }}
+cerulion_pynode = {{ path = {pynode_path} }}
 
 [profile.release]
 strip = true
@@ -129,11 +130,11 @@ pub fn generate_python_node_py(
     inputs: &[(String, String)],
     outputs: &[(String, String)],
     policy: &str,
-    trigger: Option<&str>,
+    triggers: &[String],
 ) -> String {
     let mut result = format!("import cerulion as cer\n\n\n@cer.node({policy})\nclass Node:\n");
     for (name, schema) in inputs {
-        let trigger_suffix = if trigger == Some(name.as_str()) {
+        let trigger_suffix = if triggers.contains(name) {
             ", trigger=True"
         } else {
             ""

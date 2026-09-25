@@ -336,9 +336,7 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
             eprintln!("init failed: {error}");
             return Ok(ExitCode::FAILURE);
         }
-        if std::env::var("CERULION_PYNODE_CASE").as_deref() == Ok("spawn_thread") {
-            eprintln!("WARN embedded Python node created additional threads threads=2");
-        }
+        let tick_on_worker = std::env::var_os("CERULION_PYNODE_TICK_THREAD").is_some();
         let mut elapsed_ns = Vec::with_capacity(ticks);
         for tick in 0..ticks {
             for (_, publisher, hash) in &mut input_publishers {
@@ -379,7 +377,12 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
                     .map_err(|error| error.to_string())?;
             }
             let started = Instant::now();
-            let tick_result = entry.tick();
+            let tick_result = if tick_on_worker {
+                std::thread::scope(|scope| scope.spawn(|| entry.tick()).join())
+                    .map_err(|_| "tick worker thread panicked")?
+            } else {
+                entry.tick()
+            };
             elapsed_ns.push(started.elapsed().as_nanos() as u64);
             match tick_result {
                 Ok(()) => {

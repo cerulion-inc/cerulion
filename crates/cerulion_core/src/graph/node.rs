@@ -1310,6 +1310,16 @@ impl AnySubscriber {
         }
     }
 
+    /// Dispatches to [`CerulionSubscriber::view_raw_expecting`].
+    pub fn view_raw_expecting(
+        &mut self,
+        schema_hash: u64,
+    ) -> TransportResult<Option<RawInputView<'_>>> {
+        match self {
+            Self::Ipc(s) => s.view_raw_expecting(schema_hash),
+        }
+    }
+
     /// Returns the topic name.
     pub fn topic(&self) -> &str {
         match self {

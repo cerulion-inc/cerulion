@@ -141,7 +141,13 @@ def node(
             if reserved in cls.__dict__:
                 raise TypeError(f"reserved method name: {reserved}")
         ports = list(getattr(cls, "__cerulion_declared_ports__", ()))
+        seen = set()
         for port in ports:
+            if port.name in seen:
+                raise TypeError(f"duplicate port name: {port.name}")
+            seen.add(port.name)
+            if port.name.startswith("__") and port.name.endswith("__"):
+                raise TypeError(f"reserved port name: {port.name}")
             if port.name.startswith("_cer_") or port.name.startswith("__cerulion") or port.name in (
                 "now_ns",
                 "request_shutdown",
@@ -214,7 +220,7 @@ def node(
             document = {
                 "inputs": input_info,
                 "outputs": output_info,
-                "policy": policy,
+                "policy": effective_policy,
             }
             if tick_within_ms is not None:
                 document["tick_within_ms"] = tick_within_ms
@@ -260,10 +266,10 @@ def node(
 
 
 class _Runtime:
-    def __init__(self, cls, ctx, schemas=None):
+    def __init__(self, cls, ctx, schemas=None, workspace=None):
         self.cls = cls
         self.ctx = ctx
-        root = ctx.env("CERULION_WORKSPACE", None) if schemas is None else None
+        root = (workspace or ctx.env("CERULION_WORKSPACE", None)) if schemas is None else None
         self.schemas = schemas or SchemaSet.from_workspace(root or os.getcwd())
         self.instance = cls()
         self.instance._cer_ctx = ctx

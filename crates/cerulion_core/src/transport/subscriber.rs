@@ -2832,6 +2832,24 @@ impl CerulionSubscriber {
     /// slot and do not advance the service cursor.
     #[must_use = "raw input view must be checked"]
     pub fn view_raw(&mut self) -> TransportResult<Option<RawInputView<'_>>> {
+        self.view_raw_checked(None)
+    }
+
+    /// [`Self::view_raw`] that also requires the frame's schema hash to equal
+    /// `schema_hash`. A mismatched frame is `Err(SchemaMismatch)` and, like a
+    /// typed [`Self::try_view`] rejection, does not advance the service cursor.
+    #[must_use = "raw input view must be checked"]
+    pub fn view_raw_expecting(
+        &mut self,
+        schema_hash: u64,
+    ) -> TransportResult<Option<RawInputView<'_>>> {
+        self.view_raw_checked(Some(schema_hash))
+    }
+
+    fn view_raw_checked(
+        &mut self,
+        schema_hash: Option<u64>,
+    ) -> TransportResult<Option<RawInputView<'_>>> {
         let slot = self.select_slot();
         match slot {
             FrozenSlot::Held => {
@@ -2844,14 +2862,14 @@ impl CerulionSubscriber {
                             self.topic
                         ),
                     })?;
-                let frame_len = validate_raw_frame(&self.topic, sample.payload())?;
+                let frame_len = validate_raw_frame(&self.topic, sample.payload(), schema_hash)?;
                 Ok(Some(RawInputView {
                     inner: RawInputViewInner::Held(&sample.payload()[..frame_len]),
                 }))
             }
             FrozenSlot::Empty => Ok(None),
             FrozenSlot::Sample(sample) => {
-                let frame_len = validate_raw_frame(&self.topic, sample.payload())?;
+                let frame_len = validate_raw_frame(&self.topic, sample.payload(), schema_hash)?;
                 self.record_service_cursor(sample.payload());
                 Ok(Some(RawInputView {
                     inner: RawInputViewInner::Owned(sample, frame_len),
@@ -4800,7 +4818,11 @@ impl CerulionSubscriber {
 }
 
 /// Validates a raw frame's `WireHeader` bounds and returns its total length.
-fn validate_raw_frame(topic: &str, raw: &[u8]) -> TransportResult<usize> {
+fn validate_raw_frame(
+    topic: &str,
+    raw: &[u8],
+    expected_schema_hash: Option<u64>,
+) -> TransportResult<usize> {
     if raw.len() < WireHeader::SIZE {
         return Err(TransportError::Deserialization {
             topic: topic.to_string(),
@@ -4815,6 +4837,15 @@ fn validate_raw_frame(topic: &str, raw: &[u8]) -> TransportResult<usize> {
         topic: topic.to_string(),
         reason: "failed to parse WireHeader from received message".to_string(),
     })?;
+    if let Some(expected_hash) = expected_schema_hash {
+        if header.schema_hash != expected_hash {
+            return Err(TransportError::SchemaMismatch {
+                topic: topic.to_string(),
+                expected_hash,
+                actual_hash: header.schema_hash,
+            });
+        }
+    }
     let total_size = header.total_size as usize;
     if total_size < WireHeader::SIZE || total_size > raw.len() {
         return Err(TransportError::Deserialization {
@@ -5702,7 +5733,7 @@ mod tests {
         let mut frame = [0_u8; WireHeader::SIZE];
         frame[8..12].copy_from_slice(&(WireHeader::SIZE as u32).to_le_bytes());
         assert_eq!(
-            validate_raw_frame("/raw", &frame).unwrap(),
+            validate_raw_frame("/raw", &frame, None).unwrap(),
             WireHeader::SIZE
         );
     }
@@ -5710,13 +5741,13 @@ mod tests {
     #[test]
     fn raw_frame_validation_rejects_undersized_and_out_of_bounds_frames() {
         assert!(matches!(
-            validate_raw_frame("/raw", &[0; WireHeader::SIZE - 1]),
+            validate_raw_frame("/raw", &[0; WireHeader::SIZE - 1], None),
             Err(TransportError::Deserialization { .. })
         ));
         let mut frame = [0_u8; WireHeader::SIZE];
         frame[8..12].copy_from_slice(&((WireHeader::SIZE as u32) + 1).to_le_bytes());
         assert!(matches!(
-            validate_raw_frame("/raw", &frame),
+            validate_raw_frame("/raw", &frame, None),
             Err(TransportError::Deserialization { .. })
         ));
     }
@@ -5733,6 +5764,60 @@ mod tests {
         ];
         frame[20..24].copy_from_slice(&sequence.to_le_bytes());
         frame
+    }
+
+    #[test]
+    fn view_raw_expecting_rejects_a_foreign_schema_without_advancing_the_cursor() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_expecting".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/expecting";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        let cursor = Arc::new(AtomicU64::new(0));
+        subscriber.register_service_cursor(Arc::clone(&cursor));
+
+        publisher
+            .publish_raw(&raw_view_frame(4))
+            .expect("publish foreign");
+        match subscriber.view_raw_expecting(0x1122_3344_5566_7788) {
+            Err(TransportError::SchemaMismatch {
+                expected_hash,
+                actual_hash,
+                ..
+            }) => {
+                assert_eq!(expected_hash, 0x1122_3344_5566_7788);
+                assert_eq!(actual_hash, 0x0102_0304_0506_0708);
+            }
+            other => panic!(
+                "expected SchemaMismatch, got {:?}",
+                other.map(|v| v.is_some())
+            ),
+        }
+        assert_eq!(cursor.load(Ordering::Acquire), 0);
+
+        publisher
+            .publish_raw(&raw_view_frame(5))
+            .expect("publish matching");
+        let view = subscriber
+            .view_raw_expecting(0x0102_0304_0506_0708)
+            .expect("view")
+            .expect("sample");
+        assert_eq!(&*view, raw_view_frame(5).as_slice());
+        drop(view);
+        assert_eq!(cursor.load(Ordering::Acquire), 6);
     }
 
     #[test]

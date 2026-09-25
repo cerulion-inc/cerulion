@@ -41,6 +41,11 @@ cerulion node build counter
 `nodes/counter/node.py`, regenerates the baked metadata block in `src/lib.rs`,
 and invokes Cargo. The Python process receives `CERULION_WORKSPACE` so schema
 declarations resolve against the same workspace used by the graph runtime.
+At run time a Python node resolves schemas against `CERULION_WORKSPACE` when it
+is set, otherwise against the workspace that contains its `nodes/<type>/`
+directory, so `cerulion graph run` works from any subdirectory.
+A Python node exports no state capture or restore: it behaves like a Rust node
+that declares no state, so it starts from `init` on every run.
 ROS 2 built-in messages such as `geometry_msgs/*` and `sensor_msgs/*` resolve
 without a `schemas/` entry. A workspace schema with the same qualified name
 overrides the built-in.

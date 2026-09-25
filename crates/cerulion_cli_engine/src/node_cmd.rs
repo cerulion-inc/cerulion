@@ -44,6 +44,16 @@ fn acquire_workspace_lock(dir: &Path) -> CliResult<(WorkspaceLock, std::path::Pa
     Ok((lock, canonical_dir))
 }
 
+/// Inputs the scaffold marks `trigger=True`: the data-trigger input, or every
+/// input of a sync node (the aligned set).
+fn python_trigger_inputs(policy: Option<&MacroPolicy>, inputs: &[(String, String)]) -> Vec<String> {
+    match policy {
+        Some(MacroPolicy::DataTrigger { input_name }) => vec![input_name.clone()],
+        Some(MacroPolicy::Sync { .. }) => inputs.iter().map(|(name, _)| name.clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn python_policy(policy: Option<&MacroPolicy>) -> CliResult<(serde_json::Value, String)> {
     match policy {
         Some(MacroPolicy::Period { period_ms }) => Ok((
@@ -222,6 +232,27 @@ pub fn node_create_with_options(
         }
         if let Some(name) = &options.trigger {
             utils::validate_python_identifier(name)?;
+            if !options.inputs.iter().any(|(_, input)| input == name) {
+                return Err(CliError::Validation(format!(
+                    "trigger '{name}' does not name an input port"
+                )));
+            }
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, name) in options.inputs.iter().chain(options.outputs.iter()) {
+            if !seen.insert(name.as_str()) {
+                return Err(CliError::Validation(format!(
+                    "duplicate port name '{name}': a Python node's inputs and outputs share one namespace"
+                )));
+            }
+        }
+        if matches!(policy, Some(cerulion_core::MacroPolicy::Sync { .. }))
+            && options.inputs.len() < 2
+        {
+            return Err(CliError::Validation(
+                "a sync_window_ms Python node needs at least two inputs (-i SCHEMA NAME); every input joins the aligned set"
+                    .to_string(),
+            ));
         }
     }
 
@@ -404,7 +435,7 @@ pub fn node_create_with_options(
                 &python_inputs,
                 &python_outputs,
                 python_policy_expr,
-                options.trigger.as_deref(),
+                &python_trigger_inputs(policy.as_ref(), &python_inputs),
             ),
         )?;
     }
@@ -1934,6 +1965,49 @@ mod tests {
     }
 
     #[test]
+    fn python_node_create_rejects_unusable_port_sets_before_writing() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let port = |name: &str| ("geometry_msgs/Vector3".to_string(), name.to_string());
+        let cases = [
+            (
+                NodeCreateOptions {
+                    inputs: vec![port("inp")],
+                    trigger: Some("missing".to_string()),
+                    language: NodeLanguage::Python,
+                    ..NodeCreateOptions::default()
+                },
+                None,
+                "trigger 'missing' does not name an input port",
+            ),
+            (
+                NodeCreateOptions {
+                    inputs: vec![port("same")],
+                    outputs: vec![port("same")],
+                    language: NodeLanguage::Python,
+                    ..NodeCreateOptions::default()
+                },
+                Some(cerulion_core::MacroPolicy::Period { period_ms: 10 }),
+                "duplicate port name 'same'",
+            ),
+            (
+                NodeCreateOptions {
+                    inputs: vec![port("left")],
+                    language: NodeLanguage::Python,
+                    ..NodeCreateOptions::default()
+                },
+                Some(cerulion_core::MacroPolicy::Sync { window_ms: 10 }),
+                "needs at least two inputs",
+            ),
+        ];
+        for (options, policy, expected) in cases {
+            let err = node_create_with_options(&nodes_dir, &cargo_toml, "bad", policy, &options)
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+            assert!(!nodes_dir.join("bad").exists());
+        }
+    }
+
+    #[test]
     fn python_node_create_writes_scaffold() {
         let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
         let options = NodeCreateOptions {
@@ -2359,8 +2433,37 @@ mod tests {
             "// SPDX-License-Identifier: AGPL-3.0-only\n// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{\\\"inputs\\\":[{\\\"name\\\":\\\"inp\\\",\\\"schema_hash\\\":0}],\\\"outputs\\\":[{\\\"max_slice_len_default\\\":null,\\\"name\\\":\\\"out\\\",\\\"promise_within_ms\\\":null,\\\"schema_hash\\\":0,\\\"wire_fixed_size\\\":null}],\\\"policy\\\":{\\\"period_ms\\\":100}}\\0\";\n// CERULION:INFO_END\n\ncerulion_pynode::export_node! {\n    module: \"node\",\n    sys_path: [\n// CERULION:SYSPATH_START\n    \"/workspace/nodes/echo\",\n// CERULION:SYSPATH_END\n    ],\n    info: INFO_BYTES\n}\n"
         );
         assert_eq!(
-            templates::generate_python_node_py(&inputs, &outputs, "period_ms=100", None),
+            templates::generate_python_node_py(&inputs, &outputs, "period_ms=100", &[]),
             "import cerulion as cer\n\n\n@cer.node(period_ms=100)\nclass Node:\n    inp = cer.input(\"geometry_msgs/Vector3\")\n    out = cer.output(\"geometry_msgs/Vector3\")\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n"
+        );
+    }
+
+    #[test]
+    fn python_cargo_toml_escapes_the_pynode_path() {
+        let manifest =
+            templates::generate_python_cargo_toml("echo", "/check\"out\\x/cerulion_pynode");
+        let parsed: toml::Value = toml::from_str(&manifest).expect("manifest parses");
+        assert_eq!(
+            parsed["dependencies"]["cerulion_pynode"]["path"].as_str(),
+            Some("/check\"out\\x/cerulion_pynode")
+        );
+    }
+
+    #[test]
+    fn python_sync_scaffold_marks_every_input_as_a_trigger() {
+        let inputs = vec![
+            ("left".to_string(), "Probe".to_string()),
+            ("right".to_string(), "Probe".to_string()),
+        ];
+        let triggers = python_trigger_inputs(Some(&MacroPolicy::Sync { window_ms: 10 }), &inputs);
+        assert_eq!(triggers, vec!["left".to_string(), "right".to_string()]);
+        let source =
+            templates::generate_python_node_py(&inputs, &[], "sync_window_ms=10", &triggers);
+        assert!(source.contains("left = cer.input(\"Probe\", trigger=True)"));
+        assert!(source.contains("right = cer.input(\"Probe\", trigger=True)"));
+        assert_eq!(
+            python_trigger_inputs(Some(&MacroPolicy::Period { period_ms: 5 }), &inputs),
+            Vec::<String>::new()
         );
     }
 
@@ -2378,22 +2481,22 @@ mod tests {
             &inputs,
             &outputs,
             "trigger=\"triggered\"",
-            Some("triggered"),
+            &["triggered".to_string()],
         );
         assert!(source.contains("left = cer.input(\"Probe\")"));
         assert!(source.contains("triggered = cer.input(\"Probe\", trigger=True)"));
         assert!(source.contains("first = cer.output(\"Probe\")"));
         assert!(source.contains("second = cer.output(\"Probe\")"));
         assert!(
-            templates::generate_python_node_py(&[], &[], "period_ms=1", None)
+            templates::generate_python_node_py(&[], &[], "period_ms=1", &[])
                 .contains("        return\n")
         );
         assert!(
-            templates::generate_python_node_py(&inputs, &[], "period_ms=1", None)
+            templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[])
                 .contains("msg = self.left")
         );
         assert!(
-            templates::generate_python_node_py(&[], &outputs, "period_ms=1", None)
+            templates::generate_python_node_py(&[], &outputs, "period_ms=1", &[])
                 .contains("out = self.first")
         );
     }

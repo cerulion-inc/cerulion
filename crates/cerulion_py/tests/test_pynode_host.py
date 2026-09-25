@@ -190,6 +190,24 @@ def test_two_node_types_share_one_process():
     ]
 
 
+def test_host_pynode_ticks_on_a_thread_other_than_the_initializing_one():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    env = _node_env("counter")
+    env["CERULION_PYNODE_TICK_THREAD"] = "1"
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", path, "2"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=0 out=0100000000000000",
+        "tick=1 code=0 out=0300000000000000",
+    ]
+
+
 def test_extra_thread_warning_is_latched():
     result = _run("errors", "spawn_thread", ticks=3)
     assert result.returncode == 0

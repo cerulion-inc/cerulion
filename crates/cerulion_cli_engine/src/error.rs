@@ -62,6 +62,11 @@ pub enum CliError {
 /// Result type alias for CLI operations.
 pub type CliResult<T> = Result<T, CliError>;
 
+#[cfg(target_os = "macos")]
+const LIBRARY_PATH_VAR: &str = "DYLD_LIBRARY_PATH";
+#[cfg(not(target_os = "macos"))]
+const LIBRARY_PATH_VAR: &str = "LD_LIBRARY_PATH";
+
 /// Render a CLI error with an actionable remedy for missing embedded-Python
 /// runtime libraries.
 pub fn render_user_error(error: &CliError) -> String {
@@ -71,7 +76,7 @@ pub fn render_user_error(error: &CliError) -> String {
             return format!(
                 "{rendered}\nPython node cdylib could not find libpython; rebuild with \
                  `cerulion node build <type>` (bakes the interpreter's LIBDIR rpath) or set \
-                 LD_LIBRARY_PATH"
+                 {LIBRARY_PATH_VAR}"
             );
         }
     }

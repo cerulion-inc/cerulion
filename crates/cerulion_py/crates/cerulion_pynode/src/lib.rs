@@ -48,6 +48,26 @@ fn builtin_schemas() -> Vec<MessageSchema> {
         .collect()
 }
 
+/// The workspace whose `schemas/` a node resolves against: `CERULION_WORKSPACE`
+/// when set, else the workspace that owns the node's baked source directory
+/// (`<workspace>/nodes/<type>`, the first `sys_path` entry), else the cwd.
+fn node_workspace(ctx: &NodeContext, sys_path: &[&str]) -> Result<std::path::PathBuf, String> {
+    let explicit = ctx.env_str("CERULION_WORKSPACE", "");
+    if !explicit.is_empty() {
+        return Ok(explicit.into());
+    }
+    if let Some(root) = sys_path
+        .first()
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .filter(|root| root.join("nodes").is_dir())
+    {
+        return Ok(root.to_path_buf());
+    }
+    std::env::current_dir().map_err(|error| error.to_string())
+}
+
 fn node_schemas(workspace: &std::path::Path) -> Result<SchemaSet, String> {
     let (workspace_set, warnings) =
         SchemaSet::from_workspace_dir(workspace).map_err(|error| error.to_string())?;
@@ -473,6 +493,9 @@ fn initialize_python() -> Result<(), String> {
             if PyStatus_Exception(status) != 0 {
                 return Err("Py_InitializeFromConfig failed".to_string());
             }
+            // Initialization leaves this thread holding the GIL; release it so
+            // any scheduler thread can attach for later ticks.
+            pyo3::ffi::PyEval_SaveThread();
         }
     }
     static INIT_LOG: Once = Once::new();
@@ -642,6 +665,49 @@ impl Host {
             input_hashes,
             outputs: output_meta,
         })
+    }
+
+    /// The compiled INFO is the declaration with each port's `schema` name
+    /// removed; any other difference (policy, depth, timing, backpressure,
+    /// sizes) means the scheduler would run a stale compiled shape.
+    fn validate_declaration_matches_info(info: &[u8], declaration: &str) -> Result<(), String> {
+        let info = info.strip_suffix(&[0]).unwrap_or(info);
+        let compiled: serde_json::Value = serde_json::from_slice(info)
+            .map_err(|error| format!("invalid node metadata: {error}"))?;
+        let mut current: serde_json::Value = serde_json::from_str(declaration)
+            .map_err(|error| format!("invalid Python declaration metadata: {error}"))?;
+        for section in ["inputs", "outputs"] {
+            if let Some(ports) = current
+                .get_mut(section)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for port in ports
+                    .iter_mut()
+                    .filter_map(serde_json::Value::as_object_mut)
+                {
+                    port.remove("schema");
+                }
+            }
+        }
+        if compiled == current {
+            return Ok(());
+        }
+        let empty = serde_json::Map::new();
+        let compiled_keys = compiled.as_object().unwrap_or(&empty);
+        let current_keys = current.as_object().unwrap_or(&empty);
+        let key = compiled_keys
+            .keys()
+            .chain(current_keys.keys())
+            .find(|key| compiled_keys.get(*key) != current_keys.get(*key))
+            .map_or("<document>", String::as_str);
+        let show = |value: Option<&serde_json::Value>| {
+            value.map_or_else(|| "absent".to_string(), serde_json::Value::to_string)
+        };
+        Err(format!(
+            "node metadata is stale: compiled {key} {}, declaration {}; run `cerulion node build`",
+            show(compiled_keys.get(key)),
+            show(current_keys.get(key)),
+        ))
     }
 
     fn validate_declaration_metadata(
@@ -820,12 +886,7 @@ impl Host {
                 ));
             }
             let metadata = Self::metadata(info, &classes[0].1)?;
-            let workspace: std::path::PathBuf = ctx.env_str("CERULION_WORKSPACE", "").into();
-            let workspace = if workspace.as_os_str().is_empty() {
-                std::env::current_dir().map_err(|error| error.to_string())?
-            } else {
-                workspace
-            };
+            let workspace = node_workspace(&ctx, sys_path)?;
             let schemas = node_schemas(&workspace)?;
             let ctx_ptr = Rc::new(Cell::new((&mut *ctx) as *mut NodeContext));
             let host_ctx = Py::new(
@@ -840,7 +901,12 @@ impl Host {
                 .and_then(|m| m.getattr("_Runtime"))
                 .map_err(python_error)?;
             let runtime = runtime_cls
-                .call1((classes[0].1.clone(), host_ctx, py.None()))
+                .call1((
+                    classes[0].1.clone(),
+                    host_ctx,
+                    py.None(),
+                    workspace.to_string_lossy().into_owned(),
+                ))
                 .map_err(python_error)?;
             let declaration = classes[0]
                 .1
@@ -849,6 +915,7 @@ impl Host {
                 .and_then(|info| info.extract::<String>())
                 .map_err(python_error)?;
             Self::validate_declaration_metadata(&metadata, &declaration)?;
+            Self::validate_declaration_matches_info(info, &declaration)?;
             let runtime = runtime.unbind();
             let outputs = metadata.outputs;
             let next_sequences = outputs.keys().map(|name| (name.clone(), 0)).collect();
@@ -884,8 +951,11 @@ impl Host {
         let publishers_ptr = publishers as *mut _;
         let mut views = Vec::new();
         for (name, subscriber) in subscribers.iter_mut() {
-            if self.input_hashes.contains_key(name) {
-                if let Some(view) = subscriber.view_raw().map_err(|error| error.to_string())? {
+            if let Some(&schema_hash) = self.input_hashes.get(name) {
+                if let Some(view) = subscriber
+                    .view_raw_expecting(schema_hash)
+                    .map_err(|error| error.to_string())?
+                {
                     let backing = match view.into_owned() {
                         Ok(view) => FrameBacking::Sample(view),
                         Err(held) => FrameBacking::Copied(held.to_vec()),
@@ -1160,6 +1230,10 @@ macro_rules! export_node {
                 }
                 // SAFETY: ABI transfers ownership of the boxed context.
                 let ctx = unsafe { ::std::boxed::Box::from_raw(ptr) };
+                let rust_log = ctx.env_str("RUST_LOG", "");
+                $crate::cerulion_core::graph::node::install_cdylib_stderr_tracing(
+                    if rust_log.is_empty() { None } else { Some(rust_log.as_str()) },
+                );
                 match $crate::Host::init(ctx, $module, &[$($path),*], $info) {
                     Ok(host) => {
                         let handle = NEXT_HANDLE.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
@@ -1212,4 +1286,57 @@ macro_rules! export_node {
             result.unwrap_or_else(|_| { __set_error("cerulion_node_shutdown: panic caught by catch_unwind".into()); 2 })
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Host;
+
+    const INFO: &[u8] =
+        br#"{"inputs":[],"outputs":[{"name":"out","schema_hash":7}],"policy":{"period_ms":10}}"#;
+
+    #[test]
+    fn declaration_matching_info_apart_from_schema_names_is_accepted() {
+        let declaration = r#"{"inputs":[],"outputs":[{"name":"out","schema":"Point","schema_hash":7}],"policy":{"period_ms":10}}"#;
+        assert_eq!(
+            Host::validate_declaration_matches_info(INFO, declaration),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn nul_terminated_info_is_accepted() {
+        let info = [INFO, b"\0"].concat();
+        let declaration = r#"{"inputs":[],"outputs":[{"name":"out","schema":"Point","schema_hash":7}],"policy":{"period_ms":10}}"#;
+        assert_eq!(
+            Host::validate_declaration_matches_info(&info, declaration),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn changed_policy_is_reported_as_stale_metadata() {
+        let declaration = r#"{"inputs":[],"outputs":[{"name":"out","schema":"Point","schema_hash":7}],"policy":{"period_ms":20}}"#;
+        assert_eq!(
+            Host::validate_declaration_matches_info(INFO, declaration),
+            Err("node metadata is stale: compiled policy {\"period_ms\":10}, declaration {\"period_ms\":20}; run `cerulion node build`".to_string())
+        );
+    }
+
+    #[test]
+    fn key_missing_from_declaration_is_reported_as_absent() {
+        let declaration =
+            r#"{"inputs":[],"outputs":[{"name":"out","schema":"Point","schema_hash":7}]}"#;
+        assert_eq!(
+            Host::validate_declaration_matches_info(INFO, declaration),
+            Err("node metadata is stale: compiled policy {\"period_ms\":10}, declaration absent; run `cerulion node build`".to_string())
+        );
+    }
+
+    #[test]
+    fn invalid_info_json_is_an_error() {
+        assert!(Host::validate_declaration_matches_info(b"{", "{}")
+            .unwrap_err()
+            .starts_with("invalid node metadata"));
+    }
 }

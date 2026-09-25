@@ -246,7 +246,7 @@ impl SchemaSet {
         let max_slice_len_default = if layout.variable_fields.is_empty() {
             Some((crate::wire::WireHeader::SIZE + layout.fixed_size) as u32)
         } else {
-            Some(crate::codegen::variable_schema_max_slice_len(qualified_name) as u32)
+            Some(crate::codegen::slice_ceiling_for_type(qualified_name).get())
         };
         Some((layout.schema_hash, layout.fixed_size, max_slice_len_default))
     }
