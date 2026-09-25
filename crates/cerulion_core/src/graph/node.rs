@@ -43,7 +43,7 @@ use crate::message::ShmMessage;
 use crate::transport::input_view::InputView;
 use crate::transport::output_proxy::OutputProxy;
 use crate::transport::publisher::CerulionPublisher;
-use crate::transport::subscriber::{CerulionSubscriber, ReceivedMessage};
+use crate::transport::subscriber::{CerulionSubscriber, RawInputView, ReceivedMessage};
 use crate::transport::TransportManager;
 
 /// Cooperative shutdown signal shared between `GraphRuntime` and every node
@@ -1300,6 +1300,13 @@ impl AnySubscriber {
     ) -> TransportResult<Option<R>> {
         match self {
             Self::Ipc(s) => s.try_view::<T, R>(f),
+        }
+    }
+
+    /// Dispatches to [`CerulionSubscriber::view_raw`].
+    pub fn view_raw(&mut self) -> TransportResult<Option<RawInputView<'_>>> {
+        match self {
+            Self::Ipc(s) => s.view_raw(),
         }
     }
 

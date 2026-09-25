@@ -39,6 +39,138 @@ native_ros2_messages = {{ workspace = true }}
     )
 }
 
+/// Generate the standalone manifest for an embedded Python node.
+pub fn generate_python_cargo_toml(node_type: &str, pynode_path: &str) -> String {
+    format!(
+        r#"[package]
+name = "{node_type}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cerulion_pynode = {{ path = "{pynode_path}" }}
+
+[profile.release]
+strip = true
+"#
+    )
+}
+
+/// Generate the build script for an embedded Python node.
+pub fn generate_python_build_rs(python_libdir: &str) -> String {
+    let libdir = format!("{python_libdir:?}");
+    format!(
+        r#"// SPDX-License-Identifier: AGPL-3.0-only
+fn main() {{
+    println!("cargo:rerun-if-changed=build.rs");
+    // CERULION:LIBDIR_START
+    const PYTHON_LIBDIR: &str = {libdir};
+    if (cfg!(target_os = "linux") || cfg!(target_os = "macos")) && !PYTHON_LIBDIR.is_empty() {{
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{{}}", PYTHON_LIBDIR);
+    }}
+    // CERULION:LIBDIR_END
+}}
+"#
+    )
+}
+
+/// Generate the marker-managed Python import search path block.
+pub fn generate_python_sys_path_block(node_dir: &str, site_paths: &[String]) -> String {
+    let entries = std::iter::once(node_dir.to_string())
+        .chain(site_paths.iter().cloned())
+        .map(|path| format!("    {path:?},"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "    sys_path: [
+// CERULION:SYSPATH_START
+{entries}
+// CERULION:SYSPATH_END
+    ]"
+    )
+}
+
+/// Generate the ABI-21 export source for an embedded Python node.
+pub fn generate_python_lib_rs(
+    node_dir: &str,
+    inputs: &[(String, String)],
+    outputs: &[(String, String)],
+    policy: &serde_json::Value,
+    site_paths: &[String],
+) -> Result<String, serde_json::Error> {
+    let info = serde_json::json!({
+        "inputs": inputs.iter().map(|(name, _)| serde_json::json!({"name": name, "schema_hash": 0})).collect::<Vec<_>>(),
+        "outputs": outputs.iter().map(|(name, _)| serde_json::json!({"name": name, "schema_hash": 0, "max_slice_len_default": null, "promise_within_ms": null, "wire_fixed_size": null})).collect::<Vec<_>>(),
+        "policy": policy,
+    });
+    let info_text = serde_json::to_string(&info)?;
+    let sys_path = generate_python_sys_path_block(node_dir, site_paths);
+    Ok(format!(
+        "// SPDX-License-Identifier: AGPL-3.0-only
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b\"{escaped}\\0\";
+// CERULION:INFO_END
+
+cerulion_pynode::export_node! {{
+    module: \"node\",
+{sys_path},
+    info: INFO_BYTES
+}}
+",
+        escaped = info_text.replace('\\', "\\\\").replace('"', "\\\""),
+    ))
+}
+
+/// Generate the starter Python implementation for a node.
+pub fn generate_python_node_py(
+    inputs: &[(String, String)],
+    outputs: &[(String, String)],
+    policy: &str,
+    trigger: Option<&str>,
+) -> String {
+    let mut result = format!("import cerulion as cer\n\n\n@cer.node({policy})\nclass Node:\n");
+    for (name, schema) in inputs {
+        let trigger_suffix = if trigger == Some(name.as_str()) {
+            ", trigger=True"
+        } else {
+            ""
+        };
+        result.push_str(&format!(
+            "    {name} = cer.input(\"{schema}\"{trigger_suffix})\n"
+        ));
+    }
+    for (name, schema) in outputs {
+        result.push_str(&format!("    {name} = cer.output(\"{schema}\")\n"));
+    }
+    result.push_str("\n    def tick(self):\n");
+    match (inputs.first(), outputs.first()) {
+        (Some((input, _)), Some((output, _))) => {
+            result.push_str(&format!("        msg = self.{input}\n"));
+            result.push_str("        if msg is None:  # no frame received yet\n");
+            result.push_str("            return\n");
+            result.push_str(&format!(
+                "        out = self.{output}  # first touch loans the output; it is committed at tick end\n"
+            ));
+            result.push_str("        # copy fields here, e.g. out.x = msg.x\n");
+        }
+        (Some((input, _)), None) => {
+            result.push_str(&format!("        msg = self.{input}\n"));
+            result.push_str("        if msg is None:  # no frame received yet\n");
+            result.push_str("            return\n");
+        }
+        (None, Some((output, _))) => {
+            result.push_str(&format!(
+                "        out = self.{output}  # first touch loans the output; it is committed at tick end\n"
+            ));
+        }
+        (None, None) => result.push_str("        return\n"),
+    }
+    result
+}
+
 /// Generate the `lib.rs` source for a node crate using the `#[cerulion_node]` +
 /// `#[cerulion_node_impl]` macro pair.
 ///

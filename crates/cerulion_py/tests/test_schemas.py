@@ -74,7 +74,8 @@ def test_workspace_and_rosmsg_loading(tmp_path):
     (tmp_path / "schemas" / "pkg" / "msg").mkdir(parents=True)
     (tmp_path / "schemas" / "pkg" / "msg" / "X.msg").write_text("uint32 id\n")
     schemas = cerulion.SchemaSet.from_workspace(tmp_path)
-    assert schemas.names() == ["Probe", "pkg/X"]
+    assert "Probe" in schemas.names()
+    assert "pkg/X" in schemas.names()
     assert schemas.layout("pkg/X").fixed_size == 4
 
     schemas = cerulion.SchemaSet()

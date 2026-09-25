@@ -54,4 +54,5 @@ pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks
 - Numeric verification has false-pass classes (NaN folds, >2^53 widening,
   length-derived fields); see the dossier before adding a metric.
 See `docs/internals/cli.md` before changing replay exits, completions, topic listing,
-or graph run/profile/partition consent.
+Python nodes (§13), or graph run/profile/partition consent.
+

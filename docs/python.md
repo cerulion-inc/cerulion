@@ -9,7 +9,68 @@ an opaque payload; there is no serialization envelope and no type registry.
 
 ```bash
 pip install maturin
-cd crates/cerulion_py && maturin develop --release
+cd crates/cerulion_py && RUSTUP_TOOLCHAIN=1.93.0 maturin develop --release
+```
+
+## Writing nodes in Python
+
+Python-authored nodes are standalone node `cdylib` libraries built against the current node ABI. The CLI creates
+the embedding shim, while `node.py` contains the node logic:
+
+```python-source
+import cerulion
+
+@cerulion.node(period_ms=10)
+class Counter:
+    inp = cerulion.input("test_msgs/Inp", depth=1)
+    out = cerulion.output("test_msgs/Out")
+
+    def tick(self):
+        self.out.value = self.inp.value
+```
+
+Create and build one with:
+
+```shell
+cerulion node create counter --lang python -i test_msgs/Inp inp -o test_msgs/Out out --policy period_ms=10
+cerulion node build counter
+```
+
+`node build` resolves the interpreter in this order: `$CERULION_PYTHON`,
+`<workspace>/.venv/bin/python`, then `python3` on `PATH`. It imports
+`nodes/counter/node.py`, regenerates the baked metadata block in `src/lib.rs`,
+and invokes Cargo. The Python process receives `CERULION_WORKSPACE` so schema
+declarations resolve against the same workspace used by the graph runtime.
+ROS 2 built-in messages such as `geometry_msgs/*` and `sensor_msgs/*` resolve
+without a `schemas/` entry. A workspace schema with the same qualified name
+overrides the built-in.
+The built cdylib carries an rpath to the interpreter's libdir, so no
+`LD_LIBRARY_PATH` is needed; rebuilding after switching interpreters refreshes it.
+`node build` bakes the interpreter's site-packages so the node imports the same
+`cerulion` you installed; `CERULION_PY_PATH` prepends paths for overrides.
+Node cdylibs must be built by the same `rustc` as the `cerulion` binary:
+`node build` warns when the `rustc` on `PATH` differs, and the loader refuses a
+node whose compiler fingerprint does not match. Use `RUSTUP_TOOLCHAIN` only as a
+per-command prefix for Python wheel commands.
+
+A Python node must declare exactly one scheduling policy: `period_ms`, one
+`trigger=True` input, or `sync_window_ms` for multiple trigger inputs. The
+`node create --lang python` command (alias `node new`) therefore requires `-T` or `--policy`.
+
+The embedded host supports one interpreter per process and serializes Python
+execution through the GIL. Python-created threads and `fork()` are unsupported.
+The host installs no Python signal handlers and never changes the process's
+SIGINT disposition; graph shutdown stays with the runtime. Build one host
+cdylib per CPython minor.
+This path is intended for control and
+integration nodes, not kHz loops: every tick crosses into the interpreter.
+
+```python
+print("Python nodes are built as ordinary node cdylibs.")
+```
+
+```text
+Python nodes are built as ordinary node cdylibs.
 ```
 
 ## Connect

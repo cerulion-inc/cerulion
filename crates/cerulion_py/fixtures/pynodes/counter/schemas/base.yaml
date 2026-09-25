@@ -1,0 +1,4 @@
+schemas:
+  Probe:
+    fields:
+      int64 value: {}

@@ -34,6 +34,25 @@ fn probe_set() -> SchemaSet {
     set
 }
 
+#[test]
+fn output_meta_matches_fixed_and_variable_wire_defaults() {
+    let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
+    set.add_yaml_str(
+        "schemas:\n  Fixed:\n    fields:\n      float64 x: {}\n      float64 y: {}\n      float64 z: {}\n",
+    )
+    .unwrap();
+    let fixed = set.output_meta("Fixed").expect("fixed schema present");
+    assert_eq!(fixed.0, set.schema_hash("Fixed").unwrap());
+    assert_eq!(fixed.1, 24);
+    assert_eq!(fixed.2, Some(56));
+
+    set.add_yaml_str(PROBE_YAML).unwrap();
+    let variable = set.output_meta("Probe").expect("variable schema present");
+    assert_eq!(variable.0, set.schema_hash("Probe").unwrap());
+    assert_eq!(variable.1, 8);
+    assert_eq!(variable.2, Some(128 * 1024 * 1024));
+}
+
 /// The `Probe` frame for id=0x01020304, flag=7, name="ab", samples=[1.0,
 /// 2.0], timestamp TS, sequence 0 - every byte after the hash hand-derived.
 fn probe_oracle_frame(schema_hash: u64) -> Vec<u8> {

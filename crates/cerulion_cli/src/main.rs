@@ -28,15 +28,15 @@ use std::sync::Arc;
 
 use clap::{CommandFactory, Parser};
 
-use cerulion_cli_engine::error::CliResult;
+use cerulion_cli_engine::error::{render_user_error, CliResult};
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
     account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, pair_cmd, partition_emit, ros_cmd,
     schema_cmd, topic_cmd, viz_client, workspace,
 };
 use cli::{
-    AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, Ros2Action,
-    SchemaAction, TopicAction, TraceAction, WorkspaceAction,
+    AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
+    Ros2Action, SchemaAction, TopicAction, TraceAction, WorkspaceAction,
 };
 
 /// The migration error for the REMOVED `cerulion ros` family (`ros attach`
@@ -288,7 +288,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {}", render_user_error(&e));
             ExitCode::FAILURE
         }
     }
@@ -988,12 +988,19 @@ fn run(cli: Cli) -> CliResult<()> {
             match action {
                 NodeAction::Create {
                     node_type,
+                    lang,
                     output,
                     input,
                     trigger_input,
                     policy,
                     raw_ffi,
                 } => {
+                    if raw_ffi && matches!(lang, NodeLanguage::Python) {
+                        return Err(cerulion_cli_engine::error::CliError::Validation(
+                            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+                                .to_string(),
+                        ));
+                    }
                     // Reject multi-invocation BEFORE any
                     // `parse_port_args` call. With `num_args = 2`
                     // on each flag, a valid single invocation
@@ -1085,6 +1092,10 @@ fn run(cli: Cli) -> CliResult<()> {
                         inputs: combined_inputs,
                         trigger: trigger_name,
                         raw_ffi,
+                        language: match lang {
+                            NodeLanguage::Rust => node_cmd::NodeLanguage::Rust,
+                            NodeLanguage::Python => node_cmd::NodeLanguage::Python,
+                        },
                     };
                     node_cmd::node_create_with_options(
                         &ws.nodes_dir,
@@ -1469,9 +1480,9 @@ fn run(cli: Cli) -> CliResult<()> {
                         println!("Inputs:");
                         for port in &info.inputs {
                             println!(
-                                "  {} {}",
+                                "  {} ({})",
                                 port.name,
-                                port.schema.as_deref().unwrap_or("(untyped)")
+                                port.schema.as_deref().unwrap_or("untyped")
                             );
                         }
                     }
@@ -1479,9 +1490,9 @@ fn run(cli: Cli) -> CliResult<()> {
                         println!("Outputs:");
                         for port in &info.outputs {
                             println!(
-                                "  {} {}",
+                                "  {} ({})",
                                 port.name,
-                                port.schema.as_deref().unwrap_or("(untyped)")
+                                port.schema.as_deref().unwrap_or("untyped")
                             );
                         }
                     }
@@ -4281,7 +4292,7 @@ mod clap_parse_tests {
     //! touch the filesystem. They only verify clap accepts/rejects
     //! the args and that the parsed shape (Vec lengths) is what the
     //! handler expects.
-    use super::cli::{Cli, Commands, GraphAction, NodeAction};
+    use super::cli::{Cli, Commands, GraphAction, NodeAction, NodeLanguage};
     use clap::Parser;
 
     fn try_parse(argv: &[&str]) -> Result<Cli, clap::Error> {
@@ -4457,6 +4468,22 @@ mod clap_parse_tests {
     }
 
     #[test]
+    fn node_new_alias_and_python_language_parse() {
+        let cli = try_parse(&["cerulion", "node", "new", "counter", "--lang", "python"])
+            .expect("node new --lang python must parse");
+        let Commands::Node {
+            action: NodeAction::Create {
+                node_type, lang, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected NodeAction::Create");
+        };
+        assert_eq!(node_type, "counter");
+        assert_eq!(lang, NodeLanguage::Python);
+    }
+
+    #[test]
     fn dash_t_with_only_schema_is_rejected_by_clap() {
         // num_args = 2 means clap rejects single-arg invocations
         // BEFORE the handler runs. The earlier `num_args = 1..=2`
@@ -4583,6 +4610,35 @@ mod clap_parse_tests {
             panic!("expected NodeAction::Create");
         };
         assert!(raw_ffi);
+    }
+
+    #[test]
+    fn python_create_with_raw_ffi_returns_validation_error() {
+        let _lock = crate::completion_wiring_tests::env_lock();
+        let _guard = crate::completion_wiring_tests::EnvGuard::capture();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = cerulion_cli_engine::workspace::workspace_create(tmp.path(), "test_ws")
+            .expect("workspace");
+        std::env::set_current_dir(&ws.root).expect("enter workspace");
+        let cli = try_parse(&[
+            "cerulion",
+            "node",
+            "create",
+            "python_raw",
+            "--lang",
+            "python",
+            "--raw-ffi",
+            "--policy",
+            "period_ms=1",
+        ])
+        .expect("parse Python raw FFI create");
+        let result = super::run(cli);
+        let err = result.expect_err("Python raw FFI must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+        );
+        assert!(!ws.nodes_dir.join("python_raw").exists());
     }
 
     #[test]

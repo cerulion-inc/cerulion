@@ -43,17 +43,14 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
 - Facade (`python/cerulion/_api.py`) owns Python ergonomics; `src/` owns
   transport semantics. Non-contiguous or non-byte buffers are rejected as
   `TypeError` at the facade.
-- The typed layer (`SchemaSet`, `Layout`, `Message`, and `Frame.view()`) maps
-  schema-defined fixed fields and variable offset-table fields to read-only
-  NumPy views or writable loan views. `string[]` and nested-message `Type[]`
-  variable fields are pre-framed BYTES ONLY on publish/loan (the loan
-  `**lengths` keyword is the framed byte length; element-wise encoding is
-  unsupported), and loan field views are block-scoped - a live export at
-  `with`-exit discards the loan with `EncodeError`. A typed `Publisher` is
-  bound to the schema as resolved at creation: a set mutation that changes
-  its hash fails `publish`/`loan` with `SchemaMismatch`. `DecodeError`,
-  `EncodeError`, `SchemaError`, `SchemaMismatch`, and `ReleasedFrame` are
-  the typed API's explicit failure classes.
+- Typed layer (`SchemaSet`, `Layout`, `Message`, `Frame.view()`): read-only
+  NumPy views on receive, writable views on loans. `string[]` / `Type[]` are
+  pre-framed BYTES only on publish/loan; loan views are block-scoped (a live
+  export at `with`-exit discards the loan: `EncodeError`); a set mutation that
+  changes a typed publisher's hash fails with `SchemaMismatch`.
+- `crates/cerulion_pynode` embeds ONE CPython per node process (GIL-serialized;
+  no Python threads, `fork`, or signal handlers). Its fixtures under
+  `fixtures/pynodes/` are separate cdylib crates: rebuild them after any change.
 
 ## Layout
 

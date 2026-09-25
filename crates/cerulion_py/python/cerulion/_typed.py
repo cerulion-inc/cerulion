@@ -66,7 +66,13 @@ class SchemaSet:
         self._layouts = {}
 
     @classmethod
+    def builtins(cls):
+        """Create a schema set containing the vendored ROS 2 messages."""
+        return cls(_native.SchemaSet.builtins())
+
+    @classmethod
     def from_workspace(cls, path):
+        """Load ROS 2 builtins plus workspace schemas, with workspace overrides."""
         return cls(_native.SchemaSet.from_workspace(path))
 
     def add_yaml(self, text):
@@ -86,6 +92,9 @@ class SchemaSet:
 
     def schema_hash(self, name):
         return self._native.schema_hash(name)
+
+    def output_meta(self, name):
+        return self._native.output_meta(name)
 
     @property
     def warnings(self):

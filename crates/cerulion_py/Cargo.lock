@@ -218,6 +218,7 @@ version = "0.1.0"
 dependencies = [
  "cerulion_core",
  "libc",
+ "native_ros2_messages",
  "pyo3",
  "tracing",
 ]
@@ -227,7 +228,24 @@ name = "cerulion_py_fixtures"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "indexmap 2.14.0",
  "native_ros2_messages",
+ "serde_json",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "cerulion_pynode"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "indexmap 2.14.0",
+ "libc",
+ "native_ros2_messages",
+ "pyo3",
+ "pyo3-build-config",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

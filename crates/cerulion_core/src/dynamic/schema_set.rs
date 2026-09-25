@@ -216,6 +216,21 @@ impl SchemaSet {
         self.walker.schema_hash_for(qualified_name)
     }
 
+    /// Return the metadata emitted for this schema by generated wire types.
+    ///
+    /// The final value is the wire-header-plus-fixed-body size for fixed
+    /// schemas, and otherwise carries the same slice ceiling selected by
+    /// codegen for the qualified name.
+    pub fn output_meta(&self, qualified_name: &str) -> Option<(u64, usize, Option<u32>)> {
+        let layout = self.layout(qualified_name)?;
+        let max_slice_len_default = if layout.variable_fields.is_empty() {
+            Some((crate::wire::WireHeader::SIZE + layout.fixed_size) as u32)
+        } else {
+            Some(crate::codegen::variable_schema_max_slice_len(qualified_name) as u32)
+        };
+        Some((layout.schema_hash, layout.fixed_size, max_slice_len_default))
+    }
+
     /// The qualified name the walker decodes `hash` as, if any.
     pub fn schema_name_for_hash(&self, hash: u64) -> Option<&str> {
         self.walker.schema_name_for_hash(hash)

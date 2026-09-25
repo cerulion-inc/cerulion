@@ -2623,6 +2623,16 @@ jobs:
       # fixture round-trip against its literal expected output.
       - name: Fresh-venv wheel round-trip
         run: ./scripts/e2e_fresh_venv.sh
+      # Python-node fixtures and the CLI must share one rustc (the job's
+      # RUSTUP_TOOLCHAIN) so the loader's compiler fingerprint matches.
+      - name: Build Python-node fixtures and the cerulion CLI
+        run: |
+          set -eu
+          for manifest in fixtures/pynodes/*/Cargo.toml; do
+            CARGO_TARGET_DIR="$PWD/target/pynodes" cargo build --release --manifest-path "$manifest"
+          done
+          cd ../..
+          cargo build --release -p cerulion_cli -p test_node_macro_period_cdylib
       - name: pytest (installed wheel, run from outside the tree)
         run: |
           set -eu
@@ -2630,6 +2640,12 @@ jobs:
           "$RUNNER_TEMP/pyvenv/bin/pip" install -q --no-deps "$(ls -t dist/cerulion-*.whl | head -1)"
           "$RUNNER_TEMP/pyvenv/bin/pip" install -q 'numpy>=1.26' 'pytest>=8,<9'
           export CERULION_PY_FIXTURE="$PWD/target/release/cerulion_py_fixture"
+          export CERULION_PYNODE_DIR="$PWD/target/pynodes"
+          export CERULION_CLI_BIN="$GITHUB_WORKSPACE/target/release/cerulion"
+          export CERULION_ROOT_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          export CERULION_PYTHON="$RUNNER_TEMP/pyvenv/bin/python"
+          CERULION_PY_PATH="$("$CERULION_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          export CERULION_PY_PATH
           tests="$PWD/tests"
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/pyvenv/bin/python" -m pytest -p no:cacheprovider "$tests" -q

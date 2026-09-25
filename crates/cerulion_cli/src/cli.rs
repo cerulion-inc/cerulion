@@ -32,6 +32,15 @@ pub enum TimeSource {
     Virtual,
 }
 
+/// Authoring language for a generated node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum NodeLanguage {
+    /// Generate a Rust macro node (the default).
+    Rust,
+    /// Generate an embedded-CPython cdylib node.
+    Python,
+}
+
 impl From<TimeSource> for EngineTimeSource {
     fn from(ts: TimeSource) -> Self {
         match ts {
@@ -1060,6 +1069,7 @@ pub enum WorkspaceAction {
 #[derive(Subcommand)]
 pub enum NodeAction {
     /// Create a new node type
+    #[command(alias = "new")]
     Create {
         /// Node type name
         // Deliberately NO completer. A create argument names
@@ -1067,6 +1077,9 @@ pub enum NodeAction {
         // exactly the set this verb REJECTS (`NodeExists`). Offering them
         // completes a guaranteed error. The correct candidate set is empty.
         node_type: String,
+        /// Authoring language for the generated node.
+        #[arg(long, value_enum, default_value_t = NodeLanguage::Rust)]
+        lang: NodeLanguage,
         /// Add an output port: SCHEMA NAME (both required). At most one `-o`
         /// per `node create`; add more with `cerulion node modify`.
         #[arg(short = 'o', long = "output", num_args = 2, value_names = ["SCHEMA", "NAME"])]

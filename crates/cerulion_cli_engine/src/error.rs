@@ -62,9 +62,41 @@ pub enum CliError {
 /// Result type alias for CLI operations.
 pub type CliResult<T> = Result<T, CliError>;
 
+/// Render a CLI error with an actionable remedy for missing embedded-Python
+/// runtime libraries.
+pub fn render_user_error(error: &CliError) -> String {
+    let rendered = error.to_string();
+    if let CliError::Transport(cerulion_core::TransportError::NodeError { reason, .. }) = error {
+        if reason.contains("libpython") {
+            return format!(
+                "{rendered}\nPython node cdylib could not find libpython; rebuild with \
+                 `cerulion node build <type>` (bakes the interpreter's LIBDIR rpath) or set \
+                 LD_LIBRARY_PATH"
+            );
+        }
+    }
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_libpython_error_includes_python_node_remedy() {
+        let error = CliError::Transport(cerulion_core::TransportError::NodeError {
+            node_id: "echo".to_string(),
+            reason: "failed to load library: libpython3.12.so.1.0: cannot open shared object file"
+                .to_string(),
+        });
+        assert_eq!(
+            render_user_error(&error),
+            "Node 'echo' error: failed to load library: \
+             libpython3.12.so.1.0: cannot open shared object file\nPython node cdylib could not \
+             find libpython; rebuild with `cerulion node build <type>` (bakes the interpreter's \
+             LIBDIR rpath) or set LD_LIBRARY_PATH"
+        );
+    }
 
     #[test]
     fn schema_not_found_display_renders_name_and_callsite_remedy() {

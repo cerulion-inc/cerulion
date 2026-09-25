@@ -10,6 +10,7 @@
 //! (extracting `inputs`, `outputs`, and an optional `policy`
 //! field with the same shape the cdylib FFI uses).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use cerulion_core::graph::node::BackpressurePolicy;
@@ -615,6 +616,9 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
 /// extracting port names from the embedded JSON literal.
 ///
 /// Returns `Ok(None)` if no markers are found.
+/// Prefix of the line inside a Python node's INFO block that names its port schemas.
+pub(crate) const PORT_SCHEMAS_MARKER: &str = "// CERULION:PORT_SCHEMAS ";
+
 fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<NodeMetadata>> {
     let start_marker = "// CERULION:INFO_START";
     let end_marker = "// CERULION:INFO_END";
@@ -737,13 +741,31 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
         #[serde(default)]
         inputs: Vec<RawInput>,
         #[serde(default)]
-        outputs: Vec<String>,
+        outputs: Vec<RawOutput>,
         #[serde(default)]
         policy: Option<PolicyJson>,
         /// The node-level rate cap. Absent on a node that declares none, and
         /// on an info block written before the key existed.
         #[serde(default)]
         throttle_ms: Option<u64>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum RawOutput {
+        Name(String),
+        Full { name: String },
+    }
+    // Schema names of a Python node's ports, written by `cerulion node build`
+    // as one `// CERULION:PORT_SCHEMAS {"inputs":{..},"outputs":{..}}` line
+    // inside the INFO block. They stay out of INFO_BYTES: the runtime loader
+    // does not read them.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PortSchemas {
+        #[serde(default)]
+        inputs: BTreeMap<String, String>,
+        #[serde(default)]
+        outputs: BTreeMap<String, String>,
     }
     // The SECOND host parser of this document. `graph::node`'s
     // parser reports an unknown envelope key; this one reports it too, or
@@ -785,46 +807,77 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
     let policy = info.policy.and_then(PolicyJson::into_macro_policy);
     let throttle_ms = info.throttle_ms;
     let (inputs, outputs) = (info.inputs, info.outputs);
+    let mut port_schemas = match block
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(PORT_SCHEMAS_MARKER))
+    {
+        Some(raw) => serde_json::from_str::<PortSchemas>(raw.trim()).map_err(|e| {
+            CliError::Validation(format!(
+                "node '{}' CERULION:PORT_SCHEMAS line failed to parse: {}",
+                node_type, e
+            ))
+        })?,
+        None => PortSchemas {
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        },
+    };
 
+    let inputs: Vec<PortDef> = inputs
+        .into_iter()
+        .map(|entry| match entry {
+            RawInput::Name(name) => PortDef {
+                schema: port_schemas.inputs.remove(&name),
+                name,
+                schema_alternatives: Vec::new(),
+                trigger: false,
+                backpressure: BackpressurePolicy::DropOldest,
+            },
+            RawInput::Full {
+                name,
+                trigger,
+                backpressure,
+            } => PortDef {
+                schema: port_schemas.inputs.remove(&name),
+                name,
+                schema_alternatives: Vec::new(),
+                trigger,
+                backpressure: backpressure
+                    .map(RawBackpressure::into_policy)
+                    .unwrap_or_default(),
+            },
+        })
+        .collect();
+    let outputs: Vec<PortDef> = outputs
+        .into_iter()
+        .map(|output| {
+            let (RawOutput::Name(name) | RawOutput::Full { name }) = output;
+            PortDef {
+                schema: port_schemas.outputs.remove(&name),
+                name,
+                schema_alternatives: Vec::new(),
+                trigger: false,
+                backpressure: BackpressurePolicy::DropOldest,
+            }
+        })
+        .collect();
+    if let Some(name) = port_schemas
+        .inputs
+        .keys()
+        .chain(port_schemas.outputs.keys())
+        .next()
+    {
+        return Err(CliError::Validation(format!(
+            "node '{}' CERULION:PORT_SCHEMAS names port '{}', which the INFO_BYTES document does not declare",
+            node_type, name
+        )));
+    }
     Ok(Some(NodeMetadata {
         node_type: node_type.to_string(),
         policy,
         throttle_ms,
-        inputs: inputs
-            .into_iter()
-            .map(|entry| match entry {
-                RawInput::Name(name) => PortDef {
-                    name,
-                    schema: None,
-                    schema_alternatives: Vec::new(),
-                    trigger: false,
-                    backpressure: BackpressurePolicy::DropOldest,
-                },
-                RawInput::Full {
-                    name,
-                    trigger,
-                    backpressure,
-                } => PortDef {
-                    name,
-                    schema: None,
-                    schema_alternatives: Vec::new(),
-                    trigger,
-                    backpressure: backpressure
-                        .map(RawBackpressure::into_policy)
-                        .unwrap_or_default(),
-                },
-            })
-            .collect(),
-        outputs: outputs
-            .into_iter()
-            .map(|name| PortDef {
-                name,
-                schema: None,
-                schema_alternatives: Vec::new(),
-                trigger: false,
-                backpressure: BackpressurePolicy::DropOldest,
-            })
-            .collect(),
+        inputs,
+        outputs,
     }))
 }
 
@@ -2829,6 +2882,76 @@ pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
             metadata.outputs[0].backpressure,
             BackpressurePolicy::DropOldest
         );
+    }
+
+    #[test]
+    fn raw_ffi_codegen_output_objects_are_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[{\"name\":\"out\",\"schema_hash\":1,\"max_slice_len_default\":null,\"promise_within_ms\":null,\"wire_fixed_size\":8,\"unknown_key\":\"ignored\"}]}\0";
+// CERULION:PORT_SCHEMAS {"outputs":{"out":"geometry_msgs/Vector3"}}
+
+#[no_mangle]
+pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
+    INFO_BYTES.as_ptr() as *const std::ffi::c_char
+}
+// CERULION:INFO_END
+"#;
+        let node_dir = write_node(&tmp, "rawffi_object", src);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.outputs.len(), 1);
+        assert_eq!(metadata.outputs[0].name, "out");
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
+    }
+
+    #[test]
+    fn port_schemas_line_naming_an_undeclared_port_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[{\"name\":\"inp\",\"schema_hash\":0}],\"outputs\":[]}\0";
+// CERULION:PORT_SCHEMAS {"inputs":{"typo":"geometry_msgs/Vector3"}}
+// CERULION:INFO_END
+"#;
+        let node_dir = write_node(&tmp, "rawffi_schema_typo", src);
+        let err = parse_node_metadata(&node_dir).unwrap_err().to_string();
+        assert!(err.contains("names port 'typo'"), "{err}");
+    }
+
+    #[test]
+    fn malformed_port_schemas_line_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[\"inp\"],\"outputs\":[]}\0";
+// CERULION:PORT_SCHEMAS {"inputz":{"inp":"geometry_msgs/Vector3"}}
+// CERULION:INFO_END
+"#;
+        let node_dir = write_node(&tmp, "rawffi_schema_bad", src);
+        let err = parse_node_metadata(&node_dir).unwrap_err().to_string();
+        assert!(err.contains("PORT_SCHEMAS line failed to parse"), "{err}");
+    }
+
+    #[test]
+    fn port_schemas_line_sets_input_schema_on_bare_name_input() {
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[\"inp\"],\"outputs\":[\"out\"]}\0";
+// CERULION:PORT_SCHEMAS {"inputs":{"inp":"std_msgs/Float64"}}
+// CERULION:INFO_END
+"#;
+        let node_dir = write_node(&tmp, "rawffi_schema_in", src);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(
+            metadata.inputs[0].schema.as_deref(),
+            Some("std_msgs/Float64")
+        );
+        assert_eq!(metadata.outputs[0].schema, None);
     }
 
     /// CLI/engine invariant: the metadata parser must REJECT attr surface

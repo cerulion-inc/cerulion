@@ -978,3 +978,16 @@ identity rather than an absent one provisions it:
 `cerulion_cli_engine::auth::seed_logged_in_at` from Rust, or
 `tools/ci/seed_test_login.sh <dir>` from a shell, both writing the `auth.json`
 a real sign-in writes, with `CERULION_HOME` pointed at the directory.
+
+## 13. Python node scaffolding
+
+`node create --lang python` (alias `node new`) emits an embedded-CPython `cdylib`
+and a `node.py` declaration. Python nodes never receive invented ports, reject
+`--raw-ffi`, validate port names as Python identifiers, and refuse every
+`node modify` operation; the author edits `node.py` and rebuilds. `node build`
+resolves Python via `CERULION_PYTHON`, `<workspace>/.venv/bin/python`, then
+`python3`, imports `node.py`, and regenerates the baked INFO block before Cargo
+runs. Schema names do not enter `INFO_BYTES` (the runtime parser binds only
+hashes and sizes): they ride a `// CERULION:PORT_SCHEMAS {...}` line inside the
+INFO markers, which `node_metadata::parse_node_metadata` reads and checks against
+the declared ports.

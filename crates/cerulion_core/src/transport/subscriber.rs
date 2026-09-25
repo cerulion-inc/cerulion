@@ -246,11 +246,8 @@ enum BackpressureProbe {
 #[inline]
 fn wire_timestamp_ns(raw: &[u8]) -> Option<u64> {
     if raw.len() >= WireHeader::SIZE {
-        Some(u64::from_le_bytes(
-            raw[24..32]
-                .try_into()
-                .expect("raw[24..32] is exactly 8 bytes"),
-        ))
+        let bytes = raw.get(24..32)?.try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
     } else {
         None
     }
@@ -263,11 +260,8 @@ fn wire_timestamp_ns(raw: &[u8]) -> Option<u64> {
 #[inline]
 fn wire_sequence(raw: &[u8]) -> Option<u32> {
     if raw.len() >= WireHeader::SIZE {
-        Some(u32::from_le_bytes(
-            raw[20..24]
-                .try_into()
-                .expect("raw[20..24] is exactly 4 bytes"),
-        ))
+        let bytes = raw.get(20..24)?.try_into().ok()?;
+        Some(u32::from_le_bytes(bytes))
     } else {
         None
     }
@@ -391,6 +385,55 @@ fn classify_gap(base_seq: u32, first_seq: u32) -> GapClass {
 
 /// An inbound iceoryx2 sample (slice payload, no user header).
 type InboundSample = Sample<CerService, [u8], ()>;
+
+/// A validated, zero-copy raw input frame.
+///
+/// A live sample owns its inbound slot through this view. A held sample
+/// borrows the subscriber's held slot, mirroring typed `try_view`: held
+/// serves do not record a service cursor and remain available for re-serve.
+pub struct RawInputView<'a> {
+    inner: RawInputViewInner<'a>,
+}
+
+enum RawInputViewInner<'a> {
+    Owned(InboundSample, usize),
+    Held(&'a [u8]),
+}
+
+impl RawInputView<'_> {
+    /// Detaches the view from the subscriber borrow when it owns its sample.
+    ///
+    /// `Owned` views pin their SHM sample and consume borrow budget for as long
+    /// as the returned value lives; a `Held` view borrows the subscriber's
+    /// held sample and is returned unchanged in the error arm.
+    pub fn into_owned(self) -> Result<RawInputView<'static>, Self> {
+        match self.inner {
+            RawInputViewInner::Owned(sample, len) => Ok(RawInputView {
+                inner: RawInputViewInner::Owned(sample, len),
+            }),
+            RawInputViewInner::Held(bytes) => Err(RawInputView {
+                inner: RawInputViewInner::Held(bytes),
+            }),
+        }
+    }
+}
+
+impl std::ops::Deref for RawInputView<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match &self.inner {
+            RawInputViewInner::Owned(sample, frame_len) => &sample.payload()[..*frame_len],
+            RawInputViewInner::Held(bytes) => bytes,
+        }
+    }
+}
+
+impl AsRef<[u8]> for RawInputView<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
 
 /// An owned, zero-copy inbound sample held beyond the receive callback
 /// (the `bagd` recorder tap).
@@ -1258,9 +1301,10 @@ pub struct CerulionSubscriber {
     /// ever goes
     /// `None → Some` (set on the first delivery, REPLACED by a newer sample,
     /// never reset to `None` before Drop). That monotonicity is exactly WHY the
-    /// `try_view` `Held` arm's `.expect("...held_sample is Some")` is
-    /// unreachable — `Held` is only ever written by `snapshot_latest` AFTER
-    /// `held_sample` is `Some`, and nothing clears it. There is no "un-hold":
+    /// `try_view` and `view_raw` `Held` arms' missing-sample errors are
+    /// invariant diagnostics — `Held` is only ever written by
+    /// `snapshot_latest` AFTER `held_sample` is `Some`, and nothing clears it.
+    /// There is no "un-hold":
     /// once delivered, the subscriber pins one SHM sample for life (intended; a
     /// liveliness-loss release is future scope).
     held_sample: Option<InboundSample>,
@@ -2732,6 +2776,102 @@ impl CerulionSubscriber {
         &mut self,
         f: impl FnOnce(InputView<'_, T>) -> R,
     ) -> TransportResult<Option<R>> {
+        let slot = self.select_slot();
+        match slot {
+            FrozenSlot::Sample(sample) => {
+                // The ONE serve point both drain disciplines reach —
+                // Unified serves the boundary's frozen slot, Separate pops live
+                // into the same arm — so the service cursor has one write site
+                // and one meaning, and `CERULION_DRAIN_DISCIPLINE=separate`
+                // yields the identical cursor.
+                //
+                // Advanced only on `Ok`: `build_inbound_view` rejects a
+                // schema-mismatched / undersized / out-of-bounds frame, which
+                // the tick never sees. Recording it as served would tell a
+                // resume to skip a frame nothing read.
+                let out = build_inbound_view::<T, R>(&self.topic, &sample, f)?;
+                self.record_service_cursor(sample.payload());
+                Ok(Some(out))
+            }
+            // NB: this arm records NO cursor, and it is unreachable TWICE over,
+            // which is why that is not a gap:
+            //
+            // 1. The serve-many arm above RETURNS on `Held`, so no `Held` slot
+            //    reaches this match at all.
+            // 2. Even if one did, `held_sample` is written only by
+            //    `snapshot_latest` (the non-trigger, latest-value path), and
+            //    this type's own invariant states that a `Sample` frozen slot
+            //    happens ONLY for trigger / direct-path inputs, which never
+            //    hold — so a `Held` input never carries a cursor to write.
+            //
+            // Storing here would cost an atomic per non-trigger input per fire
+            // for a value no reader can use, and — under serve-many — would do
+            // it once per fire of a burst for one frame.
+            FrozenSlot::Held => {
+                let sample = self
+                    .held_sample
+                    .as_ref()
+                    .ok_or_else(|| TransportError::Internal {
+                        reason: format!(
+                            "subscriber {} selected a held slot without a held sample",
+                            self.topic
+                        ),
+                    })?;
+                build_inbound_view::<T, R>(&self.topic, sample, f).map(Some)
+            }
+            FrozenSlot::Empty => Ok(None),
+            FrozenSlot::Err(e) => Err(e),
+        }
+    }
+
+    /// Return the next complete wire frame without schema validation.
+    ///
+    /// Slot selection, read-outcome staging, FIFO promotion, and block-slot
+    /// reconciliation are identical to [`Self::try_view`]. Live samples are
+    /// retained in an owned view until dropped; held samples borrow the held
+    /// slot and do not advance the service cursor.
+    #[must_use = "raw input view must be checked"]
+    pub fn view_raw(&mut self) -> TransportResult<Option<RawInputView<'_>>> {
+        let slot = self.select_slot();
+        match slot {
+            FrozenSlot::Held => {
+                let sample = self
+                    .held_sample
+                    .as_ref()
+                    .ok_or_else(|| TransportError::Internal {
+                        reason: format!(
+                            "subscriber {} selected a held slot without a held sample",
+                            self.topic
+                        ),
+                    })?;
+                let frame_len = validate_raw_frame(&self.topic, sample.payload())?;
+                Ok(Some(RawInputView {
+                    inner: RawInputViewInner::Held(&sample.payload()[..frame_len]),
+                }))
+            }
+            FrozenSlot::Empty => Ok(None),
+            FrozenSlot::Sample(sample) => {
+                let frame_len = validate_raw_frame(&self.topic, sample.payload())?;
+                self.record_service_cursor(sample.payload());
+                Ok(Some(RawInputView {
+                    inner: RawInputViewInner::Owned(sample, frame_len),
+                }))
+            }
+            FrozenSlot::Err(error) => Err(error),
+        }
+    }
+
+    /// Callback convenience wrapper around [`Self::view_raw`].
+    #[must_use = "raw input result must be checked"]
+    pub fn try_view_raw<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> TransportResult<Option<R>> {
+        self.view_raw().map(|view| view.map(|view| f(&view)))
+    }
+
+    /// Select the next slot using the same frozen/held/live discipline as `try_view`.
+    ///
+    /// Raw and typed consumers must share this path so read-outcome staging,
+    /// FIFO promotion, and block-slot reconciliation remain identical.
+    fn select_slot(&mut self) -> FrozenSlot {
         // Accounting-once: if a step-boundary snapshot was
         // taken for this input, serve it WITHOUT re-draining (the drain already
         // ran + accounted at snapshot time). Otherwise drain live now (trigger
@@ -2745,14 +2885,8 @@ impl CerulionSubscriber {
         // `Empty` serve reads nothing — so the accounting-once contract is
         // unchanged however many fires read it.
         match self.frozen.as_ref() {
-            Some(FrozenSlot::Held) => {
-                let sample = self
-                    .held_sample
-                    .as_ref()
-                    .expect("FrozenSlot::Held implies held_sample is Some");
-                return build_inbound_view::<T, R>(&self.topic, sample, f).map(Some);
-            }
-            Some(FrozenSlot::Empty) => return Ok(None),
+            Some(FrozenSlot::Held) => return FrozenSlot::Held,
+            Some(FrozenSlot::Empty) => return FrozenSlot::Empty,
             // `Sample` / `Err` (consumed below) and `None` (the live arm).
             _ => {}
         }
@@ -2914,52 +3048,7 @@ impl CerulionSubscriber {
         // call and never touched a slot, so re-deriving finds nothing to
         // release and the pop-time decrement stands unchanged.
         self.reconcile_block_slot_debt();
-        // Reachable with a `Sample` or an `Err` (taken from the slot,
-        // or produced by the live drain) and with an `Empty` (live drain only —
-        // a FROZEN Empty returned above). `Held` is produced by no drain and
-        // returned above, so it is unreachable here; it is served correctly
-        // rather than `unreachable!`d, because a diagnostic slot state must
-        // never be able to abort the read path it observes.
-        match slot {
-            FrozenSlot::Sample(sample) => {
-                // The ONE serve point both drain disciplines reach —
-                // Unified serves the boundary's frozen slot, Separate pops live
-                // into the same arm — so the service cursor has one write site
-                // and one meaning, and `CERULION_DRAIN_DISCIPLINE=separate`
-                // yields the identical cursor.
-                //
-                // Advanced only on `Ok`: `build_inbound_view` rejects a
-                // schema-mismatched / undersized / out-of-bounds frame, which
-                // the tick never sees. Recording it as served would tell a
-                // resume to skip a frame nothing read.
-                let out = build_inbound_view::<T, R>(&self.topic, &sample, f)?;
-                self.record_service_cursor(sample.payload());
-                Ok(Some(out))
-            }
-            // NB: this arm records NO cursor, and it is unreachable TWICE over,
-            // which is why that is not a gap:
-            //
-            // 1. The serve-many arm above RETURNS on `Held`, so no `Held` slot
-            //    reaches this match at all.
-            // 2. Even if one did, `held_sample` is written only by
-            //    `snapshot_latest` (the non-trigger, latest-value path), and
-            //    this type's own invariant states that a `Sample` frozen slot
-            //    happens ONLY for trigger / direct-path inputs, which never
-            //    hold — so a `Held` input never carries a cursor to write.
-            //
-            // Storing here would cost an atomic per non-trigger input per fire
-            // for a value no reader can use, and — under serve-many — would do
-            // it once per fire of a burst for one frame.
-            FrozenSlot::Held => {
-                let sample = self
-                    .held_sample
-                    .as_ref()
-                    .expect("FrozenSlot::Held implies held_sample is Some");
-                build_inbound_view::<T, R>(&self.topic, sample, f).map(Some)
-            }
-            FrozenSlot::Empty => Ok(None),
-            FrozenSlot::Err(e) => Err(e),
-        }
+        slot
     }
 
     /// The single drain-and-account implementation. Drains
@@ -4710,6 +4799,35 @@ impl CerulionSubscriber {
     }
 }
 
+/// Validates a raw frame's `WireHeader` bounds and returns its total length.
+fn validate_raw_frame(topic: &str, raw: &[u8]) -> TransportResult<usize> {
+    if raw.len() < WireHeader::SIZE {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "undersized message: {} bytes, need at least {}",
+                raw.len(),
+                WireHeader::SIZE
+            ),
+        });
+    }
+    let header = WireHeader::read_from_buf(raw).ok_or_else(|| TransportError::Deserialization {
+        topic: topic.to_string(),
+        reason: "failed to parse WireHeader from received message".to_string(),
+    })?;
+    let total_size = header.total_size as usize;
+    if total_size < WireHeader::SIZE || total_size > raw.len() {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "invalid total_size {total_size} for {}-byte message",
+                raw.len()
+            ),
+        });
+    }
+    Ok(total_size)
+}
+
 /// Build an `InputView` from an owned inbound iceoryx2 sample,
 /// validating its `WireHeader`. Used by the `try_view` receive path.
 /// Returns `Err` on undersized / schema-mismatch / out-of-bounds
@@ -5576,6 +5694,190 @@ mod tests {
         assert_eq!(
             classify_gap(0, BACKWARD_GAP_THRESHOLD + 1),
             GapClass::Backward
+        );
+    }
+
+    #[test]
+    fn raw_frame_validation_accepts_hand_written_wire_frame() {
+        let mut frame = [0_u8; WireHeader::SIZE];
+        frame[8..12].copy_from_slice(&(WireHeader::SIZE as u32).to_le_bytes());
+        assert_eq!(
+            validate_raw_frame("/raw", &frame).unwrap(),
+            WireHeader::SIZE
+        );
+    }
+
+    #[test]
+    fn raw_frame_validation_rejects_undersized_and_out_of_bounds_frames() {
+        assert!(matches!(
+            validate_raw_frame("/raw", &[0; WireHeader::SIZE - 1]),
+            Err(TransportError::Deserialization { .. })
+        ));
+        let mut frame = [0_u8; WireHeader::SIZE];
+        frame[8..12].copy_from_slice(&((WireHeader::SIZE as u32) + 1).to_le_bytes());
+        assert!(matches!(
+            validate_raw_frame("/raw", &frame),
+            Err(TransportError::Deserialization { .. })
+        ));
+    }
+
+    fn raw_view_frame(sequence: u32) -> Vec<u8> {
+        let mut frame = vec![
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // schema hash
+            0x22, 0x00, 0x00, 0x00, // total size
+            0x20, 0x00, 0x00, 0x00, // offset table offset
+            0x00, 0x00, 0x00, 0x00, // offset table count
+            0x00, 0x00, 0x00, 0x00, // sequence
+            0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp
+            0xAA, 0xBB,
+        ];
+        frame[20..24].copy_from_slice(&sequence.to_le_bytes());
+        frame
+    }
+
+    #[test]
+    fn view_raw_reads_a_live_frame_with_hand_written_bytes() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_live".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/live";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        let expected = raw_view_frame(7);
+        publisher.publish_raw(&expected).expect("publish");
+
+        let view = subscriber.view_raw().expect("view").expect("sample");
+        assert_eq!(&*view, expected.as_slice());
+        let owned = match view.into_owned() {
+            Ok(owned) => owned,
+            Err(_) => panic!("live sample is owned"),
+        };
+        assert_eq!(&*owned, expected.as_slice());
+    }
+
+    #[test]
+    fn view_raw_reoffers_a_held_frame_without_advancing_the_cursor() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_held".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/held";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        let expected = raw_view_frame(3);
+        publisher.publish_raw(&expected).expect("publish");
+        subscriber.snapshot_latest();
+
+        let first = subscriber.view_raw().expect("first view").expect("sample");
+        assert_eq!(&*first, expected.as_slice());
+        let held = match first.into_owned() {
+            Ok(_) => panic!("held sample must remain borrowed"),
+            Err(held) => held,
+        };
+        assert_eq!(&*held, expected.as_slice());
+        let second = subscriber.view_raw().expect("second view").expect("sample");
+        assert_eq!(&*second, expected.as_slice());
+    }
+
+    #[test]
+    fn view_raw_rejects_short_and_malformed_live_frames() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_short".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/short";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        publisher
+            .publish_raw(&[0_u8; WireHeader::SIZE - 1])
+            .expect("publish");
+
+        assert!(matches!(
+            subscriber.view_raw(),
+            Err(TransportError::Deserialization { .. })
+        ));
+        let mut malformed = raw_view_frame(8);
+        malformed[8..12].copy_from_slice(&100_u32.to_le_bytes());
+        publisher
+            .publish_raw(&malformed)
+            .expect("publish malformed");
+        assert!(matches!(
+            subscriber.view_raw(),
+            Err(TransportError::Deserialization { .. })
+        ));
+    }
+
+    #[test]
+    fn view_raw_then_try_view_raw_consumes_each_live_frame_once() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_accounting".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/accounting";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        let first = raw_view_frame(1);
+        let second = raw_view_frame(2);
+        publisher.publish_raw(&first).expect("publish first");
+        assert_eq!(
+            subscriber.view_raw().expect("first view").as_deref(),
+            Some(first.as_slice())
+        );
+        assert!(subscriber
+            .try_view_raw(|_| ())
+            .expect("empty view")
+            .is_none());
+        publisher.publish_raw(&second).expect("publish second");
+        assert_eq!(
+            subscriber
+                .try_view_raw(|bytes| bytes.to_vec())
+                .expect("second view"),
+            Some(second)
         );
     }
 }
