@@ -1,5 +1,10 @@
 [workspace]
 members = [
+    # The umbrella crate: one dependency that re-exports the runtime, the node
+    # macros and the ROS 2 message types, so a user project runs
+    # `cargo add cerulion` rather than naming three crates and keeping their
+    # versions in step. Re-exports only; it carries no logic.
+    "crates/cerulion",
     "crates/cerulion_core",
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
@@ -304,6 +309,9 @@ members = [
 # per-package netd still ships wan). Globs expand the same way as `members`; every
 # entry below is a member above.
 default-members = [
+    # Re-exports only; its whole closure (core, macros, messages) is already
+    # in this set, so it adds nothing to a plain build.
+    "crates/cerulion",
     "crates/cerulion_core",
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
