@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! How this copy of `cerulion` was installed, reported as the telemetry
-//! `channel`. Each installer writes a small JSON marker next to the files it
+//! How this copy of `cerulion` was installed, reported as the
+//! `install_method` of `cli_command_run`. Each installer writes a small JSON marker next to the files it
 //! installs; a copy built from source has none.
 //!
 //! * `install.sh` writes `.cerulion-provenance.json` beside the binaries.
@@ -15,15 +15,12 @@ use std::path::{Path, PathBuf};
 /// The methods a marker may name.
 pub const KNOWN_METHODS: &[&str] = &["install.sh", "deb", "brew"];
 
-/// The method a marker's JSON names, if it is a known one. The installers
-/// write a flat object, so this matches the `"method"` member textually
-/// rather than pulling a JSON parser into the CLI.
+/// The method a marker's JSON object names in its `method` string, if it
+/// is exactly one of [`KNOWN_METHODS`].
 pub fn parse_method(json: &str) -> Option<&'static str> {
-    let compact: String = json.chars().filter(|c| !c.is_whitespace()).collect();
-    KNOWN_METHODS
-        .iter()
-        .copied()
-        .find(|known| compact.contains(&format!("\"method\":\"{known}\"")))
+    let marker: serde_json::Value = serde_json::from_str(json).ok()?;
+    let method = marker.as_object()?.get("method")?.as_str()?;
+    KNOWN_METHODS.iter().copied().find(|known| *known == method)
 }
 
 /// Where the markers for a binary in `bin_dir` live, in lookup order.
@@ -69,6 +66,10 @@ mod tests {
         assert_eq!(parse_method(r#"{"version":"1.0.0"}"#), None);
         assert_eq!(parse_method("not json"), None);
         assert_eq!(parse_method(r#"{"method":"deb2"}"#), None);
+        assert_eq!(parse_method(r#"{"method":"d eb"}"#), None);
+        assert_eq!(parse_method(r#"{ "method" : "deb" }"#), Some("deb"));
+        assert_eq!(parse_method(r#"{"method":["deb"]}"#), None);
+        assert_eq!(parse_method(r#"["deb"]"#), None);
     }
 
     #[test]

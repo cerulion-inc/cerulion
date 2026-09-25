@@ -148,7 +148,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           # The usage-telemetry project key, baked into the CLI by
-          # crates/cerulion_cli/build.rs. A write-only project key; when the
+          # crates/cerulion_cli/src/telemetry.rs. A write-only project key; when the
           # secret is unset the artifacts carry no key and send nothing.
           CERULION_POSTHOG_KEY: ${{ secrets.CERULION_POSTHOG_KEY }}
         run: |

@@ -110,7 +110,8 @@ mod enabled {
                 .filter(|k| !k.trim().is_empty())
                 .or_else(|| {
                     fallback_key
-                        .filter(|k| !k.trim().is_empty())
+                        .map(str::trim)
+                        .filter(|k| !k.is_empty())
                         .map(str::to_owned)
                 })?;
             if !consent::status().enabled {

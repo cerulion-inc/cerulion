@@ -14,6 +14,11 @@ rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Consent resolver and property guard for Cerulion desk surfaces (a no-op without the `posthog` feature)"
+readme = "README.md"
+keywords = ["telemetry", "consent", "posthog", "cerulion"]
+# A crates.io download carries the sources, the README, the license text and
+# this manifest; the test tree stays in the repository.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
 
 [lints]
 workspace = true

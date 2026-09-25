@@ -4,8 +4,8 @@
 //! disclosure is `docs/telemetry.md`.
 //!
 //! Nothing is sent unless [`Client::from_env_or_key`] returns a client, which
-//! needs a key (`POSTHOG_API_KEY`, else the one a release build baked in via
-//! `build.rs`) and consent. The run that prints the notice sends nothing, so the
+//! needs a key (`POSTHOG_API_KEY`, else the `CERULION_POSTHOG_KEY` a release
+//! build was compiled with) and consent. The run that prints the notice sends nothing, so the
 //! user reads it before the first event leaves the machine.
 
 use std::io::Write;
@@ -41,7 +41,8 @@ pub const CLI_LOGIN_COMPLETED: EventSpec = EventSpec {
 };
 
 /// The PostHog project key a release build carries; `None` in a source build.
-const BAKED_KEY: Option<&str> = option_env!("CERULION_BAKED_POSTHOG_KEY");
+/// Read by the compiler, so the key never passes through build-script output.
+const BAKED_KEY: Option<&str> = option_env!("CERULION_POSTHOG_KEY");
 
 /// Whether this process may send: set once [`CommandRun::start`] has
 /// decided to record, so a login inside the run that printed the notice, or
