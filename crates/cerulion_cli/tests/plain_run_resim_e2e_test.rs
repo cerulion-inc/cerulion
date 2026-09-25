@@ -735,23 +735,212 @@ fn resim(root: &Path, bag: &Path, extra: &[&str], stem: &str) -> (Option<i32>, S
     (status.code(), read_file(&err_path))
 }
 
+/// What ONE line of a resim's stderr says about the re-execution, if anything.
+#[derive(Debug, PartialEq, Eq)]
+enum ResimSummary {
+    /// The re-executed step count.
+    Steps(u64),
+    /// A verdict saying the re-execution did not pass, verbatim.
+    Failed(String),
+}
+
+/// Is this line a top-level FAIL verdict header, `<HEADER>: <bag>`?
+///
+/// The class headers come from [`cerulion_cli_engine::replay_engine::DivergenceClass`]
+/// itself rather than from transcribed literals, so a rename of the vocabulary
+/// moves this parser with it instead of silently making it read nothing.
+/// `NODE FAILURE` (the verdict's panic-class block) and `resim FAILED` (the
+/// NEUTRAL renderer's crash line) are not classes and are named here.
+///
+/// The head must be the WHOLE of what precedes the first `": "`, which is what
+/// keeps the report-only `NOTE: EDGE-READ DIVERGENCE (...)` line — rendered on
+/// the pass path too, and never a verdict — out: its head is `NOTE`.
+fn fail_verdict(line: &str) -> Option<&str> {
+    let (head, _) = line.split_once(": ")?;
+    let is_class = cerulion_cli_engine::replay_engine::DivergenceClass::ALL
+        .iter()
+        .any(|c| c.header() == head);
+    (is_class || head == "NODE FAILURE" || head == "resim FAILED").then_some(line)
+}
+
+/// Classify one line of a resim's stderr. PURE, so the wordings below can be
+/// pinned by hand oracles rather than by a run.
+fn classify_resim_line(line: &str) -> Option<ResimSummary> {
+    let line = line.trim();
+    // The FAIL verdicts FIRST. A failing `--verify` run prints no line this
+    // parser can read a count off, and the two failures need different next
+    // steps from whoever reads the log.
+    if let Some(verdict) = fail_verdict(line) {
+        return Some(ResimSummary::Failed(verdict.to_string()));
+    }
+    // A bare `--resim` run: `re-executed N step(s), M produced topic(s)`.
+    if let Some(rest) = line.strip_prefix("re-executed ") {
+        return rest
+            .split_once(" step(s)")?
+            .0
+            .parse::<u64>()
+            .ok()
+            .map(ResimSummary::Steps);
+    }
+    // A `--verify` run's PASS verdict, whose count REPLACES the bare summary:
+    // `replay PASS: <bag> (N tick(s) replayed, ...)`.
+    //
+    // Anchored on the ` tick(s) replayed` marker and walked BACKWARDS over the
+    // digits in front of it, never on the opening ` (`: the verdict may carry a
+    // DECLINED suffix that opens a SECOND parenthesis
+    // (`; 1 DECLINED (1 of them matched under the fallback, not credited)`), so
+    // a right-split on ` (` lands inside that one and reads no count at all.
+    let rest = line.strip_prefix("replay PASS: ")?;
+    let head = rest.split_once(" tick(s) replayed")?.0;
+    let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    head[head.len() - digits..]
+        .parse::<u64>()
+        .ok()
+        .map(ResimSummary::Steps)
+}
+
+/// The re-executed step count a resim's whole stderr reports, or the sentence
+/// [`executed_steps`] panics with. PURE, so the failure wording is an oracle's
+/// to check rather than a panic's.
+fn resim_step_count(stderr: &str) -> Result<u64, String> {
+    match stderr.lines().find_map(classify_resim_line) {
+        Some(ResimSummary::Steps(n)) => Ok(n),
+        Some(ResimSummary::Failed(verdict)) => Err(format!(
+            "the resim was JUDGED and did not pass, so it reported no step count: {verdict}"
+        )),
+        None => Err("the resim summary must report its step count".to_string()),
+    }
+}
+
 /// The re-executed step count the resim summary reports, in either wording:
 /// a bare `--resim` run's `re-executed N step(s)`, or a `--verify` run's
-/// verdict line `replay PASS: <bag> (N tick(s) replayed, ...)` (the verdict
-/// REPLACES the bare summary; arm 6 is the first caller on a `--verify` run).
+/// verdict line `replay PASS: <bag> (N tick(s) replayed, ...)`, which REPLACES
+/// the bare summary.
+///
+/// Every end-to-end arm in this file drives a BARE `--resim` — the module doc
+/// says why `--verify` is deliberately not driven here — so the verdict
+/// wordings are pinned by the hand oracles below and by nothing else in this
+/// file. Their first end-to-end caller is the verify arm the next change in
+/// this series adds.
 fn executed_steps(stderr: &str) -> u64 {
-    stderr
-        .lines()
-        .find_map(|l| {
-            let l = l.trim();
-            if let Some(rest) = l.strip_prefix("re-executed ") {
-                return rest.split_once(" step(s)")?.0.parse::<u64>().ok();
-            }
-            let rest = l.strip_prefix("replay PASS: ")?;
-            let (_, tail) = rest.rsplit_once(" (")?;
-            tail.split_once(" tick(s) replayed")?.0.parse::<u64>().ok()
-        })
-        .unwrap_or_else(|| panic!("the resim summary must report its step count:\n{stderr}"))
+    match resim_step_count(stderr) {
+        Ok(n) => n,
+        Err(why) => panic!("{why}\n{stderr}"),
+    }
+}
+
+// The oracles below are PURE — no process, no transport — and they are still
+// `#[serial]`, for the reason `cerulion_core`'s `serial_discipline_test` states:
+// this file reaches the process-global iceoryx2 manager
+// (`TransportManager::get_or_init` in `await_the_worker_has_stepped`) and the
+// `cerulion_cli` package is NOT run with `-- --test-threads=1` in CI, so the
+// rule is per FILE, not per test. A pure arm left unmarked would run beside a
+// live one on a CI lane and cost the live one its serialisation.
+
+/// The bare `--resim` wording, which the live arms also drive.
+#[test]
+#[serial]
+fn a_bare_resim_summary_line_reports_its_step_count() {
+    assert_eq!(
+        classify_resim_line("  re-executed 47 step(s), 2 produced topic(s)"),
+        Some(ResimSummary::Steps(47)),
+        "the neutral renderer indents its summary, so the line is trimmed first"
+    );
+    assert_eq!(
+        resim_step_count(
+            "resim (no verdict): /cap.mcap\n  re-executed 47 step(s), 2 produced topic(s)\n  \
+             no verdict was made\n"
+        ),
+        Ok(47)
+    );
+}
+
+/// The `--verify` PASS wording, which no arm in this file drives.
+#[test]
+#[serial]
+fn a_verify_pass_verdict_reports_its_tick_count() {
+    let line = "replay PASS: /cap.mcap (47 tick(s) replayed, 2/2 topic(s) matched \
+                byte-for-byte and were credited)";
+    assert_eq!(
+        classify_resim_line(line),
+        Some(ResimSummary::Steps(47)),
+        "the verdict REPLACES the bare summary, so its tick count is the step count"
+    );
+    assert_eq!(
+        resim_step_count(&format!("coordination: lockstep\n{line}\n")),
+        Ok(47)
+    );
+}
+
+/// The same verdict carrying the DECLINED suffix — a SECOND parenthesis inside
+/// the first, which is the shape a right-split on ` (` reads nothing from.
+#[test]
+#[serial]
+fn a_verify_pass_verdict_with_a_declined_suffix_still_reports_its_tick_count() {
+    assert_eq!(
+        classify_resim_line(
+            "replay PASS: /cap.mcap (47 tick(s) replayed, 1/2 topic(s) matched byte-for-byte \
+             and were credited; 1 DECLINED (1 of them matched under the fallback, not \
+             credited))"
+        ),
+        Some(ResimSummary::Steps(47))
+    );
+}
+
+/// A verdict that did NOT pass is named, rather than reported as a missing
+/// summary: the panic an operator reads must say the replay was judged and
+/// lost, not send them looking at this parser.
+#[test]
+#[serial]
+fn a_failing_verify_verdict_is_named_rather_than_read_as_a_missing_summary() {
+    let stderr = "coordination: lockstep\n\
+                  FRAME-CONTENT DIVERGENCE: /cap.mcap\n  \
+                  47 tick(s) replayed; 1/2 topic(s) matched and were credited; 1 violation(s):\n  \
+                  - /xr/relay/out [frame content]: first difference at byte 20\n";
+    let why = resim_step_count(stderr).expect_err("a failing verdict reports no step count");
+    assert!(
+        why.contains("did not pass") && why.contains("FRAME-CONTENT DIVERGENCE: /cap.mcap"),
+        "the verdict must be NAMED: {why}"
+    );
+    // The panic-class block and the neutral renderer's crash line are verdicts
+    // too, and the report-only `NOTE:` line that carries a class header is NOT.
+    assert_eq!(
+        classify_resim_line("NODE FAILURE: /cap.mcap"),
+        Some(ResimSummary::Failed("NODE FAILURE: /cap.mcap".to_string()))
+    );
+    assert_eq!(
+        classify_resim_line("resim FAILED: /cap.mcap"),
+        Some(ResimSummary::Failed("resim FAILED: /cap.mcap".to_string()))
+    );
+    assert_eq!(
+        classify_resim_line(
+            "NOTE: EDGE-READ DIVERGENCE (redundant per-edge verifier; the verdict and exit \
+             code are UNAFFECTED): 2 edge(s) diverged across 3 step(s):"
+        ),
+        None,
+        "a report-only note on the PASS path must never read as a verdict"
+    );
+}
+
+/// A line the parser cannot read a count off yields NOTHING, rather than a
+/// number it invented.
+#[test]
+#[serial]
+fn a_malformed_summary_line_is_not_read_as_a_count() {
+    for line in [
+        "re-executed many step(s), 2 produced topic(s)",
+        "re-executed 47 steps",
+        "replay PASS: /cap.mcap (no tick count at all)",
+        "replay PASS: /cap.mcap (many tick(s) replayed, 2/2 topic(s) matched)",
+        "read log: verified clean (4 edge(s) compared)",
+        "",
+    ] {
+        assert_eq!(classify_resim_line(line), None, "line: {line:?}");
+    }
+    assert_eq!(
+        resim_step_count("resim (no verdict): /cap.mcap\nread log: inert\n"),
+        Err("the resim summary must report its step count".to_string())
+    );
 }
 
 /// Attach a full recorder to the live run for `secs` and return the bag path.
