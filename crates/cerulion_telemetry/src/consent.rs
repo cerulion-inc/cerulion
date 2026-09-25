@@ -95,7 +95,7 @@ pub fn resolve(
 #[cfg(feature = "posthog")]
 pub use enabled::{
     anon_id, claim_notice, file_path, mark_notice_shown, notice_shown, rotate_anon_id, set_enabled,
-    status, TelemetryFile,
+    show_notice_once, status, TelemetryFile,
 };
 
 #[cfg(feature = "posthog")]
@@ -195,9 +195,8 @@ mod enabled {
     ///
     /// The claim is persisted before the caller prints, so this is at most
     /// once: a process that dies between the claim and the print never shows
-    /// the notice. A caller that must show it at least once reads
-    /// [`notice_shown`], prints, then calls [`mark_notice_shown`], as the CLI
-    /// does.
+    /// the notice. A caller that must show it at least once uses
+    /// [`show_notice_once`], as the CLI does.
     pub fn claim_notice() -> Result<bool, Error> {
         let path = file_path()?;
         if read(&path).ok().flatten().is_some_and(|f| f.notice_shown) {
@@ -209,6 +208,28 @@ mod enabled {
             f.notice_shown = true;
         })?;
         Ok(claimed)
+    }
+
+    /// Show the first-run notice at most once across concurrent runs and at
+    /// least once across crashes: under the file lock, call `show` only if
+    /// `notice_shown` is still `false`, then persist it as `true`. A run that
+    /// dies after `show` but before the write shows it again next time.
+    /// Returns whether THIS caller showed it. An already shown notice is
+    /// answered from a lock-free read and leaves the file untouched.
+    pub fn show_notice_once(show: impl FnOnce()) -> Result<bool, Error> {
+        let path = file_path()?;
+        if read(&path)?.is_some_and(|f| f.notice_shown) {
+            return Ok(false);
+        }
+        let mut shown = false;
+        update(|f| {
+            if !f.notice_shown {
+                show();
+                shown = true;
+                f.notice_shown = true;
+            }
+        })?;
+        Ok(shown)
     }
 
     /// Record that the first-run notice has been printed.
@@ -364,7 +385,8 @@ mod enabled {
 
 #[cfg(not(feature = "posthog"))]
 pub use disabled::{
-    anon_id, claim_notice, mark_notice_shown, notice_shown, rotate_anon_id, set_enabled, status,
+    anon_id, claim_notice, mark_notice_shown, notice_shown, rotate_anon_id, set_enabled,
+    show_notice_once, status,
 };
 
 #[cfg(not(feature = "posthog"))]
@@ -397,6 +419,11 @@ mod disabled {
 
     /// Feature off: there is no notice to claim.
     pub fn claim_notice() -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// Feature off: there is no notice to show; `show` is never called.
+    pub fn show_notice_once(_show: impl FnOnce()) -> Result<bool, Error> {
         Ok(false)
     }
 
