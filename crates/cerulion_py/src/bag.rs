@@ -27,6 +27,8 @@ pub struct BagRecordIter {
     reader: SharedReader,
     topics: HashMap<u16, String>,
     spans: std::vec::IntoIter<(u16, FrameSpan)>,
+    /// Set once `__next__` has raised for a closed bag; later calls stop.
+    closure_reported: bool,
 }
 
 fn closed() -> PyErr {
@@ -131,6 +133,7 @@ impl PyBag {
             reader: Rc::clone(&self.reader),
             topics: topic_names,
             spans: spans.into_iter(),
+            closure_reported: false,
         })
     }
 
@@ -151,13 +154,14 @@ impl BagRecordIter {
         &mut self,
         py: Python<'py>,
     ) -> PyResult<Option<(String, Bound<'py, PyBytes>)>> {
-        if self.spans.len() == 0 {
+        if self.closure_reported {
             return Ok(None);
         }
         let guard = self.reader.borrow();
         let Some(reader) = guard.as_ref() else {
             self.spans = Vec::new().into_iter();
             self.topics = HashMap::new();
+            self.closure_reported = true;
             return Err(closed());
         };
         let Some((channel_id, span)) = self.spans.next() else {
