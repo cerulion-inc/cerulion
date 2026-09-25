@@ -5587,6 +5587,22 @@ pub fn graph_run(
                         executes_process_groups,
                         time_source == TimeSource::Virtual,
                         record.is_some(),
+                        // The run's ring INTENT: a supervisor run ASKS FOR
+                        // trace rings unless `--no-rings`. Intent is all this
+                        // call can know: the descriptor is rendered before
+                        // dispatch, so no ring exists yet and the `/dev/shm`
+                        // free-space gate that may refuse the whole plane has
+                        // not run. So this is the PROVISIONAL label, and the
+                        // supervisor re-stamps it from the plan it really
+                        // stamped (`restamp_effective_gating`, immediately
+                        // after the trace-plane decision and before any worker
+                        // is spawned): a refused plane stamps no tags, every
+                        // worker resolves `FreeRunLive` on the `RealClock`, and
+                        // the field a reader sees says `wall`. A WORKER-side
+                        // create failure needs no correction — the worker keys
+                        // its clock discipline on the stamped intent and
+                        // wall-follows either way.
+                        !no_rings,
                         execution_mode,
                     ),
                     // The SHM classes whose tags are known
@@ -6409,15 +6425,35 @@ pub fn graph_run_worker(
     cerulion_core::iceoryx_logger::init_iceoryx_log_level_from_env();
 
     // (2.5) The ONE build-path decision every branch point below
-    // consults — the supervisor-stamped execution mode × whether this run
-    // records. Resolved once here (pure, oracle-pinned) so the clock mint, the
-    // barrier open, the build call, the recording configuration, the epoch and
-    // the exit contract cannot disagree about which shape this rank is.
-    // The ring intent is resolved HERE (pure over the plan) and consumed again
-    // at (7.5), so "does this rank record" has ONE derivation: the build path
-    // and the recording configuration read the same `records` (two
-    // seams agreeing only by reading two functions could drift).
-    // Rings are Unix-only, so a non-Unix worker never records.
+    // consults: the supervisor-stamped execution mode × whether this rank IS
+    // ASKED FOR A TRACE RING. Resolved once here (pure, oracle-pinned) so the
+    // clock mint, the barrier open, the build call, the clock discipline, the
+    // epoch and the exit contract cannot disagree about which shape this rank
+    // is. The ring intent is resolved HERE (pure over the plan) and consumed
+    // again at (7.5), so "does this rank record" and "is this rank asked for a
+    // ring" each have ONE derivation (two seams agreeing only by reading two
+    // functions could drift). Rings are Unix-only, so a non-Unix worker
+    // neither records nor traces.
+    //
+    // INTENT, NOT OUTCOME, and the distinction is load-bearing. The predicate
+    // reads a stamped PLAN FIELD, evaluated before any ring exists, so it is
+    // settled by the time the create at (7.5) is even attempted. Every
+    // consumer of `build_path` therefore has to be reachable WITHOUT a
+    // successful create, which is why the clock discipline is armed at (7.4),
+    // ahead of the ring block, rather than inside it: a rank whose create is
+    // REFUSED was still BUILT on the controlled clock, and a controlled clock
+    // nobody armed to follow the wall advances by a fixed quantum per loop
+    // iteration with no barrier tying it to anything.
+    //
+    // The CLOCK discipline keys on
+    // `traced` (a `Recording` OR a `Trace` intent), because the Flashback
+    // plane captures every traced rank and a capture re-executes only when
+    // each frame's stamp is its step's boundary target; `records` keeps
+    // exactly what is about `--record`: the fatal/degrade ring-creation fork
+    // and per-tick duration recording. `records` is Unix-only, with no
+    // non-Unix binding: every reader of it lives inside the `#[cfg(unix)]`
+    // ring block at (7.5), so a non-Unix one would be an unused binding under
+    // this crate's `deny(unused_variables)`.
     #[cfg(unix)]
     let ring_intent = resolve_worker_ring_intent(
         plan.recording_ring.as_deref(),
@@ -6426,9 +6462,11 @@ pub fn graph_run_worker(
     );
     #[cfg(unix)]
     let records = ring_intent.as_ref().is_some_and(|intent| intent.records());
+    #[cfg(unix)]
+    let traced = ring_intent.is_some();
     #[cfg(not(unix))]
-    let records = false;
-    let build_path = resolve_worker_build_path(plan.execution_mode, records);
+    let traced = false;
+    let build_path = resolve_worker_build_path(plan.execution_mode, traced);
     tracing::info!(
         group = %plan.group,
         execution_mode = ?plan.execution_mode,
@@ -6441,12 +6479,12 @@ pub fn graph_run_worker(
     // by `build_live_deterministic_core` on the controlled-clock arms).
     //
     // WHICH clock is the first branch point. A lockstep rank and a
-    // free-run `--record` rank run on a CONTROLLED `VirtualClock` (the barrier
+    // free-run TRACED rank run on a CONTROLLED `VirtualClock` (the barrier
     // hands the former its quantum; the latter is placed at the shared epoch
-    // and then wall-follows); a free-run NON-record rank runs
-    // on the `RealClock` outright (the monolith live arm per rank),
-    // which is already the machine-wide boot-monotonic domain and needs no
-    // epoch.
+    // and then wall-follows); a free-run rank with NO trace ring
+    // (`--no-rings`) runs on the `RealClock` outright (the monolith live arm
+    // per rank), which is already the machine-wide boot-monotonic domain and
+    // needs no epoch.
     let controlled: Option<Arc<cerulion_core::VirtualClock>> = build_path
         .uses_controlled_clock()
         .then(|| Arc::new(cerulion_core::VirtualClock::new()));
@@ -6486,7 +6524,7 @@ pub fn graph_run_worker(
             &plan.barrier_ns,
             &plan.barrier_id,
         )?)),
-        WorkerBuildPath::FreeRunLive | WorkerBuildPath::FreeRunRecord => None,
+        WorkerBuildPath::FreeRunLive | WorkerBuildPath::FreeRunTraced => None,
     };
 
     // (5.5) OPEN the credit words the supervisor OWNS for every
@@ -6724,8 +6762,8 @@ pub fn graph_run_worker(
                 cross_process,
             )?
         }
-        // FREE-RUN, not recording: the monolith live arm per rank — RealClock,
-        // watch == gating, no participant, no quantum.
+        // FREE-RUN with no trace ring (`--no-rings`): the monolith live arm per
+        // rank: RealClock, watch == gating, no participant, no quantum.
         WorkerBuildPath::FreeRunLive => cerulion_core::GraphRuntime::build_live_free_run(
             config,
             factories,
@@ -6735,17 +6773,17 @@ pub fn graph_run_worker(
             mw_policy,
             cross_process,
         )?,
-        // FREE-RUN, `--record`: the monolith RECORDING arm per rank — the
-        // controlled clock, the LOCAL derived quantum, no participant.
-        // `recorded_topics` is `None` exactly as on the lockstep
-        // arm: the mp recorder's writer thread copies at any borrow >= 1,
-        // so the single-process borrow raise buys nothing here. The
-        // wall-following clock is armed at (7.5); the shared epoch is ARMED at (8.9)
-        // and placed by `run_live` at its wall-clock anchor.
-        WorkerBuildPath::FreeRunRecord => {
+        // FREE-RUN with a trace ring (the always-on rings, or `--record`): the
+        // monolith wall-following arm per rank: the controlled clock, the LOCAL
+        // derived quantum, no participant. `recorded_topics` is `None` exactly
+        // as on the lockstep arm: the mp recorder's writer thread copies at any
+        // borrow >= 1, so the single-process borrow raise buys nothing here. The
+        // wall-following clock is armed at (7.4); the shared epoch is ARMED at
+        // (8.9) and placed by `run_live` at its wall-clock anchor.
+        WorkerBuildPath::FreeRunTraced => {
             let Some(clock) = controlled.as_ref() else {
                 return Err(CliError::Validation(format!(
-                    "graph run-worker: internal — the free-run recording build path for group \
+                    "graph run-worker: internal: the free-run traced build path for group \
                      '{}' resolved without its controlled clock (please report)",
                     plan.group
                 )));
@@ -6784,6 +6822,50 @@ pub fn graph_run_worker(
     // `TransportManager::get()` singleton) already resolves to it; parking makes
     // the wiring explicit and immune to a future non-singleton worker transport.
     runtime.set_live_transport(Arc::clone(&transport));
+
+    // (7.4) The clock discipline: the fourth branch point, governed by the
+    // BUILD PATH ALONE and therefore placed here, immediately after the build
+    // and BEFORE the (7.5) ring block.
+    //
+    // A lockstep rank is QUANTUM-timed and must NEVER wall-follow; a free-run
+    // TRACED rank is the monolith wall-following arm per rank and MUST (its
+    // epoch is ARMED at (8.9) and placed by `run_live` at its wall-clock
+    // anchor). `FreeRunLive` cannot reach this arm: it is on the `RealClock`,
+    // which is the wall already.
+    //
+    // WHY IT IS NOT INSIDE (7.5). `build_path` derives from the ring INTENT,
+    // so a rank whose create is later refused has ALREADY been built on a
+    // controlled clock carrying a locally derived quantum and no barrier
+    // participant. Armed only on the create's success path, that rank would
+    // run the documented degrade (the one (7.5) exists to survive), advancing
+    // its logical clock one quantum per loop iteration, at whatever rate its
+    // loop happens to spin, while its peers advance by measured wall elapsed
+    // from the same shared epoch. Period cadence, `expect_within` and
+    // `promise_within` windows, Sync windows and every `timestamp_ns` it
+    // stamps would come off that timeline, and the degrade warn would say the
+    // graph runs normally. So the arming needs exactly what the build already
+    // guarantees (a quantum installed, no participant) and nothing the ring
+    // create provides. Adding a second arming call to the degrade arm instead
+    // would restore the behaviour and reintroduce the two-seam drift the
+    // single derivation at (2.5) exists to prevent.
+    //
+    // Per-tick duration recording stays a `--record` deliverable and stays at
+    // (7.5): it is keyed on `records`, not on the build path, and its subject
+    // (the ring) is what that block creates.
+    //
+    // `#[cfg(unix)]` because `configure_traced_runtime_free_run` is: on
+    // non-Unix `traced` is the hard `false` at (2.5), so the path resolves
+    // `FreeRunLive` and this arm is unreachable regardless of the gate.
+    #[cfg(unix)]
+    if let WorkerBuildPath::FreeRunTraced = build_path {
+        configure_traced_runtime_free_run(&mut runtime)?;
+        tracing::info!(
+            group = %plan.group,
+            rank = plan.rank,
+            "free-run traced rank: gating clock armed to follow the wall once per step \
+             (keyed on the build path, so a refused ring create does not change it)"
+        );
+    }
 
     // (7.5) The worker-side trace-ring
     // seam. The supervisor stamps ONE of two plan fields — `recording_ring`
@@ -6899,25 +6981,13 @@ pub fn graph_run_worker(
         match create_outcome {
             Ok((ring, trace_producer)) => {
                 runtime.set_trace_ring_producer(trace_producer, &recording_node_ids);
+                // Per-tick duration recording: a `--record` deliverable on
+                // every path, keyed on `records` and NOT on the build path.
+                // The CLOCK discipline is not here: it is armed at (7.4) off
+                // the build path, before this block, so a rank whose create is
+                // refused keeps it (see the reasoning there).
                 if records {
-                    // The mode-conditional PAIR: the fourth
-                    // branch point. A lockstep rank is QUANTUM-timed and must
-                    // NEVER wall-follow; a free-run `--record` rank is the
-                    // monolith recording arm per rank and MUST (its epoch is
-                    // ARMED at (8.9) and placed by `run_live` at its
-                    // wall-clock anchor). `FreeRunLive` cannot reach this arm —
-                    // `records` and the build path derive from the SAME
-                    // `recording_ring` bit — so it is grouped with the
-                    // quantum-timed shape rather than given a third,
-                    // unreachable behaviour.
-                    match build_path {
-                        WorkerBuildPath::FreeRunRecord => {
-                            configure_recording_runtime_free_run(&mut runtime)?;
-                        }
-                        WorkerBuildPath::Lockstep | WorkerBuildPath::FreeRunLive => {
-                            configure_recording_runtime_mp(&mut runtime);
-                        }
-                    }
+                    configure_recording_runtime_mp(&mut runtime);
                 }
                 tracing::info!(
                     group = %plan.group,
@@ -7279,29 +7349,29 @@ pub fn graph_run_worker(
     // the `Period` deadlines and re-seeds the watchdog windows the build
     // anchored at 0 (see `place_gating_epoch` for why a bare `clock.set` would
     // hang on the first step). A lockstep rank keeps its quantum timeline; a
-    // non-record free-run rank is already on the RealClock.
+    // ring-less free-run rank is already on the RealClock.
     //
     // Armed here and placed by `run_live` in the same breath as
     // its wall-clock anchor — placed here, each rank's clock would lag
     // boot-monotonic time by its own `run_live` setup time (the prologue
     // collects external sources and builds the reactor; unmeasured for a
     // worker), the cross-rank skew the epoch exists to remove. `#[cfg(unix)]`
-    // for symmetry with (7.5) only — on non-Unix `records` is the hard
+    // for symmetry with (7.5) only: on non-Unix `traced` is the hard
     // `false` at (2.5), so the path resolves `FreeRunLive` and this arm is
     // unreachable regardless of the gate.
     #[cfg(unix)]
-    if let WorkerBuildPath::FreeRunRecord = build_path {
+    if let WorkerBuildPath::FreeRunTraced = build_path {
         if let Err(e) = runtime.place_gating_epoch_at_live_anchor() {
             runtime.shutdown();
             return Err(CliError::Validation(format!(
-                "graph run-worker: group '{}' could not arm the free-run recording epoch: {e}",
+                "graph run-worker: group '{}' could not arm the free-run traced epoch: {e}",
                 plan.group
             )));
         }
         tracing::info!(
             group = %plan.group,
             rank = plan.rank,
-            "free-run recording: gating clock epoch armed for the live loop's wall-clock \
+            "free-run traced rank: gating clock epoch armed for the live loop's wall-clock \
              anchor (read from real_ns() immediately before the first delta)"
         );
     }
@@ -7347,7 +7417,7 @@ pub fn graph_run_worker(
                     "worker left the barrier cohort on clean shutdown (survivors proceed without a poison stall)"
                 );
             }
-            WorkerBuildPath::FreeRunLive | WorkerBuildPath::FreeRunRecord => {
+            WorkerBuildPath::FreeRunLive | WorkerBuildPath::FreeRunTraced => {
                 tracing::debug!(
                     group = %plan.group,
                     "free-run worker exiting cleanly — no barrier cohort to leave (peer death \
@@ -9244,55 +9314,67 @@ fn stamp_topic_requirements(
 }
 
 /// The worker's ONE build-path decision: the stamped
-/// [`crate::multiprocess::ExecutionMode`] × whether this run RECORDS, resolved
-/// once at the top of `graph_run_worker` and consulted at every branch point
-/// (the clock mint, the barrier open, the build call, the recording
-/// configuration, the epoch, the cohort leave) so the six cannot disagree
-/// about which shape this rank is. The three shapes are
-/// the lockstep worker, the free-run non-record worker (the
-/// monolith live arm per rank) and the free-run `--record` worker (the
-/// monolith recording arm per rank).
+/// [`crate::multiprocess::ExecutionMode`] × whether this rank MINTS A TRACE
+/// RING, resolved once at the top of `graph_run_worker` and consulted at every
+/// branch point (the clock mint, the barrier open, the build call, the clock
+/// discipline, the epoch, the cohort leave) so the six cannot disagree about
+/// which shape this rank is. The three shapes: the shipped lockstep worker, the
+/// free-run worker with NO trace ring (`--no-rings`: the monolith live arm per
+/// rank) and the free-run TRACED worker (the always-on scheduler-trace rings
+/// every multi-process run mints, or `--record`: the monolith wall-following
+/// arm per rank).
+///
+/// The predicate is "mints a trace ring", NOT "records". The Flashback plane captures every traced rank,
+/// and a capture is re-executable only when each frame's stamp IS its step's
+/// boundary target, which needs the CONTROLLED wall-following clock. Keyed on
+/// `--record` alone, a plain free-run run's ranks ran on the `RealClock`, and
+/// every capture of them carried frames stamped BETWEEN two boundaries
+/// (measured on a kept capture: ticker frames at target+42..84 us, relay frames
+/// at target+154..222 us, on every step), refused by the resim's check 3, and
+/// never byte-reproducible by a replay that re-advances to the target exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerBuildPath {
     /// Barrier lockstep, recording or not: controlled `VirtualClock` on the
     /// handed quantum, the shared `MappedBarrier`, the (e) ctor. Byte-unchanged
     /// from before free-run mode.
     Lockstep,
-    /// Free-run, NOT recording: `RealClock`, no barrier,
-    /// `GraphRuntime::build_live_free_run`.
+    /// Free-run with NO trace ring (`--no-rings`): `RealClock`, no barrier,
+    /// `GraphRuntime::build_live_free_run`. Nothing can capture this rank, so
+    /// nothing needs its stamps to be re-advanceable.
     FreeRunLive,
-    /// Free-run, `--record`: controlled `VirtualClock` (placed at the shared
-    /// `real_ns()` epoch before the first step, then wall-following), no
-    /// barrier, `GraphRuntime::build_live_deterministic_free_run`.
-    FreeRunRecord,
+    /// Free-run with a trace ring (the always-on rings, or `--record`):
+    /// controlled `VirtualClock` (placed at the shared `real_ns()` epoch before
+    /// the first step, then wall-following ONCE per step), no barrier,
+    /// `GraphRuntime::build_live_deterministic_free_run`.
+    FreeRunTraced,
 }
 
 impl WorkerBuildPath {
     /// Whether this rank's gating clock is a CONTROLLED `VirtualClock` (the
     /// transport is built on the same instance) — `false` only on the
-    /// non-record free-run arm, which runs on the `RealClock` outright.
+    /// ring-less free-run arm, which runs on the `RealClock` outright.
     fn uses_controlled_clock(self) -> bool {
         match self {
-            WorkerBuildPath::Lockstep | WorkerBuildPath::FreeRunRecord => true,
+            WorkerBuildPath::Lockstep | WorkerBuildPath::FreeRunTraced => true,
             WorkerBuildPath::FreeRunLive => false,
         }
     }
 }
 
 /// PURE: the [`WorkerBuildPath`] a plan's stamped mode and
-/// recording bit imply. `records` is derived ONCE at the worker's (2.5) from
-/// the ring intent (`WorkerRingIntent::records()`, itself keyed on
-/// `WorkerPlan::recording_ring`) and is the hard `false` on non-Unix, where no
-/// ring is minted. Oracle-pinned by
-/// `the_worker_build_path_resolves_every_mode_and_records_cell`.
+/// trace-ring bit imply. `traced` is derived ONCE at the worker's (2.5) from
+/// the ring intent (`ring_intent.is_some()`: a `Recording` OR a `Trace`
+/// intent, i.e. `WorkerPlan::recording_ring` or `WorkerPlan::trace_ring`) and
+/// is the hard `false` on non-Unix, where no ring is minted. Oracle-pinned by
+/// `the_worker_build_path_resolves_every_mode_and_traced_cell`.
 fn resolve_worker_build_path(
     mode: crate::multiprocess::ExecutionMode,
-    records: bool,
+    traced: bool,
 ) -> WorkerBuildPath {
-    match (mode, records) {
+    match (mode, traced) {
         (crate::multiprocess::ExecutionMode::Lockstep, _) => WorkerBuildPath::Lockstep,
         (crate::multiprocess::ExecutionMode::FreeRun, false) => WorkerBuildPath::FreeRunLive,
-        (crate::multiprocess::ExecutionMode::FreeRun, true) => WorkerBuildPath::FreeRunRecord,
+        (crate::multiprocess::ExecutionMode::FreeRun, true) => WorkerBuildPath::FreeRunTraced,
     }
 }
 
@@ -10337,6 +10419,26 @@ fn graph_run_supervisor(
     };
     #[cfg(unix)]
     let mut trace_plane = trace_plane;
+    // The manifest now follows the trace plane, not the
+    // intent. `graph_run` wrote `gating` before the dispatch, from `!no_rings`,
+    // because a pre-dispatch descriptor has no other fact to write; the
+    // decision above is the moment the real one exists. It is read off the
+    // PLAN — the field each worker resolves its own build path from — so the
+    // label and every rank's clock cannot disagree.
+    //
+    // Placed HERE rather than beside the refusal arm: the correction is
+    // unconditional (see `restamp_effective_gating`), and this is the first
+    // point every arm of the decision has converged. It still precedes the plan
+    // serialization and the spawn loop below, so the manifest is right before
+    // anything can attach to this run.
+    #[cfg(unix)]
+    restamp_effective_gating(
+        run_dir,
+        &plan,
+        time_source == TimeSource::Virtual,
+        record.is_some(),
+        execution_mode,
+    );
     // ARM THE WEDGE ALARM. Every rank gets a page; the supervisor
     // keeps the observing half and stamps each worker's (tag, slot order) into
     // its plan.
@@ -16726,53 +16828,55 @@ fn configure_recording_runtime(
 ///   `CERULION_MP_TRACE_DIR` diagnostic seam — re-setting it here would bypass
 ///   that gate.
 ///
-/// This is ONE HALF of a mode-conditional PAIR: the worker
-/// calls this on the `Lockstep` build path and
-/// [`configure_recording_runtime_free_run`] on the `FreeRunRecord` one. The
-/// contract above holds VERBATIM for the lockstep route (the
-/// default)
-/// and is inverted on the free-run route, where each rank has no peers to
-/// stay in lockstep with — exactly the monolith's reason.
+/// This is ONE HALF of a PAIR, cut along the fact each half is about: this fn is the
+/// `--record` half (per-tick durations) and runs on EVERY build path that
+/// records, while [`configure_traced_runtime_free_run`] is the CLOCK half and
+/// runs on every `FreeRunTraced` rank whether or not it records. The contract
+/// above holds VERBATIM for the lockstep route (the default) and is INVERTED
+/// on the free-run route by the other half, where each rank has no peers to
+/// stay in lockstep with, exactly the monolith's reason.
 ///
 /// Pinned by `configure_recording_runtime_mp_pins_durations_on_wall_off` (the
 /// mp sibling of `configure_recording_runtime_pins_recording_flags`; its
-/// free-run twin is `configure_recording_runtime_free_run_pins_durations_and_wall_on`).
+/// free-run twin is `configure_traced_runtime_free_run_pins_wall_on_and_leaves_durations_to_record`).
 #[cfg(unix)]
 fn configure_recording_runtime_mp(runtime: &mut cerulion_core::GraphRuntime) {
     runtime.set_record_tick_durations(true);
 }
 
-/// The FREE-RUN multi-process recording-mode
-/// runtime configuration — the other half of the pair above. A free-run
-/// `--record` rank is the monolith recording arm run per rank, so it does what
-/// [`configure_recording_runtime`] does for the monolith: arms the wall-following
-/// gating clock (advance the CONTROLLED clock by MEASURED wall elapsed —
-/// recorded, and re-advanceable in replay) AND flips per-tick duration
-/// recording ON. The lockstep contract's "must NEVER wall-follow" is
-/// deliberately inverted here: there is no handed gating quantum and no peer
-/// clock to stay in step with; every rank's boundary stream is its own,
-/// sharing only the epoch the worker ARMS after GO and `run_live` places at
-/// its wall-clock anchor.
+/// The FREE-RUN traced rank's CLOCK configuration, the other half of the pair
+/// above. A free-run rank that mints a trace ring is the monolith
+/// wall-following arm run per rank, so it does what
+/// [`configure_recording_runtime`] does for the monolith's clock: arms the
+/// wall-following gating clock (advance the CONTROLLED clock by MEASURED wall
+/// elapsed ONCE per step, recorded, and re-advanceable in replay, so every
+/// frame the rank publishes is stamped with its step's boundary target). The lockstep
+/// contract's "must NEVER wall-follow" is deliberately inverted here: there is
+/// no handed gating quantum and no peer clock to stay in step with; every
+/// rank's boundary stream is its own, sharing only the epoch the worker ARMS
+/// after GO and `run_live` places at its wall-clock anchor.
+///
+/// The Flashback plane captures every traced rank, recording or not, so this
+/// clock half runs on every `FreeRunTraced` rank and the per-tick durations
+/// half stays with `--record` ([`configure_recording_runtime_mp`], every
+/// path).
 ///
 /// What it does NOT do, exactly as the lockstep half: set the trace cap (the
 /// worker applies `plan.trace_limit` itself under the `CERULION_MP_TRACE_DIR`
 /// gate). Nor does it arm the epoch — that is a loop-entry decision taken
 /// after GO (`graph_run_worker` step (8.9)), not a build-time configuration.
 ///
-/// Pinned by `configure_recording_runtime_free_run_pins_durations_and_wall_on`.
+/// Pinned by `configure_traced_runtime_free_run_pins_wall_on_and_leaves_durations_to_record`.
 #[cfg(unix)]
-fn configure_recording_runtime_free_run(
-    runtime: &mut cerulion_core::GraphRuntime,
-) -> CliResult<()> {
+fn configure_traced_runtime_free_run(runtime: &mut cerulion_core::GraphRuntime) -> CliResult<()> {
     // The setter REFUSES a lockstep participant:
-    // this fn is reached only on the `FreeRunRecord` build path, whose ctor
+    // this fn is reached only on the `FreeRunTraced` build path, whose ctor
     // installs no participant, so the `Err` is unreachable here by
     // construction — propagated rather than unwrapped so the refusal, if a
     // future arm ever routed a participant here, is loud instead of a panic.
     runtime
         .set_gating_follows_wall(true)
-        .map_err(|e| CliError::Validation(format!("graph run-worker (free-run --record): {e}")))?;
-    runtime.set_record_tick_durations(true);
+        .map_err(|e| CliError::Validation(format!("graph run-worker (free-run traced): {e}")))?;
     Ok(())
 }
 
@@ -17007,6 +17111,90 @@ fn declare_run_trace_best_effort(run_dir: Option<&Path>, decl: &crate::run_dir::
     }
 }
 
+/// PURE: does the supervisor's stamped plan hand ANY rank a ring?
+///
+/// The predicate is `resolve_worker_ring_intent(..).is_some()` per rank — the
+/// call the worker's own (2.5) resolves its build path from — so the manifest's
+/// label and every rank's clock discipline read ONE fact off ONE plan field
+/// rather than two spellings of "this run is traced".
+///
+/// `any` rather than `all`: the supervisor stamps the whole plan or none of it
+/// (the gate is asked once over the deployment and the stamping call walks
+/// every worker), so a mixed plan is not a shape this code produces, and `any`
+/// is the arm that keeps a traced deployment labelled traced if one ever did.
+#[cfg(unix)]
+fn plan_carries_ring_intent(plan: &crate::multiprocess::DeploymentPlan) -> bool {
+    plan.workers.iter().any(|w| {
+        resolve_worker_ring_intent(
+            w.recording_ring.as_deref(),
+            w.trace_ring.as_deref(),
+            &w.group,
+        )
+        .is_some()
+    })
+}
+
+/// Re-stamp this run's `gating` label from the trace plane it ACTUALLY got.
+///
+/// `graph_run` classifies the label from the ring INTENT, before the dispatch
+/// and therefore before the `/dev/shm` free-space gate has run. A plane that
+/// gate refuses stamps no tags, every rank resolves `FreeRunLive` on the
+/// read-only clock, and a manifest left at `recorded_wall` tells a resim judge
+/// that boundaries the scheduler merely READ were boundaries it ADVANCED — the
+/// one distinction the field exists to carry.
+///
+/// Called on EVERY supervisor run, not only a refused one. A correction
+/// applied conditionally needs a second predicate deciding when the first
+/// answer was wrong, and that second predicate is the drift; classifying
+/// unconditionally from the stamped plan leaves one source of truth, and the
+/// ordinary path simply rewrites the value it already had.
+///
+/// Keyed on the PLAN and deliberately not on `TracePlaneDecision`: the
+/// departure-ring failure arm yields `Unavailable` with the worker plans
+/// STAMPED, so every rank still mints its own trace ring and still wall-follows.
+/// A label taken from that enum would call those ranks `wall` and be wrong in
+/// the other direction.
+///
+/// DEGRADES loudly rather than failing, like every other writer into this
+/// manifest: a run whose label cannot be corrected still runs.
+#[cfg(unix)]
+fn restamp_effective_gating(
+    run_dir: Option<&Path>,
+    plan: &crate::multiprocess::DeploymentPlan,
+    virtual_time_source: bool,
+    records: bool,
+    execution_mode: crate::multiprocess::ExecutionMode,
+) {
+    // `true` for the supervisor arm, which is the only caller: it is the same
+    // fact `executes_process_groups` carries at the descriptor's own call, and
+    // reaching here means the dispatch already chose this deployment.
+    let gating = crate::run_dir::GatingClock::classify(
+        true,
+        virtual_time_source,
+        records,
+        plan_carries_ring_intent(plan),
+        execution_mode,
+    );
+    let Some(dir) = run_dir else {
+        return;
+    };
+    match crate::run_dir::restamp_run_gating(dir, gating) {
+        Ok(()) => tracing::debug!(
+            run_dir = %dir.display(),
+            gating = gating.label(),
+            "stamped this run's EFFECTIVE gating clock into run.json"
+        ),
+        Err(e) => tracing::warn!(
+            run_dir = %dir.display(),
+            gating = gating.label(),
+            error = %e,
+            "could not correct this run's gating label in run.json: the graph runs \
+             normally, but a reader of this run's manifest sees the clock arm the run \
+             ASKED FOR rather than the one it got"
+        ),
+    }
+}
+
 /// PURE — turn this run's window-recorder decision into the
 /// `state_ring_consumer` state its `run.json` declares.
 ///
@@ -17203,7 +17391,12 @@ enum WorkerRingIntent<'a> {
     /// `--record`: the ring is part of a deliverable. Durations ON, create FATAL.
     Recording(&'a str),
     /// A plain `graph run`: the ring is the black box. Durations OFF, create
-    /// DEGRADES.
+    /// DEGRADES, and, under free-run, the wall-following CONTROLLED clock
+    /// WHETHER OR NOT THE CREATE SUCCEEDS. The clock keys on this intent and
+    /// is armed off the build path before the create is attempted
+    /// (`graph_run_worker` step (7.4)): a capture of this rank must
+    /// re-execute, and a rank that degrades to no ring must still keep its
+    /// peers' time base.
     Trace(&'a str),
 }
 
@@ -21718,6 +21911,140 @@ nodes:
         }
     }
 
+    /// HAND ORACLE: `run.json`'s `gating` records the trace plane the run GOT,
+    /// not the one it asked for.
+    ///
+    /// The refusal is injected as the thing a refusal PRODUCES — worker plans
+    /// carrying no ring tag — because the supervisor's gate refuses only when
+    /// `/dev/shm` genuinely cannot hold the deployment, and filling a machine's
+    /// tmpfs to reach it is neither hermetic nor safe (the same reason the
+    /// worker's half of this degrade has a `CER_FAIL_MODE_TRACE_RING_RANK`
+    /// seam and no real-space test).
+    ///
+    /// Both readings are asserted together on purpose. The label and the
+    /// workers' build path are the two things that must agree, and a test that
+    /// read only the file would pass on a label that is merely consistent with
+    /// itself while every rank ran a different clock.
+    #[cfg(unix)]
+    #[test]
+    fn the_manifest_records_the_gating_clock_the_run_got_not_the_one_it_asked_for() {
+        use crate::multiprocess::ExecutionMode;
+        use crate::run_dir::GatingClock;
+
+        // Hand-built, like the stamping test above: the CLASSIFICATION is what
+        // is under test, and a real planner would put a levelizer and a graph
+        // parse between the fixture and it.
+        let two_ranks = || crate::multiprocess::DeploymentPlan {
+            workers: (0..2)
+                .map(|rank| {
+                    let mut w = worker_tests::minimal_plan("{}");
+                    w.group = format!("p{rank}");
+                    w.rank = rank;
+                    w
+                })
+                .collect(),
+            barrier_ns: "gating_ns".to_string(),
+            barrier_id: "gating".to_string(),
+            expected: 2,
+        };
+
+        // The manifest `graph_run` wrote BEFORE the dispatch, with the
+        // pre-dispatch label a free-run run that asked for rings gets. The
+        // `shm` entry belongs to a writer this one does not own.
+        let seed = |dir: &std::path::Path, gating: &str| {
+            std::fs::write(
+                dir.join(crate::run_dir::RUN_MANIFEST_FILE),
+                format!(
+                    r#"{{"version":1,"run_id":"0x1","gating":"{gating}","shm":[{{"class":"arm","tag":"cer_run_1","rank":null,"source":"derived"}}]}}"#
+                ),
+            )
+            .expect("seed the manifest");
+        };
+        let read_gating = |dir: &std::path::Path| {
+            let bytes = std::fs::read(dir.join(crate::run_dir::RUN_MANIFEST_FILE))
+                .expect("read the manifest back");
+            crate::run_dir::run_manifest_gating(&bytes)
+        };
+
+        // (1) REFUSED: the gate stamped no tag into any plan.
+        let refused_dir = tempfile::tempdir().expect("tempdir");
+        seed(refused_dir.path(), "recorded_wall");
+        let refused = two_ranks();
+        restamp_effective_gating(
+            Some(refused_dir.path()),
+            &refused,
+            false,
+            false,
+            ExecutionMode::FreeRun,
+        );
+        assert_eq!(
+            read_gating(refused_dir.path()),
+            Some(GatingClock::Wall),
+            "a refused trace plane leaves every rank on the read-only clock, so the manifest \
+             has to say `wall`. Left at `recorded_wall` it tells a resim judge that \
+             boundaries the scheduler merely READ were boundaries it ADVANCED"
+        );
+        assert_eq!(
+            resolve_worker_build_path(ExecutionMode::FreeRun, plan_carries_ring_intent(&refused)),
+            WorkerBuildPath::FreeRunLive,
+            "…and that is the clock the workers really build, off the SAME plan field the \
+             label was classified from"
+        );
+
+        // (2) STAMPED: the ordinary free-run plane, which must not be relabelled.
+        let stamped_dir = tempfile::tempdir().expect("tempdir");
+        seed(stamped_dir.path(), "recorded_wall");
+        let mut stamped = two_ranks();
+        stamp_trace_ring_tags(&mut stamped, "demo", 4242, false);
+        restamp_effective_gating(
+            Some(stamped_dir.path()),
+            &stamped,
+            false,
+            false,
+            ExecutionMode::FreeRun,
+        );
+        assert_eq!(
+            read_gating(stamped_dir.path()),
+            Some(GatingClock::RecordedWall),
+            "a stamped plane keeps the traced arm; a correction that also moved THIS run \
+             would trade one wrong label for another"
+        );
+        assert_eq!(
+            resolve_worker_build_path(ExecutionMode::FreeRun, plan_carries_ring_intent(&stamped)),
+            WorkerBuildPath::FreeRunTraced,
+            "…and its ranks follow the wall on the controlled clock"
+        );
+
+        // (3) LOCKSTEP: gated by the handed quantum whether or not a ring
+        // exists, so a refused plane must leave the label alone.
+        let lockstep_dir = tempfile::tempdir().expect("tempdir");
+        seed(lockstep_dir.path(), "quantum");
+        restamp_effective_gating(
+            Some(lockstep_dir.path()),
+            &two_ranks(),
+            false,
+            false,
+            ExecutionMode::Lockstep,
+        );
+        assert_eq!(
+            read_gating(lockstep_dir.path()),
+            Some(GatingClock::Quantum),
+            "a lockstep run's gating clock is the handed quantum; the trace plane does not \
+             move it, and a correction that keyed on the ring alone would"
+        );
+
+        // The ledger entry this writer does not own survives the rewrite.
+        let bytes = std::fs::read(refused_dir.path().join(crate::run_dir::RUN_MANIFEST_FILE))
+            .expect("read back");
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("still valid JSON");
+        assert!(
+            doc["shm"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|e| e["class"] == "arm")),
+            "the ARM entry belongs to another writer and must outlive this rewrite: {doc}"
+        );
+    }
+
     /// The ring-tag scheme: distinct per rank, departure distinct from every
     /// worker tag AND from the single-process tag, supervisor pid
     /// embedded (concurrent-deployment collision proofing).
@@ -23176,14 +23503,16 @@ nodes:
         runtime.shutdown();
     }
 
-    /// The FREE-RUN half of the mode-conditional PAIR: the twin
-    /// of `configure_recording_runtime_mp_pins_durations_on_wall_off` with the
-    /// wall assertion INVERTED. A free-run `--record` rank is the monolith
-    /// recording arm per rank, so `configure_recording_runtime_free_run` must
-    /// flip per-tick duration recording ON **and** arm the wall-following
-    /// gating clock. The lockstep pin above is retained VERBATIM: "every rank
-    /// arms the wall-following clock" holds only among free-run ranks, and a refactor
-    /// that folds the two configurations into one fails one of the pair.
+    /// The FREE-RUN half of the PAIR: the twin of
+    /// `configure_recording_runtime_mp_pins_durations_on_wall_off` with the
+    /// wall assertion INVERTED. The pair is cut along the fact each half is
+    /// about: `configure_traced_runtime_free_run` arms the wall-following
+    /// gating clock and NOTHING else (it runs on
+    /// every traced free-run rank, recording or not), and per-tick durations
+    /// stay with `configure_recording_runtime_mp` under `--record`. Both halves
+    /// are asserted in order, so a refactor that folds the durations back into
+    /// the clock half (a plain free-run run would then record durations it
+    /// never asked for) fails here, as does one that drops the wall arm.
     ///
     /// Built via `build_for_test_barrier` — the single-process deterministic
     /// ctor, which is what `build_live_deterministic_free_run` is a
@@ -23192,7 +23521,7 @@ nodes:
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn configure_recording_runtime_free_run_pins_durations_and_wall_on() {
+    fn configure_traced_runtime_free_run_pins_wall_on_and_leaves_durations_to_record() {
         use cerulion_core::graph::node::{ClosureNodeEntry, NodeEntry, NodeInfo};
         use cerulion_core::MacroPolicy;
         use indexmap::IndexMap;
@@ -23241,43 +23570,57 @@ nodes:
             !runtime.record_tick_durations_enabled(),
             "fresh build: duration recording OFF"
         );
-        configure_recording_runtime_free_run(&mut runtime)
-            .expect("a free-run recording build accepts the wall-following clock");
-        assert!(
-            runtime.record_tick_durations_enabled(),
-            "free-run recording config must flip per-tick duration recording ON"
-        );
+        configure_traced_runtime_free_run(&mut runtime)
+            .expect("a free-run traced build accepts the wall-following clock");
         assert!(
             runtime.gating_follows_wall_for_test(),
-            "free-run recording config MUST arm the wall-following gating clock — each rank is \
-             the monolith recording arm, with no peer clock to stay in lockstep with"
+            "the traced config MUST arm the wall-following gating clock: each rank is the \
+             monolith wall-following arm, with no peer clock to stay in lockstep with"
+        );
+        assert!(
+            !runtime.record_tick_durations_enabled(),
+            "the traced config must NOT record per-tick durations; that is a `--record` \
+             deliverable, and a plain free-run run never asked for it"
+        );
+        configure_recording_runtime_mp(&mut runtime);
+        assert!(
+            runtime.record_tick_durations_enabled(),
+            "…the `--record` half flips per-tick duration recording ON on every path"
         );
         runtime.shutdown();
     }
 
     /// The worker's ONE build-path decision, every cell of the
-    /// mode × records matrix against a hand oracle, plus the clock-shape
+    /// mode × traced matrix against a hand oracle, plus the clock-shape
     /// derivation each cell implies. The pure seam every branch point in
     /// `graph_run_worker` consults, so the branch points cannot disagree.
+    ///
+    /// The second input is "this rank MINTS A TRACE RING", not "this run
+    /// records": the always-on rings of a plain `graph run` put a free-run
+    /// rank on the controlled wall-following clock
+    /// exactly as `--record` does, and only `--no-rings` leaves it on the
+    /// `RealClock`. Keyed on `--record`, the plain run's captures carried frames
+    /// stamped between two boundaries and could never re-execute.
     #[test]
-    fn the_worker_build_path_resolves_every_mode_and_records_cell() {
+    fn the_worker_build_path_resolves_every_mode_and_traced_cell() {
         use crate::multiprocess::ExecutionMode;
-        // Lockstep: the shipped shape, recording or not — controlled clock,
+        // Lockstep: the shipped shape, traced or not: controlled clock,
         // barrier, the (e) ctor.
-        for records in [false, true] {
-            let path = resolve_worker_build_path(ExecutionMode::Lockstep, records);
-            assert_eq!(path, WorkerBuildPath::Lockstep, "records={records}");
+        for traced in [false, true] {
+            let path = resolve_worker_build_path(ExecutionMode::Lockstep, traced);
+            assert_eq!(path, WorkerBuildPath::Lockstep, "traced={traced}");
             assert!(path.uses_controlled_clock());
         }
-        // Free-run, not recording: RealClock (the barrier open is pinned
-        // structurally below — it is the `Lockstep` arm's value).
+        // Free-run with NO trace ring (`--no-rings`): RealClock (the barrier
+        // open is pinned structurally below; it is the `Lockstep` arm's value).
         let live = resolve_worker_build_path(ExecutionMode::FreeRun, false);
         assert_eq!(live, WorkerBuildPath::FreeRunLive);
         assert!(!live.uses_controlled_clock());
-        // Free-run, recording: controlled clock (placed at the epoch).
-        let rec = resolve_worker_build_path(ExecutionMode::FreeRun, true);
-        assert_eq!(rec, WorkerBuildPath::FreeRunRecord);
-        assert!(rec.uses_controlled_clock());
+        // Free-run with a trace ring (a plain run's always-on rings, or
+        // `--record`): controlled clock (placed at the epoch).
+        let traced = resolve_worker_build_path(ExecutionMode::FreeRun, true);
+        assert_eq!(traced, WorkerBuildPath::FreeRunTraced);
+        assert!(traced.uses_controlled_clock());
     }
 
     /// The worker's branch points, STRUCTURALLY: the behavioural
@@ -23373,7 +23716,7 @@ nodes:
             "the epoch must be ARMED BEFORE run_live — run_live spends the arm at its anchor, \
              and the primitive refuses an arm after the first step"
         );
-        // The arming is gated on the FreeRunRecord build path: the LAST
+        // The arming is gated on the FreeRunTraced build path: the LAST
         // build-path mention before the epoch call is that arm's `if let`, and
         // it sits after the GO wait (the guard precedes the call it guards, so
         // the slice to search is `[go, epoch)`, not `[epoch, run_live)`).
@@ -23382,15 +23725,15 @@ nodes:
             .map(|at| go + at)
             .expect("a build-path arm guards the epoch arming");
         assert!(
-            body[gate..epoch].starts_with("WorkerBuildPath::FreeRunRecord"),
-            "the epoch arming must be gated on the FreeRunRecord build path — the nearest \
+            body[gate..epoch].starts_with("WorkerBuildPath::FreeRunTraced"),
+            "the epoch arming must be gated on the FreeRunTraced build path; the nearest \
              build-path mention before it is: {}",
             &body[gate..(gate + 40).min(body.len())]
         );
         // POLARITY: `if !matches!(..,
-        // FreeRunRecord)`, `if build_path != FreeRunRecord` and `if let
-        // FreeRunRecord = .. {} else { arm }` all leave the nearest token
-        // `FreeRunRecord` while arming on every OTHER path — and the first two
+        // FreeRunTraced)`, `if build_path != FreeRunTraced` and `if let
+        // FreeRunTraced = .. {} else { arm }` all leave the nearest token
+        // `FreeRunTraced` while arming on every OTHER path, and the first two
         // put the `!` BEFORE the token, outside a `[gate, epoch)` slice. So the
         // guard is read from the START OF ITS LINE and pinned to the literal
         // positive `if let` (a token-start slice would pass both
@@ -23399,13 +23742,13 @@ nodes:
         let guard_line = body[..gate].rfind('\n').map(|at| at + 1).unwrap_or(0);
         let guard = body[guard_line..epoch].trim();
         assert!(
-            guard.starts_with("if let WorkerBuildPath::FreeRunRecord = build_path {"),
-            "the arming's guard is the literal positive `if let` on the FreeRunRecord arm, \
+            guard.starts_with("if let WorkerBuildPath::FreeRunTraced = build_path {"),
+            "the arming's guard is the literal positive `if let` on the FreeRunTraced arm, \
              got: {guard}"
         );
         assert!(
             !guard.contains("else") && !guard.contains('!'),
-            "the guard between the FreeRunRecord token and the arming carries no negation: \
+            "the guard between the FreeRunTraced token and the arming carries no negation: \
              {guard}"
         );
         assert_eq!(
@@ -23413,27 +23756,62 @@ nodes:
             1,
             "exactly ONE build-path token between GO and the arming — the guard itself"
         );
-        // The recording-config PAIR is bound to its arm: the nearest build-path
-        // token before `configure_recording_runtime_free_run(` is FreeRunRecord
+        // The clock-config half is bound to its arm: the nearest build-path
+        // token before `configure_traced_runtime_free_run(` is FreeRunTraced
         // (a swapped pair would still pass every count above), and it is NOT
-        // the tail of an or-pattern (`Lockstep | FreeRunRecord =>`
-        // leaves the nearest token FreeRunRecord while wall-following a
-        // lockstep rank).
+        // the tail of an or-pattern (`Lockstep | FreeRunTraced =>`
+        // leaves the nearest token FreeRunTraced while wall-following a
+        // lockstep rank). The guard is the literal positive `if let`
+        // on the TRACED arm and is NOT nested under `records`: a plain
+        // free-run run's captures re-execute only because every traced rank,
+        // recording or not, arms the wall-following clock.
         let free_cfg = body
-            .find("configure_recording_runtime_free_run(")
-            .expect("the worker configures the free-run recording runtime");
+            .find("configure_traced_runtime_free_run(")
+            .expect("the worker configures the traced free-run clock");
         let cfg_gate = body[..free_cfg]
             .rfind("WorkerBuildPath::")
-            .expect("a build-path arm guards the free-run recording config");
+            .expect("a build-path arm guards the traced clock config");
         assert!(
-            body[cfg_gate..free_cfg].starts_with("WorkerBuildPath::FreeRunRecord"),
-            "the free-run recording config sits under the FreeRunRecord arm, got: {}",
+            body[cfg_gate..free_cfg].starts_with("WorkerBuildPath::FreeRunTraced"),
+            "the traced clock config sits under the FreeRunTraced arm, got: {}",
             &body[cfg_gate..(cfg_gate + 40).min(body.len())]
         );
         assert!(
             !body[..cfg_gate].trim_end().ends_with('|'),
-            "the FreeRunRecord recording-config arm is not the tail of an or-pattern: {}",
+            "the FreeRunTraced clock-config arm is not the tail of an or-pattern: {}",
             &body[cfg_gate.saturating_sub(40)..free_cfg]
+        );
+        let cfg_line = body[..cfg_gate].rfind('\n').map(|at| at + 1).unwrap_or(0);
+        assert!(
+            body[cfg_line..cfg_gate].trim_start().starts_with("if let "),
+            "the traced clock config's guard is a positive `if let` on the build path alone: {}",
+            &body[cfg_line..free_cfg]
+        );
+        assert!(
+            !body[cfg_line..free_cfg].contains("records"),
+            "the traced clock config must not be nested under `records`; the plain run's \
+             captures depend on it: {}",
+            &body[cfg_line..free_cfg]
+        );
+        // ...nor INSIDE an `if records` block above it: from the build call to
+        // the traced config there is no `records` gate at all (the body is
+        // comment-stripped, so prose can neither satisfy nor defeat this). The
+        // guard line alone cannot see a nesting one block up. Anchored on the
+        // BUILD, not on the ring hand-off: the config now precedes the ring
+        // block entirely, so a hand-off anchor would both find nothing and
+        // encode the very placement that leaves a refused rank off the wall.
+        let build = body
+            .find("let mut runtime = match build_path {")
+            .expect("the worker builds its runtime from the build-path match");
+        assert!(
+            build < free_cfg,
+            "the traced clock config comes after the build whose clock it configures"
+        );
+        assert!(
+            !body[build..free_cfg].contains("if records"),
+            "the traced clock config must not sit inside an `if records` block; a plain \
+             free-run run's captures depend on it: {}",
+            &body[build..free_cfg]
         );
 
         // The build-path decision precedes every consumer.
@@ -23443,7 +23821,7 @@ nodes:
             "build_live_deterministic_with_manager_and_barrier(",
             "build_live_free_run(",
             "build_live_deterministic_free_run(",
-            "configure_recording_runtime_free_run(",
+            "configure_traced_runtime_free_run(",
             "configure_recording_runtime_mp(",
             "place_gating_epoch_at_live_anchor(",
             "leave_barrier_cohort(",
@@ -23461,6 +23839,72 @@ nodes:
         assert!(
             body.contains("MappedWedgePage::open_unowned"),
             "the stripper ate the worker body"
+        );
+    }
+
+    /// **A free-run rank whose trace-ring create is REFUSED must still
+    /// wall-follow.**
+    ///
+    /// The degrade at (7.5) is a DESIGNED path: the worker re-asks the
+    /// `/dev/shm` free-space gate for ITSELF, so a deployment whose earlier
+    /// ranks used the space up refuses the later ones, and the create can fail
+    /// for ordinary OS reasons besides. `build_path` derives from the ring
+    /// INTENT, so such a rank was ALREADY BUILT on a controlled clock carrying
+    /// a locally derived quantum and no barrier participant. Arm the
+    /// wall-following discipline only on the create's SUCCESS path and that
+    /// rank advances one fixed quantum per loop iteration, at whatever rate its
+    /// loop happens to spin, while its peers advance by measured wall elapsed
+    /// from the same shared epoch: its `Period` cadence, its `expect_within`
+    /// and `promise_within` windows, its `Sync` windows and every
+    /// `timestamp_ns` it stamps come off that timeline, under a warn that
+    /// says the graph runs normally.
+    ///
+    /// STRUCTURAL over the comment- and literal-stripped body, for the reason
+    /// the walk above is: reaching the degrade behaviourally needs a real
+    /// supervisor, a real worker and a hostile `/dev/shm` (or the
+    /// forced-failure seam), plus a measurement of the rank's boundary stream.
+    /// What a unit test CAN pin is the placement the property reduces to, and
+    /// the placement IS the property: the arming sits ahead of the ring block,
+    /// so no create outcome stands between the build and it.
+    ///
+    /// The second assertion forbids the other repair. A second arming call in
+    /// the `Err` degrade arm would restore the behaviour while spelling the
+    /// derivation twice, which is how the two seams the single decision at
+    /// (2.5) exists to prevent come apart again.
+    #[test]
+    fn a_free_run_rank_whose_ring_create_is_refused_still_wall_follows() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "fn graph_run_worker(")
+            .expect("the worker fn must still exist; this pin moved with it");
+
+        let free_cfg = body
+            .find("configure_traced_runtime_free_run(")
+            .expect("the worker configures the traced free-run clock");
+        // The ring block: every create outcome is read inside it, so "before
+        // this block" is "before any create outcome exists".
+        let ring_block = body
+            .find("if let Some(intent) = ring_intent {")
+            .expect("the worker still opens its trace ring under the stamped intent");
+        assert!(
+            free_cfg < ring_block,
+            "the wall-following arming must precede the trace-ring block ENTIRELY. Armed \
+             inside it, a rank whose create is REFUSED runs a controlled clock nobody tied \
+             to the wall: one fixed quantum per loop iteration, while its peers advance by \
+             measured wall elapsed from the shared epoch they all start at"
+        );
+        assert_eq!(
+            body.matches("configure_traced_runtime_free_run(").count(),
+            1,
+            "exactly ONE arming site: a second one in the degrade arm buys the behaviour \
+             back at the price of the single derivation"
+        );
+        // ANTI-TAUTOLOGY: the stripped view really holds this function's code,
+        // and the create outcome really is read inside the block this pin
+        // bounds the arming by.
+        assert!(
+            body[ring_block..].contains("match create_outcome {"),
+            "the stripper ate the worker body, or the create outcome left the ring block \
+             and this pin no longer bounds anything"
         );
     }
 
@@ -27409,6 +27853,7 @@ nodes:
                 pre.config.has_process_groups(),
                 false,
                 false,
+                pre.config.has_process_groups(),
                 crate::multiprocess::ExecutionMode::Lockstep,
             ),
             graph_yaml: render_effective_graph_yaml(&pre.config).expect("render"),
@@ -28477,6 +28922,51 @@ nodes:
             body.contains("record.is_some()"),
             "the supervisor still has to know whether it records — it chooses WHICH plan field \
              to stamp and whether a ring failure is fatal"
+        );
+    }
+
+    /// The supervisor CORRECTS its gating label, exactly once, from the plan
+    /// it stamped.
+    ///
+    /// STRUCTURAL because the behavioural half cannot see a deleted call: the
+    /// oracle
+    /// (`the_manifest_records_the_gating_clock_the_run_got_not_the_one_it_asked_for`)
+    /// drives the helper directly, so removing the supervisor's only call to it
+    /// leaves every run.json at the pre-dispatch intent with the whole suite
+    /// still green. Reaching it behaviourally needs a real supervisor, real
+    /// workers and a hostile `/dev/shm`.
+    ///
+    /// It also pins WHICH fact the helper classifies from: read back off
+    /// `no_rings`, the correction re-states the intent it exists to replace and
+    /// is indistinguishable from not being there.
+    #[cfg(unix)]
+    #[test]
+    fn the_supervisor_corrects_its_gating_label_from_the_plan_it_stamped() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "fn graph_run_supervisor(")
+            .expect("the supervisor fn must still exist; this walk moved with it");
+
+        assert_eq!(
+            body.matches("restamp_effective_gating(").count(),
+            1,
+            "exactly ONE correction site: without it every refused trace plane leaves \
+             `run.json` claiming `recorded_wall` for ranks that ran the `RealClock`, and \
+             a second site is a second answer to get wrong. Body was:\n{body}"
+        );
+
+        let helper = fn_body(&src, "fn restamp_effective_gating(")
+            .expect("the correction helper must still exist");
+        assert!(
+            helper.contains("plan_carries_ring_intent(plan)"),
+            "the correction must classify from the PLAN the supervisor stamped: that is \
+             the field the worker resolves its own build path from, and it is the only \
+             reading that can differ from the intent already on disk:\n{helper}"
+        );
+        assert!(
+            !helper.contains("no_rings"),
+            "…and never from the flag: `!no_rings` is the pre-dispatch intent this write \
+             exists to replace, so a correction spelled that way writes back what is \
+             already there:\n{helper}"
         );
     }
 

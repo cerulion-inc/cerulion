@@ -247,6 +247,10 @@ pub struct RunDescriptorSpec<'a> {
     /// judge cannot recover it from a bag: a boundary produced by a clock the
     /// scheduler ADVANCES and one produced by a clock it merely READS are
     /// byte-identical records with opposite meanings. See [`GatingClock`].
+    ///
+    /// PROVISIONAL on a supervisor run: this value is the run's trace-ring
+    /// INTENT, and [`restamp_run_gating`] replaces it with the outcome once
+    /// the trace plane is decided, before any worker is spawned.
     pub gating: GatingClock,
     /// The EFFECTIVE graph config, serialized.
     pub graph_yaml: String,
@@ -542,14 +546,15 @@ pub enum GatingClock {
     /// The scheduler advances a CONTROLLED clock by the MEASURED WALL elapsed
     /// (`live_gating_quantum = Some(_)` with `gating_follows_wall`) — today's
     /// `--single-process --record` discipline, and every rank of
-    /// a FREE-RUN `--record` deployment, from a shared epoch. Jitter is
-    /// preserved, but every boundary is still recorded and re-advanceable, so
-    /// it is resim-grade.
+    /// a FREE-RUN deployment that mints trace rings (the always-on rings of a
+    /// plain run, or `--record`), from a shared epoch. Jitter is preserved,
+    /// but every boundary is still recorded and re-advanceable, so it is
+    /// resim-grade, which is what a Flashback capture of such a rank needs.
     RecordedWall,
     /// The scheduler does NOT advance the gating clock; every boundary is a
     /// CLOCK READING (`live_gating_quantum = None`, `ClockInner::Real`). Covers
     /// both `RealClock` (`--single-process`, `ros2 attach`, `node run`, and
-    /// every rank of a non-record FREE-RUN deployment) and
+    /// every rank of a `--no-rings` FREE-RUN deployment) and
     /// `ExternalClock`, which is read-only in the same sense — the scheduler
     /// never advances it either.
     Wall,
@@ -583,24 +588,40 @@ impl GatingClock {
         }
     }
 
-    /// PURE: classify a run's gating arm from the three deployment facts known
-    /// at launch plus the resolved execution mode.
+    /// PURE: classify a run's gating arm from the deployment facts known at
+    /// launch plus the resolved execution mode.
     ///
     /// One function so the CLI cannot spell the classification twice and drift:
-    /// the same three facts already decide the deployment (the mode is resolved
-    /// from that decision plus the opt-in), and the mapping is exactly the
+    /// the same facts already decide the deployment (the mode is resolved from
+    /// that decision plus the opt-in), and the mapping is exactly the
     /// `live_step` match plus the polled shape.
     ///
     /// * a SUPERVISOR run under the default LOCKSTEP execution mode builds
     ///   every worker through `build_live_deterministic_with_manager_and_barrier`,
     ///   which hands a quantum ⇒ [`Quantum`](Self::Quantum); under the
     ///   `CERULION_EXECUTION_MODE=free_run` opt-in every rank is
-    ///   on its own wall-faithful clock — a RECORDING free-run rank follows the
-    ///   wall on a controlled clock from a shared epoch ⇒
-    ///   [`RecordedWall`](Self::RecordedWall), a live one is on the read-only
-    ///   `RealClock` ⇒ [`Wall`](Self::Wall) (the mode is threaded from the ONE
-    ///   resolution `graph run` makes, so this label and the run's
+    ///   on its own wall-faithful clock: a TRACED free-run rank (`traced`: the
+    ///   run ASKS FOR scheduler-trace rings, i.e. anything but `--no-rings`)
+    ///   follows the wall on a controlled clock from a shared epoch ⇒
+    ///   [`RecordedWall`](Self::RecordedWall), a ring-less one is on the
+    ///   read-only `RealClock` ⇒ [`Wall`](Self::Wall) (the mode is threaded
+    ///   from the ONE resolution `graph run` makes, so this label and the run's
     ///   `coordination` stamp cannot disagree);
+    ///
+    ///   `traced` is answered TWICE on a supervisor run, and the second answer
+    ///   is the one a reader gets. The caller renders the descriptor BEFORE
+    ///   dispatch, when no ring exists and the only fact available is whether
+    ///   rings were asked for, so the first call passes the INTENT. The
+    ///   supervisor classifies again the moment its trace plane is decided,
+    ///   reading the ring tags it really stamped into the worker plans, and
+    ///   re-stamps the field ([`restamp_run_gating`]). That second read is the
+    ///   same plan field each worker resolves its own build path from, so the
+    ///   label and every rank's clock discipline come off ONE fact: a plane
+    ///   the `/dev/shm` free-space gate refused stamps no tags, every rank
+    ///   resolves the ring-less shape on the `RealClock`, and the label reads
+    ///   `wall`. A WORKER-side create failure needs no correction, because the
+    ///   worker keys its clock on the stamped intent and wall-follows either
+    ///   way;
     /// * a `--time-source virtual` monolith runs the polled loop and never
     ///   reaches `live_step` ⇒ [`Polled`](Self::Polled);
     /// * a RECORDING monolith is configured `gating_follows_wall` on a
@@ -617,12 +638,13 @@ impl GatingClock {
         supervisor: bool,
         virtual_time_source: bool,
         records: bool,
+        traced: bool,
         execution_mode: crate::multiprocess::ExecutionMode,
     ) -> Self {
         if supervisor {
             match execution_mode {
                 crate::multiprocess::ExecutionMode::Lockstep => GatingClock::Quantum,
-                crate::multiprocess::ExecutionMode::FreeRun if records => GatingClock::RecordedWall,
+                crate::multiprocess::ExecutionMode::FreeRun if traced => GatingClock::RecordedWall,
                 crate::multiprocess::ExecutionMode::FreeRun => GatingClock::Wall,
             }
         } else if virtual_time_source {
@@ -829,14 +851,46 @@ pub fn declare_run_trace(run_dir: &Path, decl: &RunTraceDecl) -> CliResult<()> {
     })
 }
 
+/// Re-stamp `gating` in the `run.json` this run already wrote, so the label
+/// records the gating clock the run GOT rather than the one it asked for.
+///
+/// A THIRD in-place writer, for the same reason [`declare_run_trace`] is a
+/// second one: the fact does not exist when the descriptor is rendered. That
+/// render happens before the deployment dispatch, when the only thing known
+/// about the trace plane is whether rings were ASKED for; the supervisor's own
+/// `/dev/shm` free-space gate can refuse the whole plane afterwards, and every
+/// rank then resolves the ring-less shape on the read-only clock. Left at the
+/// intent, the field tells a resim judge that boundaries the scheduler merely
+/// READ were boundaries it ADVANCED, which is the one distinction it exists to
+/// carry.
+///
+/// It goes through the same atomic read/rewrite shell, so a `cerulion bag
+/// record --run` attaching mid-rewrite reads the old document or the new one
+/// and never a partial, and every key it does not own survives.
+///
+/// # Errors
+///
+/// Returns the underlying I/O or JSON error. The caller treats it as a
+/// DEGRADE, not a failure: a run whose label cannot be corrected still runs,
+/// and what is lost is a reader seeing the arm the run asked for instead of
+/// the arm it got.
+pub fn restamp_run_gating(run_dir: &Path, gating: GatingClock) -> CliResult<()> {
+    edit_run_manifest(run_dir, "gating clock", |obj| {
+        obj.insert(
+            "gating".to_string(),
+            serde_json::Value::String(gating.label().to_string()),
+        );
+    })
+}
+
 /// PURE-ish: read `run.json`, hand its object to `edit`, and write it back.
 ///
-/// Extracted so the two writers that AMEND a run manifest in place — the
-/// trace declaration and the state-ring-consumer declaration — share
-/// ONE read/rewrite shell rather than two copies of it (the no-second-copy rule). What
-/// is genuinely shared is not convenience: it is the 0600 RE-ASSERT below, which
-/// `write_artifact`'s `OpenOptions` mode cannot supply on a rewrite, and which a
-/// second copy would be free to forget.
+/// Extracted so the writers that AMEND a run manifest in place — the gating
+/// re-stamp, the trace declaration and the state-ring-consumer declaration —
+/// share ONE read/rewrite shell rather than a copy each (the no-second-copy
+/// rule). What is genuinely shared is not convenience: it is the 0600
+/// RE-ASSERT below, which `write_artifact`'s `OpenOptions` mode cannot supply
+/// on a rewrite, and which a second copy would be free to forget.
 ///
 /// `what` names the thing being declared, so a failure says which declaration
 /// was lost rather than "a manifest edit failed".
@@ -1900,6 +1954,7 @@ mod tests {
                 groups,
                 false,
                 false,
+                groups,
                 crate::multiprocess::ExecutionMode::Lockstep,
             ),
             graph_yaml: graph_yaml.to_string(),
@@ -2556,40 +2611,60 @@ mod tests {
     #[test]
     fn gating_classification_covers_every_run_shape() {
         use crate::multiprocess::ExecutionMode::{FreeRun, Lockstep};
-        // (supervisor, virtual, records, execution_mode) -> arm
+        // (supervisor, virtual, records, traced, execution_mode) -> arm
         let table = [
             // A LOCKSTEP supervisor run hands every worker a quantum, whatever
             // else is true — including under `--record`, which is the
             // multi-process recording shape.
-            ((true, false, false, Lockstep), GatingClock::Quantum),
-            ((true, false, true, Lockstep), GatingClock::Quantum),
+            ((true, false, false, true, Lockstep), GatingClock::Quantum),
+            ((true, false, true, true, Lockstep), GatingClock::Quantum),
+            ((true, false, false, false, Lockstep), GatingClock::Quantum),
             // A FREE-RUN supervisor run puts every rank on its own
-            // wall-faithful clock — recording ranks follow the wall on a
-            // controlled clock from a shared epoch, live ranks read the
-            // RealClock. A classifier that took no mode would label BOTH `quantum`
-            // while the bag said `free_run`.
-            ((true, false, true, FreeRun), GatingClock::RecordedWall),
-            ((true, false, false, FreeRun), GatingClock::Wall),
+            // wall-faithful clock. The arm follows `traced`, not `records`: a
+            // TRACED rank (the plain run's always-on rings, or `--record`)
+            // follows the wall on a controlled clock from a shared epoch; only
+            // a `--no-rings` rank reads the RealClock. A classifier that took no
+            // mode would label BOTH `quantum` while the bag said `free_run`, and
+            // one keyed on `records` would label the plain run `wall` while its
+            // captures claimed `resimmable: true` on a clock nothing could
+            // re-advance.
+            (
+                (true, false, true, true, FreeRun),
+                GatingClock::RecordedWall,
+            ),
+            // THE FLASHBACK ROW: a plain free-run `graph run`, no `--record`.
+            (
+                (true, false, false, true, FreeRun),
+                GatingClock::RecordedWall,
+            ),
+            ((true, false, false, false, FreeRun), GatingClock::Wall),
             // A virtual monolith never enters the live loop at all.
-            ((false, true, false, Lockstep), GatingClock::Polled),
+            ((false, true, false, false, Lockstep), GatingClock::Polled),
             // A recording monolith runs the controlled-clock-follows-wall
-            // discipline: still recorded, still re-advanceable.
-            ((false, false, true, Lockstep), GatingClock::RecordedWall),
+            // discipline: still recorded, still re-advanceable. A monolith
+            // mints no trace ring, so `traced` is false on every monolith row.
+            (
+                (false, false, true, false, Lockstep),
+                GatingClock::RecordedWall,
+            ),
             // Everything else is the read-only arm — the plain `graph run
             // --single-process`, `ros2 attach` and `node run` shapes, and the
             // external clock, which the scheduler does not advance either.
-            ((false, false, false, Lockstep), GatingClock::Wall),
+            ((false, false, false, false, Lockstep), GatingClock::Wall),
             // The mode is a SUPERVISOR fact: `resolve_run_execution_mode` never
             // yields FreeRun on a monolith, and the classifier ignores it there
             // rather than inventing a fifth shape.
-            ((false, false, true, FreeRun), GatingClock::RecordedWall),
-            ((false, false, false, FreeRun), GatingClock::Wall),
+            (
+                (false, false, true, false, FreeRun),
+                GatingClock::RecordedWall,
+            ),
+            ((false, false, false, false, FreeRun), GatingClock::Wall),
         ];
-        for ((sup, virt, rec, mode), want) in table {
+        for ((sup, virt, rec, traced, mode), want) in table {
             assert_eq!(
-                GatingClock::classify(sup, virt, rec, mode),
+                GatingClock::classify(sup, virt, rec, traced, mode),
                 want,
-                "supervisor={sup} virtual={virt} records={rec} mode={mode:?}"
+                "supervisor={sup} virtual={virt} records={rec} traced={traced} mode={mode:?}"
             );
         }
         // The supervisor arm OUTRANKS both others — a partitioned LOCKSTEP
@@ -2597,7 +2672,7 @@ mod tests {
         // separately because it is the one precedence a reordering would
         // silently invert.
         assert_eq!(
-            GatingClock::classify(true, true, true, Lockstep),
+            GatingClock::classify(true, true, true, true, Lockstep),
             GatingClock::Quantum
         );
     }
@@ -3111,20 +3186,21 @@ mod tests {
         }
     }
 
-    /// The two in-place manifest writers COMPOSE.
+    /// The in-place manifest writers COMPOSE.
     ///
-    /// They share one shell (`edit_run_manifest`) and run in sequence on the
-    /// supervisor path — the trace declaration before GO, the state-ring one
-    /// after it. An extraction shared by two writers is exactly where one
-    /// caller's key gets clobbered by the other's rewrite, and nothing else
-    /// asserts that the second leaves the first's work standing.
+    /// All three share one shell (`edit_run_manifest`) and run in sequence on
+    /// the supervisor path — the gating re-stamp and the trace declaration
+    /// before GO, the state-ring one after it. An extraction shared by several
+    /// writers is exactly where one caller's key gets clobbered by another's
+    /// rewrite, and nothing else asserts that a later one leaves the earlier
+    /// work standing.
     ///
-    /// Also pins the 0600 re-assert on the SECOND writer: `write_artifact`'s
+    /// Also pins the 0600 re-assert on a LATER writer: `write_artifact`'s
     /// mode applies at creation only, and this path renames a fresh sibling
     /// over an existing file. (The comment on that re-assert records that the
     /// pin was earned by a real 0644 regression on the other caller.)
     #[test]
-    fn the_two_manifest_writers_compose_without_clobbering_each_other() {
+    fn the_manifest_writers_compose_without_clobbering_each_other() {
         // RAII, like every other temp-dir test in this file: a hand-rolled
         // directory with a trailing `remove_dir_all` leaks a 0600 manifest into
         // `$TMPDIR` on any failing assertion, which is exactly when someone is
@@ -3147,14 +3223,16 @@ mod tests {
         .expect("the trace declaration must land");
         declare_state_ring_consumer(&tmp, &StateRingConsumerDecl::Standing)
             .expect("the state-ring declaration must land");
+        restamp_run_gating(&tmp, GatingClock::Wall).expect("the gating re-stamp must land");
 
         let bytes = std::fs::read(tmp.join(RUN_MANIFEST_FILE)).expect("read back");
         let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("still valid JSON");
 
-        // BOTH writers' keys survive, and so does the entry NEITHER owns.
+        // EVERY writer's key survives, and so does the entry NONE of them owns.
         assert_eq!(doc["state_ring_consumer"], serde_json::json!("standing"));
         assert_eq!(doc["trace_rings"], serde_json::json!("declared"));
         assert_eq!(doc["rings"][0]["tag"], serde_json::json!("cer_rec_g_1_r0"));
+        assert_eq!(doc["gating"], serde_json::json!("wall"));
         assert_eq!(doc["run_id"], serde_json::json!("0x1"));
         let shm = doc["shm"].as_array().expect("the ledger survives");
         assert!(

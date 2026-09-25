@@ -476,7 +476,10 @@ into it.
 advances (`quantum` / `recorded_wall` / `wall` / `polled`). It is there because
 a resim judge cannot recover it from a bag: a boundary produced by a clock the
 scheduler ADVANCES and one produced by a clock it merely READS are
-byte-identical records with opposite meanings.
+byte-identical records with opposite meanings. Unlike `trace`, it is the
+OUTCOME: a multi-process run writes the arm it asked for before its workers are
+planned, then re-stamps the arm it got once its trace plane is decided, so a
+run whose rings were refused reads `wall` rather than `recorded_wall`.
 
 **`run.json`'s `trace` is the INTENT; `record_coverage.json` is the OUTCOME.**
 Those two cases are the healthy ones. There is a third, and it is ordinary
