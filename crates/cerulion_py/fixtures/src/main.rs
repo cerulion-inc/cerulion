@@ -3,7 +3,8 @@
 //!
 //! Modes: `write-bag` writes a deterministic oracle MCAP bag; `publish`
 //! stamps deterministic-pattern wire frames a Python subscriber can
-//! oracle-check; `subscribe` receives frames and prints a
+//! oracle-check; `publish-hold` does the same with a raised subscriber
+//! borrow floor for memory probes; `subscribe` receives frames and prints a
 //! one-line digest (sequence, header fields, FNV-1a of the body) Python
 //! publishers can be asserted against.
 
@@ -127,7 +128,7 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
         .unwrap_or(("", &[]));
     match mode {
         "publish" | "subscribe" | "publish-typed" | "subscribe-typed" | "host-pynode"
-        | "write-bag" => {}
+        | "write-bag" | "publish-hold" => {}
         _ => return Err(format!("unknown mode '{mode}'\n{USAGE}")),
     }
     if mode == "host-pynode" {
@@ -146,6 +147,18 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
     match mode {
         "write-bag" => {
             flag(&args, "path")?;
+        }
+        "publish-hold" => {
+            flag(&args, "topic")?;
+            flag_u64(&args, "schema-hash")?;
+            for required in ["count", "size", "borrow-floor"] {
+                flag_usize(&args, required)?;
+            }
+            if let Some(value) = args.flags.get("linger-ms") {
+                value
+                    .parse::<u64>()
+                    .map_err(|e| format!("--linger-ms: {e}"))?;
+            }
         }
         "publish" => {
             flag(&args, "topic")?;
@@ -203,6 +216,7 @@ fn run() -> Result<ExitCode, String> {
 
     match mode {
         "publish" => cmd_publish(&mgr, &args),
+        "publish-hold" => cmd_publish_hold(&mgr, &args),
         "subscribe" => cmd_subscribe(&mgr, &args),
         "publish-typed" => cmd_publish_typed(&mgr, &args),
         "subscribe-typed" => cmd_subscribe_typed(&mgr, &args),
@@ -925,6 +939,58 @@ fn cmd_publish(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String> 
     Ok(ExitCode::SUCCESS)
 }
 
+/// Publish `--count` pattern frames on a topic whose subscribers may hold
+/// `--borrow-floor` samples at once, so a Python peer can keep many views
+/// alive and measure where their bytes live.
+fn cmd_publish_hold(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String> {
+    let topic = flag(args, "topic")?;
+    let schema_hash = flag_u64(args, "schema-hash")?;
+    let count = flag_usize(args, "count")?;
+    let size = flag_usize(args, "size")?;
+    let floor = flag_usize(args, "borrow-floor")?;
+    let linger_ms = args
+        .flags
+        .get("linger-ms")
+        .map(|s| s.parse::<u64>().map_err(|e| format!("--linger-ms: {e}")))
+        .transpose()?
+        .unwrap_or(1000);
+    let slot_len = (size as u64)
+        .checked_add(WireHeader::SIZE as u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .and_then(MaxSliceLen::try_new)
+        .ok_or("--size does not fit the wire format")?;
+    let depth = count
+        .checked_add(32)
+        .ok_or("--count does not fit a queue depth")?;
+    let mut config = mgr.default_topic_config();
+    config.create_borrow_floor = Some(floor);
+    config.history_size = depth;
+    config.subscriber_max_buffer_size = depth;
+    let mut publisher = mgr
+        .create_publisher_with_topic_config(topic, slot_len, depth, config)
+        .map_err(|e| e.to_string())?;
+    println!("READY");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    // Gives the subscriber time to connect before the first sample.
+    std::thread::sleep(Duration::from_millis(1000));
+    for i in 0..count {
+        let mut frame = vec![0u8; WireHeader::SIZE + size];
+        let mut header = WireHeader::new(schema_hash, i as u32, real_ns());
+        header.total_size = frame.len() as u32;
+        header.write_to_buf(&mut frame[..WireHeader::SIZE]);
+        frame[WireHeader::SIZE..].copy_from_slice(&pattern(size, i as u64));
+        publisher.publish_raw(&frame).map_err(|e| e.to_string())?;
+        publisher.check_subscriber_events();
+        publisher
+            .notify_sent_sample()
+            .map_err(|e| format!("notify failed: {e}"))?;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    println!("PUBLISHED {count}");
+    std::thread::sleep(Duration::from_millis(linger_ms));
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String> {
     let topic = flag(args, "topic")?;
     let count = flag_usize(args, "count")?;
@@ -974,7 +1040,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
     Ok(ExitCode::SUCCESS)
 }
 
-const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]\n  cerulion_py_fixture write-bag --path FILE";
+const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture publish-hold --topic T --schema-hash H --count N --size S --borrow-floor F [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]\n  cerulion_py_fixture write-bag --path FILE";
 
 fn main() -> ExitCode {
     match run() {
