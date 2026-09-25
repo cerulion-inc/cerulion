@@ -758,10 +758,15 @@ fn connect_exit_code(command: Commands) -> ExitCode {
         relay_disabled,
         network,
     };
+    let started = std::time::Instant::now();
     let plan = match connect_cmd::plan(&args) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
+            telemetry::emit(
+                telemetry_events::CONNECT_SESSION_COMPLETED,
+                telemetry_events::connect_session_completed(started.elapsed(), 1),
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -779,7 +784,6 @@ fn connect_exit_code(command: Commands) -> ExitCode {
         }
     };
     tracing::info!(bin = %plan.bin.display(), "cerulion connect: spawning cerulion-connectd");
-    let started = std::time::Instant::now();
     let result = connect_cmd::spawn_and_wait(&plan, running);
     telemetry::emit(
         telemetry_events::CONNECT_SESSION_COMPLETED,
@@ -832,6 +836,10 @@ fn pair_exit_code(command: Commands) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
+            telemetry::emit(
+                telemetry_events::PAIR_COMPLETED,
+                telemetry_events::pair_completed(false),
+            );
             // A resolution / config failure is exit 1 (usage), matching the
             // `cerulion-connectd pair` contract.
             return ExitCode::from(1u8);
