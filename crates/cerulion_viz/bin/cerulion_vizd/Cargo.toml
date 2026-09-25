@@ -78,8 +78,16 @@ ctrlc = { version = "3", features = ["termination"] }
 # flock(2) for the single-daemon pidfile lock (hygiene.rs) — the stale-proof,
 # TOCTOU-free single-daemon guarantee (kernel releases the lock on process death).
 libc = "0.2"
+# Usage telemetry (`src/telemetry.rs`): the start event and the 15 minute
+# heartbeat. Sends nothing unless the build carries a PostHog key and consent
+# resolves enabled. The `posthog` feature is on through `telemetry` below.
+cerulion_telemetry = { path = "../../../cerulion_telemetry" }
 
 [features]
+default = ["telemetry"]
+# The PostHog client behind `src/telemetry.rs`. Off, every telemetry call is
+# a no-op and no network dependency is linked.
+telemetry = ["cerulion_telemetry/posthog"]
 # Expose the `*_for_test` seams on `RunningDaemon` OUTSIDE
 # `#[cfg(test)]`. The consumers are INTEGRATION tests, which link the non-test
 # rlib, so `#[cfg(test)]` alone cannot reach them — the dev-dependencies

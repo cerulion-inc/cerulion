@@ -55,6 +55,7 @@ pub mod monitors;
 pub mod net;
 pub mod protocol;
 pub mod runs;
+pub mod telemetry;
 
 pub use daemon::{
     start_on_socket, start_with_demand_plane, start_with_planes, ControlSocket, DemandPlane,

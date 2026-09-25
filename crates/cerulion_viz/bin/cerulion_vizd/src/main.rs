@@ -190,6 +190,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         socket = %daemon.socket_path().display(),
         "cerulion-vizd running — SIGINT/SIGTERM to stop"
     );
+    let telemetry = cerulion_vizd::telemetry::Telemetry::start();
 
     // Block until a signal flips the flag (SIGINT + SIGTERM via the `termination`
     // feature), then shut the daemon down cleanly.
@@ -203,6 +204,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing::info!("cerulion-vizd shutting down");
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown();
+    }
     daemon.shutdown();
     Ok(())
 }
