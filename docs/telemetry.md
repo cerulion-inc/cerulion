@@ -62,7 +62,9 @@ request carries the random id so the events from before the login are
 joined to the account. Nothing else is added to the login. If that first
 login happens in the run that printed the notice, which sends nothing, an
 empty `telemetry_alias_pending` file next to the consent file marks the join
-as owed, and the next run that sends makes it and deletes the file. When a different
+as owed, and the next run that sends makes it and deletes the file. Only a
+hosted account id is joined this way; the events of any other account stay
+under the random id. When a different
 account signs in on the same machine, the random id is replaced, so later
 anonymous events are never joined to the previous account.
 
