@@ -11758,6 +11758,15 @@ pub fn graph_list(graphs_dir: &Path) -> CliResult<Vec<String>> {
 /// `validate_partition` verdict (spawner-consumable, or the diagnostic
 /// naming the bridge node).
 ///
+/// The report CLOSES with the chain-fusion census
+/// (`render_chains_block`): the linear single-consumer trigger chains that
+/// could run as one fused synchronous call sequence, and for every other
+/// consumer edge the reason it keeps the queued path. It belongs to this verb
+/// rather than one of its own because it is a reading of the SAME levelization
+/// printed above it: a fused hop is a level boundary the executor would not
+/// have to cross, so the two halves are one view of one derivation and an
+/// operator can check that they agree.
+///
 /// Loud error paths (no partial output): missing graph, YAML parse failure,
 /// `validate_graph` failure, a node crate directory that does not exist, node
 /// source that cannot be parsed (unlike `graph_validate`'s non-blocking
@@ -11801,7 +11810,24 @@ pub fn graph_levels(workspace_root: &Path, graph_name: &str) -> CliResult<GraphL
     let levels = cerulion_core::graph::resolve_levels(&config, &topology, &trigger_edges)
         .map_err(CliError::from)?;
 
-    render_levels_report(&config, &entry_infos, &trigger_edges, &topology, &levels)
+    let mut report =
+        render_levels_report(&config, &entry_infos, &trigger_edges, &topology, &levels)?;
+
+    // The chains half, over the levels just derived. Judged against the
+    // graph's DECLARED colocation; a run that derives a partition places the
+    // nodes differently and records its own census in its run directory.
+    let census = cerulion_core::graph::census_chains(
+        &config,
+        &entry_infos,
+        &topology,
+        &trigger_edges,
+        &levels,
+        declared_colocation(&config),
+    );
+    report
+        .rendered
+        .push_str(&render_chains_block(&config, &census));
+    Ok(report)
 }
 
 /// Derive per-INSTANCE `NodeInfo` from each node TYPE's
@@ -12124,55 +12150,6 @@ pub(crate) fn render_levels_report(
     })
 }
 
-/// `cerulion graph chains <graph>` — read-only census of the trigger edges
-/// that could run as one fused synchronous chain, and of why every other edge
-/// cannot.
-///
-/// Parses and validates the graph, reads each node type's policy, trigger
-/// marks, backpressure and rate cap from source, and runs the same analysis
-/// over the same levelization the runtime builds
-/// (`build_trigger_edges` -> `GraphTopology::build` -> `resolve_levels` ->
-/// `census_chains`): one source of truth, never a reimplementation.
-///
-/// The colocation the census is judged against is the graph's DECLARED shape:
-/// its `process_groups:` block when it has one, and one process otherwise. The
-/// report names which, because a run that derives a partition places the nodes
-/// differently and its own census is written into its run directory.
-///
-/// Loud error paths (no partial output): a missing graph, a YAML parse
-/// failure, a validation failure, a node crate directory that does not exist,
-/// node source that cannot be parsed, and an algebraic cycle in the trigger
-/// DAG.
-pub fn graph_chains(workspace_root: &Path, graph_name: &str) -> CliResult<String> {
-    let graphs_dir = workspace_root.join("graphs");
-    let nodes_dir = workspace_root.join("nodes");
-
-    let mut config = graph_read(&graphs_dir, graph_name)?;
-    if config.prefix.is_empty() {
-        config.prefix = cerulion_core::graph::default_prefix(config.identity());
-    }
-    validate_graph(&config)?;
-
-    let entry_infos = source_entry_infos(
-        &nodes_dir,
-        &config,
-        "graph chains derives the census from each node's declared trigger policy",
-    )?;
-    let trigger_edges = cerulion_core::graph::build_trigger_edges(&config, &entry_infos);
-    let topology = cerulion_core::graph::GraphTopology::build(&config, &entry_infos)?;
-    let levels = cerulion_core::graph::resolve_levels(&config, &topology, &trigger_edges)
-        .map_err(CliError::from)?;
-    let census = cerulion_core::graph::census_chains(
-        &config,
-        &entry_infos,
-        &topology,
-        &trigger_edges,
-        &levels,
-        declared_colocation(&config),
-    );
-    Ok(render_chains_report(&config, &levels, &census))
-}
-
 /// The colocation a STATIC inspection judges a graph against: the groups it
 /// declares, or one process.
 ///
@@ -12187,67 +12164,53 @@ fn declared_colocation(config: &GraphConfig) -> cerulion_core::graph::Colocation
     }
 }
 
-/// Render the `graph chains` report (pure formatting, so its exact shape is
-/// oracle-testable).
-fn render_chains_report(
-    config: &GraphConfig,
-    levels: &cerulion_core::graph::Levels,
-    census: &cerulion_core::graph::ChainCensus,
-) -> String {
+/// Render the chains block that CLOSES the `graph levels` report: the linear
+/// single-consumer trigger chains that could run as one fused synchronous call
+/// sequence, and for every other consumer edge the reason it keeps the queued
+/// path.
+///
+/// TOTAL by construction: the fused hops and the queued edges add up to every
+/// consumer edge in the graph, and the header line prints both counts against
+/// that total so a reader can check it.
+///
+/// Pure formatting over a census computed once by the caller, so its exact
+/// shape is oracle-testable. The header names the colocation the census was
+/// judged against, because the verdict for every cross-group edge depends on
+/// it and a run may place the nodes differently.
+fn render_chains_block(config: &GraphConfig, census: &cerulion_core::graph::ChainCensus) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "graph: {}  prefix: {}",
-        config.identity(),
-        config.prefix
-    );
-    let _ = writeln!(
-        out,
-        "levels source: {}",
-        if config.level_assignments.is_some() {
-            "level_assignments: block (baked override in the graph yaml)"
-        } else {
-            "derived (trigger-aware Kahn levelization)"
-        }
+        "chains: {} fusable, {} hop(s), {} of {} consumer edge(s) queued",
+        census.chains().len(),
+        census.fused_hop_count(),
+        census.queued_edge_count(),
+        census.consumer_edge_count()
     );
     if config.has_process_groups() {
         let names: Vec<&str> = config.process_groups.keys().map(String::as_str).collect();
         let _ = writeln!(
             out,
-            "colocation: process_groups: {} group(s) ({})",
+            "  colocation: the {} declared process group(s) ({})",
             names.len(),
             names.join(", ")
         );
     } else {
         let _ = writeln!(
             out,
-            "colocation: one process (this graph declares no process_groups:; \
+            "  colocation: one process (this graph declares no process_groups:; \
              `cerulion graph run` may derive a partition, and each run writes its own \
              census into its run directory)"
         );
     }
-    let _ = writeln!(
-        out,
-        "nodes: {}  levels: {}  consumer edges: {}",
-        config.native_nodes().count(),
-        levels.len(),
-        census.consumer_edge_count()
-    );
-    let _ = writeln!(
-        out,
-        "fusable: {} chain(s), {} hop(s)  queued: {} edge(s)",
-        census.chains().len(),
-        census.fused_hop_count(),
-        census.queued_edge_count()
-    );
 
     for (idx, chain) in census.chains().iter().enumerate() {
         let last_level = chain.head_level + chain.hops();
         let _ = writeln!(
             out,
-            "\nchain {}  levels {}-{}  {} nodes, {} hop(s)",
+            "  chain {}  levels {}-{}  {} nodes, {} hop(s)",
             idx,
             chain.head_level,
             last_level,
@@ -12257,7 +12220,7 @@ fn render_chains_report(
         for (hop, topic) in chain.topics.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "  {} -> {}  on {}",
+                "    {} -> {}  on {}",
                 chain.nodes[hop],
                 chain.nodes[hop + 1],
                 topic
@@ -12267,11 +12230,11 @@ fn render_chains_report(
 
     let bars = census.bars();
     if !bars.is_empty() {
-        let _ = writeln!(out, "\nqueued edges by reason:");
-        for (label, count) in &bars {
-            let _ = writeln!(out, "  {label}  {count}");
-        }
-        let _ = writeln!(out, "\nqueued edges:");
+        let summary: Vec<String> = bars
+            .iter()
+            .map(|(label, count)| format!("{label} {count}"))
+            .collect();
+        let _ = writeln!(out, "  queued by reason: {}", summary.join(", "));
         for edge in census.edges() {
             let Some(bar) = &edge.bar else {
                 continue;
@@ -12279,7 +12242,7 @@ fn render_chains_report(
             let producer = edge.producer.as_deref().unwrap_or("(no in-graph producer)");
             let _ = writeln!(
                 out,
-                "  {}  {} -> {}.{}",
+                "  queued  {}  {} -> {}.{}",
                 edge.topic, producer, edge.consumer, edge.input
             );
             let _ = writeln!(out, "    {}: {}", bar.label(), bar);
@@ -12323,10 +12286,16 @@ pub(crate) fn run_chain_summary(
     match census {
         Ok(census) => Some(chain_summary(&census)),
         Err(e) => {
-            tracing::debug!(
+            // WARN, not debug: a workspace runs at the `warn` default, and a
+            // `"chains": null` nobody can explain reads as a broken manifest
+            // rather than as a graph the analysis could not read. The run is
+            // unaffected either way, which the message says.
+            tracing::warn!(
                 graph = %config.identity(),
                 error = %e,
-                "this run's chain census could not be computed, so its run directory records                  none; the run is unaffected (`cerulion graph chains` reports the same reason)"
+                "this run's chain census could not be computed, so its run directory \
+                 records none; the run is unaffected (the chains block of `cerulion graph \
+                 levels` reports the same reason)"
             );
             None
         }
@@ -20687,10 +20656,11 @@ mod tests {
     /// rate cap, and the colocation it is judged against is the one the run
     /// EXECUTES.
     ///
-    /// The verb has its own oracle (`tests/graph_chains_test.rs`); this pins
-    /// the RUN path, which no test would otherwise reach without a live run,
-    /// and both halves that path could quietly lose: the cap read from source,
-    /// and the groups a run executes rather than the ones it declares.
+    /// The rendered block has its own oracle
+    /// (`tests/graph_levels_test.rs`); this pins the RUN path, which no test
+    /// would otherwise reach without a live run, and both halves that path
+    /// could quietly lose: the cap read from source, and the groups a run
+    /// executes rather than the ones it declares.
     #[test]
     fn a_runs_chain_census_reads_the_source_cap_and_the_executed_colocation() {
         let tmp = tempfile::tempdir().unwrap();

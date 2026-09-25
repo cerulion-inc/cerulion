@@ -2455,12 +2455,18 @@ fn macro_attr_to_policy(attr: &syn::Attribute) -> Option<MacroPolicy> {
 /// not a trigger policy, it STACKS with one, and the macro rejects it only
 /// beside `period_ms`. Same token walk, same numeric-literal handling
 /// (underscores and a type suffix are both legal in the source).
+///
+/// A repeated `throttle_ms` reads as the LAST value, because the macro assigns
+/// each occurrence in sequence and the compiled node therefore carries the
+/// last one. Stopping at the first would let the report name a cap the node
+/// does not have.
 fn macro_attr_throttle_ms(attr: &syn::Attribute) -> Option<u64> {
     let syn::Meta::List(meta_list) = &attr.meta else {
         return None;
     };
     use proc_macro2::TokenTree;
     let tokens: Vec<TokenTree> = meta_list.tokens.clone().into_iter().collect();
+    let mut found: Option<u64> = None;
     for i in 0..tokens.len() {
         let TokenTree::Ident(ident) = &tokens[i] else {
             continue;
@@ -2470,11 +2476,13 @@ fn macro_attr_throttle_ms(attr: &syn::Attribute) -> Option<u64> {
         }
         if let (TokenTree::Punct(p), TokenTree::Literal(lit)) = (&tokens[i + 1], &tokens[i + 2]) {
             if p.as_char() == '=' {
-                return parse_int_literal(&lit.to_string());
+                if let Some(value) = parse_int_literal(&lit.to_string()) {
+                    found = Some(value);
+                }
             }
         }
     }
-    None
+    found
 }
 
 #[cfg(test)]
@@ -2583,6 +2591,18 @@ struct CappedNode {
         let metadata = parse_node_metadata(&node_dir).unwrap();
         assert_eq!(metadata.throttle_ms, Some(1000));
         assert_eq!(metadata.policy, Some(MacroPolicy::Sync { window_ms: 25 }));
+
+        // A REPEATED cap reads as the last value, because the macro assigns
+        // each occurrence in sequence and the compiled node carries the last
+        // one. Reading the first would make the report name a cap the node
+        // does not have.
+        let repeated = capped.replace("throttle_ms = 5", "throttle_ms = 5, throttle_ms = 9");
+        let node_dir = write_node(&tmp, "repeated", &repeated);
+        assert_eq!(
+            parse_node_metadata(&node_dir).unwrap().throttle_ms,
+            Some(9),
+            "a repeated rate cap must read as the value the compiled node carries"
+        );
 
         // ANTI-TAUTOLOGY: a node that declares no cap reports none, so the
         // arms above cannot be satisfied by a parser that always answers.

@@ -4,8 +4,9 @@
 //!
 //! Pure build-time analysis over [`GraphTopology`], [`TriggerEdges`],
 //! [`Levels`] and the run's colocation. It decides nothing at run time, changes
-//! no execution path, and is read by `cerulion graph chains` and by the run
-//! directory's manifest. Nothing in the executor consumes the result yet.
+//! no execution path, and is read by the chains block of `cerulion graph
+//! levels` and by the run directory's manifest. Nothing in the executor
+//! consumes the result yet.
 //!
 //! # What a fused chain is
 //!
@@ -39,6 +40,7 @@
 //! | the edge is neither `block` nor `sample(N)` | [`ChainBar::BlockEdge`], [`ChainBar::SampleEdge`] | `block` means "defer the producer while the consumer is at threshold", and a consumer that runs inside the producer's own fire can never reach the threshold, so the declared contract could not be honoured; `sample(N)` states that the consumer reads less often than the producer publishes, and a synchronous call reads in lockstep with it |
 //! | the consumer fires on this frame | [`ChainBar::ConsumerPolicy`] | a period is a clock decision, a sync window is an alignment decision across several edges, and an external node fires from outside the graph |
 //! | this edge is the consumer's only trigger | [`ChainBar::ConsumerJoin`] | a join fires on a set of frames, not on one; the chain ends at it and its inbound edges stay queued |
+//! | the consumer sits on the level RIGHT AFTER the producer's | [`ChainBar::LevelNotAdjacent`] | a derived levelization already guarantees it for a single-trigger consumer, but a `level_assignments:` block may place one further down while the executor still opens the levels in between, so a synchronous call would fire it a step early |
 //! | the consumer declares no `throttle_ms` | [`ChainBar::ConsumerThrottled`] | a rate cap is a decision to defer a fire, and a synchronous call has nowhere to defer to |
 //! | neither end is block-involved | [`ChainBar::BlockInvolved`] | the executor already fires those nodes serially against a shared outstanding count, and a chain would reorder that pairing |
 //! | the consumer reads no context written at or after the head's level | [`ChainBar::LateContextInput`] | the determinism rule, derived below |
@@ -87,8 +89,9 @@
 //! Every surviving edge is either a hop of exactly one chain or carries a bar,
 //! with nothing left over. A consumer has at most one trigger edge, so at most
 //! one inbound surviving edge; a producer is left at most one outbound
-//! surviving edge; and every surviving edge steps strictly one level up. So
-//! the surviving edges are disjoint PATHS, each walked once from its start.
+//! surviving edge; and every surviving edge steps EXACTLY one level up. So the
+//! surviving edges are disjoint PATHS, each walked once from its start, and a
+//! chain's level band is its head's level plus its hop count.
 //!
 //! # Determinism
 //!
@@ -254,16 +257,30 @@ pub enum ChainBar {
     /// levelization must refuse the edge rather than silently switch the
     /// context rule off for it.
     LevelUnknown { node: String },
-    /// The supplied levelization does not place the consumer after the
-    /// producer, so the edge is not a hop that levelization agrees with.
+    /// The supplied levelization does not place the consumer on the level
+    /// IMMEDIATELY after the producer's, so the hop would cross a level
+    /// boundary the executor still opens.
     ///
-    /// A trigger edge always steps exactly one level in a levelization derived
-    /// from the same graph, so this is the other half of the mismatch
-    /// [`ChainBar::LevelUnknown`] covers. Refusing it is also what keeps the
-    /// surviving edges a set of disjoint PATHS: a cycle needs one edge that
-    /// does not increase the level, and an unwalkable cycle would leave edges
-    /// that are neither a hop nor refused.
-    LevelNotIncreasing {
+    /// A DERIVED levelization places a consumer one level below its DEEPEST
+    /// triggering producer, so a single-trigger consumer is always exactly one
+    /// level below its producer and only a join spans further. The join is
+    /// refused first, by [`ChainBar::ConsumerJoin`], because that is what a
+    /// reader needs to be told.
+    ///
+    /// What reaches this bar is a `level_assignments:` block, which is valid as
+    /// long as every trigger edge is strictly level-increasing and may
+    /// therefore place a sole consumer two or more levels below its producer
+    /// while the executor still opens every level in between. Calling that
+    /// consumer inside the producer's own level phase would run it a step
+    /// early, and a chain assembled from such edges would render a level band
+    /// it does not occupy, because a chain's band assumes one level per hop.
+    /// A levelization supplied from a different graph reaches it too.
+    ///
+    /// Refusing it is also what keeps the surviving edges a set of disjoint
+    /// PATHS whose chain order IS level order: a cycle needs one edge that does
+    /// not increase the level, and an unwalkable cycle would leave edges that
+    /// are neither a hop nor refused.
+    LevelNotAdjacent {
         producer_level: usize,
         consumer_level: usize,
     },
@@ -292,7 +309,7 @@ impl ChainBar {
             Self::LateContextInput { .. } => "late-context-input",
             Self::LengthCeiling { .. } => "length-ceiling",
             Self::LevelUnknown { .. } => "level-unknown",
-            Self::LevelNotIncreasing { .. } => "level-not-increasing",
+            Self::LevelNotAdjacent { .. } => "level-not-adjacent",
         }
     }
 }
@@ -384,12 +401,12 @@ impl std::fmt::Display for ChainBar {
                 f,
                 "the levelization places no level on '{node}'"
             ),
-            Self::LevelNotIncreasing {
+            Self::LevelNotAdjacent {
                 producer_level,
                 consumer_level,
             } => write!(
                 f,
-                "the levelization places the consumer at level {consumer_level}, not after the producer's level {producer_level}"
+                "the levelization places the consumer at level {consumer_level}, not on the level after the producer's level {producer_level}"
             ),
         }
     }
@@ -648,12 +665,6 @@ fn per_edge_bar(
             node: consumer.node_id.clone(),
         });
     };
-    if consumer_level <= producer_level {
-        return Some(ChainBar::LevelNotIncreasing {
-            producer_level,
-            consumer_level,
-        });
-    }
     let producer_place = colocation.placement(producer);
     let consumer_place = colocation.placement(&consumer.node_id);
     let colocated = match (producer_place, consumer_place) {
@@ -696,6 +707,22 @@ fn per_edge_bar(
     if triggers > 1 {
         return Some(ChainBar::ConsumerJoin {
             trigger_edges: triggers,
+        });
+    }
+    // EXACTLY one level, not merely a later one. Asked AFTER the join rule
+    // because a derived levelization puts a fan-in consumer below its DEEPEST
+    // producer, so a join's other edges span more than one level and the join
+    // is what a reader needs to be told. A consumer with one trigger edge is
+    // always exactly one level below its producer under a derived
+    // levelization, so what remains here is a `level_assignments:` block that
+    // placed it further down while the executor still opens the levels in
+    // between: calling it inside the producer's own level phase would fire it
+    // a step early, and the chain would render a level band it does not
+    // occupy.
+    if consumer_level != producer_level + 1 {
+        return Some(ChainBar::LevelNotAdjacent {
+            producer_level,
+            consumer_level,
         });
     }
     if let Some(throttle_ms) = info.and_then(NodeInfo::throttle_ms) {

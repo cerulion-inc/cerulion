@@ -151,8 +151,8 @@ constraints:
 `GraphTopology` + `TriggerEdges` + `Levels` + the run's colocation: `census_chains` returns
 the chains that qualify plus a `ChainBar` for every consumer edge that does not, so the
 verdicts partition the graph's consumer edges and a reader can add them up. Read by
-`cerulion graph chains` and written into every run's `run.json`, so the shape of real
-graphs is measured rather than guessed. No execution path consumes it.
+the chains block of `cerulion graph levels` and written into every run's `run.json`, so
+the shape of real graphs is measured rather than guessed. No execution path consumes it.
 
 The rules and the reason each exists are in that module's own header. Two are worth
 naming here because they are easy to get wrong:
@@ -164,6 +164,13 @@ naming here because they are easy to get wrong:
   part of that level has. The head is the bound, not the consumer's own level. An edge the
   rule refuses CUTS its chain: the refused consumer heads a new one, judged against its
   own level.
+- **One level per hop.** A fused hop must land on the level RIGHT AFTER its producer's.
+  A derived levelization places a consumer one level below its DEEPEST triggering
+  producer, so a single-trigger consumer is always adjacent and only a join spans
+  further, which the join rule reports first. What reaches this rule is a
+  `level_assignments:` block, which may legally place a sole consumer further down while
+  the executor still opens the levels in between. It is also what makes a chain's
+  rendered level band its head's level plus its hop count.
 - **One fusable edge per producer.** A topic-level fan-out is refused because the second
   consumer would wait for the first consumer's whole chain. A node publishing two
   single-consumer topics is the same wait one level up, and refusing it is also what makes

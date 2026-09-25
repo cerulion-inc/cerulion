@@ -449,7 +449,6 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion bag play::resim",
         "cerulion bag record::topics",
         "cerulion connect::robot",
-        "cerulion graph chains::name",
         "cerulion graph levels::name",
         "cerulion graph partition::name",
         "cerulion graph profile::name",

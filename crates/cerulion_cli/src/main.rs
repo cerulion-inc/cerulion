@@ -1597,14 +1597,6 @@ fn run(cli: Cli) -> CliResult<()> {
                     print!("{}", report.rendered);
                     map_levels_partition_result(report.partition_error)
                 }
-                GraphAction::Chains { name } => {
-                    // The chain-fusion census. Read-only and total: every
-                    // consumer edge is either a fused hop or carries the reason
-                    // it is not, so the report adds up. The engine returns the
-                    // rendered text; print it verbatim.
-                    print!("{}", graph_cmd::graph_chains(&ws.root, &name)?);
-                    Ok(())
-                }
                 GraphAction::Profile {
                     name,
                     duration,

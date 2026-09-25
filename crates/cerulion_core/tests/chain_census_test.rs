@@ -162,6 +162,31 @@ impl Harness {
         }
     }
 
+    /// The same, but levelized through `resolve_levels`, which honours a
+    /// `level_assignments:` block.
+    ///
+    /// A derived levelization steps every trigger edge by exactly one level, so
+    /// it cannot express a hop that skips a level the executor still opens. An
+    /// assigned one can, which is why the adjacency rule needs this seam.
+    fn assigned(yaml: &str, specs: &[(&str, Spec)]) -> Self {
+        let config = parse_graph(yaml).expect("the fixture graph must parse");
+        let infos: IndexMap<String, NodeInfo> = specs
+            .iter()
+            .map(|(id, spec)| ((*id).to_string(), spec.info()))
+            .collect();
+        let trigger_edges = build_trigger_edges(&config, &infos);
+        let topology = GraphTopology::build(&config, &infos).expect("the fixture must build");
+        let levels = cerulion_core::graph::resolve_levels(&config, &topology, &trigger_edges)
+            .expect("the assigned levels must validate");
+        Self {
+            config,
+            infos,
+            topology,
+            trigger_edges,
+            levels,
+        }
+    }
+
     /// The census with every node in one process.
     fn monolith(&self) -> ChainCensus {
         census_chains(
@@ -1164,7 +1189,7 @@ nodes:
         verdicts(&census),
         vec![
             "relay.inp <- src : level-unknown",
-            "sink.inp <- relay : level-not-increasing",
+            "sink.inp <- relay : level-not-adjacent",
         ]
     );
     assert_eq!(
@@ -1172,9 +1197,149 @@ nodes:
         "the levelization places no level on 'src'"
     );
     assert_eq!(
-        sentence(&census, "level-not-increasing"),
-        "the levelization places the consumer at level 0, not after the producer's level 0"
+        sentence(&census, "level-not-adjacent"),
+        "the levelization places the consumer at level 0, not on the level after the \
+         producer's level 0"
     );
+    assert_total(&census);
+}
+
+#[test]
+fn a_hop_that_skips_a_level_the_executor_still_opens_is_refused() {
+    // A `level_assignments:` block is valid as long as every trigger edge is
+    // strictly level-increasing and the levels form a contiguous range, so it
+    // may place a sole consumer TWO levels below its producer while the
+    // executor still opens the level in between. `far` sits at level 2 with
+    // `filler` occupying level 1, so `src -> far` increases by two.
+    //
+    // Fusing it would call `far` inside `src`'s level phase, a whole step
+    // before the levels say it fires, and the chain would render a band it
+    // does not occupy. An edge that merely INCREASES is not a hop.
+    let yaml = r#"
+prefix: t
+level_assignments:
+  src: 0
+  filler: 1
+  far: 2
+nodes:
+  - id: src
+    type: src
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: filler
+    type: relay
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: far
+    type: sink
+    inputs:
+      - name: inp
+        source: src/out
+"#;
+    let h = Harness::assigned(
+        yaml,
+        &[
+            ("src", Spec::period(10)),
+            ("filler", Spec::data("inp")),
+            ("far", Spec::data("inp")),
+        ],
+    );
+    assert_eq!(h.levels.level_of("src"), Some(0));
+    assert_eq!(h.levels.level_of("filler"), Some(1));
+    assert_eq!(h.levels.level_of("far"), Some(2));
+
+    let census = h.monolith();
+    // Both edges leave `src`, so the fan-out rule refuses them first: this arm
+    // pins that the SKIPPING edge is not fused, and the arm below isolates the
+    // skip with a single-consumer topic.
+    assert!(chains(&census).is_empty());
+    assert_total(&census);
+
+    // The skip ALONE, with no fan-out to mask it: `src` feeds only `far`, and
+    // `filler` is fed by a second source so level 1 stays occupied.
+    let isolated = r#"
+prefix: t
+level_assignments:
+  src: 0
+  other: 0
+  filler: 1
+  far: 2
+nodes:
+  - id: src
+    type: src
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: other
+    type: src
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: filler
+    type: relay
+    inputs:
+      - name: inp
+        source: other/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: far
+    type: sink
+    inputs:
+      - name: inp
+        source: src/out
+"#;
+    let h = Harness::assigned(
+        isolated,
+        &[
+            ("src", Spec::period(10)),
+            ("other", Spec::period(10)),
+            ("filler", Spec::data("inp")),
+            ("far", Spec::data("inp")),
+        ],
+    );
+    let census = h.monolith();
+    // `other -> filler` is an ordinary adjacent hop and fuses, which is the
+    // control: the analysis has not refused this levelization wholesale. The
+    // two-level `src -> far` is the one refused, and `far` is a sink, so it
+    // heads nothing either.
+    assert_eq!(
+        chains(&census),
+        vec!["other->filler".to_string()],
+        "only the two-level hop may be refused"
+    );
+    assert_eq!(
+        sentence(&census, "level-not-adjacent"),
+        "the levelization places the consumer at level 2, not on the level after the \
+         producer's level 0"
+    );
+    assert_total(&census);
+
+    // ANTI-TAUTOLOGY: the SAME shape with `far` moved onto the level right
+    // after `src` fuses, so the arm above cannot pass against an analysis that
+    // refuses every assigned levelization.
+    let adjacent = isolated.replace("  far: 2\n", "  far: 1\n");
+    let h = Harness::assigned(
+        &adjacent,
+        &[
+            ("src", Spec::period(10)),
+            ("other", Spec::period(10)),
+            ("filler", Spec::data("inp")),
+            ("far", Spec::data("inp")),
+        ],
+    );
+    let census = h.monolith();
+    assert_eq!(
+        chains(&census),
+        vec!["src->far".to_string(), "other->filler".to_string()],
+        "with `far` one level below `src`, both hops fuse"
+    );
+    assert_eq!(census.bars(), Vec::new());
     assert_total(&census);
 }
 

@@ -77,7 +77,7 @@ it: re-run the command after an upgrade or a move.
 | `topic echo\|info\|hz <TAB>`, `bag record <TAB>` | topic names | the local iceoryx2 service directory |
 | `viz <TAB>` | topic names | same |
 | `node delete\|modify\|build\|stage\|run\|info <TAB>` | node types | `nodes/*` in your workspace |
-| `graph run\|validate\|levels\|chains\|profile\|partition <TAB>`, `node stage -g <TAB>` | graph names | `graphs/*.yaml` stems |
+| `graph run\|validate\|levels\|profile\|partition <TAB>`, `node stage -g <TAB>` | graph names | `graphs/*.yaml` stems |
 | `schema delete\|info <TAB>` | workspace schemas, the `.msg` store, and all 254 built-in ROS 2 types | `schemas/`, `native_ros2_messages` |
 | `viz --robot <TAB>`, `connect <TAB>`, `pair <TAB>` | robot names | `~/.cerulion/robots.toml` (paired) + `~/.cerulion/peers.json` (seen on the LAN) |
 | `bag play\|info\|migrate <TAB>` | `.mcap` bags and directories | the filesystem |
