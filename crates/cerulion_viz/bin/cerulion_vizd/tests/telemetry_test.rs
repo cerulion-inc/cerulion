@@ -32,7 +32,7 @@ fn event_names_and_common_values_pass_the_guard() {
 fn properties_stay_inside_their_allowlists_and_pass_the_guard() {
     for (spec, props) in [
         (VIZD_STARTED, started_props()),
-        (VIZD_HEARTBEAT, heartbeat_props(3, HEARTBEAT_INTERVAL)),
+        (VIZD_HEARTBEAT, heartbeat_props(3 * HEARTBEAT_INTERVAL)),
     ] {
         let (kept, dropped) = guard::filter(props.clone(), spec.allowlist);
         assert!(dropped.is_empty(), "{}: {dropped:?}", spec.name);
@@ -41,12 +41,20 @@ fn properties_stay_inside_their_allowlists_and_pass_the_guard() {
 }
 
 #[test]
-fn uptime_is_whole_minutes_of_elapsed_heartbeats() {
-    let props = heartbeat_props(4, HEARTBEAT_INTERVAL);
+fn uptime_is_whole_minutes_of_elapsed_time() {
+    let props = heartbeat_props(4 * HEARTBEAT_INTERVAL);
     assert_eq!(props, vec![("uptime_minutes".to_string(), Value::Int(60))]);
     assert_eq!(
-        heartbeat_props(u64::MAX, HEARTBEAT_INTERVAL)[0].1,
-        Value::Int(i64::MAX)
+        heartbeat_props(Duration::from_secs(179))[0].1,
+        Value::Int(2)
+    );
+    assert_eq!(
+        heartbeat_props(Duration::from_secs(180))[0].1,
+        Value::Int(3)
+    );
+    assert_eq!(
+        heartbeat_props(Duration::MAX)[0].1,
+        Value::Int((u64::MAX / 60) as i64)
     );
 }
 

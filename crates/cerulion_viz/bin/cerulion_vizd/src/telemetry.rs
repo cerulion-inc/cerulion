@@ -11,7 +11,7 @@
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cerulion_telemetry::{consent, Client, Common, EventSpec, Props, DEFAULT_SHUTDOWN_BUDGET};
 
@@ -53,9 +53,9 @@ pub fn started_props() -> Props {
     ]
 }
 
-/// `vizd_heartbeat` properties after `ticks` heartbeats.
-pub fn heartbeat_props(ticks: u64, interval: Duration) -> Props {
-    let minutes = ticks.saturating_mul(interval.as_secs() / 60);
+/// `vizd_heartbeat` properties for a daemon that has been up for `uptime`.
+pub fn heartbeat_props(uptime: Duration) -> Props {
+    let minutes = uptime.as_secs() / 60;
     vec![(
         "uptime_minutes".into(),
         i64::try_from(minutes).unwrap_or(i64::MAX).into(),
@@ -115,13 +115,19 @@ impl Telemetry {
         client.capture_anonymous(VIZD_STARTED, &anon_id, started_props());
         let client = Arc::new(Mutex::new(Some(client)));
         let beat = Arc::clone(&client);
-        let heartbeat = Heartbeat::spawn(HEARTBEAT_INTERVAL, move |ticks| {
+        let started = Instant::now();
+        let heartbeat = Heartbeat::spawn(HEARTBEAT_INTERVAL, move |_| {
+            // Consent is re-read on every beat, so `cerulion telemetry off` or
+            // `DO_NOT_TRACK` stops a running daemon's heartbeats.
+            if !consent::status().enabled {
+                return;
+            }
             if let Ok(guard) = beat.lock() {
                 if let Some(client) = guard.as_ref() {
                     client.capture_anonymous(
                         VIZD_HEARTBEAT,
                         &anon_id,
-                        heartbeat_props(ticks, HEARTBEAT_INTERVAL),
+                        heartbeat_props(started.elapsed()),
                     );
                 }
             }
