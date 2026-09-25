@@ -87,10 +87,7 @@ pub fn validate_python_identifier(name: &str) -> CliResult<()> {
             "port name '{name}' is reserved by the Python node runtime"
         )));
     }
-    if name.starts_with("_cer_")
-        || name.starts_with("__cerulion")
-        || (name.len() > 4 && name.starts_with("__") && name.ends_with("__"))
-    {
+    if name.starts_with("_cer_") || name.starts_with("__cerulion") || name.starts_with("__") {
         return Err(CliError::Validation(format!(
             "port name '{name}' uses a prefix reserved by the Python node runtime"
         )));
@@ -177,6 +174,9 @@ mod tests {
             "__cerulion_ports__",
             "__init__",
             "__dict__",
+            "__",
+            "___",
+            "__foo",
         ] {
             let err = validate_python_identifier(name).unwrap_err();
             assert_eq!(

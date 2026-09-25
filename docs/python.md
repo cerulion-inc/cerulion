@@ -22,20 +22,20 @@ import cerulion
 
 @cerulion.node(period_ms=10)
 class Counter:
-    inp = cerulion.input("test_msgs/Inp", depth=1)
-    out = cerulion.output("test_msgs/Out")
+    inp = cerulion.input("std_msgs/Int32", depth=1)
+    out = cerulion.output("std_msgs/Int32")
 
     def tick(self):
         msg = self.inp
         if msg is None:
             return
-        self.out.value = msg.value
+        self.out.data = msg.data
 ```
 
 Create and build one with:
 
 ```shell
-cerulion node create counter --lang python -i test_msgs/Inp inp -o test_msgs/Out out --policy period_ms=10
+cerulion node create counter --lang python -i std_msgs/Int32 inp -o std_msgs/Int32 out --policy period_ms=10
 cerulion node build counter
 ```
 
@@ -64,9 +64,9 @@ per-command prefix for Python wheel commands.
 A Python node must declare exactly one scheduling policy: `period_ms`, one
 `trigger=True` input, or `sync_window_ms` for multiple trigger inputs. The
 `node create --lang python` command (alias `node new`) therefore requires `-T` or `--policy`.
-`node create` writes one input; for `sync_window_ms`, add the other aligned
-inputs to `node.py` with `trigger=True` and run `cerulion node build`
-(`node modify` does not edit Python nodes).
+A Python node takes `-i` and `-o` repeatedly; a `sync_window_ms` node needs at
+least two `-i` inputs, and each one joins the aligned set (`node modify` does not
+edit Python nodes; edit `node.py` and run `cerulion node build`).
 
 The embedded host supports one interpreter per process and serializes Python
 execution through the GIL. Python-created threads and `fork()` are unsupported.

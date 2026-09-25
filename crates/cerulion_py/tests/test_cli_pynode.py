@@ -214,6 +214,45 @@ nodes:
     assert "schema 'echo'.out: geometry_msgs/Vector3" in combined
 
 
+def test_cli_python_sync_node_takes_repeated_inputs_and_rejects_one(tmp_path):
+    env = os.environ.copy()
+    env["CERULION_LOGIN_GATE"] = "off"
+    _run(CLI, "workspace", "create", "ws", cwd=tmp_path, env=env)
+    workspace = tmp_path / "ws"
+
+    single = _run(
+        CLI, "node", "create", "--lang", "python", "lonely",
+        "-i", "std_msgs/Int32", "a",
+        "--policy", "sync_window_ms=10",
+        cwd=workspace, env=env, check=False,
+    )
+    assert single.returncode != 0
+    assert (
+        "a sync_window_ms Python node aligns two or more inputs: "
+        "repeat `-i SCHEMA NAME` for each" in single.stderr
+    )
+    assert not (workspace / "nodes" / "lonely").exists()
+
+    _run(
+        CLI, "node", "create", "--lang", "python", "pair",
+        "-i", "std_msgs/Int32", "a",
+        "-i", "std_msgs/Int32", "b",
+        "-o", "std_msgs/Int32", "x",
+        "-o", "std_msgs/Int32", "y",
+        "--policy", "sync_window_ms=10",
+        cwd=workspace, env=env,
+    )
+    source = (workspace / "nodes" / "pair" / "node.py").read_text()
+    for line in (
+        "@cer.node(sync_window_ms=10)",
+        'a = cer.input("std_msgs/Int32", trigger=True)',
+        'b = cer.input("std_msgs/Int32", trigger=True)',
+        'x = cer.output("std_msgs/Int32")',
+        'y = cer.output("std_msgs/Int32")',
+    ):
+        assert line in source, source
+
+
 def test_cli_python_node_builds_builtin_schema_without_workspace_schema(tmp_path):
     env = os.environ.copy()
     env.pop("CERULION_PYTHON", None)

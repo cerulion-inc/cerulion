@@ -143,12 +143,13 @@ impl HostCtx {
     }
 }
 
-/// Owns the inbound sample for a frame. A held view cannot detach from its
-/// subscriber, so it is copied as a safe fallback; the pynode host does not
-/// currently export snapshot inputs.
+/// Owns the inbound sample for a frame. A held view (the subscriber re-serving
+/// its last sample on a tick with no new data) cannot detach from its
+/// subscriber, so it is copied once per distinct held frame and the copy is
+/// shared by every later tick that re-serves the same frame.
 enum FrameBacking {
     Sample(RawInputView<'static>),
-    Copied(Vec<u8>),
+    Copied(Rc<[u8]>),
 }
 
 #[pyclass(unsendable)]
@@ -534,6 +535,7 @@ pub struct Host {
     input_hashes: HashMap<String, u64>,
     outputs: HashMap<String, LoanMeta>,
     next_sequences: HashMap<String, u32>,
+    held_copies: HashMap<String, Rc<[u8]>>,
     warned_threads: bool,
 }
 
@@ -928,6 +930,7 @@ impl Host {
                 input_hashes: metadata.input_hashes,
                 outputs,
                 next_sequences,
+                held_copies: HashMap::new(),
                 warned_threads: false,
             };
             Self::warn_extra_threads(py, &mut host.warned_threads);
@@ -958,7 +961,22 @@ impl Host {
                 {
                     let backing = match view.into_owned() {
                         Ok(view) => FrameBacking::Sample(view),
-                        Err(held) => FrameBacking::Copied(held.to_vec()),
+                        Err(held) => {
+                            let header = held.len().min(WireHeader::SIZE);
+                            let cached = self.held_copies.get(name).filter(|copy| {
+                                copy.len() == held.len() && copy[..header] == held[..header]
+                            });
+                            let copy = match cached {
+                                Some(copy) => Rc::clone(copy),
+                                None => {
+                                    // hot-path-alloc-ok: one copy per distinct held frame.
+                                    let copy: Rc<[u8]> = Rc::from(&held[..]);
+                                    self.held_copies.insert(name.clone(), Rc::clone(&copy));
+                                    copy
+                                }
+                            };
+                            FrameBacking::Copied(copy)
+                        }
                     };
                     views.push((name.clone(), backing));
                 }
@@ -1244,7 +1262,7 @@ macro_rules! export_node {
                             Ok(nodes) => nodes,
                             Err(_) => {
                                 __set_error("mutex poisoned".into());
-                                return 3;
+                                return 0;
                             }
                         };
                         nodes.get_or_insert_with(::std::collections::HashMap::new).insert(handle, host);

@@ -1019,14 +1019,15 @@ fn run(cli: Cli) -> CliResult<()> {
                                 .to_string(),
                         ));
                     }
-                    if input.len() > 2 {
+                    let python = matches!(lang, NodeLanguage::Python);
+                    if input.len() > 2 && !python {
                         return Err(cerulion_cli_engine::error::CliError::Validation(
                             "at most one `-i` per `node create` (use `node modify` to add \
                              more inputs after creation)"
                                 .to_string(),
                         ));
                     }
-                    if output.len() > 2 {
+                    if output.len() > 2 && !python {
                         return Err(cerulion_cli_engine::error::CliError::Validation(
                             "at most one `-o` per `node create` (use `node modify` to add \
                              more outputs after creation)"
@@ -1039,18 +1040,16 @@ fn run(cli: Cli) -> CliResult<()> {
                     // ambiguous/unknown names error before anything
                     // is created. The engine re-resolves as the
                     // enforcement backstop (idempotent, free).
-                    let outputs: Vec<(String, String)> = if output.is_empty() {
-                        vec![]
-                    } else {
-                        let (schema, name) = parse_port_args(&output);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                    let resolve_ports = |args: &[String]| {
+                        args.chunks(2)
+                            .map(|pair| {
+                                let (schema, name) = parse_port_args(pair);
+                                Ok((resolve_and_report(&ws.schemas_dir, &schema)?, name))
+                            })
+                            .collect::<Result<Vec<(String, String)>, cerulion_cli_engine::error::CliError>>()
                     };
-                    let regular_inputs: Vec<(String, String)> = if input.is_empty() {
-                        vec![]
-                    } else {
-                        let (schema, name) = parse_port_args(&input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
-                    };
+                    let outputs = resolve_ports(&output)?;
+                    let regular_inputs = resolve_ports(&input)?;
                     let trigger_inputs: Vec<(String, String)> = if trigger_input.is_empty() {
                         vec![]
                     } else {

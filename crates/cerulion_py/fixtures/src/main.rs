@@ -129,9 +129,12 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
         _ => return Err(format!("unknown mode '{mode}'\n{USAGE}")),
     }
     if mode == "host-pynode" {
-        if rest.is_empty() {
+        if rest.len() < 2 {
             return Err("host-pynode requires <path.so> <ticks>".to_string());
         }
+        rest[1]
+            .parse::<usize>()
+            .map_err(|error| format!("invalid tick count: {error}"))?;
         return Ok((
             mode,
             Args {
@@ -269,14 +272,10 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
             let harness = mgr
                 .create_publisher(&topic, max_len, 1)
                 .map_err(|error| error.to_string())?;
-            let node_pub = mgr
-                .create_publisher(&topic, max_len, 1)
-                .map_err(|error| error.to_string())?;
             let node_sub = mgr
                 .create_subscriber(&topic)
                 .map_err(|error| error.to_string())?;
             input_publishers.push((name.to_string(), harness, hash));
-            publishers.insert(name.to_string(), AnyPublisher::Ipc(node_pub));
             subscribers.insert(name.to_string(), AnySubscriber::Ipc(node_sub));
         }
         for output in document["outputs"]

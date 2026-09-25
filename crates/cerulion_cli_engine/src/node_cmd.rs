@@ -194,6 +194,15 @@ pub fn node_create_with_options(
     } else {
         policy
     };
+    if options.language == NodeLanguage::Python
+        && matches!(policy, Some(cerulion_core::MacroPolicy::Sync { .. }))
+        && options.inputs.len() < 2
+    {
+        return Err(CliError::Validation(
+            "a sync_window_ms Python node aligns two or more inputs: repeat `-i SCHEMA NAME` for each"
+                .to_string(),
+        ));
+    }
 
     if policy.is_none() && options.inputs.is_empty() && options.trigger.is_none() {
         return Err(CliError::Validation(
@@ -1980,6 +1989,15 @@ mod tests {
                 },
                 Some(cerulion_core::MacroPolicy::Period { period_ms: 10 }),
                 "duplicate port name 'same'",
+            ),
+            (
+                NodeCreateOptions {
+                    inputs: vec![port("only")],
+                    language: NodeLanguage::Python,
+                    ..NodeCreateOptions::default()
+                },
+                Some(cerulion_core::MacroPolicy::Sync { window_ms: 10 }),
+                "a sync_window_ms Python node aligns two or more inputs",
             ),
         ];
         for (options, policy, expected) in cases {

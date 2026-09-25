@@ -807,10 +807,13 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
     let policy = info.policy.and_then(PolicyJson::into_macro_policy);
     let throttle_ms = info.throttle_ms;
     let (inputs, outputs) = (info.inputs, info.outputs);
-    let mut port_schemas = match block
-        .lines()
-        .find_map(|line| line.trim().strip_prefix(PORT_SCHEMAS_MARKER))
-    {
+    let mut port_schemas = match block.lines().map(str::trim).find_map(|line| {
+        if line == PORT_SCHEMAS_MARKER.trim_end() {
+            Some("")
+        } else {
+            line.strip_prefix(PORT_SCHEMAS_MARKER)
+        }
+    }) {
         Some(raw) => serde_json::from_str::<PortSchemas>(raw.trim()).map_err(|e| {
             CliError::Validation(format!(
                 "node '{}' CERULION:PORT_SCHEMAS line failed to parse: {}",
@@ -2932,6 +2935,15 @@ static INFO_BYTES: &[u8] = b"{\"inputs\":[\"inp\"],\"outputs\":[]}\0";
 // CERULION:INFO_END
 "#;
         let node_dir = write_node(&tmp, "rawffi_schema_bad", src);
+        let err = parse_node_metadata(&node_dir).unwrap_err().to_string();
+        assert!(err.contains("PORT_SCHEMAS line failed to parse"), "{err}");
+    }
+
+    #[test]
+    fn empty_port_schemas_line_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let src = "\n// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{\\\"inputs\\\":[\\\"inp\\\"],\\\"outputs\\\":[]}\\0\";\n// CERULION:PORT_SCHEMAS \n// CERULION:INFO_END\n";
+        let node_dir = write_node(&tmp, "rawffi_schema_empty", src);
         let err = parse_node_metadata(&node_dir).unwrap_err().to_string();
         assert!(err.contains("PORT_SCHEMAS line failed to parse"), "{err}");
     }

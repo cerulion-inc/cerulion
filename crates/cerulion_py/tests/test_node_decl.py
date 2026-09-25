@@ -180,7 +180,7 @@ def test_depth_64_is_accepted():
 
 
 def test_runtime_reserved_port_names_are_rejected():
-    for name in ("_cer_ctx", "__cerulion_ports__"):
+    for name in ("_cer_ctx", "__cerulion_ports__", "__", "___"):
         with pytest.raises(TypeError, match=rf"reserved port name: {name}"):
             cerulion.node(period_ms=1)(
                 type(

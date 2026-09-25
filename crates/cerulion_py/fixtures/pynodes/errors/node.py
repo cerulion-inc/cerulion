@@ -35,6 +35,15 @@ else:
 
         def tick(self):
             case = os.environ.get("CERULION_PYNODE_CASE")
+            if case == "loan_length_type":
+                for length in (1.9, True, -1, "2"):
+                    try:
+                        self.loan("out", value=length)
+                    except TypeError as error:
+                        if "must be a non-negative int" not in str(error):
+                            raise
+                    else:
+                        raise RuntimeError(f"loan accepted length {length!r}")
             if case == "tick_exception":
                 raise RuntimeError("fixture tick failure")
             if case == "retain_view" and self.inp is not None:

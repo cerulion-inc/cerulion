@@ -146,7 +146,7 @@ def node(
             if port.name in seen:
                 raise TypeError(f"duplicate port name: {port.name}")
             seen.add(port.name)
-            if port.name.startswith("__") and port.name.endswith("__"):
+            if port.name.startswith("__"):
                 raise TypeError(f"reserved port name: {port.name}")
             if port.name.startswith("_cer_") or port.name.startswith("__cerulion") or port.name in (
                 "now_ns",
@@ -245,14 +245,19 @@ def node(
             if name in self._cer_outputs:
                 raise RuntimeError(f"output '{name}' was already touched this tick")
             port = next(port for port in outputs if port.name == name)
-            lengths = [
-                int(variable_lengths.get(field.name, 0))
-                for field in self._cer_layouts[name].variable_fields
-            ]
+            for field, length in variable_lengths.items():
+                if isinstance(length, bool) or not isinstance(length, int) or length < 0:
+                    raise TypeError(
+                        f"variable length for '{field}' must be a non-negative int"
+                    )
             if set(variable_lengths) - {
                 field.name for field in self._cer_layouts[name].variable_fields
             }:
                 raise TypeError(f"unknown variable field for output '{name}'")
+            lengths = [
+                variable_lengths.get(field.name, 0)
+                for field in self._cer_layouts[name].variable_fields
+            ]
             self._cer_outputs[name] = self._cer_make_output(name, lengths)
             return self._cer_outputs[name]
 

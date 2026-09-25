@@ -72,7 +72,10 @@ const LIBRARY_PATH_VAR: &str = "LD_LIBRARY_PATH";
 pub fn render_user_error(error: &CliError) -> String {
     let rendered = error.to_string();
     if let CliError::Transport(cerulion_core::TransportError::NodeError { reason, .. }) = error {
-        if reason.contains("libpython") {
+        let loader_failure = ["cannot open shared object file", "Library not loaded"]
+            .iter()
+            .any(|marker| reason.contains(marker));
+        if loader_failure && reason.contains("libpython") {
             return format!(
                 "{rendered}\nPython node cdylib could not find libpython; rebuild with \
                  `cerulion node build <type>` (bakes the interpreter's LIBDIR rpath) or set \
@@ -100,6 +103,18 @@ mod tests {
              libpython3.12.so.1.0: cannot open shared object file\nPython node cdylib could not \
              find libpython; rebuild with `cerulion node build <type>` (bakes the interpreter's \
              LIBDIR rpath) or set LD_LIBRARY_PATH"
+        );
+    }
+
+    #[test]
+    fn python_exception_mentioning_libpython_gets_no_loader_remedy() {
+        let error = CliError::Transport(cerulion_core::TransportError::NodeError {
+            node_id: "echo".to_string(),
+            reason: "tick raised ValueError: bad path /opt/libpython-tools".to_string(),
+        });
+        assert_eq!(
+            render_user_error(&error),
+            "Node 'echo' error: tick raised ValueError: bad path /opt/libpython-tools"
         );
     }
 
