@@ -168,6 +168,11 @@ fn yaml_error_arms() {
         set.add_yaml_str("schemas:\n  A:\n    fields:\n      7: {}\n"),
         Err(DynamicError::InvalidFieldKey { .. })
     ));
+    assert!(matches!(
+        set.add_yaml_str("schemas:\n  A:\n    fields:\n      uint8 x: {}\n      uint16 x: {}\n"),
+        Err(DynamicError::InvalidFieldKey { schema, key, reason })
+            if schema == "A" && key == "uint16 x" && reason == "duplicate field name 'x'"
+    ));
     // Hostile inline lengths stop at the CLI's cap, one above it for both
     // sized variants (the `uint8[usize::MAX]` class that once overflowed
     // `LayoutResolver` never reaches the size recipe).
