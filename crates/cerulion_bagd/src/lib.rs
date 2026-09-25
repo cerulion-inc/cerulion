@@ -9027,7 +9027,7 @@ fn map_ring_err(ring_name: &str, e: ShmRingError) -> BagdError {
 /// index is backed by records this bag carries, and a declaration is weaker
 /// evidence than a record.
 fn build_capture_state_coverage(
-    checkpoint: &anchor_window::Checkpoint,
+    checkpoints: &[&anchor_window::Checkpoint],
     armed: Option<state_coverage::StateArmCoverage>,
     declared: &BTreeMap<String, Vec<String>>,
 ) -> (Vec<u8>, usize) {
@@ -9051,7 +9051,12 @@ fn build_capture_state_coverage(
     let mut ring_ranks_disagreed: BTreeSet<&str> = BTreeSet::new();
     let mut records = 0u64;
 
-    for anchor in &checkpoint.anchors {
+    // Over the whole SET, one member per rank. Walked as one stream because
+    // every tally here is a fact about the CAPTURE rather than about one rank:
+    // `rings` is what `rings_declared` counts, `ring_ranks` is the join a reader
+    // resolves `node_idx` through, and both are wrong by a factor of k if only
+    // one member is walked.
+    for anchor in checkpoints.iter().flat_map(|c| c.anchors.iter()) {
         rings.insert(anchor.ring.as_str());
         if let Some(rank) = producer_rank(&anchor.records) {
             match ring_ranks.get(&anchor.ring) {
@@ -9182,7 +9187,9 @@ fn build_capture_state_coverage(
     let bytes = serde_json::to_vec(&coverage).unwrap_or_else(|e| {
         tracing::error!(
             error = %e,
-            step = checkpoint.step,
+            // Every member's step, because the set may straddle two of them and
+            // naming one would send a reader to the wrong checkpoint.
+            steps = ?checkpoints.iter().map(|c| c.step).collect::<Vec<_>>(),
             "flashback: the capture's state-coverage manifest would not serialize — \
              this capture's node state will not be readable"
         );
@@ -16582,7 +16589,15 @@ impl Recorder {
         let declared_nodes = plane.declared_ring_nodes();
         let (anchor, state_coverage, anchor_report, anchor_summary, (anchor_facts, rings_seen)) =
             match plane.select_anchor(floor_ns, started_ns) {
-                Ok((checkpoint, fit)) => {
+                Ok(selection) => {
+                    // The SET, one member per rank, in ring order. Ring order is
+                    // the manifest's order and is stable across captures, so two
+                    // runs of the same graph render their per-rank block the
+                    // same way.
+                    let members: Vec<&anchor_window::SelectedAnchor> =
+                        selection.selected.values().collect();
+                    let checkpoints: Vec<&anchor_window::Checkpoint> =
+                        members.iter().map(|m| &m.checkpoint).collect();
                     // One `Arc` bump per ANCHOR, not a copy of
                     // every record. The anchor-first split arithmetic makes the copy
                     // this replaces up to ~1.2 GiB on a 25-rank robot, paid on
@@ -16592,8 +16607,9 @@ impl Recorder {
                     // every anchor is a single part, and they disagreed on the
                     // first e2e run after this change: a two-anchor,
                     // three-record checkpoint reported 2.
-                    let records: Vec<std::sync::Arc<Vec<anchor_window::StateRecord>>> = checkpoint
-                        .record_groups()
+                    let records: Vec<std::sync::Arc<Vec<anchor_window::StateRecord>>> = checkpoints
+                        .iter()
+                        .flat_map(|c| c.record_groups())
                         .map(std::sync::Arc::clone)
                         .collect();
                     let record_count: usize = records.iter().map(|g| g.len()).sum();
@@ -16603,12 +16619,19 @@ impl Recorder {
                     // nothing: it can satisfy no required node, and inventing an id
                     // for it would let a capture claim coverage of a node that does
                     // not exist.
-                    let facts: Vec<cerulion_core::state_restore::AnchorFact> = checkpoint
-                        .anchors
+                    let facts: Vec<cerulion_core::state_restore::AnchorFact> = checkpoints
                         .iter()
-                        .filter_map(|a| {
+                        .flat_map(|checkpoint| {
+                            checkpoint.anchors.iter().map(move |a| (*checkpoint, a))
+                        })
+                        .filter_map(|(checkpoint, a)| {
                             let node = a.node.clone()?;
                             Some(cerulion_core::state_restore::AnchorFact {
+                                // Each fact carries ITS OWN member's run and
+                                // step, never the folded scalar: the ranks may
+                                // sit at different steps, and stamping one rank's
+                                // step onto another rank's anchor would describe
+                                // a checkpoint that was never taken.
                                 run_id: checkpoint.run_id,
                                 step: checkpoint.step,
                                 node,
@@ -16635,26 +16658,59 @@ impl Recorder {
                             })
                         })
                         .collect();
+                    // The FOLD, and the rule it follows: counts SUM over the
+                    // ranks, the two instants take the CONSERVATIVE extreme, and
+                    // the fit is the worst rank's. No scalar is ever one ring's
+                    // number published as the capture's, which is the defect a
+                    // k-rank capture had before the set existed.
+                    //
+                    // For a lockstep or k=1 capture the set has one member and
+                    // every fold below is the identity, so such a capture's
+                    // manifest is byte-identical to the one this recorder wrote
+                    // before the set.
+                    let nodes: usize = checkpoints.iter().map(|c| c.anchors.len()).sum();
+                    let complete: usize = checkpoints.iter().map(|c| c.complete_anchors()).sum();
+                    let byte_len: usize = checkpoints.iter().map(|c| c.byte_len()).sum();
+                    // The LATEST rank's, both of them. A resume is only as good
+                    // as its slowest rank: the graph has every rank's state from
+                    // the latest member onward and not before it, so the earliest
+                    // member's step would claim a covered range this capture
+                    // cannot back. The two are read off the SAME member, so the
+                    // pair a reader sees is a checkpoint that was really taken.
+                    let latest = members
+                        .iter()
+                        .max_by_key(|m| (m.checkpoint.taken_at_ns, m.checkpoint.step))
+                        .expect("a selection is non-empty by construction");
+                    let step = latest.checkpoint.step;
+                    let taken_at_ns = latest.checkpoint.taken_at_ns;
+                    let run_id = latest.checkpoint.run_id;
+                    // The WORST rank's. A capture covers the window it claims
+                    // only if EVERY rank's member does; reporting the best would
+                    // publish a coverage claim one rank cannot meet.
+                    let fit = if members
+                        .iter()
+                        .any(|m| m.fit == anchor_window::AnchorFit::NewerThanTheClaimedWindow)
+                    {
+                        anchor_window::AnchorFit::NewerThanTheClaimedWindow
+                    } else {
+                        anchor_window::AnchorFit::CoversTheClaimedWindow
+                    };
                     let summary = format!(
                         "step {}: {}/{} node(s) complete, {} record(s), {} byte(s)",
-                        checkpoint.step,
-                        checkpoint.complete_anchors(),
-                        checkpoint.anchors.len(),
-                        record_count,
-                        checkpoint.byte_len(),
+                        step, complete, nodes, record_count, byte_len,
                     );
                     let report = flashback_plane::AnchorReport::Embedded {
-                        run_id: checkpoint.run_id,
-                        step: checkpoint.step,
-                        nodes: checkpoint.anchors.len(),
-                        complete: checkpoint.complete_anchors(),
+                        run_id,
+                        step,
+                        nodes,
+                        complete,
                         records: record_count,
                         fit,
                         // The raw instant, so a reader can compute the
                         // CLAIM-relative distance (`taken_at_ns − floor_ns`) as
                         // well as the two bag-relative figures below — see the
                         // field's own doc for why one cannot serve for the other.
-                        taken_at_ns: checkpoint.taken_at_ns,
+                        taken_at_ns,
                         // How much of the bag's FRAME span a resume will not
                         // re-execute.
                         //
@@ -16666,17 +16722,22 @@ impl Recorder {
                         // manifest's `achieved_from_ns: null` beside it is what
                         // says why.
                         frames_before_anchor_ms: achieved_from_ns
-                            .map(|from| checkpoint.taken_at_ns.saturating_sub(from) / 1_000_000)
+                            .map(|from| taken_at_ns.saturating_sub(from) / 1_000_000)
                             .unwrap_or(0),
                         // The other side of the same gap: frames the resume NEEDS
                         // and the bag does not have. At most one of the two is
                         // nonzero.
                         frames_missing_after_anchor_ms: achieved_from_ns
-                            .map(|from| from.saturating_sub(checkpoint.taken_at_ns) / 1_000_000)
+                            .map(|from| from.saturating_sub(taken_at_ns) / 1_000_000)
                             .unwrap_or(0),
                     };
+                    // Both spans are measured from the SAME folded instant, which
+                    // is what keeps the field docs' "at most one of the two is
+                    // nonzero" true for a k-rank capture: computing each as its
+                    // own per-rank extreme would let both read nonzero and leave
+                    // a reader unable to say which side the gap is on.
                     let (coverage, rings) =
-                        build_capture_state_coverage(&checkpoint, observed_arm, &declared_nodes);
+                        build_capture_state_coverage(&checkpoints, observed_arm, &declared_nodes);
                     (
                         Some(crate::capture::CaptureAnchor { records }),
                         Some(coverage),
@@ -25410,7 +25471,8 @@ mod commit_ordering_tests {
         let held = lock_anchors(&anchors);
         assert_eq!(held.checkpoints(), 1);
         assert_eq!(held.admitted(), 1);
-        let (checkpoint, _) = held.select(0, u64::MAX).expect("the anchor is selectable");
+        let selection = held.select(0, u64::MAX).expect("the anchor is selectable");
+        let (checkpoint, _) = selection.sole();
         assert_eq!(checkpoint.run_id, RUN);
         assert_eq!(checkpoint.step, 22);
         assert_eq!(
@@ -25672,8 +25734,10 @@ mod capture_coverage_tests {
                 },
             );
         }
-        let (checkpoint, _) = window.select(0, u64::MAX).expect("one checkpoint");
-        let (bytes, _rings) = build_capture_state_coverage(checkpoint, armed, declared);
+        let selection = window.select(0, u64::MAX).expect("a selection");
+        let checkpoints: Vec<&anchor_window::Checkpoint> =
+            selection.selected.values().map(|m| &m.checkpoint).collect();
+        let (bytes, _rings) = build_capture_state_coverage(&checkpoints, armed, declared);
         serde_json::from_slice(&bytes).expect("the capture manifest must be valid JSON")
     }
 

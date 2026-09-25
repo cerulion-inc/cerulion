@@ -37,7 +37,7 @@ use cerulion_core::flashback::trigger::{
     TriggerPolicy, TriggerStats,
 };
 
-use crate::anchor_window::{AnchorFit, AnchorWindow, Checkpoint, NoAnchorReason};
+use crate::anchor_window::{AnchorFit, AnchorSelection, AnchorWindow, NoAnchorReason};
 use crate::capture::{CaptureStats, CaptureWriter};
 use crate::window::FrameWindow;
 
@@ -761,11 +761,9 @@ impl FlashbackPlane {
         &self,
         floor_ns: u64,
         started_ns: u64,
-    ) -> Result<(Checkpoint, AnchorFit), NoAnchorReason> {
+    ) -> Result<AnchorSelection, NoAnchorReason> {
         let deadline = self.claimed_window_start_ns(started_ns).max(floor_ns);
-        lock_anchors(&self.anchors)
-            .select(floor_ns, deadline)
-            .map(|(c, fit)| (c.clone(), fit))
+        lock_anchors(&self.anchors).select(floor_ns, deadline)
     }
 
     /// PURE: the instant the capture's CLAIMED pre-window starts, derived
@@ -4218,7 +4216,8 @@ mod tests {
 
         // A checkpoint at 10 s — FIVE SECONDS AFTER the trigger.
         lock_anchors(&plane.anchors).admit(10_000 * MS, probe_anchor(700));
-        let (picked, fit) = plane.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = plane.select_anchor(floor_ns, trigger).expect("selected");
+        let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 700);
         assert_eq!(
             fit,
@@ -4240,7 +4239,8 @@ mod tests {
             "still an early capture: 20 s into a 30 s window"
         );
         lock_anchors(&later.anchors).admit(15_000 * MS, probe_anchor(800));
-        let (picked, fit) = later.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = later.select_anchor(floor_ns, trigger).expect("selected");
+        let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 800);
         assert_eq!(
             fit,
@@ -4268,7 +4268,8 @@ mod tests {
         // the claimed window start (85 s). Under the original close-time deadline
         // (100 s) this reported `CoversTheClaimedWindow`.
         lock_anchors(&plane.anchors).admit(90_000 * MS, probe_anchor(500));
-        let (picked, fit) = plane.select_anchor(floor_ns, TRIGGER_NS).expect("selected");
+        let selection = plane.select_anchor(floor_ns, TRIGGER_NS).expect("selected");
+        let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 500);
         assert_eq!(
             fit,
@@ -4285,7 +4286,8 @@ mod tests {
             held.clear();
             held.admit(80_000 * MS, probe_anchor(400));
         }
-        let (picked, fit) = plane.select_anchor(floor_ns, TRIGGER_NS).expect("selected");
+        let selection = plane.select_anchor(floor_ns, TRIGGER_NS).expect("selected");
+        let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 400);
         assert_eq!(fit, AnchorFit::CoversTheClaimedWindow);
     }
@@ -4331,7 +4333,8 @@ mod tests {
         // AT the floor: this checkpoint covers every frame the capture carries,
         // which is the most any anchor could do.
         lock_anchors(&plane.anchors).admit(floor_ns, probe_anchor(900));
-        let (picked, fit) = plane.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = plane.select_anchor(floor_ns, trigger).expect("selected");
+        let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 900);
         assert_eq!(
             fit,
@@ -4347,7 +4350,8 @@ mod tests {
             held.clear();
             held.admit(floor_ns + MS, probe_anchor(901));
         }
-        let (picked, fit) = plane.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = plane.select_anchor(floor_ns, trigger).expect("selected");
+        let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 901);
         assert_eq!(
             fit,
@@ -4363,7 +4367,8 @@ mod tests {
         let ordinary = FlashbackPlane::new(settings(std::path::PathBuf::from("/tmp/fb")), None);
         let floor_ns = 70_000 * MS;
         lock_anchors(&ordinary.anchors).admit(80_000 * MS, probe_anchor(902));
-        let (picked, fit) = ordinary.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = ordinary.select_anchor(floor_ns, trigger).expect("selected");
+        let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 902);
         assert_eq!(
             fit,
@@ -4630,11 +4635,12 @@ mod tests {
         // lived a whole span) and so does the claimed-window deadline, so the
         // boot anchor is NEWER than the window this capture claims.
         const TRIGGER_NS: u64 = 8_000_000_000;
-        let (checkpoint, fit) = plane.select_anchor(0, TRIGGER_NS).expect(
+        let selection = plane.select_anchor(0, TRIGGER_NS).expect(
             "project rule: a young run must still resim, since an anchor exists and must be \
              served, not refused for being newer than a window the run is too young \
              to have",
         );
+        let (checkpoint, fit) = selection.sole();
         assert_eq!(
             checkpoint.taken_at_ns, BOOT_NS,
             "and it must be the BOOT anchor, not some other checkpoint"
