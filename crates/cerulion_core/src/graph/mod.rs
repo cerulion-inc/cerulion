@@ -45,11 +45,13 @@ pub mod validation;
 pub(crate) mod waitset;
 
 pub use chain::{
-    census_chains, ChainBar, ChainCensus, Colocation, ConsumerEdgeVerdict, ConsumerFireClass,
-    FusedChain, MAX_FUSED_CHAIN_NODES,
+    census_chains, log_fusion_decision, resolve_fusion, ChainBar, ChainCensus, Colocation,
+    ConsumerEdgeVerdict, ConsumerFireClass, FusedChain, FusionDecision, FusionSource,
+    FUSE_CHAINS_ENV, MAX_FUSED_CHAIN_NODES,
 };
 pub use config::{
-    GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef, UNNAMED_GRAPH,
+    ExecutionBlock, GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef,
+    UNNAMED_GRAPH,
 };
 #[cfg(feature = "fuzz-helpers")]
 pub use node::fuzz_parse_info_json;
