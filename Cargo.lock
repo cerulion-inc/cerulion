@@ -1535,6 +1535,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerulion_telemetry"
+version = "1.0.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.17",
+ "uuid",
+]
+
+[[package]]
 name = "cerulion_viz"
 version = "1.0.0"
 dependencies = [

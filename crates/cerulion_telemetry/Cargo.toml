@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Consent and content-free usage events for the desk surfaces (the `cerulion`
+# CLI and `cerulion-vizd`). With default features the crate has no network or
+# serialization dependency and every API is a no-op, so a crate wired to it by
+# mistake still sends nothing. `tests/hot_path_dependency_gate.rs` fails if a
+# robot or runtime crate names it at all.
+[package]
+name = "cerulion_telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Consent resolver and property guard for Cerulion desk surfaces (a no-op without the `posthog` feature)"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+posthog = ["dep:serde", "dep:serde_json", "dep:uuid", "dep:dirs"]
+
+[dependencies]
+# `url_hash`: the first 12 hex chars of SHA-256. The same 0.10 line the other
+# workspace crates pin.
+sha2 = "0.10"
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+dirs = { version = "6", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
