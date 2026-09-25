@@ -270,7 +270,12 @@ record is copied out of the map into owned Python bytes when the iterator
 yields it. `messages()` indexes the selected records up front at 16 bytes
 per record, so its memory is proportional to the record count, not the
 bag size. `Record.raw` owns the bytes, `Record.payload` is a read-only
-memoryview over them, and records stay valid after `bag.close()`.
+memoryview over them, and records stay valid after `bag.close()`; an
+unfinished `messages()` iterator raises `BagError` once its bag is closed.
+`open_bag` verifies every chunk CRC in one pass before returning, so a
+corrupted, truncated, or unfinalized bag raises `BagError` at open. Full
+passes (`open_bag`, `topics()`, `messages()`) release the mapped pages
+behind them, so resident memory stays bounded on large bags.
 `Record.view(schemas, schema)` decodes a typed message from those bytes.
 A record whose embedded wire header is shorter than 32 bytes, or whose
 `total_size` disagrees with the record length, raises `BagError`. An

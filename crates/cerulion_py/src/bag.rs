@@ -2,50 +2,80 @@
 //! Native finalized-bag reading for the Python binding.
 
 use crate::errors::{map_bag_err, BagError};
-use cerulion_bag::{BagReader, FrameSpan, RESERVED_PREFIX};
+use cerulion_bag::{
+    AdviseCursor, BagCompleteness, BagReader, FrameSpan, UserFrameWalk, RESERVED_PREFIX,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::rc::Rc;
+
+/// The reader a bag and its iterators share; `close()` empties it for all.
+type SharedReader = Rc<RefCell<Option<BagReader>>>;
 
 /// A finalized bag reader. Record bytes are copied out of the read-only memory
 /// map, and `messages()` builds its 16-byte-per-frame span index up front.
 #[pyclass(unsendable, name = "Bag")]
 pub struct PyBag {
-    reader: Option<Arc<BagReader>>,
+    reader: SharedReader,
 }
 
 #[pyclass(unsendable)]
 pub struct BagRecordIter {
-    reader: Arc<BagReader>,
+    reader: SharedReader,
     spans: std::vec::IntoIter<(String, FrameSpan)>,
 }
 
-fn live_reader(reader: &Option<Arc<BagReader>>) -> PyResult<&Arc<BagReader>> {
-    reader
-        .as_ref()
-        .ok_or_else(|| BagError::new_err("bag is closed"))
+fn closed() -> PyErr {
+    BagError::new_err("bag is closed")
 }
 
+/// Walk every user frame, evicting mapped pages behind the walk so a full
+/// pass over a large bag does not stay resident.
+fn walk_user_frames(
+    reader: &BagReader,
+    mut visit: impl FnMut(&UserFrameWalk<'_>, u16, FrameSpan),
+) -> PyResult<()> {
+    let mut cursor = AdviseCursor::new();
+    let mut walk = reader.user_frames().map_err(map_bag_err)?;
+    while let Some((channel_id, span)) = walk.next_user_frame().map_err(map_bag_err)? {
+        visit(&walk, channel_id, span);
+        reader.advise_evict_behind_scoped(&mut cursor, walk.file_frontier());
+    }
+    Ok(())
+}
+
+/// Open a bag, refusing one whose chunk CRCs or framing do not verify and
+/// one that was never finalized.
 #[pyfunction]
 pub fn open_bag(path: PathBuf) -> PyResult<PyBag> {
     let reader = BagReader::open(&path).map_err(map_bag_err)?;
+    match reader.completeness().map_err(map_bag_err)? {
+        BagCompleteness::Finalized => {}
+        BagCompleteness::TornTail(e) => return Err(map_bag_err(e)),
+        _ => {
+            return Err(BagError::new_err(
+                "bag is not finalized: the recording ended without its summary",
+            ));
+        }
+    }
     Ok(PyBag {
-        reader: Some(Arc::new(reader)),
+        reader: Rc::new(RefCell::new(Some(reader))),
     })
 }
 
 #[pymethods]
 impl PyBag {
     fn topics(&self) -> PyResult<Vec<(String, String, u64, usize)>> {
-        let reader = live_reader(&self.reader)?;
+        let guard = self.reader.borrow();
+        let reader = guard.as_ref().ok_or_else(closed)?;
         let channels = reader.channels().map_err(map_bag_err)?;
         let mut counts = HashMap::<String, usize>::new();
-        let mut walk = reader.user_frames().map_err(map_bag_err)?;
-        while let Some((channel_id, _)) = walk.next_user_frame().map_err(map_bag_err)? {
+        walk_user_frames(reader, |walk, channel_id, _| {
             *counts.entry(walk.topic(channel_id).to_owned()).or_default() += 1;
-        }
+        })?;
         let topics = channels
             .into_iter()
             .filter(|channel| !channel.topic.starts_with(RESERVED_PREFIX))
@@ -63,7 +93,8 @@ impl PyBag {
     }
 
     fn messages(&self, topics: Option<Vec<String>>) -> PyResult<BagRecordIter> {
-        let reader = live_reader(&self.reader)?;
+        let guard = self.reader.borrow();
+        let reader = guard.as_ref().ok_or_else(closed)?;
         let channels = reader.channels().map_err(map_bag_err)?;
         let user_topics: HashSet<&str> = channels
             .iter()
@@ -84,22 +115,23 @@ impl PyBag {
                 Ok(filter)
             })
             .transpose()?;
-        let mut walk = reader.user_frames().map_err(map_bag_err)?;
         let mut spans = Vec::new();
-        while let Some((channel_id, span)) = walk.next_user_frame().map_err(map_bag_err)? {
+        walk_user_frames(reader, |walk, channel_id, span| {
             let topic = walk.topic(channel_id);
             if filter.as_ref().is_none_or(|names| names.contains(topic)) {
                 spans.push((topic.to_string(), span));
             }
-        }
+        })?;
         Ok(BagRecordIter {
-            reader: Arc::clone(reader),
+            reader: Rc::clone(&self.reader),
             spans: spans.into_iter(),
         })
     }
 
+    /// Unmap the bag. Iterators from `messages()` raise `BagError` afterwards;
+    /// records already yielded stay valid.
     fn close(&mut self) {
-        self.reader = None;
+        self.reader.borrow_mut().take();
     }
 }
 
@@ -113,9 +145,14 @@ impl BagRecordIter {
         &mut self,
         py: Python<'py>,
     ) -> PyResult<Option<(String, Bound<'py, PyBytes>)>> {
+        let guard = self.reader.borrow();
+        let Some(reader) = guard.as_ref() else {
+            self.spans = Vec::new().into_iter();
+            return Err(closed());
+        };
         let Some((topic, span)) = self.spans.next() else {
             return Ok(None);
         };
-        Ok(Some((topic, PyBytes::new(py, self.reader.frame(&span)))))
+        Ok(Some((topic, PyBytes::new(py, reader.frame(&span)))))
     }
 }
