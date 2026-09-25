@@ -469,3 +469,38 @@ fn set_once_with_only_disallowed_keys_sends_nothing() {
         "nothing queued, so the worker exits at once"
     );
 }
+
+#[test]
+fn a_host_that_is_not_https_or_loopback_disables_the_client() {
+    for host in [
+        "http://example.com",
+        "ftp://127.0.0.1",
+        "not a url",
+        "http://10.0.0.1:8000",
+    ] {
+        assert!(
+            Client::new("k".into(), host, common()).is_none(),
+            "{host} must be refused"
+        );
+    }
+    for host in [
+        "https://example.com",
+        "http://127.0.0.1:1",
+        "http://localhost:1",
+        "http://[::1]:1",
+    ] {
+        let mut client = Client::new("k".into(), host, common()).expect(host);
+        assert_eq!(
+            client.shutdown(DEFAULT_SHUTDOWN_BUDGET),
+            ShutdownOutcome::Flushed
+        );
+    }
+}
+
+#[test]
+fn an_unrepresentable_budget_is_clamped_instead_of_panicking() {
+    let (host, _rx) = mock_server();
+    let mut client = Client::new("k".into(), &host, common()).expect("client");
+    assert_eq!(client.shutdown(Duration::MAX), ShutdownOutcome::Flushed);
+    assert_eq!(client.shutdown(Duration::MAX), ShutdownOutcome::Noop);
+}

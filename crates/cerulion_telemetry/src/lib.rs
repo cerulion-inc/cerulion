@@ -31,7 +31,8 @@ pub mod rfc3339;
 mod value;
 
 pub use client::{
-    Client, ShutdownOutcome, DEFAULT_HOST, DEFAULT_SHUTDOWN_BUDGET, HTTP_TIMEOUT, QUEUE_CAPACITY,
+    Client, ShutdownOutcome, DEFAULT_HOST, DEFAULT_SHUTDOWN_BUDGET, HTTP_TIMEOUT,
+    MAX_SHUTDOWN_BUDGET, QUEUE_CAPACITY,
 };
 pub use error::Error;
 pub use value::{Allowlist, Common, EventSpec, Props, Value};
