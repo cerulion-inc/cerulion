@@ -1146,7 +1146,7 @@ impl CoTenant {
     /// nothing. `>= 1` is exact here: this process creates the topic's only
     /// publisher and attaches no subscriber of its own, so the only port that can
     /// appear is the recorder's tap. Same helper, same reasoning, as
-    /// `discovery_e2e_test::await_rescan_tap`.
+    /// `discovery_e2e_test::await_discovered_tap`.
     fn await_tapped(&self, topic: &str) {
         let mgr = TransportManager::get_or_init().expect("the co-tenant's transport");
         let start = Instant::now();
