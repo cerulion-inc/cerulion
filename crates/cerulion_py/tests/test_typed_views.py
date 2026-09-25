@@ -194,7 +194,7 @@ def test_nested_dynamic_array_decodes_and_copy_deep_copies(session):
     import struct
 
     # A fixed-element nested array is back-to-back fixed sections with no
-    # count prefix (canonical element framing, CER-884).
+    # count prefix (canonical element framing).
     body = struct.pack("<fff", 1.0, 2.0, 3.0) + struct.pack("<fff", 4.0, 5.0, 6.0)
     with pub.loan(pts=len(body)) as message:
         message.pts = body
