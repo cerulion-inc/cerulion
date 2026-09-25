@@ -4,6 +4,7 @@
 mod cli;
 mod completion;
 mod telemetry;
+mod telemetry_events;
 // Pins for the shell-facing WIRING (which arg carries
 // which completer, the path hints, the create arms completing nothing). A
 // binary-crate unit test because `cerulion_cli` has no library target, so an
@@ -250,7 +251,13 @@ fn dispatch(cli: Cli) -> ExitCode {
     // playback and falls through to run() untouched.
     if let Commands::Bag { action } = &cli.command {
         if is_resim_family(action) {
-            return resim_exit_code(cli.command);
+            let started = std::time::Instant::now();
+            let code = resim_exit_code(cli.command);
+            telemetry::emit(
+                telemetry_events::RESIM_COMPLETED,
+                telemetry_events::resim_completed(started.elapsed(), code),
+            );
+            return ExitCode::from(code);
         }
     }
 
@@ -465,7 +472,7 @@ fn is_resim_family(action: &BagAction) -> bool {
 /// loud refusal and never
 /// reaches the engine.
 #[cfg(unix)]
-fn resim_exit_code(command: Commands) -> ExitCode {
+fn resim_exit_code(command: Commands) -> u8 {
     let Commands::Bag { action } = &command else {
         unreachable!("`resim_exit_code` is reached only for a `bag play` resim-family invocation")
     };
@@ -476,7 +483,7 @@ fn resim_exit_code(command: Commands) -> ExitCode {
     // ONE mapping, shared with the pre-auth `resim_usage_refusal` above — so
     // the flags the usage check validates are, by construction, the flags the
     // run receives. Two hand-written destructures could disagree.
-    ExitCode::from(cerulion_cli_engine::resim_cmd::run_play_resim(bag, flags))
+    cerulion_cli_engine::resim_cmd::run_play_resim(bag, flags)
 }
 
 /// Dispatch `cerulion bag <play|info|record>`.
@@ -544,6 +551,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             };
             let running = setup_ctrlc_handler()?;
             let mut out = std::io::stdout();
+            let started = std::time::Instant::now();
             let summary = bag_cmd::bag_play(
                 &bag,
                 bag_cmd::PlayOptions {
@@ -556,7 +564,12 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                 },
                 running,
                 &mut out,
-            )?;
+            );
+            telemetry::emit(
+                telemetry_events::BAG_REPLAY_COMPLETED,
+                telemetry_events::bag_replay_completed(started.elapsed(), summary.is_ok()),
+            );
+            let summary = summary?;
             print!("{}", bag_cmd::render_play_summary(&summary));
             out.flush()?;
             Ok(())
@@ -573,6 +586,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
         } => {
             let running = setup_ctrlc_handler()?;
             let mut out = std::io::stdout();
+            let started = std::time::Instant::now();
             let summary = bag_cmd::bag_record(
                 bag_cmd::RecordOptions {
                     topics,
@@ -607,7 +621,27 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                 },
                 running,
                 &mut out,
-            )?;
+            );
+            match &summary {
+                Ok(summary) => telemetry::emit(
+                    telemetry_events::BAG_RECORD_COMPLETED,
+                    telemetry_events::bag_record_completed(
+                        started.elapsed(),
+                        summary
+                            .bag_paths
+                            .iter()
+                            .filter_map(|path| std::fs::metadata(path).ok())
+                            .map(|meta| meta.len())
+                            .sum(),
+                        summary.per_topic.len(),
+                    ),
+                ),
+                Err(_) => telemetry::emit(
+                    telemetry_events::BAG_RECORD_FAILED,
+                    telemetry_events::bag_record_failed(started.elapsed()),
+                ),
+            }
+            let summary = summary?;
             print!("{}", bag_cmd::render_record_summary(&summary));
             out.flush()?;
             Ok(())
@@ -679,12 +713,12 @@ fn run_bag(_action: BagAction) -> CliResult<()> {
 /// Non-Unix stub: `cerulion bag play --resim` is unavailable (the bag reader is
 /// `#![cfg(unix)]`). Mirrors the `cerulion bagd` platform stub.
 #[cfg(not(unix))]
-fn resim_exit_code(_command: Commands) -> ExitCode {
+fn resim_exit_code(_command: Commands) -> u8 {
     eprintln!(
         "Error: `cerulion bag play --resim` is only supported on Unix platforms (the bag reader \
          depends on Unix-only POSIX trace-ring types)"
     );
-    ExitCode::FAILURE
+    1
 }
 
 /// Resolve + spawn `cerulion-connectd`, streaming its stdio and
@@ -724,10 +758,15 @@ fn connect_exit_code(command: Commands) -> ExitCode {
         relay_disabled,
         network,
     };
+    let started = std::time::Instant::now();
     let plan = match connect_cmd::plan(&args) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
+            telemetry::emit(
+                telemetry_events::CONNECT_SESSION_COMPLETED,
+                telemetry_events::connect_session_completed(started.elapsed(), 1),
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -745,7 +784,15 @@ fn connect_exit_code(command: Commands) -> ExitCode {
         }
     };
     tracing::info!(bin = %plan.bin.display(), "cerulion connect: spawning cerulion-connectd");
-    match connect_cmd::spawn_and_wait(&plan, running) {
+    let result = connect_cmd::spawn_and_wait(&plan, running);
+    telemetry::emit(
+        telemetry_events::CONNECT_SESSION_COMPLETED,
+        telemetry_events::connect_session_completed(
+            started.elapsed(),
+            result.as_ref().map_or(1, |code| i64::from(*code)),
+        ),
+    );
+    match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -789,6 +836,10 @@ fn pair_exit_code(command: Commands) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
+            telemetry::emit(
+                telemetry_events::PAIR_COMPLETED,
+                telemetry_events::pair_completed(false),
+            );
             // A resolution / config failure is exit 1 (usage), matching the
             // `cerulion-connectd pair` contract.
             return ExitCode::from(1u8);
@@ -803,7 +854,12 @@ fn pair_exit_code(command: Commands) -> ExitCode {
         }
     };
     tracing::info!(bin = %plan.bin.display(), "cerulion pair: spawning cerulion-connectd pair");
-    match pair_cmd::spawn_and_pair(&plan, running) {
+    let result = pair_cmd::spawn_and_pair(&plan, running);
+    telemetry::emit(
+        telemetry_events::PAIR_COMPLETED,
+        telemetry_events::pair_completed(matches!(result, Ok(0))),
+    );
+    match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1361,13 +1417,23 @@ fn run(cli: Cli) -> CliResult<()> {
                     // Cargo's output is captured, so the progress line is the
                     // only thing on screen while it runs. It goes to stderr
                     // with the notice: stdout carries the result alone.
-                    let _outcome = node_cmd::node_build_with_progress(
+                    let started = std::time::Instant::now();
+                    let outcome = node_cmd::node_build_with_progress(
                         &ws.root,
                         &node_type,
                         release,
                         &mut |notice| eprint!("{notice}"),
                         &mut |line| eprintln!("{line}"),
-                    )?;
+                    );
+                    telemetry::emit(
+                        telemetry_events::NODE_BUILD_COMPLETED,
+                        telemetry_events::node_build_completed(
+                            started.elapsed(),
+                            outcome.is_ok(),
+                            release,
+                        ),
+                    );
+                    let _outcome = outcome?;
                     println!("Built '{}'", node_type);
                     Ok(())
                 }
@@ -1550,7 +1616,12 @@ fn run(cli: Cli) -> CliResult<()> {
                         is_tty: std::io::stdin().is_terminal(),
                         confirm: &mut confirm,
                     };
-                    graph_cmd::graph_run(
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_STARTED,
+                        telemetry_events::graph_run_started(single_process),
+                    );
+                    let started = std::time::Instant::now();
+                    let result = graph_cmd::graph_run(
                         &ws.root,
                         &ws.graphs_dir,
                         &name,
@@ -1584,7 +1655,12 @@ fn run(cli: Cli) -> CliResult<()> {
                         // `--no-rings` — decline this run's per-rank
                         // scheduler-trace rings and its window recorder.
                         no_rings,
-                    )
+                    );
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_COMPLETED,
+                        telemetry_events::graph_run_completed(started.elapsed(), result.is_ok()),
+                    );
+                    result
                 }
                 GraphAction::Validate { name, release } => {
                     let report = graph_cmd::graph_validate(&ws.root, &name, release)?;
@@ -2422,7 +2498,13 @@ fn run(cli: Cli) -> CliResult<()> {
                                     "ros2 attach: running `cerulion graph run {graph} \
                                      --single-process` (Ctrl+C to stop)"
                                 );
-                                graph_cmd::graph_run(
+                                telemetry::emit(telemetry_events::ROS2_BRIDGE_STARTED, Vec::new());
+                                telemetry::emit(
+                                    telemetry_events::GRAPH_RUN_STARTED,
+                                    telemetry_events::graph_run_started(true),
+                                );
+                                let started = std::time::Instant::now();
+                                let result = graph_cmd::graph_run(
                                     &ws.root,
                                     &ws.graphs_dir,
                                     &graph,
@@ -2451,7 +2533,15 @@ fn run(cli: Cli) -> CliResult<()> {
                                     // path (the gating clock is wall-driven), so
                                     // there is nothing to decline.
                                     false, // no_rings
-                                )
+                                );
+                                telemetry::emit(
+                                    telemetry_events::GRAPH_RUN_COMPLETED,
+                                    telemetry_events::graph_run_completed(
+                                        started.elapsed(),
+                                        result.is_ok(),
+                                    ),
+                                );
+                                result
                             }
                             None => Ok(()),
                         }
