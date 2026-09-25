@@ -151,6 +151,7 @@ impl WsSampleConsumer {
 /// topic `EXT_TOPIC`.
 fn ws_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -160,6 +161,7 @@ fn ws_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         identity: "waitset_reactor_test".to_string(),
         prefix: "wsr".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "consumer".to_string(),
             node_type: "ws_consumer".to_string(),
@@ -374,6 +376,7 @@ const EXT_TOPIC_ALPHA: &str = "/wsm/ext/alpha";
 /// regression.
 fn ws_multi_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -386,6 +389,7 @@ fn ws_multi_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
             // REVERSE-alphabetical declaration: `zeta` first (source index 0),
             // `alpha` second (source index 1).
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "zeta".to_string(),
                 node_type: "ws_consumer".to_string(),
@@ -396,6 +400,7 @@ fn ws_multi_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "alpha".to_string(),
                 node_type: "ws_consumer".to_string(),
@@ -512,6 +517,7 @@ fn reactor_multiplexing_is_deterministic_across_runs() {
 /// Build a producer-ONLY graph (a lone period producer, no consumer).
 fn ws_producer_only_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -521,6 +527,7 @@ fn ws_producer_only_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>
         identity: "waitset_reactor_empty_test".to_string(),
         prefix: "wse".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "producer".to_string(),
             node_type: "ws_producer".to_string(),
@@ -599,6 +606,7 @@ const EXT_TOPIC_MIXED: &str = "/wsx/ext/cam";
 /// `.map`-over-both dispatch under test.
 fn ws_mixed_variant_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -609,6 +617,7 @@ fn ws_mixed_variant_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>
         prefix: "wsx".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "unified".to_string(),
                 node_type: "ws_consumer".to_string(),
@@ -619,6 +628,7 @@ fn ws_mixed_variant_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sampled".to_string(),
                 node_type: "ws_sample_consumer".to_string(),

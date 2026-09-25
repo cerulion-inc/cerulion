@@ -67,6 +67,7 @@ impl Depth32Consumer {
 
 fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -77,6 +78,7 @@ fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         prefix: "tbs".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "deep_producer".to_string(),
@@ -90,6 +92,7 @@ fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth32_consumer".to_string(),
@@ -403,6 +406,7 @@ fn default_opener_attaches_to_low_depth_topic() {
     // would lock default openers (`cerulion topic echo` requires the global
     // 16) out of the topic.
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -413,6 +417,7 @@ fn default_opener_attaches_to_low_depth_topic() {
         prefix: "tbsl".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "deep_producer".to_string(),
@@ -426,6 +431,7 @@ fn default_opener_attaches_to_low_depth_topic() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth2_consumer".to_string(),
@@ -594,6 +600,7 @@ fn history_above_input_depth_warns_at_build() {
     // unconditionally → 2; `<` loosened to `<=` (false positive at
     // exactly-fits, where the queue holds ALL replayed frames) → 2.
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -604,6 +611,7 @@ fn history_above_input_depth_warns_at_build() {
         prefix: "tbsh".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "deep_producer".to_string(),
@@ -617,6 +625,7 @@ fn history_above_input_depth_warns_at_build() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "shallow_history_consumer".to_string(),
@@ -627,6 +636,7 @@ fn history_above_input_depth_warns_at_build() {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "exact_fit".to_string(),
                 node_type: "exact_fit_history_consumer".to_string(),
@@ -882,6 +892,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
     // fails; `consumers.len() → 1` provisions 5 — require-6 fails;
     // double-counting consumers provisions 8 — reject-7 fails.)
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -892,6 +903,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
         prefix: "tbst".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "trigger_producer".to_string(),
@@ -905,6 +917,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "triggered_consumer".to_string(),
@@ -915,6 +928,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "plain".to_string(),
                 node_type: "plain_consumer".to_string(),
@@ -1063,6 +1077,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
     // attaches / require ONE MORE (= 2) rejected. The require-one-more arm is
     // what pins the listener budget is EXACT, not merely "enough".
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1073,6 +1088,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
         prefix: "mxt".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "trigger_producer".to_string(),
@@ -1086,6 +1102,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "unified".to_string(),
                 node_type: "triggered_consumer".to_string(),
@@ -1096,6 +1113,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "blocked".to_string(),
                 node_type: "block_triggered_consumer".to_string(),

@@ -79,6 +79,7 @@ fn out_def(name: &str) -> OutputDef {
 /// `fuse`, whose YAML `inputs:` list is supplied by the caller.
 fn two_node_config(fuse_inputs: Vec<InputDef>) -> GraphConfig {
     GraphConfig {
+        execution: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),
@@ -89,6 +90,7 @@ fn two_node_config(fuse_inputs: Vec<InputDef>) -> GraphConfig {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "source".to_string(),
                 node_type: "source".to_string(),
@@ -96,6 +98,7 @@ fn two_node_config(fuse_inputs: Vec<InputDef>) -> GraphConfig {
                 outputs: vec![out_def("out_a"), out_def("out_b")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "fuse".to_string(),

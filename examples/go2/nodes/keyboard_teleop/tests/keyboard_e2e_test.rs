@@ -67,6 +67,7 @@ fn build_rig(prefix: &str) -> Rig {
     let inbox: Arc<Mutex<Vec<KeyOp>>> = Arc::new(Mutex::new(Vec::new()));
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -76,6 +77,7 @@ fn build_rig(prefix: &str) -> Rig {
         identity: format!("key_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "keyboard".to_string(),
             node_type: "keyboard_teleop".to_string(),

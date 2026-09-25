@@ -134,6 +134,7 @@ fn mixed_graph(
     let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
     if !egress_topic.is_empty() {
         nodes.push(NodeDef {
+            fuse: None,
             ros2: None,
             id: "src".to_string(),
             node_type: "nw_producer".to_string(),
@@ -150,6 +151,7 @@ fn mixed_graph(
     }
     if !ingress_topic.is_empty() {
         nodes.push(NodeDef {
+            fuse: None,
             ros2: None,
             id: "sink".to_string(),
             node_type: "nw_sink".to_string(),
@@ -162,6 +164,7 @@ fn mixed_graph(
         factories.insert("sink".to_string(), Box::new(NwSinkEntry::new()));
     }
     let config = GraphConfig {
+        execution: None,
         name: None,
         identity: "nw_wiring".to_string(),
         prefix: prefix.to_string(),

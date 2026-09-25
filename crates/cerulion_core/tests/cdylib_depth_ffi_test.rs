@@ -254,6 +254,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
     // the ceiling was max(16, 10) = 16 and the require-32 probe below
     // fails — the regression guard.
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -264,6 +265,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
         prefix: "cdd".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "depth_feed_producer".to_string(),
@@ -286,6 +288,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
                 ],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth_probe".to_string(),

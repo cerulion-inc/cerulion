@@ -127,6 +127,7 @@ struct SweepResult {
 fn run_sweep() -> SweepResult {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -137,6 +138,7 @@ fn run_sweep() -> SweepResult {
         prefix: "cdo".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "flood_producer".to_string(),
@@ -144,6 +146,7 @@ fn run_sweep() -> SweepResult {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "slow_drain_consumer".to_string(),
@@ -154,6 +157,7 @@ fn run_sweep() -> SweepResult {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "drain".to_string(),
                 node_type: "drain".to_string(),

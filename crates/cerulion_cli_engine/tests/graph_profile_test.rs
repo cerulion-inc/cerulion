@@ -644,6 +644,7 @@ fn thawed_artifact_feeds_auto_partition() {
 
     // ticker -> sink (trigger edge), laggard disconnected + isolated.
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         name: None,
@@ -651,6 +652,7 @@ fn thawed_artifact_feeds_auto_partition() {
         prefix: "p".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -664,6 +666,7 @@ fn thawed_artifact_feeds_auto_partition() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),
@@ -674,6 +677,7 @@ fn thawed_artifact_feeds_auto_partition() {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "laggard".to_string(),
                 node_type: "laggard".to_string(),

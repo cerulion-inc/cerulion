@@ -55,6 +55,7 @@ impl SyncFuse {
 /// External topics that an out-of-graph publisher can write to).
 fn sync_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -64,6 +65,7 @@ fn sync_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn N
         identity: "sync_fire_test".to_string(),
         prefix: "syncf".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "sync_fuse".to_string(),
@@ -389,6 +391,7 @@ impl UnboundedFuseCtx {
 /// bounded ([`SyncFuseCtx`]) and unbounded ([`UnboundedFuseCtx`]) variants.
 fn ctx_graph(entry: Box<dyn NodeEntry>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),
@@ -398,6 +401,7 @@ fn ctx_graph(entry: Box<dyn NodeEntry>) -> (GraphConfig, IndexMap<String, Box<dy
         identity: "sync_ctx_fire_test".to_string(),
         prefix: "s425f".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "sync_fuse_ctx".to_string(),

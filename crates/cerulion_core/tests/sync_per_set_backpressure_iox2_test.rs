@@ -401,6 +401,7 @@ impl PlainSibling {
 
 fn node(id: &str, ty: &str, inputs: Vec<(&str, &str)>, outputs: Vec<&str>) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: ty.to_string(),
@@ -426,6 +427,7 @@ fn node(id: &str, ty: &str, inputs: Vec<(&str, &str)>, outputs: Vec<&str>) -> No
 
 fn graph(name: &str, prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -279,6 +279,7 @@ fn build_graph(
 ) -> (GraphRuntime, Arc<AtomicU64>) {
     let last_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -289,6 +290,7 @@ fn build_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: producer_type.to_string(),
@@ -296,6 +298,7 @@ fn build_graph(
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "hold_consumer".to_string(),
@@ -817,6 +820,7 @@ fn build_one_input_graph(
     buffer: usize,
 ) -> GraphRuntime {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -827,6 +831,7 @@ fn build_one_input_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: producer_type.to_string(),
@@ -834,6 +839,7 @@ fn build_one_input_graph(
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: consumer_type.to_string(),
@@ -868,6 +874,7 @@ fn data_trigger_consumer_holds_silent_context() {
 
     let last_ctx = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -878,6 +885,7 @@ fn data_trigger_consumer_holds_silent_context() {
         prefix: "nthtrigctx".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "trig_producer".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -885,6 +893,7 @@ fn data_trigger_consumer_holds_silent_context() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "ctx_producer".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -892,6 +901,7 @@ fn data_trigger_consumer_holds_silent_context() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "trig_ctx_consumer".to_string(),
@@ -1363,6 +1373,7 @@ fn two_non_trigger_inputs_hold_independently() {
     let last_a = Arc::new(AtomicU64::new(MISSING));
     let last_b = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1373,6 +1384,7 @@ fn two_non_trigger_inputs_hold_independently() {
         prefix: "nthtwo".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod_a".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -1380,6 +1392,7 @@ fn two_non_trigger_inputs_hold_independently() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod_b".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -1387,6 +1400,7 @@ fn two_non_trigger_inputs_hold_independently() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "two_input_consumer".to_string(),
@@ -1621,6 +1635,7 @@ fn build_external_snapshot_graph(
     last_read: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1630,6 +1645,7 @@ fn build_external_snapshot_graph(
         identity: "non_trigger_hold_ext".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "consumer".to_string(),
             node_type: "hold_consumer".to_string(),
@@ -1825,6 +1841,7 @@ fn build_producer_via_worker_path(
     overrides: Option<&std::collections::BTreeMap<String, cerulion_core::TopicRequirements>>,
 ) -> GraphRuntime {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1834,6 +1851,7 @@ fn build_producer_via_worker_path(
         identity: format!("{prefix}_prod"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "producer".to_string(),
             node_type: "hold_producer".to_string(),
@@ -2161,6 +2179,7 @@ fn external_topic_excluded_from_union_and_harvest() {
     // roots (the consumer's trigger source has no in-graph producer) → ONE
     // global level.
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2171,6 +2190,7 @@ fn external_topic_excluded_from_union_and_harvest() {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -2178,6 +2198,7 @@ fn external_topic_excluded_from_union_and_harvest() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "extcons".to_string(),
                 node_type: "trig_consumer".to_string(),
@@ -2307,6 +2328,7 @@ fn override_applies_only_to_its_topic_not_siblings() {
 
     // Two independent owned producer topics (both roots → ONE global level).
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2317,6 +2339,7 @@ fn override_applies_only_to_its_topic_not_siblings() {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod_a".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -2324,6 +2347,7 @@ fn override_applies_only_to_its_topic_not_siblings() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod_b".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -2454,6 +2478,7 @@ fn build_producer_override_graph(
     val: f64,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2463,6 +2488,7 @@ fn build_producer_override_graph(
         identity: format!("{prefix}_prod"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "producer".to_string(),
             node_type: "hold_producer".to_string(),

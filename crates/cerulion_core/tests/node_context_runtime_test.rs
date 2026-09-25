@@ -164,6 +164,7 @@ fn graph_runtime_run_until_shutdown_exits_when_signal_fires() {
     // step that set it).
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -173,6 +174,7 @@ fn graph_runtime_run_until_shutdown_exits_when_signal_fires() {
         identity: "smoke".to_string(),
         prefix: "smoke".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),

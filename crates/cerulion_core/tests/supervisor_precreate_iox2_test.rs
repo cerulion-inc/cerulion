@@ -180,6 +180,7 @@ fn input(name: &str, source: &str) -> InputDef {
 /// producer/b.
 fn build_three_axis_graph() -> GraphRuntime {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -190,6 +191,7 @@ fn build_three_axis_graph() -> GraphRuntime {
         prefix: "precreate".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "precreate_producer".to_string(),
@@ -197,6 +199,7 @@ fn build_three_axis_graph() -> GraphRuntime {
                 outputs: vec![out("a"), out("b"), out("c")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "snap".to_string(),
                 node_type: "snap_consumer".to_string(),
@@ -204,6 +207,7 @@ fn build_three_axis_graph() -> GraphRuntime {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "deep".to_string(),
                 node_type: "deep_consumer".to_string(),
@@ -211,6 +215,7 @@ fn build_three_axis_graph() -> GraphRuntime {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "trig".to_string(),
                 node_type: "trig_consumer".to_string(),

@@ -166,6 +166,21 @@ pub struct GraphConfig {
     /// validate only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkBlock>,
+    /// OPTIONAL execution-shape block. Absent means today's behaviour, byte
+    /// for byte.
+    ///
+    /// The `level_assignments:` precedent exactly: an `Option` that is absent
+    /// by default, skipped on serialize so a round trip cannot invent one,
+    /// validated loudly at graph build, and consumed through exactly one seam.
+    /// [`GraphConfig`] carries `deny_unknown_fields` and so does
+    /// [`ExecutionBlock`], so a misspelling inside it is a loud parse error
+    /// rather than a silently dropped setting.
+    ///
+    /// Graph YAML is the source of truth for topology, and the execution
+    /// shapes declared here are topology-derived properties, which is why they
+    /// live here rather than in a node macro.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionBlock>,
 }
 
 impl GraphConfig {
@@ -334,6 +349,32 @@ pub enum NetworkMode {
 /// canonical absolute (leading `/`). The full contract is enforced at
 /// graph-load by the `validate_network_block` arm in `super::validation`.
 ///
+/// The `execution:` block: how the graph's declared topology is EXECUTED,
+/// as distinct from what it is.
+///
+/// Absent means today's behaviour, byte for byte. Every key inside is an
+/// `Option` for the same reason, so an author declares only what they are
+/// changing and a round trip cannot invent a setting they did not write.
+///
+/// `#[serde(deny_unknown_fields)]`: a misspelled key is a loud parse error,
+/// never a silently dropped setting; see [`GraphConfig`] for the rationale.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionBlock {
+    /// Whether a linear single-consumer trigger chain inside one process may
+    /// run as one fused synchronous call sequence.
+    ///
+    /// Absent means the built-in default. `false` refuses every chain in the
+    /// graph; `true` asks for the chains the census finds, which are exactly
+    /// the edges `cerulion graph levels` reports as fusable.
+    ///
+    /// NOTHING in the executor reads this yet: the resolved decision is
+    /// logged at graph build and consumed by no execution path, so a graph
+    /// that sets it runs byte-identically to one that does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse_chains: Option<bool>,
+}
+
 /// `#[serde(deny_unknown_fields)]`: a misspelled key is a loud parse error,
 /// never a silently dropped setting — see [`GraphConfig`] for the rationale.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -446,6 +487,26 @@ pub struct NodeDef {
     /// in v1). Mutually exclusive with `type:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ros2: Option<Ros2NodeDef>,
+    /// OPTIONAL per-node execution opt-out: `fuse: false` ENDS any fused
+    /// chain at this node.
+    ///
+    /// Absent means the graph's decision applies, which is the default for
+    /// every node that does not say otherwise. `true` is accepted and means
+    /// the same as absent, so a graph may state the default explicitly
+    /// without that reading as a request for something different.
+    ///
+    /// The opt-out is per INSTANCE rather than per node TYPE because whether
+    /// a consumer should pull its producer's period along with it is a
+    /// property of the deployment, not of the code: the same logger type is a
+    /// best-effort tail in one graph and a control node in another. Fusion
+    /// converts consumer lag into head-node period slip, which is what a
+    /// control chain wants and a best-effort tail does not.
+    ///
+    /// NOTHING in the executor reads this yet: an opted-out node appears in
+    /// the resolved decision that is logged at graph build and in no
+    /// execution path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse: Option<bool>,
 }
 
 impl NodeDef {

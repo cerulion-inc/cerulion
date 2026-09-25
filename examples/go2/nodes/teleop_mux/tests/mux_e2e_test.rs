@@ -94,6 +94,7 @@ fn build_rig(prefix: &str) -> Rig {
     let key_topic = format!("/teleop/{prefix}/key");
 
     let config = GraphConfig {
+        execution: None,
         network: None,
         level_assignments: None,
         process_groups: Default::default(),
@@ -103,6 +104,7 @@ fn build_rig(prefix: &str) -> Rig {
         identity: format!("mux_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "mux".to_string(),
             node_type: "teleop_mux".to_string(),

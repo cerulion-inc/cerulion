@@ -162,6 +162,7 @@ fn pair_graph(
     entry: Box<dyn NodeEntry>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -171,6 +172,7 @@ fn pair_graph(
         identity: name.to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "pair_fuse".to_string(),
@@ -194,6 +196,7 @@ fn pair_graph(
 
 fn triple_graph(sets: Triples) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -203,6 +206,7 @@ fn triple_graph(sets: Triples) -> (GraphConfig, IndexMap<String, Box<dyn NodeEnt
         identity: "pss_triple".to_string(),
         prefix: "psstri".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "triple_fuse".to_string(),
@@ -915,6 +919,7 @@ impl PairFuseCtx {
 fn every_fire_of_a_burst_reads_the_same_frozen_context_with_its_own_members() {
     let sets: Triples = Arc::new(Mutex::new(Vec::new()));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -924,6 +929,7 @@ fn every_fire_of_a_burst_reads_the_same_frozen_context_with_its_own_members() {
         identity: "pss_ctx".to_string(),
         prefix: "pssctx".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "pair_fuse_ctx".to_string(),
@@ -1300,6 +1306,7 @@ fn closure_sync_graph(
     let entry = ClosureNodeEntry::new(info, body).with_label("pss_closure_fuse");
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1309,6 +1316,7 @@ fn closure_sync_graph(
         identity: format!("pss_closure_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "closure_fuse".to_string(),
@@ -1535,6 +1543,7 @@ fn degraded_sync_graph(
         .with_label("pss_degraded_fuse");
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1544,6 +1553,7 @@ fn degraded_sync_graph(
         identity: format!("pss_degraded_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "degraded_fuse".to_string(),

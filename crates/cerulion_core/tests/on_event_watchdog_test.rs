@@ -113,6 +113,7 @@ fn expect_graph(
     stale_fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -123,6 +124,7 @@ fn expect_graph(
         prefix: "oee".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -136,6 +138,7 @@ fn expect_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "expect_watch_consumer".to_string(),
@@ -342,6 +345,7 @@ fn promise_graph(
     late_fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -352,6 +356,7 @@ fn promise_graph(
         prefix: "oep".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -365,6 +370,7 @@ fn promise_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "plain_drain_consumer".to_string(),

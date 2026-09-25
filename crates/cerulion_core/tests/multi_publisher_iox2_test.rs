@@ -68,6 +68,7 @@ fn producer_only_graph(
     marker: f64,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -77,6 +78,7 @@ fn producer_only_graph(
         identity: format!("{prefix}_{node_id}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: node_id.to_string(),
             node_type: "marker_producer".to_string(),
@@ -151,6 +153,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
     let pos = Arc::new(AtomicU64::new(0));
     let neg = Arc::new(AtomicU64::new(0));
     let cfg_b = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -161,6 +164,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
         prefix: "gb".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "bc_b".to_string(),
                 node_type: "marker_producer".to_string(),
@@ -174,6 +178,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "listener".to_string(),
                 node_type: "drain_all_tf_consumer".to_string(),
@@ -388,6 +393,7 @@ struct BlockAllObs {
 /// takes the subscriber, which would mask a gap.
 fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -398,6 +404,7 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
         prefix: "dc".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod_a".to_string(),
                 node_type: "seq_producer".to_string(),
@@ -411,6 +418,7 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod_b".to_string(),
                 node_type: "seq_producer".to_string(),
@@ -424,6 +432,7 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "draining_block_consumer".to_string(),
@@ -630,6 +639,7 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
     // leaves B firing every step — fires_b grows past 1 and the
     // equality fails.)
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -640,6 +650,7 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
         prefix: "ba".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod_a".to_string(),
                 node_type: "marker_producer".to_string(),
@@ -653,6 +664,7 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod_b".to_string(),
                 node_type: "marker_producer".to_string(),
@@ -666,6 +678,7 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "stalled".to_string(),
                 node_type: "stalled_block_consumer".to_string(),
@@ -773,6 +786,7 @@ fn per_stream_eviction_counting_tracks_loose_cap() {
     // first and under-report. Mutation oracle: Multi mapping to Some(1)
     // also kills the external attaches outright.)
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -783,6 +797,7 @@ fn per_stream_eviction_counting_tracks_loose_cap() {
         prefix: "ev".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "quiet".to_string(),
                 node_type: "quiet_producer".to_string(),
@@ -796,6 +811,7 @@ fn per_stream_eviction_counting_tracks_loose_cap() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "tiny_queue_consumer".to_string(),
@@ -941,6 +957,7 @@ fn listed_topic_rejects_depth_above_shared_ceiling_at_build() {
     // be honored on a listed topic — the build must die with the
     // trade-off named, not at a confusing open-requirement error.
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -951,6 +968,7 @@ fn listed_topic_rejects_depth_above_shared_ceiling_at_build() {
         prefix: "dp".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "quiet".to_string(),
                 node_type: "quiet_producer".to_string(),
@@ -964,6 +982,7 @@ fn listed_topic_rejects_depth_above_shared_ceiling_at_build() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "deep".to_string(),
                 node_type: "deep_consumer".to_string(),
@@ -1006,6 +1025,7 @@ fn listed_topic_rejects_single_graph_subscriber_overflow_at_build() {
     // LISTENERs are provisioned on the EVENT service (`extra_event_listeners`),
     // not as subscriber slots, so they don't enter this subscriber-axis sum.
     let mut nodes = vec![NodeDef {
+        fuse: None,
         ros2: None,
         id: "quiet".to_string(),
         node_type: "quiet_producer".to_string(),
@@ -1028,6 +1048,7 @@ fn listed_topic_rejects_single_graph_subscriber_overflow_at_build() {
     for i in 0..over_cap {
         let id = format!("sink_{i}");
         nodes.push(NodeDef {
+            fuse: None,
             ros2: None,
             id: id.clone(),
             node_type: "tiny_queue_consumer".to_string(),
@@ -1040,6 +1061,7 @@ fn listed_topic_rejects_single_graph_subscriber_overflow_at_build() {
         factories.insert(id, Box::new(TinyQueueConsumerEntry::new()));
     }
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1112,6 +1134,7 @@ fn quiet_listed_graph_with(
     consumers: &[(&str, &str)],
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let mut nodes = vec![NodeDef {
+        fuse: None,
         ros2: None,
         id: "quiet".to_string(),
         node_type: "quiet_producer".to_string(),
@@ -1128,6 +1151,7 @@ fn quiet_listed_graph_with(
     factories.insert("quiet".to_string(), Box::new(QuietProducerEntry::new()));
     for (id, node_type) in consumers {
         nodes.push(NodeDef {
+            fuse: None,
             ros2: None,
             id: (*id).to_string(),
             node_type: (*node_type).to_string(),
@@ -1147,6 +1171,7 @@ fn quiet_listed_graph_with(
     }
     (
         GraphConfig {
+            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -1249,6 +1274,7 @@ fn listed_provisioning_warns_and_infos_are_pinned() {
     // (b) a produced listed topic → the "opted in" info with the cap
     // fields. Both in one traced test, distinct graphs.
     let consumed_only = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1258,6 +1284,7 @@ fn listed_provisioning_warns_and_infos_are_pinned() {
         identity: "consumed".to_string(),
         prefix: "co".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "sink".to_string(),
             node_type: "tiny_queue_consumer".to_string(),

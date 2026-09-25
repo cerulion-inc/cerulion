@@ -64,6 +64,7 @@ fn unique_tag(what: &str) -> String {
 
 fn ticker_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -73,6 +74,7 @@ fn ticker_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         identity: "clamp".to_string(),
         prefix: "clamp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),

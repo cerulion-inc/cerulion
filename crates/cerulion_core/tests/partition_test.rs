@@ -20,6 +20,7 @@ const PREFIX: &str = "p";
 /// One node: id, (input_name, source) pairs, output names.
 fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: id.to_string(),
@@ -48,6 +49,7 @@ fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
 /// YAML `inputs`, not from macro metadata).
 fn chain_config(process_groups: IndexMap<String, Vec<String>>) -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         name: None,
@@ -130,6 +132,7 @@ fn levels_for(config: &GraphConfig, trigger_edges: &[(&str, &str)]) -> Levels {
 /// and n3 consumes BOTH n1 and n2 (level 2). 3 global levels total.
 fn diamond_config(process_groups: IndexMap<String, Vec<String>>) -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         name: None,
@@ -551,6 +554,7 @@ fn derive_errs_on_config_levels_mismatch() {
 
     // A smaller config (n0..n3 only) — n4 has NO level here.
     let small_config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         name: None,
@@ -728,6 +732,7 @@ fn override_separated_colocated_members_validate_via_compression() {
     // Kahn: x@0, y@0, z@1. Override: x@0, y@1, z@2 (legal: y->z stays
     // increasing, levels contiguous + non-empty).
     let mut config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         name: None,

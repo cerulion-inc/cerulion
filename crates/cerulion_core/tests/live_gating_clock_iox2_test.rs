@@ -153,6 +153,7 @@ impl QuantumNode {
 /// (`build_for_test_barrier` keys by node ID).
 fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -162,6 +163,7 @@ fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn
         identity: "lgc_ticker".to_string(),
         prefix: "lgc".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -204,6 +206,7 @@ fn humanoid_graph(
         topic: None,
     };
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -214,6 +217,7 @@ fn humanoid_graph(
         prefix: "hum".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "fast".to_string(),
                 node_type: "fast".to_string(),
@@ -221,6 +225,7 @@ fn humanoid_graph(
                 outputs: vec![out_def("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "slow".to_string(),
                 node_type: "slow".to_string(),
@@ -254,6 +259,7 @@ fn humanoid_graph(
 /// `Period` cadence (50ms) or the 1ms fallback. `id` == factory-map key.
 fn quantum_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -263,6 +269,7 @@ fn quantum_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         identity: "lgc_quantum".to_string(),
         prefix: "lgcq".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "qn".to_string(),
             node_type: "qn".to_string(),
@@ -613,6 +620,7 @@ impl LiveConsumer {
 /// publishers to drive real liveliness transitions.
 fn liveliness_graph(obs: Arc<LiveObs>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -622,6 +630,7 @@ fn liveliness_graph(obs: Arc<LiveObs>) -> (GraphConfig, IndexMap<String, Box<dyn
         identity: "lgc_liveliness".to_string(),
         prefix: "lgcl".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "cons".to_string(),
             node_type: "live_consumer".to_string(),

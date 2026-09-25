@@ -72,6 +72,7 @@ fn producer_graph(
     multi: Vec<String>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -81,6 +82,7 @@ fn producer_graph(
         identity: format!("rec_prov_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "producer".to_string(),
             node_type: "rec_producer".to_string(),
@@ -499,6 +501,7 @@ impl DiscardingProducer {
 /// the surface bagd's gap detector reads.
 fn discard_arm(prefix: &str, steps: usize) -> Vec<(u32, f64)> {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -508,6 +511,7 @@ fn discard_arm(prefix: &str, steps: usize) -> Vec<(u32, f64)> {
         identity: format!("rec_prov_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "producer".to_string(),
             node_type: "discarding_producer".to_string(),

@@ -166,6 +166,7 @@ fn build_graph_config() -> GraphConfig {
         source: source.to_string(),
     };
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         name: None,
@@ -173,6 +174,7 @@ fn build_graph_config() -> GraphConfig {
         prefix: GRAPH_PREFIX.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -180,6 +182,7 @@ fn build_graph_config() -> GraphConfig {
                 outputs: vec![out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "relay".to_string(),
                 node_type: "relay".to_string(),
@@ -187,6 +190,7 @@ fn build_graph_config() -> GraphConfig {
                 outputs: vec![out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),
