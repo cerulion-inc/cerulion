@@ -8,7 +8,7 @@ use super::schema_yaml::{parse_yaml_schemas, validate_fixed_lengths};
 use super::DynamicError;
 use crate::codegen::layout::WireLayout;
 use crate::codegen::parse_rosmsg as parse_rosmsg_raw;
-use crate::codegen::{composed_overflow_indices, FrameWalker, MessageSchema};
+use crate::codegen::{composed_overflow_indices, FieldType, FrameWalker, MessageSchema};
 
 /// An owned set of [`MessageSchema`]s plus the [`FrameWalker`] resolved over
 /// them.
@@ -64,14 +64,15 @@ impl SchemaSet {
     /// read (an `msg` path that is missing or a plain file is simply
     /// skipped).
     pub fn from_workspace_dir(workspace: &Path) -> Result<(Self, Vec<String>), DynamicError> {
-        let mut schemas = Vec::new();
+        let mut yaml = Vec::new();
+        let mut store = Vec::new();
         let mut file_warnings = Vec::new();
         let schemas_dir = workspace.join("schemas");
         match std::fs::metadata(&schemas_dir) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(dir = %schemas_dir.display(), "no schemas/ directory");
-                return Self::from_schemas(schemas);
+                return Self::from_schemas(yaml);
             }
             Err(e) => return Err(io_err(&schemas_dir, &e)),
         }
@@ -80,7 +81,7 @@ impl SchemaSet {
             if path.extension().and_then(|e| e.to_str()) == Some("yaml") && path.is_file() {
                 match std::fs::read_to_string(&path).map_err(|e| io_err(&path, &e)) {
                     Ok(text) => match parse_yaml_checked(&text) {
-                        Ok(parsed) => schemas.extend(parsed),
+                        Ok(parsed) => yaml.extend(parsed),
                         Err(e) => file_warnings.push(skip_warning(&path, &e)),
                     },
                     Err(e) => file_warnings.push(skip_warning(&path, &e)),
@@ -105,7 +106,7 @@ impl SchemaSet {
                     };
                     match std::fs::read_to_string(&msg_path).map_err(|e| io_err(&msg_path, &e)) {
                         Ok(text) => match parse_rosmsg(&text, stem, Some(pkg)) {
-                            Ok(schema) => schemas.push(schema),
+                            Ok(schema) => store.push(schema),
                             Err(e) => file_warnings.push(skip_warning(&msg_path, &e)),
                         },
                         Err(e) => file_warnings.push(skip_warning(&msg_path, &e)),
@@ -114,16 +115,34 @@ impl SchemaSet {
             }
         }
 
+        // Workspace YAML outranks the `.msg` store on a name collision, as the
+        // CLI resolves it.
+        let yaml_names: BTreeSet<String> = yaml.iter().map(MessageSchema::qualified_name).collect();
+        let mut schemas = yaml;
+        for schema in store {
+            let q = schema.qualified_name();
+            if yaml_names.contains(&q) {
+                file_warnings.push(format!(
+                    "workspace YAML schema '{q}' shadows the .msg store definition of the same name"
+                ));
+            } else {
+                schemas.push(schema);
+            }
+        }
+
         loop {
             let bad = composed_overflow_indices(&schemas);
             if !bad.is_empty() {
+                let mut rejected = BTreeSet::new();
                 for &i in bad.iter().rev() {
                     let schema = schemas.remove(i);
                     file_warnings.push(format!(
                         "skipped workspace schema '{}': composed fixed section (after fixed-nested inlining) overflows usize (the rest still load)",
                         schema.qualified_name()
                     ));
+                    rejected.insert(schema.qualified_name());
                 }
+                drop_dependents(&mut schemas, rejected, &mut file_warnings);
                 continue;
             }
             let (walker, warnings) = FrameWalker::new(schemas.clone());
@@ -142,12 +161,13 @@ impl SchemaSet {
                 file_warnings.extend(warnings);
                 return Ok((Self { schemas, walker }, file_warnings));
             }
-            for q in over {
-                schemas.retain(|s| s.qualified_name() != q);
+            for q in &over {
+                schemas.retain(|s| s.qualified_name() != *q);
                 file_warnings.push(format!(
                     "skipped workspace schema '{q}': frame prefix exceeds the u32 wire total_size (the rest still load)"
                 ));
             }
+            drop_dependents(&mut schemas, over, &mut file_warnings);
         }
     }
 
@@ -323,5 +343,64 @@ fn check_representable(schema: MessageSchema) -> Result<MessageSchema, DynamicEr
             schema: schema.qualified_name(),
             detail,
         }),
+    }
+}
+
+/// Remove every schema that references a rejected one, transitively. Left in
+/// place, such a parent would re-resolve the missing target as opaque bytes
+/// and silently load with a different layout and hash than it declares.
+fn drop_dependents(
+    schemas: &mut Vec<MessageSchema>,
+    mut rejected: BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    loop {
+        let before = schemas.len();
+        let mut newly = BTreeSet::new();
+        schemas.retain(|schema| {
+            let Some(target) = schema
+                .fields
+                .iter()
+                .find_map(|f| rejected_reference(&f.field_type, schema, &rejected))
+            else {
+                return true;
+            };
+            let q = schema.qualified_name();
+            warnings.push(format!(
+                "skipped workspace schema '{q}': it references skipped schema '{target}' (the rest still load)"
+            ));
+            newly.insert(q);
+            false
+        });
+        if schemas.len() == before {
+            return;
+        }
+        rejected.extend(newly);
+    }
+}
+
+/// The rejected schema `ty` references, if any. An unqualified reference
+/// binds within the referencing schema's own package first, then bare.
+fn rejected_reference(
+    ty: &FieldType,
+    owner: &MessageSchema,
+    rejected: &BTreeSet<String>,
+) -> Option<String> {
+    match ty {
+        FieldType::Nested {
+            schema_name,
+            package,
+            ..
+        } => {
+            let candidates = match package.as_ref().or(owner.package.as_ref()) {
+                Some(pkg) => vec![format!("{pkg}/{schema_name}"), schema_name.clone()],
+                None => vec![schema_name.clone()],
+            };
+            candidates.into_iter().find(|c| rejected.contains(c))
+        }
+        FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
+            rejected_reference(element_type, owner, rejected)
+        }
+        _ => None,
     }
 }

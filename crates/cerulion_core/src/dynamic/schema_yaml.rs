@@ -74,6 +74,13 @@ pub fn parse_yaml_schemas(yaml: &str) -> Result<Vec<MessageSchema>, DynamicError
                         reason: "field key is not a string; expected '<type> <name>'".to_string(),
                     })?;
                 let (field_type, field_name) = parse_field_key(name, key_str)?;
+                if schema.fields.iter().any(|f| f.name == field_name) {
+                    return Err(DynamicError::InvalidFieldKey {
+                        schema: name.to_string(),
+                        key: key_str.to_string(),
+                        reason: format!("duplicate field name '{field_name}'"),
+                    });
+                }
                 schema.add_field(FieldDef::new(field_name, field_type));
             }
         }

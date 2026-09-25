@@ -16,7 +16,8 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use std::cell::Cell;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 static NEXT_THREAD_TOKEN: AtomicUsize = AtomicUsize::new(1);
 thread_local! {
@@ -35,36 +36,99 @@ pub(crate) fn thread_token() -> usize {
     })
 }
 
-/// Record the exporting thread in `view.internal` (exporter-private per
-/// the buffer protocol; `PyBuffer_FillInfo` leaves it NULL).
+/// Live buffer-export count shared by an exporter and its `Py_buffer`s.
+///
+/// Each export stores one `Arc` reference in `view.internal`
+/// (exporter-private per the buffer protocol), so `__releasebuffer__` can
+/// decrement the count on ANY thread without borrowing the unsendable
+/// pyclass. `owner` is the exporter's creating thread: only there may the
+/// SHM slot itself be dropped.
+pub(crate) struct Exports {
+    owner: usize,
+    live: AtomicUsize,
+    given_up: AtomicBool,
+}
+
+impl Exports {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            owner: thread_token(),
+            live: AtomicUsize::new(0),
+            given_up: AtomicBool::new(false),
+        })
+    }
+
+    /// Exports not yet released, on any thread.
+    pub(crate) fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// Mark the slot as given up (released / discarded) by its owner.
+    pub(crate) fn give_up(&self) {
+        self.given_up.store(true, Ordering::Release);
+    }
+}
+
+/// What `release_export` observed for one released export.
+pub(crate) struct ExportRelease {
+    pub(crate) on_owner: bool,
+    pub(crate) live: usize,
+    pub(crate) given_up: bool,
+}
+
+/// Count one export and store its reference in `view.internal`.
 ///
 /// SAFETY: caller passes the `Py_buffer` the interpreter handed to
 /// `__getbuffer__`, after a successful `PyBuffer_FillInfo`.
-pub(crate) unsafe fn stamp_export_owner(view: *mut ffi::Py_buffer) {
-    unsafe { (*view).internal = thread_token() as *mut std::ffi::c_void };
+pub(crate) unsafe fn stamp_export(view: *mut ffi::Py_buffer, exports: &Arc<Exports>) {
+    exports.live.fetch_add(1, Ordering::AcqRel);
+    let raw = Arc::into_raw(Arc::clone(exports));
+    unsafe { (*view).internal = raw.cast_mut().cast() };
 }
 
-/// True when the calling thread is the one that exported `view`.
+/// Uncount the export stored in `view.internal`; `None` for a view this
+/// exporter never stamped.
 ///
 /// SAFETY: caller passes the `Py_buffer` the interpreter hands to
-/// `__releasebuffer__` - the same struct `stamp_export_owner` stamped.
-pub(crate) unsafe fn export_released_on_owner(view: *mut ffi::Py_buffer) -> bool {
-    unsafe { (*view).internal as usize == thread_token() }
+/// `__releasebuffer__` - the same struct `stamp_export` stamped, released
+/// exactly once.
+pub(crate) unsafe fn release_export(view: *mut ffi::Py_buffer) -> Option<ExportRelease> {
+    let raw = unsafe { (*view).internal } as *const Exports;
+    if raw.is_null() {
+        return None;
+    }
+    unsafe { (*view).internal = std::ptr::null_mut() };
+    // SAFETY: `raw` came from `Arc::into_raw` in `stamp_export` and is
+    // consumed once, here.
+    let exports = unsafe { Arc::from_raw(raw) };
+    let live = exports
+        .live
+        .fetch_sub(1, Ordering::AcqRel)
+        .saturating_sub(1);
+    Some(ExportRelease {
+        on_owner: exports.owner == thread_token(),
+        live,
+        given_up: exports.given_up.load(Ordering::Acquire),
+    })
 }
 
-/// Emit the `RuntimeWarning` for a `__releasebuffer__` that ran off its
-/// object's owning thread (or could not borrow it). `releasebuffer`
+/// Emit the `RuntimeWarning` for the last `__releasebuffer__` of a given-up
+/// slot that ran off its object's owning thread (or could not borrow it). `releasebuffer`
 /// cannot raise, so the `Result` is ignored by callers.
 pub(crate) fn warn_offthread_release(py: Python<'_>, class: &str) {
     let msg = CString::new(format!(
-        "cerulion {class} buffer released off the owning thread; \
-         the shared-memory slot is returned only when the {class} itself is dropped"
+        "cerulion {class} buffer released off the owning thread after the slot was \
+         given up; the shared-memory slot returns when the {class} is dropped"
     ))
     .unwrap_or_else(|_| c"cerulion buffer released off the owning thread".to_owned());
     let _ = PyErr::warn(py, &py.get_type::<PyRuntimeWarning>(), &msg, 1);
 }
 
 /// One received wire frame (32-byte header + body).
+///
+/// A memoryview released on a foreign thread still uncounts its export;
+/// if that was the last view of a released frame, the slot returns when
+/// the frame drops on its owning thread.
 ///
 /// Limitation (pyo3 `unsendable`): a `Frame` whose LAST Python reference
 /// dies on a foreign thread is never dropped - pyo3's `can_drop` refuses,
@@ -75,7 +139,7 @@ pub struct Frame {
     sample: Option<OwnedInboundSample>,
     header: WireHeader,
     recv_ns: u64,
-    exports: usize,
+    exports: Arc<Exports>,
     released: bool,
 }
 
@@ -85,8 +149,15 @@ impl Frame {
             sample: Some(sample),
             header,
             recv_ns,
-            exports: 0,
+            exports: Exports::new(),
             released: false,
+        }
+    }
+
+    /// Drop the sample once released with no live exports (owner thread).
+    fn reap(&mut self) {
+        if self.released && self.exports.live() == 0 {
+            self.sample = None;
         }
     }
 
@@ -142,40 +213,37 @@ impl Frame {
                 flags,
             )
         };
-        drop(this);
-        let mut this = slf.borrow_mut();
         if rc != 0 {
             return Err(PyErr::take(slf.py())
                 .unwrap_or_else(|| PyBufferError::new_err("frame buffer export failed")));
         }
-        this.exports += 1;
-        drop(this);
-        unsafe { stamp_export_owner(view) };
+        unsafe { stamp_export(view, &this.exports) };
         Ok(())
     }
 
     /// SAFETY: called by the interpreter once per live export produced by
-    /// `__getbuffer__`; `view` is the same pointer it filled there. The
-    /// release path reads its exporter-private `internal` stamp, then
-    /// decrements bookkeeping and may trigger a deferred `release()` drop.
+    /// `__getbuffer__`; `view` is the same pointer it filled there.
     ///
     /// CPython may run this on a FOREIGN thread (a memoryview handed to
-    /// another `threading.Thread` releases there). Borrowing an
-    /// unsendable pyclass off its owning thread panics in pyo3, so the
-    /// borrow is gated on the per-export thread token; on a foreign thread
-    /// bookkeeping is skipped with a `RuntimeWarning` and the SHM slot is
-    /// returned when the `Frame` itself is dropped.
-    /// (`releasebuffer` cannot raise: the warning's `Result` is ignored.)
+    /// another `threading.Thread` releases there). The export count is
+    /// atomic, so it is always decremented; only the owning thread borrows
+    /// the unsendable pyclass to drop a released sample. Off the owner, a
+    /// released frame's last export leaves the drop to the frame's own
+    /// drop, with a `RuntimeWarning`.
     unsafe fn __releasebuffer__(slf: Bound<'_, Self>, view: *mut ffi::Py_buffer) {
-        let on_owner = unsafe { export_released_on_owner(view) };
-        let Some(mut this) = on_owner.then(|| slf.try_borrow_mut().ok()).flatten() else {
-            warn_offthread_release(slf.py(), "Frame");
+        let Some(done) = (unsafe { release_export(view) }) else {
             return;
         };
-        this.exports = this.exports.saturating_sub(1);
-        if this.released && this.exports == 0 {
-            this.sample = None;
+        if done.live > 0 || !done.given_up {
+            return;
         }
+        if done.on_owner {
+            if let Ok(mut this) = slf.try_borrow_mut() {
+                this.reap();
+                return;
+            }
+        }
+        warn_offthread_release(slf.py(), "Frame");
     }
 
     /// Wire `schema_hash` field.
@@ -226,8 +294,7 @@ impl Frame {
     /// borrow budget stays consumed.
     fn release(&mut self) {
         self.released = true;
-        if self.exports == 0 {
-            self.sample = None;
-        }
+        self.exports.give_up();
+        self.reap();
     }
 }

@@ -2627,7 +2627,7 @@ jobs:
         run: |
           set -eu
           python3 -m venv "$RUNNER_TEMP/pyvenv"
-          "$RUNNER_TEMP/pyvenv/bin/pip" install -q --no-deps "$(ls -t dist/cerulion-*.whl | head -1)"
+          "$RUNNER_TEMP/pyvenv/bin/pip" install -q --no-deps dist/cerulion-*.whl
           "$RUNNER_TEMP/pyvenv/bin/pip" install -q 'numpy>=1.26' 'pytest>=8,<9'
           export CERULION_PY_FIXTURE="$PWD/target/release/cerulion_py_fixture"
           tests="$PWD/tests"
