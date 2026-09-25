@@ -501,10 +501,11 @@ fn a_host_that_is_not_https_or_loopback_disables_the_client() {
 
 #[test]
 fn an_unrepresentable_budget_is_clamped_instead_of_panicking() {
-    let (host, _rx) = mock_server();
+    let (host, go, _rx, server) = gated_mock_server(1);
     let mut client = Client::new("k".into(), &host, common()).expect("client");
     assert_eq!(client.shutdown(Duration::MAX), ShutdownOutcome::Flushed);
     assert_eq!(client.shutdown(Duration::MAX), ShutdownOutcome::Noop);
+    server.stop(go);
 }
 
 #[test]
@@ -533,7 +534,7 @@ fn replying_server(reply: &'static [u8]) -> (String, mpsc::Receiver<Request>) {
 
 #[test]
 fn a_redirect_is_not_followed() {
-    let (target, target_rx) = mock_server();
+    let (target, target_go, target_rx, target_server) = gated_mock_server(1);
     let reply: &'static [u8] = Box::leak(
         format!(
             "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}/batch\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -554,6 +555,7 @@ fn a_redirect_is_not_followed() {
         "the batch must not be replayed to the redirect target"
     );
     assert_eq!(client.post_failed(), 1, "a redirect is not a success");
+    target_server.stop(target_go);
 }
 
 #[test]
