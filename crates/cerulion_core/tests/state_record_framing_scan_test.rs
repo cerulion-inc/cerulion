@@ -51,7 +51,8 @@ struct Scanned {
 ///
 /// It is a SET rather than one file because a framing sentence lives outside
 /// `state_ring.rs` too: `state_carrier/fork.rs` states the payload region in
-/// prose, and a scan of one file reaches neither it nor the ring room
+/// prose, the SHM ring the state plane rides states the record COUNT a 500 MB
+/// anchor takes, and a scan of one file reaches none of those nor the ring room
 /// precheck's arena term. Adding a file here is how a new framing sentence
 /// joins the gate.
 const REGION: &[Scanned] = &[
@@ -83,6 +84,18 @@ const REGION: &[Scanned] = &[
         path: "crates/cerulion_core/tests/state_ring_test.rs",
         min_markers: 3,
     },
+    // The SHM ring is a GENERIC primitive, but two of its sentences state the
+    // record count a 500 MB state anchor takes, which is derived from the state
+    // record payload region and moved with the header. Its behavioural test
+    // states the same count a third time.
+    Scanned {
+        path: "crates/cerulion_core/src/shm_ring.rs",
+        min_markers: 2,
+    },
+    Scanned {
+        path: "crates/cerulion_core/tests/shm_ring_backpressure_test.rs",
+        min_markers: 1,
+    },
     // The ring room precheck's hand oracle writes the arena's record count down
     // (64 KiB of arena is 139 records). That number is DERIVED from the payload
     // region, so it moves with the header, and it is a framing number written in
@@ -93,6 +106,40 @@ const REGION: &[Scanned] = &[
     },
 ];
 
+/// A character that continues a WORD.
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// A character that continues a NUMBER.
+///
+/// The decimal point is in this set and not in [`is_word_char`], so `1.09 M`
+/// cannot match inside `11.09 M` while `480` still matches at the end of a
+/// sentence.
+fn is_number_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '.'
+}
+
+/// Is `needle` in `line` standing on its own, by `boundary`?
+///
+/// The boundary test is the whole point: it keeps `480` out of `4801`, `1.09 M`
+/// out of `11.09 M`, and the frame carve-out below off `framework`.
+fn contains_token(line: &str, needle: &str, boundary: fn(char) -> bool) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while let Some(at) = line[i..].find(needle) {
+        let s = i + at;
+        let e = s + needle.len();
+        let before_ok = s == 0 || !boundary(bytes[s - 1] as char);
+        let after_ok = e == bytes.len() || !boundary(bytes[e] as char);
+        if before_ok && after_ok {
+            return true;
+        }
+        i = e;
+    }
+    false
+}
+
 /// A line may still carry a previous format's number when it SAYS so.
 ///
 /// Two allowances, both narrow. A line naming format version 0 is talking about
@@ -100,12 +147,26 @@ const REGION: &[Scanned] = &[
 /// who meets a refusal mentioning it needs somewhere to look it up. A line naming
 /// a FRAME is about the wire frame prefix, a different plane with its own
 /// 32-byte header that this sweep must not touch.
+///
+/// The frame allowance is WORD BOUNDED. As a substring test it also exempted
+/// `framework` and `frameless`, which have nothing to do with the wire frame
+/// plane, so a stale state record number written on a line that happened to say
+/// `framework` walked straight through the sweep.
 fn is_allowed(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("format version 0")
         || lower.contains("format_version_0")
-        || lower.contains("frame")
+        || contains_token(&lower, "frame", is_word_char)
+        || contains_token(&lower, "frames", is_word_char)
 }
+
+/// The DERIVED record counts format version 0 stated, retired at version 1.
+///
+/// A 500 MB anchor was 1_092_267 records at the 480-byte payload region and is
+/// 1_110_780 at 472, which `state_ring.rs`'s own `parts_for_len` oracle asserts.
+/// Nothing in the compiler notices a derived number: it is arithmetic a human
+/// did once and wrote down, so it is exactly the class this file reads for.
+const RETIRED_DERIVED_COUNTS: &[&str] = &["1.09 M", "1_092_267", "1092267"];
 
 /// Does this line carry a state record framing number that moved?
 fn carries_a_stale_framing_literal(line: &str) -> bool {
@@ -113,19 +174,13 @@ fn carries_a_stale_framing_literal(line: &str) -> bool {
         return true;
     }
     // A bare 480, the previous payload region, as its own word.
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while let Some(at) = line[i..].find("480") {
-        let s = i + at;
-        let e = s + 3;
-        let before_ok = s == 0 || !(bytes[s - 1] as char).is_ascii_alphanumeric();
-        let after_ok = e == bytes.len() || !(bytes[e] as char).is_ascii_alphanumeric();
-        if before_ok && after_ok {
-            return true;
-        }
-        i = e;
+    if contains_token(line, "480", is_word_char) {
+        return true;
     }
-    false
+    // A record COUNT derived from that payload region.
+    RETIRED_DERIVED_COUNTS
+        .iter()
+        .any(|n| contains_token(line, n, is_number_char))
 }
 
 /// Does this line carry a CURRENT framing marker, for the control half?
@@ -176,6 +231,97 @@ fn the_state_record_framing_literals_are_swept_and_the_scan_is_not_vacuous() {
          layout must say `format version 0` so a reader can tell the two apart.\n{}",
         stale.join("\n")
     );
+}
+
+/// The DETECTOR's own control: every literal this format retired fires, every
+/// number that replaced one does not, and the prose carve-outs exempt only the
+/// words they name.
+///
+/// The sweep above is a walk over files, so a detector arm that matches nothing
+/// in the region reads there as a pass: the arm that catches a number moving is
+/// worthless until something proves it can fire at all. This test is that proof,
+/// and it runs in both directions, because an arm that fires on everything is
+/// the same kind of useless.
+///
+/// `1.09 s` and `1.098` are lines that really are elsewhere in this repo and
+/// mean something else entirely, so they are the negatives rather than invented
+/// ones. This FILE is deliberately outside the scan region: it has to write the
+/// retired numbers down to check for them.
+#[test]
+fn the_stale_literal_detector_fires_on_every_number_this_format_retired() {
+    let must_fire = [
+        "//! a 500 MB anchor is ~1.09 M records through a fixed ring",
+        "/// the wait-free policy silently laps a 1.09 M-record anchor",
+        "const FORMAT_VERSION_0_PARTS: u64 = 1_092_267;",
+        "// 1092267 records, at the payload region that preceded this one",
+        "/// the header is 32-byte and the rest is payload",
+        "/// the payload region is 480 bytes",
+    ];
+    let must_not_fire = [
+        "//! a 500 MB anchor is ~1.11 M records through a fixed ring",
+        "const PARTS: u64 = 1_110_780;",
+        "/// the header is 40-byte and the payload region is 472",
+        "/// the binary goes from 1.09 s to 5.08 s, but nothing fails",
+        "/// run 4   K=3 1.098  K=8 1.233",
+        "/// a 4801 byte blob",
+        "/// 11.09 M is a different number",
+    ];
+    let missed: Vec<&str> = must_fire
+        .iter()
+        .copied()
+        .filter(|l| !carries_a_stale_framing_literal(l))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "the detector does not see a number this format retired, so the sweep \
+         above proves nothing about it: {missed:?}"
+    );
+    let over: Vec<&str> = must_not_fire
+        .iter()
+        .copied()
+        .filter(|l| carries_a_stale_framing_literal(l))
+        .collect();
+    assert!(
+        over.is_empty(),
+        "the detector fires on a number that is CURRENT or on an unrelated one, \
+         which is how a gate gets deleted: {over:?}"
+    );
+}
+
+/// The frame carve-out exempts the wire frame plane and nothing that merely
+/// starts with the same five letters.
+///
+/// Its own control is the pair: the two lines that MUST stay exempt, beside the
+/// two that must not, so neither a carve-out that stopped working nor one that
+/// swallowed the region can read as a pass.
+#[test]
+fn the_frame_carve_out_is_word_bounded() {
+    for exempt in [
+        "/// the wire frame prefix carries a 32-byte header of its own",
+        "/// rides a 32-byte slot on every StagedFrame and the `frames` vector is",
+        "/// at format version 0 the payload region read 480",
+    ] {
+        assert!(
+            is_allowed(exempt),
+            "a line that names the frame plane or format version 0 must stay \
+             exempt: {exempt}"
+        );
+    }
+    for caught in [
+        "/// the framework writes the 32-byte header down",
+        "/// a frameless record leaves 480 bytes of payload",
+    ] {
+        assert!(
+            !is_allowed(caught),
+            "the carve-out is for the wire FRAME, not for any word beginning \
+             with it: {caught}"
+        );
+        assert!(
+            carries_a_stale_framing_literal(caught),
+            "the control is only meaningful if the line is stale to begin \
+             with: {caught}"
+        );
+    }
 }
 
 /// The kind space doc says what the kind space IS, and no longer reserves a range

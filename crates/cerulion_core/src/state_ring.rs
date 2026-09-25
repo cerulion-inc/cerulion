@@ -31,12 +31,12 @@
 //! # This ring is ALWAYS [`OverrunPolicy::Backpressure`]
 //!
 //! [`StateRingOwner::create`] is the only constructor and it selects
-//! [`OverrunPolicy::Backpressure`] unconditionally, so the mode cannot drift: a
-//! 500 MB anchor is ~1.09 M records through a fixed ring, and a lapped anchor is a
-//! LOST anchor. Blocking the writer is harmless because the writer is a short-lived
-//! `fork` child, never the hot loop. [`StateRingConsumer::open`] REFUSES a
-//! ring created under any other policy, so a mis-created ring is loud at the first
-//! read rather than silently lossy.
+//! [`OverrunPolicy::Backpressure`] unconditionally, so the mode cannot drift: at the
+//! 472-byte payload region a 500 MB anchor is ~1.11 M records through a fixed ring,
+//! and a lapped anchor is a LOST anchor. Blocking the writer is harmless because the
+//! writer is a short-lived `fork` child, never the hot loop.
+//! [`StateRingConsumer::open`] REFUSES a ring created under any other policy, so a
+//! mis-created ring is loud at the first read rather than silently lossy.
 //!
 //! # Nothing here allocates on the writer path
 //!
@@ -1015,8 +1015,9 @@ pub enum StateRingError {
         expected: u32,
     },
     /// The opened ring was NOT created under [`OverrunPolicy::Backpressure`]. A state
-    /// ring under the wait-free policy silently laps a 1.09 M-record anchor, so this
-    /// is refused at open rather than discovered as loss later.
+    /// ring under the wait-free policy silently laps an anchor that is ~1.11 M records
+    /// at the 472-byte payload region, so this is refused at open rather than
+    /// discovered as loss later.
     #[error("state ring '{name}' was created under overrun policy {actual} but a state ring requires Backpressure ({expected}) — an anchor through a wait-free ring is lost, not slow")]
     OverrunPolicyMismatch {
         /// The object name.

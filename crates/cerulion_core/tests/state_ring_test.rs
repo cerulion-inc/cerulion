@@ -327,8 +327,9 @@ fn an_omitted_middle_record_is_torn_over_the_real_ring_and_serves_no_short_blob(
 /// and at OPEN.
 ///
 /// A state ring under `FailLoud` does not merely go slower: the writer never waits,
-/// so a 1.09 M-record anchor laps a fixed ring and the anchor is LOST. Refusing at
-/// open turns that into one error instead of a bag full of torn anchors.
+/// so a 500 MB anchor, which is ~1.11 M records at the 472-byte payload region, laps
+/// a fixed ring and the anchor is LOST. Refusing at open turns that into one error
+/// instead of a bag full of torn anchors.
 ///
 /// Its ANTI-TAUTOLOGY half is the headline round trip above, which opens a
 /// backpressure ring through the same code path and succeeds.
