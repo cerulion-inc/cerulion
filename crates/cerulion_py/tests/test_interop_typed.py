@@ -34,6 +34,16 @@ def ros_schemas():
     return schemas
 
 
+# Hand-written oracle for the LaserScan both Python writers publish, as the
+# Rust fixture prints it after decoding the frame with generated types.
+LASER_SCAN_VALUES = (
+    "angle_min=-1.5 angle_max=1.5 angle_increment=0.25 time_increment=0.001 "
+    "scan_time=0.1 range_min=0.2 range_max=30 ranges=[1.5, 2.25, 3.0, 0.5] "
+    "intensities=[10.0, 20.0, 30.0, 40.0] header_stamp_sec=7 "
+    "header_stamp_nanosec=9 frame_id=laser"
+)
+
+
 def frame_hex(frame):
     raw = bytearray(frame.raw)
     raw[20:32] = b"\0" * 12
@@ -229,6 +239,7 @@ def test_python_typed_loan_pins_laserscan_bytes(session, fixture_bin):
     output = proc.stdout.read()
     frame.release()
     assert output_frame_hex(output) == expected_hex
+    assert LASER_SCAN_VALUES in output, output
 
 
 def test_python_dict_pins_laserscan_bytes(session, fixture_bin):
@@ -252,10 +263,7 @@ def test_python_dict_pins_laserscan_bytes(session, fixture_bin):
         fixture_bin,
         schemas,
         "interop-python-dict-laserscan",
-        "angle_min=-1.5 angle_max=1.5 angle_increment=0.25 time_increment=0.001 "
-        "scan_time=0.1 range_min=0.2 range_max=30 ranges=[1.5, 2.25, 3.0, 0.5] "
-        "intensities=[10.0, 20.0, 30.0, 40.0] header_stamp_sec=7 "
-        "header_stamp_nanosec=9 frame_id=laser",
+        LASER_SCAN_VALUES,
     )
 
 

@@ -2833,6 +2833,7 @@ schemas:
       float64 y: {}
 """)
 layout = schemas.layout("Point")
+topic = "/demo/typed"
 pub = session.publisher(topic, schema="Point", schemas=schemas)
 sub = session.subscriber(topic, schema="Point", schemas=schemas)
 with pub.loan() as point:                          # writable zero-copy loan

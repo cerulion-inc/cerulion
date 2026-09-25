@@ -1,5 +1,7 @@
-import pytest
+import array
 import struct
+
+import pytest
 
 import cerulion
 
@@ -369,3 +371,37 @@ def test_typed_loan_refuses_non_integral_lengths(session):
             message.tag = b"\xff"
         message.values = [7, 8]
     assert pub.sequence == 1
+
+
+def test_typed_publish_accepts_empty_scalar_arrays(session):
+    pub, sub = _scalar_pair(session, "typed-empty-array")
+    pub.publish({**GOOD, "values": []})
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert bytes(frame.view().values) == b""
+    frame.release()
+
+
+def test_typed_publish_frame_rejects_a_non_byte_buffer_as_type_error(session):
+    pub, _ = _scalar_pair(session, "typed-frame-buffer")
+    with pytest.raises(TypeError, match="single-byte"):
+        pub.publish_frame(array.array("I", [0] * 16))
+    assert pub.sequence == 0
+
+
+def test_typed_loans_reclaim_slots_released_after_an_escaped_view(session):
+    pub, sub = _scalar_pair(session, "typed-loan-reap")
+    for _ in range(64):
+        with pytest.raises(cerulion.EncodeError, match="escaped the `with` block"):
+            with pub.loan(values=2) as message:
+                escaped = message.values
+        del escaped
+    with pub.loan(values=2) as message:
+        for field, value in GOOD.items():
+            if field != "values":
+                setattr(message, field, value)
+        message.values = [4, 5]
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert bytes(frame.view().values) == bytes([4, 5])
+    frame.release()

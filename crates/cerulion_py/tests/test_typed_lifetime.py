@@ -28,7 +28,9 @@ def test_typed_loan_is_writable_and_detaches_on_commit(session):
 
     frame = subscriber.receive(1000)
     assert frame is not None
-    assert frame.view().copy()["id"] == 9
+    copied = frame.view().copy()
+    assert copied["id"] == 9
+    np.testing.assert_array_equal(copied["values"], [13, 21, 34])
     frame.release()
 
 

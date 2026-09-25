@@ -272,6 +272,8 @@ def _scalar_array(name, field_type, value):
     except (TypeError, ValueError) as exc:
         raise _native.EncodeError(f"field {name!r}: {exc}") from exc
     kind = source.dtype.kind
+    if source.size == 0:
+        return source.astype(dtype)
     if dtype.kind == "b":
         ok = kind == "b"
     elif dtype.kind in "iu":

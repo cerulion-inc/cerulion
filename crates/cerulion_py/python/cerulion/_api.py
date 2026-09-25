@@ -197,7 +197,13 @@ class Publisher:
         """Publish a complete wire frame, preserving its offset table."""
         if self._schema is not None:
             self._check_schema_binding()
-        self._native.publish_frame(frame_bytes, timestamp_ns)
+        try:
+            self._native.publish_frame(frame_bytes, timestamp_ns)
+        except BufferError as e:
+            raise TypeError(
+                "frame must be a contiguous bytes-like object of single-byte "
+                "items (bytes, bytearray, memoryview of bytes, np.uint8 array)"
+            ) from e
 
 
 class Loan:
@@ -284,6 +290,7 @@ class Subscriber:
         self._native = native
         self._schemas = schemas
         self._schema = schema
+        self._next_iter = None
 
     @property
     def topic(self):
@@ -315,6 +322,13 @@ class Subscriber:
 
     def __iter__(self):
         return _FrameIterator(self)
+
+    def __next__(self):
+        """``next(sub)``: like one long-lived ``for`` loop, it releases the
+        frame the previous ``next(sub)`` returned before blocking."""
+        if self._next_iter is None:
+            self._next_iter = _FrameIterator(self)
+        return next(self._next_iter)
 
 
 class _FrameIterator:
