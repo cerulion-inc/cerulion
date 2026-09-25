@@ -10,13 +10,18 @@
 //! * **Feature `posthog` on:** [`consent`] resolves enabled or disabled
 //!   (`DO_NOT_TRACK` > `CERULION_TELEMETRY` > `telemetry.json` > default on),
 //!   and `payload` renders PostHog `/batch` JSON from events that were
-//!   guarded when they were built.
+//!   guarded when they were built. [`Client`] sends them from one bounded
+//!   queue on one worker thread and never holds process exit longer than its
+//!   shutdown budget ([`DEFAULT_SHUTDOWN_BUDGET`], 300 ms).
+//! * **No key, no client.** [`Client::from_env`] is `None` unless
+//!   `POSTHOG_API_KEY` is set and consent resolves enabled.
 //! * **Every property is guarded** (the `guard` module): keys must be in the
 //!   event's [`Allowlist`], and string values may not look like URLs, emails
 //!   or paths, nor exceed 128 chars. A rejected property is dropped and
 //!   counted, never sent.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod client;
 pub mod consent;
 mod error;
 pub mod guard;
@@ -25,6 +30,9 @@ pub mod payload;
 pub mod rfc3339;
 mod value;
 
+pub use client::{
+    Client, ShutdownOutcome, DEFAULT_HOST, DEFAULT_SHUTDOWN_BUDGET, HTTP_TIMEOUT, QUEUE_CAPACITY,
+};
 pub use error::Error;
 pub use value::{Allowlist, Common, EventSpec, Props, Value};
 
