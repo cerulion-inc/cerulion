@@ -179,6 +179,7 @@ def test_python_typed_loan_pins_vector3_bytes(session, fixture_bin):
     finish_proc(proc)
     output = proc.stdout.read()
     frame.release()
+    assert "schema=geometry_msgs/Vector3 values=x=1.5 y=-2.25 z=0.001\n" in output, output
     assert output_frame_hex(output) == expected_hex
 
 
