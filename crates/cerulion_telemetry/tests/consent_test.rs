@@ -299,6 +299,17 @@ mod feature_on {
     }
 
     #[test]
+    fn a_malformed_file_shows_the_notice_and_is_repaired() {
+        let env = isolated();
+        std::fs::create_dir_all(&env.home).unwrap();
+        std::fs::write(env.home.join("telemetry.json"), b"{not json").unwrap();
+        let mut shown = 0;
+        assert!(consent::show_notice_once(|| shown += 1).expect("ok"));
+        assert_eq!(shown, 1);
+        assert!(read_file(&env).notice_shown);
+    }
+
+    #[test]
     fn partial_file_keeps_its_opt_out_and_is_completed_on_write() {
         let env = isolated();
         std::fs::create_dir_all(&env.home).unwrap();
