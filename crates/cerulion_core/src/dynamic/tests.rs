@@ -1410,3 +1410,78 @@ fn encoder_rejects_a_misaligned_buffer_before_writing() {
     let short = encoder.required_len(&empty).expect("len");
     assert!(encoder.begin(&mut buf.0[1..1 + short], &empty, 0).is_ok());
 }
+
+fn ros_schema(text: &str, qualified: &str) -> MessageSchema {
+    let (pkg, name) = qualified.split_once('/').expect("qualified");
+    crate::codegen::parse_rosmsg(text, name, Some(pkg)).expect("parses")
+}
+
+fn surviving_after_drop(schemas: Vec<MessageSchema>, rejected: &[&str]) -> Vec<String> {
+    let mut schemas = schemas;
+    let mut warnings = Vec::new();
+    schema_set::drop_dependents(
+        &mut schemas,
+        rejected.iter().map(|s| s.to_string()).collect(),
+        &mut warnings,
+    );
+    schemas.iter().map(MessageSchema::qualified_name).collect()
+}
+
+#[test]
+fn dependents_binding_bare_header_to_a_rejected_std_msgs_header_are_dropped() {
+    let kept = surviving_after_drop(
+        vec![
+            ros_schema("Header header\nuint32 id\n", "demo/Stamped"),
+            ros_schema("uint32 id\n", "demo/Plain"),
+        ],
+        &["std_msgs/Header"],
+    );
+    assert_eq!(kept, vec!["demo/Plain".to_string()]);
+}
+
+#[test]
+fn dependents_binding_a_unique_bare_name_to_a_rejected_schema_are_dropped() {
+    let kept = surviving_after_drop(
+        vec![
+            ros_schema("Inner inner\n", "demo/Outer"),
+            ros_schema("Outer outer\n", "demo/Top"),
+        ],
+        &["other/Inner"],
+    );
+    assert!(kept.is_empty(), "{kept:?}");
+}
+
+#[test]
+fn a_same_package_target_shields_a_parent_from_a_rejected_bare_name() {
+    let kept = surviving_after_drop(
+        vec![
+            ros_schema("uint8 v\n", "demo/Inner"),
+            ros_schema("Inner inner\n", "demo/Outer"),
+        ],
+        &["Inner"],
+    );
+    assert_eq!(
+        kept,
+        vec!["demo/Inner".to_string(), "demo/Outer".to_string()]
+    );
+}
+
+#[test]
+fn an_explicit_package_binds_only_that_package() {
+    let kept = surviving_after_drop(
+        vec![
+            ros_schema("uint8 v\n", "demo/Inner"),
+            ros_schema("other/Inner inner\n", "demo/Outer"),
+        ],
+        &["demo/Other"],
+    );
+    assert_eq!(
+        kept,
+        vec!["demo/Inner".to_string(), "demo/Outer".to_string()]
+    );
+    let kept = surviving_after_drop(
+        vec![ros_schema("other/Inner inner\n", "demo/Outer")],
+        &["other/Inner"],
+    );
+    assert!(kept.is_empty(), "{kept:?}");
+}
