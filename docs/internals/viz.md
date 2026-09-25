@@ -242,6 +242,16 @@ lockstep with the rest of the `re_*` graph).
   objects, so the sink renders what decodes and reports the rest, unlike the
   all-or-nothing rule for a single message's fields.
 
+### URDF numeric geometry
+
+`skeleton.rs` rejects explicit joint/visual origin, axis, and mesh-scale vectors
+unless they contain exactly three finite numbers that remain finite as `f32` at
+the rendering boundary. `UrdfError::InvalidVector` identifies the XML element,
+attribute, source line, and rejected value. Defaults apply only to absent
+attributes: identity origins, unit mesh scale, and X for a motion axis.
+Fixed joints ignore their axis. This validation does not provide a production
+model-import path.
+
 ### Entity paths
 
 - House rule: sanitize-then-plain-string. Entity strings are a contract with
