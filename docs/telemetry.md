@@ -33,6 +33,7 @@ The events:
 | Event | Sent by | Properties |
 |---|---|---|
 | `cli_command_run` | every CLI command | `verb` and `subverb` (the command's name, such as `graph` and `run`), `exit_code`, and `duration_bucket` (`lt_1s`, `1s_10s`, `10s_1m`, `1m_10m`, `gte_10m`) |
+| `cli_login_completed` | `cerulion login`, and the login a command starts on a machine that never signed in | `is_account_switch` (whether a different account was signed in before) |
 | `vizd_started` | the vizd daemon, once at start | `os`, `arch` |
 | `vizd_heartbeat` | the vizd daemon, every 15 minutes | `uptime_minutes` |
 
@@ -44,6 +45,17 @@ dropped instead of sent.
 
 The id is your Cerulion account id once this machine has signed in, and a
 random `anon:<uuid>` before that. The random id lives in the consent file.
+
+When a machine that has never signed in runs its first login, the login
+request carries the random id so the events from before the login are
+joined to the account. Nothing else is added to the login. If that first
+login happens in the run that printed the notice, which sends nothing, an
+empty `telemetry_alias_pending` file next to the consent file marks the join
+as owed, and the next run that sends makes it and deletes the file. Only a
+hosted account id is joined this way; the events of any other account stay
+under the random id. When a different
+account signs in on the same machine, the random id is replaced, so later
+anonymous events are never joined to the previous account.
 
 These commands record no event at all: `cerulion telemetry`, `cerulion
 completions`, and the internal subprocesses a command starts for itself.

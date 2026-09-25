@@ -135,11 +135,15 @@ fn extract_user_code(prompt: &str) -> Option<String> {
 /// `magic-link/start` (mints + "emails" a completable link) then GET the captured
 /// link (`magic-link/complete`), which authorizes the pending device code.
 fn authorize_via_magic_link(port: u16, email: &CapturingEmailSender, user_code: &str) {
+    authorize_as(port, email, user_code, "owner@example.com");
+}
+
+fn authorize_as(port: u16, email: &CapturingEmailSender, user_code: &str, address: &str) {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(format!("{base}/v1/auth/magic-link/start"))
-        .json(&serde_json::json!({ "email": "owner@example.com", "user_code": user_code }))
+        .json(&serde_json::json!({ "email": address, "user_code": user_code }))
         .send()
         .expect("magic-link/start reachable");
     assert!(
@@ -2297,4 +2301,57 @@ fn a_cert_that_cannot_be_read_is_held_at_its_aside_until_the_login_publishes() {
         std::fs::symlink_metadata(&aside).is_err(),
         "and consumes the aside rather than leaving a second copy"
     );
+}
+
+/// Drive one `run_login_carrying` to completion, authorizing `address`.
+fn login_as(
+    port: u16,
+    email: &Arc<CapturingEmailSender>,
+    address: &str,
+    anon_id: Option<&'static str>,
+) -> login_cmd::LoginOutcome {
+    let buf = SharedBuf::new();
+    let worker = std::thread::spawn({
+        let mut b = buf.clone();
+        move || login_cmd::run_login_carrying(&mut b, anon_id)
+    });
+    let code = wait_for(
+        || extract_user_code(&buf.snapshot()),
+        Duration::from_secs(15),
+    )
+    .expect("run_login printed a user_code");
+    authorize_as(port, email, &code, address);
+    worker
+        .join()
+        .expect("worker thread")
+        .expect("login succeeds after authorization")
+}
+
+#[test]
+#[serial]
+fn a_login_carrying_an_anon_id_reports_only_a_real_account_switch() {
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+
+    let anon = Some("anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8");
+    let first = login_as(port, &email, "owner@example.com", anon);
+    assert!(!first.switched_account, "a first login is not a switch");
+    let again = login_as(port, &email, "owner@example.com", None);
+    assert!(
+        !again.switched_account,
+        "the same account again is not a switch"
+    );
+    assert_eq!(again.state.account_id, first.state.account_id);
+    // accountd binds a device key to one account, so the second account
+    // signs in with a fresh key; auth.json still names the first account.
+    std::fs::remove_file(home.path().join("desk.key")).unwrap();
+    let other = login_as(port, &email, "second@example.com", None);
+    assert!(other.switched_account, "a different account is a switch");
+    assert_ne!(other.state.account_id, first.state.account_id);
 }

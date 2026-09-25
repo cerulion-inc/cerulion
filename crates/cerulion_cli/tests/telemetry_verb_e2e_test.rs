@@ -260,3 +260,40 @@ fn a_non_uuid_account_id_falls_back_to_the_anonymous_id() {
     assert!(!body.contains(base64url_id), "{body}");
     assert!(body.contains("\"distinct_id\":\"anon:"), "{body}");
 }
+
+#[test]
+fn an_alias_left_pending_by_the_notice_run_is_merged_by_the_next_send() {
+    let home = tempfile::tempdir().unwrap();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    auth::seed_logged_in_at(home.path(), sub).unwrap();
+    let marker = home.path().join("telemetry_alias_pending");
+    std::fs::write(&marker, b"").unwrap();
+    let sink = sink();
+    let mut body = sent_after_notice(home.path(), &sink);
+    while let Ok(more) = sink.bodies.recv_timeout(std::time::Duration::from_secs(2)) {
+        body.push_str(&more);
+    }
+    let consent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.path().join("telemetry.json")).unwrap())
+            .unwrap();
+    let anon_id = consent["anon_id"]
+        .as_str()
+        .expect("the consent file carries an anon id");
+    let events: Vec<serde_json::Value> = serde_json::Deserializer::from_str(&body)
+        .into_iter::<serde_json::Value>()
+        .flat_map(|batch| batch.unwrap()["batch"].as_array().unwrap().clone())
+        .collect();
+    let aliases: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["event"] == "$create_alias")
+        .collect();
+    assert_eq!(aliases.len(), 1, "exactly one alias: {body}");
+    let alias = aliases[0];
+    assert_eq!(alias["properties"]["alias"], anon_id, "{alias}");
+    assert_eq!(alias["distinct_id"], sub, "{alias}");
+    assert!(
+        events.iter().any(|e| e["event"] == "cli_command_run"),
+        "{body}"
+    );
+    assert!(!marker.exists());
+}
