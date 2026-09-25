@@ -9,10 +9,11 @@
 mod errors;
 
 pub(crate) use errors::{
-    BorrowLimitExceeded, CerulionError, DecodeError, EncodeError, ReleasedFrame, SchemaError,
-    SchemaMismatch, TransportError as PyTransportError,
+    BagError, BorrowLimitExceeded, CerulionError, DecodeError, EncodeError, ReleasedFrame,
+    SchemaError, SchemaMismatch, TransportError as PyTransportError,
 };
 
+mod bag;
 mod frame;
 mod publisher;
 mod session;
@@ -36,6 +37,7 @@ fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("EncodeError", m.py().get_type::<EncodeError>())?;
     m.add("DecodeError", m.py().get_type::<DecodeError>())?;
     m.add("SchemaError", m.py().get_type::<SchemaError>())?;
+    m.add("BagError", m.py().get_type::<BagError>())?;
     m.add("WIRE_HEADER_SIZE", WireHeader::SIZE)?;
     m.add_function(wrap_pyfunction!(session::connect, m)?)?;
     m.add_function(wrap_pyfunction!(session::real_ns, m)?)?;
@@ -44,5 +46,8 @@ fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<subscriber::Subscriber>()?;
     m.add_class::<frame::Frame>()?;
     m.add_class::<typed::PySchemaSet>()?;
+    m.add_class::<bag::PyBag>()?;
+    m.add_class::<bag::BagRecordIter>()?;
+    m.add_function(wrap_pyfunction!(bag::open_bag, m)?)?;
     Ok(())
 }
