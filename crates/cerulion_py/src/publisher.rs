@@ -306,6 +306,15 @@ impl Publisher {
                 "frame total_size is outside its buffer",
             ));
         }
+        if header.schema_hash != self.schema_hash {
+            return Err(crate::errors::schema_mismatch(
+                py,
+                format!(
+                    "frame schema hash {:#x} does not match the publisher's {:#x}",
+                    header.schema_hash, self.schema_hash
+                ),
+            ));
+        }
         let payload_len = total - WireHeader::SIZE;
         if payload_len > self.max_payload_len {
             return Err(EncodeError::new_err(format!(

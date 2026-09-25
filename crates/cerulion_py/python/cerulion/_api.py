@@ -6,6 +6,7 @@ that delegate to the native objects and add iteration / context-manager
 """
 
 import threading
+import weakref
 
 import numpy as np
 
@@ -374,6 +375,10 @@ class Frame:
 
     def release(self):
         """Return the SHM slot to the publisher pool (idempotent)."""
+        cached = self._message() if self._message is not None else None
+        if cached is not None:
+            cached._detach()
+        self._message = None
         self._native.release()
 
     def view(self, schemas=None, schema=None):
@@ -384,14 +389,19 @@ class Frame:
             schemas, schema = self._typed
         elif schemas is None or schema is None:
             raise TypeError("schemas and schema must be provided together")
+        self._check_alive()
         key = (id(schemas), schemas._generation, schema)
-        if self._message is not None and self._message_key == key:
-            return self._message
+        cached = self._message() if self._message is not None else None
+        if cached is not None and self._message_key == key:
+            return cached
         descriptor = schemas._native.resolve_frame(self._native, schema)
         layout = schemas.layout(descriptor["schema"])
-        self._message = Message(self.payload, layout, schemas, descriptor["variables"], self)
+        message = Message(self.payload, layout, schemas, descriptor["variables"], self)
+        # Weak: a strong cache would cycle with ``Message._owner`` and pin
+        # the slot's buffer export until cyclic GC.
+        self._message = weakref.ref(message)
         self._message_key = key
-        return self._message
+        return message
 
     def __enter__(self):
         return self
