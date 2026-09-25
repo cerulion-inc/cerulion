@@ -5,11 +5,12 @@
 #   E2E_WHEEL=/path/to/wheel.whl   skip the build, test that wheel instead
 set -euo pipefail
 
+# A relative E2E_WHEEL is resolved against the caller's cwd, before any cd.
+if [ -n "${E2E_WHEEL:-}" ]; then
+    E2E_WHEEL="$(cd "$(dirname "$E2E_WHEEL")" && pwd)/$(basename "$E2E_WHEEL")"
+fi
 cd "$(dirname "$0")/../../.."
 REPO="$PWD"
-# E2E_WHEEL is resolved against the caller's cwd (repo root here) BEFORE
-# we descend into crates/cerulion_py/.
-[ -n "${E2E_WHEEL:-}" ] && E2E_WHEEL="$(cd "$(dirname "$E2E_WHEEL")" && pwd)/$(basename "$E2E_WHEEL")"
 cd crates/cerulion_py
 export RUSTUP_TOOLCHAIN=1.93.0
 

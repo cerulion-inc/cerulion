@@ -4,9 +4,11 @@
 //! The frame owns the `OwnedInboundSample`, so the SHM slot stays pinned
 //! (borrowed, never overwritten) as long as the frame - or any buffer
 //! exported from it - is alive. `release()` returns the slot early; with
-//! live views it takes effect at the last `__releasebuffer__` (a
-//! memoryview/ndarray keeps reading VALID pinned memory - nothing can
-//! invalidate a CPython memoryview from the exporter side).
+//! live views the sample is parked with its subscriber and dropped at the
+//! last `__releasebuffer__` on the owning thread, or at the subscriber's
+//! next receive when that last view closed elsewhere (a memoryview/ndarray
+//! keeps reading VALID pinned memory - nothing can invalidate a CPython
+//! memoryview from the exporter side).
 
 use crate::errors::{ReleasedFrame, TransportError as PyTransportError};
 use cerulion_core::transport::subscriber::OwnedInboundSample;
@@ -14,8 +16,9 @@ use cerulion_core::WireHeader;
 use pyo3::exceptions::{PyBufferError, PyRuntimeWarning};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CString;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -67,6 +70,49 @@ impl Exports {
     pub(crate) fn give_up(&self) {
         self.given_up.store(true, Ordering::Release);
     }
+
+    /// Reuse an unshared counter for a new exporter on the same thread.
+    fn reset(&mut self) {
+        *self.live.get_mut() = 0;
+        *self.given_up.get_mut() = false;
+    }
+}
+
+/// Slot bookkeeping a `Subscriber` shares with every `Frame` it hands out.
+///
+/// `parked` holds samples of released frames whose views are still open,
+/// so the slot returns as soon as the last view closes even while the
+/// `Frame` object stays referenced. `pool` recycles export counters of
+/// dropped frames, so a steady receive loop allocates none.
+pub(crate) struct SlotHome {
+    parked: Vec<(Arc<Exports>, OwnedInboundSample)>,
+    pool: Vec<Arc<Exports>>,
+}
+
+impl SlotHome {
+    /// Capacity for `borrowed` simultaneously held frames.
+    pub(crate) fn shared(borrowed: usize) -> Rc<RefCell<Self>> {
+        let capacity = borrowed.max(1);
+        Rc::new(RefCell::new(Self {
+            parked: Vec::with_capacity(capacity),
+            pool: Vec::with_capacity(capacity),
+        }))
+    }
+
+    /// Drop every parked sample whose views have all closed.
+    pub(crate) fn reap(&mut self) {
+        self.parked.retain(|(exports, _)| exports.live() > 0);
+    }
+
+    fn take_exports(&mut self) -> Arc<Exports> {
+        if let Some(mut exports) = self.pool.pop() {
+            if let Some(counter) = Arc::get_mut(&mut exports) {
+                counter.reset();
+                return exports;
+            }
+        }
+        Exports::new()
+    }
 }
 
 /// What `release_export` observed for one released export.
@@ -113,12 +159,13 @@ pub(crate) unsafe fn release_export(view: *mut ffi::Py_buffer) -> Option<ExportR
 }
 
 /// Emit the `RuntimeWarning` for the last `__releasebuffer__` of a given-up
-/// slot that ran off its object's owning thread (or could not borrow it). `releasebuffer`
-/// cannot raise, so the `Result` is ignored by callers.
-pub(crate) fn warn_offthread_release(py: Python<'_>, class: &str) {
+/// slot that ran off its object's owning thread (or could not borrow it);
+/// `returns` says when the slot comes back. `releasebuffer` cannot raise, so
+/// the `Result` is ignored by callers.
+pub(crate) fn warn_offthread_release(py: Python<'_>, class: &str, returns: &str) {
     let msg = CString::new(format!(
         "cerulion {class} buffer released off the owning thread after the slot was \
-         given up; the shared-memory slot returns when the {class} is dropped"
+         given up; the shared-memory slot returns {returns}"
     ))
     .unwrap_or_else(|_| c"cerulion buffer released off the owning thread".to_owned());
     let _ = PyErr::warn(py, &py.get_type::<PyRuntimeWarning>(), &msg, 1);
@@ -127,8 +174,8 @@ pub(crate) fn warn_offthread_release(py: Python<'_>, class: &str) {
 /// One received wire frame (32-byte header + body).
 ///
 /// A memoryview released on a foreign thread still uncounts its export;
-/// if that was the last view of a released frame, the slot returns when
-/// the frame drops on its owning thread.
+/// if that was the last view of a released frame, the slot returns at the
+/// subscriber's next receive.
 ///
 /// Limitation (pyo3 `unsendable`): a `Frame` whose LAST Python reference
 /// dies on a foreign thread is never dropped - pyo3's `can_drop` refuses,
@@ -140,27 +187,57 @@ pub struct Frame {
     header: WireHeader,
     recv_ns: u64,
     exports: Arc<Exports>,
+    home: Rc<RefCell<SlotHome>>,
     released: bool,
 }
 
 impl Frame {
-    pub(crate) fn new(sample: OwnedInboundSample, header: WireHeader, recv_ns: u64) -> Self {
+    pub(crate) fn new(
+        sample: OwnedInboundSample,
+        header: WireHeader,
+        recv_ns: u64,
+        home: &Rc<RefCell<SlotHome>>,
+    ) -> Self {
+        let exports = home.borrow_mut().take_exports();
         Self {
             sample: Some(sample),
             header,
             recv_ns,
-            exports: Exports::new(),
+            exports,
+            home: Rc::clone(home),
             released: false,
         }
     }
 
-    /// Drop the sample once released with no live exports (owner thread).
+    /// Once released, drop the sample if no view is live, else park it
+    /// with the subscriber until its last view closes (owner thread).
     fn reap(&mut self) {
-        if self.released && self.exports.live() == 0 {
-            self.sample = None;
+        if !self.released {
+            return;
+        }
+        let mut home = self.home.borrow_mut();
+        if let Some(sample) = self.sample.take() {
+            if self.exports.live() > 0 {
+                home.parked.push((Arc::clone(&self.exports), sample));
+            }
+        }
+        home.reap();
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        self.sample = None;
+        if let Ok(mut home) = self.home.try_borrow_mut() {
+            home.reap();
+            if Arc::strong_count(&self.exports) == 1 && home.pool.len() < home.pool.capacity() {
+                home.pool.push(Arc::clone(&self.exports));
+            }
         }
     }
+}
 
+impl Frame {
     fn check_live(&self) -> PyResult<()> {
         if self.released {
             return Err(ReleasedFrame::new_err("frame already released"));
@@ -228,8 +305,8 @@ impl Frame {
     /// another `threading.Thread` releases there). The export count is
     /// atomic, so it is always decremented; only the owning thread borrows
     /// the unsendable pyclass to drop a released sample. Off the owner, a
-    /// released frame's last export leaves the drop to the frame's own
-    /// drop, with a `RuntimeWarning`.
+    /// released frame's last export leaves the parked sample to the
+    /// subscriber's next receive, with a `RuntimeWarning`.
     unsafe fn __releasebuffer__(slf: Bound<'_, Self>, view: *mut ffi::Py_buffer) {
         let Some(done) = (unsafe { release_export(view) }) else {
             return;
@@ -243,7 +320,7 @@ impl Frame {
                 return;
             }
         }
-        warn_offthread_release(slf.py(), "Frame");
+        warn_offthread_release(slf.py(), "Frame", "at the subscriber's next receive");
     }
 
     /// Wire `schema_hash` field.
@@ -289,8 +366,8 @@ impl Frame {
     }
 
     /// Return the SHM slot to the publisher pool. Idempotent. With live
-    /// buffer views the return is deferred to the last `__releasebuffer__`
-    /// - the views keep reading valid pinned memory until then, but the
+    /// buffer views the return is deferred until the last view closes -
+    /// the views keep reading valid pinned memory until then, but the
     /// borrow budget stays consumed.
     fn release(&mut self) {
         self.released = true;

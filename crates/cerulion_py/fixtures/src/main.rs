@@ -482,7 +482,8 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
 
     // Consume EXACTLY `--count` frames; `--timeout-ms` is the overall
     // budget from READY to the last frame, not a per-frame deadline.
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    // An unrepresentable deadline (e.g. `u64::MAX` ms) waits without bound.
+    let deadline = Instant::now().checked_add(Duration::from_millis(timeout_ms));
     let mut received = 0usize;
     loop {
         // `--count 0` exits immediately - consume nothing.
@@ -509,7 +510,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
             drop(sample);
             continue;
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             println!("TIMEOUT");
             return Ok(ExitCode::from(2));
         }

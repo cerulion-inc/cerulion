@@ -179,7 +179,7 @@ point_frame.release()
 
 ## Errors
 
-Every exception derives from `cerulion.CerulionError`:
+Client errors derive from `cerulion.CerulionError`:
 
 - `TransportError` - transport failures (bad topic, depth outside the
   ceiling, connect-time errors, receive errors).
@@ -196,6 +196,11 @@ Every exception derives from `cerulion.CerulionError`:
   variable string field of a received frame.
 - `SchemaError` - invalid schema documents, unknown schemas, or incompatible
   fixed layouts.
+
+Invalid arguments raise built-in exceptions instead: `TypeError` for a
+wrong argument type or a non-contiguous or non-byte buffer, `ValueError`
+for using a loan after `commit()` or `discard()`, and `OverflowError` for
+an integer outside its range (a negative `timeout_ms`, say).
 
 ```python
 try:

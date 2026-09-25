@@ -8,7 +8,7 @@ import sys
 import numpy as np
 import pytest
 
-from conftest import pattern, shm_mappings, unique_topic
+from conftest import macos_shared_mapping, pattern, shm_mappings, unique_topic
 
 SIZE = 4 << 20
 ITERATIONS = 1000
@@ -48,7 +48,8 @@ def test_zero_copy_receive_1000_frames(session):
         ptr = a.__array_interface__["data"][0]
         assert not a.flags.writeable
         if not LINUX:
-            shm_ptrs += 1  # no /proc/self/maps; the RSS budget carries the check
+            if macos_shared_mapping(ptr):
+                shm_ptrs += 1
         elif ranges is None:
             ranges = shm_mappings()
             assert ranges, "no iox2_ mapping in /proc/self/maps"
