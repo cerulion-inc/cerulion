@@ -500,3 +500,70 @@ fn an_unrepresentable_budget_is_clamped_instead_of_panicking() {
     assert_eq!(client.shutdown(Duration::MAX), ShutdownOutcome::Flushed);
     assert_eq!(client.shutdown(Duration::MAX), ShutdownOutcome::Noop);
 }
+
+#[test]
+fn a_host_with_a_query_or_fragment_is_refused() {
+    for host in ["https://example.com/base#tag", "https://example.com/?x=1"] {
+        assert!(
+            Client::new("k".into(), host, common()).is_none(),
+            "{host} must be refused"
+        );
+    }
+}
+
+/// Serve one connection with a fixed raw `reply`, handing the request over.
+fn replying_server(reply: &'static [u8]) -> (String, mpsc::Receiver<Request>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let request = read_request(&mut stream);
+        let _ = stream.write_all(reply);
+        let _ = tx.send(request);
+    });
+    (format!("http://{addr}"), rx)
+}
+
+#[test]
+fn a_redirect_is_not_followed() {
+    let (target, target_rx) = mock_server();
+    let reply: &'static [u8] = Box::leak(
+        format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}/batch\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+        .into_boxed_slice(),
+    );
+    let (host, rx) = replying_server(reply);
+    let mut client = Client::new("phc_test".into(), &host, common()).expect("client");
+    client.capture(CMD, SUB, vec![("duration_ms".into(), Value::from(1_i64))]);
+    assert_eq!(
+        client.shutdown(Duration::from_secs(2)),
+        ShutdownOutcome::Flushed
+    );
+    rx.recv_timeout(Duration::from_secs(1)).expect("first hop");
+    assert!(
+        target_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the batch must not be replayed to the redirect target"
+    );
+    assert_eq!(client.post_failed(), 1, "a redirect is not a success");
+}
+
+#[test]
+fn a_failed_post_is_counted_and_later_batches_still_go_out() {
+    let (host, rx) = replying_server(
+        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    let mut client = Client::new("phc_test".into(), &host, common()).expect("client");
+    client.capture(CMD, SUB, vec![("duration_ms".into(), Value::from(1_i64))]);
+    rx.recv_timeout(Duration::from_secs(5)).expect("first POST");
+    client.capture(CMD, SUB, vec![("duration_ms".into(), Value::from(2_i64))]);
+    // The listener is gone, so the second POST is refused.
+    assert_eq!(
+        client.shutdown(Duration::from_secs(4)),
+        ShutdownOutcome::Flushed
+    );
+    assert_eq!(client.post_failed(), 2, "a 5xx and a refused connection");
+    assert_eq!(client.queue_dropped(), 0);
+}
