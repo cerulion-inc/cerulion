@@ -257,7 +257,12 @@ impl<'l, 'a> FrameView<'l, 'a> {
         let (off, len) = read_offset_entry(payload, self.layout.fixed_size, idx);
         let (off, len) = (off as usize, len as usize);
         if len == 0 {
-            return Ok(&[]);
+            // The slice still carries the recorded offset so a binding's
+            // `ptr - payload_ptr` arithmetic lands on it. Construction
+            // skips bounds checks for empty entries, so an out-of-range
+            // offset clamps to the payload end rather than panicking.
+            let off = off.min(payload.len());
+            return Ok(&payload[off..off]);
         }
         Ok(&payload[off..off + len])
     }

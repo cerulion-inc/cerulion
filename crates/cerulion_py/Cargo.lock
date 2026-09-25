@@ -227,6 +227,7 @@ name = "cerulion_py_fixtures"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -1355,6 +1356,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a51313c5820b0b02bd422f4b44776fbf47961755c74ce64afc73bfad10226c3"
 dependencies = [
  "getrandom 0.2.17",
+]
+
+[[package]]
+name = "native_ros2_messages"
+version = "1.0.0"
+dependencies = [
+ "cerulion_core",
 ]
 
 [[package]]

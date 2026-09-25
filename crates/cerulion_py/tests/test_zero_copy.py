@@ -8,7 +8,7 @@ import sys
 import numpy as np
 import pytest
 
-from conftest import pattern, unique_topic
+from conftest import pattern, shm_mappings, unique_topic
 
 SIZE = 4 << 20
 ITERATIONS = 1000
@@ -29,19 +29,6 @@ def vmrss_bytes():
             if line.startswith("VmRSS:"):
                 return int(line.split()[1]) * 1024
     pytest.fail("VmRSS not found in /proc/self/status")
-
-
-def shm_mappings():
-    """[start, end) ranges of /dev/shm/iox2_ mappings (data segments, not [anon shmem])."""
-    ranges = []
-    with open("/proc/self/maps") as f:
-        for line in f:
-            if "iox2_" not in line:
-                continue
-            m = re.match(r"([0-9a-f]+)-([0-9a-f]+)", line)
-            if m:
-                ranges.append((int(m.group(1), 16), int(m.group(2), 16)))
-    return ranges
 
 
 def test_zero_copy_receive_1000_frames(session):

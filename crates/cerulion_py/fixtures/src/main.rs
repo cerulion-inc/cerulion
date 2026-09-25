@@ -10,9 +10,11 @@
 #![allow(clippy::print_stdout)]
 
 use cerulion_core::clock::real_ns;
+use cerulion_core::message::ShmMessage;
 use cerulion_core::transport::TransportManager;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::TransportConfig;
+use native_ros2_messages::{geometry_msgs, sensor_msgs};
 use std::io::Write;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -92,7 +94,7 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
         .map(|(m, r)| (m.as_str(), r))
         .unwrap_or(("", &[]));
     match mode {
-        "publish" | "subscribe" => {}
+        "publish" | "subscribe" | "publish-typed" | "subscribe-typed" => {}
         _ => return Err(format!("unknown mode '{mode}'\n{USAGE}")),
     }
     let args = parse_args(rest).map_err(|e| format!("{e}\n{USAGE}"))?;
@@ -116,6 +118,20 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
             flag_usize(&args, "count")?;
             flag_u64(&args, "timeout-ms")?;
         }
+        "publish-typed" | "subscribe-typed" => {
+            flag(&args, "topic")?;
+            flag(&args, "schema")?;
+            flag_usize(&args, "count")?;
+            if mode == "subscribe-typed" {
+                flag_u64(&args, "timeout-ms")?;
+            } else {
+                for opt in ["wait-ms", "linger-ms"] {
+                    if let Some(value) = args.flags.get(opt) {
+                        value.parse::<u64>().map_err(|e| format!("--{opt}: {e}"))?;
+                    }
+                }
+            }
+        }
         _ => unreachable!("mode already validated"),
     }
     Ok((mode, args))
@@ -135,8 +151,223 @@ fn run() -> Result<ExitCode, String> {
     match mode {
         "publish" => cmd_publish(&mgr, &args),
         "subscribe" => cmd_subscribe(&mgr, &args),
+        "publish-typed" => cmd_publish_typed(&mgr, &args),
+        "subscribe-typed" => cmd_subscribe_typed(&mgr, &args),
         _ => unreachable!("mode already validated"),
     }
+}
+
+// Vector3 has three f64 fields, so its fixed body is 3 * 8 = 24 bytes.
+// These are the little-endian encodings of 1.5, -2.25, and 1e-3.
+const VECTOR3_BODY: [u8; 3 * std::mem::size_of::<f64>()] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xC0,
+    0xFC, 0xA9, 0xF1, 0xD2, 0x4D, 0x62, 0x50, 0x3F,
+];
+
+// Header body arithmetic: sec (4) + nanosec (4) + offset (4) + length (4)
+// + five frame_id bytes = 21 bytes. The offset points past the 16-byte fixed
+// prefix to the UTF-8 bytes for "laser".
+const LASER_HEADER_BODY: [u8; 21] = [
+    0x07, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+    b'l', b'a', b's', b'e', b'r',
+];
+
+fn frame_hex(bytes: &[u8]) -> String {
+    let mut copy = bytes.to_vec();
+    if copy.len() >= 32 {
+        copy[20..32].fill(0);
+    }
+    copy.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn typed_schema(args: &Args) -> Result<&str, String> {
+    match flag(args, "schema")? {
+        "geometry_msgs/Vector3" | "sensor_msgs/LaserScan" => Ok(flag(args, "schema")?),
+        other => Err(format!("unsupported typed fixture schema '{other}'")),
+    }
+}
+
+fn cmd_publish_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String> {
+    let topic = flag(args, "topic")?;
+    let count = flag_usize(args, "count")?;
+    let wait_ms = args
+        .flags
+        .get("wait-ms")
+        .map(|s| s.parse::<u64>().map_err(|e| format!("--wait-ms: {e}")))
+        .transpose()?
+        .unwrap_or(500);
+    let linger_ms = args
+        .flags
+        .get("linger-ms")
+        .map(|s| s.parse::<u64>().map_err(|e| format!("--linger-ms: {e}")))
+        .transpose()?
+        .unwrap_or(1000);
+    let schema = typed_schema(args)?;
+    match schema {
+        "geometry_msgs/Vector3" => {
+            let mut publisher = mgr
+                .create_publisher_typed::<geometry_msgs::Vector3>(topic, None)
+                .map_err(|e| e.to_string())?;
+            println!("READY");
+            std::io::stdout().flush().map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(wait_ms));
+            for _ in 0..count {
+                let mut proxy = publisher
+                    .loan_proxy::<geometry_msgs::Vector3>()
+                    .map_err(|e| e.to_string())?;
+                let snapshot = geometry_msgs::Vector3Snapshot {
+                    x: 1.5,
+                    y: -2.25,
+                    z: 1e-3,
+                };
+                proxy.write_from_snapshot(&snapshot);
+                drop(proxy);
+                publisher.check_subscriber_events();
+                publisher.notify_sent_sample().map_err(|e| e.to_string())?;
+            }
+        }
+        "sensor_msgs/LaserScan" => {
+            let mut publisher = mgr
+                .create_publisher_typed::<sensor_msgs::LaserScan>(
+                    topic,
+                    Some(MaxSliceLen::const_new(16 * 1024)),
+                )
+                .map_err(|e| e.to_string())?;
+            println!("READY");
+            std::io::stdout().flush().map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(wait_ms));
+            for _ in 0..count {
+                let mut proxy = publisher
+                    .loan_proxy::<sensor_msgs::LaserScan>()
+                    .map_err(|e| e.to_string())?;
+                let snapshot = sensor_msgs::LaserScanSnapshot {
+                    header: LASER_HEADER_BODY.to_vec(),
+                    angle_min: -1.5,
+                    angle_max: 1.5,
+                    angle_increment: 0.25,
+                    time_increment: 0.001,
+                    scan_time: 0.1,
+                    range_min: 0.2,
+                    range_max: 30.0,
+                    ranges: vec![1.5, 2.25, 3.0, 0.5],
+                    intensities: vec![10.0, 20.0, 30.0, 40.0],
+                };
+                proxy
+                    .write_from_snapshot(&snapshot)
+                    .map_err(|e| e.to_string())?;
+                drop(proxy);
+                publisher.check_subscriber_events();
+                publisher.notify_sent_sample().map_err(|e| e.to_string())?;
+            }
+        }
+        _ => unreachable!(),
+    }
+    std::thread::sleep(Duration::from_millis(linger_ms));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Reject a frame whose wire header does not carry `T`'s schema hash, or
+/// whose body is shorter than `T`'s fixed section, BEFORE the typed
+/// `from_bytes` reinterprets it - a wrong-schema or truncated frame must
+/// fail loudly instead of decoding garbage bytes.
+fn check_typed_frame<T: ShmMessage>(bytes: &[u8]) -> Result<(), String> {
+    // `read_from_buf` copies into an owned header: `from_bytes` reinterprets
+    // the slice in place and refuses non-8-byte-aligned buffers, which a
+    // received SHM slice is not guaranteed to be.
+    let header = WireHeader::read_from_buf(bytes).ok_or("frame shorter than wire header")?;
+    if header.schema_hash != T::SCHEMA_HASH {
+        return Err(format!(
+            "schema hash mismatch: expected {:#x} got {:#x}",
+            T::SCHEMA_HASH,
+            header.schema_hash
+        ));
+    }
+    // The body floor is the fixed section PLUS the offset table (8 bytes
+    // per variable field; zero for fixed schemas) - a frame any shorter
+    // cannot carry a well-formed typed body at all.
+    if bytes.len() < WireHeader::SIZE + T::WIRE_FIXED_SIZE + 8 * T::VARIABLE_FIELD_COUNT {
+        return Err("body shorter than the fixed section + offset table".to_string());
+    }
+    Ok(())
+}
+
+fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String> {
+    let topic = flag(args, "topic")?;
+    let count = flag_usize(args, "count")?;
+    let timeout_ms = flag_u64(args, "timeout-ms")?;
+    let schema = typed_schema(args)?;
+    let sub = mgr.create_subscriber(topic).map_err(|e| e.to_string())?;
+    println!("READY");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    match schema {
+        "geometry_msgs/Vector3" => {
+            for i in 0..count {
+                loop {
+                    if let Some(sample) = sub.try_receive_one_owned().map_err(|e| e.to_string())? {
+                        let bytes = sample.payload();
+                        check_typed_frame::<geometry_msgs::Vector3>(bytes)?;
+                        let value =
+                            geometry_msgs::Vector3Shm::from_bytes(&bytes[WireHeader::SIZE..])
+                                .snapshot();
+                        if bytes[WireHeader::SIZE..] != VECTOR3_BODY {
+                            return Err("Vector3 body oracle mismatch".to_string());
+                        }
+                        println!(
+                            "frame index={i} schema={schema} values=x={} y={} z={}",
+                            value.x, value.y, value.z
+                        );
+                        println!("frame_hex={}", frame_hex(bytes));
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        println!("TIMEOUT");
+                        return Ok(ExitCode::from(2));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        "sensor_msgs/LaserScan" => {
+            for i in 0..count {
+                loop {
+                    if let Some(sample) = sub.try_receive_one_owned().map_err(|e| e.to_string())? {
+                        let bytes = sample.payload();
+                        check_typed_frame::<sensor_msgs::LaserScan>(bytes)?;
+                        let value =
+                            sensor_msgs::LaserScanShm::from_bytes(&bytes[WireHeader::SIZE..])
+                                .snapshot();
+                        let frame_id =
+                            std::str::from_utf8(&value.header[16..]).map_err(|e| e.to_string())?;
+                        println!(
+                            "frame index={i} schema={schema} values=angle_min={} angle_max={} angle_increment={} time_increment={} scan_time={} range_min={} range_max={} ranges={:?} intensities={:?} header_stamp_sec={} header_stamp_nanosec={} frame_id={}",
+                            value.angle_min,
+                            value.angle_max,
+                            value.angle_increment,
+                            value.time_increment,
+                            value.scan_time,
+                            value.range_min,
+                            value.range_max,
+                            value.ranges,
+                            value.intensities,
+                            i32::from_le_bytes(value.header[0..4].try_into().unwrap()),
+                            u32::from_le_bytes(value.header[4..8].try_into().unwrap()),
+                            frame_id,
+                        );
+                        println!("frame_hex={}", frame_hex(bytes));
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        println!("TIMEOUT");
+                        return Ok(ExitCode::from(2));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_publish(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String> {
@@ -239,7 +470,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
     Ok(ExitCode::SUCCESS)
 }
 
-const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M";
+const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M";
 
 fn main() -> ExitCode {
     match run() {

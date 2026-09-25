@@ -15,3 +15,4 @@ workspace = true
 
 [dependencies]
 cerulion_core = { path = "../../cerulion_core" }
+native_ros2_messages = { path = "../../native_ros2_messages" }

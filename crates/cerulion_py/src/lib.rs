@@ -9,14 +9,15 @@
 mod errors;
 
 pub(crate) use errors::{
-    BorrowLimitExceeded, CerulionError, EncodeError, ReleasedFrame, SchemaMismatch,
-    TransportError as PyTransportError,
+    BorrowLimitExceeded, CerulionError, DecodeError, EncodeError, ReleasedFrame, SchemaError,
+    SchemaMismatch, TransportError as PyTransportError,
 };
 
 mod frame;
 mod publisher;
 mod session;
 mod subscriber;
+mod typed;
 
 use cerulion_core::WireHeader;
 use pyo3::prelude::*;
@@ -33,6 +34,8 @@ fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ReleasedFrame", m.py().get_type::<ReleasedFrame>())?;
     m.add("TransportError", m.py().get_type::<PyTransportError>())?;
     m.add("EncodeError", m.py().get_type::<EncodeError>())?;
+    m.add("DecodeError", m.py().get_type::<DecodeError>())?;
+    m.add("SchemaError", m.py().get_type::<SchemaError>())?;
     m.add("WIRE_HEADER_SIZE", WireHeader::SIZE)?;
     m.add_function(wrap_pyfunction!(session::connect, m)?)?;
     m.add_function(wrap_pyfunction!(session::real_ns, m)?)?;
@@ -40,5 +43,6 @@ fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<publisher::Loan>()?;
     m.add_class::<subscriber::Subscriber>()?;
     m.add_class::<frame::Frame>()?;
+    m.add_class::<typed::PySchemaSet>()?;
     Ok(())
 }

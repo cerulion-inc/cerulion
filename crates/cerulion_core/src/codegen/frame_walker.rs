@@ -714,8 +714,13 @@ impl FrameWalker {
             let bytes: &[u8] = match audit {
                 // An unwritten / genuinely empty field: `read_offset_entry`
                 // returns (0, 0). An empty slice is the correct value, not a
-                // corruption.
-                PayloadAudit::Frame if len == 0 => &[],
+                // corruption, but the slice must still carry the recorded
+                // offset (a binding's `ptr - payload_ptr` arithmetic lands on
+                // it), so clamp rather than hand back a static `&[]`.
+                PayloadAudit::Frame if len == 0 => {
+                    let off = off.min(payload.len());
+                    &payload[off..off]
+                }
                 PayloadAudit::Frame => {
                     let end = off.checked_add(len);
                     let in_bounds = off >= data_floor && end.is_some_and(|e| e <= payload.len());
