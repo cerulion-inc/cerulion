@@ -513,7 +513,11 @@ enum FieldOp {
     /// `string` field → variable entry: raw UTF-8.
     String { c_offset: usize, var_idx: usize },
     /// Primitive sequence (`T[]`/bounded) → variable entry: raw LE
-    /// element bytes, offset aligned to element alignment.
+    /// element bytes, offset aligned to element alignment. Planned only
+    /// for primitive element types (see [`plan_field_op`]), never for a
+    /// message sequence, so every arm may read the Lyrical instance flag
+    /// through [`prim_seq_is_rosidl_buffer`] in bounds, and every arm
+    /// that reads the header does: a Buffer-backed instance is refused.
     PrimSeq {
         c_offset: usize,
         var_idx: usize,
@@ -1408,6 +1412,15 @@ impl BridgedMessage {
                     ..
                 } => {
                     let seq = &*(c_msg.add(*c_offset) as *const RosSequence);
+                    // A Buffer-backed instance (Lyrical, Rolling) keeps a
+                    // Buffer object behind `data`, not elements: it is not
+                    // readable as bytes, so the frame is refused here and
+                    // in the write pass alike.
+                    if prim_seq_is_rosidl_buffer(seq) {
+                        return Err(self.encode_err(
+                            "sequence instance is a rosidl Buffer, not readable as bytes",
+                        ));
+                    }
                     let byte_len = seq
                         .size
                         .checked_mul(*elem_size)
@@ -1538,6 +1551,11 @@ impl BridgedMessage {
                     forge: _,
                 } => {
                     let seq = &*(c_msg.add(*c_offset) as *const RosSequence);
+                    if prim_seq_is_rosidl_buffer(seq) {
+                        return Err(self.encode_err(
+                            "sequence instance is a rosidl Buffer, not readable as bytes",
+                        ));
+                    }
                     let count = seq.size; // single read in the write pass
                                           // Bound BEFORE forming the slice — `from_raw_parts`
                                           // with a corrupt huge length is UB by itself.
@@ -3560,6 +3578,13 @@ impl BridgedMessage {
                     ..
                 } => {
                     let seq = &*(c_msg.add(*c_offset) as *const RosSequence);
+                    // Pre-mutation refusal like every other seal refusal:
+                    // a Buffer-backed instance is neither adopted nor copied.
+                    if prim_seq_is_rosidl_buffer(seq) {
+                        return Err(SealRefusal::Encode(self.encode_err(
+                            "sequence instance is a rosidl Buffer, not readable as bytes",
+                        )));
+                    }
                     let byte_len = seq
                         .size
                         .checked_mul(*elem_size)

@@ -1464,3 +1464,41 @@ extern "C" {
     /// REAL vector (same idiom as `forged_take_bridge_test.rs`).
     fn rmw_cerulion_vector_u8_assign(v: *mut c_void, data: *const u8, len: usize);
 }
+
+/// Lyrical and Rolling: the borrow seal refuses a Buffer-backed top-level
+/// primitive sequence instance before touching the payload (neither
+/// adopted nor copied), and the same slot with the flag clear seals.
+#[cfg(cerulion_has_is_rosidl_buffer)]
+#[test]
+#[serial]
+fn c_buffer_backed_instance_is_refused_by_the_seal_before_any_mutation() {
+    let bridge = scanish_bridge();
+    let ranges = [0.25f32, 0.5];
+    unsafe {
+        let mut slot = Slot::new();
+        let payload = slot.payload();
+        let heap = calloc(ranges.len(), 4) as *mut f32;
+        std::ptr::copy_nonoverlapping(ranges.as_ptr(), heap, ranges.len());
+        build_scanish_in_slot(payload, 3.0, heap, ranges.len(), "w");
+        let seq = payload.add(std::mem::offset_of!(CScanish, ranges)) as *mut CF32Seq;
+        (*seq).is_rosidl_buffer = true;
+        let before: Vec<u8> = std::slice::from_raw_parts(payload, PAYLOAD_LEN).to_vec();
+
+        let geo = bridge.borrow_geometry().expect("geometry");
+        let refused =
+            bridge.seal_borrowed_frame(payload, PAYLOAD_LEN, &geo, None, GAP_OK, &mut scratch());
+        assert!(
+            matches!(refused, Err(SealRefusal::Encode(_))),
+            "a Buffer-backed instance must be refused as an encode refusal"
+        );
+        let after: Vec<u8> = std::slice::from_raw_parts(payload, PAYLOAD_LEN).to_vec();
+        assert_eq!(before, after, "a refused seal must not touch the payload");
+
+        // Control: the flag is the ONLY difference.
+        (*seq).is_rosidl_buffer = false;
+        let seal = bridge
+            .seal_borrowed_frame(payload, PAYLOAD_LEN, &geo, None, GAP_OK, &mut scratch())
+            .expect("seal");
+        assert_eq!((seal.adopted, seal.escaped, seal.copied), (0, 1, 1));
+    }
+}

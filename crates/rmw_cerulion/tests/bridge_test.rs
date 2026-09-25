@@ -1976,3 +1976,49 @@ fn loan_pad_ranges_cover_exactly_the_padding() {
         "a gapless layout has nothing to zero"
     );
 }
+
+/// Lyrical and Rolling: a top-level `uint8[]` INSTANCE whose header says
+/// Buffer-backed holds a Buffer object behind `data`, not elements. The
+/// size pass, the write pass and the fill all refuse it (a bogus non-null
+/// pointer would be read or freed if any of them did not), and the same
+/// message with the flag clear goes through.
+#[cfg(cerulion_has_is_rosidl_buffer)]
+#[test]
+fn c_buffer_backed_top_level_instance_is_refused_by_size_flatten_and_fill() {
+    let bridge = unsafe { BridgedMessage::new(u8_seq_members()) }.expect("bridge");
+    let mut backing = [1u8, 2, 3];
+    let mut msg = CU8SeqMsg {
+        data: CU8Seq {
+            data: backing.as_mut_ptr(),
+            size: backing.len(),
+            capacity: backing.len(),
+            is_rosidl_buffer: true,
+            owns_rosidl_buffer: false,
+        },
+    };
+    let size = unsafe { bridge.frame_size(&msg as *const _ as *const c_void) };
+    assert!(
+        size.is_err(),
+        "the size pass must refuse a Buffer-backed instance"
+    );
+    let frame = unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) };
+    let err = frame.expect_err("the write pass must refuse a Buffer-backed instance");
+    assert!(err.to_string().contains("rosidl Buffer"), "got: {err}");
+    // The fill refuses the same instance and leaves its pointer untouched.
+    let plain = CU8SeqMsg {
+        data: u8_seq(&[9, 8, 7]),
+    };
+    let good = unsafe { bridge.flatten(&plain as *const _ as *const c_void, 0, 0) }.expect("plain");
+    let ok =
+        unsafe { bridge.unflatten(&good[WireHeader::SIZE..], &mut msg as *mut _ as *mut c_void) };
+    assert!(!ok, "the fill must refuse a Buffer-backed instance");
+    assert_eq!(msg.data.data as usize, backing.as_mut_ptr() as usize);
+    assert_eq!(msg.data.size, 3);
+    // Control: the flag is the ONLY difference.
+    msg.data.is_rosidl_buffer = false;
+    let size = unsafe { bridge.frame_size(&msg as *const _ as *const c_void) }.expect("plain size");
+    assert!(size > 0);
+    let frame =
+        unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) }.expect("plain flatten");
+    assert!(frame.len() > WireHeader::SIZE);
+}
