@@ -21,11 +21,24 @@
 # packaging documentation that describes what it produces: for those, finding
 # out on `main` means a revert instead of a red check.
 #
-# The list is derived from the job's own steps rather than guessed. Every
-# entry is a file the job reads or a script it executes; `apt-repo.yml` is in
-# because it publishes what this job smoke-tests, and `ci.yml` is deliberately
-# OUT, because a workflow edit that does not touch packaging should not pay 22
-# minutes to learn that.
+# The list is derived from the job's own steps rather than guessed. Every entry
+# is a file the job reads or a script it executes, DIRECTLY or through another
+# script: `check_version_sync.sh` and `check_citation_release.sh` are in because
+# `test_workspace_version.sh` and `test_release_debian_gate.sh` execute them, and
+# the root `LICENSE` is in because the job stages it and `build_deb.sh` refuses
+# an archive that does not carry it. `apt-repo.yml` is in because it publishes
+# what this job smoke-tests.
+#
+# Two files the job does touch are deliberately OUT. `ci.yml`, because a workflow
+# edit that does not touch packaging should not pay 22 minutes to learn that. And
+# the root `README.md`, staged beside the license by the same step: it is edited
+# far too often to put every documentation pull request behind a 22-minute job,
+# and a pull request that deletes it and nothing else is still caught by `main`'s
+# push run.
+#
+# Renames reach here as a DELETE plus an ADD, never as a destination path alone:
+# the workflow diffs with `--no-renames` so that renaming a listed input away
+# still matches on the name it had.
 #
 # Unreadable or empty input yields `false` for every class: this gate only ever
 # ADDS work, so the quiet answer is the same behaviour the workflow had before.
@@ -43,14 +56,17 @@ tools/scripts/build_keyring_deb.sh
 tools/scripts/check_apt_keyring_coverage.sh
 tools/scripts/test_apt_publication_order.sh
 tools/scripts/test_release_debian_gate.sh
+tools/scripts/check_citation_release.sh
 tools/scripts/debian_version.sh
 tools/scripts/workspace_version.sh
 tools/scripts/test_workspace_version.sh
+tools/scripts/check_version_sync.sh
 tools/scripts/verify_rmw_deb.sh
 tools/scripts/verify_rmw_deb_container.sh
 tools/release/
 docs/packaging/
 docs/legal/
+LICENSE
 .github/workflows/apt-repo.yml
 '
 
@@ -87,6 +103,10 @@ docs/packaging/apt.md|true
 tools/release/about.toml|true
 .github/workflows/apt-repo.yml|true
 docs/legal/NOTICE|true
+tools/scripts/check_version_sync.sh|true
+tools/scripts/check_citation_release.sh|true
+LICENSE|true
+LICENSE-BSD-3-CLAUSE|false
 crates/cerulion_core/src/wire.rs|false
 .github/workflows/ci.yml|false
 README.md|false

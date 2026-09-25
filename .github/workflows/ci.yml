@@ -134,7 +134,11 @@ jobs:
           fi
           # On a `pull_request` event the checkout is the MERGE commit, so
           # `diff <base> HEAD` is exactly what the pull request changes.
-          git diff --name-only "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+          # `--no-renames` so a rename arrives as its DELETE plus its ADD.
+          # With rename detection left on, `--name-only` prints the DESTINATION
+          # path alone, so renaming a listed packaging input to an unlisted path
+          # would classify as `packaging=false` and skip the job that reads it.
+          git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
           echo "== changed paths =="
           cat "$RUNNER_TEMP/changed.txt"
           ./tools/scripts/ci_changed_paths.sh < "$RUNNER_TEMP/changed.txt" \
@@ -159,9 +163,18 @@ jobs:
     # `merge_group` stays excluded either way: the queue would pay for the same
     # work a second time over the same commits, and `main`'s push run is still
     # the control.
+    #
+    # `!cancelled()` is load bearing. `needs: [changes]` makes the classifier a
+    # prerequisite on EVERY event, and GitHub skips a dependent when its
+    # dependency fails, so without the guard a checkout or classification
+    # failure would silently skip this job on `push`, where it runs
+    # unconditionally today. With it, a push runs the smoke whatever the
+    # classifier did, and a pull request whose classifier failed reads an empty
+    # `packaging` and skips, which is exactly the behaviour it has today.
     if: >-
-      (github.event_name != 'pull_request' && github.event_name != 'merge_group')
-      || (github.event_name == 'pull_request' && needs.changes.outputs.packaging == 'true')
+      !cancelled()
+      && ((github.event_name != 'pull_request' && github.event_name != 'merge_group')
+      || (github.event_name == 'pull_request' && needs.changes.outputs.packaging == 'true'))
     # Measured 22 min on the PR head (the debug-binary tar + dpkg-deb step
     # alone is ~12 min); 30 left eight minutes of headroom on a
     # compression-bound job.

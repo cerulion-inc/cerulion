@@ -408,7 +408,9 @@ those are the only pull requests that can break it and "caught on the merge to m
 means a revert rather than a red check. The direction is the safe one: a class only
 ever makes a job RUN that would otherwise skip, so no rule in that script can weaken a
 gate a pull request has today, and every class is `false` on `push`, `merge_group` and
-`workflow_dispatch`, where there is no pull request to diff.
+`workflow_dispatch`, where there is no pull request to diff. `deb-smoke` keeps its
+`push` run whatever the classifier did: the job is guarded with `!cancelled()`, because
+`needs:` alone would let a failed classifier skip a job that runs unconditionally today.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.
