@@ -181,3 +181,5 @@ def test_default_borrow_floor_rejects_third_held_frame(fixture_bin, session):
     finally:
         proc.kill()
         proc.wait()
+        if proc.returncode not in (0, -9):
+            pytest.fail(proc.stderr.read())
