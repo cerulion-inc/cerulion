@@ -29,6 +29,12 @@ fn event_names_and_common_values_pass_the_guard() {
 }
 
 #[test]
+fn started_carries_the_platform() {
+    let keys: Vec<String> = started_props().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, ["os", "arch"]);
+}
+
+#[test]
 fn properties_stay_inside_their_allowlists_and_pass_the_guard() {
     for (spec, props) in [
         (VIZD_STARTED, started_props()),

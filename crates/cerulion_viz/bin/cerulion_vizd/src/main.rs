@@ -197,15 +197,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let running = Arc::clone(&running);
         ctrlc::set_handler(move || running.store(false, Ordering::SeqCst))?;
     }
-    let telemetry = cerulion_vizd::telemetry::Telemetry::start();
+    let telemetry = cerulion_vizd::telemetry::Telemetry::start_in_background();
     while running.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
     }
 
     tracing::info!("cerulion-vizd shutting down");
-    if let Some(telemetry) = telemetry {
-        telemetry.shutdown();
-    }
+    telemetry.shutdown();
     daemon.shutdown();
     Ok(())
 }

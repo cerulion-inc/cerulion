@@ -171,12 +171,27 @@ impl Telemetry {
         })
     }
 
+    /// Run [`Telemetry::start`] on its own thread, so a consent file held
+    /// locked by another process never delays the daemon or its shutdown.
+    pub fn start_in_background() -> Starting {
+        let (ready, receiver) = mpsc::channel();
+        let _ = thread::Builder::new()
+            .name("vizd-telemetry-start".into())
+            .spawn(move || {
+                let _ = ready.send(Telemetry::start());
+            });
+        Starting(receiver)
+    }
+
     /// Stop the heartbeat and flush, both within one
     /// [`DEFAULT_SHUTDOWN_BUDGET`].
-    pub fn shutdown(mut self) {
-        let deadline = Instant::now() + DEFAULT_SHUTDOWN_BUDGET;
+    pub fn shutdown(self) {
+        self.shutdown_by(Instant::now() + DEFAULT_SHUTDOWN_BUDGET);
+    }
+
+    fn shutdown_by(mut self, deadline: Instant) {
         if let Some(mut heartbeat) = self.heartbeat.take() {
-            heartbeat.stop_within(DEFAULT_SHUTDOWN_BUDGET);
+            heartbeat.stop_within(deadline.saturating_duration_since(Instant::now()));
         }
         let client = self
             .client
@@ -185,6 +200,21 @@ impl Telemetry {
             .and_then(|mut guard| guard.take());
         if let Some(mut client) = client {
             client.shutdown(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+}
+
+/// Telemetry that may still be starting; see [`Telemetry::start_in_background`].
+pub struct Starting(mpsc::Receiver<Option<Telemetry>>);
+
+impl Starting {
+    /// Wait for the start and shut the telemetry down, all within one
+    /// [`DEFAULT_SHUTDOWN_BUDGET`]. A start still blocked at the deadline is
+    /// abandoned and sends nothing more than it already queued.
+    pub fn shutdown(self) {
+        let deadline = Instant::now() + DEFAULT_SHUTDOWN_BUDGET;
+        if let Ok(Some(telemetry)) = self.0.recv_timeout(DEFAULT_SHUTDOWN_BUDGET) {
+            telemetry.shutdown_by(deadline);
         }
     }
 }
