@@ -5,7 +5,7 @@ import pytest
 
 import cerulion
 
-from conftest import shm_mappings, unique_topic
+from conftest import macos_shared_mapping, shm_mappings, unique_topic
 
 
 SCHEMA = """\
@@ -95,11 +95,13 @@ def test_materialized_publish_and_readonly_view(session):
     assert not message.vector.flags.writeable
     nested_record = np.asarray(message.nested._record())
     assert not nested_record.flags.writeable
-    if sys.platform.startswith("linux"):
-        ranges = shm_mappings()
-        for array in (message.values, message.vector, message.floats, nested_record):
-            ptr = np.asarray(array).__array_interface__["data"][0]
+    ranges = shm_mappings() if sys.platform.startswith("linux") else None
+    for array in (message.values, message.vector, message.floats, nested_record):
+        ptr = np.asarray(array).__array_interface__["data"][0]
+        if ranges is not None:
             assert any(start <= ptr < end for start, end in ranges)
+        else:
+            assert macos_shared_mapping(ptr), f"typed view at {ptr:#x} is not in shared memory"
     copied = message.copy()
     assert copied["boolean"] is True
     assert copied["i8"] == -8
