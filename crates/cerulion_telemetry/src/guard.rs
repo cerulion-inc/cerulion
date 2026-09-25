@@ -107,8 +107,9 @@ pub fn check_uuid(uuid: &str) -> Result<(), Rejection> {
     })
 }
 
-/// Check an event `timestamp`: exactly the `YYYY-MM-DDTHH:MM:SS.mmmZ` shape
-/// [`crate::rfc3339::format()`] produces. Rejected and counted otherwise.
+/// Check an event `timestamp`: a real instant in exactly the
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` shape [`crate::rfc3339::format()`] produces.
+/// Rejected and counted otherwise.
 pub fn check_timestamp(timestamp: &str) -> Result<(), Rejection> {
     counted(if crate::rfc3339::is_well_formed(timestamp) {
         Ok(())
@@ -227,8 +228,12 @@ fn is_lowercase_uuid(s: &str) -> bool {
 fn looks_like_url(value: &str) -> bool {
     value
         .as_bytes()
-        .windows(8)
-        .any(|w| w.eq_ignore_ascii_case(b"https://"))
+        .windows(4)
+        .any(|w| w.eq_ignore_ascii_case(b"www."))
+        || value
+            .as_bytes()
+            .windows(8)
+            .any(|w| w.eq_ignore_ascii_case(b"https://"))
         || value
             .as_bytes()
             .windows(7)
