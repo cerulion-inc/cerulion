@@ -1171,8 +1171,14 @@ pub struct TopicLiveness {
 /// it by an observer-clock duration does not compare two clocks, and the module's
 /// clock rule is untouched. That matters more than it looks: the publisher's OWN
 /// stamps could not be used as the denominator, because a `graph run` worker's
-/// gating clock advances by a fixed LOGICAL quantum per step and its
-/// seconds are not wall seconds.
+/// gating clock is a CONTROLLED clock advanced ONCE PER STEP, never read at the
+/// publish instant, and neither mode makes its seconds the observer's. Under
+/// the `CERULION_EXECUTION_MODE=lockstep` opt-out it advances by a fixed
+/// LOGICAL quantum, which is not wall time at all. Under the free-run default
+/// (`--record`) it advances by the step's MEASURED wall elapsed from a shared
+/// epoch, so it tracks wall time in aggregate but still moves in step-sized
+/// jumps taken on the worker's own timeline rather than at the observer's
+/// drain.
 ///
 /// The count is exact **whatever the observer tap could hold**. The tap keeps
 /// only [`LIVENESS_TAP_BUFFER_SIZE`] frames, so a 500 Hz topic delivers two

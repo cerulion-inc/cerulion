@@ -20342,8 +20342,9 @@ impl ActiveReadLog<'_> {
                     // JSON subscriber, so the message points at it.
                     "replay: this edge DIVERGED (see `class`) — REDUNDANT verifier; \
                      the verdict and exit code are UNAFFECTED, warning once per edge. A \
-                     multi-process bag recorded on the shipping barrier with a same-level \
-                     cross-group plain edge legitimately diverges here \
+                     multi-process bag recorded under the \
+                     `CERULION_EXECUTION_MODE=lockstep` opt-out, with a same-level \
+                     cross-group plain edge, legitimately diverges here \
                      — the warn IS the per-edge attribution of that race"
                 );
                 self.divergences.push(ReadLogEdgeDivergence {

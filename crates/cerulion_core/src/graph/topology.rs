@@ -1065,9 +1065,12 @@ impl GraphTopology {
     ///   level. `debug_assert`ed against the input node count.
     /// * **Contiguous, no empty level.** The level count may GROW (cascade)
     ///   under [`LevelGrowth::Allow`] but the final assignment is COMPRESSED
-    ///   to a contiguous `0..K` range with every level occupied (the barrier
-    ///   advances one generation per level, so empties are structurally
-    ///   excluded), and `K` never exceeds the node count. With no applied
+    ///   to a contiguous `0..K` range with every level occupied (the level
+    ///   index is what the executor and the merged fire trace name a DAG stage
+    ///   by, in every mode; under the `CERULION_EXECUTION_MODE=lockstep`
+    ///   opt-out the cross-process barrier additionally advances one generation
+    ///   per level, so empties are structurally excluded), and `K` never
+    ///   exceeds the node count. With no applied
     ///   cascade the count is preserved exactly (phase 1 alone cannot move a
     ///   critical-path node: by induction from its sink each has zero slack).
     ///   Under [`LevelGrowth::Deny`] the count can NEVER grow (every
@@ -1546,12 +1549,18 @@ impl GraphTopology {
     /// [`TransportError`] — hand-edited files are untrusted input):
     ///
     /// 1. **No empty level** (contiguity): the levels vector has no empty
-    ///    entry. Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the
-    ///    cross-process barrier advances ONE generation per level, so an empty
-    ///    level would desync the per-step generation math across processes;
-    ///    under the free-run default there is no shared counter to desync, and
-    ///    the invariant still holds because the executor and the recorded
-    ///    boundary stream are indexed by level on every rank.
+    ///    entry. TRUE IN BOTH MODES, and for a reason the barrier does not
+    ///    own: the level INDEX is how every consumer names a DAG stage. The
+    ///    executor runs the levels vector by index
+    ///    (`GraphRuntime::step_live`'s `0..levels.len()` loop), every fire
+    ///    record is stamped with the level it fired at and merged on it, and
+    ///    the derived levelization this assignment replaces is COMPRESSED to a
+    ///    gap-free `0..K` by construction (see [`Self::refine_levels`]), so an
+    ///    empty level is an index with no stage behind it. Under the
+    ///    `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process barrier
+    ///    is a FURTHER consumer of that index, advancing ONE generation per
+    ///    level, and there an empty level would additionally desync the
+    ///    per-step generation math across processes.
     /// 2. **Every trigger edge strictly level-increasing**: for every
     ///    TRIGGERING consumer edge, `level(producer) < level(consumer)` —
     ///    else the consumer would fire in the same step-phase as (or before)
@@ -1572,10 +1581,16 @@ impl GraphTopology {
         for (idx, level) in levels.iter().enumerate() {
             if level.nodes.is_empty() {
                 return Some(format!(
-                    "level {idx} is EMPTY — assigned levels must form a contiguous \
-                     0..={} range with no gaps (the multi-process barrier advances \
-                     one generation per level, so an empty level would desync the \
-                     generation math); renumber the levels to close the gap",
+                    "level {idx} is EMPTY: assigned levels must form a contiguous \
+                     0..={} range with no gaps. The level INDEX is how every consumer \
+                     names a DAG stage (the executor runs the levels vector by index, \
+                     and every fire record is stamped and merged on the level it fired \
+                     at), and the derived levelization this map replaces never emits a \
+                     gap, so an empty level is an index with no stage behind it. Under \
+                     the `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process \
+                     barrier advances one generation per level and is a further consumer \
+                     of that same index, so there an empty level would also desync the \
+                     generation math. Renumber the levels to close the gap",
                     levels.len().saturating_sub(1)
                 ));
             }
@@ -5118,11 +5133,21 @@ mod tests {
             .expect_err("gapped level range must be rejected");
         let msg = format!("{err}");
         assert!(msg.contains("level 1 is EMPTY"), "names the gap: {msg}");
+        // The WHY must be true on a DEFAULT (free-run) load, which maps no
+        // barrier at all: the mode-independent half comes first and the
+        // barrier appears only as the opt-out's further consumer.
         assert!(
-            msg.contains("barrier advances one generation per level"),
-            "explains the WHY: {msg}"
+            msg.contains("The level INDEX is how every consumer names a DAG stage"),
+            "explains the WHY without a barrier: {msg}"
         );
-        assert!(msg.contains("renumber"), "remedy: {msg}");
+        assert!(
+            msg.contains(
+                "Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process \
+                 barrier advances one generation per level"
+            ),
+            "scopes the barrier clause to the mode that has one: {msg}"
+        );
+        assert!(msg.contains("Renumber"), "remedy: {msg}");
     }
 
     #[test]

@@ -9303,11 +9303,19 @@ fn stamp_cap_mode(plan: &mut crate::multiprocess::DeploymentPlan, mode: CpuDmaLo
 /// holds the loaded metadata and injects the answer here).
 ///
 /// **The SAME vector goes to EVERY worker, and that is a correctness
-/// requirement, not a convenience.** The flags decide how many barrier
+/// requirement, not a convenience.** Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out the flags decide how many barrier
 /// generations each level burns, so two workers disagreeing on one level
 /// desynchronise the shared generation counter for the rest of the run — every
 /// later rendezvous times out and poisons. Computing it once here and cloning is
 /// what makes disagreement unrepresentable.
+///
+/// **The stamp itself is MODE-INDEPENDENT; its EFFECT is not.** The free-run
+/// default creates no barrier and no rank maps one, so the flags ride a plan
+/// nothing reads and no level crosses an extra generation. Stamping anyway is
+/// deliberate (the plan file stays one shape, and the mode a plan is read under
+/// is not this function's to know), but it is why the run's own line is written
+/// per mode: `execution_mode` is taken here for the LOG, never for the stamp.
 ///
 /// Sized from the plan's own `global_level_map` (not from the classifier), so
 /// the vector is index-compatible with the map by construction. A worker whose
@@ -9318,12 +9326,15 @@ fn stamp_cap_mode(plan: &mut crate::multiprocess::DeploymentPlan, mode: CpuDmaLo
 fn stamp_mid_level_barrier(
     plan: &mut crate::multiprocess::DeploymentPlan,
     pairs: &[crate::multiprocess::SplitNonTriggerPair],
+    execution_mode: crate::multiprocess::ExecutionMode,
 ) {
     if pairs.is_empty() {
-        // The overwhelmingly common case: nothing to order, so every level keeps
-        // exactly one generation per step. `plan_deployment` already sized an
-        // all-`false` vector per worker; leave it, and say nothing (a clean
-        // partition logs NOTHING — the reporter's own rule).
+        // The overwhelmingly common case: nothing to flag, so under the
+        // `lockstep` opt-out every level keeps exactly one generation per step
+        // (the free-run default pays nothing either way).
+        // `plan_deployment` already sized an all-`false` vector per worker;
+        // leave it, and say nothing (a clean partition logs NOTHING: the
+        // reporter's own rule).
         return;
     }
     for w in &mut plan.workers {
@@ -9331,21 +9342,39 @@ fn stamp_mid_level_barrier(
             crate::multiprocess::mid_level_barrier_flags(pairs, w.global_level_map.len());
     }
     // One line per RUN (the per-pair detail is the reporter's). `levels` is the
-    // count of DISTINCT global levels taking the extra rendezvous, which is what
-    // the run's generation-per-step law is derived from — not the pair count.
+    // count of DISTINCT global levels FLAGGED, not the pair count. Under the
+    // `lockstep` opt-out that is also the count taking the extra rendezvous, and
+    // the run's generation-per-step law is derived from it; under the free-run
+    // default no level takes one, which is why the line below is written per
+    // mode rather than stating the law unconditionally.
     let flagged = plan
         .workers
         .first()
         .map(|w| w.mid_level_barrier.iter().filter(|f| **f).count())
         .unwrap_or(0);
-    tracing::info!(
-        pairs = pairs.len(),
-        levels = flagged,
-        workers = plan.workers.len(),
-        "stamping mid-level barrier levels into every worker plan — each flagged \
-         level crosses TWO barrier generations per step so every group's step-start \
-         snapshots are ordered before any group ticks"
-    );
+    match execution_mode {
+        crate::multiprocess::ExecutionMode::Lockstep => tracing::info!(
+            pairs = pairs.len(),
+            levels = flagged,
+            workers = plan.workers.len(),
+            execution_mode = %"lockstep",
+            "stamping mid-level barrier levels into every worker plan: each flagged \
+             level crosses TWO barrier generations per step so every group's step-start \
+             snapshots are ordered before any group ticks"
+        ),
+        crate::multiprocess::ExecutionMode::FreeRun => tracing::info!(
+            pairs = pairs.len(),
+            levels = flagged,
+            workers = plan.workers.len(),
+            execution_mode = %"free_run",
+            "stamping mid-level barrier levels into every worker plan: this run is \
+             free-run, so it creates no barrier and no rank maps one: the flags ride the \
+             plan INERT, every level crosses exactly one generation per step, and nothing \
+             orders a split same-level non-trigger edge. \
+             `CERULION_EXECUTION_MODE=lockstep` is what turns these levels into a \
+             rendezvous"
+        ),
+    }
 }
 
 fn stamp_topic_requirements(
@@ -9972,16 +10001,24 @@ fn graph_run_supervisor(
             crate::multiprocess::LoadedNodeMetadata(&loaded_entry_infos),
             &levels,
         );
+        // The advisory is MODE-SPLIT. The classification above is
+        // mode-independent (the same pairs, the same stamp either way), but the
+        // CONSEQUENCE is not: only the lockstep opt-out builds the mid-level
+        // barrier that orders this shape (the owner below is minted on the
+        // `Lockstep` arm alone, and the worker opens none on either free-run
+        // path), so a default run told it had a rendezvous would be told
+        // something false at the one moment it can still act on it.
         crate::multiprocess::report_split_same_level_non_trigger_pairs(
             config.identity(),
             &split_non_trigger_pairs,
+            execution_mode,
         );
     }
 
     // Stamp the classified levels into every worker plan BEFORE the
     // plans are serialised (below). Empty on a clean partition, which leaves the
     // planner's all-`false` vectors untouched and the run paying nothing.
-    stamp_mid_level_barrier(&mut plan, &split_non_trigger_pairs);
+    stamp_mid_level_barrier(&mut plan, &split_non_trigger_pairs, execution_mode);
 
     // (5.5) The recorded topic set was resolved at (4.5),
     // BEFORE the planning build — so the fail-fast ordering is unchanged
