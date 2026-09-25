@@ -141,6 +141,7 @@ mod enabled {
                 .timeout(HTTP_TIMEOUT)
                 .connect_timeout(HTTP_TIMEOUT)
                 .no_gzip()
+                .redirect(reqwest::redirect::Policy::none())
                 .user_agent(format!("{}/{}", crate::LIB_NAME, crate::LIB_VERSION))
                 .build()
                 .ok()?;
@@ -238,12 +239,22 @@ mod enabled {
             let budget = budget.min(MAX_SHUTDOWN_BUDGET);
             let deadline = Instant::now() + budget;
             self.shut = true;
-            {
-                let mut state = lock(&self.shared.state);
-                state.closed = true;
+            let soft_deadline = deadline - budget / 10;
+            // The queue lock is only ever held for a push or a drain, but the
+            // budget is hard: a holder stalled past the soft deadline leaves
+            // the queue open and the abort below ends the worker instead.
+            loop {
+                if let Ok(mut state) = self.shared.state.try_lock() {
+                    state.closed = true;
+                    break;
+                }
+                if Instant::now() >= soft_deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
             }
             self.shared.wake.notify_all();
-            if self.wait_done(deadline - budget / 10) {
+            if self.wait_done(soft_deadline) {
                 return ShutdownOutcome::Flushed;
             }
             self.shared.abort.store(true, Ordering::Release);
@@ -306,6 +317,9 @@ mod enabled {
         let Ok(url) = reqwest::Url::parse(host) else {
             return false;
         };
+        if url.query().is_some() || url.fragment().is_some() {
+            return false;
+        }
         match url.scheme() {
             "https" => url.host().is_some(),
             "http" => url.host_str().is_some_and(|h| {

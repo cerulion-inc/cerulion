@@ -468,3 +468,15 @@ fn common_values_that_fail_the_guard_are_not_stamped() {
     let json = event_json(&event, &common());
     assert_eq!(json["properties"]["surface"], "cli");
 }
+
+#[test]
+fn a_scheme_less_web_host_is_url_like() {
+    for value in ["www.example.com", "see WWW.example.org"] {
+        assert_eq!(
+            guard::check_str(value),
+            Err(Rejection::LooksLikeUrl),
+            "{value}"
+        );
+    }
+    assert_eq!(guard::check_str("install.sh"), Ok(()));
+}
