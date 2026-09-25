@@ -271,7 +271,10 @@ pub fn login_anon_id() -> Option<String> {
     }
     // Only the notice run defers a merge; any other non-sending run mints no
     // id and writes no consent file.
-    if NOTICE_RUN.load(Ordering::Relaxed) && consent::anon_id().ok().flatten().is_some() {
+    if NOTICE_RUN.load(Ordering::Relaxed)
+        && consent::status().enabled
+        && consent::anon_id().ok().flatten().is_some()
+    {
         UNCARRIED.store(true, Ordering::Relaxed);
     }
     None
