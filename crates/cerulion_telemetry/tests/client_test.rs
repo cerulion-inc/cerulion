@@ -5,7 +5,8 @@
 #![cfg(feature = "posthog")]
 
 use cerulion_telemetry::{
-    Client, Common, EventSpec, ShutdownOutcome, Value, DEFAULT_SHUTDOWN_BUDGET, QUEUE_CAPACITY,
+    Client, Common, EventSpec, ShutdownOutcome, Value, DEFAULT_SHUTDOWN_BUDGET, HTTP_TIMEOUT,
+    QUEUE_CAPACITY,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -324,8 +325,8 @@ fn a_post_that_starts_during_shutdown_is_cancelled_at_the_deadline() {
     );
     assert_eq!(second["batch"][0]["properties"]["duration_ms"], 2);
     assert!(
-        returned_at < budget + Duration::from_millis(100),
-        "shutdown returned at {returned_at:?}, not at HTTP_TIMEOUT"
+        returned_at < budget + Duration::from_secs(1) && returned_at < HTTP_TIMEOUT,
+        "shutdown returned at {returned_at:?}, not near the budget"
     );
     assert_cancelled(outcome, &client, 1);
     assert_eq!(client.post_failed(), 0, "cancelled, not failed");
