@@ -35,6 +35,11 @@
 //! - the macro data-trigger consumer is UNIFIED (`unified_binding_count == 1`);
 //! - `CERULION_LIVE_SPIN_US=0` kills the spin arm so ALL idle routing goes
 //!   through `monitor_wait_block` and the park counters see every wake;
+//! - `CERULION_NOTIFY_ELISION=off` keeps the publish NOTIFYING, which is what
+//!   the modelled multi-process shape does and what a single-process harness
+//!   otherwise would not (see [`ParkEnvGuard`]) — without it the publish sends
+//!   no event at all, so there is no stale event to survive and the
+//!   discriminating assert below passes with or without the drain;
 //! - after a fire+deliver iteration, M SILENT iterations must ALL be
 //!   TIMEOUT-paced: `wakes_listener` delta == 0 (without the drain: 1 — the stale
 //!   event from the publish; THE discriminating assert), `wakes_timeout`
@@ -49,7 +54,7 @@
 //! cargo test -p cerulion_core --test unified_stale_wake_park_test -- --test-threads=1
 //! ```
 //!
-//! `#[serial]`: env (`CERULION_LIVE_SPIN_US`) is process-global + iceoryx2.
+//! `#[serial]`: the env knobs are process-global, and so is iceoryx2.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -75,18 +80,35 @@ const SILENT_ITERS: u64 = 8;
 /// Per-iteration live timeout (the park's deadline).
 const STEP_TIMEOUT: Duration = Duration::from_millis(3);
 
-/// RAII guard pinning `CERULION_LIVE_SPIN_US=0` (spin disabled → all idle
-/// routing goes through the park and its wake counters). Panic-safe removal.
-struct SpinOffGuard;
-impl SpinOffGuard {
+/// RAII guard pinning the two env knobs this pin depends on. Panic-safe
+/// removal of both.
+///
+/// - `CERULION_LIVE_SPIN_US=0` disables the spin arm, so ALL idle routing goes
+///   through the park and its wake counters see every wake.
+/// - `CERULION_NOTIFY_ELISION=off` restores the notify shape of the leak this
+///   file models. Elision skips a graph-owned topic's per-publish notify while
+///   the topic's LIVE listener count equals the in-process count the runtime
+///   proved it owns. The measured leak is a MULTI-PROCESS one: the consumer
+///   lives in another process, the live count exceeds the owned count, the gate
+///   stays open and every publish notifies. This harness is single-process, so
+///   every listener on the producer's topic is graph-owned, the gate closes,
+///   and the publish sends no notify at all. With no notify there is no stale
+///   `ListenerOnly` event, the drain under test has nothing to remove, and the
+///   discriminating assert below reads 0 whether the drain runs or not. Pinning
+///   the knob off is what makes this pin BITE: verified by mutation, the assert
+///   fails with `left: 1, right: 0` when the Unified drain is removed.
+struct ParkEnvGuard;
+impl ParkEnvGuard {
     fn set() -> Self {
         std::env::set_var("CERULION_LIVE_SPIN_US", "0");
+        std::env::set_var("CERULION_NOTIFY_ELISION", "off");
         Self
     }
 }
-impl Drop for SpinOffGuard {
+impl Drop for ParkEnvGuard {
     fn drop(&mut self) {
         std::env::remove_var("CERULION_LIVE_SPIN_US");
+        std::env::remove_var("CERULION_NOTIFY_ELISION");
     }
 }
 
@@ -111,7 +133,7 @@ impl StaleWakeConsumer {
 #[test]
 #[serial]
 fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
-    let _spin_off = SpinOffGuard::set();
+    let _park_env = ParkEnvGuard::set();
 
     let last_read = Arc::new(AtomicU64::new(MISSING));
 
@@ -198,6 +220,18 @@ fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
         runtime.unified_binding_count_for_test(),
         1,
         "the macro data-trigger consumer must be wired Unified (anti-vacuity)"
+    );
+    // Anti-vacuity, the second half: the publish must really notify. Elision
+    // arms per BUILD off the env read, so a build that armed anything on this
+    // graph would mean the guard above did not take and the publish would send
+    // no event — leaving nothing for the drain to remove and nothing for the
+    // discriminating assert to catch.
+    assert_eq!(
+        runtime.notify_elision_armed_topic_count_for_test(),
+        0,
+        "notify elision must be DISARMED for this pin: an armed publisher elides \
+         the very notify whose stale event the Unified drain exists to clear, \
+         which silently turns the listener-wake assert below into a tautology"
     );
 
     // Iteration 1: fire the producer — the same live step delivers to the

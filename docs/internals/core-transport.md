@@ -97,16 +97,20 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   exit; consume at commit. The symptom of getting this wrong is phantom loss:
   sequence-gap detectors fire at the abort rate while completed-work counters match
   recorded artifacts exactly.
-- **Self-drain**: iceoryx2 0.9.1's notifier delivers to EVERY listener on a topic's event
-  service, including the publisher's own (each `CerulionPublisher` owns one for
-  `SubscriberConnected`). Every path that notifies must drain it: `loan_proxy` drains
-  per loan; `publish_raw` calls `check_subscriber_events()`. Forgetting this saturates
-  the publisher's own AF_UNIX socket after a few hundred publishes, after which every
-  notify fails and iceoryx2 logs a warning per publish (a disk-filling flood on a
-  many-topic robot). Oracle: `CerulionPublisher::notify_undelivered_count()`
+- **Self-drain**: the notifier delivers to EVERY listener on a topic's event service,
+  including the publisher's own (each `CerulionPublisher` owns one for
+  `SubscriberConnected`). `loan_proxy` and `publish_raw` both call
+  `check_subscriber_events()`, which is GATED on the topic's live listener count: a
+  change in that count arms a bounded run of drains, a drain that sees a transition
+  disarms it, and a steady topic pays one relaxed load per publish. Under iceoryx2
+  0.9.1 the drain was unconditional because an undrained listener filled its own
+  AF_UNIX socket, after which every notify failed and was logged once per publish (a
+  disk-filling flood on a many-topic robot); 0.10 removed that failure mode, and the
+  remaining job of the call is late-joiner history. Oracle for a notify that does not
+  reach every listener: `CerulionPublisher::notify_undelivered_count()`
   (log-level-independent); off-thread via `NodeHandle::notify_undelivered_count(output)`.
-  Pinned by `notify_self_drain_iox2_test` (includes the anti-tautology arm proving
-  saturation is real).
+  Pinned by `notify_shortfall_iox2_test`, whose apparatus arm kills a consumer process
+  to prove the condition is still reachable.
 - **Notify elision**: the per-publish notify is skipped while the topic's live listener
   count equals the count the runtime has proven it owns; over- or under-count both fail
   safe to never-elide. A foreign listener attaching resumes notifies within one publish
@@ -131,7 +135,7 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 
 ## Provisioning
 
-- iceoryx2 0.9.1 pool formula (`service/static_config/publish_subscribe.rs`):
+- iceoryx2 pool formula (`service/static_config/publish_subscribe.rs`):
   `samples_per_segment = max_subscribers × (buffer + borrowed) + history + loaned`.
   Slots are refcount-shared across connections; the `× max_subscribers` term is a
   worst-case wait-free bound.
@@ -368,13 +372,31 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   `lz4_flex` requirement against the RUSTSEC-2026-0041 patched ranges (the requirement
   is `zenoh = "1"`, so bumps are lockfile-only).
 
-## iceoryx2 0.9.1 platform facts (source-verified; pinned `=0.9.1` exactly)
+## iceoryx2 0.10.0 platform facts (source-verified; pinned `=0.10.0` exactly)
 
-- Events are AF_UNIX SOCK_DGRAM sockets on every target; every wake is a kernel
-  crossing; there is no SHM word to monitor-wait on (hence Cerulion's own doorbell, see
-  the scheduler dossier). On Linux, dgram queueing is charged to the SENDER (raising
-  the receiver's SO_RCVBUF is a measured no-op); macOS/BSD charge receiver-side. Any
-  "socket buffer" fix must state which side the target kernel charges.
+- An event is a shared-memory counting bitset plus a one-byte AF_UNIX SOCK_DGRAM
+  doorbell. The event id and its repeat count live in the bitset; the datagram carries
+  no id and exists only to wake a blocked waiter. Every wake is still a kernel crossing
+  and there is still no SHM word to monitor-wait on (hence Cerulion's own doorbell, see
+  the scheduler dossier).
+- A notify whose doorbell buffer is FULL is swallowed, not refused, and a notify into a
+  listener that already holds an unconsumed wake skips the send entirely. So an
+  undrained listener costs a producer LESS than a drained one, and it can never
+  degrade into a per-publish failure. Under 0.9.1 the id rode in the datagram and an
+  undrained listener filled its socket, after which every notify failed and was logged
+  once per publish; several drains in this tree existed only for that and are gone.
+- A listener walks one bitset entry per id in the service's `event_id_max_value` space
+  on EVERY wait, whatever is pending. The library default is 255; every Cerulion event
+  service is created with the highest id the transport mints (6), which is what makes a
+  poll that finds nothing cheap. A creation site that omits it restores the wide walk
+  for every later opener of that service, so `event_id_ceiling_iox2_test` walks the
+  source for one.
+- The wait API is `Listener::{try,timed,blocking}_wait(callback)`: one call empties the
+  queue, the callback fires once per DISTINCT id carrying a repeat `count`, and the
+  return value is the number of activations delivered. Counting callback invocations is
+  NOT counting notifies; read `count`.
+- The stale resources of a dead port now include its on-disk port tag, so a publisher
+  destroyed while a loaned sample was leaked no longer strands its node directory.
 - There is NO native receiver-side drop counter; eviction is silent in the sender's
   overflow queue. Drop accounting is inferred from wire-sequence gaps (Cerulion stamps
   `sequence` per publisher). Subscriber queues are per-(publisher,subscriber)
@@ -402,11 +424,18 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 - macOS select() path: any fd NUMBER >= 1024 entering a WaitSet aborts the process (the
   fd number, not the count). Host-attached fds are guarded; iceoryx2's internal fds are
   not; keep macOS many-topic recordings modest until the upstream kqueue fix.
-- A resident `*_node.global_mgmt.shm_state` segment from a DIFFERENT iceoryx2 version
-  blocks node creation with an opaque `InternalError`/`VersionMismatch`; it lives
-  outside the usual SHM root and survives prefix-scoped sweeps. Crashed runs also leave
-  stale `*.event` sockets under `/tmp/iceoryx2/` (not `/dev/shm`); every publish then
-  logs an undeliverable-notify warning per dead listener; sweep both locations.
+- The global management segment's name carries the iceoryx2 version:
+  `<prefix><id>_node.0_10_0.global_mgmt`. Two iceoryx2 versions on one machine therefore
+  keep SEPARATE node registries and cannot see each other's services at all, with no
+  error on either side. The discriminator is the PATCH level, so a future 0.10.1 fleet
+  would partition from a 0.10.0 one the same way. The practical rule is that every
+  Cerulion process and every node library on a machine must be built against the same
+  `cerulion_core`, which `CERULION_ABI_VERSION` now refuses at load. The mapping lives
+  outside the usual SHM root (`/tmp/`, whatever `root_path` says) and is reclaimed by
+  the `.shm_state` walk, which is keyed on the config PREFIX and is unaffected by the
+  version in the middle of the name (`isolated_root_evidence_test`). Crashed runs also
+  leave stale `*.event` sockets under `/tmp/iceoryx2/` (not `/dev/shm`); sweep both
+  locations.
 - `generate_isolated_config()` mints a unique prefix baked into both service paths and
   the node-monitoring registry; a subprocess child must deserialize and reuse the
   parent's exact `Config`. `ipc_threadsafe::Service` is what makes ports `Send`
@@ -417,7 +446,7 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 | Test file | Pins |
 |---|---|
 | `output_proxy_test.rs` | proxy/view round-trips; commit-time sequence; discard-count observability |
-| `notify_self_drain_iox2_test.rs` | publisher self-drain on `publish_raw`; latch lifecycle |
+| `notify_shortfall_iox2_test.rs` | undelivered-notify accounting; a killed consumer as the apparatus; latch lifecycle |
 | `notify_elision_iox2_test.rs` + `notify_elision_resweep_iox2_test.rs` | elision self-heal gate; boundary resweep debt semantics |
 | `data_only_tap_iox2_test.rs` | listener-less tap; non-consuming `has_samples()` |
 | `topic_liveness_iox2_test.rs` | dating rule, baselines, epoch reset, rate estimate (observer plane) |

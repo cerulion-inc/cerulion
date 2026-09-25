@@ -81,6 +81,26 @@ enum NotifyListenerCount {
     ReadHere,
 }
 
+/// Calls to [`CerulionPublisher::check_subscriber_events`] that keep draining
+/// the publisher's own event listener after the topic's live listener count
+/// moves.
+///
+/// Exactly one would race. The count rises when a late joiner's `Listener` is
+/// created, and its `SubscriberConnected` notify lands after that, so a single
+/// gated drain can fall in the window between the two, see nothing, and never
+/// look again. Staying armed across a run of calls closes that window: on the
+/// quiescent-publisher path the runtime's `pump_history` cadence spends this
+/// budget over as many steps, and on a publishing path a drain that observes a
+/// transition clears the arming immediately.
+///
+/// The bound is what stops the opposite failure. A listener that attaches or
+/// dies WITHOUT ever sending a transition — a foreign observer, a consumer that
+/// crashed — would otherwise arm every publish for the life of the process.
+/// While armed the cost is what every publish paid before this gate existed, so
+/// the budget is set well past any plausible create-then-notify gap rather than
+/// trimmed: it is spent only when the listener count actually moves.
+const SELF_DRAIN_ARMED_CALLS: u8 = 64;
+
 /// Zero-copy publisher for a single topic.
 ///
 /// Holds an iceoryx2 data publisher, an event notifier (to signal subscribers),
@@ -113,6 +133,16 @@ pub struct CerulionPublisher {
     publisher: Publisher<CerService, [u8], ()>,
     notifier: Notifier<CerService>,
     listener: Listener<CerService>,
+    /// Live listener count on this topic's event service as of the last
+    /// [`Self::check_subscriber_events`] — the cheap gate on the per-publish
+    /// self drain. `usize::MAX` until the first call, so the first publish
+    /// always drains.
+    last_listener_count: usize,
+    /// Armed self drains still owed. A change in `last_listener_count` sets it
+    /// to [`SELF_DRAIN_ARMED_CALLS`]; a drain that observes a subscriber
+    /// transition clears it early. While zero, a publish costs one relaxed load
+    /// instead of a listener drain.
+    self_drains_armed: u8,
     sequence: AtomicU32,
     /// The value `sequence` was CONSTRUCTED with — 0 on every
     /// live path, and the recorded stream's next sequence on a restored replay.
@@ -411,13 +441,14 @@ pub struct CerulionPublisher {
     /// this counter is also the storm oracle (`N` silent passes ⇒ still 1).
     /// `None` when elision is not armed (armed together with the elided counter).
     resweep_notify_count: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// Flood-suppression latch + log-level-independent counter for
-    /// notifies that could NOT be delivered to every live listener (a saturated
-    /// `AF_UNIX SOCK_DGRAM` event socket ⇒ iceoryx2
-    /// `NotifierNotifyError::FailedToDeliverSignal`). Always armed — see
-    /// [`NotifyDeliveryLatch`] for why this signal must exist on OUR side once
-    /// `IOX2_LOG_LEVEL=error` correctly filters iceoryx2's own per-publish
-    /// `warn!`. Read via [`Self::notify_undelivered_count`].
+    /// Flood-suppression latch + log-level-independent counter for notifies
+    /// that could NOT be delivered to every live listener (a consumer whose
+    /// process died without deregistering, so its doorbell has no reader while
+    /// its registration stands). Always armed — see [`NotifyDeliveryLatch`] for
+    /// why this signal must exist on OUR side once `IOX2_LOG_LEVEL=error`
+    /// correctly filters iceoryx2's own complaint, and for the condition the
+    /// latch was built for that iceoryx2 0.10 made unreachable. Read via
+    /// [`Self::notify_undelivered_count`].
     notify_delivery_latch: NotifyDeliveryLatch,
     /// SHARED mirror of [`notify_delivery_latch`](Self::notify_delivery_latch)'s
     /// `total_undelivered`, so the count is observable EXTERNALLY
@@ -558,6 +589,10 @@ impl CerulionPublisher {
             publisher: config.publisher,
             notifier: config.notifier,
             listener: config.listener,
+            // `usize::MAX` can never equal a real listener count, so the first
+            // publish always drains and establishes the baseline.
+            last_listener_count: usize::MAX,
+            self_drains_armed: 0,
             sequence: AtomicU32::new(config.initial_sequence),
             initial_sequence: config.initial_sequence,
             clock: config.clock,
@@ -2151,35 +2186,34 @@ impl CerulionPublisher {
         // for graph outputs / service / rmw — they notify on their own schedule,
         // so this never double-notifies.
         if self.notify_on_publish_raw {
-            // Drain OUR OWN event listener before
-            // notifying. iceoryx2's `notify_with_custom_event_id` passes
-            // `skip_self_deliver = false`, so a notify is delivered to EVERY
-            // listener on the topic's event service — including this
-            // publisher's own (every `CerulionPublisher` owns one, to hear
-            // `SubscriberConnected`). The typed loan path drains it on every
-            // `loan_proxy` (see the `check_subscriber_events()` call there);
-            // `publish_raw` did NOT, so once this notify was armed the
-            // publisher started filling its OWN `AF_UNIX SOCK_DGRAM` socket:
-            // after a few hundred publishes it is full and EVERY subsequent
-            // notify fails with `FailedToDeliverSignal`, which iceoryx2 logs
-            // once per publish. On a Go2 `cerulion graph run attach`
-            // (~90 `RawIngressRoute`s, each a `create_ingress_publisher` +
-            // `publish_raw`) that is ~2500 lines/s ≈ 5 MB/s, enough to fill the
-            // root disk. Draining here keeps our own queue at ≤1 event and
-            // costs nothing on the zero-copy loan hot path (this branch is
-            // raw-ingress only).
+            // Service any subscriber transition before notifying, the same
+            // call the typed loan path makes. iceoryx2's
+            // `notify_with_custom_event_id` passes `skip_self_deliver = false`,
+            // so a notify is delivered to EVERY listener on the topic's event
+            // service, this publisher's own included (every
+            // `CerulionPublisher` owns one, to hear `SubscriberConnected`).
             //
-            // `check_subscriber_events` rather than a bare `try_wait_one` loop
-            // because it is the ONE drain primitive that also CLASSIFIES what
-            // it pulled — the same call `loan_proxy` makes, so there is one
-            // drain path to reason about instead of a second bespoke one. Be
-            // precise about its `SubscriberConnected` arm here: the only
-            // publishers reaching this branch are `create_ingress_publisher`'s
-            // (the sole `arm_publish_raw_notify` caller) and those are built
-            // with `history_size = 0`, so the `deliver_history` it drives is a
-            // no-op TODAY. It is not dead weight — it is what keeps this drain
-            // correct if an ingress publisher ever requests history — but it is
-            // not the reason to prefer this call over a raw drain.
+            // This call used to drain that listener on EVERY raw publish, and
+            // under iceoryx2 0.9.1 it had to: an undrained listener filled its
+            // own `AF_UNIX SOCK_DGRAM` socket within a few hundred publishes,
+            // after which every notify failed and was logged once per publish
+            // (~90 raw ingress routes on an attached robot, ~2500 lines/s,
+            // ~5 MB/s, enough to fill a root disk). 0.10 removed that failure
+            // at the source, so `check_subscriber_events` is now gated on the
+            // topic's live listener count and does nothing at all on a steady
+            // topic — see its own doc for the gate and for the race it arms
+            // across.
+            //
+            // `check_subscriber_events` rather than a bare listener drain
+            // because it is the ONE primitive that also CLASSIFIES what it
+            // pulled, so there is one path to reason about instead of a second
+            // bespoke one. Be precise about its `SubscriberConnected` arm here:
+            // the only publishers reaching this branch are
+            // `create_ingress_publisher`'s (the sole `arm_publish_raw_notify`
+            // caller) and those are built with `history_size = 0`, so the
+            // `deliver_history` it drives is a no-op TODAY. It is not dead
+            // weight — it is what keeps this call correct if an ingress
+            // publisher ever requests history.
             self.check_subscriber_events();
             let _ = self.notify_sent_sample();
         } else {
@@ -2210,21 +2244,74 @@ impl CerulionPublisher {
     /// rmw bridge publish via `publish_raw` / `send_raw_loan` + notify and
     /// must drain their own listener to service late joiners.
     pub fn check_subscriber_events(&mut self) {
-        loop {
-            match self.listener.try_wait_one() {
-                Ok(Some(event_id)) => match PubSubEvent::try_from(event_id) {
-                    Ok(PubSubEvent::SubscriberConnected) => {
-                        tracing::debug!(topic = %self.topic, "subscriber connected");
-                        self.deliver_history();
-                    }
-                    Ok(PubSubEvent::SubscriberDisconnected) => {
-                        tracing::debug!(topic = %self.topic, "subscriber disconnected");
-                    }
-                    _ => {}
-                },
-                Ok(None) => break, // No more events
-                Err(_) => break,   // Listener error, stop polling
-            }
+        // iceoryx2 0.10: gate the drain on the topic's LIVE listener count.
+        //
+        // This function's only action is `deliver_history()` on a
+        // `SubscriberConnected`, which happens when a subscriber attaches and
+        // at no other time — yet it ran a full listener drain on EVERY
+        // `loan_proxy` and every `publish_raw`. Under iceoryx2 0.9.1 the
+        // unconditional drain had a second job: an undrained listener filled
+        // its datagram socket, after which every later notify from any
+        // publisher on the topic failed and logged. 0.10 removed that hazard at
+        // the source, so the drain is now paying two `recvmsg` calls, two
+        // sequentially consistent atomic operations and a counting-bitset walk
+        // per publish to ask a question whose answer is almost always no.
+        //
+        // The gate is `number_of_listeners()` on the event service the
+        // publisher already holds — `self.listeners.len()` on a shared-memory
+        // container, one relaxed load. A `CerulionSubscriber` bundles a
+        // listener, so any late joiner owed history moves that count. A
+        // listener-less `DataOnlySubscriber` does not move it and does not need
+        // to: iceoryx2's own `update_connections()` inside the next `send()`
+        // flushes retained history into a new tap.
+        //
+        // A count change ARMS several drains rather than one, because the
+        // count rises when the subscriber's listener is created and the
+        // `SubscriberConnected` notify lands after it — a single gated drain
+        // could fall in that window and see nothing. Staying armed until a
+        // transition is actually observed closes that race; the bounded count
+        // is what stops a listener that attaches or dies WITHOUT an event (a
+        // foreign observer, a crashed consumer) from arming every later publish
+        // forever. While disarmed the cost is the one load.
+        let live = self.event_service.dynamic_config().number_of_listeners();
+        if live != self.last_listener_count {
+            self.last_listener_count = live;
+            self.self_drains_armed = SELF_DRAIN_ARMED_CALLS;
+        }
+        if self.self_drains_armed == 0 {
+            return;
+        }
+        self.self_drains_armed -= 1;
+        // One `try_wait` empties the queue. Its callback borrows `self.listener`
+        // for the whole call while `deliver_history()` below needs `&mut self`,
+        // so the callback only FLAGS what it saw and the act happens after the
+        // drain returns.
+        let mut connected = false;
+        let mut disconnected = false;
+        // A listener error is still "stop polling": nothing is flagged.
+        let _ = self
+            .listener
+            .try_wait(|activation| match PubSubEvent::try_from(activation.id) {
+                Ok(PubSubEvent::SubscriberConnected) => connected = true,
+                Ok(PubSubEvent::SubscriberDisconnected) => disconnected = true,
+                _ => {}
+            });
+        if connected || disconnected {
+            // The transition this arming was waiting for: stop draining on
+            // every publish until the listener count moves again.
+            self.self_drains_armed = 0;
+        }
+        if connected {
+            tracing::debug!(topic = %self.topic, "subscriber connected");
+            // ONE `deliver_history()` per drain, where 0.9.1 ran one per queued
+            // `SubscriberConnected`. `deliver_history` drives iceoryx2's
+            // `update_connections()`, which services EVERY newly-connected
+            // subscriber in one call, so N connects in one batch still get their
+            // history from one call.
+            self.deliver_history();
+        }
+        if disconnected {
+            tracing::debug!(topic = %self.topic, "subscriber disconnected");
         }
     }
 
@@ -2644,6 +2731,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
         publisher,
         notifier,
         listener,
+        last_listener_count,
+        self_drains_armed,
         sequence,
         initial_sequence,
         clock,
@@ -2706,6 +2795,24 @@ mod notify_elision_gate_tests {
     use super::*;
     use crate::transport::{TransportConfig, TransportManager};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    /// Drain a raw event listener, returning one entry per NOTIFY.
+    ///
+    /// iceoryx2 0.10 calls the drain callback once per DISTINCT event id,
+    /// carrying how many times that id was activated since the last drain,
+    /// where 0.9.1's socket queue held one datagram per notify and was popped
+    /// one at a time. Expanding by `count` keeps these oracles counting
+    /// notifies, which is what they are about; reading the number of CALLBACK
+    /// invocations instead would silently collapse a burst to one.
+    fn drain_notifies(listener: &Listener<CerService>) -> Vec<iceoryx2::prelude::EventId> {
+        let mut seen = Vec::new();
+        let _ = listener.try_wait(|activation| {
+            for _ in 0..activation.count {
+                seen.push(activation.id);
+            }
+        });
+        seen
+    }
 
     #[test]
     fn elision_gate_skips_the_real_notify_and_self_heals_at_the_boundary() {
@@ -2830,7 +2937,7 @@ mod notify_elision_gate_tests {
     /// receives the `SentSample`); a "did not notify since the last boundary"
     /// trigger fails the SILENT-PASS arm (the resweep
     /// fire count climbs with the passes instead of staying at the frame count).
-    /// Truthful observables: the foreign listener's own `try_wait_one()`, and
+    /// Truthful observables: the foreign listener's own drained events, and
     /// the shared `resweep` fire counter the runtime exposes to tests.
     #[test]
     fn resweep_announces_each_unannounced_frame_once_and_a_silent_pass_never() {
@@ -2905,7 +3012,7 @@ mod notify_elision_gate_tests {
         let foreign = mgr
             .create_trigger_listener_for_test(topic, mgr.default_topic_config())
             .expect("attach a foreign listener on the topic's event service");
-        while foreign.try_wait_one().ok().flatten().is_some() {}
+        drain_notifies(&foreign);
 
         // HEADLINE (the LATE-ATTACH heal): the debt survived, the listener is
         // here, so the boundary announces it. The exact wake the per-publish path
@@ -2920,14 +3027,12 @@ mod notify_elision_gate_tests {
         // The foreign listener actually received the SentSample event — the wake
         // that unblocks a `topic hz`. (A no-op resweep leaves this
         // `None`.)
-        let event = foreign
-            .try_wait_one()
-            .expect("listener wait ok")
-            .expect("the boundary sweep's notify reached the foreign listener");
+        let seen = drain_notifies(&foreign);
         assert_eq!(
-            event,
-            crate::transport::events::PubSubEvent::SentSample.into(),
-            "the boundary wake is a SentSample event (a data wake, not history)"
+            seen,
+            vec![crate::transport::events::PubSubEvent::SentSample.into()],
+            "the boundary sweep's notify must reach the foreign listener, exactly once, \
+             as a SentSample event (a data wake, not history)"
         );
 
         // The sweep is NOT a publish — the elided counter is still untouched.
@@ -2959,7 +3064,7 @@ mod notify_elision_gate_tests {
              trigger is an un-announced frame, never a quiet pass)"
         );
         assert!(
-            foreign.try_wait_one().ok().flatten().is_none(),
+            drain_notifies(&foreign).is_empty(),
             "and the foreign listener received nothing across all of them"
         );
 
@@ -2976,7 +3081,7 @@ mod notify_elision_gate_tests {
             publisher.resweep_notify_elision() >= 1,
             "a NEW un-announced frame (off-gate publish_raw) must be announced"
         );
-        while foreign.try_wait_one().ok().flatten().is_some() {}
+        drain_notifies(&foreign);
         assert_eq!(
             publisher.resweep_notify_elision(),
             0,
@@ -2994,7 +3099,7 @@ mod notify_elision_gate_tests {
             n >= 1,
             "per-publish path notifies while foreign present (got {n})"
         );
-        while foreign.try_wait_one().ok().flatten().is_some() {} // drain that wake
+        drain_notifies(&foreign); // drain that wake
         assert_eq!(
             publisher.resweep_notify_elision(),
             0,
@@ -3002,7 +3107,7 @@ mod notify_elision_gate_tests {
              sweep must SKIP (no redundant second notify)"
         );
         assert!(
-            foreign.try_wait_one().ok().flatten().is_none(),
+            drain_notifies(&foreign).is_empty(),
             "the skipped boundary sweep fired NO notify to the foreign listener"
         );
 
@@ -3052,14 +3157,14 @@ mod notify_elision_gate_tests {
         let foreign = mgr
             .create_trigger_listener_for_test("resweep_unarmed/out", mgr.default_topic_config())
             .expect("attach a foreign listener");
-        while foreign.try_wait_one().ok().flatten().is_some() {}
+        drain_notifies(&foreign);
         assert_eq!(
             publisher.resweep_notify_elision(),
             0,
             "an unarmed publisher's boundary sweep is a strict no-op"
         );
         assert!(
-            foreign.try_wait_one().ok().flatten().is_none(),
+            drain_notifies(&foreign).is_empty(),
             "the unarmed sweep fired NO notify to the foreign listener"
         );
         drop(foreign);
@@ -3347,36 +3452,42 @@ mod notify_delivery_wiring_tests {
         assert!(publisher.notify_delivery_latch.is_degraded());
     }
 
-    /// The boundary resweep FEEDS the latch — end to end over real
-    /// transport, with NO per-publish notify involved at any point.
+    /// The boundary resweep FEEDS the latch — end to end over real transport,
+    /// with NO per-publish notify involved at any point.
     ///
-    /// SCOPE: this pins that the resweep classifies its notify AT ALL.
-    /// It does NOT discriminate WHICH count the resweep passes: once the
-    /// foreign listener's socket is full every sweep falls short, so a variant
-    /// passing `ReadHere` instead of its already-read count would merely defer
-    /// the count by one sweep inside a 20_000-iteration loop and still pass.
-    /// The already-paid-count decision is pinned by
+    /// SCOPE: this pins that the resweep classifies its notify AT ALL. It does
+    /// NOT discriminate WHICH count the resweep passes; the already-paid-count
+    /// decision is pinned by
     /// `known_listener_count_is_always_classified_even_when_triggered_never_moves`,
     /// and the declared-timing decision by
     /// `declared_timing_governs_classification_not_the_presence_of_a_count`.
     ///
     /// This is the site the resweep's own docs call the one that matters most
     /// for the signal: it runs only when a FOREIGN listener is present and the
-    /// producer holds an UN-ANNOUNCED frame, so a saturated foreign listener on
-    /// a producer that never notifies for itself is observable HERE AND NOWHERE
-    /// ELSE.
+    /// producer holds an UN-ANNOUNCED frame, so a producer that never notifies
+    /// for itself is observable HERE AND NOWHERE ELSE.
     ///
-    /// The debt-keyed trigger changed WHAT this loop must do, not what it pins: the resweep
-    /// announces a DEBT, so each round has to create one. It does that the way
-    /// the shape actually arises in production — an off-gate `publish_raw` on a
-    /// publisher that is not `notify_on_publish_raw`-armed (the graph-output /
-    /// DDS-bridge raw-route shape, the resweep docs' case 2). A round that merely swept
-    /// again would now correctly do nothing.
+    /// Each round has to create a debt, the way the shape actually arises in
+    /// production: an off-gate `publish_raw` on a publisher that is not
+    /// `notify_on_publish_raw`-armed (the graph-output raw-route shape, the
+    /// resweep docs' case 2). A round that merely swept again would correctly
+    /// do nothing.
     ///
-    /// Truthful observable: the publisher's own listener is drained every round
-    /// (so it can never be the one missing), the foreign listener never is, and
-    /// the count moves only after the foreign listener's `AF_UNIX SOCK_DGRAM`
-    /// socket fills.
+    /// TRUTHFUL OBSERVABLE, and it moved. It used to be a SHORTFALL: leave the
+    /// foreign listener undrained, let its datagram socket fill, and watch the
+    /// undelivered count rise. iceoryx2 0.10 made that unreachable, because a
+    /// full doorbell is swallowed and a notify into an already-notified
+    /// listener skips the send, so a live listener is reached forever however
+    /// long it goes undrained (`notify_shortfall_iox2_test` measures that and
+    /// drives the condition that IS still reachable). Waiting for a shortfall
+    /// here would wait forever, and asserting its absence would pass whether or
+    /// not the resweep ever touched the latch.
+    ///
+    /// So the observable is the latch's own CLASSIFICATION state instead, which
+    /// is what "feeds the latch" meant all along: before the first sweep the
+    /// latch has never classified anything and says so, and after one sweep it
+    /// has classified that exact notify. A resweep wired past
+    /// `record_notify_delivery` leaves the sentinel standing and fails here.
     #[test]
     fn boundary_resweep_feeds_the_delivery_latch_on_a_quiescent_producer() {
         let mgr = test_manager("resweep_latch_test");
@@ -3390,7 +3501,8 @@ mod notify_delivery_wiring_tests {
             Arc::new(AtomicU64::new(0)),
         );
 
-        // A foreign listener (a `topic hz`-shaped attacher) that NOBODY drains.
+        // A foreign listener (a `topic hz`-shaped attacher), which is what makes
+        // the resweep fire at all: live 2 > expected 1.
         let foreign = mgr
             .create_trigger_listener_for_test(topic, mgr.default_topic_config())
             .expect("attach a foreign listener on the topic's event service");
@@ -3400,47 +3512,66 @@ mod notify_delivery_wiring_tests {
             0,
             "precondition: nothing undelivered before the sweeps start"
         );
+        // The sentinel: nothing has been classified, so the latch demands
+        // classification of ANY count. This is the anti-tautology half of the
+        // assertion below, which would otherwise pass on a latch nobody feeds.
+        assert!(
+            publisher.notify_delivery_latch.needs_classification(2),
+            "precondition: a publisher that has never notified must classify its \
+             next notify whatever it triggers"
+        );
 
-        // Drive ONLY the boundary sweep — the per-publish notify path never runs
-        // (an off-gate `publish_raw` on this publisher notifies nobody; it only
-        // records the debt). Each sweep therefore announces that debt (live 2 >
-        // expected 1); our own listener is drained every round, the foreign one
-        // is not.
+        // Drive ONLY the boundary sweep. The per-publish notify path never runs:
+        // an off-gate `publish_raw` on this publisher notifies nobody, it only
+        // records the debt the sweep then announces.
         // hot-path-alloc-ok: test-only fixture frame, built once outside any
         // measured window (this whole module is `#[cfg(test)]`).
         let mut frame = vec![0u8; WireHeader::SIZE];
         WireHeader::new(0xFEED_FACE, 0, 0).write_to_buf(&mut frame);
-        let mut swept = 0_usize;
-        let mut saturated = false;
-        for _ in 0..20_000 {
-            publisher.check_subscriber_events();
+        publisher
+            .publish_raw(&frame)
+            .expect("off-gate raw publish (creates the un-announced debt)");
+        let triggered = publisher.resweep_notify_elision();
+        assert_eq!(
+            triggered, 2,
+            "the boundary sweep must fire a real notify reaching BOTH listeners \
+             while a foreign one is present and a frame is un-announced"
+        );
+
+        // THE PIN: that notify went through `record_notify_delivery`, so the
+        // latch now holds this classification and no longer demands one for the
+        // same count. A resweep that notified without classifying leaves the
+        // sentinel and fails here.
+        assert!(
+            !publisher
+                .notify_delivery_latch
+                .needs_classification(triggered),
+            "the boundary sweep's notify must be CLASSIFIED by the delivery latch, \
+             not merely sent: this is the only site that observes a quiescent \
+             producer's foreign listener at all"
+        );
+        // And it was classified HEALTHY: the notify reached every listener the
+        // service reports, so no regime opened and nothing was counted.
+        assert!(
+            !publisher.notify_delivery_latch.is_degraded(),
+            "a notify that reached every listener must not open a degraded regime"
+        );
+        assert_eq!(
+            publisher.notify_undelivered_count(),
+            0,
+            "and must not be counted as undelivered"
+        );
+
+        // Repeating it is still classified and still healthy, so the first round
+        // was not a one-off of the sentinel.
+        for _ in 0..16 {
             publisher
                 .publish_raw(&frame)
-                .expect("off-gate raw publish (creates the un-announced debt)");
-            let triggered = publisher.resweep_notify_elision();
-            swept += 1;
-            assert!(
-                triggered >= 1,
-                "the boundary sweep must fire a real notify while a foreign \
-                 listener is present and a frame is un-announced"
-            );
-            if publisher.notify_undelivered_count() > 0 {
-                saturated = true;
-                break;
-            }
+                .expect("off-gate raw publish (a fresh debt)");
+            assert_eq!(publisher.resweep_notify_elision(), 2);
         }
-
-        assert!(
-            saturated,
-            "after {swept} boundary sweeps with the foreign listener never drained, \
-             its event socket must be full and the resweep's notify must start \
-             falling short — got 0, so either the platform's socket is unexpectedly \
-             unbounded or the resweep no longer feeds the delivery latch"
-        );
-        assert!(
-            publisher.notify_delivery_latch.is_degraded(),
-            "the resweep's shortfall opens a real regime, not a silent count"
-        );
+        assert!(!publisher.notify_delivery_latch.is_degraded());
+        assert_eq!(publisher.notify_undelivered_count(), 0);
         drop(foreign);
     }
 }

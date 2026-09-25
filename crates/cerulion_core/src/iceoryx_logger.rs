@@ -29,11 +29,11 @@ use iceoryx2_log::{Log, LogLevel};
 /// Cerulion's default iceoryx2 log level.
 ///
 /// `Error` — iceoryx2's own `warn!`s are operational chatter on a healthy
-/// system (stale listener notifications, "no config file was loaded", failed
-/// notifies to a saturated listener), and one of them
-/// (`iceoryx2-0.9.1/src/port/notifier.rs:525`, `FailedToDeliverSignal`) is
-/// emitted once per publish per stuck listener connection — a measured
-/// ~2500 lines/s ≈ 5 MB/s in production. `error!` and `fatal!` still surface.
+/// system (stale listener notifications, "no config file was loaded", a port
+/// ceiling clamped to its minimum), and the class is emitted from paths that
+/// run per publish, which is how one of them reached a measured ~2500 lines/s
+/// ≈ 5 MB/s in production and filled a root disk. `error!` and `fatal!` still
+/// surface.
 ///
 /// This is the SAME value the generated workspace's `.cargo/config.toml`
 /// documents (`IOX2_LOG_LEVEL = "error"`), the value

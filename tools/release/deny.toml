@@ -32,7 +32,6 @@ ignore = [
     # transitively - it cannot be updated away from this side. Revisit
     # when upstream dependencies migrate off `paste`.
     { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, compile-time only, transitive" },
-    { id = "RUSTSEC-2026-0294", reason = "iceoryx2-bb-container 0.9.1: the unsound String::as_mut_bytes and deref_mut are never called by this workspace (no call site; the transport is used through iceoryx2 0.9.1's public services), and every iceoryx2 crate is pinned to 0.9.1 by the version-lockstep test; lifted with the iceoryx2 0.10 migration" },
     # Net2 is UNMAINTAINED-class (deprecated in favor of socket2),
     # NOT a fixable vulnerability. It reaches us through the cerulion_dds DDS
     # discovery path: {cerulion-rustdds 0.14.2, mio-extras} -> mio 0.6.23 ->

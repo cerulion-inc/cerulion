@@ -60,7 +60,7 @@ native_ros2_messages = { path = "../native_ros2_messages" }
 # pin as cerulion_core's) and read the transport's test-only registration
 # seams — both behind cerulion_core's `test-helpers` feature.
 cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
-iceoryx2 = "=0.9.1"
+iceoryx2 = "=0.10.0"
 # Self-reference: turns `test-seams` ON for this crate's own test targets (see
 # the `[features]` note). Path-only, no `version`, so it can never become a
 # publish-time cycle (this crate is `publish = false` anyway).

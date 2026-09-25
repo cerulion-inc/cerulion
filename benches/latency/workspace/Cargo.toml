@@ -10,7 +10,7 @@
 #
 # This workspace has its OWN Cargo.lock (committed — see ../../latency
 # README + PITFALLS: the iceoryx2 dependency family MUST resolve to exactly
-# one version, =0.9.1, in every lockfile; a binary<->cdylib patch skew breaks
+# one version, =0.10.0, in every lockfile; a binary<->cdylib patch skew breaks
 # the SHM event protocol silently — the class).
 [workspace]
 members = ["nodes/*", "pod_schema"]

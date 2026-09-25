@@ -266,7 +266,6 @@ fn the_walk_reads_the_code_it_claims_to_read() {
 // ---------------------------------------------------------------------------
 
 use cerulion_cli_engine::ipc_cleanup::{classify_cleanup_failures, FailedNodeCleanup};
-use cerulion_cli_engine::orphan_port_tags::{OrphanTagReclaim, ReclaimVerdict};
 use cerulion_core::iceoryx_logger::CapturedLog;
 use iceoryx2::prelude::LogLevel;
 
@@ -394,8 +393,8 @@ fn the_clean_verb_prints_the_listing_between_the_breakdown_and_the_unclassified_
     // internal-error remediation points DOWN at the listing, so the
     // listing must follow it, and the unclassified hint closes the report.
     let src = code_only(&read_main());
-    // The printing lives in `report_sweep` because the orphan-tag reclaim makes
-    // `clean_dead_nodes` run TWO sweeps through one reporter.
+    // The printing lives in `report_sweep`, the one reporter
+    // `clean_dead_nodes` goes through.
     let body = fn_body(&src, "report_sweep");
     let breakdown = body
         .find("Failure breakdown:")
@@ -500,308 +499,6 @@ fn each_renderer_is_handed_the_reports_own_field_never_an_empty_slice() {
         sig.contains("(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport)"),
         "the reporter takes the sweep report as `report`; signature was:\n{sig}"
     );
-
-    // Same class, one function over: the reclaim renderer is handed the
-    // reclaim outcomes and the operator's flag, never a literal.
-    let verb = fn_body(&src, "clean_dead_nodes");
-    assert_eq!(
-        call_args(&verb, "render_orphan_tag_reclaims"),
-        "&reclaims, report_only",
-        "the reclaim listing must render the reclaim outcomes under the operator's flag; body \
-         was:\n{verb}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// The orphan port-tag reclaim: a dead node whose directory holds nothing but
-// the tags of ports it had already deregistered (a publisher destroyed while
-// a loaned sample was leaked) fails every sweep at the final `rmdir`, so
-// `cerulion clean` reclaims the tags and sweeps once more. The renderer is
-// PURE and pinned against hand oracles; the wiring — WHICH sweep feeds the
-// selector, that the reclaim sits BETWEEN the two sweeps, that `--report-only`
-// travels as the dry-run bit, and that the convergence the `.shm_state` gate
-// sees is the SECOND sweep's — is a source walk for the same reason the arms
-// above are: the real thing deletes from the developer's `/tmp/iceoryx2`.
-// The behavioural half over a REAL minted shape is
-// `crates/cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs`.
-// ---------------------------------------------------------------------------
-
-fn reclaim(node_id: u128, pid: u32, removed: &[u128], refused: Option<&str>) -> OrphanTagReclaim {
-    OrphanTagReclaim {
-        node: format!(
-            "UniqueNodeId(UniqueSystemId {{ value: {node_id}, pid: {pid}, creation_time: 0 }})"
-        ),
-        node_id,
-        pid,
-        dir: std::path::PathBuf::from(format!("/tmp/iceoryx2/nodes/{node_id}")),
-        removed: removed.to_vec(),
-        verdict: match refused {
-            Some(reason) => ReclaimVerdict::Refused(reason.to_string()),
-            None => ReclaimVerdict::Reclaimed,
-        },
-    }
-}
-
-#[test]
-fn an_already_empty_directory_renders_as_converged_pending_sweep_never_as_a_refusal() {
-    // The truthful line is kept — the directory IS empty and the next sweep IS
-    // what removes it — but it is not a "not reclaimed" line: the node is
-    // converged pending sweep, and the second sweep the verb runs right after
-    // this listing is the one that removes it.
-    let empty = OrphanTagReclaim {
-        verdict: ReclaimVerdict::AlreadyEmpty,
-        ..reclaim(4242, 77, &[], None)
-    };
-    for report_only in [false, true] {
-        let lines = super::render_orphan_tag_reclaims(std::slice::from_ref(&empty), report_only);
-        assert_eq!(
-            lines[1],
-            "node 4242 (pid 77, process gone): directory already empty — nothing to reclaim; the \
-             next sweep removes it",
-            "report_only={report_only}"
-        );
-        assert!(
-            !lines[1].contains("not reclaimed") && !lines[1].contains("removed 0"),
-            "neither a refusal nor a phantom removal: {lines:?}"
-        );
-    }
-}
-
-#[test]
-fn a_reclaimed_node_renders_its_pid_the_gone_verdict_and_every_removed_port_id() {
-    let lines = super::render_orphan_tag_reclaims(&[reclaim(4242, 77, &[1, 22], None)], false);
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(
-        lines[0].starts_with("Reclaiming orphan port tags"),
-        "{lines:?}"
-    );
-    assert_eq!(
-        lines[1],
-        "node 4242 (pid 77, process gone): directory not empty — removed 2 orphan port tag(s) [1, 22]"
-    );
-}
-
-#[test]
-fn report_only_says_would_remove_and_closes_with_the_nothing_removed_line() {
-    let lines = super::render_orphan_tag_reclaims(&[reclaim(4242, 77, &[1], None)], true);
-    assert_eq!(lines.len(), 3, "{lines:?}");
-    assert!(
-        lines[0].contains("report only") && lines[0].contains("nothing removed"),
-        "{lines:?}"
-    );
-    assert_eq!(
-        lines[1],
-        "node 4242 (pid 77, process gone): directory not empty — would remove 1 orphan port tag(s) [1]"
-    );
-    assert!(
-        !lines.iter().any(|l| l.contains(" removed 1 ")),
-        "a report must never claim a removal: {lines:?}"
-    );
-    assert!(lines[2].contains("without `--report-only`"), "{lines:?}");
-}
-
-#[test]
-fn a_refusal_renders_the_reason_and_never_claims_the_gone_verdict() {
-    let lines = super::render_orphan_tag_reclaims(
-        &[reclaim(4242, 77, &[], Some("process 77 is still alive"))],
-        false,
-    );
-    assert_eq!(
-        lines[1],
-        "node 4242 (pid 77): not reclaimed — process 77 is still alive"
-    );
-    assert!(!lines[1].contains("process gone"), "{lines:?}");
-
-    // A mid-way failure states what WAS removed rather than hiding it.
-    let lines = super::render_orphan_tag_reclaims(
-        &[reclaim(4242, 77, &[5], Some("removing `x` failed: boom"))],
-        false,
-    );
-    assert_eq!(
-        lines[1],
-        "node 4242 (pid 77): not fully reclaimed — removing `x` failed: boom; 1 tag(s) removed \
-         before the failure [5]"
-    );
-}
-
-#[test]
-fn no_candidates_render_nothing_at_all() {
-    assert_eq!(
-        super::render_orphan_tag_reclaims(&[], false),
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        super::render_orphan_tag_reclaims(&[], true),
-        Vec::<String>::new()
-    );
-}
-
-#[test]
-fn the_clean_verb_reclaims_orphan_tags_between_exactly_two_sweeps() {
-    let src = code_only(&read_main());
-    let body = fn_body(&src, "clean_dead_nodes");
-    let sweep = "cleanup_dead_iceoryx2_nodes_with_diagnostics()";
-    let sweeps: Vec<usize> = body.match_indices(sweep).map(|(i, _)| i).collect();
-    assert_eq!(
-        sweeps.len(),
-        2,
-        "the verb runs the first sweep, reclaims, and runs ONE more; body was:\n{body}"
-    );
-    let select = body
-        .find("orphan_port_tag_candidates(")
-        .expect("the verb must select candidates from the first sweep's refusals");
-    let reclaim = body
-        .find("reclaim_orphan_port_tags(")
-        .expect("the verb must reclaim the candidates");
-    let render = body
-        .find("render_orphan_tag_reclaims(")
-        .expect("the verb must print the reclaim outcome");
-    assert!(
-        sweeps[0] < select && select < reclaim && reclaim < render && render < sweeps[1],
-        "sweep, select, reclaim, print, sweep again — in that order; body was:\n{body}"
-    );
-    // Both sweeps print through the ONE reporter, and EACH report is tied to
-    // ITS sweep: the first sweep's binding precedes its report, the second's
-    // binding precedes the second report, and there is no third. A count of
-    // two `report_sweep(` calls alone is satisfied by printing the FIRST
-    // report twice and never the second.
-    let first_bind = body
-        .find("let report = ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics();")
-        .expect("the first sweep is bound to `report`");
-    let first_report = body
-        .find("report_sweep(&report)")
-        .expect("the first sweep's report is printed");
-    let second_bind = body
-        .find("let second = ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics();")
-        .expect("the second sweep is bound to `second`");
-    let second_report = body
-        .find("report_sweep(&second)")
-        .expect("the second sweep's report is printed");
-    assert!(
-        first_bind < first_report
-            && first_report < select
-            && render < second_bind
-            && second_bind < second_report,
-        "bind the first sweep, report it, select, reclaim, print, bind the second sweep, report \
-         it; body was:\n{body}"
-    );
-    assert_eq!(
-        body.matches("report_sweep(").count(),
-        2,
-        "exactly the two reports — one per sweep; body was:\n{body}"
-    );
-    assert_eq!(
-        body.matches("let second").count(),
-        1,
-        "`second` is bound once, by its sweep; body was:\n{body}"
-    );
-}
-
-#[test]
-fn report_only_travels_as_the_dry_run_bit_and_gates_the_second_sweep() {
-    let src = code_only(&read_main());
-    let body = fn_body(&src, "clean_dead_nodes");
-    // POSITION and VALUE, not a substring: `!report_only` in the dry-run slot
-    // contains `report_only` and reclaims on the one run whose whole point
-    // was not to; `report_only` in another slot and a literal in the dry-run
-    // slot would pass a substring check just the same. The reclaim's
-    // signature is `(candidates, config, dry_run, verdict)`, so the operator's
-    // flag must be the THIRD argument verbatim and `shm_state`'s one liveness
-    // verdict the FOURTH.
-    let args = call_args(&body, "reclaim_orphan_port_tags");
-    let args: Vec<&str> = args.split(", ").collect();
-    assert_eq!(
-        args,
-        vec!["&candidates", "config", "report_only", "&creator_verdict"],
-        "the reclaim's arguments, in order — the dry-run bit is the operator's flag itself, \
-         never its negation or a literal, and the verdict is `shm_state`'s; body was:\n{body}"
-    );
-    let call = body
-        .find("reclaim_orphan_port_tags(")
-        .expect("reclaim call");
-    let args_end = body[call..].find(')').expect("call closes") + call;
-    let second = body
-        .rfind("cleanup_dead_iceoryx2_nodes_with_diagnostics()")
-        .expect("second sweep");
-    let between = &body[args_end..second];
-    // The GUARD GOVERNS the second sweep, and nothing else does: the one
-    // `if` between the reclaim and the second sweep forks on the operator's
-    // flag, its block is exactly the non-converged early return, and from
-    // its end to the second sweep there is no other `if` and no other
-    // `return` — so the sweep runs on the guard's fall-through whenever
-    // candidates existed, and ONLY `--report-only` skips it. A guard that
-    // also asked "did a tag come off?" would leave an already-empty
-    // directory standing for one more run.
-    let guard = between
-        .find("if report_only {")
-        .expect("the dry-run guard sits between the reclaim and the second sweep");
-    let then = block_after(between, guard);
-    assert_eq!(
-        then.split_whitespace().collect::<Vec<_>>().join(" "),
-        "{ return (Ok(()), false); }",
-        "the guard's block is the non-converged early return and nothing else; block was:\n{then}"
-    );
-    let after_guard = &between[guard + then.len()..];
-    assert!(
-        !after_guard.contains("if ") && !after_guard.contains("return"),
-        "no other fork or return between the guard and the second sweep; was:\n{after_guard}"
-    );
-    assert_eq!(
-        between.matches("if ").count(),
-        1,
-        "the operator's flag is the ONLY condition on the second sweep; between was:\n{between}"
-    );
-    assert!(
-        !between.contains("removed_any"),
-        "the second sweep must not be gated on a tag having come off; between was:\n{between}"
-    );
-}
-
-#[test]
-fn the_convergence_handed_to_the_state_file_gate_is_the_second_sweeps() {
-    let src = code_only(&read_main());
-    let body = fn_body(&src, "clean_dead_nodes");
-    let second = body
-        .rfind("cleanup_dead_iceoryx2_nodes_with_diagnostics()")
-        .expect("second sweep");
-    let tail = body[second..]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    // BOUND to the second sweep's result: the verb's LAST convergence value
-    // is the full conjunction over `second` — the binding the second sweep
-    // was assigned to — and it is computed after that sweep's report. A
-    // `contains("second.failed_cleanups == 0")` alone is satisfied by a tail
-    // that computes the conjunction and returns `converged` anyway.
-    let last = convergence_positions(&body)
-        .pop()
-        .expect("the verb hands back a convergence");
-    assert_eq!(
-        last, "second.failed_cleanups == 0 && second.registry_errors.is_empty()",
-        "the tail convergence is the second sweep's full conjunction; body was:\n{body}"
-    );
-    let reported = body
-        .rfind("report_sweep(&second)")
-        .expect("the second sweep is reported");
-    let last_tuple = body.rfind("Ok(()),").expect("a convergence tuple");
-    assert!(
-        reported < last_tuple,
-        "the second sweep is reported, then ITS convergence is handed back; tail was:\n{tail}"
-    );
-    // And the pre-reclaim early returns hand back the FIRST sweep's truth: a
-    // converged first sweep is `true`, an unreclaimable refusal is `false`.
-    let first_return = body
-        .find("return (Ok(()), converged);")
-        .expect("the first sweep's early return hands back ITS convergence");
-    let select = body.find("orphan_port_tag_candidates(").expect("select");
-    assert!(
-        first_return < select,
-        "a converged first sweep returns before selecting"
-    );
-    assert!(
-        body[select..second].contains("return (Ok(()), false);"),
-        "a refusal the reclaim cannot heal must hand back `false`; body was:\n{body}"
-    );
 }
 
 /// Every convergence VALUE `clean_dead_nodes` hands back — the second half of
@@ -850,45 +547,26 @@ fn convergence_positions(body: &str) -> Vec<String> {
 
 #[test]
 fn every_convergence_the_verb_hands_back_is_computed_never_a_literal_true() {
-    // The arms above `find` ONE `return (Ok(()), converged);` and ONE
-    // `return (Ok(()), false);` somewhere in the body. A verb with FOUR
-    // convergence positions has three others a `find` never looks at, and
-    // the `.shm_state` gate reclaims on whichever of them fires: a `true` on
-    // the dry-run/nothing-removed arm reclaims on a wedged desk the moment
-    // every candidate is refused; a bare `report.failed_cleanups == 0` on the
-    // early return reclaims on a 0/0 sweep whose registry could not be
-    // scanned. So EVERY position is enumerated and pinned, in order.
+    // The `.shm_state` reclamation is gated on this value, so a literal `true`
+    // anywhere in the verb would reclaim on a wedged desk: a 0/0 sweep whose
+    // registry could not be scanned reports nothing refused and has reached
+    // nothing. Every convergence position is enumerated rather than `find`-ed,
+    // because a `find` never looks at the positions it did not name.
     let src = code_only(&read_main());
     let body = fn_body(&src, "clean_dead_nodes");
     assert_eq!(
         convergence_positions(&body),
-        vec![
-            // The first sweep's, computed above — FALSE on a 0/0 sweep with
-            // registry errors, which is exactly the run the early return
-            // takes.
-            "converged".to_string(),
-            // No candidate: a refusal the reclaim cannot heal.
-            "false".to_string(),
-            // A dry run, or nothing removed: the registry is as the first
-            // sweep left it, and that sweep did not converge.
-            "false".to_string(),
-            // The second sweep's, computed from ITS report.
-            "second.failed_cleanups == 0 && second.registry_errors.is_empty()".to_string(),
-        ],
-        "every convergence position, in order; body was:\n{body}"
+        vec!["converged".to_string()],
+        "the verb hands back exactly one convergence, the computed conjunction; body was:\n{body}"
     );
-    // The value the early return hands back is the FULL first-sweep
-    // conjunction, and the guard on that return is the failure count alone —
-    // so a scan failure with nothing refused takes the early return and
-    // hands back `converged == false`, never the guard's own truth.
+    // And that conjunction is the FULL one: the failure count alone would call
+    // a scan failure with nothing refused converged.
     let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         normalized.contains(
-            "let converged = report.failed_cleanups == 0 && report.registry_errors.is_empty(); \
-             if report.failed_cleanups == 0 { return (Ok(()), converged); }"
+            "let converged = report.failed_cleanups == 0 && report.registry_errors.is_empty();"
         ),
-        "the early return must hand back the computed conjunction under the failure-count \
-         guard; body was:\n{body}"
+        "convergence is the failure count AND an empty registry-error list; body was:\n{body}"
     );
 }
 
@@ -1201,17 +879,6 @@ fn the_renderers_are_bit_identical_across_runs_and_match_their_oracles() {
     let registry2 = super::render_registry_errors(&parts.registry_errors);
     assert_eq!(registry1[1], format!("  {FULL_SCAN_LINE}"));
     assert_eq!(registry1, registry2);
-
-    let reclaims = [
-        reclaim(4242, 77, &[1, 22], None),
-        reclaim(4243, 78, &[], Some("process 78 is still alive")),
-    ];
-    for report_only in [false, true] {
-        let lines1 = super::render_orphan_tag_reclaims(&reclaims, report_only);
-        let lines2 = super::render_orphan_tag_reclaims(&reclaims, report_only);
-        assert_eq!(lines1.len(), if report_only { 4 } else { 3 }, "{lines1:?}");
-        assert_eq!(lines1, lines2, "report_only={report_only}");
-    }
 }
 
 #[test]
@@ -1223,8 +890,8 @@ fn the_clean_verb_prints_the_registry_block_first_and_gates_convergence_on_it() 
     // scan that listed nothing are otherwise indistinguishable from a clean
     // registry, and that return would skip the block entirely.
     let src = code_only(&read_main());
-    // The printing lives in `report_sweep` — the one reporter BOTH sweeps of
-    // `clean_dead_nodes` go through — so the ordering facts are read there;
+    // The printing lives in `report_sweep`, the one reporter `clean_dead_nodes`
+    // goes through, so the ordering facts are read there;
     // the convergence conjunction is the verb's own and is read below.
     let printing = fn_body(&src, "report_sweep");
     let body = fn_body(&src, "clean_dead_nodes");
@@ -1241,11 +908,12 @@ fn the_clean_verb_prints_the_registry_block_first_and_gates_convergence_on_it() 
         registry < nothing_to_clean && registry < listing,
         "the registry block must precede both the early return and the listing; body was:\n{printing}"
     );
-    // Both sweeps print through it: the block is per sweep, never only the first.
+    // The sweep prints through it, exactly once: a second call would print one
+    // report twice, and zero would leave the block unwired.
     assert_eq!(
         body.matches("report_sweep(").count(),
-        2,
-        "both sweeps must print through `report_sweep`; body was:\n{body}"
+        1,
+        "the sweep must print through `report_sweep`; body was:\n{body}"
     );
     // CONVERGENCE: a registry the walk could not cover leaves dead nodes
     // registered that appear in no counter, so the `.shm_state` reclamation
@@ -1257,10 +925,6 @@ fn the_clean_verb_prints_the_registry_block_first_and_gates_convergence_on_it() 
             "let converged = report.failed_cleanups == 0 && report.registry_errors.is_empty();"
         ),
         "convergence must require an empty registry-error set; body was:\n{body}"
-    );
-    assert!(
-        normalized.contains("second.failed_cleanups == 0 && second.registry_errors.is_empty()"),
-        "the SECOND sweep's convergence must require it too; body was:\n{body}"
     );
     // And the "nothing to clean" claim is reserved for a registry that WAS
     // scanned: the early-return arm forks on the registry errors, and the

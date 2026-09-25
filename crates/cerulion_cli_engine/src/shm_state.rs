@@ -545,10 +545,17 @@ pub trait SystemProbe {
     ///
     /// The SECOND piece of evidence, and the one the pid alone cannot
     /// give. Every `.shm_state` file observed on a real desk is a
-    /// `<prefix><id>_node.global_mgmt` — the ONE management segment a whole
-    /// iceoryx2 NAMESPACE shares, not a per-process resource. Its creator is
-    /// simply whichever process opened the namespace first, so "the creator is
-    /// gone" says nothing whatever about whether the segment is still in use.
+    /// `<prefix><id>_node.<major>_<minor>_<patch>.global_mgmt` — the ONE
+    /// management segment a whole iceoryx2 NAMESPACE shares, not a per-process
+    /// resource. Its creator is simply whichever process opened the namespace
+    /// first, so "the creator is gone" says nothing whatever about whether the
+    /// segment is still in use.
+    ///
+    /// The version in the middle is iceoryx2's own, added in 0.9.3 so two
+    /// versions on one machine keep separate registries. It sits AFTER the
+    /// config prefix, which is what this evidence is keyed on, so the
+    /// prefix-match below is unaffected by it; `isolated_root_evidence_test`
+    /// checks that against real files rather than against this paragraph.
     ///
     /// A namespace with a registered node still needs its name mapping;
     /// removing it splits the namespace in two (the next `shm_open` finds no
@@ -906,9 +913,8 @@ pub enum CreatorVerdict {
 /// The ONE liveness answer for the CREATOR of a registry entry — `(pid,
 /// creation stamp)` — reached through this module's own predicate
 /// ([`SystemProbe::process_liveness`] on [`LibcProbe`], i.e. `kill(pid, 0)`),
-/// so the orphan port-tag reclaim (`crate::orphan_port_tags`) and
-/// `cerulion clean` route through the same evidence the `.shm_state`
-/// reclamation trusts and carry no second spelling of it.
+/// so `cerulion clean` routes through the same evidence the `.shm_state`
+/// reclamation trusts and carries no second spelling of it.
 ///
 /// `created_at_unix_s` is the entry's `creation_time` on a `Realtime` clock,
 /// or `None` when the stamp is on a clock that cannot be compared to wall time
@@ -2569,7 +2575,7 @@ mod tests {
     }
 
     /// The headline. Every `.shm_state` file MEASURED on a real desk
-    /// (2,018 of 2,018) is a `<prefix><id>_node.global_mgmt` — the one
+    /// (2,018 of 2,018) is a `<prefix><id>_node.<version>.global_mgmt` — the one
     /// management segment an iceoryx2 NAMESPACE shares — so the creating pid is
     /// merely whichever process opened the namespace first and says nothing at
     /// all about whether the segment is still in use. A namespace with a node
@@ -2581,8 +2587,11 @@ mod tests {
         let dir = tempdir("ns_in_use");
         // Both creators are DEAD: the only thing separating the two files is
         // whether their namespace still has a node.
-        let live_ns = write_state_file(&dir, "iox2_abc_node.global_mgmt", "100_1_1_1");
-        let dead_ns = write_state_file(&dir, "cer_p_dead_node.global_mgmt", "101_1_1_1");
+        // Names carry iceoryx2's version between the id and the suffix, as the
+        // library writes them; the evidence is keyed on the PREFIX, which is
+        // what this arm proves is still true with the version present.
+        let live_ns = write_state_file(&dir, "iox2_abc_node.0_10_0.global_mgmt", "100_1_1_1");
+        let dead_ns = write_state_file(&dir, "cer_p_dead_node.0_10_0.global_mgmt", "101_1_1_1");
 
         let probe = FakeProbe::all_dead()
             .with_size("100_1_1_1", 4_096)
@@ -2629,7 +2638,7 @@ mod tests {
     fn a_registry_that_cannot_be_read_refuses_every_reclamation() {
         for (unreadable, expected_reclaimed) in [(true, 0), (false, 1)] {
             let dir = tempdir(if unreadable { "ns_unk" } else { "ns_known" });
-            let file = write_state_file(&dir, "cer_p_x_node.global_mgmt", "100_1_1_1");
+            let file = write_state_file(&dir, "cer_p_x_node.0_10_0.global_mgmt", "100_1_1_1");
             let probe = FakeProbe::all_dead().with_size("100_1_1_1", 4_096);
             let probe = if unreadable {
                 probe.registry_unreadable()
@@ -2740,8 +2749,8 @@ mod tests {
         // provably-dead OTHER namespace is still reclaimed. Without this half,
         // an all-refusing walk would pass the assertion above.
         let dir = tempdir("ns_monitor_state");
-        let live = write_state_file(&dir, "iox2_9204_node.global_mgmt", "100_1_1_1");
-        let dead = write_state_file(&dir, "cer_p_gone_node.global_mgmt", "101_1_1_1");
+        let live = write_state_file(&dir, "iox2_9204_node.0_10_0.global_mgmt", "100_1_1_1");
+        let dead = write_state_file(&dir, "cer_p_gone_node.0_10_0.global_mgmt", "101_1_1_1");
         let probe = FakeProbe::all_dead()
             .with_size("100_1_1_1", 4_096)
             .with_size("101_1_1_1", 4_096)
@@ -2772,7 +2781,7 @@ mod tests {
     #[test]
     fn the_registry_walk_runs_on_what_is_left_of_the_scans_budget() {
         let dir = tempdir("ns_budget_thread");
-        write_state_file(&dir, "cer_p_x_node.global_mgmt", "100_1_1_1");
+        write_state_file(&dir, "cer_p_x_node.0_10_0.global_mgmt", "100_1_1_1");
         let probe = FakeProbe::all_dead().with_size("100_1_1_1", 4_096);
 
         // DELIBERATELY far below a fixed 2 s walk:
@@ -2796,7 +2805,7 @@ mod tests {
         // The floor of the same claim: a scan with NOTHING left hands nothing,
         // and a walk with no budget proves nothing, so nothing is reclaimed.
         let dir2 = tempdir("ns_budget_spent");
-        let file = write_state_file(&dir2, "cer_p_y_node.global_mgmt", "100_1_1_1");
+        let file = write_state_file(&dir2, "cer_p_y_node.0_10_0.global_mgmt", "100_1_1_1");
         let spent = FakeProbe::all_dead().with_size("100_1_1_1", 4_096);
         let report = scan(
             &dir2,
@@ -2944,7 +2953,7 @@ mod tests {
         // nothing about the isolated one, so its files read as free.
         let global_only = namespaces_in_use_at(&root.join("nodes"), Duration::from_secs(5));
         assert!(
-            !global_only.covers("test_prefix_abcd_node.global_mgmt.shm_state"),
+            !global_only.covers("test_prefix_abcd_node.0_10_0.global_mgmt.shm_state"),
             "precondition: the global-root-only evidence must MISS the isolated namespace — \
              otherwise this arm is not testing anything"
         );
@@ -2965,8 +2974,16 @@ mod tests {
         plant_registered_node(&root, Some("tests"), "test_prefix_live");
 
         let files = tempdir("scan_files");
-        let live = write_state_file(&files, "test_prefix_live_node.global_mgmt", "100_1_1_1");
-        let dead = write_state_file(&files, "test_prefix_dead_node.global_mgmt", "101_1_1_1");
+        let live = write_state_file(
+            &files,
+            "test_prefix_live_node.0_10_0.global_mgmt",
+            "100_1_1_1",
+        );
+        let dead = write_state_file(
+            &files,
+            "test_prefix_dead_node.0_10_0.global_mgmt",
+            "101_1_1_1",
+        );
 
         let probe = RootSearchProbe::at(&root);
         let report = scan(
@@ -3181,10 +3198,10 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
         );
-        assert!(known.covers("iox2_9204_node.global_mgmt.shm_state"));
-        assert!(known.covers("cer_p_beef1234_node.global_mgmt.shm_state"));
+        assert!(known.covers("iox2_9204_node.0_10_0.global_mgmt.shm_state"));
+        assert!(known.covers("cer_p_beef1234_node.0_10_0.global_mgmt.shm_state"));
         assert!(
-            !known.covers("cer_p_other1234_node.global_mgmt.shm_state"),
+            !known.covers("cer_p_other1234_node.0_10_0.global_mgmt.shm_state"),
             "a namespace with no registered node is not covered"
         );
         assert!(

@@ -72,6 +72,22 @@ use iceoryx2::prelude::*;
 // `unsafe impl Send/Sync`).
 pub(crate) use iceoryx2::service::ipc_threadsafe::Service as CerService;
 
+/// The `event_id_max_value` EVERY Cerulion event service is created with.
+///
+/// The highest `EventId` the transport mints is
+/// `PubSubEvent::PublisherDisconnected` (6), and iceoryx2's default ceiling is
+/// 255. The ceiling sizes a shared-memory counting bitset that a listener walks
+/// entry by entry on every wait, so the default charges each wait 256 atomic
+/// read-modify-writes to carry 7 ids. Sized from the event enum itself, so a
+/// new variant moves the ceiling with it.
+///
+/// A service is created with the ceiling of whichever process gets there first,
+/// and an open only fails when the EXISTING ceiling is below the one requested,
+/// so every creation site in the transport passes this and none may be left
+/// out: one uncapped creator restores the 255-wide walk for every later opener.
+/// `event_services_are_created_with_the_event_id_ceiling` pins that.
+const CERULION_MAX_EVENT_ID: usize = crate::transport::events::PubSubEvent::MAX_ID;
+
 use crate::clock::{Clock, RealClock};
 use crate::error::{NodeNameRefusal, TransportError, TransportResult};
 use crate::message::ShmMessage;
@@ -1579,6 +1595,15 @@ fn publish_subscribe_open_env_hint(
              the stale iceoryx2 shared-memory artifacts (or reboot) \
              before reopening"
         }
+        PublishSubscribeOpenError::VersionMismatch => {
+            "; the existing service was created by a process linking a \
+             DIFFERENT iceoryx2 version. Every Cerulion process and every \
+             node cdylib on one machine must be built against the same \
+             `cerulion_core`, because each links its own iceoryx2 and the \
+             two cannot share a service. Rebuild the node libraries against \
+             the installed `cerulion` (`cerulion node build`), or stop the \
+             process left over from the previous version"
+        }
         PublishSubscribeOpenError::ServiceInCorruptedState => {
             "; the service's shared state is corrupted (a peer \
              likely crashed mid-operation) — remove the stale \
@@ -1587,7 +1612,12 @@ fn publish_subscribe_open_env_hint(
              the process exhausts its open-file (fd) limit — every \
              node's services/ports consume fds, so a many-node graph \
              can blow past the default 1024; raise it with \
-             `ulimit -n 65536` and retry before assuming corruption"
+             `ulimit -n 65536` and retry before assuming corruption. \
+             A machine UPGRADED from an older Cerulion reads the same \
+             way: a service whose on-disk static config was written by \
+             an older iceoryx2 cannot be parsed by this one, so it is \
+             reported as corrupted rather than as a version skew. \
+             Sweep the iceoryx2 root once after the upgrade"
         }
         _ => "",
     }
@@ -1624,11 +1654,29 @@ fn event_env_hint(e: &iceoryx2::service::builder::event::EventOpenOrCreateError)
              can blow past the default 1024; raise it with \
              `ulimit -n 65536` and retry before assuming corruption"
         }
-        EventOpenOrCreateError::EventOpenError(EventOpenError::HangsInCreation)
-        | EventOpenOrCreateError::EventCreateError(EventCreateError::HangsInCreation) => {
+        // iceoryx2 0.10 carries `HangsInCreation` on the Open half only (the
+        // create-side variant was removed upstream).
+        EventOpenOrCreateError::EventOpenError(EventOpenError::HangsInCreation) => {
             "; a peer crashed while creating this event service — \
              remove the stale iceoryx2 shared-memory artifacts (or \
              reboot) before reopening"
+        }
+        EventOpenOrCreateError::EventOpenError(EventOpenError::VersionMismatch) => {
+            "; the existing event service was created by a process linking a \
+             DIFFERENT iceoryx2 version. Every Cerulion process and every \
+             node cdylib on one machine must be built against the same \
+             `cerulion_core`, because each links its own iceoryx2 and the \
+             two cannot share a service. Rebuild the node libraries against \
+             the installed `cerulion` (`cerulion node build`), or stop the \
+             process left over from the previous version"
+        }
+        EventOpenOrCreateError::EventOpenError(
+            EventOpenError::DoesNotSupportRequestedMaxEventId,
+        ) => {
+            "; the existing event service carries a SMALLER event-id ceiling \
+             than this process needs. It was created by an older Cerulion \
+             whose event enum was shorter. Stop the older process and let \
+             this one create the service"
         }
         _ => "",
     }
@@ -1835,7 +1883,24 @@ impl LivelinessCleaner {
         #[cfg(any(test, feature = "test-helpers"))]
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
-        let state = Node::<CerService>::try_cleanup_dead_nodes(&self.config);
+        // iceoryx2 carries `try_cleanup_dead_nodes` on `&Node`, so the sweep
+        // needs a node in the namespace it is cleaning, and this cleaner
+        // deliberately does not hold the transport. Mint a transient one, from
+        // a config whose implicit sweeps are OFF: a node built with iceoryx2's
+        // defaults reaps on creation and again on destruction, which would make
+        // the explicit call below report zero for work it had already done, and
+        // which is the runtime auto-reap `disable_auto_dead_node_cleanup`
+        // exists to forbid. A node that cannot be created is the same non-fatal
+        // skip a failed cleanup already was.
+        let sweep_config = dead_node_sweep::sweep_node_config(&self.config);
+        let Ok(node) = NodeBuilder::new()
+            .config(&sweep_config)
+            .create::<CerService>()
+        else {
+            tracing::trace!("liveliness sweep: dead-node cleanup skipped (no node)");
+            return;
+        };
+        let state = node.try_cleanup_dead_nodes();
         tracing::trace!(
             cleanups = state.cleanups,
             failed_cleanups = state.failed_cleanups,
@@ -4775,10 +4840,13 @@ impl TransportManager {
                 map_err(format!("{e}{hint}"))
             })?;
 
+        // Size the event-id space to the ids this transport mints; see
+        // `CERULION_MAX_EVENT_ID`.
         let event_service = self
             .node
             .service_builder(&event_service_name)
             .event()
+            .event_id_max_value(CERULION_MAX_EVENT_ID)
             .open_or_create()
             .map_err(|e| map_err(format!("{e}{}", event_env_hint(&e))))?;
 
@@ -4988,10 +5056,14 @@ impl TransportManager {
             .as_str()
             .try_into()
             .map_err(|e| map_err(format!("{e}")))?;
+        // Same event-id ceiling as every other event service; see
+        // `CERULION_MAX_EVENT_ID`. This doorbell's listener is on a blocking
+        // wait, which is exactly the path the ceiling makes cheap.
         let event_service = self
             .node
             .service_builder(&event_service_name)
             .event()
+            .event_id_max_value(CERULION_MAX_EVENT_ID)
             .open_or_create()
             .map_err(|e| map_err(format!("{e}{}", event_env_hint(&e))))?;
         let notifier = event_service.notifier_builder().create().map_err(|e| {
@@ -6121,7 +6193,13 @@ impl TransportManager {
                 ports
             }
         });
-        let mut event_builder = self.node.service_builder(&event_service_name).event();
+        // Same event-id ceiling as the sibling open above; see
+        // `CERULION_MAX_EVENT_ID`.
+        let mut event_builder = self
+            .node
+            .service_builder(&event_service_name)
+            .event()
+            .event_id_max_value(CERULION_MAX_EVENT_ID);
         if let Some(event_ports) = armed_event_ports {
             event_builder = event_builder
                 .max_listeners(event_ports)
@@ -6290,29 +6368,33 @@ mod tap_depth_tests {
         // change upstream is visible as a NUMBER in a failing test rather than
         // only as a shifted depth three assertions later.
         assert_eq!(
-            IOX2_SAMPLE_HEADER_BYTES, 40,
-            "iceoryx2 0.9.1's publish-subscribe Header is 40 bytes \
-             (UniqueNodeId 16 + UniquePublisherId 16 + u64 8) — if this moved, \
-             every depth below moves with it and that is the point of reading it"
+            IOX2_SAMPLE_HEADER_BYTES, 48,
+            "iceoryx2's publish-subscribe Header is 48 bytes (UniqueNodeId 16 + \
+             UniquePublisherId 16 + number_of_elements 8 + payload_offset 8). It \
+             WAS 40: 0.10 added `payload_offset`, so every slot is eight bytes \
+             bigger and a fixed shared-memory budget buys marginally fewer of \
+             them. The production arithmetic reads the size off the type and \
+             needed no change; this number is here so the next such move is \
+             visible as a failing NUMBER rather than as a quietly shifted depth"
         );
         assert_eq!(IOX2_SAMPLE_HEADER_ALIGN, 8);
 
         // Aligned slices: the overhead is FLATLY the header.
-        assert_eq!(iceoryx2_slot_bytes(0), 40);
-        assert_eq!(iceoryx2_slot_bytes(256), 296);
-        assert_eq!(iceoryx2_slot_bytes(4096), 4136);
-        assert_eq!(iceoryx2_slot_bytes(1024 * 1024), 1_048_616);
-        assert_eq!(iceoryx2_slot_bytes(16 * 1024 * 1024), 16_777_256);
+        assert_eq!(iceoryx2_slot_bytes(0), 48);
+        assert_eq!(iceoryx2_slot_bytes(256), 304);
+        assert_eq!(iceoryx2_slot_bytes(4096), 4144);
+        assert_eq!(iceoryx2_slot_bytes(1024 * 1024), 1_048_624);
+        assert_eq!(iceoryx2_slot_bytes(16 * 1024 * 1024), 16_777_264);
 
         // UNALIGNED slices round UP. 157 is a real `/tf` frame size,
-        // so this is not a synthetic number: 40 + 157 = 197 → 200.
-        assert_eq!(iceoryx2_slot_bytes(157), 200);
+        // so this is not a synthetic number: 48 + 157 = 205 → 208.
+        assert_eq!(iceoryx2_slot_bytes(157), 208);
         // One byte either side of a multiple of 8, to pin the rounding on both
         // edges rather than at one convenient point.
-        assert_eq!(iceoryx2_slot_bytes(1), 48);
-        assert_eq!(iceoryx2_slot_bytes(7), 48);
-        assert_eq!(iceoryx2_slot_bytes(8), 48);
-        assert_eq!(iceoryx2_slot_bytes(9), 56);
+        assert_eq!(iceoryx2_slot_bytes(1), 56);
+        assert_eq!(iceoryx2_slot_bytes(7), 56);
+        assert_eq!(iceoryx2_slot_bytes(8), 56);
+        assert_eq!(iceoryx2_slot_bytes(9), 64);
 
         // The property every caller relies on: a slot is never SMALLER than its
         // payload, at any size, so a budget divided by it can never admit more
@@ -6341,13 +6423,13 @@ mod tap_depth_tests {
         const BUDGET: u64 = 64 * 1024 * 1024;
         const CEILING: usize = 4096;
 
-        // 1 MiB slice: 64 MiB / 1_048_616 = 63. A nominal divisor says 64.
+        // 1 MiB slice: 64 MiB / 1_048_624 = 63. A nominal divisor says 64.
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 1024 * 1024, CEILING),
             63,
             "a nominal divisor would answer 64 and over-commit the budget by a slot"
         );
-        // 16 MiB slice: 64 MiB / 16_777_256 = 3. A nominal divisor says 4.
+        // 16 MiB slice: 64 MiB / 16_777_264 = 3. A nominal divisor says 4.
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 16 * 1024 * 1024, CEILING),
             3,
@@ -6364,7 +6446,7 @@ mod tap_depth_tests {
         }
 
         // A small slice is bounded by the CEILING, not the budget: 64 MiB of
-        // 296-byte slots is 226 719 slots, and no service is that deep.
+        // 304-byte slots is 220 752 slots, and no service is that deep.
         assert_eq!(flashback_tap_buffer_depth(BUDGET, 256, CEILING), CEILING);
         assert_eq!(flashback_tap_buffer_depth(BUDGET, 256, 16), 16);
     }
@@ -6382,19 +6464,24 @@ mod tap_depth_tests {
             flashback_tap_buffer_depth(BUDGET, 128 * 1024 * 1024, 4096),
             FLASHBACK_TAP_BUFFER_DEPTH_FLOOR
         );
-        // Exactly AT the budget is one slot, which the floor lifts to two — the
-        // boundary on the side the floor is for.
+        // A slice EXACTLY the size of the budget also buys zero, because a slot
+        // is the slice PLUS the header: the boundary sits on the SLOT and never
+        // on the slice, which is the whole reason this rule exists.
+        assert_eq!(BUDGET / iceoryx2_slot_bytes(64 * 1024 * 1024) as u64, 0);
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 64 * 1024 * 1024, 4096),
-            2
+            FLASHBACK_TAP_BUFFER_DEPTH_FLOOR
         );
-        // And just under it, two slots, which the floor does not touch: the
-        // other side of the same boundary, so the floor cannot be mistaken for a
-        // constant answer.
+        // HALF the budget buys exactly one slot, which the floor lifts to two —
+        // the boundary on the side the floor is for.
+        assert_eq!(BUDGET / iceoryx2_slot_bytes(32 * 1024 * 1024) as u64, 1);
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 32 * 1024 * 1024, 4096),
             2
         );
+        // And a slice that buys THREE is left alone: the other side of the same
+        // boundary, so the floor cannot be mistaken for a constant answer.
+        assert_eq!(BUDGET / iceoryx2_slot_bytes(16 * 1024 * 1024) as u64, 3);
         assert_eq!(
             flashback_tap_buffer_depth(BUDGET, 16 * 1024 * 1024, 4096),
             3
@@ -7352,7 +7439,15 @@ mod tests {
                 | O::ServiceInCorruptedState
                 | O::HangsInCreation
                 | O::ExceedsMaxNumberOfNodes
-                | O::IsMarkedForDestruction => false,
+                | O::IsMarkedForDestruction
+                // iceoryx2 0.10 additions. `VersionMismatch` is the named
+                // refusal when the incumbent service was created by a
+                // different iceoryx2 version: a skew, not a ceiling.
+                | O::Interrupt
+                | O::UnableToCreateServiceTag
+                | O::VersionMismatch
+                | O::UnableToAcquireTypeDefinition
+                | O::InvalidTypeDefinition => false,
             }
         }
 
@@ -7377,10 +7472,15 @@ mod tests {
             O::HangsInCreation,
             O::ExceedsMaxNumberOfNodes,
             O::IsMarkedForDestruction,
+            O::Interrupt,
+            O::UnableToCreateServiceTag,
+            O::VersionMismatch,
+            O::UnableToAcquireTypeDefinition,
+            O::InvalidTypeDefinition,
         ];
         assert_eq!(
             all_open.len(),
-            17,
+            22,
             "the sweep must cover every open variant — extend BOTH this list \
              and `want_open` when iceoryx2 adds one"
         );
@@ -7410,6 +7510,12 @@ mod tests {
             C::InternalFailure,
             C::IsBeingCreatedByAnotherInstance,
             C::HangsInCreation,
+            C::Interrupt,
+            C::UnableToCreateServiceTag,
+            C::ServiceConfigCouldNotBeCreated,
+            C::UnableToAcquireTypeDefinition,
+            C::InvalidTypeDefinition,
+            C::UnableToGenerateUniqueServiceId,
         ] {
             assert!(
                 !is_buffer_ceiling_refusal(&E::PublishSubscribeCreateError(v)),

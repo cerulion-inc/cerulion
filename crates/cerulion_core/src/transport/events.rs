@@ -37,6 +37,41 @@ pub enum PubSubEvent {
     PublisherDisconnected = 6,
 }
 
+impl PubSubEvent {
+    /// Every variant, in discriminant order. The single list the event-id
+    /// ceiling is derived from; `all_lists_every_variant_and_max_id_covers_it`
+    /// fails to COMPILE if a variant is added and not listed here.
+    pub(crate) const ALL: [PubSubEvent; 7] = [
+        PubSubEvent::SentSample,
+        PubSubEvent::SentHistory,
+        PubSubEvent::SubscriberConnected,
+        PubSubEvent::SubscriberDisconnected,
+        PubSubEvent::ReceivedSample,
+        PubSubEvent::PublisherConnected,
+        PubSubEvent::PublisherDisconnected,
+    ];
+
+    /// The highest event id the transport ever mints, derived from
+    /// [`Self::ALL`] rather than written down twice. Every event service is
+    /// created with this as its `event_id_max_value`, which sizes the
+    /// shared-memory counting bitset a listener walks on every wait; see
+    /// `CERULION_MAX_EVENT_ID` in `transport::mod`.
+    pub(crate) const MAX_ID: usize = Self::max_id();
+
+    const fn max_id() -> usize {
+        let mut max = 0;
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            let value = Self::ALL[i] as usize;
+            if value > max {
+                max = value;
+            }
+            i += 1;
+        }
+        max
+    }
+}
+
 impl From<PubSubEvent> for EventId {
     fn from(event: PubSubEvent) -> Self {
         EventId::new(event as usize)
@@ -111,6 +146,31 @@ mod tests {
             let back: PubSubEvent = id.try_into().unwrap();
             assert_eq!(back, event);
         }
+    }
+
+    #[test]
+    fn all_lists_every_variant_and_max_id_covers_it() {
+        for event in PubSubEvent::ALL {
+            // Exhaustive on purpose: a variant added to the enum and not to
+            // `ALL` makes this match fail to compile, and an id above the
+            // ceiling would be refused by iceoryx2 at notify time.
+            let id: usize = match event {
+                PubSubEvent::SentSample => 0,
+                PubSubEvent::SentHistory => 1,
+                PubSubEvent::SubscriberConnected => 2,
+                PubSubEvent::SubscriberDisconnected => 3,
+                PubSubEvent::ReceivedSample => 4,
+                PubSubEvent::PublisherConnected => 5,
+                PubSubEvent::PublisherDisconnected => 6,
+            };
+            assert_eq!(EventId::from(event).as_value(), id);
+            assert!(
+                id <= PubSubEvent::MAX_ID,
+                "event id {id} exceeds the ceiling {} every event service is created with",
+                PubSubEvent::MAX_ID
+            );
+        }
+        assert_eq!(PubSubEvent::MAX_ID, 6);
     }
 
     #[test]

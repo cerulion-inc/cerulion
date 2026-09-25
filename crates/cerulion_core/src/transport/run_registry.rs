@@ -725,6 +725,10 @@ fn open_doorbell_service(
             })?;
     node.service_builder(&name)
         .event()
+        // Same event-id ceiling as every other event service; see
+        // `CERULION_MAX_EVENT_ID`. This doorbell's listener sits in a timed
+        // wait that returns on every interval, so the ceiling is paid per tick.
+        .event_id_max_value(super::CERULION_MAX_EVENT_ID)
         .max_listeners(RUN_DOORBELL_MAX_LISTENERS)
         .max_notifiers(RUN_DOORBELL_MAX_NOTIFIERS)
         .open_or_create()
@@ -1046,11 +1050,15 @@ fn pump_loop(
 ) {
     while !exit.load(Ordering::Relaxed) {
         match doorbell.as_ref() {
-            Some(listener) => match listener.timed_wait_one(RUN_REPUBLISH_INTERVAL) {
+            // iceoryx2 0.10: `timed_wait_one` is gone. `timed_wait` drains every
+            // queued activation and returns how many were delivered, so a ring is
+            // `Ok(n > 0)` where it used to be `Ok(Some(_))` and the timeout is
+            // `Ok(0)` where it used to be `Ok(None)`.
+            Some(listener) => match listener.timed_wait(|_a| {}, RUN_REPUBLISH_INTERVAL) {
                 // A ring: somebody is gathering and wants this run's answer.
-                Ok(Some(_)) => inner.note_doorbell_ring(),
+                Ok(n) if n > 0 => inner.note_doorbell_ring(),
                 // The fallback timeout — republish on the interval as before.
-                Ok(None) => {}
+                Ok(_) => {}
                 // A broken listener must degrade to the interval, never spin.
                 Err(e) => {
                     inner.record_doorbell_failure(&format!("{e}"));

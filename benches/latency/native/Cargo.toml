@@ -55,16 +55,16 @@ path = "src/bin/zenoh_shm_round_trip_pong.rs"
 # buffers, so no ROS 2 message type is needed.
 cerulion_core = { path = "../../../crates/cerulion_core" }
 # The iceoryx2 dependency family MUST resolve to exactly
-# ONE version (=0.9.1) in this lockfile. A bench binary whose statically
+# ONE version (=0.10.0) in this lockfile. A bench binary whose statically
 # linked iceoryx2 sub-crates skew against the host runtime's stamps a
 # different `PackageVersion` into the shared-memory connection and NO data
 # flows (`VersionMismatch`, silent). cerulion_core exact-pins the whole
 # sub-crate family; this top-level pin keeps THIS manifest from ever asking
 # for anything newer. (The retired bench trees carried `iceoryx2 = "0.9"`
-# and their stale lockfiles had resolved 0.9.2 — the exact skew class this
+# and their stale lockfiles had resolved a newer patch — the exact skew class this
 # pin closes.) Verify after any lockfile regeneration:
-#   grep '^name = "iceoryx2' -A1 Cargo.lock   # every entry must be 0.9.1
-iceoryx2 = "=0.9.1"
+#   grep '^name = "iceoryx2' -A1 Cargo.lock   # every entry must be 0.10.0
+iceoryx2 = "=0.10.0"
 # Pinned to the version the May-2026 campaign verified the SHM config
 # against (`zenoh_shm_config`'s JSON5 keys + the Talc-backend 1 MiB floor
 # are 1.7.2-verified). The main workspace is on zenoh 1.8 — bumping this

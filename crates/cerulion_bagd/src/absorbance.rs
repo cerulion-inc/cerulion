@@ -2306,6 +2306,9 @@ mod tests {
     #[test]
     fn budget_occupancy_separates_over_inside_and_unknowable() {
         const BUDGET: u64 = 140_000;
+        // An arbitrary slot size: `budget_occupancy` is arithmetic over whatever
+        // it is handed, and pinning it to the live iceoryx2 slot would make this
+        // oracle move every time that header does.
         const SLOT: u64 = 65_576;
 
         // (1) OVER: 3 x 65_576 = 196_728 > 140_000. Hand-computed.

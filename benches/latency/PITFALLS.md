@@ -392,12 +392,12 @@ node ever fires. The data plane is simply dead.
 **Cause:** the iceoryx2 dependency family must resolve to **exactly one
 version** across every artifact that shares an SHM connection (the host
 binary and every node cdylib). A skew in any `iceoryx2-*` sub-crate
-(e.g. `iceoryx2-bb-elementary` 0.9.1 vs 0.9.2) changes the internal
+(e.g. `iceoryx2-bb-elementary` 0.10.0 vs 0.10.1) changes the internal
 `PackageVersion` handshake, iceoryx2 refuses the zero-copy connection
 (`ZeroCopyCreationError::VersionMismatch`), and the failure is silent
 at the application level.
 
-**Fix:** exact-pin (`=0.9.1`) every `iceoryx2*` dependency; after any
+**Fix:** exact-pin (`=0.10.0`) every `iceoryx2*` dependency; after any
 lockfile regeneration, verify one version per lockfile:
 
 ```bash

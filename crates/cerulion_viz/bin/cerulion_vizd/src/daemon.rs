@@ -7447,14 +7447,15 @@ fn elapsed_ns(origin: Instant) -> u64 {
 /// The most consecutive passes that may SKIP their wait on a
 /// drained backlog before one is forced to wait anyway.
 ///
-/// **This bound is the notify storm's structural defence, not a tuning knob.**
-/// The listener's event queue is drained by the multiplexer's callback, which
-/// only runs inside a wait — so a pass that skips its wait leaves the listener
-/// UNDRAINED. A topic publishing faster than the loop drains would take the
-/// backlog arm on every pass forever, its `AF_UNIX SOCK_DGRAM` socket would
-/// fill, and then EVERY publisher notify pays `FailedToDeliverSignal` plus a
-/// ~2 KB iceoryx2 warn, the exact failure listener-less taps removed, re-created on the
-/// desk's own netd.
+/// **This bound keeps the loop's waits from being skipped indefinitely, not a
+/// tuning knob.** The listener's event queue is drained by the multiplexer's
+/// callback, which only runs inside a wait — so a pass that skips its wait
+/// leaves the listener UNDRAINED. A topic publishing faster than the loop
+/// drains would otherwise take the backlog arm on every pass forever and the
+/// loop would never wait again, which is a liveness problem for everything else
+/// the multiplexer is responsible for. (Under iceoryx2 0.9.1 it was also a
+/// producer-side failure: the undrained socket filled and every publisher
+/// notify took a logged failure path. 0.10 removed that half.)
 ///
 /// Eight keeps the skip useful (a `POLL_MAX`-capped drain gets eight immediate
 /// re-drains, i.e. up to 32 768 frames per tap with no wait) while the undrained

@@ -87,12 +87,27 @@ env:
   RUST_BACKTRACE: 1
   # Suppress iceoryx2 log noise
   IOX2_LOG_LEVEL: error
-  # Single source of truth for the nightly pin used by the fuzz and miri
-  # jobs. iceoryx2 0.8.1 failed to compile on the newer nightlies tested
-  # (StaticString::as_str trait-scope regression);
-  # nightly-2026-04-07 verified locally to compile the full dep tree.
-  # Bump deliberately, not via drift.
-  PINNED_NIGHTLY: nightly-2026-04-07
+  # The toolchain the fuzz and miri jobs run on. NOT pinned, deliberately.
+  #
+  # It used to be `nightly-2026-04-07`, because iceoryx2 0.8.1 failed to
+  # compile on the newer nightlies tested (a StaticString::as_str trait-scope
+  # regression) and that date was the last one verified to build the tree.
+  # With the iceoryx2 family on 0.10.0 the reason is gone, and a pin nobody
+  # revisits is a pin that hides the next regression for months rather than
+  # reporting it the week it lands.
+  #
+  # Both jobs were run end to end on a current nightly before this was lifted,
+  # not merely type-checked: all three fuzz targets for their full 30 seconds
+  # with no crash, and all three miri binaries (110 tests) with no undefined
+  # behaviour.
+  #
+  # The failure mode to expect, so it is recognised rather than debugged: a
+  # given nightly sometimes ships without `miri`, and the toolchain install in
+  # the miri job then fails before any test runs. That is a bad day upstream,
+  # not a regression in this tree. Pin this back to a dated nightly when it
+  # happens, and say in the commit which component was missing and on which
+  # date, so the next lift knows what it is looking at.
+  FUZZ_MIRI_NIGHTLY: nightly
 
 jobs:
   # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
@@ -897,7 +912,7 @@ jobs:
   # builds, NOT from `--workspace`), so this job also proves rerun compiles on
   # the floor.
   # Runs in PARALLEL (no `needs:`) — off the critical path. STABLE, not the
-  # PINNED_NIGHTLY used by fuzz/miri.
+  # FUZZ_MIRI_NIGHTLY used by fuzz/miri.
   msrv:
     name: MSRV (1.93)
     runs-on: ubuntu-latest
@@ -2756,7 +2771,7 @@ jobs:
       # The test itself runs `cargo build -p cerulion_cli --release` + builds
       # the node cdylibs internally (also release), so NO separate build step
       # is needed. It also pins the scaffolded workspace's iceoryx2 to the
-      # repo Cargo.lock (avoids the 0.9.1/0.9.2 version-skew that breaks SHM
+      # repo Cargo.lock (avoids the patch-level version skew that breaks SHM
       # event connections).
       - name: CLI E2E graph latency test (release, serial)
         run: cargo test -p cerulion_core --test cli_e2e_graph_latency_test --release -- --test-threads=1 --nocapture
@@ -2775,11 +2790,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Nightly pin: see PINNED_NIGHTLY in the top-level env block.
-      - name: Install nightly toolchain (pinned)
+      # See FUZZ_MIRI_NIGHTLY in the top-level env block.
+      - name: Install the current nightly toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: ${{ env.PINNED_NIGHTLY }}
+          toolchain: ${{ env.FUZZ_MIRI_NIGHTLY }}
 
       # Cache restore must precede the cargo-fuzz install so a warm
       # ~/.cargo/bin/cargo-fuzz skips the from-source compile entirely.
@@ -2799,13 +2814,13 @@ jobs:
         run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
 
       - name: Fuzz wire header (30s)
-        run: cd crates/cerulion_core && cargo +${{ env.PINNED_NIGHTLY }} fuzz run fuzz_wire_header -- -max_total_time=30
+        run: cd crates/cerulion_core && cargo +${{ env.FUZZ_MIRI_NIGHTLY }} fuzz run fuzz_wire_header -- -max_total_time=30
 
       - name: Fuzz parse graph (30s)
-        run: cd crates/cerulion_core && cargo +${{ env.PINNED_NIGHTLY }} fuzz run fuzz_parse_graph -- -max_total_time=30
+        run: cd crates/cerulion_core && cargo +${{ env.FUZZ_MIRI_NIGHTLY }} fuzz run fuzz_parse_graph -- -max_total_time=30
 
       - name: Fuzz parse info JSON (30s)
-        run: cd crates/cerulion_core && cargo +${{ env.PINNED_NIGHTLY }} fuzz run fuzz_parse_info_json -- -max_total_time=30
+        run: cd crates/cerulion_core && cargo +${{ env.FUZZ_MIRI_NIGHTLY }} fuzz run fuzz_parse_info_json -- -max_total_time=30
 
   # Miri: interpret unsafe-code paths under the nightly Miri UB checker.
   #
@@ -2838,8 +2853,8 @@ jobs:
   # This job is BLOCKING (no continue-on-error). It was promoted
   # from the original non-blocking stopgap after being observed green on
   # 12+ consecutive CI runs across main + PRs (the FFI-free scope on the
-  # PINNED_NIGHTLY is stable). If a future nightly / iceoryx2 bump breaks
-  # Miri, fix or re-pin rather than silently reverting to non-blocking.
+  # scope is stable). If a future nightly breaks Miri, fix it or pin the
+  # toolchain back rather than silently reverting this job to non-blocking.
   miri:
     name: Miri (Linux, scoped to FFI-free tests)
     runs-on: ubuntu-latest
@@ -2852,12 +2867,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Same pin as the fuzz job: see PINNED_NIGHTLY in the top-level env
-      # block. The pinned nightly ships miri+rust-src (verified locally).
-      - name: Install nightly toolchain with Miri (pinned)
+      # Same toolchain as the fuzz job: see FUZZ_MIRI_NIGHTLY in the top-level
+      # env block. A nightly that ships without `miri` fails HERE, before any
+      # test runs, which is the shape to recognise.
+      - name: Install the current nightly toolchain with Miri
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: ${{ env.PINNED_NIGHTLY }}
+          toolchain: ${{ env.FUZZ_MIRI_NIGHTLY }}
           components: miri, rust-src
 
       # target/ holds the Miri-interpreted dep builds and ~/.cache/miri
