@@ -3,8 +3,9 @@
 //! one-time first-run notice and the `cli_command_run` event. The public
 //! disclosure is `docs/telemetry.md`.
 //!
-//! Nothing is sent unless [`Client::from_env`] returns a client, which needs
-//! a key and consent. The run that prints the notice sends nothing, so the
+//! Nothing is sent unless [`Client::from_env_or_key`] returns a client, which
+//! needs a key (`POSTHOG_API_KEY`, else the `CERULION_POSTHOG_KEY` a release
+//! build was compiled with) and consent. The run that prints the notice sends nothing, so the
 //! user reads it before the first event leaves the machine.
 
 use std::io::Write;
@@ -24,7 +25,13 @@ use crate::cli::TelemetryAction;
 /// One CLI invocation: which verb, how it ended, roughly how long it took.
 pub const CLI_COMMAND_RUN: EventSpec = EventSpec {
     name: "cli_command_run",
-    allowlist: &["verb", "subverb", "exit_code", "duration_bucket"],
+    allowlist: &[
+        "verb",
+        "subverb",
+        "exit_code",
+        "duration_bucket",
+        "install_method",
+    ],
 };
 
 /// A completed device login. The account is the event's `distinct_id`.
@@ -32,6 +39,10 @@ pub const CLI_LOGIN_COMPLETED: EventSpec = EventSpec {
     name: "cli_login_completed",
     allowlist: &["is_account_switch"],
 };
+
+/// The PostHog project key a release build carries; `None` in a source build.
+/// Read by the compiler, so the key never passes through build-script output.
+const BAKED_KEY: Option<&str> = option_env!("CERULION_POSTHOG_KEY");
 
 /// Whether this process may send: set once [`CommandRun::start`] has
 /// decided to record, so a login inside the run that printed the notice, or
@@ -58,9 +69,10 @@ const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 
 /// Printed to stderr once per machine, on the first run that could send.
 pub const NOTICE: &str = "\
-Cerulion sends usage events from this CLI: the verb you ran, its exit code \
-and a rough duration, under your Cerulion account id once you sign in and a \
-random anonymous id before that. Never arguments, paths, topic names or data.
+Cerulion sends usage events from this CLI: the verb you ran, its exit code, \
+a rough duration and how it was installed, under your Cerulion account id \
+once you sign in and a random anonymous id before that. Never arguments, \
+paths, topic names or data.
 Turn it off with `cerulion telemetry off` or DO_NOT_TRACK=1. Details: \
 https://github.com/cerulion-inc/cerulion/blob/main/docs/telemetry.md";
 
@@ -113,6 +125,7 @@ pub fn command_run_props(
     subverb: Option<&str>,
     code: ExitCode,
     elapsed: Duration,
+    install_method: Option<&str>,
 ) -> Props {
     let mut props: Props = vec![("verb".into(), verb.into())];
     if let Some(subverb) = subverb {
@@ -120,6 +133,9 @@ pub fn command_run_props(
     }
     props.push(("exit_code".into(), exit_code_number(code).into()));
     props.push(("duration_bucket".into(), duration_bucket(elapsed).into()));
+    if let Some(method) = install_method {
+        props.push(("install_method".into(), method.into()));
+    }
     props
 }
 
@@ -144,7 +160,7 @@ impl CommandRun {
         if !is_recorded(verb, subverb) {
             return None;
         }
-        let client = Client::from_env(common())?;
+        let client = Client::from_env_or_key(BAKED_KEY, common())?;
         // Printed under the consent lock before it is recorded: concurrent
         // first runs print it once, and a run killed in between prints it
         // again next time. The run that prints it sends nothing.
@@ -177,6 +193,7 @@ impl CommandRun {
             self.subverb.as_deref(),
             code,
             self.started.elapsed(),
+            crate::install_marker::current_method(),
         );
         emit(CLI_COMMAND_RUN, props);
         SENDING.store(false, Ordering::Relaxed);
@@ -408,8 +425,9 @@ mod tests {
 
     #[test]
     fn command_run_props_stay_inside_the_allowlist_and_pass_the_guard() {
-        for subverb in [None, Some("run")] {
-            let props = command_run_props("graph", subverb, ExitCode::FAILURE, Duration::ZERO);
+        for (subverb, method) in [(None, None), (Some("run"), Some("install.sh"))] {
+            let props =
+                command_run_props("graph", subverb, ExitCode::FAILURE, Duration::ZERO, method);
             let (kept, dropped) = guard::filter(props.clone(), CLI_COMMAND_RUN.allowlist);
             assert!(dropped.is_empty(), "{dropped:?}");
             assert_eq!(kept, props);
