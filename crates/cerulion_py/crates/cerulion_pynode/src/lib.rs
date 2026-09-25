@@ -25,9 +25,10 @@ use std::collections::{HashMap, HashSet};
 #[cfg(all(not(Py_LIMITED_API), not(cerulion_pynode_limited)))]
 use std::ffi::CString;
 use std::rc::Rc;
-#[cfg(all(not(Py_LIMITED_API), not(cerulion_pynode_limited)))]
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::Arc;
+#[cfg(all(not(Py_LIMITED_API), not(cerulion_pynode_limited)))]
+use std::sync::{Once, OnceLock};
 
 pub use cerulion_core;
 
