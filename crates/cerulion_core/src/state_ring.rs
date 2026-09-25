@@ -1015,9 +1015,9 @@ pub enum StateRingError {
         expected: u32,
     },
     /// The opened ring was NOT created under [`OverrunPolicy::Backpressure`]. A state
-    /// ring under the wait-free policy silently laps an anchor that is ~1.11 M records
-    /// at the 472-byte payload region, so this is refused at open rather than
-    /// discovered as loss later.
+    /// ring under the wait-free policy silently laps a 500 MB anchor, which is
+    /// ~1.11 M records at the 472-byte payload region, so this is refused at open
+    /// rather than discovered as loss later.
     #[error("state ring '{name}' was created under overrun policy {actual} but a state ring requires Backpressure ({expected}) — an anchor through a wait-free ring is lost, not slow")]
     OverrunPolicyMismatch {
         /// The object name.

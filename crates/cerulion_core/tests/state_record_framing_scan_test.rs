@@ -140,24 +140,26 @@ fn contains_token(line: &str, needle: &str, boundary: fn(char) -> bool) -> bool 
     false
 }
 
-/// A line may still carry a previous format's number when it SAYS so.
+/// Does this line SAY it is describing the layout that preceded this one?
 ///
-/// Two allowances, both narrow. A line naming format version 0 is talking about
-/// the layout that preceded this one, which the docs must keep doing: a reader
-/// who meets a refusal mentioning it needs somewhere to look it up. A line naming
-/// a FRAME is about the wire frame prefix, a different plane with its own
-/// 32-byte header that this sweep must not touch.
-///
-/// The frame allowance is WORD BOUNDED. As a substring test it also exempted
-/// `framework` and `frameless`, which have nothing to do with the wire frame
-/// plane, so a stale state record number written on a line that happened to say
-/// `framework` walked straight through the sweep.
-fn is_allowed(line: &str) -> bool {
+/// The docs must keep describing format version 0: a reader who meets a refusal
+/// naming it needs somewhere to look it up. A line that says so may state ANY of
+/// that format's numbers, so this excuses all three detector arms.
+fn names_format_version_0(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    lower.contains("format version 0")
-        || lower.contains("format_version_0")
-        || contains_token(&lower, "frame", is_word_char)
-        || contains_token(&lower, "frames", is_word_char)
+    lower.contains("format version 0") || lower.contains("format_version_0")
+}
+
+/// Does this line name the WIRE FRAME plane?
+///
+/// That plane is a different one with a 32-byte header of its own, which this
+/// sweep must not touch. The allowance is WORD BOUNDED: as a substring test it
+/// also exempted `framework` and `frameless`, which have nothing to do with the
+/// wire frame, so a stale number on a line that happened to say `framework`
+/// walked straight through.
+fn names_the_wire_frame_plane(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    contains_token(&lower, "frame", is_word_char) || contains_token(&lower, "frames", is_word_char)
 }
 
 /// The DERIVED record counts format version 0 stated, retired at version 1.
@@ -168,19 +170,46 @@ fn is_allowed(line: &str) -> bool {
 /// did once and wrote down, so it is exactly the class this file reads for.
 const RETIRED_DERIVED_COUNTS: &[&str] = &["1.09 M", "1_092_267", "1092267"];
 
-/// Does this line carry a state record framing number that moved?
+/// Does this line carry a state record framing number that moved, EXCUSES ASIDE?
 fn carries_a_stale_framing_literal(line: &str) -> bool {
-    if line.contains("32-byte") {
-        return true;
-    }
-    // A bare 480, the previous payload region, as its own word.
-    if contains_token(line, "480", is_word_char) {
-        return true;
-    }
-    // A record COUNT derived from that payload region.
+    carries_a_stale_header_size(line)
+        || carries_a_stale_payload_region(line)
+        || carries_a_retired_derived_count(line)
+}
+
+/// Arm one: the 32-byte header the state record grew out of.
+fn carries_a_stale_header_size(line: &str) -> bool {
+    line.contains("32-byte")
+}
+
+/// Arm two: a bare 480, the previous payload region, as its own word.
+fn carries_a_stale_payload_region(line: &str) -> bool {
+    contains_token(line, "480", is_word_char)
+}
+
+/// Arm three: a record COUNT derived from that payload region.
+fn carries_a_retired_derived_count(line: &str) -> bool {
     RETIRED_DERIVED_COUNTS
         .iter()
         .any(|n| contains_token(line, n, is_number_char))
+}
+
+/// Does this line carry a stale framing number that nothing on it EXCUSES?
+///
+/// The excuses are scoped to the arm each one justifies, which they were not
+/// before: the wire frame carve-out is about a 32-byte header on another plane,
+/// so it excuses arm one and nothing else. Applied to the whole line it also
+/// suppressed a bare 480 and a retired record count whenever the sentence
+/// happened to mention a frame, which is a state record number hiding behind an
+/// unrelated word. Only the format version 0 excuse, which names this exact
+/// layout, reaches all three.
+fn carries_an_unexcused_stale_framing_literal(line: &str) -> bool {
+    if names_format_version_0(line) {
+        return false;
+    }
+    (carries_a_stale_header_size(line) && !names_the_wire_frame_plane(line))
+        || carries_a_stale_payload_region(line)
+        || carries_a_retired_derived_count(line)
 }
 
 /// Does this line carry a CURRENT framing marker, for the control half?
@@ -205,7 +234,7 @@ fn the_state_record_framing_literals_are_swept_and_the_scan_is_not_vacuous() {
             if carries_a_current_framing_marker(line) {
                 markers += 1;
             }
-            if carries_a_stale_framing_literal(line) && !is_allowed(line) {
+            if carries_an_unexcused_stale_framing_literal(line) {
                 stale.push(format!("{}:{}: {}", f.path, no + 1, line.trim()));
             }
         }
@@ -288,38 +317,47 @@ fn the_stale_literal_detector_fires_on_every_number_this_format_retired() {
     );
 }
 
-/// The frame carve-out exempts the wire frame plane and nothing that merely
-/// starts with the same five letters.
+/// The frame carve-out exempts the wire frame plane, nothing that merely starts
+/// with the same five letters, and NO arm but the 32-byte header arm it argues
+/// for.
 ///
-/// Its own control is the pair: the two lines that MUST stay exempt, beside the
-/// two that must not, so neither a carve-out that stopped working nor one that
-/// swallowed the region can read as a pass.
+/// Its own control is the pair: the lines that MUST stay exempt, beside the ones
+/// that must not, so neither a carve-out that stopped working nor one that
+/// swallowed the region can read as a pass. The last two negatives are the
+/// scoping itself. A sentence about frames that also states a retired payload
+/// region or a retired record count is a state record number hiding behind an
+/// unrelated word, and the whole-line carve-out this file used to apply let both
+/// of them through.
 #[test]
-fn the_frame_carve_out_is_word_bounded() {
+fn the_frame_carve_out_is_word_bounded_and_scoped_to_its_own_arm() {
     for exempt in [
         "/// the wire frame prefix carries a 32-byte header of its own",
         "/// rides a 32-byte slot on every StagedFrame and the `frames` vector is",
         "/// at format version 0 the payload region read 480",
+        "/// at format version 0 a 500 MB anchor was ~1.09 M records",
     ] {
         assert!(
-            is_allowed(exempt),
-            "a line that names the frame plane or format version 0 must stay \
+            !carries_an_unexcused_stale_framing_literal(exempt),
+            "a line that names the frame plane, or format version 0, must stay \
              exempt: {exempt}"
         );
     }
     for caught in [
         "/// the framework writes the 32-byte header down",
         "/// a frameless record leaves 480 bytes of payload",
+        "/// every frame in the ring leaves 480 bytes of payload",
+        "/// a 500 MB anchor is ~1.09 M records, one per frame",
     ] {
-        assert!(
-            !is_allowed(caught),
-            "the carve-out is for the wire FRAME, not for any word beginning \
-             with it: {caught}"
-        );
         assert!(
             carries_a_stale_framing_literal(caught),
             "the control is only meaningful if the line is stale to begin \
              with: {caught}"
+        );
+        assert!(
+            carries_an_unexcused_stale_framing_literal(caught),
+            "the carve-out is for the wire FRAME's own 32-byte header: it must \
+             not reach a word that merely begins with it, nor the payload region \
+             and record count arms: {caught}"
         );
     }
 }
