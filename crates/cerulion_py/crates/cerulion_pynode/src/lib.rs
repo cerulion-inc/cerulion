@@ -121,14 +121,14 @@ impl HostCtx {
     }
 
     #[pyo3(signature = (name, default=None))]
-    fn env(&self, name: &str, default: Option<&str>) -> PyResult<String> {
+    fn env(&self, name: &str, default: Option<String>) -> PyResult<Option<String>> {
         let ptr = self.ptr.get();
         if ptr.is_null() {
             return Err(PyRuntimeError::new_err("node context is no longer alive"));
         }
         // SAFETY: Host nulls the pointer in shutdown and Drop before releasing
         // the boxed NodeContext; the GIL serializes all access.
-        Ok(unsafe { (*ptr).env_str(name, default.unwrap_or("")) })
+        Ok(unsafe { (*ptr).env_opt(name) }.or(default))
     }
 
     fn request_shutdown(&self) -> PyResult<()> {
@@ -1220,9 +1220,8 @@ macro_rules! export_node {
             }
         }
         #[no_mangle]
-        pub extern "C" fn cerulion_node_init(
-            ptr: *mut $crate::cerulion_core::graph::node::NodeContext,
-        ) -> u64 {
+        pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {
+            let ptr = ctx_ptr.cast::<$crate::cerulion_core::graph::node::NodeContext>();
             let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                 if ptr.is_null() {
                     __set_error("cerulion_node_init: NodeContext pointer was null".into());

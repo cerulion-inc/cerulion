@@ -94,6 +94,12 @@ def test_tick_exception_reports_traceback():
     assert "Traceback" in result.stdout
 
 
+def test_env_returns_none_for_an_absent_key_without_default():
+    result = _run("errors", "env_lookup")
+    assert result.returncode == 0, result.stderr
+    assert "tick=0 code=0" in result.stdout
+
+
 def test_import_failure_is_an_init_error():
     result = _run("errors", "import_error")
     assert result.returncode != 0

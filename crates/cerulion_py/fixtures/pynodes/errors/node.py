@@ -24,6 +24,14 @@ else:
             if os.environ.get("CERULION_PYNODE_CASE") == "spawn_thread":
                 threading.Thread(target=time.sleep, args=(5,), daemon=True).start()
                 time.sleep(0.02)
+            if os.environ.get("CERULION_PYNODE_CASE") == "env_lookup":
+                seen = (
+                    ctx.env("CERULION_PYNODE_ABSENT_KEY"),
+                    ctx.env("CERULION_PYNODE_ABSENT_KEY", "fallback"),
+                    ctx.env("CERULION_PYNODE_CASE"),
+                )
+                if seen != (None, "fallback", "env_lookup"):
+                    raise RuntimeError(f"unexpected env lookups {seen!r}")
 
         def tick(self):
             case = os.environ.get("CERULION_PYNODE_CASE")

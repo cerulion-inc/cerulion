@@ -2265,6 +2265,13 @@ impl NodeContext {
         self.env_lookup(key).unwrap_or_else(|| default.to_string())
     }
 
+    /// String-typed env var lookup that reports absence as `None`, for
+    /// callers that must tell an unset key from one set to `""`. Reads the
+    /// same frozen snapshot as [`Self::env_str`].
+    pub fn env_opt(&self, key: &str) -> Option<String> {
+        self.env_lookup(key)
+    }
+
     /// Env-var read backend. Always reads from the
     /// frozen snapshot — there is no live `std::env::var` fallback.
     ///

@@ -26,7 +26,10 @@ class Counter:
     out = cerulion.output("test_msgs/Out")
 
     def tick(self):
-        self.out.value = self.inp.value
+        msg = self.inp
+        if msg is None:
+            return
+        self.out.value = msg.value
 ```
 
 Create and build one with:
