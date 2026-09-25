@@ -29,6 +29,7 @@ use std::sync::Arc;
 /// strategy Static - a larger loan fails at loan time).
 #[pyclass(unsendable)]
 pub struct Publisher {
+    parked: Vec<(Arc<Exports>, RawShmLoan)>,
     publisher: CerulionPublisher,
     schema_hash: u64,
     max_payload_len: usize,
@@ -36,6 +37,11 @@ pub struct Publisher {
 }
 
 impl Publisher {
+    /// Return every parked loan whose views have all closed.
+    fn reap(&mut self) {
+        self.parked.retain(|(exports, _)| exports.live() > 0);
+    }
+
     /// Commit `loan`: stamp the header (sequence taken HERE, at commit -
     /// a failed loan burned no number) and send. Shared by `publish` and
     /// `Loan::commit`.
@@ -101,6 +107,7 @@ impl Publisher {
             .create_publisher(topic, slot_len, 0)
             .map_err(map_transport_err)?;
         Ok(Self {
+            parked: Vec::with_capacity(2),
             publisher,
             schema_hash,
             max_payload_len,
@@ -145,6 +152,7 @@ impl Publisher {
             PyTypeError::new_err("payload must be a contiguous bytes-like object")
         })?;
         let len = src.len();
+        self.reap();
         if len > self.max_payload_len {
             return Err(EncodeError::new_err(format!(
                 "payload length {len} exceeds max_payload_len {}",
@@ -177,6 +185,7 @@ impl Publisher {
     /// unwritten payload bytes are deterministic (never recycled garbage).
     fn loan(slf: &Bound<'_, Self>, payload_len: usize) -> PyResult<Loan> {
         let mut this = slf.borrow_mut();
+        this.reap();
         if payload_len > this.max_payload_len {
             return Err(EncodeError::new_err(format!(
                 "payload_len {payload_len} exceeds max_payload_len {}",
@@ -341,8 +350,8 @@ impl Publisher {
 ///
 /// The buffer-export count keeps the loan alive while a view exists -
 /// `commit()` refuses with `EncodeError` while exports are live (a view
-/// over a sent slot would dangle); `discard()` with live exports defers
-/// the slot's return to the last `__releasebuffer__` (`pending_drop`).
+/// over a sent slot would dangle); `discard()` with live exports parks
+/// the slot with its publisher until the last `__releasebuffer__`.
 #[pyclass(unsendable)]
 pub struct Loan {
     publisher: Py<Publisher>,
@@ -406,9 +415,10 @@ impl Loan {
     ///
     /// Same foreign-thread rule as `Frame::__releasebuffer__` (see
     /// `frame.rs`): the atomic count is always decremented, so `commit()`
-    /// works once every view is released on any thread; only the drop of
-    /// a discarded loan's slot waits for the owning thread (the `Loan`'s
-    /// own drop, with a `RuntimeWarning`).
+    /// works once every view is released on any thread. A discarded
+    /// loan's slot is parked with its publisher; when its last view
+    /// closes off the owning thread, it returns at the publisher's next
+    /// `publish()` or `loan()`, with a `RuntimeWarning`.
     unsafe fn __releasebuffer__(slf: Bound<'_, Self>, view: *mut ffi::Py_buffer) {
         let Some(done) = (unsafe { release_export(view) }) else {
             return;
@@ -421,10 +431,17 @@ impl Loan {
                 if this.pending_drop {
                     this.loan = None;
                 }
-                return;
+                if let Ok(mut publisher) = this.publisher.bind(slf.py()).try_borrow_mut() {
+                    publisher.reap();
+                    return;
+                }
             }
         }
-        warn_offthread_release(slf.py(), "Loan", "when the Loan is dropped");
+        warn_offthread_release(
+            slf.py(),
+            "Loan",
+            "at the publisher's next publish() or loan()",
+        );
     }
 
     /// Payload length in bytes (the writable region's length).
@@ -481,17 +498,25 @@ impl Loan {
         result
     }
 
-    /// Release the SHM slot without sending (closes the loan). A live
-    /// view defers the return to the last `__releasebuffer__`.
-    fn discard(&mut self) {
+    /// Release the SHM slot without sending (closes the loan). With a
+    /// live view the slot is parked with the publisher and returns once
+    /// the last view closes.
+    fn discard(&mut self, py: Python<'_>) {
         if self.closed {
             return;
         }
         self.closed = true;
         self.pending_drop = true;
         self.exports.give_up();
+        let Some(loan) = self.loan.take() else {
+            return;
+        };
         if self.exports.live() == 0 {
-            self.loan = None;
+            return;
+        }
+        match self.publisher.bind(py).try_borrow_mut() {
+            Ok(mut publisher) => publisher.parked.push((Arc::clone(&self.exports), loan)),
+            Err(_) => self.loan = Some(loan),
         }
     }
 }
