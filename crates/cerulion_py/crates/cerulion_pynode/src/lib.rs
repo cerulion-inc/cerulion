@@ -920,7 +920,6 @@ impl Host {
             Self::validate_declaration_matches_info(info, &declaration)?;
             let runtime = runtime.unbind();
             let outputs = metadata.outputs;
-            let next_sequences = outputs.keys().map(|name| (name.clone(), 0)).collect();
             let mut host = Self {
                 ctx,
                 ctx_ptr,
@@ -929,7 +928,7 @@ impl Host {
                 input_names: metadata.input_names,
                 input_hashes: metadata.input_hashes,
                 outputs,
-                next_sequences,
+                next_sequences: HashMap::new(),
                 held_copies: HashMap::new(),
                 warned_threads: false,
             };
@@ -1137,7 +1136,17 @@ impl Host {
                         .outputs
                         .get(&name)
                         .ok_or_else(|| format!("unknown output '{name}'"))?;
-                    let sequence = self.next_sequences.entry(name.clone()).or_default();
+                    // SAFETY: the split context borrow keeps the publishers map
+                    // alive for the duration of this tick.
+                    let publisher = publishers
+                        .get_mut(&name)
+                        .ok_or_else(|| format!("unknown output publisher '{name}'"))?;
+                    // A restored replay seeds the publisher; the first frame
+                    // continues the recorded stream's numbering, as a Rust node's does.
+                    let initial = match publisher {
+                        AnyPublisher::Ipc(publisher) => publisher.initial_sequence(),
+                    };
+                    let sequence = self.next_sequences.entry(name.clone()).or_insert(initial);
                     let bytes = raw_loan.bytes_mut();
                     let mut header = WireHeader::read_from_buf(bytes).ok_or_else(|| {
                         format!("output loan '{name}' has an invalid wire header")
@@ -1146,11 +1155,6 @@ impl Host {
                     header.sequence = *sequence;
                     header.timestamp_ns = clock.now_ns();
                     header.write_to_buf(bytes);
-                    // SAFETY: the split context borrow keeps the publishers map
-                    // alive for the duration of this tick.
-                    let publisher = publishers
-                        .get_mut(&name)
-                        .ok_or_else(|| format!("unknown output publisher '{name}'"))?;
                     match publisher {
                         AnyPublisher::Ipc(publisher) => {
                             publisher

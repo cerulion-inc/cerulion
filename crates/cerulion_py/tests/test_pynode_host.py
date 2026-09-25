@@ -44,6 +44,45 @@ def test_host_pynode_harness_is_deterministic():
     ]
 
 
+def test_host_pynode_continues_a_restored_output_sequence():
+    # A restored replay seeds each output publisher; the Python node's first
+    # frame must carry the seed, the next seed + 1, exactly as a Rust node's.
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", counter, "2", "--seed", "41"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_node_env("counter"),
+    )
+    assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=0 out=0100000000000000 seq=41",
+        "tick=1 code=0 out=0300000000000000 seq=42",
+    ]
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--also"], "--also requires a node path"),
+        (["--seed"], "--seed requires a sequence number"),
+        (["--seed", "-1"], "--seed:"),
+        (["--bogus"], "unknown host-pynode option '--bogus'"),
+    ],
+)
+def test_host_pynode_refuses_malformed_options(extra, message):
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", counter, "1", *extra],
+        capture_output=True,
+        text=True,
+        env=_node_env("counter"),
+    )
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "node_info=" not in result.stdout
+
+
 def test_host_pynode_loans_builtin_output_without_workspace_schemas():
     path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_builtin" + DYLIB)
     result = subprocess.run(

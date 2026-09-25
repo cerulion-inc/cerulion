@@ -129,12 +129,7 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
         _ => return Err(format!("unknown mode '{mode}'\n{USAGE}")),
     }
     if mode == "host-pynode" {
-        if rest.len() < 2 {
-            return Err("host-pynode requires <path.so> <ticks>".to_string());
-        }
-        rest[1]
-            .parse::<usize>()
-            .map_err(|error| format!("invalid tick count: {error}"))?;
+        parse_host_pynode(rest)?;
         return Ok((
             mode,
             Args {
@@ -207,20 +202,57 @@ fn run() -> Result<ExitCode, String> {
     }
 }
 
+/// `host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]`.
+struct HostPynodeArgs<'a> {
+    path: &'a str,
+    ticks: usize,
+    also: Option<&'a str>,
+    bench: bool,
+    seed: Option<u32>,
+}
+
+fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
+    let [path, ticks, options @ ..] = argv else {
+        return Err("host-pynode requires <path.so> <ticks>".to_string());
+    };
+    let mut args = HostPynodeArgs {
+        path,
+        ticks: ticks
+            .parse::<usize>()
+            .map_err(|error| format!("invalid tick count: {error}"))?,
+        also: None,
+        bench: false,
+        seed: None,
+    };
+    let mut options = options.iter();
+    while let Some(option) = options.next() {
+        match option.as_str() {
+            "--also" => {
+                let path = options.next().ok_or("--also requires a node path")?;
+                args.also = Some(path);
+            }
+            "--bench" => args.bench = true,
+            "--seed" => {
+                let seed = options.next().ok_or("--seed requires a sequence number")?;
+                args.seed = Some(
+                    seed.parse::<u32>()
+                        .map_err(|error| format!("--seed: {error}"))?,
+                );
+            }
+            other => return Err(format!("unknown host-pynode option '{other}'\n{USAGE}")),
+        }
+    }
+    Ok(args)
+}
+
 fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, String> {
-    let path = argv
-        .first()
-        .ok_or_else(|| "host-pynode requires <path.so> <ticks>".to_string())?;
-    let ticks = argv
-        .get(1)
-        .ok_or_else(|| "host-pynode requires <path.so> <ticks>".to_string())?
-        .parse::<usize>()
-        .map_err(|error| format!("invalid tick count: {error}"))?;
-    let also = argv
-        .get(2)
-        .filter(|flag| flag.as_str() == "--also")
-        .and_then(|_| argv.get(3));
-    let bench = argv.iter().any(|arg| arg == "--bench");
+    let HostPynodeArgs {
+        path,
+        ticks,
+        also,
+        bench,
+        seed,
+    } = parse_host_pynode(argv)?;
     for node_path in [Some(path), also].into_iter().flatten() {
         let mut entry = DylibNodeEntry::load(std::path::Path::new(node_path))
             .map_err(|error| error.to_string())?;
@@ -309,6 +341,9 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
                 }
                 None => MaxSliceLen::try_new(total as u32).ok_or("output frame is too large")?,
             };
+            if let Some(seed) = seed {
+                mgr.set_replay_sequence_seeds([(topic.clone(), seed)].into());
+            }
             let node_pub = mgr
                 .create_publisher(&topic, max_len, 1)
                 .map_err(|error| error.to_string())?;
@@ -386,19 +421,26 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
             match tick_result {
                 Ok(()) => {
                     let mut output = String::new();
+                    let mut sequence = None;
                     for (_, subscriber) in &mut output_subscribers {
                         if let Some(sample) = subscriber
                             .try_receive_one_owned()
                             .map_err(|error| error.to_string())?
                         {
+                            sequence = WireHeader::read_from_buf(sample.payload())
+                                .map(|header| header.sequence);
                             output = sample.payload()[WireHeader::SIZE..]
                                 .iter()
                                 .map(|byte| format!("{byte:02x}"))
                                 .collect();
                         }
                     }
-                    if !bench {
-                        println!("tick={tick} code=0 out={output}");
+                    match (bench, seed, sequence) {
+                        (true, _, _) => {}
+                        (false, Some(_), Some(sequence)) => {
+                            println!("tick={tick} code=0 out={output} seq={sequence}")
+                        }
+                        (false, _, _) => println!("tick={tick} code=0 out={output}"),
                     }
                 }
                 Err(error) => {
@@ -802,7 +844,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
     Ok(ExitCode::SUCCESS)
 }
 
-const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M";
+const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]";
 
 fn main() -> ExitCode {
     match run() {
