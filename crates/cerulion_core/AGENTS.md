@@ -56,5 +56,5 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 - macOS iceoryx2 select() aborts when any fd NUMBER >= 1024 enters a WaitSet.
 - Per-frame byte-identity: publish in lockstep + `try_receive_one` (drain-all keeps newest).
 
-Read first (`docs/internals/`): `core-transport.md` (transport/liveness/latch/gateway),
-`core-scheduler-graph.md` (scheduler/trigger/graph/determinism), `core-testing.md`.
+Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
+(scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
