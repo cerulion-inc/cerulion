@@ -3,6 +3,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,30 @@ def _python_libdir():
         text=True,
     )
     return result.stdout.strip()
+
+
+def _echo_topic(topic, graph, *, cwd, env):
+    """Stream ``topic echo`` for a few seconds while ``graph`` runs; return its stdout."""
+    out = ""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and graph.poll() is None:
+        echo = subprocess.Popen(
+            [CLI, "topic", "echo", topic],
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            out, _ = echo.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            echo.send_signal(signal.SIGINT)
+            out, _ = echo.communicate(timeout=10)
+        if "x:" in out:
+            return out
+        time.sleep(0.2)
+    return out
 
 
 def test_cli_python_node_build_info_and_graph_run(tmp_path):
@@ -104,7 +129,7 @@ def test_cli_python_node_build_info_and_graph_run(tmp_path):
     assert '@cer.node(trigger="inp")' in source
     source = source.replace(
         "        # copy fields here, e.g. out.x = msg.x",
-        "        out.x = msg.x\n        out.y = msg.y\n        out.z = msg.z",
+        "        out.x = msg.x + 1.5\n        out.y = msg.y - 2.0\n        out.z = msg.z + 0.25",
     )
     node_py.write_text(source)
 
@@ -203,12 +228,15 @@ nodes:
         stderr=subprocess.PIPE,
         text=True,
     )
+    echo = _echo_topic("/echo/echo/out", run, cwd=workspace, env=env)
     try:
-        stdout, stderr = run.communicate(timeout=5)
+        stdout, stderr = run.communicate(timeout=1)
     except subprocess.TimeoutExpired:
         run.send_signal(signal.SIGINT)
         stdout, stderr = run.communicate(timeout=10)
     assert run.returncode in (0, -signal.SIGINT), stderr
+    # The producer publishes a zero vector; only the Python tick adds the offsets.
+    assert "x: 1.5" in echo and "y: -2" in echo and "z: 0.25" in echo, echo
     combined = stdout + stderr
     assert "schema 'producer'.cmd: geometry_msgs/Vector3" in combined
     assert "schema 'echo'.out: geometry_msgs/Vector3" in combined

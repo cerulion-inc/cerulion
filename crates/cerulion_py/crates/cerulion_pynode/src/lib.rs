@@ -962,10 +962,10 @@ impl Host {
                     let backing = match view.into_owned() {
                         Ok(view) => FrameBacking::Sample(view),
                         Err(held) => {
-                            let header = held.len().min(WireHeader::SIZE);
-                            let cached = self.held_copies.get(name).filter(|copy| {
-                                copy.len() == held.len() && copy[..header] == held[..header]
-                            });
+                            let cached = self
+                                .held_copies
+                                .get(name)
+                                .filter(|copy| copy.as_ref() == &held[..]);
                             let copy = match cached {
                                 Some(copy) => Rc::clone(copy),
                                 None => {
