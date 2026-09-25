@@ -69,8 +69,10 @@ const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 
 /// Printed to stderr once per machine, on the first run that could send.
 pub const NOTICE: &str = "\
-Cerulion sends anonymous usage events from this CLI: the verb you ran, its \
-exit code, a rough duration and how it was installed. Never arguments, paths, topic names or data.
+Cerulion sends usage events from this CLI: the verb you ran, its exit code, \
+a rough duration and how it was installed, under your Cerulion account id \
+once you sign in and a random anonymous id before that. Never arguments, \
+paths, topic names or data.
 Turn it off with `cerulion telemetry off` or DO_NOT_TRACK=1. Details: \
 https://github.com/cerulion-inc/cerulion/blob/main/docs/telemetry.md";
 
@@ -159,14 +161,12 @@ impl CommandRun {
             return None;
         }
         let client = Client::from_env_or_key(BAKED_KEY, common())?;
-        match consent::notice_shown() {
-            Ok(true) => {}
-            // Printed BEFORE it is recorded, so no run can see the notice as
-            // shown while it has not been: concurrent first runs may each
-            // print it, and a run killed in between prints it again next time.
-            Ok(false) => {
-                eprintln!("{NOTICE}\n");
-                let _ = consent::mark_notice_shown();
+        // Printed under the consent lock before it is recorded: concurrent
+        // first runs print it once, and a run killed in between prints it
+        // again next time. The run that prints it sends nothing.
+        match consent::show_notice_once(|| eprintln!("{NOTICE}\n")) {
+            Ok(false) => {}
+            Ok(true) => {
                 NOTICE_RUN.store(true, Ordering::Relaxed);
                 return None;
             }
@@ -244,6 +244,11 @@ fn merge_pending_alias(client: &Client) {
         let Some(path) = pending_alias_path().filter(|p| p.exists()) else {
             return;
         };
+        // Consent is read again: an opt-out since the client was built keeps
+        // the marker, so nothing is sent and nothing owed is forgotten.
+        if !consent::status().enabled {
+            return;
+        }
         let sub = auth::load().state().and_then(|s| hosted_sub(&s.account_id));
         if let (Some(sub), Ok(Some(anon_id))) = (sub, consent::anon_id()) {
             client.alias(&sub, &anon_id);
@@ -273,11 +278,19 @@ pub fn login_anon_id() -> Option<String> {
     if auth::load().state().is_some() {
         return None;
     }
-    let anon_id = consent::anon_id().ok().flatten()?;
     if SENDING.load(Ordering::Relaxed) {
-        return Some(anon_id);
+        // Consent is read again: `cerulion telemetry off` in another terminal
+        // since this run started must keep the id out of the login.
+        if !consent::status().enabled {
+            return None;
+        }
+        return consent::anon_id().ok().flatten();
     }
-    UNCARRIED.store(NOTICE_RUN.load(Ordering::Relaxed), Ordering::Relaxed);
+    // Only the notice run defers a merge; any other non-sending run mints no
+    // id and writes no consent file.
+    if NOTICE_RUN.load(Ordering::Relaxed) && consent::anon_id().ok().flatten().is_some() {
+        UNCARRIED.store(true, Ordering::Relaxed);
+    }
     None
 }
 
@@ -295,7 +308,11 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
             if let Some(path) = pending_alias_path() {
                 let _ = std::fs::remove_file(path);
             }
-            let _ = consent::rotate_anon_id();
+            // An id that cannot be rotated must not keep sending: stop this
+            // run's events rather than attribute them to the old account.
+            if consent::rotate_anon_id().is_err() {
+                SENDING.store(false, Ordering::Relaxed);
+            }
         }
         // The run that printed the notice sends nothing, so the merge waits
         // for the next run that may send (see `merge_pending_alias`).

@@ -4,14 +4,41 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Whether `s` has exactly the `YYYY-MM-DDTHH:MM:SS.mmmZ` shape [`format()`]
-/// produces: ASCII digits in every numeric position, fixed separators.
+/// produces (ASCII digits in every numeric position, fixed separators) and
+/// names a real instant: month 01 to 12, a day that exists in that month,
+/// hour 00 to 23, minute and second 00 to 59.
 pub fn is_well_formed(s: &str) -> bool {
     const SHAPE: &[u8; 24] = b"dddd-dd-ddTdd:dd:dd.dddZ";
-    s.len() == SHAPE.len()
+    let shaped = s.len() == SHAPE.len()
         && s.bytes().zip(SHAPE.iter()).all(|(b, &want)| match want {
             b'd' => b.is_ascii_digit(),
             _ => b == want,
-        })
+        });
+    if !shaped {
+        return false;
+    }
+    let num = |range: std::ops::Range<usize>| -> u32 {
+        s.as_bytes()[range]
+            .iter()
+            .fold(0, |n, b| n * 10 + u32::from(b - b'0'))
+    };
+    let (year, month, day) = (num(0..4), num(5..7), num(8..10));
+    (1..=12).contains(&month)
+        && (1..=days_in_month(year, month)).contains(&day)
+        && num(11..13) <= 23
+        && num(14..16) <= 59
+        && num(17..19) <= 59
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 /// Millisecond-precision UTC RFC 3339, always with a `Z` suffix. Instants
@@ -62,6 +89,26 @@ mod tests {
             let t =
                 UNIX_EPOCH + Duration::from_secs(*secs) + Duration::from_millis(u64::from(*millis));
             assert_eq!(format(t), *want, "secs={secs} millis={millis}");
+            assert!(is_well_formed(want), "{want}");
         }
+    }
+
+    #[test]
+    fn impossible_instants_are_not_well_formed() {
+        for bad in [
+            "2026-13-01T00:00:00.000Z",
+            "2026-00-01T00:00:00.000Z",
+            "2026-04-31T00:00:00.000Z",
+            "2026-02-29T00:00:00.000Z",
+            "1900-02-29T00:00:00.000Z",
+            "2026-01-00T00:00:00.000Z",
+            "2026-01-01T24:00:00.000Z",
+            "2026-01-01T00:60:00.000Z",
+            "2026-01-01T00:00:60.000Z",
+            "2026-99-99T99:99:99.999Z",
+        ] {
+            assert!(!is_well_formed(bad), "{bad}");
+        }
+        assert!(is_well_formed("2024-02-29T23:59:59.999Z"));
     }
 }

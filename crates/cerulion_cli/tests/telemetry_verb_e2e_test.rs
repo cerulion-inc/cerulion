@@ -78,7 +78,15 @@ fn off_then_on_persist_in_the_consent_file() {
         status.stdout
     );
     let on = cerulion(home.path(), &[], &["telemetry", "on"]);
+    assert_eq!(on.code, Some(0), "stderr={}", on.stderr);
     assert!(on.stdout.contains("telemetry: on"), "{}", on.stdout);
+    let file = std::fs::read_to_string(home.path().join("telemetry.json")).unwrap();
+    assert!(
+        file.contains("\"enabled\":true") || file.contains("\"enabled\": true"),
+        "{file}"
+    );
+    let status = cerulion(home.path(), &[], &["telemetry", "status"]);
+    assert!(status.stdout.contains("telemetry: on"), "{}", status.stdout);
 }
 
 #[test]
@@ -240,7 +248,11 @@ fn an_alias_left_pending_by_the_notice_run_is_merged_by_the_next_send() {
         .as_str()
         .expect("the consent file carries an anon id");
     assert!(body.contains("\"$create_alias\""), "{body}");
-    assert!(body.contains(anon_id), "{body}");
+    assert!(body.contains(&format!("\"alias\":\"{anon_id}\"")), "{body}");
+    assert!(
+        body.contains(&format!("\"distinct_id\":\"{sub}\"")),
+        "{body}"
+    );
     assert!(body.contains("\"cli_command_run\""), "{body}");
     assert!(!marker.exists());
 }
