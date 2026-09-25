@@ -5592,13 +5592,16 @@ pub fn graph_run(
                         // call can know: the descriptor is rendered before
                         // dispatch, so no ring exists yet and the `/dev/shm`
                         // free-space gate that may refuse the whole plane has
-                        // not run. A refused plane stamps no tags, every
-                        // worker then resolves `FreeRunLive` on the
-                        // `RealClock`, and this label stands as written: it
-                        // records what the run asked for, not what it got. A
-                        // WORKER-side create failure does not diverge: the
-                        // worker keys its clock discipline on the same stamped
-                        // intent and wall-follows either way.
+                        // not run. So this is the PROVISIONAL label, and the
+                        // supervisor re-stamps it from the plan it really
+                        // stamped (`restamp_effective_gating`, immediately
+                        // after the trace-plane decision and before any worker
+                        // is spawned): a refused plane stamps no tags, every
+                        // worker resolves `FreeRunLive` on the `RealClock`, and
+                        // the field a reader sees says `wall`. A WORKER-side
+                        // create failure needs no correction — the worker keys
+                        // its clock discipline on the stamped intent and
+                        // wall-follows either way.
                         !no_rings,
                         execution_mode,
                     ),
@@ -10416,6 +10419,26 @@ fn graph_run_supervisor(
     };
     #[cfg(unix)]
     let mut trace_plane = trace_plane;
+    // The manifest now follows the trace plane, not the
+    // intent. `graph_run` wrote `gating` before the dispatch, from `!no_rings`,
+    // because a pre-dispatch descriptor has no other fact to write; the
+    // decision above is the moment the real one exists. It is read off the
+    // PLAN — the field each worker resolves its own build path from — so the
+    // label and every rank's clock cannot disagree.
+    //
+    // Placed HERE rather than beside the refusal arm: the correction is
+    // unconditional (see `restamp_effective_gating`), and this is the first
+    // point every arm of the decision has converged. It still precedes the plan
+    // serialization and the spawn loop below, so the manifest is right before
+    // anything can attach to this run.
+    #[cfg(unix)]
+    restamp_effective_gating(
+        run_dir,
+        &plan,
+        time_source == TimeSource::Virtual,
+        record.is_some(),
+        execution_mode,
+    );
     // ARM THE WEDGE ALARM. Every rank gets a page; the supervisor
     // keeps the observing half and stamps each worker's (tag, slot order) into
     // its plan.
@@ -17088,6 +17111,90 @@ fn declare_run_trace_best_effort(run_dir: Option<&Path>, decl: &crate::run_dir::
     }
 }
 
+/// PURE: does the supervisor's stamped plan hand ANY rank a ring?
+///
+/// The predicate is `resolve_worker_ring_intent(..).is_some()` per rank — the
+/// call the worker's own (2.5) resolves its build path from — so the manifest's
+/// label and every rank's clock discipline read ONE fact off ONE plan field
+/// rather than two spellings of "this run is traced".
+///
+/// `any` rather than `all`: the supervisor stamps the whole plan or none of it
+/// (the gate is asked once over the deployment and the stamping call walks
+/// every worker), so a mixed plan is not a shape this code produces, and `any`
+/// is the arm that keeps a traced deployment labelled traced if one ever did.
+#[cfg(unix)]
+fn plan_carries_ring_intent(plan: &crate::multiprocess::DeploymentPlan) -> bool {
+    plan.workers.iter().any(|w| {
+        resolve_worker_ring_intent(
+            w.recording_ring.as_deref(),
+            w.trace_ring.as_deref(),
+            &w.group,
+        )
+        .is_some()
+    })
+}
+
+/// Re-stamp this run's `gating` label from the trace plane it ACTUALLY got.
+///
+/// `graph_run` classifies the label from the ring INTENT, before the dispatch
+/// and therefore before the `/dev/shm` free-space gate has run. A plane that
+/// gate refuses stamps no tags, every rank resolves `FreeRunLive` on the
+/// read-only clock, and a manifest left at `recorded_wall` tells a resim judge
+/// that boundaries the scheduler merely READ were boundaries it ADVANCED — the
+/// one distinction the field exists to carry.
+///
+/// Called on EVERY supervisor run, not only a refused one. A correction
+/// applied conditionally needs a second predicate deciding when the first
+/// answer was wrong, and that second predicate is the drift; classifying
+/// unconditionally from the stamped plan leaves one source of truth, and the
+/// ordinary path simply rewrites the value it already had.
+///
+/// Keyed on the PLAN and deliberately not on `TracePlaneDecision`: the
+/// departure-ring failure arm yields `Unavailable` with the worker plans
+/// STAMPED, so every rank still mints its own trace ring and still wall-follows.
+/// A label taken from that enum would call those ranks `wall` and be wrong in
+/// the other direction.
+///
+/// DEGRADES loudly rather than failing, like every other writer into this
+/// manifest: a run whose label cannot be corrected still runs.
+#[cfg(unix)]
+fn restamp_effective_gating(
+    run_dir: Option<&Path>,
+    plan: &crate::multiprocess::DeploymentPlan,
+    virtual_time_source: bool,
+    records: bool,
+    execution_mode: crate::multiprocess::ExecutionMode,
+) {
+    // `true` for the supervisor arm, which is the only caller: it is the same
+    // fact `executes_process_groups` carries at the descriptor's own call, and
+    // reaching here means the dispatch already chose this deployment.
+    let gating = crate::run_dir::GatingClock::classify(
+        true,
+        virtual_time_source,
+        records,
+        plan_carries_ring_intent(plan),
+        execution_mode,
+    );
+    let Some(dir) = run_dir else {
+        return;
+    };
+    match crate::run_dir::restamp_run_gating(dir, gating) {
+        Ok(()) => tracing::debug!(
+            run_dir = %dir.display(),
+            gating = gating.label(),
+            "stamped this run's EFFECTIVE gating clock into run.json"
+        ),
+        Err(e) => tracing::warn!(
+            run_dir = %dir.display(),
+            gating = gating.label(),
+            error = %e,
+            "could not correct this run's gating label in run.json: the graph runs \
+             normally, but a reader of this run's manifest sees the clock arm the run \
+             ASKED FOR rather than the one it got"
+        ),
+    }
+}
+
 /// PURE — turn this run's window-recorder decision into the
 /// `state_ring_consumer` state its `run.json` declares.
 ///
@@ -21802,6 +21909,140 @@ nodes:
                  shape the supervisor produces"
             );
         }
+    }
+
+    /// HAND ORACLE: `run.json`'s `gating` records the trace plane the run GOT,
+    /// not the one it asked for.
+    ///
+    /// The refusal is injected as the thing a refusal PRODUCES — worker plans
+    /// carrying no ring tag — because the supervisor's gate refuses only when
+    /// `/dev/shm` genuinely cannot hold the deployment, and filling a machine's
+    /// tmpfs to reach it is neither hermetic nor safe (the same reason the
+    /// worker's half of this degrade has a `CER_FAIL_MODE_TRACE_RING_RANK`
+    /// seam and no real-space test).
+    ///
+    /// Both readings are asserted together on purpose. The label and the
+    /// workers' build path are the two things that must agree, and a test that
+    /// read only the file would pass on a label that is merely consistent with
+    /// itself while every rank ran a different clock.
+    #[cfg(unix)]
+    #[test]
+    fn the_manifest_records_the_gating_clock_the_run_got_not_the_one_it_asked_for() {
+        use crate::multiprocess::ExecutionMode;
+        use crate::run_dir::GatingClock;
+
+        // Hand-built, like the stamping test above: the CLASSIFICATION is what
+        // is under test, and a real planner would put a levelizer and a graph
+        // parse between the fixture and it.
+        let two_ranks = || crate::multiprocess::DeploymentPlan {
+            workers: (0..2)
+                .map(|rank| {
+                    let mut w = worker_tests::minimal_plan("{}");
+                    w.group = format!("p{rank}");
+                    w.rank = rank;
+                    w
+                })
+                .collect(),
+            barrier_ns: "gating_ns".to_string(),
+            barrier_id: "gating".to_string(),
+            expected: 2,
+        };
+
+        // The manifest `graph_run` wrote BEFORE the dispatch, with the
+        // pre-dispatch label a free-run run that asked for rings gets. The
+        // `shm` entry belongs to a writer this one does not own.
+        let seed = |dir: &std::path::Path, gating: &str| {
+            std::fs::write(
+                dir.join(crate::run_dir::RUN_MANIFEST_FILE),
+                format!(
+                    r#"{{"version":1,"run_id":"0x1","gating":"{gating}","shm":[{{"class":"arm","tag":"cer_run_1","rank":null,"source":"derived"}}]}}"#
+                ),
+            )
+            .expect("seed the manifest");
+        };
+        let read_gating = |dir: &std::path::Path| {
+            let bytes = std::fs::read(dir.join(crate::run_dir::RUN_MANIFEST_FILE))
+                .expect("read the manifest back");
+            crate::run_dir::run_manifest_gating(&bytes)
+        };
+
+        // (1) REFUSED: the gate stamped no tag into any plan.
+        let refused_dir = tempfile::tempdir().expect("tempdir");
+        seed(refused_dir.path(), "recorded_wall");
+        let refused = two_ranks();
+        restamp_effective_gating(
+            Some(refused_dir.path()),
+            &refused,
+            false,
+            false,
+            ExecutionMode::FreeRun,
+        );
+        assert_eq!(
+            read_gating(refused_dir.path()),
+            Some(GatingClock::Wall),
+            "a refused trace plane leaves every rank on the read-only clock, so the manifest \
+             has to say `wall`. Left at `recorded_wall` it tells a resim judge that \
+             boundaries the scheduler merely READ were boundaries it ADVANCED"
+        );
+        assert_eq!(
+            resolve_worker_build_path(ExecutionMode::FreeRun, plan_carries_ring_intent(&refused)),
+            WorkerBuildPath::FreeRunLive,
+            "…and that is the clock the workers really build, off the SAME plan field the \
+             label was classified from"
+        );
+
+        // (2) STAMPED: the ordinary free-run plane, which must not be relabelled.
+        let stamped_dir = tempfile::tempdir().expect("tempdir");
+        seed(stamped_dir.path(), "recorded_wall");
+        let mut stamped = two_ranks();
+        stamp_trace_ring_tags(&mut stamped, "demo", 4242, false);
+        restamp_effective_gating(
+            Some(stamped_dir.path()),
+            &stamped,
+            false,
+            false,
+            ExecutionMode::FreeRun,
+        );
+        assert_eq!(
+            read_gating(stamped_dir.path()),
+            Some(GatingClock::RecordedWall),
+            "a stamped plane keeps the traced arm; a correction that also moved THIS run \
+             would trade one wrong label for another"
+        );
+        assert_eq!(
+            resolve_worker_build_path(ExecutionMode::FreeRun, plan_carries_ring_intent(&stamped)),
+            WorkerBuildPath::FreeRunTraced,
+            "…and its ranks follow the wall on the controlled clock"
+        );
+
+        // (3) LOCKSTEP: gated by the handed quantum whether or not a ring
+        // exists, so a refused plane must leave the label alone.
+        let lockstep_dir = tempfile::tempdir().expect("tempdir");
+        seed(lockstep_dir.path(), "quantum");
+        restamp_effective_gating(
+            Some(lockstep_dir.path()),
+            &two_ranks(),
+            false,
+            false,
+            ExecutionMode::Lockstep,
+        );
+        assert_eq!(
+            read_gating(lockstep_dir.path()),
+            Some(GatingClock::Quantum),
+            "a lockstep run's gating clock is the handed quantum; the trace plane does not \
+             move it, and a correction that keyed on the ring alone would"
+        );
+
+        // The ledger entry this writer does not own survives the rewrite.
+        let bytes = std::fs::read(refused_dir.path().join(crate::run_dir::RUN_MANIFEST_FILE))
+            .expect("read back");
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("still valid JSON");
+        assert!(
+            doc["shm"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|e| e["class"] == "arm")),
+            "the ARM entry belongs to another writer and must outlive this rewrite: {doc}"
+        );
     }
 
     /// The ring-tag scheme: distinct per rank, departure distinct from every
@@ -28681,6 +28922,51 @@ nodes:
             body.contains("record.is_some()"),
             "the supervisor still has to know whether it records — it chooses WHICH plan field \
              to stamp and whether a ring failure is fatal"
+        );
+    }
+
+    /// The supervisor CORRECTS its gating label, exactly once, from the plan
+    /// it stamped.
+    ///
+    /// STRUCTURAL because the behavioural half cannot see a deleted call: the
+    /// oracle
+    /// (`the_manifest_records_the_gating_clock_the_run_got_not_the_one_it_asked_for`)
+    /// drives the helper directly, so removing the supervisor's only call to it
+    /// leaves every run.json at the pre-dispatch intent with the whole suite
+    /// still green. Reaching it behaviourally needs a real supervisor, real
+    /// workers and a hostile `/dev/shm`.
+    ///
+    /// It also pins WHICH fact the helper classifies from: read back off
+    /// `no_rings`, the correction re-states the intent it exists to replace and
+    /// is indistinguishable from not being there.
+    #[cfg(unix)]
+    #[test]
+    fn the_supervisor_corrects_its_gating_label_from_the_plan_it_stamped() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "fn graph_run_supervisor(")
+            .expect("the supervisor fn must still exist; this walk moved with it");
+
+        assert_eq!(
+            body.matches("restamp_effective_gating(").count(),
+            1,
+            "exactly ONE correction site: without it every refused trace plane leaves \
+             `run.json` claiming `recorded_wall` for ranks that ran the `RealClock`, and \
+             a second site is a second answer to get wrong. Body was:\n{body}"
+        );
+
+        let helper = fn_body(&src, "fn restamp_effective_gating(")
+            .expect("the correction helper must still exist");
+        assert!(
+            helper.contains("plan_carries_ring_intent(plan)"),
+            "the correction must classify from the PLAN the supervisor stamped: that is \
+             the field the worker resolves its own build path from, and it is the only \
+             reading that can differ from the intent already on disk:\n{helper}"
+        );
+        assert!(
+            !helper.contains("no_rings"),
+            "…and never from the flag: `!no_rings` is the pre-dispatch intent this write \
+             exists to replace, so a correction spelled that way writes back what is \
+             already there:\n{helper}"
         );
     }
 

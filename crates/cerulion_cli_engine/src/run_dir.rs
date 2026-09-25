@@ -247,6 +247,10 @@ pub struct RunDescriptorSpec<'a> {
     /// judge cannot recover it from a bag: a boundary produced by a clock the
     /// scheduler ADVANCES and one produced by a clock it merely READS are
     /// byte-identical records with opposite meanings. See [`GatingClock`].
+    ///
+    /// PROVISIONAL on a supervisor run: this value is the run's trace-ring
+    /// INTENT, and [`restamp_run_gating`] replaces it with the outcome once
+    /// the trace plane is decided, before any worker is spawned.
     pub gating: GatingClock,
     /// The EFFECTIVE graph config, serialized.
     pub graph_yaml: String,
@@ -604,17 +608,20 @@ impl GatingClock {
     ///   from the ONE resolution `graph run` makes, so this label and the run's
     ///   `coordination` stamp cannot disagree);
     ///
-    ///   `traced` is the run's INTENT, and the label says so. The caller
-    ///   renders the descriptor BEFORE dispatch, when no ring exists, so the
-    ///   only fact available is whether rings were asked for. The worker keys
-    ///   its clock discipline on the same stamped intent, so a worker whose
-    ///   own ring create is REFUSED still wall-follows and the label still
-    ///   describes its clock. The one divergence left is the supervisor's own
-    ///   `/dev/shm` free-space gate: a plane it refuses stamps no tags, every
-    ///   rank resolves the ring-less shape on the `RealClock`, and the label
-    ///   stands as the intent it recorded. Making it describe the outcome
-    ///   means classifying after the trace-plane decision, or rewriting the
-    ///   field alongside `declared_unavailable`;
+    ///   `traced` is answered TWICE on a supervisor run, and the second answer
+    ///   is the one a reader gets. The caller renders the descriptor BEFORE
+    ///   dispatch, when no ring exists and the only fact available is whether
+    ///   rings were asked for, so the first call passes the INTENT. The
+    ///   supervisor classifies again the moment its trace plane is decided,
+    ///   reading the ring tags it really stamped into the worker plans, and
+    ///   re-stamps the field ([`restamp_run_gating`]). That second read is the
+    ///   same plan field each worker resolves its own build path from, so the
+    ///   label and every rank's clock discipline come off ONE fact: a plane
+    ///   the `/dev/shm` free-space gate refused stamps no tags, every rank
+    ///   resolves the ring-less shape on the `RealClock`, and the label reads
+    ///   `wall`. A WORKER-side create failure needs no correction, because the
+    ///   worker keys its clock on the stamped intent and wall-follows either
+    ///   way;
     /// * a `--time-source virtual` monolith runs the polled loop and never
     ///   reaches `live_step` ⇒ [`Polled`](Self::Polled);
     /// * a RECORDING monolith is configured `gating_follows_wall` on a
@@ -844,14 +851,46 @@ pub fn declare_run_trace(run_dir: &Path, decl: &RunTraceDecl) -> CliResult<()> {
     })
 }
 
+/// Re-stamp `gating` in the `run.json` this run already wrote, so the label
+/// records the gating clock the run GOT rather than the one it asked for.
+///
+/// A THIRD in-place writer, for the same reason [`declare_run_trace`] is a
+/// second one: the fact does not exist when the descriptor is rendered. That
+/// render happens before the deployment dispatch, when the only thing known
+/// about the trace plane is whether rings were ASKED for; the supervisor's own
+/// `/dev/shm` free-space gate can refuse the whole plane afterwards, and every
+/// rank then resolves the ring-less shape on the read-only clock. Left at the
+/// intent, the field tells a resim judge that boundaries the scheduler merely
+/// READ were boundaries it ADVANCED, which is the one distinction it exists to
+/// carry.
+///
+/// It goes through the same atomic read/rewrite shell, so a `cerulion bag
+/// record --run` attaching mid-rewrite reads the old document or the new one
+/// and never a partial, and every key it does not own survives.
+///
+/// # Errors
+///
+/// Returns the underlying I/O or JSON error. The caller treats it as a
+/// DEGRADE, not a failure: a run whose label cannot be corrected still runs,
+/// and what is lost is a reader seeing the arm the run asked for instead of
+/// the arm it got.
+pub fn restamp_run_gating(run_dir: &Path, gating: GatingClock) -> CliResult<()> {
+    edit_run_manifest(run_dir, "gating clock", |obj| {
+        obj.insert(
+            "gating".to_string(),
+            serde_json::Value::String(gating.label().to_string()),
+        );
+    })
+}
+
 /// PURE-ish: read `run.json`, hand its object to `edit`, and write it back.
 ///
-/// Extracted so the two writers that AMEND a run manifest in place — the
-/// trace declaration and the state-ring-consumer declaration — share
-/// ONE read/rewrite shell rather than two copies of it (the no-second-copy rule). What
-/// is genuinely shared is not convenience: it is the 0600 RE-ASSERT below, which
-/// `write_artifact`'s `OpenOptions` mode cannot supply on a rewrite, and which a
-/// second copy would be free to forget.
+/// Extracted so the writers that AMEND a run manifest in place — the gating
+/// re-stamp, the trace declaration and the state-ring-consumer declaration —
+/// share ONE read/rewrite shell rather than a copy each (the no-second-copy
+/// rule). What is genuinely shared is not convenience: it is the 0600
+/// RE-ASSERT below, which `write_artifact`'s `OpenOptions` mode cannot supply
+/// on a rewrite, and which a second copy would be free to forget.
 ///
 /// `what` names the thing being declared, so a failure says which declaration
 /// was lost rather than "a manifest edit failed".
@@ -3147,20 +3186,21 @@ mod tests {
         }
     }
 
-    /// The two in-place manifest writers COMPOSE.
+    /// The in-place manifest writers COMPOSE.
     ///
-    /// They share one shell (`edit_run_manifest`) and run in sequence on the
-    /// supervisor path — the trace declaration before GO, the state-ring one
-    /// after it. An extraction shared by two writers is exactly where one
-    /// caller's key gets clobbered by the other's rewrite, and nothing else
-    /// asserts that the second leaves the first's work standing.
+    /// All three share one shell (`edit_run_manifest`) and run in sequence on
+    /// the supervisor path — the gating re-stamp and the trace declaration
+    /// before GO, the state-ring one after it. An extraction shared by several
+    /// writers is exactly where one caller's key gets clobbered by another's
+    /// rewrite, and nothing else asserts that a later one leaves the earlier
+    /// work standing.
     ///
-    /// Also pins the 0600 re-assert on the SECOND writer: `write_artifact`'s
+    /// Also pins the 0600 re-assert on a LATER writer: `write_artifact`'s
     /// mode applies at creation only, and this path renames a fresh sibling
     /// over an existing file. (The comment on that re-assert records that the
     /// pin was earned by a real 0644 regression on the other caller.)
     #[test]
-    fn the_two_manifest_writers_compose_without_clobbering_each_other() {
+    fn the_manifest_writers_compose_without_clobbering_each_other() {
         // RAII, like every other temp-dir test in this file: a hand-rolled
         // directory with a trailing `remove_dir_all` leaks a 0600 manifest into
         // `$TMPDIR` on any failing assertion, which is exactly when someone is
@@ -3183,14 +3223,16 @@ mod tests {
         .expect("the trace declaration must land");
         declare_state_ring_consumer(&tmp, &StateRingConsumerDecl::Standing)
             .expect("the state-ring declaration must land");
+        restamp_run_gating(&tmp, GatingClock::Wall).expect("the gating re-stamp must land");
 
         let bytes = std::fs::read(tmp.join(RUN_MANIFEST_FILE)).expect("read back");
         let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("still valid JSON");
 
-        // BOTH writers' keys survive, and so does the entry NEITHER owns.
+        // EVERY writer's key survives, and so does the entry NONE of them owns.
         assert_eq!(doc["state_ring_consumer"], serde_json::json!("standing"));
         assert_eq!(doc["trace_rings"], serde_json::json!("declared"));
         assert_eq!(doc["rings"][0]["tag"], serde_json::json!("cer_rec_g_1_r0"));
+        assert_eq!(doc["gating"], serde_json::json!("wall"));
         assert_eq!(doc["run_id"], serde_json::json!("0x1"));
         let shm = doc["shm"].as_array().expect("the ledger survives");
         assert!(
