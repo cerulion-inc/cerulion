@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cerulion"
+version = "0.1.0"
+requires-python = ">=3.11"
+license = "AGPL-3.0-only"
+dependencies = ["numpy>=1.26"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "cerulion._native"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

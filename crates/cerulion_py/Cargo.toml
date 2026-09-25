@@ -1,0 +1,47 @@
+[package]
+name = "cerulion_py"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+name = "cerulion_py"
+crate-type = ["cdylib"]
+
+[workspace]
+members = [".", "fixtures"]
+
+# Copied verbatim from the root Cargo.toml's [workspace.lints] (rust +
+# clippy tables): this is a SEPARATE workspace so the same lint set is
+# restated here; both members inherit via `[lints] workspace = true`.
+[workspace.lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("cdylib"))',
+    'cfg(cerulion_rmw_vendored_bindings)',
+    'cfg(cerulion_rmw_generated_bindings)',
+] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+
+[lints]
+workspace = true
+
+[profile.release]
+strip = true
+
+[dependencies]
+pyo3 = { version = "=0.29.2", features = ["abi3-py311", "extension-module"] }
+cerulion_core = { path = "../cerulion_core" }
+libc = "=0.2.186"
+tracing = "=0.1.44"

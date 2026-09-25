@@ -1,0 +1,17 @@
+[package]
+name = "cerulion_py_fixtures"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "AGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "cerulion_py_fixture"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+cerulion_core = { path = "../../cerulion_core" }

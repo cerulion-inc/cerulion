@@ -1,0 +1,8 @@
+# Hide the one non-Python dynamic symbol the extension would otherwise
+# export (iceoryx2's `__internal_default_logger`): two `.so`s embedding
+# static iceoryx2 in one process must not interpose on each other.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--exclude-libs,ALL"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--exclude-libs,ALL"]
