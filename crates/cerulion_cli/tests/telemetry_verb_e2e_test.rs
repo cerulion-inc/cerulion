@@ -139,3 +139,84 @@ fn an_opted_out_machine_never_sees_the_notice() {
     let out = cerulion(home.path(), &key, &["graph", "list"]);
     assert!(!out.stderr.contains("usage events"), "{}", out.stderr);
 }
+
+/// A loopback `/batch` sink: answers every request `200 {}` and hands the
+/// request bodies back when dropped into [`Sink::bodies`].
+struct Sink {
+    url: String,
+    bodies: std::sync::mpsc::Receiver<String>,
+}
+
+fn sink() -> Sink {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, bodies) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream);
+            let mut len = 0usize;
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                line.clear();
+            }
+            let mut body = vec![0; len];
+            let _ = reader.read_exact(&mut body);
+            let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+            let _ = reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}");
+        }
+    });
+    Sink { url, bodies }
+}
+
+fn sent_after_notice(home: &Path, sink: &Sink) -> String {
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    cerulion(home, &key, &["graph", "list"]);
+    let out = cerulion(home, &key, &["graph", "list"]);
+    assert!(!out.stderr.contains("usage events"), "{}", out.stderr);
+    sink.bodies
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the second run delivers one batch")
+}
+
+#[test]
+fn a_hosted_account_is_the_distinct_id_and_only_allowlisted_props_leave() {
+    let home = tempfile::tempdir().unwrap();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    auth::seed_logged_in_at(home.path(), sub).unwrap();
+    let sink = sink();
+    let body = sent_after_notice(home.path(), &sink);
+    assert!(body.contains("\"cli_command_run\""), "{body}");
+    assert!(
+        body.contains(&format!("\"distinct_id\":\"{sub}\"")),
+        "{body}"
+    );
+    for key in [
+        "\"verb\":\"graph\"",
+        "\"subverb\":\"list\"",
+        "\"exit_code\"",
+        "\"duration_bucket\"",
+    ] {
+        assert!(body.contains(key), "{key} missing: {body}");
+    }
+    assert!(!body.contains(home.path().to_str().unwrap()), "{body}");
+}
+
+#[test]
+fn a_non_uuid_account_id_falls_back_to_the_anonymous_id() {
+    let home = tempfile::tempdir().unwrap();
+    let base64url_id = "q83vEjRWeJCrze8SNFZ4kKvN7xI0VniQq83vEjRWeJA";
+    auth::seed_logged_in_at(home.path(), base64url_id).unwrap();
+    let sink = sink();
+    let body = sent_after_notice(home.path(), &sink);
+    assert!(!body.contains(base64url_id), "{body}");
+    assert!(body.contains("\"distinct_id\":\"anon:"), "{body}");
+}

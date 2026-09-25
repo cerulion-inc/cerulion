@@ -105,7 +105,7 @@ pub struct CommandRun {
 
 impl CommandRun {
     /// Begin recording, or `None` when nothing may be sent: no key or no
-    /// consent, an unrecorded verb, or this run claimed the first-run notice.
+    /// consent, an unrecorded verb, or this run printed the first-run notice.
     pub fn start(matches: &clap::ArgMatches) -> Option<CommandRun> {
         let (verb, sub) = matches.subcommand()?;
         let subverb = sub.subcommand_name();
@@ -113,10 +113,14 @@ impl CommandRun {
             return None;
         }
         let client = Client::from_env(common())?;
-        match consent::claim_notice() {
-            Ok(false) => {}
-            Ok(true) => {
+        match consent::notice_shown() {
+            Ok(true) => {}
+            // Printed BEFORE it is recorded, so no run can see the notice as
+            // shown while it has not been: concurrent first runs may each
+            // print it, and a run killed in between prints it again next time.
+            Ok(false) => {
                 eprintln!("{NOTICE}\n");
+                let _ = consent::mark_notice_shown();
                 return None;
             }
             // Without a readable consent file the notice cannot be tracked,
@@ -135,6 +139,12 @@ impl CommandRun {
     /// identity is read here, after the command ran, so a first `login`
     /// is attributed to the account it just signed in.
     pub fn finish(mut self, code: ExitCode) {
+        // Consent is read again: a `cerulion telemetry off` from another
+        // terminal while this command ran must still stop its event.
+        if !consent::status().enabled {
+            self.client.shutdown(DEFAULT_SHUTDOWN_BUDGET);
+            return;
+        }
         let props = command_run_props(
             &self.verb,
             self.subverb.as_deref(),
@@ -154,7 +164,10 @@ impl CommandRun {
     }
 }
 
-/// The signed-in account id, if it has the shape of one.
+/// The signed-in account id, if it is a hosted account id (a lowercase UUID,
+/// the account service's user id). Any other shape, such as the base64url id
+/// a self-hosted account service issues, is never sent as a person id: the
+/// event falls back to the anonymous id.
 fn signed_in_account() -> Option<String> {
     let loaded = auth::load();
     let id = &loaded.state()?.account_id;
