@@ -142,6 +142,45 @@ def test_multiple_trigger_inputs_require_sync_policy():
                 pass
 
 
+@pytest.mark.parametrize("value", ["false", 1, 0, None])
+def test_input_trigger_must_be_a_bool(value):
+    with pytest.raises(TypeError) as error:
+        cerulion.input("Probe", trigger=value)
+    assert str(error.value) == f"trigger must be True or False, got {value!r}"
+
+
+def test_trigger_inputs_are_rejected_under_a_period_policy():
+    with pytest.raises(TypeError) as error:
+
+        @cerulion.node(period_ms=10)
+        class Mixed:
+            inp = cerulion.input("Probe", trigger=True)
+
+            def tick(self):
+                pass
+
+    assert str(error.value) == (
+        "cannot combine input(trigger=True) with period_ms: trigger inputs "
+        "define a data-driven policy, which conflicts with a time-driven one"
+    )
+
+
+def test_explicit_trigger_conflicting_with_a_marked_input_is_rejected():
+    with pytest.raises(TypeError) as error:
+
+        @cerulion.node(trigger="left")
+        class Conflicting:
+            left = cerulion.input("Probe")
+            right = cerulion.input("Probe", trigger=True)
+
+            def tick(self):
+                pass
+
+    assert str(error.value) == (
+        "node(trigger='left') conflicts with input(trigger=True) on right"
+    )
+
+
 def test_missing_tick_and_reserved_host_methods_are_rejected():
     with pytest.raises(TypeError):
 

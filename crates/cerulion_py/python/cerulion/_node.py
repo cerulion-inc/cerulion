@@ -62,6 +62,8 @@ def input(
         isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 64
     ):
         raise ValueError("depth must be between 1 and 64")
+    if not isinstance(trigger, bool):
+        raise TypeError(f"trigger must be True or False, got {trigger!r}")
     if expect_within_ms is not None:
         _positive_int("expect_within_ms", expect_within_ms)
     if backpressure not in (None, "drop_oldest", "block") and not (
@@ -76,7 +78,7 @@ def input(
         schema,
         input_port=True,
         depth=depth,
-        trigger=bool(trigger),
+        trigger=trigger,
         expect_within_ms=expect_within_ms,
         backpressure=backpressure,
     )
@@ -162,11 +164,19 @@ def node(
         outputs = [port for port in ports if not port.input_port]
         if trigger is not None and trigger not in {port.name for port in inputs}:
             raise TypeError(f"unknown trigger input: {trigger}")
+        trigger_inputs = [port.name for port in inputs if port.kwargs["trigger"]]
+        if "period_ms" in policy and trigger_inputs:
+            raise TypeError(
+                "cannot combine input(trigger=True) with period_ms: trigger inputs "
+                "define a data-driven policy, which conflicts with a time-driven one"
+            )
+        if "data_trigger" in policy and any(name != trigger for name in trigger_inputs):
+            raise TypeError(
+                f"node(trigger={trigger!r}) conflicts with input(trigger=True) on "
+                f"{', '.join(name for name in trigger_inputs if name != trigger)}"
+            )
         effective_policy = policy
         if not effective_policy:
-            trigger_inputs = [
-                port.name for port in inputs if port.kwargs.get("trigger", False)
-            ]
             if len(trigger_inputs) > 1:
                 raise TypeError("multiple trigger inputs require sync_window_ms")
             if not trigger_inputs:

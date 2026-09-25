@@ -125,6 +125,12 @@ cerulion_pynode::export_node! {{
     ))
 }
 
+/// `value` as a double-quoted Python string literal. A JSON string is one:
+/// `\"`, `\\`, `\n` and `\uXXXX` escape identically in both languages.
+fn python_str_literal(value: &str) -> String {
+    serde_json::Value::String(value.to_string()).to_string()
+}
+
 /// Generate the starter Python implementation for a node.
 pub fn generate_python_node_py(
     inputs: &[(String, String)],
@@ -139,12 +145,14 @@ pub fn generate_python_node_py(
         } else {
             ""
         };
+        let schema = python_str_literal(schema);
         result.push_str(&format!(
-            "    {name} = cer.input(\"{schema}\"{trigger_suffix})\n"
+            "    {name} = cer.input({schema}{trigger_suffix})\n"
         ));
     }
     for (name, schema) in outputs {
-        result.push_str(&format!("    {name} = cer.output(\"{schema}\")\n"));
+        let schema = python_str_literal(schema);
+        result.push_str(&format!("    {name} = cer.output({schema})\n"));
     }
     result.push_str("\n    def tick(self):\n");
     match (inputs.first(), outputs.first()) {

@@ -58,12 +58,15 @@ The built cdylib carries an rpath to the interpreter's libdir, so no
 `cerulion` you installed; `CERULION_PY_PATH` prepends paths for overrides.
 Node cdylibs must be built by the same `rustc` as the `cerulion` binary:
 `node build` warns when the `rustc` on `PATH` differs, and the loader refuses a
-node whose compiler fingerprint does not match. Use `RUSTUP_TOOLCHAIN` only as a
-per-command prefix for Python wheel commands.
+node whose compiler fingerprint does not match. When the default `rustc`
+differs from the one that built `cerulion`, prefix `cerulion node build` with
+`RUSTUP_TOOLCHAIN=<that toolchain>` for that command only.
 
 A Python node must declare exactly one scheduling policy: `period_ms`, one
 `trigger=True` input, or `sync_window_ms` for multiple trigger inputs. The
 `node create --lang python` command (alias `node new`) therefore requires `-T` or `--policy`.
+A `trigger=True` input is refused under `period_ms`, and under `trigger=` unless it
+names that same input; `trigger` must be `True` or `False`.
 A Python node takes `-i` and `-o` repeatedly; a `sync_window_ms` node needs at
 least two `-i` inputs, and each one joins the aligned set (`node modify` does not
 edit Python nodes; edit `node.py` and run `cerulion node build`).

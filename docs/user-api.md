@@ -2788,7 +2788,8 @@ You generally don't set these; the CLI generates the right feature wiring per no
 
 Python-authored nodes must declare exactly one scheduling policy: `period_ms`,
 one input marked `trigger=True`, or `sync_window_ms` for synchronized trigger
-inputs. Consequently, `node new --lang python` requires `-T` or `--policy`;
+inputs. A `trigger=True` input is refused under `period_ms`, and under
+`trigger=` unless it names that same input. Consequently, `node new --lang python` requires `-T` or `--policy`;
 Python nodes cannot be amended with `node modify`.
 
 `cerulion_py` is a standalone PyO3 wheel (its own cargo workspace, not a

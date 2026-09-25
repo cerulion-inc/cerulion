@@ -247,6 +247,18 @@ pub fn node_create_with_options(
                 )));
             }
         }
+        if let Some(MacroPolicy::DataTrigger { input_name }) = policy.as_ref() {
+            if !options.inputs.iter().any(|(_, input)| input == input_name) {
+                return Err(CliError::Validation(format!(
+                    "data_trigger policy input '{input_name}' does not name an input port"
+                )));
+            }
+            if let Some(name) = options.trigger.as_ref().filter(|name| *name != input_name) {
+                return Err(CliError::Validation(format!(
+                    "trigger '{name}' conflicts with data_trigger policy input '{input_name}'"
+                )));
+            }
+        }
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (_, name) in options.inputs.iter().chain(options.outputs.iter()) {
             if !seen.insert(name.as_str()) {
@@ -2081,6 +2093,48 @@ mod tests {
         let source = std::fs::read_to_string(root.join("node.py")).unwrap();
         assert!(lib.contains(r#"\"data_trigger\":{\"input_name\":\"inp\"}"#));
         assert!(source.contains(r#"@cer.node(trigger="inp")"#));
+    }
+
+    #[test]
+    fn python_node_data_trigger_policy_must_name_the_trigger_input_before_write() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let policy = || {
+            Some(MacroPolicy::DataTrigger {
+                input_name: "missing".to_string(),
+            })
+        };
+        let mut options = NodeCreateOptions {
+            inputs: vec![("geometry_msgs/Vector3".to_string(), "inp".to_string())],
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        let err = node_create_with_options(&nodes_dir, &cargo_toml, "unknown", policy(), &options)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "data_trigger policy input 'missing' does not name an input port"
+        );
+        options
+            .inputs
+            .push(("geometry_msgs/Vector3".to_string(), "missing".to_string()));
+        options.trigger = Some("inp".to_string());
+        let err = node_create_with_options(&nodes_dir, &cargo_toml, "conflict", policy(), &options)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "trigger 'inp' conflicts with data_trigger policy input 'missing'"
+        );
+        assert!(!nodes_dir.join("unknown").exists());
+        assert!(!nodes_dir.join("conflict").exists());
+    }
+
+    #[test]
+    fn python_template_escapes_schema_names_as_python_literals() {
+        let inputs = vec![("inp".to_string(), "pkg/Q\"uo\\te\nd".to_string())];
+        let outputs = vec![("out".to_string(), "pkg/Plain".to_string())];
+        let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
+        assert!(source.contains("    inp = cer.input(\"pkg/Q\\\"uo\\\\te\\nd\")\n"));
+        assert!(source.contains("    out = cer.output(\"pkg/Plain\")\n"));
     }
 
     #[test]
