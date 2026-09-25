@@ -99,16 +99,27 @@ impl Heartbeat {
     }
 }
 
-impl Drop for Heartbeat {
-    fn drop(&mut self) {
-        drop(self.stop.take());
+impl Heartbeat {
+    /// Wake the thread and wait at most `budget` for it to finish. Only the
+    /// first call waits; later calls and the drop return at once.
+    pub fn stop_within(&mut self, budget: Duration) {
+        let Some(stop) = self.stop.take() else {
+            return;
+        };
+        drop(stop);
         let finished = matches!(
-            self.finished.recv_timeout(DEFAULT_SHUTDOWN_BUDGET),
+            self.finished.recv_timeout(budget),
             Err(RecvTimeoutError::Disconnected)
         );
         if let (true, Some(thread)) = (finished, self.thread.take()) {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.stop_within(DEFAULT_SHUTDOWN_BUDGET);
     }
 }
 
@@ -160,12 +171,20 @@ impl Telemetry {
         })
     }
 
-    /// Stop the heartbeat and flush within [`DEFAULT_SHUTDOWN_BUDGET`].
+    /// Stop the heartbeat and flush, both within one
+    /// [`DEFAULT_SHUTDOWN_BUDGET`].
     pub fn shutdown(mut self) {
-        drop(self.heartbeat.take());
-        let client = self.client.lock().ok().and_then(|mut guard| guard.take());
+        let deadline = Instant::now() + DEFAULT_SHUTDOWN_BUDGET;
+        if let Some(mut heartbeat) = self.heartbeat.take() {
+            heartbeat.stop_within(DEFAULT_SHUTDOWN_BUDGET);
+        }
+        let client = self
+            .client
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
         if let Some(mut client) = client {
-            client.shutdown(DEFAULT_SHUTDOWN_BUDGET);
+            client.shutdown(deadline.saturating_duration_since(Instant::now()));
         }
     }
 }
