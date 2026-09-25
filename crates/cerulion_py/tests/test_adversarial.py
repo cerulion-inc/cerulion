@@ -298,3 +298,62 @@ def test_dropped_subscriber_then_publish(session):
     del sub
     pub.publish(pattern(64, 1), timestamp_ns=2)
     assert pub.sequence == 2
+
+
+def test_independent_iterators_do_not_release_each_others_frames(session):
+    """Each `iter(sub)` owns its previous-frame slot: advancing one iterator
+    never releases a frame another iterator handed out."""
+    topic = unique_topic("iter-indep")
+    sub = session.subscriber(topic, depth=4)
+    pub = session.publisher(topic, 1, max_payload_len=64)
+    pub.publish(b"one")
+    pub.publish(b"two")
+    it1, it2 = iter(sub), iter(sub)
+    assert it1 is not it2
+    f1 = next(it1)
+    f2 = next(it2)
+    assert f1.is_released is False
+    assert f1.to_bytes() == b"one" and f2.to_bytes() == b"two"
+    f1.release()
+    f2.release()
+
+
+def _max_open_loans(pub):
+    loans = []
+    try:
+        while len(loans) < 64:
+            loans.append(pub.loan(8))
+    except cerulion.TransportError:
+        pass
+    for loan in loans:
+        loan.discard()
+    return len(loans)
+
+
+def test_discarded_loan_slot_returns_after_foreign_thread_view_release(session):
+    """A loan discarded with a live view parks its slot with the publisher;
+    when that view closes on a foreign thread the slot returns at the next
+    loan(), so the publisher's loan budget is not consumed permanently."""
+    import warnings
+
+    topic = unique_topic("loan-park")
+    sub = session.subscriber(topic, depth=2)
+    pub = session.publisher(topic, 1, max_payload_len=64)
+    budget = _max_open_loans(pub)
+    assert budget >= 1
+    loan = pub.loan(8)
+    mv = loan.payload
+    loan.discard()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _release_on_thread(mv)
+    assert any("next publish() or loan()" in str(w.message) for w in caught), [
+        str(w.message) for w in caught
+    ]
+    assert loan.is_open is False
+    assert _max_open_loans(pub) == budget
+    pub.publish(b"after")
+    frame = sub.receive(2000)
+    assert frame is not None
+    assert frame.to_bytes() == b"after"
+    frame.release()

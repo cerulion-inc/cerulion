@@ -163,7 +163,6 @@ class Loan:
 class Subscriber:
     def __init__(self, native):
         self._native = native
-        self._iter_prev = None
 
     @property
     def topic(self):
@@ -189,20 +188,30 @@ class Subscriber:
         return None if native is None else Frame(native)
 
     def __iter__(self):
+        return _FrameIterator(self)
+
+
+class _FrameIterator:
+    """One ``for frame in sub`` loop: before blocking for the next frame it
+    releases the previous frame IT handed out - one outstanding borrow per
+    iterator. It holds only a weak reference, so a frame the caller drops
+    after leaving the loop frees its slot at once."""
+
+    def __init__(self, subscriber):
+        self._subscriber = subscriber
+        self._prev = None
+
+    def __iter__(self):
         return self
 
     def __next__(self):
-        # Release the previous frame handed out by THIS iterator before
-        # blocking for the next - one outstanding borrow per iterator. The
-        # iterator holds only a weak reference, so a frame the caller drops
-        # after leaving the loop frees its slot at once.
-        prev_ref, self._iter_prev = self._iter_prev, None
+        prev_ref, self._prev = self._prev, None
         prev = None if prev_ref is None else prev_ref()
         if prev is not None:
             prev.release()
-        frame = self.receive(None)
+        frame = self._subscriber.receive(None)
         if frame is not None:
-            self._iter_prev = weakref.ref(frame)
+            self._prev = weakref.ref(frame)
         return frame
 
 

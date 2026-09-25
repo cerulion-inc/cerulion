@@ -2802,8 +2802,8 @@ cd crates/cerulion_py && maturin develop --release
 import cerulion
 
 session = cerulion.connect()                      # idempotent singleton
-pub = session.publisher(topic, schema_hash, max_payload_len=1 << 20)
-sub = session.subscriber(topic, depth=1)          # depth <= 16
+pub = session.publisher("/demo/raw", 0xC0DE, max_payload_len=1 << 20)
+sub = session.subscriber("/demo/raw", depth=1)    # depth <= 16
 
 pub.publish(b"bytes", timestamp_ns=5)             # single-copy publish
 with pub.loan(4) as loan:                          # zero-copy publish path
