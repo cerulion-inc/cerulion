@@ -206,8 +206,7 @@ def node(
                 schema_hash, fixed_size, max_slice = schemas.output_meta(port.schema)
                 configured_max_slice = port.kwargs["max_slice_len_default"]
                 if configured_max_slice is not None:
-                    variable = len(schemas.layout(port.schema).variable_fields)
-                    smallest = 32 + fixed_size + 8 * variable
+                    smallest = schemas._native.min_frame_len(port.schema)
                     if configured_max_slice < smallest:
                         raise ValueError(
                             f"output {port.name!r}: max_slice_len_default "

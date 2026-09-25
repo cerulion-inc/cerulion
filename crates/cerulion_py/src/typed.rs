@@ -114,6 +114,19 @@ impl PySchemaSet {
         })
     }
 
+    /// Length of the smallest frame of `name`: every variable field empty,
+    /// alignment padding included, as `FrameEncoder` lays it out.
+    fn min_frame_len(&self, py: Python<'_>, name: &str) -> PyResult<usize> {
+        let layout = self
+            .inner
+            .layout(name)
+            .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
+            .map_err(|e| map_dynamic_err(py, e))?;
+        cerulion_core::dynamic::FrameEncoder::new(layout)
+            .and_then(|encoder| encoder.required_len(&vec![0; layout.variable_fields.len()]))
+            .map_err(|e| map_dynamic_err(py, e))
+    }
+
     fn schema_name_for_hash(&self, hash: u64) -> Option<String> {
         self.inner.schema_name_for_hash(hash).map(ToOwned::to_owned)
     }

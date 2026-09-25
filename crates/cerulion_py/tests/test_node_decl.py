@@ -346,3 +346,29 @@ def test_output_limit_smaller_than_the_fixed_frame_is_rejected():
         "output 'cmd': max_slice_len_default 55 is smaller than the 56-byte "
         "geometry_msgs/Vector3 frame"
     )
+
+
+def test_output_limit_counts_alignment_padding_before_variable_fields():
+    """uint32 id + uint64[] v: 32 header + 4 fixed + 8 offset entry = 44,
+    padded to the 8-byte element boundary = 48 bytes even with `v` empty."""
+    schemas = cerulion.SchemaSet()
+    assert schemas.add_rosmsg("uint32 id\nuint64[] v\n", "pkg/Padded") == []
+
+    def declare(limit):
+        @cerulion.node(period_ms=50)
+        class Padded:
+            out = cerulion.output("pkg/Padded", max_slice_len_default=limit)
+
+            def tick(self):
+                pass
+
+        return Padded
+
+    with pytest.raises(ValueError) as error:
+        declare(47).__cerulion_info__(schemas)
+    assert str(error.value) == (
+        "output 'out': max_slice_len_default 47 is smaller than the 48-byte "
+        "pkg/Padded frame"
+    )
+    info = json.loads(declare(48).__cerulion_info__(schemas))
+    assert info["outputs"][0]["max_slice_len_default"] == 48
