@@ -12,7 +12,7 @@
 use cerulion_core::clock::real_ns;
 use cerulion_core::clock::RealClock;
 use cerulion_core::codegen::{parse_rosmsg, MessageSchema};
-use cerulion_core::dynamic::{FrameEncoder, SchemaSet};
+use cerulion_core::dynamic::{FrameEncoder, FrameView, SchemaSet};
 use cerulion_core::graph::node::{
     AnyPublisher, AnySubscriber, DylibNodeEntry, NodeContext, NodeEntry, ShutdownSignal,
 };
@@ -50,11 +50,17 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-fn fixture_schemas(workspace: &std::path::Path) -> Result<SchemaSet, String> {
-    let builtin = native_ros2_messages::BUILTIN_MSGS
+fn builtin_schemas() -> Result<Vec<MessageSchema>, String> {
+    native_ros2_messages::BUILTIN_MSGS
         .iter()
-        .filter_map(|&(package, name, text)| parse_rosmsg(text, name, Some(package)).ok())
-        .collect::<Vec<MessageSchema>>();
+        .map(|&(package, name, text)| {
+            parse_rosmsg(text, name, Some(package)).map_err(|e| format!("{package}/{name}: {e}"))
+        })
+        .collect()
+}
+
+fn fixture_schemas(workspace: &std::path::Path) -> Result<SchemaSet, String> {
+    let builtin = builtin_schemas()?;
     let (workspace_set, _warnings) =
         SchemaSet::from_workspace_dir(workspace).map_err(|error| error.to_string())?;
     let mut schemas = builtin;
@@ -549,11 +555,34 @@ fn cmd_publish_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, St
     Ok(ExitCode::SUCCESS)
 }
 
+/// The vendored ROS 2 corpus as a dynamic schema set: `FrameView` checks a
+/// received frame's offset table and nested bodies before the generated
+/// reader, which trusts them, touches it.
+fn builtin_schema_set() -> Result<SchemaSet, String> {
+    SchemaSet::from_schemas(builtin_schemas()?)
+        .map(|(set, _)| set)
+        .map_err(|e| e.to_string())
+}
+
+/// Copy the frame body into `scratch` at an 8-byte-aligned start: the
+/// generated `from_bytes` asserts alignment, and a received SHM slice
+/// carries none.
+fn aligned_body<'s>(bytes: &[u8], scratch: &'s mut Vec<u8>) -> &'s [u8] {
+    const ALIGN: usize = 8;
+    let body = &bytes[WireHeader::SIZE..];
+    scratch.clear();
+    scratch.resize(body.len() + ALIGN, 0);
+    let start = scratch.as_ptr().align_offset(ALIGN);
+    scratch[start..start + body.len()].copy_from_slice(body);
+    &scratch[start..start + body.len()]
+}
+
 /// Reject a frame whose wire header does not carry `T`'s schema hash, or
 /// whose body is shorter than `T`'s fixed section, BEFORE the typed
 /// `from_bytes` reinterprets it - a wrong-schema or truncated frame must
-/// fail loudly instead of decoding garbage bytes.
-fn check_typed_frame<T: ShmMessage>(bytes: &[u8]) -> Result<(), String> {
+/// fail loudly instead of decoding garbage bytes, and so must one whose
+/// offset table or nested bodies do not validate.
+fn check_typed_frame<T: ShmMessage>(set: &SchemaSet, bytes: &[u8]) -> Result<(), String> {
     // `read_from_buf` copies into an owned header: `from_bytes` reinterprets
     // the slice in place and refuses non-8-byte-aligned buffers, which a
     // received SHM slice is not guaranteed to be.
@@ -571,6 +600,7 @@ fn check_typed_frame<T: ShmMessage>(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() < WireHeader::SIZE + T::WIRE_FIXED_SIZE + 8 * T::VARIABLE_FIELD_COUNT {
         return Err("body shorter than the fixed section + offset table".to_string());
     }
+    FrameView::new(set.walker(), bytes).map_err(|e| format!("invalid typed frame: {e}"))?;
     Ok(())
 }
 
@@ -579,6 +609,8 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
     let count = flag_usize(args, "count")?;
     let timeout_ms = flag_u64(args, "timeout-ms")?;
     let schema = typed_schema(args)?;
+    let set = builtin_schema_set()?;
+    let mut scratch = Vec::new();
     let sub = mgr.create_subscriber(topic).map_err(|e| e.to_string())?;
     println!("READY");
     std::io::stdout().flush().map_err(|e| e.to_string())?;
@@ -589,10 +621,12 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
                 loop {
                     if let Some(sample) = sub.try_receive_one_owned().map_err(|e| e.to_string())? {
                         let bytes = sample.payload();
-                        check_typed_frame::<geometry_msgs::Vector3>(bytes)?;
-                        let value =
-                            geometry_msgs::Vector3Shm::from_bytes(&bytes[WireHeader::SIZE..])
-                                .snapshot();
+                        check_typed_frame::<geometry_msgs::Vector3>(&set, bytes)?;
+                        let value = geometry_msgs::Vector3Shm::from_bytes(aligned_body(
+                            bytes,
+                            &mut scratch,
+                        ))
+                        .snapshot();
                         if bytes[WireHeader::SIZE..] != VECTOR3_BODY {
                             return Err("Vector3 body oracle mismatch".to_string());
                         }
@@ -616,10 +650,12 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
                 loop {
                     if let Some(sample) = sub.try_receive_one_owned().map_err(|e| e.to_string())? {
                         let bytes = sample.payload();
-                        check_typed_frame::<sensor_msgs::LaserScan>(bytes)?;
-                        let value =
-                            sensor_msgs::LaserScanShm::from_bytes(&bytes[WireHeader::SIZE..])
-                                .snapshot();
+                        check_typed_frame::<sensor_msgs::LaserScan>(&set, bytes)?;
+                        let value = sensor_msgs::LaserScanShm::from_bytes(aligned_body(
+                            bytes,
+                            &mut scratch,
+                        ))
+                        .snapshot();
                         let frame_id =
                             std::str::from_utf8(&value.header[16..]).map_err(|e| e.to_string())?;
                         println!(

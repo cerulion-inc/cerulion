@@ -165,24 +165,14 @@ class Layout:
         return self._dtype
 
     def _resolve_nested(self, field_type):
-        candidates = []
-        if field_type["package"]:
-            candidates.append(f"{field_type['package']}/{field_type['schema_name']}")
-        package = self.qualified_name.rpartition("/")[0]
-        if package:
-            candidates.append(f"{package}/{field_type['schema_name']}")
-        candidates.append(field_type["schema_name"])
-        for candidate in candidates:
-            if candidate not in self._schemas.names():
-                continue
-            target = self._schemas.layout(candidate)
-            fixed = field_type.get("fixed")
-            if fixed is not None and target.schema_hash != fixed["target_hash"]:
-                continue
-            return target
-        raise _native.SchemaError(
-            f"cannot resolve nested schema {field_type['schema_name']!r}"
-        )
+        name = _nested_name(self._schemas, field_type, self.qualified_name)
+        target = self._schemas.layout(name)
+        fixed = field_type.get("fixed")
+        if fixed is not None and target.schema_hash != fixed["target_hash"]:
+            raise _native.SchemaError(
+                f"nested schema {name!r} hash does not match its resolved layout"
+            )
+        return target
 
 
 def _parse_type(value):
@@ -254,6 +244,15 @@ def _value_wire_length(schemas, field_type, value, parent=None, name=None):
     if isinstance(field_type, str):
         if field_type in ("String", "Bytes"):
             return len(value.encode() if isinstance(value, str) else bytes(value))
+    if isinstance(field_type, dict) and "FixedArray" in field_type:
+        # A fixed array in the variable section has variable-size
+        # elements: like string[]/nested[], it takes pre-framed bytes.
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return len(bytes(value))
+        raise _native.EncodeError(
+            f"fixed array field {name!r} of variable-size elements must be "
+            "given as pre-framed bytes"
+        )
     if isinstance(field_type, dict) and "DynamicArray" in field_type:
         elem = field_type["DynamicArray"]["element_type"]
         if isinstance(elem, str) and elem in _SCALARS:
@@ -282,17 +281,28 @@ def _value_wire_length(schemas, field_type, value, parent=None, name=None):
 
 
 def _nested_name(schemas, field_type, parent):
+    """Resolve a nested reference with the core walker's precedence: an
+    explicit package only; else the parent's package (a bare name for a
+    package-less parent); else bare ``Header`` as ``std_msgs/Header``;
+    else a unique package suffix match."""
+    name = field_type["schema_name"]
     package = field_type.get("package")
-    candidates = []
+    known = set(schemas.names())
     if package:
-        candidates.append(f"{package}/{field_type['schema_name']}")
-    if parent and "/" in parent:
-        candidates.append(f"{parent.rpartition('/')[0]}/{field_type['schema_name']}")
-    candidates.append(field_type["schema_name"])
-    for candidate in candidates:
-        if candidate in schemas.names():
+        candidate = f"{package}/{name}"
+        if candidate in known:
             return candidate
-    raise _native.SchemaError(f"unknown nested schema {field_type['schema_name']}")
+        raise _native.SchemaError(f"unknown nested schema {candidate}")
+    parent_package = parent.rpartition("/")[0] if parent else ""
+    candidate = f"{parent_package}/{name}" if parent_package else name
+    if candidate in known:
+        return candidate
+    if name == "Header" and "std_msgs/Header" in known:
+        return "std_msgs/Header"
+    matches = [k for k in known if k.rpartition("/")[2] == name]
+    if len(matches) == 1:
+        return matches[0]
+    raise _native.SchemaError(f"unknown nested schema {name}")
 
 
 def _encode_message(schemas, name, values, timestamp_ns):
@@ -345,10 +355,24 @@ def _assign_value(message, name, value):
     field = message._field(name)
     if isinstance(field, FieldLayout) and isinstance(field.field_type, dict) and "Nested" in field.field_type:
         nested = getattr(message, name)
+        if isinstance(value, Message):
+            value = value.copy()
         if not isinstance(value, dict):
             raise _native.EncodeError(f"nested field {name} expects a dict")
-        for key, nested_value in value.items():
-            setattr(nested, key, nested_value)
+        layout = nested._layout
+        expected = {f.name for f in layout.fixed_fields}
+        missing = expected - set(value)
+        extra = set(value) - expected
+        if missing:
+            raise _native.EncodeError(
+                f"nested field {name}: missing field(s): {', '.join(sorted(missing))}"
+            )
+        if extra:
+            raise _native.EncodeError(
+                f"nested field {name}: extra field(s): {', '.join(sorted(extra))}"
+            )
+        for field in layout.fixed_fields:
+            _assign_value(nested, field.name, value[field.name])
         return
     setattr(message, name, value)
 
@@ -466,8 +490,9 @@ class Message:
                 ) from exc
         if isinstance(field_type, str) and field_type == "Bytes":
             return self._payload[_offset(descriptor) : _end(descriptor)]
-        if isinstance(field_type, dict) and "DynamicArray" in field_type:
-            elem = field_type["DynamicArray"]["element_type"]
+        array_key = _array_key(field_type)
+        if array_key is not None:
+            elem = field_type[array_key]["element_type"]
             if isinstance(descriptor, tuple):
                 if descriptor[0] == "prim":
                     return _owned_array(np.frombuffer(
@@ -489,9 +514,8 @@ class Message:
                 # DecodeError.
                 return self._payload[_offset(descriptor) : _end(descriptor)]
             if isinstance(descriptor, list):
-                # A decoded string[] arrives as a list of str already.
                 if elem == "String":
-                    return descriptor
+                    return [self._string_element(name, item) for item in descriptor]
                 return self._nested_value(descriptor, elem)
             return self._nested_value(descriptor, elem)
         if isinstance(field_type, dict) and "Nested" in field_type:
@@ -510,6 +534,16 @@ class Message:
                 resolved_fields=nested_data.get("fields", {}),
             )
         raise _native.DecodeError(f"unsupported variable field {name}")
+
+    def _string_element(self, name, item):
+        if isinstance(item, str):
+            return item
+        try:
+            return bytes(self._payload[_offset(item) : _end(item)]).decode()
+        except UnicodeDecodeError as exc:
+            raise _native.DecodeError(
+                f"string array field {name!r}: invalid UTF-8"
+            ) from exc
 
     def _nested_value(self, descriptor, elem):
         if isinstance(descriptor, list):
@@ -587,6 +621,7 @@ class Message:
                 return
             if isinstance(field.field_type, dict) and (
                 "Nested" in field.field_type
+                or "FixedArray" in field.field_type
                 or (
                     "DynamicArray" in field.field_type
                     and not (
@@ -653,6 +688,14 @@ class Message:
         object.__setattr__(self, "_owner", None)
         object.__setattr__(self, "_variables", {})
         object.__setattr__(self, "_owner", None)
+
+
+def _array_key(field_type):
+    if isinstance(field_type, dict):
+        for key in ("DynamicArray", "FixedArray"):
+            if key in field_type:
+                return key
+    return None
 
 
 def _offset(descriptor):

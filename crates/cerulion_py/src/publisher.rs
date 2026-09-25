@@ -11,7 +11,7 @@
 //! fatal: the data is already committed to SHM).
 
 use crate::errors::{map_transport_err, EncodeError};
-use crate::frame::{export_released_on_owner, stamp_export_owner, warn_offthread_release};
+use crate::frame::{release_export, stamp_export, warn_offthread_release, Exports};
 use crate::typed::PySchemaSet;
 use cerulion_core::clock::real_ns;
 use cerulion_core::dynamic::{FrameEncoder, FrameView};
@@ -22,6 +22,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyBufferError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
+use std::sync::Arc;
 
 /// A publisher on one topic. `max_payload_len` bounds every frame body;
 /// the iceoryx2 slot is `WireHeader::SIZE + max_payload_len` (allocation
@@ -197,7 +198,7 @@ impl Publisher {
             loan: Some(loan),
             payload_len,
             timestamp_ns: None,
-            exports: 0,
+            exports: Exports::new(),
             closed: false,
             pending_drop: false,
             variable_entries: None,
@@ -275,7 +276,7 @@ impl Publisher {
             loan: Some(loan),
             payload_len,
             timestamp_ns,
-            exports: 0,
+            exports: Exports::new(),
             closed: false,
             pending_drop: false,
             variable_entries: Some(entries),
@@ -303,6 +304,15 @@ impl Publisher {
         if total < WireHeader::SIZE || total > src.len() {
             return Err(EncodeError::new_err(
                 "frame total_size is outside its buffer",
+            ));
+        }
+        if header.schema_hash != self.schema_hash {
+            return Err(crate::errors::schema_mismatch(
+                py,
+                format!(
+                    "frame schema hash {:#x} does not match the publisher's {:#x}",
+                    header.schema_hash, self.schema_hash
+                ),
             ));
         }
         let payload_len = total - WireHeader::SIZE;
@@ -339,7 +349,7 @@ pub struct Loan {
     loan: Option<RawShmLoan>,
     payload_len: usize,
     timestamp_ns: Option<u64>,
-    exports: usize,
+    exports: Arc<Exports>,
     closed: bool,
     pending_drop: bool,
     variable_entries: Option<Vec<(String, usize, usize)>>,
@@ -384,33 +394,37 @@ impl Loan {
             return Err(PyErr::take(slf.py())
                 .unwrap_or_else(|| PyBufferError::new_err("loan buffer export failed")));
         }
-        this.exports += 1;
-        drop(this);
-        unsafe { stamp_export_owner(view) };
+        unsafe { stamp_export(view, &this.exports) };
         Ok(())
     }
 
     /// SAFETY: called by the interpreter once per live export produced by
     /// `__getbuffer__`; `view` is the same pointer it filled there. The
-    /// release path reads its exporter-private `internal` stamp, decrements
-    /// bookkeeping, and `ffi::PyBuffer_Release` (inside the runtime) drops
-    /// the reference FillInfo added.
+    /// release path uncounts the export stored in its exporter-private
+    /// `internal` field, and `ffi::PyBuffer_Release` (inside the runtime)
+    /// drops the reference FillInfo added.
     ///
     /// Same foreign-thread rule as `Frame::__releasebuffer__` (see
-    /// `frame.rs`): off the owning thread the borrow would panic, so
-    /// bookkeeping is skipped with a `RuntimeWarning`.
-    /// A skipped decrement leaves `exports > 0` - `commit()` keeps
-    /// refusing - and the slot is returned when the `Loan` itself drops.
+    /// `frame.rs`): the atomic count is always decremented, so `commit()`
+    /// works once every view is released on any thread; only the drop of
+    /// a discarded loan's slot waits for the owning thread (the `Loan`'s
+    /// own drop, with a `RuntimeWarning`).
     unsafe fn __releasebuffer__(slf: Bound<'_, Self>, view: *mut ffi::Py_buffer) {
-        let on_owner = unsafe { export_released_on_owner(view) };
-        let Some(mut this) = on_owner.then(|| slf.try_borrow_mut().ok()).flatten() else {
-            warn_offthread_release(slf.py(), "Loan");
+        let Some(done) = (unsafe { release_export(view) }) else {
             return;
         };
-        this.exports = this.exports.saturating_sub(1);
-        if this.pending_drop && this.exports == 0 {
-            this.loan = None;
+        if done.live > 0 || !done.given_up {
+            return;
         }
+        if done.on_owner {
+            if let Ok(mut this) = slf.try_borrow_mut() {
+                if this.pending_drop {
+                    this.loan = None;
+                }
+                return;
+            }
+        }
+        warn_offthread_release(slf.py(), "Loan");
     }
 
     /// Payload length in bytes (the writable region's length).
@@ -446,7 +460,7 @@ impl Loan {
         if this.closed {
             return Err(PyValueError::new_err("loan already committed or discarded"));
         }
-        if this.exports > 0 {
+        if this.exports.live() > 0 {
             return Err(EncodeError::new_err(
                 "release loan.payload views before commit()",
             ));
@@ -474,10 +488,10 @@ impl Loan {
             return;
         }
         self.closed = true;
-        if self.exports == 0 {
+        self.pending_drop = true;
+        self.exports.give_up();
+        if self.exports.live() == 0 {
             self.loan = None;
-        } else {
-            self.pending_drop = true;
         }
     }
 }

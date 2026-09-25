@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 import pytest
 
@@ -128,10 +130,11 @@ def test_materialized_publish_and_readonly_view(session):
     assert not message.vector.flags.writeable
     nested_record = np.asarray(message.nested._record())
     assert not nested_record.flags.writeable
-    ranges = shm_mappings()
-    for array in (message.values, message.vector, message.floats, nested_record):
-        ptr = np.asarray(array).__array_interface__["data"][0]
-        assert any(start <= ptr < end for start, end in ranges)
+    if sys.platform.startswith("linux"):
+        ranges = shm_mappings()
+        for array in (message.values, message.vector, message.floats, nested_record):
+            ptr = np.asarray(array).__array_interface__["data"][0]
+            assert any(start <= ptr < end for start, end in ranges)
     copied = message.copy()
     assert copied["boolean"] is True
     assert copied["i8"] == -8

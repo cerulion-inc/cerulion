@@ -193,7 +193,7 @@ pub(crate) fn map_dynamic_err(py: Python<'_>, error: DynamicError) -> PyErr {
     }
 }
 
-fn schema_mismatch(py: Python<'_>, message: String) -> PyErr {
+pub(crate) fn schema_mismatch(py: Python<'_>, message: String) -> PyErr {
     let err = py
         .get_type::<SchemaMismatch>()
         .call1((message,))
