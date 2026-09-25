@@ -197,7 +197,8 @@ impl Telemetry {
             .name("vizd-telemetry-start".into())
             .spawn(move || {
                 // A start that finishes after shutdown gave up on it stops
-                // at once, with no budget, so nothing it queued is sent.
+                // at once, with no budget: its queue is dropped, and only a
+                // POST the worker had already begun may still complete.
                 if let Err(mpsc::SendError(Some(late))) = ready.send(Telemetry::start_unless(&flag))
                 {
                     late.shutdown_by(Instant::now());
