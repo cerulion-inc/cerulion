@@ -6912,6 +6912,7 @@ fn write_multi_rank_bag_with(
         &[],
         ProducerAttributionFixture::default(),
         None,
+        &[],
     )
 }
 
@@ -6944,6 +6945,7 @@ fn write_multi_rank_bag_with_producers(
         &[],
         producers,
         None,
+        &[],
     )
 }
 
@@ -6972,6 +6974,7 @@ fn write_multi_rank_bag_unattributed(
         omit_from_manifests,
         ProducerAttributionFixture::default(),
         None,
+        &[],
     )
 }
 
@@ -7001,6 +7004,7 @@ fn write_multi_rank_bag_with_declared_range(
         &[],
         ProducerAttributionFixture::default(),
         None,
+        &[],
     )
 }
 
@@ -7032,6 +7036,36 @@ fn write_multi_rank_bag_coordinated(
         &[],
         ProducerAttributionFixture::default(),
         None,
+        &[],
+    )
+}
+
+/// [`write_multi_rank_bag_coordinated`] plus VERBATIM extra attachments: the
+/// seam the multi-rank REFUSAL pins use to give a two-rank bag the
+/// `state_coverage.json` a real two-worker capture declares.
+fn write_multi_rank_bag_coordinated_with_attachments(
+    rec: &Recording,
+    rank_of: impl Fn(&str) -> u32,
+    rank_count: u32,
+    layout: MpLayout,
+    path: &std::path::Path,
+    coordination: replay_engine::CoordinationMode,
+    extra_attachments: &[(&str, &[u8])],
+) -> MpBag {
+    write_multi_rank_bag_impl(
+        rec,
+        rank_of,
+        rank_count,
+        layout,
+        path,
+        |_| {},
+        None,
+        Some(production_recorder_json(coordination)),
+        None,
+        &[],
+        ProducerAttributionFixture::default(),
+        None,
+        extra_attachments,
     )
 }
 
@@ -7072,6 +7106,12 @@ fn write_multi_rank_bag_impl(
     // MIXED-REGIME shape, which no recording can produce: one rank stating
     // per-edge rims while another states a legacy global one.
     staging_override: Option<&dyn Fn(u32) -> Option<serde_json::Value>>,
+    // One-rank free-run resume: VERBATIM extra attachments
+    // (`(name, bytes)`), written after the manifests. `&[]` (every pre-existing
+    // caller) writes none. The multi-rank REFUSAL pins need a bag that carries
+    // the `state_coverage.json` a real two-worker capture declares, and this
+    // writer had no seam for any attachment it did not know by name.
+    extra_attachments: &[(&str, &[u8])],
 ) -> MpBag {
     // Per-rank manifest tables preserve the monolith's node order within each
     // rank (the per-rank recorder writes its own manifest in its own order).
@@ -7246,6 +7286,10 @@ fn write_multi_rank_bag_impl(
             &manifest,
         )
         .unwrap();
+    }
+    for (name, bytes) in extra_attachments {
+        w.write_attachment(name, "application/json", 0, 0, bytes)
+            .unwrap();
     }
     w.finalize().unwrap();
     MpBag { tables, per_rank }
@@ -12529,10 +12573,16 @@ fn write_checkpoint_bag_with_capture(
         rec.graph_yaml.as_bytes(),
     )
     .unwrap();
-    let manifest = serde_json::to_vec(&serde_json::json!({
+    let mut manifest_json = serde_json::json!({
         "rank": 0, "generation": 0, "node_ids": rec.node_ids,
-    }))
-    .unwrap();
+    });
+    // The manifest's additive `inputs` key, exactly as `write_bag`
+    // writes it: present only when the recording captured the read log, so
+    // every pre-existing checkpoint bag's manifest is byte-identical.
+    if let Some(inputs) = &rec.input_names {
+        manifest_json["inputs"] = serde_json::json!(inputs);
+    }
+    let manifest = serde_json::to_vec(&manifest_json).unwrap();
     w.write_attachment(
         "__cerulion/trace_manifest_rank0.json",
         "application/json",
@@ -12939,6 +12989,66 @@ fn the_engine_reads_the_clamp_from_the_bag_not_from_the_resume_plan() {
     assert!(
         src.contains("fn run_engine"),
         "the walk must reach the engine's own source"
+    );
+}
+
+/// The clamp the pass INSTALLS is the clamp the re-derivation verifier RUNS.
+///
+/// STRUCTURAL, for the same reason as the arm above: the behavioural
+/// consequence — a `Period` node's re-derived catch-up burst capped exactly as
+/// the recording's was — needs a stalled multi-step fixture whose fire counts
+/// are wall-sensitive, and `prepare_pass_verification` hands back no clamp for
+/// an arm to read. What a walk CAN see is the one thing the regression changes:
+/// the argument at the call.
+///
+/// `None` is what a revert looks like, and it COMPILES (the parameter is an
+/// `Option`), so nothing else in this file fails on it: the verifier then runs
+/// the unclamped rule against a recording the clamp shaped and convicts the
+/// candidate for the recorder's own cap.
+#[test]
+fn the_rederivation_verifier_is_handed_the_clamp_the_pass_runs() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/replay_engine.rs"),
+    )
+    .expect("read replay_engine.rs");
+    let code = code_only(&src);
+
+    // The parameter must still BE there, or the claim below is about a call
+    // that no longer takes a clamp at all.
+    let decl = code
+        .find("fn prepare_pass_verification(")
+        .expect("the verifier's preparation must still exist");
+    let decl_body = code[decl..]
+        .find(") -> Result<PassVerification, ReplayError> {")
+        .expect("its signature must still end where this walk expects");
+    assert!(
+        code[decl..decl + decl_body]
+            .contains("catchup_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>"),
+        "the preparation must still take the armed clamp"
+    );
+
+    // ONE call, and its argument list must carry the PASS's own onset. Anchored
+    // on the call rather than the file so a `None` there fails this even though
+    // it compiles and every other arm still passes.
+    let call = code[decl + decl_body..]
+        .find("prepare_pass_verification(")
+        .map(|at| decl + decl_body + at)
+        .expect("the pass loop must still call it");
+    assert_eq!(
+        code[decl + decl_body..]
+            .matches("prepare_pass_verification(")
+            .count(),
+        1,
+        "ONE call site, so the argument this arm reads is the only one"
+    );
+    let args_end = code[call..]
+        .find(")?")
+        .expect("the call must still end in the `?` its Result demands");
+    let args = &code[call..call + args_end];
+    assert!(
+        args.contains("pass.catchup_onset"),
+        "the verifier must be handed the pass's OWN clamp, never `None` — it runs the \
+         re-derived Period rule against a recording the clamp shaped: {args}"
     );
 }
 
@@ -20443,6 +20553,7 @@ fn read_log_duplicate_node_id_across_rank_manifests_warns_and_resolves_last_wins
         &[],
         ProducerAttributionFixture::default(),
         None,
+        &[],
     );
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
@@ -21994,44 +22105,6 @@ fn write_mid_run_bag(
 
 #[test]
 #[serial]
-fn free_run_bag_with_first_boundary_above_zero_is_refused_by_name() {
-    // A mid-run resume anchors on the ONE first recorded boundary and
-    // places the clock off that single value — three assumptions a free-run
-    // recording abolishes. Refused LOUDLY and BY NAME rather than silently
-    // mis-anchored, which would produce a divergence report about an execution
-    // that never happened.
-    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 5);
-    let dir = tempfile::tempdir().unwrap();
-    let bag = dir.path().join("free_run_mid_run.mcap");
-    write_mid_run_bag(
-        &rec,
-        &bag,
-        2,
-        Some(replay_engine::CoordinationMode::FreeRun),
-    );
-
-    let err = replay(&bag, source_relay_factories, None, None)
-        .expect_err("a free-run bag beginning mid-run must be refused");
-    match &err {
-        ReplayError::FreeRunResumeUnsupported { first_step } => {
-            assert_eq!(*first_step, 2, "the refusal names the bag's own first step");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("free_run") && msg.contains("not supported yet"),
-                "the refusal names the stamp and the limitation: {msg}"
-            );
-            assert!(
-                msg.contains("replay from the start of this bag"),
-                "…and the literal remedy: {msg}"
-            );
-        }
-        other => panic!("expected FreeRunResumeUnsupported, got {other:?}"),
-    }
-    assert_eq!(err.exit_code(), 2, "not replay-grade for THIS binary");
-}
-
-#[test]
-#[serial]
 fn a_lockstep_mid_run_bag_is_not_refused_by_the_free_run_resume_gate() {
     // The pin: the gate keys on the EXPLICIT free-run stamp ONLY. Two
     // controls over the SAME mid-run bytes — an explicit lockstep stamp, and NO
@@ -22056,6 +22129,788 @@ fn a_lockstep_mid_run_bag_is_not_refused_by_the_free_run_resume_gate() {
             "{name} must never reach the free-run resume gate; got {err:?}"
         );
     }
+}
+
+/// [`write_checkpoint_bag_with_deadline`] with an EXPLICIT `coordination`
+/// stamp rendered by the production writer, so the same anchor (a framework
+/// deadline the trace does not state) can be replayed under either contract.
+fn write_stamped_checkpoint_bag_with_deadline(
+    dir: &tempfile::TempDir,
+    name: &str,
+    count_at_anchor: u64,
+    next_fire_ns: u64,
+    coordination: replay_engine::CoordinationMode,
+) -> std::path::PathBuf {
+    let rec = checkpoint_reference();
+    let mid = make_mid_run(&rec, CP_FIRST_STEP);
+    let bag = dir.path().join(name);
+    write_checkpoint_bag_with_capture(
+        &mid,
+        &bag,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob_with_framework(
+                CHECKPOINT_SHAPE,
+                Some(count_at_anchor),
+                &period_section(next_fire_ns),
+            ),
+        ),
+        Some(&checkpoint_coverage(1, Some(CHECKPOINT_NODE_IDX))),
+        None,
+        None,
+        Some(production_recorder_json(coordination)),
+    );
+    bag
+}
+
+/// The HAND ORACLE every resume of the `checkpoint_reference` bag at
+/// `CP_FIRST_STEP` must report: the facts the lockstep headline
+/// (`a_mid_run_bag_resumes_from_its_anchor_and_replays_byte_exact`) asserts
+/// inline, lifted so the one-rank free-run arms read against the SAME numbers
+/// rather than only against each other.
+fn assert_cp_resume_matches_the_fixture_oracle(
+    resume: &cerulion_cli_engine::replay_engine::ResumeReport,
+    rec: &Recording,
+) {
+    assert_eq!(resume.run_id, CHECKPOINT_RUN);
+    assert_eq!(resume.anchor_step, CP_FIRST_STEP - 1);
+    assert_eq!(resume.first_replay_step, CP_FIRST_STEP);
+    assert_eq!(resume.restored_nodes, vec![CP_NODE.to_string()]);
+    assert!(resume.nodes_without_state.is_empty());
+    assert!(resume.anchors_unused.is_empty());
+    assert_eq!(
+        resume.skipped_prefix_frames.get(CP_TOPIC).copied(),
+        Some(CP_FIRST_STEP as usize),
+        "the three pre-anchor frames are named and counted"
+    );
+    let seed = resume
+        .sequence_seeds
+        .get(CP_TOPIC)
+        .expect("a re-executed topic is seeded");
+    assert_eq!(seed.seed, CP_FIRST_STEP as u32);
+    assert_eq!(seed.rung, "last-frame-before-anchor");
+    assert_eq!(
+        resume.anchor_clock_ns,
+        cp_anchor_clock_ns(rec),
+        "the clock was placed at the first recorded boundary's target"
+    );
+}
+
+#[test]
+#[serial]
+fn a_one_rank_free_run_mid_run_bag_takes_the_ordinary_resume_not_the_gate() {
+    // The refusal pin, INVERTED. The old refusal named three assumptions a free-run
+    // recording abolishes (ONE first boundary, ONE clock placement, ONE
+    // stamp domain) and refused every free-run bag beginning mid-run. For a
+    // recording with exactly ONE worker rank all three hold trivially (rank
+    // 0's first boundary IS the first boundary), so the bag now reaches the
+    // ordinary resume machinery: this crafted bag carries no checkpoint, and
+    // what it is refused for is the SAME thing the lockstep twin is refused
+    // for: the same sentence, since the resume path is one path.
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 5);
+    let dir = tempfile::tempdir().unwrap();
+    let free_run = dir.path().join("free_run_mid_run.mcap");
+    write_mid_run_bag(
+        &rec,
+        &free_run,
+        2,
+        Some(replay_engine::CoordinationMode::FreeRun),
+    );
+    let lockstep = dir.path().join("lockstep_mid_run.mcap");
+    write_mid_run_bag(
+        &rec,
+        &lockstep,
+        2,
+        Some(replay_engine::CoordinationMode::Lockstep),
+    );
+
+    let err = replay(&free_run, source_relay_factories, None, None)
+        .expect_err("this crafted bag carries no checkpoint to resume from");
+    assert!(
+        !matches!(err, ReplayError::FreeRunResumeUnsupported { .. }),
+        "a ONE-rank free-run mid-run bag must not be refused for being free-run; got {err:?}"
+    );
+    assert!(
+        matches!(err, ReplayError::StateRestore { .. }),
+        "…it is refused by the resume machinery itself, for the missing anchor: {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+    let control = replay(&lockstep, source_relay_factories, None, None)
+        .expect_err("the lockstep twin carries no checkpoint either");
+    assert_eq!(
+        err.to_string(),
+        control.to_string(),
+        "ONE resume path: the free-run and lockstep twins of one recording are refused with \
+         one sentence"
+    );
+    assert!(
+        !err.to_string().contains("free_run"),
+        "…and that sentence is about the anchor, not about the coordination stamp: {err}"
+    );
+}
+
+#[test]
+#[serial]
+fn a_one_rank_free_run_checkpoint_bag_resumes_byte_exact_like_lockstep() {
+    // THE ADMISSION. The always-on Flashback capture of a one-group free-run
+    // deployment is exactly this bag: `coordination: free_run`, one worker
+    // rank, a complete anchor at `S`, a recording that begins at `S + 1`. It
+    // must resume (the state, the sequence seed, the clock placement and the
+    // prefix skip all read off the recording) and produce the SAME plan the
+    // lockstep-stamped twin produces, because for one rank the two contracts
+    // name one arithmetic. Both are read against the fixture's HAND oracle
+    // first; their equality is the second claim, never the only one.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = checkpoint_reference();
+    let xs: Vec<f64> = rec
+        .messages
+        .get(CP_TOPIC)
+        .expect("the fixture graph produces exactly one topic")
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
+    assert_eq!(
+        xs,
+        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        "the reference run is the oracle these arms are read against"
+    );
+    let free_run = write_stamped_checkpoint_bag(
+        &dir,
+        "free_run_cp.mcap",
+        CP_FIRST_STEP,
+        replay_engine::CoordinationMode::FreeRun,
+    );
+    let lockstep = write_stamped_checkpoint_bag(
+        &dir,
+        "lockstep_cp.mcap",
+        CP_FIRST_STEP,
+        replay_engine::CoordinationMode::Lockstep,
+    );
+
+    let outcome = replay(&free_run, checkpoint_factories, None, None)
+        .expect("a one-rank free-run mid-run bag resumes");
+    assert_eq!(
+        outcome.coordination,
+        replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::FreeRun,
+            inferred: false,
+        },
+        "the contract applied is the one the bag stamped"
+    );
+    assert!(
+        outcome.passed,
+        "a restored replay of its own recording is byte-exact: {outcome:?}"
+    );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert_eq!(
+        outcome.ticks_replayed,
+        CP_STEPS - CP_FIRST_STEP as usize,
+        "steps 3..5 are re-executed and nothing before them"
+    );
+    let resume = outcome
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_cp_resume_matches_the_fixture_oracle(resume, &rec);
+
+    let twin = replay(&lockstep, checkpoint_factories, None, None)
+        .expect("the lockstep twin resumes as it always has");
+    assert!(twin.passed, "{twin:?}");
+    let twin_resume = twin.resume.as_ref().expect("…and reports its resume");
+    assert_cp_resume_matches_the_fixture_oracle(twin_resume, &rec);
+    assert_eq!(
+        serde_json::to_string(resume).unwrap(),
+        serde_json::to_string(twin_resume).unwrap(),
+        "ONE resume plan for one recording, whichever contract stamped it"
+    );
+}
+
+#[test]
+#[serial]
+fn two_resims_of_a_one_rank_free_run_mid_run_bag_are_byte_identical() {
+    // Principle #7 over the admitted path: the restore, the seed, the clock
+    // placement and the prefix skip are functions of the recording, and the
+    // free-run pass adds nothing wall-dependent. Two runs, one report, read
+    // against the hand oracle too, so this is not a self-compare alone.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = checkpoint_reference();
+    let bag = write_stamped_checkpoint_bag(
+        &dir,
+        "free_run_cp_twice.mcap",
+        CP_FIRST_STEP,
+        replay_engine::CoordinationMode::FreeRun,
+    );
+    let a = replay(&bag, checkpoint_factories, None, None).expect("first");
+    let b = replay(&bag, checkpoint_factories, None, None).expect("second");
+    assert!(a.passed && b.passed, "{a:?}\n{b:?}");
+    assert_cp_resume_matches_the_fixture_oracle(a.resume.as_ref().expect("resume"), &rec);
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap(),
+        "two resumed resims of one bag must produce one report"
+    );
+}
+
+#[test]
+#[serial]
+fn a_multi_rank_free_run_mid_run_bag_is_refused_by_name() {
+    // The shape the admission does NOT cover, pinned on both of its faces.
+    //
+    // A free-run recording with SEVERAL worker ranks has no single first
+    // boundary, no single clock to place and no single stamp domain, so a
+    // mid-run resume of it is REFUSED rather than mis-anchored. WHICH refusal
+    // an operator reads follows the capture judge's own order: a real capture
+    // declares one state ring per worker, and `read_bag_anchors` refuses that
+    // FIRST (`MultiRingAmbiguous`, the sentence the capture's own
+    // `resimmable_reason` carries, so the two surfaces agree), while the
+    // by-name free-run refusal is the BACKSTOP for a multi-rank bag whose
+    // state plane declares nothing (a `bag record --run` attach of a run
+    // whose state plane is off), where the anchor walk alone would answer
+    // with a generic missing-anchor sentence naming neither the mode nor the
+    // rank count.
+    let steps = 5usize;
+    let rec = record_uniform(
+        mp_three_source_yaml(),
+        mp_three_source_factories,
+        &[],
+        steps,
+    );
+    let mid = make_mid_run(&rec, 2);
+    let dir = tempfile::tempdir().unwrap();
+
+    // Face 1: no state coverage at all, so the backstop names the shape.
+    let bare = dir.path().join("free_run_two_rank_mid_run.mcap");
+    write_multi_rank_bag_coordinated(
+        &mid,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bare,
+        |_| {},
+        replay_engine::CoordinationMode::FreeRun,
+    );
+    let err = replay(&bare, mp_three_source_factories, None, None)
+        .expect_err("a two-rank free-run bag beginning mid-run is refused");
+    match &err {
+        ReplayError::FreeRunResumeUnsupported { first_step, ranks } => {
+            assert_eq!(*first_step, 2, "the refusal names the bag's own first step");
+            assert_eq!(*ranks, 2, "…and its worker rank count");
+            let msg = err.to_string();
+            for needle in [
+                "free_run",
+                "2 worker ranks",
+                "not supported yet",
+                "ONE process group",
+                "from its start",
+            ] {
+                assert!(
+                    msg.contains(needle),
+                    "the refusal names the stamp, the count, the limitation and both remedies \
+                     (missing {needle:?}): {msg}"
+                );
+            }
+        }
+        other => panic!("expected FreeRunResumeUnsupported, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2, "not replay-grade for THIS binary");
+
+    // Face 2: the state coverage a real two-worker capture carries. The
+    // multi-ring refusal comes FIRST, as it does in the capture judge; under
+    // BOTH stamps, which is what shows the sentence is about the rings and
+    // not about the mode.
+    let two_rings = coverage_naming("src_a1", cerulion_bagd::STATE_COVERAGE_VERSION, 2, Some(0));
+    for (name, coordination) in [
+        (
+            "free_run_two_rank_two_rings.mcap",
+            replay_engine::CoordinationMode::FreeRun,
+        ),
+        (
+            "lockstep_two_rank_two_rings.mcap",
+            replay_engine::CoordinationMode::Lockstep,
+        ),
+    ] {
+        let covered = dir.path().join(name);
+        write_multi_rank_bag_coordinated_with_attachments(
+            &mid,
+            mp_rank_of,
+            2,
+            MpLayout::PerStepBatches,
+            &covered,
+            coordination,
+            &[(STATE_COVERAGE_ATTACHMENT, &two_rings)],
+        );
+        let err = replay(&covered, mp_three_source_factories, None, None)
+            .expect_err("a two-rank mid-run bag is refused under either stamp");
+        match &err {
+            ReplayError::StateRestore { reason } => assert!(
+                reason.contains("drained 2 state rings"),
+                "{name}: the multi-ring refusal, the sentence the capture judge reports \
+                 first: {reason}"
+            ),
+            other => panic!(
+                "{name}: a two-ring state coverage is refused BEFORE the rank-count gate, \
+                 got {other:?}"
+            ),
+        }
+        assert_eq!(err.exit_code(), 2);
+    }
+}
+
+#[test]
+#[serial]
+fn a_one_rank_free_run_resume_is_trace_driven_so_a_deadline_beyond_the_suffix_cannot_silence_the_node(
+) {
+    // The CONTRAST arm, and the one fact about the admitted pass that is NOT
+    // "byte-identical to lockstep": WHAT decides a fire. A lockstep resume
+    // decides fires LIVE, so a framework deadline beyond the recorded suffix
+    // silences the node (`a_recorded_next_fire_deadline_outranks_the_recorded_fire_trace`).
+    // A free-run pass is TRACE-DRIVEN (`Scheduler::set_replay_fire_plan`:
+    // the recorded fires are synthesized instead of evaluating triggers), so
+    // the SAME anchor replays byte-exact: the restored deadline is
+    // scheduler state the report describes, not a decider. Both twins in one
+    // body, so neither reading is vacuous.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = checkpoint_reference();
+    let last_target = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+        .map(|r| r.fire_time_ns)
+        .max()
+        .expect("the reference run recorded boundaries");
+    assert_eq!(last_target, 30_000_000);
+    let beyond_the_suffix = 37_000_000;
+    assert!(beyond_the_suffix > last_target);
+
+    let free_run = write_stamped_checkpoint_bag_with_deadline(
+        &dir,
+        "free_run_cp_ws2c.mcap",
+        CP_FIRST_STEP,
+        beyond_the_suffix,
+        replay_engine::CoordinationMode::FreeRun,
+    );
+    let outcome = replay(&free_run, checkpoint_factories, None, None)
+        .expect("a one-rank free-run mid-run bag resumes");
+    assert_eq!(
+        outcome.coordination,
+        replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::FreeRun,
+            inferred: false,
+        }
+    );
+    assert!(
+        outcome.passed,
+        "trace-driven: the recorded fires happen whatever the restored deadline says: {outcome:?}"
+    );
+    assert_eq!(outcome.ticks_replayed, CP_STEPS - CP_FIRST_STEP as usize);
+    let resume = outcome.resume.expect("a mid-run bag reports its resume");
+    assert_eq!(resume.framework_nodes, vec![CP_NODE.to_string()]);
+    assert_eq!(
+        resume.period_baselines_from_state,
+        vec![CP_NODE.to_string()],
+        "the report still says the deadline came from recorded scheduler state"
+    );
+
+    let lockstep = write_stamped_checkpoint_bag_with_deadline(
+        &dir,
+        "lockstep_cp_ws2c.mcap",
+        CP_FIRST_STEP,
+        beyond_the_suffix,
+        replay_engine::CoordinationMode::Lockstep,
+    );
+    let twin = replay(&lockstep, checkpoint_factories, None, None).expect("mid-run replay runs");
+    assert!(
+        !twin.passed,
+        "live-decided: the same deadline silences the node under lockstep"
+    );
+    assert!(
+        twin.violations
+            .iter()
+            .any(|v| v.topic == CP_TOPIC && matches!(v.class, ViolationClass::MissingTopic)),
+        "{:?}",
+        twin.violations
+    );
+}
+
+/// [`cp3_reference`] with the read log captured: the kind-6
+/// records the re-derivation verifier folds, so a resumed FREE-RUN pass of
+/// this fixture is actually JUDGED rather than declined at the census.
+fn cp3_reference_with_read_log() -> Recording {
+    record_reference_impl(
+        cp3_yaml(),
+        cp3_factories,
+        &[],
+        &[DELTA_MS; CP3_STEPS],
+        16,
+        true,
+    )
+}
+
+/// [`write_cp3_bag`] with an EXPLICIT `coordination` stamp rendered by the
+/// production writer, the same framework-section anchor under the other contract.
+fn write_stamped_cp3_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    sync_state: BTreeMap<String, u64>,
+    coordination: replay_engine::CoordinationMode,
+) -> std::path::PathBuf {
+    let mid = make_mid_run(rec, CP3_FIRST_STEP);
+    let bag = dir.path().join(name);
+    let anchor_step = CP3_FIRST_STEP - 1;
+    let mut records = Vec::new();
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        anchor_step,
+        0,
+        &anchor_blob_with_framework(CHECKPOINT_SHAPE, Some(1), &period_section(60_000_000)),
+    ));
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        anchor_step,
+        1,
+        &anchor_blob_with_framework(CHECKPOINT_SHAPE, Some(0), &period_section(40_000_000)),
+    ));
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        anchor_step,
+        2,
+        &node_anchor_blob_with_framework(
+            &FusionNode::default(),
+            &NodeFrameworkState {
+                next_fire_ns: None,
+                pending_data_count: 0,
+                sync_input_timestamps: sync_state,
+                input_service: Some(BTreeMap::new()),
+            },
+        ),
+    ));
+    write_checkpoint_bag_with_capture(
+        &mid,
+        &bag,
+        &records,
+        Some(&coverage_for_nodes(&[
+            (CP3_A, 0),
+            (CP3_B, 1),
+            (CP3_FUSION, 2),
+        ])),
+        None,
+        None,
+        Some(production_recorder_json(coordination)),
+    );
+    bag
+}
+
+#[test]
+#[serial]
+fn a_one_rank_free_run_resume_with_restored_sync_heads_is_not_mis_judged() {
+    // THE `PassRestore` GATE, end to end. The framework-section fusion anchor restores
+    // `/a`'s alignment as an UNBACKED head, a real stamp with no kind-6
+    // record, since the read that filled it happened before the recording's
+    // first retained step, and under free-run the resumed pass is judged by
+    // the re-derivation verifier. A verifier folding only the records it can
+    // see judges a map MISSING that head, finds no transversal for the
+    // recorded fusion fire, and convicts a healthy resume on its first step
+    // (exit 6). With the restored heads seeded it is CLEAN.
+    //
+    // Two anti-vacuity claims ride along: the verifier RAN (no rank-level
+    // decline and no stand-down on the fusion node: a declined verifier
+    // finds nothing for the wrong reason), and the recorded frames are read
+    // against the same hand oracle the lockstep arms use.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = cp3_reference_with_read_log();
+    assert_cp3_reference_shape(&rec);
+    assert!(
+        rec.input_names.is_some()
+            && rec
+                .trace
+                .iter()
+                .any(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step >= CP3_FIRST_STEP),
+        "precondition: the recording carries kind-6 records inside the resumed slice"
+    );
+    let bag = write_stamped_cp3_bag(
+        &dir,
+        "cp3_sync_free_run.mcap",
+        &rec,
+        [(CP3_A_TOPIC.to_string(), 30_000_000u64)]
+            .into_iter()
+            .collect(),
+        replay_engine::CoordinationMode::FreeRun,
+    );
+
+    let outcome = replay(&bag, cp3_factories, None, None).expect("mid-run replay runs");
+    assert_eq!(
+        outcome.coordination,
+        replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::FreeRun,
+            inferred: false,
+        }
+    );
+    assert_eq!(outcome.ticks_replayed, CP3_STEPS - CP3_FIRST_STEP as usize);
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "the restored alignment must be judged as the scheduler held it: {:?}",
+        outcome.trace_divergence
+    );
+    let declined: Vec<&cerulion_cli_engine::replay_engine::RederivationNote> = outcome
+        .rederivation_notes
+        .iter()
+        .filter(|n| {
+            n.kind == cerulion_cli_engine::replay_engine::RederivationNoteKind::StandDown
+                && (n.subject == "rank 0" || n.subject == CP3_FUSION)
+        })
+        .collect();
+    assert!(
+        declined.is_empty(),
+        "the verifier must JUDGE the fusion node rather than decline it: {declined:?}"
+    );
+    let resume = outcome
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_eq!(
+        resume.framework_nodes,
+        vec![CP3_A.to_string(), CP3_B.to_string(), CP3_FUSION.to_string()]
+    );
+    // The framework-section residual is unchanged by the mode: the fired node has no /a
+    // data to publish from, and nothing ELSE diverges.
+    assert!(
+        outcome
+            .violations
+            .iter()
+            .all(|v| v.topic == CP3_FUSION_TOPIC),
+        "{:?}",
+        outcome.violations
+    );
+}
+
+/// [`backlog_reference`]'s relay run WITH the read log captured.
+///
+/// The kind-6 records are what the planner steers from, so a FREE-RUN pass of
+/// this fixture drives its external topic off the read log rather than off the
+/// recorded-clock window — which is the half a mid-run resume has never met.
+fn backlog_reference_with_read_log() -> Recording {
+    let per_step: Vec<f64> = (0..CP_STEPS).map(|k| (k * 10 + 1) as f64).collect();
+    record_uniform_with_read_log(
+        ext_graph_yaml(),
+        ext_relay_factories,
+        &[ExternalDrive::singles(CP4_EXT_TOPIC, per_step)],
+        CP_STEPS,
+    )
+}
+
+/// [`write_backlog_bag`] stamped FREE-RUN by the production writer, with no
+/// claimed backlog: the ONE contract under which a mid-run resume and read-log
+/// steering run on a single pass.
+fn write_free_run_backlog_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    service: Option<BTreeMap<String, Option<u32>>>,
+) -> std::path::PathBuf {
+    let mid = make_mid_run(rec, CP_FIRST_STEP);
+    let bag = dir.path().join(name);
+    write_checkpoint_bag_with_capture(
+        &mid,
+        &bag,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &node_anchor_blob_with_framework(
+                &ext_relay_state(),
+                &NodeFrameworkState {
+                    next_fire_ns: None,
+                    pending_data_count: 0,
+                    sync_input_timestamps: BTreeMap::new(),
+                    input_service: service,
+                },
+            ),
+        ),
+        Some(&coverage_naming(
+            "relay",
+            cerulion_bagd::STATE_COVERAGE_VERSION,
+            1,
+            Some(CHECKPOINT_NODE_IDX),
+        )),
+        None,
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+    );
+    bag
+}
+
+#[test]
+#[serial]
+fn a_resumed_one_rank_free_run_pass_injects_from_the_skipped_prefix() {
+    // SKIP and STEER on ONE pass. A one-worker-rank free-run bag resumes
+    // mid-run, so its external topic carries a service-cursor skip while the
+    // same bag's read log is what drives injection — the two halves
+    // `open_injectors`' `skipped_prefix` doc says cannot meet.
+    //
+    // They DO meet here, and the arm states what each half then does, because
+    // the two answers are different and only one of them is a product claim:
+    //
+    //  * the SKIP is applied, and the first frame this pass serves is the one
+    //    after it (the hand oracle below, byte-exact through the relay);
+    //  * the STEER stands the topic DOWN, MEASURED, with `join_mismatch`. The
+    //    schedule's positional cursor counts this topic's frames from ordinal
+    //    0 while the read log's first record names the frame at the skipped
+    //    prefix, so the planner reads the two as disagreeing about the stream
+    //    and refuses to steer it. `Injector::feed_position`'s seed is therefore
+    //    DEFENSIVE at this head: the arms that read it (`inject_planned`,
+    //    `stage_slot_frames`) are the steered ones, and on this shape they are
+    //    not reached. The seed is still right — both numbers are ordinals of
+    //    the same stream — and the day the planner's own origin moves, the
+    //    stand-down assertion below is the line that says which claim changed.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = backlog_reference_with_read_log();
+    assert!(
+        rec.input_names.is_some(),
+        "precondition: the fixture carries the read log the steering plans from"
+    );
+    let anchor_clock = cp_anchor_clock(&rec);
+    let band = pre_anchor_sequences(&rec, CP4_EXT_TOPIC, anchor_clock);
+    let cursor = relay_service_cursor(&rec, CP4_EXT_TOPIC, "/xr/relay/out", anchor_clock);
+    let already_read = band.iter().take_while(|s| **s <= cursor).count();
+
+    // THE HAND ORACLE, derived from the crafted bag and never from the engine.
+    //
+    // The read log says the recorded relay had READ through wire sequence
+    // `cursor` on this topic by the anchor; `already_read` frames of the
+    // topic's whole-recording stream sit at or below it, and the resumed pass
+    // must not serve any of them again. So the FIRST frame it may inject is
+    // this topic's whole-recording frame index `already_read` — ONE number
+    // reached two ways, which is the invariant the seed rests on: the read
+    // log's own schedule names that same index as its first due frame (the
+    // relay reads external frame k at step k, and the resumed slice opens at
+    // `CP_FIRST_STEP`), and the skip counts the same stream from the same end.
+    let first_injected_index = already_read;
+    assert!(
+        first_injected_index > 0 && first_injected_index < band.len(),
+        "this arm needs a PARTIALLY read band, or the skip it pins is empty — read \
+         {already_read} of {} (sequences {band:?}, cursor {cursor})",
+        band.len()
+    );
+    assert_eq!(
+        first_injected_index, CP_FIRST_STEP as usize,
+        "the read log and the service cursor must name the SAME first frame, or the \
+         oracle below is two claims rather than one"
+    );
+    // What the relay does with that frame, by hand: it publishes `inp.x + 100`
+    // and the drive's frame k carries `k * 10 + 1`, so the first output frame
+    // of the resumed slice is the relay's read of external frame
+    // `first_injected_index`. Serving the prefix again, or serving a later
+    // frame in its place, moves this value.
+    let first_replayed_out = rec.messages["/xr/relay/out"]
+        .iter()
+        .find(|f| WireHeader::read_from_buf(f).expect("header").timestamp_ns >= anchor_clock)
+        .map(|f| frame_x(f))
+        .expect("the reference run fires after the anchor");
+    assert_eq!(
+        first_replayed_out,
+        (first_injected_index * 10 + 1) as f64 + 100.0,
+        "hand oracle: the resumed slice opens on the relay's read of external frame \
+         {first_injected_index}"
+    );
+
+    let bag = write_free_run_backlog_bag(
+        &dir,
+        "free_run_steered_resume.mcap",
+        &rec,
+        service_table("inp", Some(cursor)),
+    );
+    let outcome = replay(&bag, ext_relay_factories, None, None).expect("mid-run replay runs");
+
+    // The contract this pass ran under, so the arm cannot be satisfied by a bag
+    // that quietly took the lockstep path — where no steering is planned at all
+    // and the seam this arm is about does not exist.
+    assert_eq!(
+        outcome.coordination,
+        replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::FreeRun,
+            inferred: false,
+        }
+    );
+    // …and the rank was JUDGED, not declined wholesale: a rank-level decline
+    // stands every topic down for a reason that has nothing to do with the
+    // skip, which would make the measurement below say nothing.
+    assert_eq!(
+        rederivation_kinds(&outcome),
+        Vec::<(u32, String, String)>::new(),
+        "the rank's tables must be readable, or the stand-down below is the census's"
+    );
+
+    // The SKIP the pass applied is the oracle's, stated on the map so a run
+    // that merely happened to pass cannot satisfy it.
+    let resume = outcome
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_eq!(
+        resume.pre_anchor_frames_already_read,
+        [(CP4_EXT_TOPIC.to_string(), first_injected_index)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+        "the resumed pass must skip exactly the frames the read log says were served"
+    );
+
+    // THE MEASUREMENT. Stated on the code and the edge, not merely as "nothing
+    // was steered": the planner refuses THIS topic because its positional
+    // cursor and the read log disagree about where the stream starts, which is
+    // the resume's prefix seen from the one place that was not told about it.
+    let stood_down: Vec<(&str, &str)> = outcome
+        .injection_stand_downs
+        .iter()
+        .map(|sd| (sd.topic.as_str(), sd.code.as_str()))
+        .collect();
+    assert_eq!(
+        stood_down,
+        vec![(CP4_EXT_TOPIC, "join_mismatch")],
+        "a resumed pass's steered plan counts from ordinal 0 while its read log names \
+         frames from the skipped prefix on, so the topic falls back to the \
+         recorded-clock window"
+    );
+    assert!(
+        outcome.injection_coverage.is_empty(),
+        "a stood-down topic is planned for by nothing: {:?}",
+        outcome.injection_coverage
+    );
+
+    // And the SKIP half is right whichever arm drives the injection: the feed
+    // itself starts past the prefix, so the first frame served is the oracle's
+    // and the relay reproduces its recorded output byte-for-byte.
+    assert!(
+        outcome.injection_anomalies.is_empty(),
+        "the frames served must be the ones the recording holds from the prefix on: {:?}",
+        outcome.injection_anomalies
+    );
+    assert!(
+        outcome.passed,
+        "a resumed free-run pass that serves from the skipped prefix replays byte-exact: \
+         {:?} / {:?}",
+        outcome.violations, outcome.trace_divergence
+    );
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "…and mints no fire the recording does not hold: {:?}",
+        outcome.trace_divergence
+    );
+    // ANTI-VACUITY: `passed` is also true of a run that compared nothing.
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (1, 1),
+        "the relay's output is the one produced topic, and it must be compared"
+    );
+    assert_eq!(
+        outcome.ticks_replayed,
+        CP_STEPS - CP_FIRST_STEP as usize,
+        "the resumed slice is the suffix from the anchor on"
+    );
 }
 
 #[test]
@@ -27748,6 +28603,7 @@ fn write_sy_bag_overridden(
         &[],
         ProducerAttributionFixture::default(),
         staging_override,
+        &[],
     )
 }
 
@@ -27791,6 +28647,7 @@ fn write_sy_single_rank_free_run_bag(
         &[],
         ProducerAttributionFixture::default(),
         None,
+        &[],
     )
 }
 
@@ -31775,6 +32632,7 @@ fn write_sb_bag(
             labels: &labels,
         },
         None,
+        &[],
     )
 }
 
@@ -32873,6 +33731,7 @@ fn rt_bag(
             labels: &labels,
         },
         None,
+        &[],
     )
 }
 
@@ -33745,6 +34604,7 @@ fn c6_a_finished_pass_holds_no_capture_port_into_the_next_ranks_pass() {
         &[],
         ProducerAttributionFixture::default(),
         None,
+        &[],
     );
 
     let obs = PortProbeObservations::default();
