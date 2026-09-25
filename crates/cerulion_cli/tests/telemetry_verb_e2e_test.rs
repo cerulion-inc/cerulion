@@ -188,6 +188,12 @@ fn sent_after_notice(home: &Path, sink: &Sink) -> String {
         ("POSTHOG_HOST", sink.url.as_str()),
     ];
     cerulion(home, &key, &["graph", "list"]);
+    assert!(
+        sink.bodies
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_err(),
+        "the notice run sends nothing"
+    );
     let out = cerulion(home, &key, &["graph", "list"]);
     assert!(!out.stderr.contains("usage events"), "{}", out.stderr);
     sink.bodies
@@ -215,6 +221,23 @@ fn a_hosted_account_is_the_distinct_id_and_only_allowlisted_props_leave() {
     ] {
         assert!(body.contains(key), "{key} missing: {body}");
     }
+    let batch: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let props = batch["batch"][0]["properties"].as_object().unwrap();
+    let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let allowed = [
+        "$lib",
+        "$lib_version",
+        "app_version",
+        "channel",
+        "duration_bucket",
+        "env",
+        "exit_code",
+        "subverb",
+        "surface",
+        "verb",
+    ];
+    assert!(keys.iter().all(|k| allowed.contains(k)), "{keys:?}");
     assert!(!body.contains(home.path().to_str().unwrap()), "{body}");
 }
 
