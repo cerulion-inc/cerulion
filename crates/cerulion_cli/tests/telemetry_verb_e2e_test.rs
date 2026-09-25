@@ -165,6 +165,12 @@ fn sink() -> Sink {
             let mut reader = BufReader::new(stream);
             let mut len = 0usize;
             let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            if !line.starts_with("POST /batch ") {
+                let _ = tx.send(format!("unexpected request line: {line}"));
+                continue;
+            }
+            line.clear();
             while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
                 if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                     len = v.trim().parse().unwrap_or(0);
