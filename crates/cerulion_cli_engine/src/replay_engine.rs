@@ -7161,11 +7161,17 @@ fn fold_read_log_outcomes(outcomes: Vec<ReadLogOutcome>) -> ReadLogOutcome {
 ///
 /// Resolved through [`cerulion_core::graph::resolve_source`], the ONE rule the
 /// runtime, the validator and `replay_rank` already apply to an input's
-/// `source`, never a second spelling of it. A topic that names no input of its
-/// node is DROPPED with a breadcrumb rather than seeded onto a guess: it can
-/// only come from a recording whose graph disagrees with the bag's, and a
-/// missing seed is the conservative direction (the verifier can then only
-/// convict, never accept a fire it should have refused).
+/// `source`, never a second spelling of it. EVERY input the topic resolves to
+/// is seeded, not the first found: the anchor keys by TOPIC and a node may wire
+/// two inputs to one, so a first-match walk leaves the second bare.
+///
+/// A topic that names no input of its node is DROPPED with a WARN rather than
+/// seeded onto a guess: it can only come from a recording whose graph disagrees
+/// with the bag's, and a missing seed is the conservative direction (the
+/// verifier can then only convict, never accept a fire it should have refused).
+/// Both drops are WARN because both are that disagreement, and the pass they
+/// silently change the judgement of is one an operator has to be able to
+/// explain.
 fn restored_sync_heads_by_input(
     config: &GraphConfig,
     by_topic: &BTreeMap<String, BTreeMap<String, u64>>,
@@ -7173,7 +7179,12 @@ fn restored_sync_heads_by_input(
     let mut out: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     for (node_id, heads) in by_topic {
         let Some(node) = config.nodes.iter().find(|n| &n.id == node_id) else {
-            tracing::debug!(
+            // WARN, not debug: a dropped seed is a BAG-VERSUS-GRAPH
+            // disagreement, and its consequence is a resumed pass judged
+            // against an alignment the recording held and the verifier does
+            // not. A breadcrumb nobody sees at the default level is how that
+            // arrives as an unexplained exit 6.
+            tracing::warn!(
                 node_id = %node_id,
                 "replay resume: the anchor restores Sync heads for a node the graph does not \
                  declare; nothing is seeded for it"
@@ -7181,21 +7192,29 @@ fn restored_sync_heads_by_input(
             continue;
         };
         for (topic, ts) in heads {
-            let input = node.inputs.iter().find(|input| {
+            // EVERY input sourced from this topic, never the first one found.
+            // A node may declare two trigger inputs on ONE topic (two Sync
+            // alignments fed from the same producer), and the anchor's
+            // topic-keyed head is the head of BOTH: seeding one of them left
+            // the other bare, which convicts the resumed pass on the input the
+            // walk skipped — the same defect the re-keying exists to prevent,
+            // reached one input later.
+            let mut seeded = 0usize;
+            for input in node.inputs.iter().filter(|input| {
                 cerulion_core::graph::resolve_source(&config.prefix, &input.source) == *topic
-            });
-            match input {
-                Some(input) => {
-                    out.entry(node_id.clone())
-                        .or_default()
-                        .insert(input.name.clone(), *ts);
-                }
-                None => tracing::debug!(
+            }) {
+                out.entry(node_id.clone())
+                    .or_default()
+                    .insert(input.name.clone(), *ts);
+                seeded += 1;
+            }
+            if seeded == 0 {
+                tracing::warn!(
                     node_id = %node_id,
                     topic = %topic,
                     "replay resume: the anchor restores a Sync head on a topic none of this \
                      node's declared inputs is sourced from; nothing is seeded for it"
-                ),
+                );
             }
         }
     }
@@ -14218,6 +14237,42 @@ mod restored_sync_heads_tests {
             "a from-start pass restores nothing"
         );
     }
+
+    /// TWO trigger inputs of one node wired to ONE topic. The anchor keys by
+    /// topic, so the restored head is the head of BOTH — and a first-match walk
+    /// seeds one of them and leaves the other bare, which convicts the resumed
+    /// pass on the input it skipped. The oracle names both inputs by hand.
+    #[test]
+    fn one_topic_feeding_two_inputs_of_a_node_seeds_both_of_them() {
+        const GRAPH: &str = "prefix: cp3\n\
+             nodes:\n\
+             \x20 - id: a_src\n\
+             \x20   type: src\n\
+             \x20   outputs:\n\
+             \x20     - name: out\n\
+             \x20       schema: geometry_msgs/Vector3\n\
+             \x20 - id: fusion\n\
+             \x20   type: fusion\n\
+             \x20   inputs:\n\
+             \x20     - name: left\n\
+             \x20       source: a_src/out\n\
+             \x20     - name: right\n\
+             \x20       source: /cp3/a_src/out\n";
+        let config = parse_graph(GRAPH).expect("graph parses");
+        // The two spellings must really resolve to ONE topic, or this arm is
+        // the ordinary two-topic case wearing a different name.
+        let heads = BTreeMap::from([("/cp3/a_src/out".to_string(), 30_000_000u64)]);
+        let by_topic = BTreeMap::from([("fusion".to_string(), heads)]);
+
+        let want = BTreeMap::from([(
+            "fusion".to_string(),
+            BTreeMap::from([
+                ("left".to_string(), 30_000_000u64),
+                ("right".to_string(), 30_000_000u64),
+            ]),
+        )]);
+        assert_eq!(restored_sync_heads_by_input(&config, &by_topic), want);
+    }
 }
 
 #[cfg(test)]
@@ -16260,10 +16315,30 @@ fn open_injectors(
     // starts POST-skip (`FrameFeed::ensure_front` discards `pending_skip`
     // first), so a cursor that started at 0 would walk `frame_index` frames
     // past a post-skip front and over-advance by the prefix on every planned
-    // injection — reachable only when skip and steer meet on one pass, which
-    // today's gates keep apart (skip ⇒ resume ⇒ lockstep ⇒ no steer), but two
-    // gates three thousand lines apart are not a contract. Seeding the cursor
-    // at the prefix puts both walks on ONE origin.
+    // injection.
+    //
+    // Skip and steer now reach one pass together — a one-worker-rank free-run
+    // bag resumes mid-run, so its external topics carry a skip on the pass
+    // whose read log plans their injection. What they do NOT yet do is drive
+    // one topic together, and the reason is no longer a chain of distant gates:
+    // `plan_topic_injection`'s own positional cursor counts a topic's frames
+    // from ordinal 0, while a resumed pass's read log names frames from the
+    // skipped prefix on, so the planner reads the two as disagreeing about the
+    // stream and stands the topic down (`join_mismatch`) onto the
+    // recorded-clock window. MEASURED, and pinned by
+    // `a_resumed_one_rank_free_run_pass_injects_from_the_skipped_prefix`, which
+    // fails the day that origin moves.
+    //
+    // So the seed below is DEFENSIVE, and it is right for a reason that does
+    // not depend on which arm drives: the two numbers are ordinals of the SAME
+    // stream — this topic's frames in file order as `RecordedMessages` holds
+    // them, counted from frame 0 with no skip. `frame_index` is that ordinal by
+    // construction; every contributor to `skipped_prefix` (the pre-anchor
+    // produced split, the capture-window prefix, the service cursor) names a
+    // LEADING run of that same stream, and `FrameFeed` discards exactly that
+    // many, so the feed's front IS ordinal `skipped_prefix[topic]`. Seeding the
+    // cursor there states the front's ordinal rather than assuming it is zero,
+    // which is what puts both walks on ONE origin.
     skipped_prefix: &BTreeMap<String, usize>,
     // The read-log-steered schedules this pass planned, keyed by
     // topic. EMPTY on every lockstep replay and on every free-run topic that

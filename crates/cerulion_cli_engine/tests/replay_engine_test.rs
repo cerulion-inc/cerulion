@@ -12992,6 +12992,66 @@ fn the_engine_reads_the_clamp_from_the_bag_not_from_the_resume_plan() {
     );
 }
 
+/// The clamp the pass INSTALLS is the clamp the re-derivation verifier RUNS.
+///
+/// STRUCTURAL, for the same reason as the arm above: the behavioural
+/// consequence — a `Period` node's re-derived catch-up burst capped exactly as
+/// the recording's was — needs a stalled multi-step fixture whose fire counts
+/// are wall-sensitive, and `prepare_pass_verification` hands back no clamp for
+/// an arm to read. What a walk CAN see is the one thing the regression changes:
+/// the argument at the call.
+///
+/// `None` is what a revert looks like, and it COMPILES (the parameter is an
+/// `Option`), so nothing else in this file fails on it: the verifier then runs
+/// the unclamped rule against a recording the clamp shaped and convicts the
+/// candidate for the recorder's own cap.
+#[test]
+fn the_rederivation_verifier_is_handed_the_clamp_the_pass_runs() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/replay_engine.rs"),
+    )
+    .expect("read replay_engine.rs");
+    let code = code_only(&src);
+
+    // The parameter must still BE there, or the claim below is about a call
+    // that no longer takes a clamp at all.
+    let decl = code
+        .find("fn prepare_pass_verification(")
+        .expect("the verifier's preparation must still exist");
+    let decl_body = code[decl..]
+        .find(") -> Result<PassVerification, ReplayError> {")
+        .expect("its signature must still end where this walk expects");
+    assert!(
+        code[decl..decl + decl_body]
+            .contains("catchup_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>"),
+        "the preparation must still take the armed clamp"
+    );
+
+    // ONE call, and its argument list must carry the PASS's own onset. Anchored
+    // on the call rather than the file so a `None` there fails this even though
+    // it compiles and every other arm still passes.
+    let call = code[decl + decl_body..]
+        .find("prepare_pass_verification(")
+        .map(|at| decl + decl_body + at)
+        .expect("the pass loop must still call it");
+    assert_eq!(
+        code[decl + decl_body..]
+            .matches("prepare_pass_verification(")
+            .count(),
+        1,
+        "ONE call site, so the argument this arm reads is the only one"
+    );
+    let args_end = code[call..]
+        .find(")?")
+        .expect("the call must still end in the `?` its Result demands");
+    let args = &code[call..call + args_end];
+    assert!(
+        args.contains("pass.catchup_onset"),
+        "the verifier must be handed the pass's OWN clamp, never `None` — it runs the \
+         re-derived Period rule against a recording the clamp shaped: {args}"
+    );
+}
+
 #[test]
 #[serial]
 fn a_from_start_bag_that_also_carries_anchors_is_unaffected_by_them() {
@@ -22623,6 +22683,233 @@ fn a_one_rank_free_run_resume_with_restored_sync_heads_is_not_mis_judged() {
             .all(|v| v.topic == CP3_FUSION_TOPIC),
         "{:?}",
         outcome.violations
+    );
+}
+
+/// [`backlog_reference`]'s relay run WITH the read log captured.
+///
+/// The kind-6 records are what the planner steers from, so a FREE-RUN pass of
+/// this fixture drives its external topic off the read log rather than off the
+/// recorded-clock window — which is the half a mid-run resume has never met.
+fn backlog_reference_with_read_log() -> Recording {
+    let per_step: Vec<f64> = (0..CP_STEPS).map(|k| (k * 10 + 1) as f64).collect();
+    record_uniform_with_read_log(
+        ext_graph_yaml(),
+        ext_relay_factories,
+        &[ExternalDrive::singles(CP4_EXT_TOPIC, per_step)],
+        CP_STEPS,
+    )
+}
+
+/// [`write_backlog_bag`] stamped FREE-RUN by the production writer, with no
+/// claimed backlog: the ONE contract under which a mid-run resume and read-log
+/// steering run on a single pass.
+fn write_free_run_backlog_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    service: Option<BTreeMap<String, Option<u32>>>,
+) -> std::path::PathBuf {
+    let mid = make_mid_run(rec, CP_FIRST_STEP);
+    let bag = dir.path().join(name);
+    write_checkpoint_bag_with_capture(
+        &mid,
+        &bag,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &node_anchor_blob_with_framework(
+                &ext_relay_state(),
+                &NodeFrameworkState {
+                    next_fire_ns: None,
+                    pending_data_count: 0,
+                    sync_input_timestamps: BTreeMap::new(),
+                    input_service: service,
+                },
+            ),
+        ),
+        Some(&coverage_naming(
+            "relay",
+            cerulion_bagd::STATE_COVERAGE_VERSION,
+            1,
+            Some(CHECKPOINT_NODE_IDX),
+        )),
+        None,
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+    );
+    bag
+}
+
+#[test]
+#[serial]
+fn a_resumed_one_rank_free_run_pass_injects_from_the_skipped_prefix() {
+    // SKIP and STEER on ONE pass. A one-worker-rank free-run bag resumes
+    // mid-run, so its external topic carries a service-cursor skip while the
+    // same bag's read log is what drives injection — the two halves
+    // `open_injectors`' `skipped_prefix` doc says cannot meet.
+    //
+    // They DO meet here, and the arm states what each half then does, because
+    // the two answers are different and only one of them is a product claim:
+    //
+    //  * the SKIP is applied, and the first frame this pass serves is the one
+    //    after it (the hand oracle below, byte-exact through the relay);
+    //  * the STEER stands the topic DOWN, MEASURED, with `join_mismatch`. The
+    //    schedule's positional cursor counts this topic's frames from ordinal
+    //    0 while the read log's first record names the frame at the skipped
+    //    prefix, so the planner reads the two as disagreeing about the stream
+    //    and refuses to steer it. `Injector::feed_position`'s seed is therefore
+    //    DEFENSIVE at this head: the arms that read it (`inject_planned`,
+    //    `stage_slot_frames`) are the steered ones, and on this shape they are
+    //    not reached. The seed is still right — both numbers are ordinals of
+    //    the same stream — and the day the planner's own origin moves, the
+    //    stand-down assertion below is the line that says which claim changed.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = backlog_reference_with_read_log();
+    assert!(
+        rec.input_names.is_some(),
+        "precondition: the fixture carries the read log the steering plans from"
+    );
+    let anchor_clock = cp_anchor_clock(&rec);
+    let band = pre_anchor_sequences(&rec, CP4_EXT_TOPIC, anchor_clock);
+    let cursor = relay_service_cursor(&rec, CP4_EXT_TOPIC, "/xr/relay/out", anchor_clock);
+    let already_read = band.iter().take_while(|s| **s <= cursor).count();
+
+    // THE HAND ORACLE, derived from the crafted bag and never from the engine.
+    //
+    // The read log says the recorded relay had READ through wire sequence
+    // `cursor` on this topic by the anchor; `already_read` frames of the
+    // topic's whole-recording stream sit at or below it, and the resumed pass
+    // must not serve any of them again. So the FIRST frame it may inject is
+    // this topic's whole-recording frame index `already_read` — ONE number
+    // reached two ways, which is the invariant the seed rests on: the read
+    // log's own schedule names that same index as its first due frame (the
+    // relay reads external frame k at step k, and the resumed slice opens at
+    // `CP_FIRST_STEP`), and the skip counts the same stream from the same end.
+    let first_injected_index = already_read;
+    assert!(
+        first_injected_index > 0 && first_injected_index < band.len(),
+        "this arm needs a PARTIALLY read band, or the skip it pins is empty — read \
+         {already_read} of {} (sequences {band:?}, cursor {cursor})",
+        band.len()
+    );
+    assert_eq!(
+        first_injected_index, CP_FIRST_STEP as usize,
+        "the read log and the service cursor must name the SAME first frame, or the \
+         oracle below is two claims rather than one"
+    );
+    // What the relay does with that frame, by hand: it publishes `inp.x + 100`
+    // and the drive's frame k carries `k * 10 + 1`, so the first output frame
+    // of the resumed slice is the relay's read of external frame
+    // `first_injected_index`. Serving the prefix again, or serving a later
+    // frame in its place, moves this value.
+    let first_replayed_out = rec.messages["/xr/relay/out"]
+        .iter()
+        .find(|f| WireHeader::read_from_buf(f).expect("header").timestamp_ns >= anchor_clock)
+        .map(|f| frame_x(f))
+        .expect("the reference run fires after the anchor");
+    assert_eq!(
+        first_replayed_out,
+        (first_injected_index * 10 + 1) as f64 + 100.0,
+        "hand oracle: the resumed slice opens on the relay's read of external frame \
+         {first_injected_index}"
+    );
+
+    let bag = write_free_run_backlog_bag(
+        &dir,
+        "free_run_steered_resume.mcap",
+        &rec,
+        service_table("inp", Some(cursor)),
+    );
+    let outcome = replay(&bag, ext_relay_factories, None, None).expect("mid-run replay runs");
+
+    // The contract this pass ran under, so the arm cannot be satisfied by a bag
+    // that quietly took the lockstep path — where no steering is planned at all
+    // and the seam this arm is about does not exist.
+    assert_eq!(
+        outcome.coordination,
+        replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::FreeRun,
+            inferred: false,
+        }
+    );
+    // …and the rank was JUDGED, not declined wholesale: a rank-level decline
+    // stands every topic down for a reason that has nothing to do with the
+    // skip, which would make the measurement below say nothing.
+    assert_eq!(
+        rederivation_kinds(&outcome),
+        Vec::<(u32, String, String)>::new(),
+        "the rank's tables must be readable, or the stand-down below is the census's"
+    );
+
+    // The SKIP the pass applied is the oracle's, stated on the map so a run
+    // that merely happened to pass cannot satisfy it.
+    let resume = outcome
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_eq!(
+        resume.pre_anchor_frames_already_read,
+        [(CP4_EXT_TOPIC.to_string(), first_injected_index)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+        "the resumed pass must skip exactly the frames the read log says were served"
+    );
+
+    // THE MEASUREMENT. Stated on the code and the edge, not merely as "nothing
+    // was steered": the planner refuses THIS topic because its positional
+    // cursor and the read log disagree about where the stream starts, which is
+    // the resume's prefix seen from the one place that was not told about it.
+    let stood_down: Vec<(&str, &str)> = outcome
+        .injection_stand_downs
+        .iter()
+        .map(|sd| (sd.topic.as_str(), sd.code.as_str()))
+        .collect();
+    assert_eq!(
+        stood_down,
+        vec![(CP4_EXT_TOPIC, "join_mismatch")],
+        "a resumed pass's steered plan counts from ordinal 0 while its read log names \
+         frames from the skipped prefix on, so the topic falls back to the \
+         recorded-clock window"
+    );
+    assert!(
+        outcome.injection_coverage.is_empty(),
+        "a stood-down topic is planned for by nothing: {:?}",
+        outcome.injection_coverage
+    );
+
+    // And the SKIP half is right whichever arm drives the injection: the feed
+    // itself starts past the prefix, so the first frame served is the oracle's
+    // and the relay reproduces its recorded output byte-for-byte.
+    assert!(
+        outcome.injection_anomalies.is_empty(),
+        "the frames served must be the ones the recording holds from the prefix on: {:?}",
+        outcome.injection_anomalies
+    );
+    assert!(
+        outcome.passed,
+        "a resumed free-run pass that serves from the skipped prefix replays byte-exact: \
+         {:?} / {:?}",
+        outcome.violations, outcome.trace_divergence
+    );
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "…and mints no fire the recording does not hold: {:?}",
+        outcome.trace_divergence
+    );
+    // ANTI-VACUITY: `passed` is also true of a run that compared nothing.
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (1, 1),
+        "the relay's output is the one produced topic, and it must be compared"
+    );
+    assert_eq!(
+        outcome.ticks_replayed,
+        CP_STEPS - CP_FIRST_STEP as usize,
+        "the resumed slice is the suffix from the anchor on"
     );
 }
 
