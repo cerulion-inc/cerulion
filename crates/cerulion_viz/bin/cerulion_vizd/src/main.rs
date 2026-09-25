@@ -190,7 +190,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         socket = %daemon.socket_path().display(),
         "cerulion-vizd running — SIGINT/SIGTERM to stop"
     );
-
     // Block until a signal flips the flag (SIGINT + SIGTERM via the `termination`
     // feature), then shut the daemon down cleanly.
     let running = Arc::new(AtomicBool::new(true));
@@ -198,11 +197,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let running = Arc::clone(&running);
         ctrlc::set_handler(move || running.store(false, Ordering::SeqCst))?;
     }
+    let telemetry = cerulion_vizd::telemetry::Telemetry::start_in_background();
     while running.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
     }
 
     tracing::info!("cerulion-vizd shutting down");
+    telemetry.shutdown();
     daemon.shutdown();
     Ok(())
 }
