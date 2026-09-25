@@ -197,6 +197,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 |---|---|---|---|
 | `scheduler_test.rs` | Deterministic scheduler under `VirtualClock`; duration-recording gates; policy rejections. | `#[serial]` | none |
 | `graph_test.rs` | YAML graph parsing, validation, runtime stepping. | parallel | none |
+| `chain_census_test.rs` | The chain-fusion census: one oracle vector per rule (a trigger edge, one producer, one consumer, one fusable edge per producer, one process, neither `block` nor `sample`, the consumer fires on this frame, one trigger, no rate cap, no block-involved end, no context written at or after the head's level, the length ceiling), most as a PAIR built from one graph with one declaration changed. Asserts the chains AND the reason recorded for every refused edge, and that the two add up to every consumer edge. | parallel | none |
 | `config_deny_unknown_fields_test.rs` | Graph-config types reject unknown keys: a typo is a loud parse error, never a silent default; round-trip + rejection oracles per config type. | parallel | none |
 | `node_test.rs` | `ClosureNodeEntry` + `DylibNodeEntry` loading. | parallel | cdylib fixtures (header) |
 | `replay_test.rs` | Replay-equivalence (Replay = Live). | parallel | none |

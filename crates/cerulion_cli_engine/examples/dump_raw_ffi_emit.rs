@@ -12,6 +12,7 @@ use cerulion_cli_engine::templates::generate_lib_rs;
 
 fn main() {
     let m = NodeMetadata {
+        throttle_ms: None,
         node_type: "raw_ffi_template".to_string(),
         policy: None,
         inputs: vec![],

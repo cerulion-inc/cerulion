@@ -333,6 +333,35 @@ impl TopicFlow {
         self.credit_bar().is_none()
     }
 
+    /// The topic's ONE in-graph producer, or `None` when it has none (an
+    /// outside publisher) or several (a `multi_publisher_topics` topic).
+    ///
+    /// The half of the single-writer question that [`producers_of`] cannot
+    /// answer without the caller re-deciding what "one" means.
+    ///
+    /// [`producers_of`]: GraphTopology::producers_of
+    pub fn sole_producer(&self) -> Option<&str> {
+        match self.producers.as_slice() {
+            [only] => Some(only.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The topic's ONE consumer edge, or `None` when it has none or several.
+    ///
+    /// The reader-side twin of [`sole_producer`](Self::sole_producer). A topic
+    /// with two consumer edges is a fan-out, and the pair is what lets a caller
+    /// ask "is this topic one writer talking to one reader?" in the terms the
+    /// model already uses, instead of reaching into `consumers` and deciding
+    /// again. Two edges on the SAME node (one topic wired to two inputs) are
+    /// two consumers here, which is what they are to the scheduler.
+    pub fn sole_consumer(&self) -> Option<&ConsumerEdge> {
+        match self.consumers.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
     /// True when at least one consumer declared `block`.
     pub fn has_block_consumer(&self) -> bool {
         self.consumers

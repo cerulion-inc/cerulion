@@ -1561,6 +1561,7 @@ mod tests {
         // is compiled under the strict workspace lint contract. Users
         // adding real logic should add the imports they need.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1576,6 +1577,7 @@ mod tests {
     #[test]
     fn test_generate_lib_rs_has_entry_points() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1600,6 +1602,7 @@ mod tests {
     #[test]
     fn test_generate_lib_rs_has_marker_comments() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1613,6 +1616,7 @@ mod tests {
     #[test]
     fn test_generate_lib_rs_with_ports() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1642,6 +1646,7 @@ mod tests {
     #[test]
     fn test_generate_info_fn_uses_static_bytes() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1663,6 +1668,7 @@ mod tests {
     #[test]
     fn test_generate_lib_rs_handle_based_signatures() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1708,6 +1714,7 @@ mod tests {
     #[test]
     fn test_generate_lib_rs_has_last_error_machinery() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1743,6 +1750,7 @@ mod tests {
     #[test]
     fn test_generate_lib_rs_thread_local_uses_const_init() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1761,6 +1769,7 @@ mod tests {
     #[test]
     fn test_generate_lib_rs_populates_last_error_on_mutex_poison() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1808,6 +1817,7 @@ mod tests {
     #[test]
     fn test_generate_lib_rs_populates_last_error_on_missing_handle() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1860,6 +1870,7 @@ mod tests {
         // `test_raw_ffi_template_cdylib_init_drops_context_no_leak`)
         // exercises 16 init+shutdown cycles to catch the leak end-to-end.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1904,6 +1915,7 @@ mod tests {
         // onto a single line and silently break the test even though
         // the contract was preserved.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1950,6 +1962,7 @@ mod tests {
         // If you REMOVE one: bump this count down AND ensure the removed
         // path is no longer reachable.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -1982,6 +1995,7 @@ mod tests {
         // `RefCell` + `CString` and used bare names; that worked for
         // empty-port nodes but broke for any node with a String port.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -2018,6 +2032,7 @@ mod tests {
         // resolving to `std_msgs::String::from` (which doesn't exist) at
         // compile time. The macro form qualifies for the same reason.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -2080,6 +2095,7 @@ mod tests {
         // (a) schema import is absent, AND (b) the qualification is
         // still in place.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "stringnode".to_string(),
             policy: None,
             inputs: vec![],
@@ -2138,6 +2154,7 @@ mod tests {
         // form pinned an 8-space indent, which a `cargo fmt` could
         // silently invalidate.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -2193,6 +2210,7 @@ mod tests {
         // mutex-poison branches) — this test ensures the contract
         // can't drift silently.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -2223,6 +2241,7 @@ mod tests {
         // users never look. Pinning the in-emit form here ensures the
         // warning is delivered to the actual audience.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -2270,6 +2289,7 @@ mod tests {
         // unconditional `CString::from_raw(ptr)` would crash on the
         // documented "no error to free" case.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -2288,6 +2308,7 @@ mod tests {
         // the match-arm so a drift that always returns a CString-style
         // pointer is loud.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -2309,6 +2330,7 @@ mod tests {
         // worst possible moment (while it's trying to surface an
         // error to the host).
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -2347,6 +2369,7 @@ mod tests {
         // matching `crates/cerulion_core/tests/node_raw_ffi_template_test.rs`
         // tests prove `DylibNodeEntry::load` succeeds on the artifact.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "raw_ffi_template".to_string(),
             policy: None,
             inputs: vec![],
@@ -2529,6 +2552,7 @@ mod tests {
         // whose `use` statement is
         // `native_ros2_messages::sensor_msgs::Image`.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
             inputs: vec![],
@@ -2564,6 +2588,7 @@ mod tests {
         // `test_macro_lib_rs_with_outputs` but pins the colon-form
         // path explicitly.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
             inputs: vec![],
@@ -2585,6 +2610,7 @@ mod tests {
         // Input ports go through the same codegen path; pin them
         // independently.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "detector".to_string(),
             policy: None,
             inputs: vec![PortDef {
@@ -2612,6 +2638,7 @@ mod tests {
         // `node_create_with_options`; the template is a pure
         // codegen function that trusts its inputs.
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
             inputs: vec![],
@@ -2641,6 +2668,7 @@ mod tests {
         // non-external (Period) scaffold does NOT (so a regression that always
         // emits it, or never emits it, fails here).
         let external = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera_driver".to_string(),
             policy: Some(cerulion_core::MacroPolicy::External),
             inputs: vec![],
@@ -2668,6 +2696,7 @@ mod tests {
 
         // Non-external control: a Period node must NOT emit `external_source`.
         let periodic = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
             inputs: vec![],
@@ -2683,6 +2712,7 @@ mod tests {
     #[test]
     fn test_macro_lib_rs_with_outputs() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "camera".to_string(),
             policy: Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
             inputs: vec![],
@@ -2707,6 +2737,7 @@ mod tests {
     #[test]
     fn test_macro_lib_rs_with_inputs() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "detector".to_string(),
             policy: None,
             inputs: vec![PortDef {
@@ -2728,6 +2759,7 @@ mod tests {
     #[test]
     fn test_macro_lib_rs_with_trigger() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "fusion".to_string(),
             policy: None,
             inputs: vec![
@@ -2760,6 +2792,7 @@ mod tests {
     #[test]
     fn test_macro_lib_rs_multiple_outputs() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "driver".to_string(),
             policy: Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
             inputs: vec![],
@@ -2791,6 +2824,7 @@ mod tests {
     #[test]
     fn test_macro_lib_rs_pascal_case_struct_name() {
         let metadata = NodeMetadata {
+            throttle_ms: None,
             node_type: "imu_fusion".to_string(),
             policy: Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
             inputs: vec![],
