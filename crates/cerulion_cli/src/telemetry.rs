@@ -220,7 +220,8 @@ fn pending_alias_path() -> Option<std::path::PathBuf> {
 
 /// Merge an anonymous id left pending by a first login that ran while the
 /// notice was printed, now that this run may send. The marker is removed
-/// either way once read: without a hosted account there is nothing to merge.
+/// once read, unless the anonymous id cannot be read: without a hosted
+/// account there is nothing to merge.
 fn merge_pending_alias(client: &Client) {
     #[cfg(feature = "telemetry")]
     {
@@ -233,8 +234,10 @@ fn merge_pending_alias(client: &Client) {
             return;
         }
         let sub = auth::load().state().and_then(|s| hosted_sub(&s.account_id));
-        if let (Some(sub), Ok(Some(anon_id))) = (sub, consent::anon_id()) {
-            client.alias(&sub, &anon_id);
+        match (sub, consent::anon_id()) {
+            (_, Err(_)) => return,
+            (Some(sub), Ok(Some(anon_id))) => client.alias(&sub, &anon_id),
+            _ => {}
         }
         let _ = std::fs::remove_file(path);
     }
