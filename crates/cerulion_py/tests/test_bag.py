@@ -152,3 +152,31 @@ def test_open_bag_accepts_a_non_utf8_bytes_path(fixture_bin, tmp_path):
     os.rename(written, path)
     with cerulion.open_bag(path) as bag:
         assert [topic.count for topic in bag.topics()] == [5, 3, 1]
+
+
+def test_open_bag_rejects_a_corrupted_chunk_body(fixture_bin, tmp_path):
+    path = tmp_path / "bag.mcap"
+    write_bag(fixture_bin, path)
+    data = bytearray(path.read_bytes())
+    frame = oracle_frame(HASH_A, 0)
+    offset = data.find(frame)
+    assert offset > 0
+    data[offset + len(frame) - 1] ^= 0xFF
+    corrupted = tmp_path / "corrupted.mcap"
+    corrupted.write_bytes(bytes(data))
+    with pytest.raises(cerulion.BagError, match="(?i)crc"):
+        cerulion.open_bag(corrupted)
+
+
+def test_close_invalidates_pending_iterators_but_not_yielded_records(fixture_bin, tmp_path):
+    path = tmp_path / "bag.mcap"
+    write_bag(fixture_bin, path)
+    bag = cerulion.open_bag(path)
+    records = bag.messages("/py_bag/a")
+    topic, first = next(records)
+    bag.close()
+    with pytest.raises(cerulion.BagError, match="bag is closed"):
+        next(records)
+    with pytest.raises(StopIteration):
+        next(records)
+    assert (topic, first.raw) == ("/py_bag/a", oracle_frame(HASH_A, 0))
