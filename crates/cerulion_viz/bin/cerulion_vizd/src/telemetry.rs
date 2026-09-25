@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 
 use cerulion_telemetry::{consent, Client, Common, EventSpec, Props, DEFAULT_SHUTDOWN_BUDGET};
 
+/// How long [`Starting::shutdown`] waits, past its budget, to mark a start
+/// abandoned.
+const ABANDON_GRACE: Duration = Duration::from_millis(20);
+
 /// How often a running daemon reports that it is still up.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
@@ -242,8 +246,19 @@ impl Starting {
             Ok(Some(telemetry)) => telemetry.shutdown_by(deadline),
             Ok(None) | Err(RecvTimeoutError::Disconnected) => {}
             Err(RecvTimeoutError::Timeout) => {
-                if let Ok(mut abandoned) = self.abandoned.lock() {
-                    *abandoned = true;
+                // The starter holds this lock only while it queues the
+                // started event; past a short grace it is left to finish
+                // alone and shuts itself down when it cannot hand over.
+                let grace = Instant::now() + ABANDON_GRACE;
+                loop {
+                    if let Ok(mut abandoned) = self.abandoned.try_lock() {
+                        *abandoned = true;
+                        break;
+                    }
+                    if Instant::now() >= grace {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
                 }
             }
         }
