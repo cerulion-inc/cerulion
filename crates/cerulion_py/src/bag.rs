@@ -16,7 +16,7 @@ use std::rc::Rc;
 type SharedReader = Rc<RefCell<Option<BagReader>>>;
 
 /// A finalized bag reader. Record bytes are copied out of the read-only memory
-/// map, and `messages()` builds its 16-byte-per-frame span index up front.
+/// map, and `messages()` builds its 24-byte-per-frame span index up front.
 #[pyclass(unsendable, name = "Bag")]
 pub struct PyBag {
     reader: SharedReader,
@@ -25,7 +25,8 @@ pub struct PyBag {
 #[pyclass(unsendable)]
 pub struct BagRecordIter {
     reader: SharedReader,
-    spans: std::vec::IntoIter<(String, FrameSpan)>,
+    topics: HashMap<u16, String>,
+    spans: std::vec::IntoIter<(u16, FrameSpan)>,
 }
 
 fn closed() -> PyErr {
@@ -115,15 +116,20 @@ impl PyBag {
                 Ok(filter)
             })
             .transpose()?;
+        let mut topic_names = HashMap::new();
         let mut spans = Vec::new();
         walk_user_frames(reader, |walk, channel_id, span| {
             let topic = walk.topic(channel_id);
             if filter.as_ref().is_none_or(|names| names.contains(topic)) {
-                spans.push((topic.to_string(), span));
+                topic_names
+                    .entry(channel_id)
+                    .or_insert_with(|| topic.to_owned());
+                spans.push((channel_id, span));
             }
         })?;
         Ok(BagRecordIter {
             reader: Rc::clone(&self.reader),
+            topics: topic_names,
             spans: spans.into_iter(),
         })
     }
@@ -145,14 +151,19 @@ impl BagRecordIter {
         &mut self,
         py: Python<'py>,
     ) -> PyResult<Option<(String, Bound<'py, PyBytes>)>> {
+        if self.spans.len() == 0 {
+            return Ok(None);
+        }
         let guard = self.reader.borrow();
         let Some(reader) = guard.as_ref() else {
             self.spans = Vec::new().into_iter();
+            self.topics = HashMap::new();
             return Err(closed());
         };
-        let Some((topic, span)) = self.spans.next() else {
+        let Some((channel_id, span)) = self.spans.next() else {
             return Ok(None);
         };
+        let topic = self.topics.get(&channel_id).cloned().unwrap_or_default();
         Ok(Some((topic, PyBytes::new(py, reader.frame(&span)))))
     }
 }

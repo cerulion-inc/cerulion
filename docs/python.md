@@ -267,9 +267,9 @@ of names. `Record` exposes the header attributes `schema_hash`,
 
 Bag records are not zero-copy: the reader memory-maps the bag, and each
 record is copied out of the map into owned Python bytes when the iterator
-yields it. `messages()` indexes the selected records up front at 16 bytes
-per record, so its memory is proportional to the record count, not the
-bag size. `Record.raw` owns the bytes, `Record.payload` is a read-only
+yields it. `messages()` indexes the selected records up front at 24 bytes
+per record plus one copy of each selected topic name, so its memory is
+proportional to the record count, not the bag size. `Record.raw` owns the bytes, `Record.payload` is a read-only
 memoryview over them, and records stay valid after `bag.close()`; an
 unfinished `messages()` iterator raises `BagError` once its bag is closed.
 `open_bag` verifies every chunk CRC in one pass before returning, so a
