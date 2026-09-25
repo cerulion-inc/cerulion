@@ -270,8 +270,33 @@ mod enabled {
             }
         };
         serde_json::from_str(&text)
+            .or_else(|e| salvage(&text).ok_or(e))
             .map(Some)
             .map_err(|e| Error::Json(e.to_string()))
+    }
+
+    /// Keep a readable `enabled` from a record whose other fields have the
+    /// wrong type, so a repair never turns a stored opt-out back on. The
+    /// unreadable fields are left empty and filled in on the next write.
+    fn salvage(text: &str) -> Option<TelemetryFile> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let record = value.as_object()?;
+        let text_field = |key: &str| {
+            record
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Some(TelemetryFile {
+            enabled: record.get("enabled")?.as_bool()?,
+            anon_id: text_field("anon_id"),
+            notice_shown: record
+                .get("notice_shown")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            updated_at: text_field("updated_at"),
+        })
     }
 
     fn load_or_create(path: &Path) -> Result<TelemetryFile, Error> {
