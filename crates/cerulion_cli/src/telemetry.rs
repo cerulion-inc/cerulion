@@ -26,8 +26,9 @@ pub const CLI_COMMAND_RUN: EventSpec = EventSpec {
 
 /// Printed to stderr once per machine, on the first run that could send.
 pub const NOTICE: &str = "\
-Cerulion sends anonymous usage events from this CLI: the verb you ran, its \
-exit code and a rough duration. Never arguments, paths, topic names or data.
+Cerulion sends usage events from this CLI: the verb you ran, its exit code \
+and a rough duration, under your Cerulion account id once you sign in and a \
+random anonymous id before that. Never arguments, paths, topic names or data.
 Turn it off with `cerulion telemetry off` or DO_NOT_TRACK=1. Details: \
 https://github.com/cerulion-inc/cerulion/blob/main/docs/telemetry.md";
 
@@ -113,16 +114,12 @@ impl CommandRun {
             return None;
         }
         let client = Client::from_env(common())?;
-        match consent::notice_shown() {
-            Ok(true) => {}
-            // Printed BEFORE it is recorded, so no run can see the notice as
-            // shown while it has not been: concurrent first runs may each
-            // print it, and a run killed in between prints it again next time.
-            Ok(false) => {
-                eprintln!("{NOTICE}\n");
-                let _ = consent::mark_notice_shown();
-                return None;
-            }
+        // Printed under the consent lock before it is recorded: concurrent
+        // first runs print it once, and a run killed in between prints it
+        // again next time. The run that prints it sends nothing.
+        match consent::show_notice_once(|| eprintln!("{NOTICE}\n")) {
+            Ok(false) => {}
+            Ok(true) => return None,
             // Without a readable consent file the notice cannot be tracked,
             // so it cannot be known to have been shown: send nothing.
             Err(_) => return None,

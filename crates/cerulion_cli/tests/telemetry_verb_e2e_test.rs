@@ -78,7 +78,15 @@ fn off_then_on_persist_in_the_consent_file() {
         status.stdout
     );
     let on = cerulion(home.path(), &[], &["telemetry", "on"]);
+    assert_eq!(on.code, Some(0), "stderr={}", on.stderr);
     assert!(on.stdout.contains("telemetry: on"), "{}", on.stdout);
+    let file = std::fs::read_to_string(home.path().join("telemetry.json")).unwrap();
+    assert!(
+        file.contains("\"enabled\":true") || file.contains("\"enabled\": true"),
+        "{file}"
+    );
+    let status = cerulion(home.path(), &[], &["telemetry", "status"]);
+    assert!(status.stdout.contains("telemetry: on"), "{}", status.stdout);
 }
 
 #[test]
