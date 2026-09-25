@@ -566,17 +566,17 @@ fn builtin_schema_set() -> Result<SchemaSet, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Copy the frame body into `scratch` at an 8-byte-aligned start: the
-/// generated `from_bytes` asserts alignment, and a received SHM slice
-/// carries none.
-fn aligned_body<'s>(bytes: &[u8], scratch: &'s mut Vec<u8>) -> &'s [u8] {
+/// Copy the whole frame into `scratch` at an 8-byte-aligned start: both
+/// `FrameView` and the generated `from_bytes` require element alignment in
+/// memory, and a received SHM slice carries none. The body starts at
+/// `WireHeader::SIZE`, a multiple of 8, so it stays aligned too.
+fn aligned_frame<'s>(bytes: &[u8], scratch: &'s mut Vec<u8>) -> &'s [u8] {
     const ALIGN: usize = 8;
-    let body = &bytes[WireHeader::SIZE..];
     scratch.clear();
-    scratch.resize(body.len() + ALIGN, 0);
+    scratch.resize(bytes.len() + ALIGN, 0);
     let start = scratch.as_ptr().align_offset(ALIGN);
-    scratch[start..start + body.len()].copy_from_slice(body);
-    &scratch[start..start + body.len()]
+    scratch[start..start + bytes.len()].copy_from_slice(bytes);
+    &scratch[start..start + bytes.len()]
 }
 
 /// Reject a frame whose wire header does not carry `T`'s schema hash, or
@@ -584,6 +584,21 @@ fn aligned_body<'s>(bytes: &[u8], scratch: &'s mut Vec<u8>) -> &'s [u8] {
 /// `from_bytes` reinterprets it - a wrong-schema or truncated frame must
 /// fail loudly instead of decoding garbage bytes, and so must one whose
 /// offset table or nested bodies do not validate.
+/// Split an encoded `std_msgs/Header` body (`stamp.sec`, `stamp.nanosec`,
+/// then the `frame_id` string) without trusting its length: the top-level
+/// `FrameView` check does not validate a nested entry's contents.
+fn header_fields(header: &[u8]) -> Result<(i32, u32, &str), String> {
+    let short = || format!("nested header is {} bytes, shorter than 16", header.len());
+    let sec = header.get(0..4).ok_or_else(short)?;
+    let nanosec = header.get(4..8).ok_or_else(short)?;
+    let frame_id = header.get(16..).ok_or_else(short)?;
+    Ok((
+        i32::from_le_bytes(sec.try_into().map_err(|_| short())?),
+        u32::from_le_bytes(nanosec.try_into().map_err(|_| short())?),
+        std::str::from_utf8(frame_id).map_err(|e| e.to_string())?,
+    ))
+}
+
 fn check_typed_frame<T: ShmMessage>(set: &SchemaSet, bytes: &[u8]) -> Result<(), String> {
     // `read_from_buf` copies into an owned header: `from_bytes` reinterprets
     // the slice in place and refuses non-8-byte-aligned buffers, which a
@@ -622,13 +637,11 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
             for i in 0..count {
                 loop {
                     if let Some(sample) = sub.try_receive_one_owned().map_err(|e| e.to_string())? {
-                        let bytes = sample.payload();
+                        let bytes = aligned_frame(sample.payload(), &mut scratch);
                         check_typed_frame::<geometry_msgs::Vector3>(&set, bytes)?;
-                        let value = geometry_msgs::Vector3Shm::from_bytes(aligned_body(
-                            bytes,
-                            &mut scratch,
-                        ))
-                        .snapshot();
+                        let value =
+                            geometry_msgs::Vector3Shm::from_bytes(&bytes[WireHeader::SIZE..])
+                                .snapshot();
                         if bytes[WireHeader::SIZE..] != VECTOR3_BODY {
                             return Err("Vector3 body oracle mismatch".to_string());
                         }
@@ -651,15 +664,12 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
             for i in 0..count {
                 loop {
                     if let Some(sample) = sub.try_receive_one_owned().map_err(|e| e.to_string())? {
-                        let bytes = sample.payload();
+                        let bytes = aligned_frame(sample.payload(), &mut scratch);
                         check_typed_frame::<sensor_msgs::LaserScan>(&set, bytes)?;
-                        let value = sensor_msgs::LaserScanShm::from_bytes(aligned_body(
-                            bytes,
-                            &mut scratch,
-                        ))
-                        .snapshot();
-                        let frame_id =
-                            std::str::from_utf8(&value.header[16..]).map_err(|e| e.to_string())?;
+                        let value =
+                            sensor_msgs::LaserScanShm::from_bytes(&bytes[WireHeader::SIZE..])
+                                .snapshot();
+                        let (stamp_sec, stamp_nanosec, frame_id) = header_fields(&value.header)?;
                         println!(
                             "frame index={i} schema={schema} values=angle_min={} angle_max={} angle_increment={} time_increment={} scan_time={} range_min={} range_max={} ranges={:?} intensities={:?} header_stamp_sec={} header_stamp_nanosec={} frame_id={}",
                             value.angle_min,
@@ -671,8 +681,8 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
                             value.range_max,
                             value.ranges,
                             value.intensities,
-                            i32::from_le_bytes(value.header[0..4].try_into().unwrap()),
-                            u32::from_le_bytes(value.header[4..8].try_into().unwrap()),
+                            stamp_sec,
+                            stamp_nanosec,
                             frame_id,
                         );
                         println!("frame_hex={}", frame_hex(bytes));
@@ -755,7 +765,8 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
 
     // Consume EXACTLY `--count` frames; `--timeout-ms` is the overall
     // budget from READY to the last frame, not a per-frame deadline.
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    // An unrepresentable deadline (e.g. `u64::MAX` ms) waits without bound.
+    let deadline = Instant::now().checked_add(Duration::from_millis(timeout_ms));
     let mut received = 0usize;
     loop {
         // `--count 0` exits immediately - consume nothing.
@@ -782,7 +793,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
             drop(sample);
             continue;
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             println!("TIMEOUT");
             return Ok(ExitCode::from(2));
         }

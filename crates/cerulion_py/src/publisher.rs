@@ -141,16 +141,16 @@ impl Publisher {
         payload: PyBuffer<u8>,
         timestamp_ns: Option<u64>,
     ) -> PyResult<()> {
-        let len = payload.len_bytes();
+        let src = payload.as_slice(py).ok_or_else(|| {
+            PyTypeError::new_err("payload must be a contiguous bytes-like object")
+        })?;
+        let len = src.len();
         if len > self.max_payload_len {
             return Err(EncodeError::new_err(format!(
                 "payload length {len} exceeds max_payload_len {}",
                 self.max_payload_len
             )));
         }
-        let src = payload.as_slice(py).ok_or_else(|| {
-            PyTypeError::new_err("payload must be a contiguous bytes-like object")
-        })?;
         let mut loan = self
             .publisher
             .loan_raw_uninit(WireHeader::SIZE + len)
@@ -424,7 +424,7 @@ impl Loan {
                 return;
             }
         }
-        warn_offthread_release(slf.py(), "Loan");
+        warn_offthread_release(slf.py(), "Loan", "when the Loan is dropped");
     }
 
     /// Payload length in bytes (the writable region's length).

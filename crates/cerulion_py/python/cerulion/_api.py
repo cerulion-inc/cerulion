@@ -311,12 +311,16 @@ class Subscriber:
 
     def __next__(self):
         # Release the previous frame handed out by THIS iterator before
-        # blocking for the next - one outstanding borrow per iterator.
-        prev, self._iter_prev = self._iter_prev, None
+        # blocking for the next - one outstanding borrow per iterator. The
+        # iterator holds only a weak reference, so a frame the caller drops
+        # after leaving the loop frees its slot at once.
+        prev_ref, self._iter_prev = self._iter_prev, None
+        prev = None if prev_ref is None else prev_ref()
         if prev is not None:
             prev.release()
         frame = self.receive(None)
-        self._iter_prev = frame
+        if frame is not None:
+            self._iter_prev = weakref.ref(frame)
         return frame
 
 

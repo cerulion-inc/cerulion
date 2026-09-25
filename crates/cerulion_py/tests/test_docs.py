@@ -14,8 +14,7 @@ DOC = Path(__file__).resolve().parents[3] / "docs" / "python.md"
 
 def extract_blocks():
     text = DOC.read_text()
-    blocks = re.findall(r"```(python|text)\n(.*?)```", text, re.DOTALL)
-    return blocks
+    return re.findall(r"^```([^\n`]*)\n(.*?)^```", text, re.DOTALL | re.MULTILINE)
 
 
 def test_docs_code_blocks(capsys):
@@ -28,6 +27,13 @@ def test_docs_code_blocks(capsys):
     namespace = {}
     pending_python = -1
     for i, (lang, body) in enumerate(blocks):
+        if lang not in ("python", "text"):
+            if pending_python >= 0:
+                pytest.fail(
+                    f"python block {pending_python} is followed by a `{lang}` block {i} "
+                    "before its `text` stdout block"
+                )
+            continue
         if lang == "python":
             if pending_python >= 0:
                 pytest.fail(
