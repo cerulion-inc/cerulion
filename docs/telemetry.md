@@ -7,13 +7,13 @@ off.
 
 ## When anything is sent
 
-Only a release build that carries a telemetry key sends events. The key is
-baked into the release artifacts (the install script, the Debian package and
-the Homebrew formula) when they are built, if the release pipeline provides
-one; an artifact built without it sends nothing. A build from source (`cargo install`, `cargo build`) has no
-key and sends nothing, whatever the settings below say, unless you supply a
-key yourself through `POSTHOG_API_KEY`, which also takes precedence over a
-baked key.
+Events are sent only by a build that has a telemetry key. The key is baked
+into the release artifacts (the install script, the Debian package and the
+Homebrew formula) when they are built, if the release pipeline provides one.
+A build from source (`cargo install`, `cargo build`) or an artifact built
+without the key has none, and sends nothing whatever the settings below say.
+Any build also uses a key you supply yourself through `POSTHOG_API_KEY`,
+which takes precedence over a baked key.
 
 Robot and runtime code never sends anything. The graph runtime, the
 transport, the recorder, the network daemons and every node run without this
