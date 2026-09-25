@@ -54,7 +54,7 @@ def test_receive_zero_timeout_empty(session):
     assert sub.try_receive() is None
 
 
-def test_receive_u64_max_timeout_delivers(session):
+def test_receive_u64_max_timeout_delivers(session, tmp_path):
     """An unrepresentable deadline (2**64-1 ms) is treated as unbounded, not an error.
 
     The frame is published from a SECOND PROCESS after receive() has
@@ -66,19 +66,23 @@ def test_receive_u64_max_timeout_delivers(session):
 
     topic = unique_topic("u64max")
     sub = session.subscriber(topic, depth=2)
+    ready = tmp_path / "receiving"
     proc = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            f"import cerulion, time\n"
+            f"import cerulion, os, time\n"
             f"s = cerulion.connect()\n"
             f"p = s.publisher({topic!r}, 1, max_payload_len=64)\n"
-            f"time.sleep(0.5)\n"
+            f"while not os.path.exists({str(ready)!r}):\n"
+            f"    time.sleep(0.01)\n"
+            f"time.sleep(1.0)\n"
             f"p.publish(b'x')\n"
             f"time.sleep(2.0)\n",  # linger so SHM outlives the publisher
         ]
     )
     try:
+        ready.touch()
         frame = sub.receive(timeout_ms=2**64 - 1)
     finally:
         proc.kill()

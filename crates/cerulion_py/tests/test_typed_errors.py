@@ -220,6 +220,9 @@ def test_typed_publisher_binding_detects_nested_schema_mutation(session):
     assert exc.value.kind == "SchemaMismatch"
     with pytest.raises(cerulion.SchemaMismatch, match="changed after"):
         pub.loan(n=8)
+    with pytest.raises(cerulion.SchemaMismatch, match="changed after"):
+        pub.publish_frame(_wire_frame(bound, b"\0" * 8, count=0, offset=0))
+    assert pub.sequence == 0
 
 
 def test_typed_publisher_binding_tolerates_unrelated_mutation(session):
@@ -283,3 +286,86 @@ def test_string_field_rejects_a_non_string_value(session):
     assert frame is not None
     assert frame.view(schemas, "Probe").name == "raw"
     frame.release()
+
+
+SCALAR_SCHEMA = """\
+schemas:
+  Scalars:
+    fields:
+      uint8 small: {}
+      bool flag: {}
+      float32 ratio: {}
+      int16[3] triple: {}
+      uint8[] values: {}
+      string_fixed[8] tag: {}
+"""
+
+
+def _scalar_pair(session, name):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(SCALAR_SCHEMA)
+    topic = unique_topic(name)
+    pub = session.publisher(topic, schema="Scalars", schemas=schemas)
+    sub = session.subscriber(topic, schema="Scalars", schemas=schemas)
+    return pub, sub
+
+
+GOOD = {
+    "small": 255,
+    "flag": True,
+    "ratio": 0.5,
+    "triple": [-1, 0, 1],
+    "values": [0, 255],
+    "tag": "ok",
+}
+
+
+@pytest.mark.parametrize(
+    "field, bad",
+    [
+        ("small", 256),
+        ("small", -1),
+        ("small", 1.5),
+        ("small", "1"),
+        ("small", True),
+        ("flag", "false"),
+        ("flag", 1),
+        ("ratio", "0.5"),
+        ("ratio", True),
+        ("triple", [0, 0, 40000]),
+        ("triple", [0.5, 0, 0]),
+        ("values", [0, 256]),
+        ("values", [1.5]),
+        ("tag", b"\xff"),
+    ],
+)
+def test_typed_publish_refuses_values_numpy_would_coerce(session, field, bad):
+    pub, sub = _scalar_pair(session, f"typed-coerce-{field}")
+    with pytest.raises(cerulion.EncodeError):
+        pub.publish({**GOOD, field: bad})
+    assert pub.sequence == 0
+    pub.publish(GOOD)
+    frame = sub.receive(1000)
+    assert frame is not None
+    message = frame.view()
+    assert (message.small, message.flag, message.ratio) == (255, True, 0.5)
+    assert list(message.triple) == [-1, 0, 1]
+    assert bytes(message.values) == bytes([0, 255])
+    assert message.tag == "ok"
+    frame.release()
+
+
+def test_typed_loan_refuses_non_integral_lengths(session):
+    pub, _ = _scalar_pair(session, "typed-loan-length")
+    for bad in (3.9, "3", True, None):
+        with pytest.raises(TypeError, match="must be an int"):
+            pub.loan(values=bad)
+    with pytest.raises(ValueError, match="non-negative"):
+        pub.loan(values=-1)
+    with pub.loan(values=2) as message:
+        with pytest.raises(cerulion.EncodeError):
+            message.small = 300
+        with pytest.raises(cerulion.EncodeError, match="invalid UTF-8"):
+            message.tag = b"\xff"
+        message.values = [7, 8]
+    assert pub.sequence == 1

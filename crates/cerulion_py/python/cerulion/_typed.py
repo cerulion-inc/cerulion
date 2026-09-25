@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import numbers
 from dataclasses import dataclass
 
 import numpy as np
@@ -244,14 +245,64 @@ _BYTES_LIKE = (bytes, bytearray, memoryview)
 
 
 def _string_bytes(name, value):
-    """UTF-8 bytes of a string field value: a ``str`` or raw bytes."""
+    """UTF-8 bytes of a string field value: a ``str`` or raw bytes that
+    decode as UTF-8 (readers decode every string field)."""
     if isinstance(value, str):
         return value.encode()
     if isinstance(value, _BYTES_LIKE):
-        return bytes(value)
+        raw = bytes(value)
+        try:
+            raw.decode()
+        except UnicodeDecodeError as exc:
+            raise _native.EncodeError(f"string field {name!r}: invalid UTF-8") from exc
+        return raw
     raise _native.EncodeError(
         f"string field {name!r} expects str or bytes, not {type(value).__name__}"
     )
+
+
+def _scalar_array(name, field_type, value):
+    """``value`` as an array of scalar ``field_type`` elements, refusing
+    anything NumPy would silently coerce: a non-bool for ``Bool``, a
+    non-integral or out-of-range value for an integer, a non-number for
+    a float."""
+    dtype = np.dtype(_SCALARS[field_type][0])
+    try:
+        source = np.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise _native.EncodeError(f"field {name!r}: {exc}") from exc
+    kind = source.dtype.kind
+    if dtype.kind == "b":
+        ok = kind == "b"
+    elif dtype.kind in "iu":
+        ok = kind in "iu"
+        if ok and source.size:
+            info = np.iinfo(dtype)
+            ok = info.min <= int(source.min()) and int(source.max()) <= info.max
+    else:
+        ok = kind in "iuf"
+    if not ok:
+        raise _native.EncodeError(
+            f"field {name!r} expects {field_type} values, got {value!r}"
+        )
+    return source
+
+
+def _scalar_value(name, field_type, value):
+    """One scalar ``field_type`` value, validated like `_scalar_array`."""
+    if field_type == "Bool":
+        ok = isinstance(value, (bool, np.bool_))
+    elif isinstance(value, (bool, np.bool_)):
+        ok = False
+    elif field_type.startswith("F"):
+        ok = isinstance(value, numbers.Real)
+    else:
+        ok = isinstance(value, numbers.Integral)
+    if not ok:
+        raise _native.EncodeError(
+            f"field {name!r} expects {field_type}, not {type(value).__name__}"
+        )
+    return _scalar_array(name, field_type, value)[()]
 
 
 def _bytes_value(name, value):
@@ -629,6 +680,17 @@ class Message:
                         )
                     rec[name] = raw
                     return
+                if isinstance(field.field_type, str) and field.field_type in _SCALARS:
+                    rec[name] = _scalar_value(name, field.field_type, value)
+                    return
+                if (
+                    isinstance(field.field_type, dict)
+                    and "FixedArray" in field.field_type
+                    and field.field_type["FixedArray"]["element_type"] in _SCALARS
+                ):
+                    element = field.field_type["FixedArray"]["element_type"]
+                    rec[name] = _scalar_array(name, element, value)
+                    return
                 rec[name] = value
                 return
             descriptor = self._variables[name]
@@ -680,7 +742,8 @@ class Message:
                 self._payload[_offset(descriptor) : _end(descriptor)] = raw
                 return
             array = self.__getattr__(name)
-            array[...] = value
+            element = field.field_type["DynamicArray"]["element_type"]
+            array[...] = _scalar_array(name, element, value)
         except (ValueError, TypeError) as exc:
             raise _native.EncodeError(str(exc)) from exc
 

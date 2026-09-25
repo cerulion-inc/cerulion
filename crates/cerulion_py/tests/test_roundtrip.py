@@ -90,15 +90,16 @@ def test_publish_buffer_types(session):
     topic = unique_topic("buftypes")
     sub = session.subscriber(topic, depth=4)
     pub = session.publisher(topic, 1, max_payload_len=64)
+    expected = [bytes(range(k, k + 16)) for k in (0, 16, 32, 48)]
     for payload in (
-        bytes(range(16)),
-        bytearray(range(16)),
-        memoryview(bytes(range(16))),
-        np.arange(16, dtype=np.uint8),
+        expected[0],
+        bytearray(expected[1]),
+        memoryview(expected[2]),
+        np.frombuffer(expected[3], dtype=np.uint8),
     ):
         pub.publish(payload, timestamp_ns=1)
-    for _ in range(4):
+    for want in expected:
         frame = sub.receive(2000)
         assert frame is not None
-        assert frame.to_bytes() == bytes(range(16))
+        assert frame.to_bytes() == want
         frame.release()
