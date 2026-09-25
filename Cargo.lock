@@ -1539,11 +1539,14 @@ name = "cerulion_telemetry"
 version = "1.0.0"
 dependencies = [
  "dirs",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.17",
+ "tokio",
  "uuid",
 ]
 

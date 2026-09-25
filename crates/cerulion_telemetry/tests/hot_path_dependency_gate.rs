@@ -122,7 +122,15 @@ fn telemetry_default_features_are_off_and_posthog_owns_the_network_deps() {
         BTreeSet::from(["sha2", "thiserror"]),
         "every network/serialization dep must be optional behind `posthog`"
     );
-    for dep in ["serde", "serde_json", "uuid", "dirs"] {
+    for dep in [
+        "reqwest",
+        "rustls",
+        "tokio",
+        "serde",
+        "serde_json",
+        "uuid",
+        "dirs",
+    ] {
         assert!(
             posthog.contains(&*format!("dep:{dep}")),
             "`posthog` must enable dep:{dep}"
