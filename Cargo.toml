@@ -343,6 +343,8 @@ exclude = [
     "examples/perception",
     "examples/realsense",
     "examples/v4l2_camera",
+    # The Python wheel (PyO3) is its own workspace with its own lockfile.
+    "crates/cerulion_py",
 ]
 resolver = "2"
 

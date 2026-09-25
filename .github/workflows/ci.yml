@@ -2573,6 +2573,67 @@ jobs:
       - name: cerulion_hygiene tests
         run: cargo test -p cerulion_hygiene
 
+  # The Python client (`crates/cerulion_py`) is its own cargo workspace (root
+  # `exclude`), so no other job builds it. Both legs build the abi3 wheel,
+  # install it into a fresh venv and run the pytest suite from outside the
+  # source tree, so what is tested is the installed wheel, not the checkout.
+  # Toolchain 1.93.0 to match the workspace's `rust-version` and the e2e
+  # script's pin.
+  python-client:
+    name: Python client (${{ matrix.os }})
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: crates/cerulion_py
+    env:
+      RUSTUP_TOOLCHAIN: 1.93.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain (1.93.0)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.93.0
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/cerulion_py/target
+          key: cargo-py-${{ runner.os }}-${{ hashFiles('crates/cerulion_py/Cargo.lock') }}
+          restore-keys: |
+            cargo-py-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build the interop fixture
+        run: cargo build --release --locked -p cerulion_py_fixtures
+      # Builds the wheel, installs it into a fresh venv and diffs the
+      # fixture round-trip against its literal expected output.
+      - name: Fresh-venv wheel round-trip
+        run: ./scripts/e2e_fresh_venv.sh
+      - name: pytest (installed wheel, run from outside the tree)
+        run: |
+          set -eu
+          python3 -m venv "$RUNNER_TEMP/pyvenv"
+          "$RUNNER_TEMP/pyvenv/bin/pip" install -q --no-deps dist/cerulion-*.whl
+          "$RUNNER_TEMP/pyvenv/bin/pip" install -q 'numpy>=1.26' 'pytest>=8,<9'
+          export CERULION_PY_FIXTURE="$PWD/target/release/cerulion_py_fixture"
+          tests="$PWD/tests"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/pyvenv/bin/python" -m pytest -p no:cacheprovider "$tests" -q
+
   # Release-mode latency threshold (Linux-only)
   #
   # Gated OFF the per-PR critical path — runs on push to main and on manual
@@ -3811,3 +3872,6 @@ jobs:
 
       - name: Run cargo-deny
         run: cargo deny --config tools/release/deny.toml check advisories licenses bans sources
+      # The Python client's own workspace and lockfile, under the same policy.
+      - name: Run cargo-deny (crates/cerulion_py)
+        run: cargo deny --manifest-path crates/cerulion_py/Cargo.toml --config tools/release/deny.toml check advisories licenses bans sources

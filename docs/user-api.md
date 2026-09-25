@@ -2784,6 +2784,52 @@ You generally don't set these; the CLI generates the right feature wiring per no
 
 ---
 
+## Python client
+
+`cerulion_py` is a standalone PyO3 wheel (its own cargo workspace, not a
+member of the root one) giving Python processes raw access to the same
+transport: 32-byte wire headers plus opaque payload bytes, over iceoryx2
+shared memory. One process-wide transport lives behind `connect()`:
+a Python process that loads it must not also load another module
+embedding `cerulion_core`.
+
+```bash
+pip install maturin
+cd crates/cerulion_py && maturin develop --release
+```
+
+```python
+import cerulion
+
+session = cerulion.connect()                      # idempotent singleton
+pub = session.publisher("/demo/raw", 0xC0DE, max_payload_len=1 << 20)
+sub = session.subscriber("/demo/raw", depth=1)    # depth <= 16
+
+pub.publish(b"bytes", timestamp_ns=5)             # single-copy publish
+with pub.loan(4) as loan:                          # zero-copy publish path
+    loan.payload[:] = b"data"
+    loan.timestamp_ns = 7
+
+frame = sub.receive(timeout_ms=1000)              # blocks, GIL released
+frame.raw, frame.payload, frame.as_numpy()        # read-only zero-copy views
+frame.to_bytes()                                   # materialised (copies)
+frame.release()                                    # returns the borrowed slot
+```
+
+`publish()` requires a contiguous buffer of single-byte items (`bytes`,
+`bytearray`, `memoryview` of bytes, `np.uint8` arrays; other dtypes need
+`arr.view(np.uint8)`). Received frames hold borrowed loan slots
+(`sub.max_borrowed_samples`, default 2): `release()` them promptly, and
+drop their views first: a live view keeps the slot borrowed. Client errors
+derive from `cerulion.CerulionError` (`TransportError`, `SchemaMismatch`,
+`BorrowLimitExceeded`, `ReleasedFrame`, `EncodeError`); invalid arguments
+raise the built-in exceptions listed in `docs/python.md`.
+
+Full contract, including the zero-copy wording and the interop fixture:
+`docs/python.md`.
+
+---
+
 ## What this document is NOT
 
 - A tour of `cerulion_core`'s internal modules. Use `cargo doc --open` for the rustdoc if you need to read internals.
