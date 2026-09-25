@@ -2,22 +2,33 @@
 //! Cross-process partition derivation.
 //! Turns a `GraphConfig::process_groups` declaration + the GLOBAL levelization
 //! (Kahn-derived, or the `level_assignments:`-refined assignment when
-//! the graph carries one) into per-group barrier participant-maps. The SOURCE of the
+//! the graph carries one) into per-group participant-maps. The SOURCE of the
 //! groups is intentionally decoupled (a `&GraphConfig` today; a deployment
 //! file or the auto-partitioner later) so only this module changes.
 //!
 //! # What a participant-map is
 //!
-//! The cross-process barrier rendezvouses every context at every
-//! GLOBAL DAG-level boundary so all processes advance in lockstep (Principle
-//! #7: replay = live). Each group needs a `global_level_map: Vec<Option<usize>>`
-//! of length = the global level count: `Some(local_idx)` if the group OWNS ≥1
-//! node at that global level (the `local_idx` increments per owned global
-//! level, in ascending global order), `None` if the group only RENDEZVOUSES
-//! there (owns nothing). This is exactly the contract documented on
-//! `GraphRuntime::set_barrier_participant_for_test` — the non-`None` entries
-//! are a strictly-increasing bijection onto `0..local_count` by construction
-//! (a contiguous-split index map).
+//! A participant-map is the plan's PER-LEVEL LOCAL INDEX for one group over the
+//! one global levelization, and it is derived identically in every execution
+//! mode: a `global_level_map: Vec<Option<usize>>` of length = the global level
+//! count, `Some(local_idx)` if the group OWNS ≥1 node at that global level (the
+//! `local_idx` increments per owned global level, in ascending global order)
+//! and `None` where the group owns nothing at that level. The non-`None`
+//! entries are a strictly-increasing bijection onto `0..local_count` by
+//! construction (a contiguous-split index map), which is the property
+//! [`validate_partition`] enforces in every mode: a group process re-levelizes
+//! its OWN induced subgraph, and that local band has to line up with the global
+//! levels the group owns whatever the ranks do about coordination.
+//!
+//! The `CERULION_EXECUTION_MODE=lockstep` opt-out is the FURTHER consumer of
+//! that index, and the reason the map is named for a participant. There the
+//! cross-process barrier rendezvouses every context at every GLOBAL DAG-level
+//! boundary so all processes advance in lockstep (Principle #7: replay = live),
+//! a `None` entry is a level the group rendezvouses at while owning nothing,
+//! and the installed map is exactly the contract documented on
+//! `GraphRuntime::set_barrier_participant_for_test`, re-checked at worker
+//! build. Under the free-run default no barrier is created and nothing installs
+//! the map, so the same value is read only as the plan's index.
 //!
 //! # Scope
 //!

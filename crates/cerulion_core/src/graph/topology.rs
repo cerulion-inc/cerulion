@@ -1017,10 +1017,13 @@ impl GraphTopology {
     /// faster-tier sink levels). See the in-body comment for the full
     /// derivation.
     ///
-    /// Growing the count is safe for CONSISTENCY across processes: the
-    /// assignment is FROZEN into the graph yaml (`level_assignments:`) and
-    /// every process derives its barrier generations from the same block, so
-    /// cross-process consistency holds at ANY count by construction. But
+    /// Growing the count is safe for CONSISTENCY across processes in every
+    /// execution mode: the assignment is FROZEN into the graph yaml
+    /// (`level_assignments:`) and every process reads its levelization from
+    /// that one block rather than re-deriving one, so every rank names the
+    /// same DAG stage by the same index at ANY count by construction. Under
+    /// the `CERULION_EXECUTION_MODE=lockstep` opt-out that is also what makes
+    /// the per-step barrier generations agree across ranks. But
     /// growth is NOT free for the CADENCE of a multi-process run under the
     /// `CERULION_EXECUTION_MODE=lockstep` opt-out: the level-lockstep
     /// barrier advances ONE generation per level, so +1 level = +1

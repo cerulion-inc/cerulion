@@ -1370,12 +1370,18 @@ fn diagnostic_topology(
 /// is still safe: `run_level` drains, decides, snapshots ALL inputs, and only
 /// then ticks ALL nodes, so the consumer provably reads the value as of
 /// step-start. Across TWO process groups co-owning that level the guarantee is
-/// gone: the cross-process barrier rendezvous sits at the level's END, so
-/// nothing orders the producer's tick+publish against the consumer's
-/// `snapshot_inputs`. OS scheduling decides the pairing, the bag records no
-/// consumption edge that could reproduce it, and replay re-executes as a
-/// monolith where the safe ordering applies — so the live run is
-/// nondeterministic AND replay is structurally unable to match it.
+/// gone, and it is gone in both execution modes. Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process barrier
+/// rendezvous sits at the level's END, so it orders the level boundary and not
+/// the producer's tick+publish against the consumer's `snapshot_inputs`; under
+/// the free-run default no barrier is created at all, so the level carries no
+/// boundary of its own. Either way OS scheduling decides the pairing and the
+/// bag records no consumption edge that could reproduce it. What replay does
+/// with that differs: a lockstep bag re-executes as a monolith, where the safe
+/// snapshot-before-tick ordering applies and therefore need not match the live
+/// pairing; a free-run bag re-executes one rank at a time with every cross-rank
+/// edge served from the RECORDED frames, so it reproduces the pairing this run
+/// took instead of re-deriving one. The live run is nondeterministic in both.
 ///
 /// # The predicate (all four must hold)
 ///
@@ -1384,7 +1390,8 @@ fn diagnostic_topology(
 ///    this?";
 /// 2. producer and consumer sit at the SAME global level — a trigger edge, or
 ///    any other path that levelizes the consumer below the producer, is
-///    ordered by the end-of-level barrier and is NOT reported;
+///    ordered by the DATA dependency itself in either mode (the consumer
+///    cannot fire until the producer's frame arrives) and is NOT reported;
 /// 3. they are in DIFFERENT process groups — co-located nodes keep the
 ///    monolith's snapshot-before-tick guarantee (a self-edge is therefore
 ///    never reported, since a node is always in its own group);

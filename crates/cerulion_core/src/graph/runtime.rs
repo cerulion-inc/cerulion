@@ -4014,9 +4014,14 @@ impl GraphRuntime {
     /// The DETERMINISTIC-LIVE build path. Identical wiring to
     /// `build_live` but the scheduler uses the `Barrier` gating clock
     /// (`Scheduler::with_barrier_clock`) and `live_step` advances it by a fixed
-    /// logical QUANTUM (the graph's `tightest_timing_ns`, 1ms fallback) rather than
-    /// wall elapsed — so `fire_time_ns` is replay-deterministic across runs
-    /// (Principle #7). A dedicated `RealClock` is the wall-health (`watch_clock`)
+    /// logical QUANTUM (the graph's `tightest_timing_ns`, 1ms fallback) rather
+    /// than wall elapsed, which is what makes `fire_time_ns` identical across
+    /// runs (Principle #7). That branch holds until a caller arms
+    /// [`Self::set_gating_follows_wall`]`(true)`, which the recording paths do:
+    /// the clock then stays CONTROLLED and step-advanced, but by the step's
+    /// MEASURED wall elapsed, so the run is reproducible from its own recorded
+    /// boundary targets rather than identical to the next run.
+    /// A dedicated `RealClock` is the wall-health (`watch_clock`)
     /// source, so liveliness + external-silence cadence stay real-time. Drive with
     /// `run_live`/`run_live_step_once_for_test`. NodeContexts + the scheduler share
     /// the gating VirtualClock, so `ctx.now_ns()` is the deterministic gating time.
@@ -4261,10 +4266,19 @@ impl GraphRuntime {
             .unwrap_or_else(|| std::time::Duration::from_millis(1))
             .max(std::time::Duration::from_millis(1));
         // The quantum is an INFERENCE (declared graph
-        // tightness, else a 1ms data-driven fallback) AND it is the load-bearing
-        // build-time decision that fixes the run's deterministic `fire_time_ns`
-        // timeline — surface it LOUDLY at `info!` (on by default) rather than
-        // picking it silently. Logged at `info!`, not `debug!` (which is off by
+        // tightness, else a 1ms data-driven fallback) and it is resolved on
+        // every deterministic-live build, including the free-run `--record`
+        // arm that reaches this prelude through
+        // `build_live_deterministic_free_run`. What it BUYS differs by shape:
+        // it fixes the run's deterministic `fire_time_ns` timeline only while
+        // the gating clock is advanced by it, which is the
+        // `CERULION_EXECUTION_MODE=lockstep` opt-out; a free-run `--record`
+        // rank arms `set_gating_follows_wall(true)` afterwards and
+        // `live_step` then takes the `Some(_) if self.gating_follows_wall`
+        // arm, handing the step's measured wall elapsed instead and leaving
+        // this value unused for gating. Either way it is a build-time decision
+        // the operator should see, so surface it LOUDLY at `info!` (on by
+        // default) rather than picking it silently. Logged at `info!`, not `debug!` (which is off by
         // default), so the trace is genuinely "loud"; mirrors the C-state
         // cap (cerulion_cli_engine graph_cmd), which logs its APPLIED derived
         // decision at `info!`. `source` names which rule produced it.
@@ -13626,9 +13640,13 @@ impl GraphRuntime {
     /// `step_live` — the scheduler's gating clock advance AND the
     /// liveliness/external-silence cadence both move by the same `delta`. Every
     /// existing caller (the polled `run_until_shutdown`, the default live path,
-    /// tests) routes through here; only the deterministic-live build path
-    /// (`build_live_deterministic*`) calls `step_live` directly with a distinct
-    /// gating quantum.
+    /// tests) routes through here; only the deterministic-live build paths
+    /// (`build_live_deterministic*`) call `step_live` directly with a gating
+    /// delta of their own. Under the `CERULION_EXECUTION_MODE=lockstep` opt-out
+    /// that delta is the fixed quantum and differs from the wall delta; on the
+    /// free-run recording arm `set_gating_follows_wall(true)` makes it the
+    /// step's measured wall elapsed, which is the same number as the wall delta
+    /// but still arrives through `step_live` rather than through here.
     pub fn step(&mut self, delta: Duration) {
         // Here gating == wall on the polled path: both newtypes
         // wrap the SAME `delta`, so `step(d)` is byte-identical to the pre-newtype
@@ -15659,8 +15677,11 @@ impl GraphRuntime {
     /// trigger-aware DAG `Levels`, level 0 first, graph order
     /// within a level). Used by the multi-process planner
     /// (`plan_deployment`), which needs the ONE global levelization of the
-    /// full graph to mint each process group's cross-process barrier
-    /// participant map. PURE READ — no scheduler mutation. `Levels` is
+    /// full graph to mint each process group's PARTICIPANT-MAP (its per-level
+    /// local index, minted in every execution mode; the
+    /// `CERULION_EXECUTION_MODE=lockstep` opt-out is the mode that goes on to
+    /// install it as a barrier participant map). PURE READ, no scheduler
+    /// mutation. `Levels` is
     /// `Clone`, so callers can snapshot it and drop the runtime.
     pub fn levels(&self) -> &Levels {
         &self.levels
