@@ -781,6 +781,7 @@ fn stamps_from_deltas(first: u64, deltas: &[u64]) -> Vec<u64> {
 /// the rule exists to let through: two catch-up bursts, each a 0 ns delta right
 /// after a step the clock charged 101 ms / 110 ms and followed by a short one.
 #[test]
+#[serial]
 fn the_stamp_rule_admits_the_measured_free_run_catch_up_burst() {
     let stamps = stamps_from_deltas(
         1_000 * NS_PER_MS,
@@ -812,6 +813,7 @@ fn the_stamp_rule_admits_the_measured_free_run_catch_up_burst() {
 /// That is asserted here rather than described, so the oracle is a comparison of
 /// the two rules and not a claim about one.
 #[test]
+#[serial]
 fn the_stamp_rule_refuses_a_stalled_stretch_the_relaxed_rule_admitted() {
     let mut deltas: Vec<u64> = Vec::new();
     for _ in 0..3 {
@@ -839,6 +841,7 @@ fn the_stamp_rule_refuses_a_stalled_stretch_the_relaxed_rule_admitted() {
 /// A healthy series — one stamp per step, every step — passes under BOTH modes.
 /// The free-run relaxation is an EXCEPTION, not a different rule.
 #[test]
+#[serial]
 fn the_stamp_rule_admits_a_strictly_increasing_series_under_both_modes() {
     let stamps = stamps_from_deltas(7 * NS_PER_MS, &[50 * NS_PER_MS; 8]);
     for gating in [Gating::Lockstep, Gating::FreeRun] {
@@ -853,6 +856,7 @@ fn the_stamp_rule_admits_a_strictly_increasing_series_under_both_modes() {
 /// A clock that runs BACKWARDS is refused under both modes — the half neither
 /// relaxation may ever reach.
 #[test]
+#[serial]
 fn the_stamp_rule_refuses_a_decreasing_pair_under_both_modes() {
     let stamps = vec![
         100 * NS_PER_MS,
@@ -871,6 +875,7 @@ fn the_stamp_rule_refuses_a_decreasing_pair_under_both_modes() {
 /// FAILURE under lockstep, which is what makes passing the mode in worth doing:
 /// the three lockstep callers keep the strict rule the free-run arm cannot.
 #[test]
+#[serial]
 fn the_stamp_rule_refuses_under_lockstep_the_burst_it_admits_under_free_run() {
     let stamps = stamps_from_deltas(
         1_000 * NS_PER_MS,
@@ -886,6 +891,7 @@ fn the_stamp_rule_refuses_under_lockstep_the_burst_it_admits_under_free_run() {
 /// fire, so it is a stopped clock however short the run of it is — the half the
 /// absolute ceiling alone would miss.
 #[test]
+#[serial]
 fn the_stamp_rule_refuses_a_zero_delta_after_an_ordinary_step() {
     let stamps = stamps_from_deltas(
         1_000 * NS_PER_MS,
@@ -900,6 +906,7 @@ fn the_stamp_rule_refuses_a_zero_delta_after_an_ordinary_step() {
 /// cleared one period: the owed-fire count is the bound, not the mere fact of an
 /// overrun.
 #[test]
+#[serial]
 fn the_stamp_rule_refuses_a_burst_longer_than_its_advance_owes() {
     // A 101 ms advance owes two fires, so a THIRD frame at that target is one
     // the step never owed.
