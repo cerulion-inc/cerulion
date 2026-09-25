@@ -49,7 +49,18 @@ use serde::{Deserialize, Serialize};
 pub const STATE_COVERAGE_ATTACHMENT: &str = "__cerulion/state_coverage.json";
 
 /// The [`StateCoverage`] wire version.
-pub const STATE_COVERAGE_VERSION: u32 = 1;
+///
+/// It went from 1 to 2 when the manifest gained
+/// [`state_record_format_version`](StateCoverage::state_record_format_version).
+/// That key is the BAG LEVEL discriminator for the record layout, and it is what
+/// a reader gates on: a state record written before format version 1 carries no
+/// version of its own, so the only place the backward direction can be answered
+/// is the bag.
+///
+/// It is a DIFFERENT constant from `cerulion_core::state_ring`'s
+/// `STATE_RECORD_FORMAT_VERSION`. This one versions the MANIFEST; that one
+/// versions the RECORD.
+pub const STATE_COVERAGE_VERSION: u32 = 2;
 
 // ===========================================================================
 // The ledger — pure, header-only
@@ -520,6 +531,39 @@ pub struct StateCoverage {
     pub armed: Option<StateArmCoverage>,
     /// State rings this recorder was ASKED to drain.
     pub rings_declared: usize,
+    /// Ring SHM name to the producer RANK that owned it.
+    ///
+    /// This is what lets a reader build a per-rank index table: a record names
+    /// its rank, a node coverage entry names its `ring`, and this map is the
+    /// join between them. Without it a bag with several rings still cannot say
+    /// which ring a given rank's records came off, which is the ambiguity the
+    /// restore engine refuses on.
+    ///
+    /// EMPTY is not a refusal and not a hole. A capture that carried no
+    /// checkpoint has no rings to name, and the continuous seed is taken at bag
+    /// creation before the sweep has found any, so both write an empty map and
+    /// the continuous one fills it at finalize. A reader meeting an empty map on
+    /// a bag declaring at most one ring falls back to the single-ring table it
+    /// used before this key existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ring_ranks: BTreeMap<String, u32>,
+    /// The state RECORD format this bag's records were written under
+    /// (`cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION` at the writer).
+    ///
+    /// `None` means the bag was written before the key existed, which is
+    /// exactly what a reader needs to know: those records are laid out
+    /// differently, they carry no version of their own, and there is no checksum
+    /// to catch a decode from the wrong offset. So the key is OPTIONAL on the
+    /// wire and REQUIRED by the reader: an absent one is refused BY NAME rather
+    /// than read as version 0, because a manifest that predates the key and a
+    /// manifest whose writer forgot it are the same bytes and the safe reading
+    /// of both is a refusal.
+    ///
+    /// It is written by every manifest THIS build produces, including a capture
+    /// that carried no checkpoint at all: the key states what layout this
+    /// writer's records use, not whether any record exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_record_format_version: Option<u32>,
     /// The producer RANKS whose state rings this recording actually
     /// drained, ascending.
     ///
@@ -656,6 +700,7 @@ impl StateCoverage {
     pub fn for_capture(
         armed: Option<StateArmCoverage>,
         rings_declared: usize,
+        ring_ranks: BTreeMap<String, u32>,
         records: u64,
         nodes: BTreeMap<String, StateNodeCoverage>,
         unattributed_indices: BTreeMap<String, BTreeMap<u32, StateNodeCoverage>>,
@@ -666,6 +711,14 @@ impl StateCoverage {
             attached_mid_run: false,
             armed,
             rings_declared,
+            // A capture's rings ARE embedded in it, so the join a reader needs
+            // is a fact this manifest can state.
+            ring_ranks,
+            // What THIS writer's records are laid out as, which is a claim about
+            // the writer rather than about whether any record exists.
+            state_record_format_version: Some(
+                cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION,
+            ),
             // A capture makes no claim about a run's RANK SPACE: it walked no
             // rank space, so it can witness neither density nor a hole. Empty is
             // the correct answer, not zero-ranks-found.
@@ -1356,6 +1409,10 @@ mod tests {
                 first_anchor_step: 1,
             }),
             rings_declared: 1,
+            ring_ranks: BTreeMap::new(),
+            state_record_format_version: Some(
+                cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION,
+            ),
             ranks_discovered: Vec::new(),
             ranks_missing: Vec::new(),
             rings_unavailable: BTreeMap::new(),
@@ -1925,6 +1982,85 @@ mod tests {
             l.nodes().is_empty(),
             "and contributes to no node's tally: {:?}",
             l.nodes()
+        );
+    }
+
+    /// A manifest written BEFORE the two new keys existed still PARSES, with both
+    /// reading as absent.
+    ///
+    /// This is the shape the whole backward story rests on. Declared without
+    /// `#[serde(default)]` the two keys would be REQUIRED, an older manifest would
+    /// take the parse's error arm, and the reader would report it MALFORMED and
+    /// return nothing. The operator would then get the wrong diagnosis (the
+    /// manifest is not malformed, it is older) and, worse, a path this change does
+    /// not claim to touch would silently lose the catch-up clamp, which reads the
+    /// same bytes.
+    #[test]
+    fn a_manifest_written_before_the_two_new_keys_still_parses_with_both_absent() {
+        // The JSON a version 1 writer produced, byte for byte in shape: no
+        // `ring_ranks`, no `state_record_format_version`.
+        let previous = r#"{
+            "version": 1,
+            "rings_declared": 1,
+            "records": 4,
+            "nodes": {
+                "a": { "ring": "r0", "node_idx": 0, "anchors_complete": 1 }
+            }
+        }"#;
+        let cov: StateCoverage =
+            serde_json::from_str(previous).expect("a version 1 manifest must still parse");
+        assert_eq!(cov.version, 1);
+        assert_eq!(
+            cov.state_record_format_version, None,
+            "absent, which is what makes the reader's refusal possible at all"
+        );
+        assert!(cov.ring_ranks.is_empty(), "absent, not a claim of no rings");
+        // The fields a version 1 manifest DID carry are unchanged, so the parse
+        // is a real parse rather than a shape that swallowed everything.
+        assert_eq!(cov.rings_declared, 1);
+        assert_eq!(cov.records, 4);
+        assert_eq!(cov.nodes["a"].node_idx, Some(0));
+        assert_eq!(cov.nodes["a"].anchors_complete, 1);
+    }
+
+    /// This build's manifest round trips, and an UNKNOWN key from a newer writer
+    /// is ignored rather than fatal.
+    ///
+    /// The forward direction stays tolerant on purpose: the type carries no
+    /// `deny_unknown_fields`, so a newer manifest's extra keys are ignorable by
+    /// construction, and refusing a readable bag on a version bump would turn
+    /// every additive field into a compatibility break.
+    #[test]
+    fn this_builds_manifest_round_trips_and_a_newer_writers_extra_key_is_ignored() {
+        let mut cov = coverage_of(&[("a", 1, 0)], false);
+        cov.ring_ranks = BTreeMap::from([("r0".to_string(), 0u32), ("r1".to_string(), 3u32)]);
+        let json = serde_json::to_string(&cov).expect("serializes");
+        assert_eq!(
+            serde_json::from_str::<StateCoverage>(&json).expect("round trips"),
+            cov
+        );
+
+        // A key this build has never heard of, beside the ones it has.
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        value["a_key_from_a_newer_bagd"] = serde_json::json!({ "anything": 1 });
+        let read: StateCoverage =
+            serde_json::from_value(value).expect("an unknown key must be IGNORED, never fatal");
+        assert_eq!(read, cov);
+        assert_eq!(read.ring_ranks["r1"], 3);
+    }
+
+    /// The manifest version is a LITERAL, pinned, because a reader gates on it.
+    ///
+    /// Left at what it was, a bag carrying the two new keys would announce itself
+    /// as the version that predates them, and the forward warn at the reader
+    /// (`replay_state`'s `read_state_coverage_reporting`) would stay silent on a
+    /// manifest it genuinely does not know. A version constant that only ever
+    /// compares against itself is a version constant that never moves.
+    #[test]
+    fn the_manifest_version_is_the_documented_literal() {
+        assert_eq!(
+            STATE_COVERAGE_VERSION, 2,
+            "it went to 2 when the manifest gained the state record format version"
         );
     }
 }

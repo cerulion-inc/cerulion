@@ -593,6 +593,10 @@ mod tests {
             attached_mid_run: false,
             armed: None,
             rings_declared: rings,
+            ring_ranks: Default::default(),
+            state_record_format_version: Some(
+                cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION,
+            ),
             ranks_discovered: Vec::new(),
             ranks_missing: Vec::new(),
             rings_unavailable: Default::default(),

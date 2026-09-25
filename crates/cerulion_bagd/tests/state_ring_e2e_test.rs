@@ -265,6 +265,20 @@ fn node_state_anchors_reach_the_bag_and_the_manifest_matches_a_hand_oracle() {
     // (b) the MANIFEST: the hand-computed tally.
     let cov = state_coverage(&out).expect("a checkpointed bag carries state_coverage.json");
     assert_eq!(cov.rings_declared, 1);
+    // The two keys a reader gates and joins on, written by the CONTINUOUS path:
+    // the seed states the record layout at bag creation and finalize fills the
+    // ring-to-rank map from the rings the writer holds. Without the first, a
+    // reader built after the format refuses every recording this build writes.
+    assert_eq!(
+        cov.state_record_format_version,
+        Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
+        "a recording must say which record layout its records were written under"
+    );
+    assert_eq!(
+        cov.ring_ranks,
+        std::collections::BTreeMap::from([(owner.name().to_string(), 0u32)]),
+        "and which rank the ring it drained belonged to"
+    );
     assert!(cov.rings_unavailable.is_empty());
     assert_eq!(cov.records, expected.len() as u64);
     assert_eq!(cov.head_records_discarded, 0);

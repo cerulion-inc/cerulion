@@ -217,6 +217,26 @@ impl RetainedAnchor {
 /// A record whose header will not parse contributes nothing rather than a
 /// guess; every record here came through the assembler, so that is unreachable
 /// and the arm exists only so a malformed one cannot inflate the count.
+/// The producer RANK this anchor's records carry, read off the first one.
+///
+/// Read rather than carried, on exactly the rule
+/// [`RetainedAnchor::skip_cause`] states for the skip cause: the rank is IN the
+/// record from state record format version 1, so a second copy on the retained
+/// anchor would be a second thing to keep in step with the wire. `None` for an
+/// anchor holding no record, which is a shape the harvester does not produce and
+/// which is answered rather than assumed.
+pub(crate) fn producer_rank(records: &[StateRecord]) -> Option<u32> {
+    let first = records.first()?;
+    Some(
+        StateRecordHeader::from_bytes(
+            first[..STATE_RECORD_HEADER_SIZE]
+                .try_into()
+                .expect("a 512-byte record always holds a 40-byte header"),
+        )
+        .rank,
+    )
+}
+
 pub(crate) fn anchor_payload_bytes(records: &[StateRecord]) -> u64 {
     records
         .iter()

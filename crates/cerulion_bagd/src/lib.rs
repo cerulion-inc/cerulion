@@ -8389,6 +8389,17 @@ impl WriterCore {
             &swept,
             &coverage.ranks_discovered,
         );
+        // The ring to rank JOIN, filled here for the same reason
+        // `ranks_discovered` is: the writer holds the rings, so the name each
+        // one was declared under and the rank in its header are both in hand,
+        // and the seed taken at bag creation could state neither. The key is the
+        // DECLARED name, which is what `StateNodeCoverage::ring` carries, so the
+        // two halves of the join speak the same names.
+        coverage.ring_ranks = self
+            .state_rings
+            .iter()
+            .map(|s| (s.declared_name.clone(), s.ring.rank()))
+            .collect();
         // Node ids whose manifest INDEX
         // two rings disagree on. A node lives in exactly one worker, so this
         // stays empty in every shipping shape — but if it ever fills, the index
@@ -9019,16 +9030,24 @@ fn build_capture_state_coverage(
     armed: Option<state_coverage::StateArmCoverage>,
     declared: &BTreeMap<String, Vec<String>>,
 ) -> (Vec<u8>, usize) {
-    use anchor_window::anchor_payload_bytes;
+    use anchor_window::{anchor_payload_bytes, producer_rank};
     use state_coverage::StateNodeCoverage;
 
     let mut nodes: BTreeMap<String, StateNodeCoverage> = BTreeMap::new();
     let mut unattributed: BTreeMap<String, BTreeMap<u32, StateNodeCoverage>> = BTreeMap::new();
     let mut rings: BTreeSet<&str> = BTreeSet::new();
+    // The ring to rank join, read off the RECORDS rather than plumbed: a
+    // retained anchor names its ring and its records name their rank, and
+    // reading the two together is what makes the map a fact about this bag
+    // rather than a restatement of what the writer believed.
+    let mut ring_ranks: BTreeMap<String, u32> = BTreeMap::new();
     let mut records = 0u64;
 
     for anchor in &checkpoint.anchors {
         rings.insert(anchor.ring.as_str());
+        if let Some(rank) = producer_rank(&anchor.records) {
+            ring_ranks.insert(anchor.ring.clone(), rank);
+        }
         records += anchor.records.len() as u64;
         let is_complete = anchor.kind == anchor_window::AnchorKind::Complete;
         let complete = u64::from(is_complete);
@@ -9111,6 +9130,7 @@ fn build_capture_state_coverage(
     let coverage = state_coverage::StateCoverage::for_capture(
         armed,
         rings.len(),
+        ring_ranks,
         records,
         nodes,
         unattributed,
@@ -9163,6 +9183,13 @@ fn build_arm_only_state_coverage(
         attached_mid_run: false,
         armed: Some(armed),
         rings_declared,
+        // EMPTY on the same no-claim footing as `ranks_discovered` below: this
+        // capture embedded no ring, so it can name no ring's rank.
+        ring_ranks: BTreeMap::new(),
+        // WRITTEN even here. The key states what layout THIS writer's records
+        // use, and a reader that met no key could not tell a capture with no
+        // checkpoint from a bag recorded before the format.
+        state_record_format_version: Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
         ranks_discovered: Vec::new(),
         ranks_missing: Vec::new(),
         rings_unavailable: BTreeMap::new(),
@@ -14120,6 +14147,16 @@ impl Recorder {
         Some(StateCoverage {
             version: STATE_COVERAGE_VERSION,
             attached_mid_run: self.cfg.attached_mid_run,
+            // EMPTY at the seed and FILLED at finalize by
+            // `build_state_coverage`, on exactly the precedent
+            // `ranks_discovered` below already sets: this seed is taken at bag
+            // creation, before the sweep has found a ring to name.
+            ring_ranks: BTreeMap::new(),
+            // What this writer's records are laid out as, known at bag creation
+            // because it is a property of the build rather than of the run.
+            state_record_format_version: Some(
+                cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION,
+            ),
             // What the graph's plane says, read by
             // `observe_arm_word`, not what this recorder did — it does nothing.
             armed: self.observed_arm.clone(),
@@ -25516,8 +25553,19 @@ mod capture_coverage_tests {
     }
 
     fn complete(ring: &str, node: Option<&str>, node_idx: u32, blob: &[u8]) -> RetainedProbe {
+        complete_on_rank(ring, node, node_idx, 0, blob)
+    }
+
+    /// [`complete`] on a named rank, for the arms that are ABOUT the rank.
+    fn complete_on_rank(
+        ring: &str,
+        node: Option<&str>,
+        node_idx: u32,
+        rank: u32,
+        blob: &[u8],
+    ) -> RetainedProbe {
         let mut records = Vec::new();
-        let mut chunker = StateChunker::new(7, 42, node_idx, 0);
+        let mut chunker = StateChunker::new(7, 42, node_idx, rank);
         chunker.append(blob, &mut |r| records.push(*r));
         chunker.finish(&mut |r| records.push(*r));
         RetainedProbe {
@@ -25530,6 +25578,11 @@ mod capture_coverage_tests {
     }
 
     fn skip(ring: &str, node: Option<&str>, node_idx: u32) -> RetainedProbe {
+        skip_on_rank(ring, node, node_idx, 0)
+    }
+
+    /// [`skip`] on a named rank, for the arms that are ABOUT the rank.
+    fn skip_on_rank(ring: &str, node: Option<&str>, node_idx: u32, rank: u32) -> RetainedProbe {
         let detail = b"the recorder has not drained enough of the state ring";
         let mut payload = Vec::with_capacity(4 + detail.len());
         payload.extend_from_slice(&2u32.to_le_bytes());
@@ -25547,7 +25600,7 @@ mod capture_coverage_tests {
                     part: 0,
                     kind: RECORD_KIND_SKIP_V2,
                     len: payload.len() as u32,
-                    rank: 0,
+                    rank,
                     format_version: STATE_RECORD_FORMAT_VERSION,
                 },
                 &payload,
@@ -25607,6 +25660,101 @@ mod capture_coverage_tests {
                 )
             })
             .collect()
+    }
+
+    /// The capture manifest names the RANK behind every ring it embedded, and the
+    /// ring COUNT it declares is the count a reader refuses on.
+    ///
+    /// The join is read off the RECORDS, so this is also the arm that fails if the
+    /// producer ever stopped stamping the rank: two rings whose records both said
+    /// rank 0 would render a map naming one rank twice.
+    #[test]
+    fn a_capture_manifest_names_the_rank_behind_every_ring_it_embedded() {
+        let cov = coverage_of(vec![
+            complete_on_rank("r0", Some("a"), 0, 0, &[1u8; 16]),
+            complete_on_rank("r1", Some("b"), 0, 1, &[2u8; 16]),
+        ]);
+        assert_eq!(cov.rings_declared, 2, "two rings really are embedded");
+        assert_eq!(
+            cov.ring_ranks,
+            BTreeMap::from([("r0".to_string(), 0u32), ("r1".to_string(), 1u32)]),
+            "the join a reader needs, read off the records"
+        );
+        assert_eq!(
+            cov.state_record_format_version,
+            Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION)
+        );
+        // The capture still claims NOTHING about the run's rank space: it walked
+        // none, so it can witness neither density nor a hole.
+        assert!(cov.ranks_discovered.is_empty());
+        assert!(cov.ranks_missing.is_empty());
+
+        // The one-rank shape, which is what every shipping deployment writes
+        // today: one ring, one rank, and the count the reader's ambiguity gate
+        // tests stays at 1.
+        let one = coverage_of(vec![complete_on_rank("r0", Some("a"), 0, 0, &[3u8; 16])]);
+        assert_eq!(one.rings_declared, 1);
+        assert_eq!(
+            one.ring_ranks,
+            BTreeMap::from([("r0".to_string(), 0u32)]),
+            "a single-rank capture names its one rank"
+        );
+    }
+
+    /// Oracle 9 arm (c): a DECLINED anchor is attributed to the rank that
+    /// declined it, never to rank 0.
+    ///
+    /// At the parent of this change the arm could not even be expressed: no
+    /// record carried a rank, so a skip from the second worker and a skip from
+    /// the first were the same bytes with a different node index, and a reader
+    /// with two rings could not tell them apart at all.
+    #[test]
+    fn a_declined_anchor_is_attributed_to_the_rank_that_declined_it() {
+        let cov = coverage_of(vec![
+            complete_on_rank("r0", Some("a"), 0, 0, &[1u8; 16]),
+            skip_on_rank("r1", Some("b"), 0, 1),
+        ]);
+        assert_eq!(
+            cov.ring_ranks,
+            BTreeMap::from([("r0".to_string(), 0u32), ("r1".to_string(), 1u32)]),
+            "the SKIP record names rank 1, so its ring does too"
+        );
+        // And the refusal is tallied under the node that refused, on the ring
+        // that refused, rather than folded into the healthy rank's row.
+        assert_eq!(cov.nodes["b"].anchors_skipped, 1);
+        assert_eq!(cov.nodes["b"].ring, "r1");
+        assert_eq!(cov.nodes["a"].anchors_skipped, 0);
+        assert_eq!(cov.nodes["a"].anchors_complete, 1);
+    }
+
+    /// A capture that carried NO checkpoint still says which record layout this
+    /// writer uses, and says NOTHING about rings it does not have.
+    ///
+    /// Both halves matter. Without the format version key the reader could not
+    /// tell this capture from a bag recorded before the key existed, and would
+    /// refuse every arm-only capture this build writes. With an INVENTED map it
+    /// would claim a ring-to-rank fact it never witnessed, which is the same
+    /// no-claim rule `ranks_discovered` already carries beside it.
+    #[test]
+    fn an_arm_only_capture_states_its_record_format_and_claims_no_ring() {
+        let bytes = build_arm_only_state_coverage(arm_word(), 2);
+        let cov: state_coverage::StateCoverage =
+            serde_json::from_slice(&bytes).expect("the arm-only manifest must be valid JSON");
+        assert_eq!(
+            cov.state_record_format_version,
+            Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
+            "the key states the WRITER's layout, not that a record exists"
+        );
+        assert!(
+            cov.ring_ranks.is_empty(),
+            "no checkpoint was carried, so no ring's rank is a fact this bag has"
+        );
+        assert!(cov.ranks_discovered.is_empty());
+        assert_eq!(
+            cov.rings_declared, 2,
+            "what it was ASKED to drain, unchanged"
+        );
+        assert_eq!(cov.version, state_coverage::STATE_COVERAGE_VERSION);
     }
 
     /// A node the ring DECLARED and that did not anchor at this step is

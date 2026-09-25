@@ -327,6 +327,26 @@ fn ranks_armed_before_and_after_bag_creation_are_all_discovered_by_name() {
         "the manifest must say WHICH ranks this recording's anchors came from"
     );
     assert!(cov.ranks_missing.is_empty());
+    // The ring-to-rank JOIN: a record names its rank and a node entry names its
+    // ring, and this is what ties the two. Its keys are the DECLARED names, the
+    // same names `StateNodeCoverage::ring` carries.
+    // SORTED before the comparison, and that is the assertion rather than a
+    // convenience: the map is keyed by ring NAME, the names are minted from a
+    // hash, so their order carries no rank order at all. Comparing the values in
+    // key order would pass or fail on the hash. What the join owes is that every
+    // rank this recording drained is named, once each.
+    let mut ranks_named: Vec<u32> = cov.ring_ranks.values().copied().collect();
+    ranks_named.sort_unstable();
+    assert_eq!(
+        ranks_named,
+        vec![0, 1, 2],
+        "every drained ring's rank is named: {:?}",
+        cov.ring_ranks
+    );
+    assert_eq!(
+        cov.state_record_format_version,
+        Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION)
+    );
     assert_eq!(
         cov.rings_declared, 0,
         "nothing was declared — every ring here was found by name"
