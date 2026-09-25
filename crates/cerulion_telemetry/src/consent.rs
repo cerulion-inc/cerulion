@@ -192,6 +192,12 @@ mod enabled {
     /// claimed notice is answered from a lock-free read: `notice_shown` only
     /// ever goes `false -> true`, so a stale `true` is still correct and the
     /// file is left untouched (no lock, fsync or `updated_at` bump).
+    ///
+    /// The claim is persisted before the caller prints, so this is at most
+    /// once: a process that dies between the claim and the print never shows
+    /// the notice. A caller that must show it at least once reads
+    /// [`notice_shown`], prints, then calls [`mark_notice_shown`], as the CLI
+    /// does.
     pub fn claim_notice() -> Result<bool, Error> {
         let path = file_path()?;
         if read(&path).ok().flatten().is_some_and(|f| f.notice_shown) {
