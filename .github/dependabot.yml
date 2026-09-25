@@ -1,0 +1,20 @@
+# Every action in the workflows is pinned to a commit, and the Rust
+# dependencies are pinned in the lockfile, so nothing proposes a security
+# bump on its own. Dependabot opens the proposals; the ordinary pull request
+# checks decide them. The iceoryx2 family is exact-pinned and kept in lockstep
+# across the workspace by a test, so it moves only through a deliberate
+# migration, never through a bot.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "iceoryx2*"

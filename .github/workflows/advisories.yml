@@ -1,0 +1,33 @@
+# The dependency audit in ci.yml runs on pull requests and pushes, so an
+# unchanged lockfile can go from clean to vulnerable with nothing to notice
+# until the next change. This job checks the same policy against the current
+# advisory database once a day. It is advisory by design: it opens nothing and
+# blocks nothing, and a failure here is read by a person.
+name: Advisories
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: Dependency advisories (daily)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install cargo-deny 0.20.2
+        run: |
+          set -eu
+          url=https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          curl -sSL --retry 3 -o cargo-deny.tgz "$url"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tgz" | sha256sum -c -
+          tar -xzf cargo-deny.tgz
+          install -m 0755 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.cargo/bin/cargo-deny"
+          cargo deny --version
+      - name: Check the workspace lockfile against today's advisory database
+        run: cargo deny --config tools/release/deny.toml check advisories
