@@ -41,8 +41,8 @@ use cerulion_bagd::{run_bagd, BagdConfig, BagdError, BagdSummary, StateCoverage,
 use cerulion_core::state::StateSink;
 use cerulion_core::state_arm::MappedStateArm;
 use cerulion_core::state_ring::{
-    encode_record, state_ring_tag, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL,
-    STATE_RING_RESERVED_RANK,
+    encode_record, state_ring_tag, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL_V2,
+    STATE_RECORD_FORMAT_VERSION, STATE_RING_RESERVED_RANK,
 };
 use cerulion_core::transport::TransportManager;
 
@@ -238,8 +238,10 @@ impl Rank {
                 step,
                 node_idx: 0,
                 part: 0,
-                kind: RECORD_KIND_FINAL,
+                kind: RECORD_KIND_FINAL_V2,
                 len: payload.len() as u32,
+                rank: self.rank,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &payload,
         )
@@ -493,8 +495,10 @@ fn a_ring_at_the_departure_sentinels_name_is_never_adopted() {
                 step: 10,
                 node_idx: 0,
                 part: 0,
-                kind: RECORD_KIND_FINAL,
+                kind: RECORD_KIND_FINAL_V2,
                 len: payload.len() as u32,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &payload,
         );

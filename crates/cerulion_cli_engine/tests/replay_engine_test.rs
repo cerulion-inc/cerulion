@@ -12405,7 +12405,7 @@ fn relay_anchor_blob() -> Vec<u8> {
 /// Chunk `blob` into the 512-byte `__cerulion/state` records the ring carries.
 fn state_records(run_id: u64, step: u64, node_idx: u32, blob: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    let mut chunker = StateChunker::new(run_id, step, node_idx);
+    let mut chunker = StateChunker::new(run_id, step, node_idx, 0);
     {
         let mut emit = |rec: &[u8; STATE_RECORD_SIZE as usize]| out.push(rec.to_vec());
         chunker.append(blob, &mut emit);

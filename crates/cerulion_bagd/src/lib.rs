@@ -7749,7 +7749,8 @@ impl WriterCore {
             }
         }
         // The state records carry NO wire timestamp — the header is
-        // `run_id | S | node_idx | part | kind | len` and a step is not a
+        // `run_id | S | node_idx | part | kind | len | rank | format_version`
+        // and a step is not a
         // nanosecond. So the only meaningful `log_time` is the instant the RECORDER
         // wrote them, read ONCE here rather than per record: inside `write_all`
         // it would differ between the first attempt and the salvage retry, and
@@ -8228,7 +8229,7 @@ impl WriterCore {
         // The ledger is fed HERE, on the success path only, and exactly once per
         // record: inside `write_all` the salvage retry would double-count, and
         // on the error path the run dies with the bag un-finalized so no
-        // coverage attachment is written at all. It reads each record's 32-byte
+        // coverage attachment is written at all. It reads each record's 40-byte
         // header off the span the writer just copied — never the payload, which
         // is the whole reason a recorder can afford to judge a 500 MB anchor.
         //
@@ -25235,7 +25236,8 @@ mod c3_terminal_tests {
 mod commit_ordering_tests {
     use super::*;
     use cerulion_core::state_ring::{
-        encode_record, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL,
+        encode_record, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL_V2,
+        STATE_RECORD_FORMAT_VERSION,
     };
     use std::sync::Mutex;
 
@@ -25258,8 +25260,10 @@ mod commit_ordering_tests {
                 step,
                 node_idx,
                 part: 0,
-                kind: RECORD_KIND_FINAL,
+                kind: RECORD_KIND_FINAL_V2,
                 len: 8,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &[0xC5u8; 8],
         )
@@ -25499,7 +25503,8 @@ mod commit_ordering_tests {
 mod capture_coverage_tests {
     use super::*;
     use cerulion_core::state_ring::{
-        encode_record, StateChunker, StateRecordHeader, RECORD_KIND_SKIP,
+        encode_record, StateChunker, StateRecordHeader, RECORD_KIND_SKIP_V2,
+        STATE_RECORD_FORMAT_VERSION,
     };
 
     struct RetainedProbe {
@@ -25512,7 +25517,7 @@ mod capture_coverage_tests {
 
     fn complete(ring: &str, node: Option<&str>, node_idx: u32, blob: &[u8]) -> RetainedProbe {
         let mut records = Vec::new();
-        let mut chunker = StateChunker::new(7, 42, node_idx);
+        let mut chunker = StateChunker::new(7, 42, node_idx, 0);
         chunker.append(blob, &mut |r| records.push(*r));
         chunker.finish(&mut |r| records.push(*r));
         RetainedProbe {
@@ -25540,8 +25545,10 @@ mod capture_coverage_tests {
                     step: 42,
                     node_idx,
                     part: 0,
-                    kind: RECORD_KIND_SKIP,
+                    kind: RECORD_KIND_SKIP_V2,
                     len: payload.len() as u32,
+                    rank: 0,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
                 },
                 &payload,
             )],

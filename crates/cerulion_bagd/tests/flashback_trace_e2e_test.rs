@@ -98,8 +98,8 @@ use cerulion_core::flashback::retention::RetentionCaps;
 use cerulion_core::flashback::switch::TriggerPosture;
 use cerulion_core::flashback::trigger::{CaptureRequest, TriggerPolicy};
 use cerulion_core::state_ring::{
-    encode_record, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL, STATE_RECORD_PAYLOAD,
-    STATE_RECORD_SIZE,
+    encode_record, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL_V2,
+    STATE_RECORD_FORMAT_VERSION, STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE,
 };
 use cerulion_core::trace_ring::{
     TraceRingProducer, TraceRingRecord, RECORD_TYPE_DEPARTURE, RECORD_TYPE_FIRE,
@@ -261,8 +261,10 @@ fn anchor_record(node_idx: u32, fill: u8) -> Vec<u8> {
             step: ANCHOR_STEP,
             node_idx,
             part: 0,
-            kind: RECORD_KIND_FINAL,
+            kind: RECORD_KIND_FINAL_V2,
             len: payload.len() as u32,
+            rank: 0,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         },
         &payload,
     )
