@@ -603,11 +603,14 @@ latch's DECADE re-announcement is pinned by an in-crate unit arm in
 ## Peer loss: `--peer-loss <continue|fail>`
 
 What happens when a worker process **dies** (crash, OOM-kill, `kill -9`)
-while the deployment is live:
+while the deployment is live. The POLICY is the same in both execution modes;
+only the barrier repair it performs belongs to the
+`CERULION_EXECUTION_MODE=lockstep` opt-out, because a free-run run (the
+default) has no cohort to repair:
 
 | Policy | Behavior |
 |---|---|
-| `continue` (**default**) | The supervisor logs a loud error naming the lost group, drops the dead peer from the shared barrier (so the survivors do not stall at the next level boundary), and keeps the survivors running **degraded**. The run still exits 0, unless EVERY worker crashed (no survivors), which is an error. Near-simultaneous deaths are dropped as a batch (one disambiguation grace total). |
+| `continue` (**default**) | The supervisor logs a loud error naming the lost group and keeps the survivors running **degraded**. Under the `lockstep` opt-out it also drops the dead peer from the shared barrier, so the survivors do not stall at the next level boundary; under the free-run default there is no cohort to drop from and the survivors were never stalled by the death, which the degraded summary says in those words. The run still exits 0, unless EVERY worker crashed (no survivors), which is an error. Near-simultaneous deaths are dropped as a batch (one disambiguation grace total). |
 | `fail` | Any worker death stops the WHOLE deployment: the supervisor SIGKILLs every sibling and returns a loud error (non-zero exit). Deterministic: choose this for CI and replay-comparison runs. |
 
 The flag wins outright; when absent, the hidden `CERULION_MP_PEER_LOSS`
@@ -618,10 +621,12 @@ default is `continue`.
 fault instant. A recorded run captures the
 departure: the supervisor writes a Departure record naming the lost group's
 rank into the bag (see "Recording a multi-process run" below), so the bag
-documents WHERE the cohort degraded. The post-fault trace is still
+documents WHERE the deployment degraded. The post-fault trace is still
 live-only evidence (the crash instant itself is not re-executable); use
 `--peer-loss fail` when you need a run that either completes
-identically-replayable or stops.
+identically-replayable or stops. Under the free-run default that
+re-executability is per rank, as everywhere else on this page; the
+`lockstep` opt-out is what makes it a cross-rank property.
 
 ## Recording a multi-process run (`--record`)
 

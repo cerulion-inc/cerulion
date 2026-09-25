@@ -16,17 +16,22 @@ laser_scanner  --(sensor_msgs/LaserScan)-->  safety_controller  --(geometry_msgs
   (`x = 0.3`).
 
 The trigger is deliberate. The controller runs when a scan arrives, so every
-command it emits is computed from a new measurement, and that is what keeps
-this graph deterministic when
-`cerulion graph run` splits the two nodes into one process per node (the
-default): a `#[input(trigger)]` edge is a DAG edge, so the scanner
-levelizes strictly above the controller and the cross-process level-boundary
-barrier orders the publish before the read. Polling the same scan on a
-`period_ms` timer leaves the edge out of the DAG: both nodes share one level,
-which scan a tick pairs with becomes OS-scheduled, and the recording does not
-replay. (Co-locating both nodes in one `process_groups:` group, or running
-`--single-process`, also avoids that; see "Scope of the data guarantee" in
-`docs/multi_process.md`.)
+command it emits is computed from a new measurement rather than from whichever
+scan happened to be in the slot when a timer fired. A `#[input(trigger)]` edge
+is also a DAG edge, so the scanner levelizes strictly above the controller.
+Polling the same scan on a `period_ms` timer leaves the edge out of the DAG:
+both nodes share one level, which scan a tick pairs with becomes OS-scheduled,
+and the recording does not replay.
+
+When `cerulion graph run` splits the two nodes into one process per node (the
+default partition), the two ranks FREE-RUN: no cross-process barrier is
+created, so the ranks are not stepped against each other, and each one is
+deterministic on its own recorded boundary stream rather than against the
+other's. The `CERULION_EXECUTION_MODE=lockstep` opt-out adds the shared
+level-boundary barrier, the mode that does order the publish before the read
+across a process split. Co-locating both nodes in one `process_groups:` group,
+or running `--single-process`, keeps the edge inside one rank instead. See
+"Scope of the data guarantee" in `docs/multi_process.md`.
 
 This is a standalone workspace: it has its own `[workspace]` `Cargo.toml` and is
 excluded from the repo's root workspace (see the root `Cargo.toml` `exclude`).

@@ -816,7 +816,7 @@ INFO safety_controller: emergency stop range=0.4970099925994873 stop_count=1
 INFO safety_controller: emergency stop range=0.41373515129089355 stop_count=2
 ```
 
-The graph is now running as three lockstepped processes. The `lidar_sensor`
+The graph is now running as three free-running worker processes. The `lidar_sensor`
 publishes at 10 Hz, the `safety_controller` reacts to each reading (the
 `emergency stop` lines are its own `tracing::info!`, printed each time the
 simulated obstacle comes within half a meter), and the `drive_base` receives
@@ -893,23 +893,34 @@ cerulion topic echo /demo/safety_controller/cmd_vel
 **Expected output (streaming):**
 
 ```
-seq=152 ts=15300000000ns schema=0xd43ee5592039b9df size=56
+seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=56
   geometry_msgs/Vector3:
     x: 0.5
     y: 0.0
     z: 0.0
-seq=153 ts=15400000000ns schema=0xd43ee5592039b9df size=56
+seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=56
   geometry_msgs/Vector3:
-    x: 0.5
+    x: 0.0
+    y: 0.0
+    z: 0.0
+seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=56
+  geometry_msgs/Vector3:
+    x: 0.0
     y: 0.0
     z: 0.0
 ```
 
 The first line of each message is its wire header:
 - `seq`: the wire sequence number (monotonically increasing)
-- `ts`: the wire timestamp in nanoseconds. In this multi-process run it is the
-  graph's deterministic logical clock, which advances 100 ms per step, not a
-  wall-clock reading
+- `ts`: the wire timestamp in nanoseconds. A multi-process run FREE-RUNS by
+  default: each rank advances its own gating clock at step boundaries by the
+  measured wall elapsed, from an epoch anchored to that rank's monotonic clock.
+  So the stamps step by about the node's 100 ms period and carry the run's real
+  jitter (100.027 ms then 100.009 ms in the capture above) instead of landing on
+  exact multiples. What makes the Step 8 replay exact is not a tidy clock but
+  the recorded posture: every step boundary is written into the bag and replayed
+  from there. `CERULION_EXECUTION_MODE=lockstep` opts into the other shape,
+  where every rank advances the same 100 ms quantum behind a shared barrier
 - `schema`: the layout-sensitive schema hash (see the wire-format footnote below)
 - `size`: total wire size (header + payload)
 
@@ -923,7 +934,7 @@ cerulion topic echo /demo/lidar_sensor/scan --truncate-length 4
 ```
 
 ```
-seq=119 ts=12000000000ns schema=0x64cc8631dc24946b size=1361
+seq=331 ts=1997429329506375ns schema=0x64cc8631dc24946b size=1361
   sensor_msgs/LaserScan:
     angle_min: -1.57
     angle_max: 1.57
@@ -957,8 +968,9 @@ average rate: 10.00 Hz, min: 0.1000s max: 0.1000s std: 0.0000s window: 10
 ```
 
 This confirms the LIDAR sensor is publishing at the configured 10 Hz. (The
-figures are exact because the rate is computed from the wire timestamps, which
-this run stamps from its logical clock.)
+figures are computed from the wire timestamps and printed to 0.1 ms, and the
+free-running gating clock's per-step jitter on this run was tens of
+microseconds, so it rounds away at that width.)
 
 ### Get topic info
 
@@ -971,8 +983,8 @@ cerulion topic info /demo/lidar_sensor/scan
 ```
 Topic: /demo/lidar_sensor/scan
 Schema: sensor_msgs/LaserScan (0x64cc8631dc24946b)
-Last sequence: 182
-Last timestamp: 18300000000ns
+Last sequence: 516
+Last timestamp: 1997447829523916ns
 ```
 
 ---

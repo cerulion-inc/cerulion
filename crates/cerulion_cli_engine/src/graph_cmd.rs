@@ -9475,10 +9475,12 @@ fn supervisor_precreate_error(
 /// Builds the full graph ONCE (planning: fail-fast full-graph validation + the
 /// IMPURE `Levels`/`tightest_timing_ns` the pure planner needs), plans one worker
 /// per group, mints + injects the shared iceoryx2 `Config`, creates the shared
-/// SHM barrier, then spawns one `cerulion graph run-worker --plan <f>` process
+/// SHM barrier ONLY under the `lockstep` opt-out (the body branches on
+/// `execution_mode`; the free-run default creates none and no rank maps one),
+/// then spawns one `cerulion graph run-worker --plan <f>` process
 /// per group (producer-owning groups first, gated on each worker's READY
 /// sentinel) and joins them under a fail-loud lifecycle contract (see the JOIN
-/// state machine below). Unix-only (the cross-process barrier is
+/// state machine below). Unix-only (the lockstep barrier is
 /// portable POSIX SHM, so macOS runs the real supervisor too) — the
 /// `resolve_deployment` dispatch in `graph_run` routes non-Unix hosts to
 /// the monolith FALLBACK before ever calling this; single-process `graph run`
