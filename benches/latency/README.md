@@ -171,7 +171,7 @@ The matrix below is the normalization key; the pairing table in
 |---|---|---|---|---|---|
 | `iox2_chrt0` (floor) | 1 (two threads) | 0 process / 2 thread | 0: spin-poll both sides | spin | harness bracket |
 | `zenoh_shm_*` | 2 | 2 | 2 (blocking `recv()` + RX callback) | block | harness bracket |
-| `cerulion_workspace_split_*` | 2 workers (+ supervisor & gateway, off-path) | 1 | 1 cross-process data wake (ping → pong); the pong → latency echo hop is in-process in g2, gated by the level-boundary barrier rendezvous | block (WaitSet/park) | embedded stamp |
+| `cerulion_workspace_split_*` | 2 workers (+ supervisor & gateway, off-path) | 1 | 1 cross-process data wake (ping → pong); the pong → latency echo hop is in-process in g2, so under the free-run default nothing gates it but g2's own level order inside the step (levels 1 and 2 run back to back on that rank's thread, no rendezvous of any kind); `CERULION_EXECUTION_MODE=lockstep` opts a run out and puts the level-boundary barrier rendezvous there | block (WaitSet/park) | embedded stamp |
 | `cerulion_workspace_mono_*` | 1 (+ gateway, off-path) | 0 | 0: all three nodes fire in one step on one thread | in-step dispatch | embedded stamp |
 | ROS 2 `*_rclcpp_*` | 3 nodes (+ iox-roudi / rmw_zenohd where applicable, off-path) | 2 | 2 executor wakes (+ per-receive heap alloc + payload memcpy) | block (executor) | embedded stamp |
 | ROS 2 `*_loan_*` | 3 nodes | 2 | 2 WaitSet wakes (no receive memcpy on pong/latency) | block (WaitSet) | embedded stamp |
@@ -192,7 +192,9 @@ Three facts the matrix encodes:
   (`METHODOLOGY.md` §1). Quiescent-vs-backtoback deltas must be read
   per line, not as one mechanism.
 - **Tails are owned by each line's wake mechanism.** A workspace
-  `split` max is barrier/park-wake territory; a ROS 2 max is
+  `split` max is park-wake territory under the free-run default (the
+  `CERULION_EXECUTION_MODE=lockstep` opt-out adds barrier waits to that
+  list; nothing on the default leg waits on a barrier); a ROS 2 max is
   DDS-listener/executor territory; an `iox2` max is scheduler
   preemption of a spin. A cross-family MAX or p99 comparison must name
   the mechanism it is comparing; the `.bin`s preserve chronological

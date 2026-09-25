@@ -160,11 +160,11 @@ graph load by `validate_process_groups`, the fourth at plan time by
 | Every node id appears in **exactly one** group | graph load | The groups are a partition: an orphan node would silently never run; a double-listed node would run twice |
 | Every listed id **exists** in `nodes:` | graph load | Rejects dangling references |
 | `process_group_order` (if present) is a **permutation** of the group names | graph load | Every group ranked exactly once |
-| Each group owns a **contiguous band** of global DAG levels | plan time | The cross-process barrier supports contiguous splits only; an interleaved partition (a group owning levels {0, 2} while another owns {1}) is rejected |
+| Each group owns a **contiguous band** of global DAG levels | plan time | Every rank re-levelizes its own subgraph onto the band it owns, in every execution mode, and the `lockstep` opt-out's participant map needs the same band; an interleaved partition (a group owning levels {0, 2} while another owns {1}) is rejected |
 
 **Listed order is the contract.** `process_groups` is an ordered map
 (`IndexMap`): the **declaration order defines each group's rank** (the
-cross-process trace-merge tiebreaker and barrier ordering) unless the
+cross-process trace-merge tiebreaker in every mode, and the barrier's ordering under the `lockstep` opt-out) unless the
 optional `process_group_order` list overrides it. Reordering the YAML
 entries changes ranks; treat the listing order as meaningful, exactly like
 node declaration order elsewhere in the graph file.
@@ -403,7 +403,7 @@ Only the deployment's **infrastructure** stays run-scoped/isolated:
 
 | Object | Name shape | Scope |
 |---|---|---|
-| Cross-process level barrier | `cerdep_{graph}_{nonce}` (POSIX SHM) | per run |
+| Cross-process level barrier (`CERULION_EXECUTION_MODE=lockstep` opt-out only; a free-run run creates none) | `cerdep_{graph}_{nonce}` (POSIX SHM) | per run |
 | Trace/recording rings | `cer_rec_*` / `cer_rg_*` (POSIX SHM) | per run |
 | Doorbells | `/cer_db_<user>_*` | per `$USER` |
 | Supervisor **planning** namespace | `cer_p_{hex}` (iceoryx2) | per run: the planning build attaches real single-writer publishers for every graph-owned topic; on the shared data-plane namespace it would collide with the workers' own |
