@@ -268,8 +268,10 @@ const CONN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// terminated request is never rejected; only unbounded no-newline growth is.)
 pub const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 
-/// A topic's resolved schema + archetype (computed ONCE from the first decodable
-/// frame — a topic's schema is stable).
+/// A topic's resolved schema + archetype, computed ONCE from the first decodable
+/// frame (a topic's schema is stable). Until that frame, a remote attach may hold a
+/// guess made from the pinned schema NAME; [`TopicStat::resolved_from_frame`] says
+/// which one this is.
 #[derive(Debug, Clone)]
 struct Resolved {
     /// The qualified schema name (`pkg/Type`).
@@ -289,8 +291,20 @@ struct TopicStat {
     samples: VecDeque<(u32, Instant)>,
     /// Total frames drained from this tap.
     frames_seen: u64,
-    /// The once-resolved schema + archetype (set from the first decodable frame).
+    /// The resolved schema + archetype: the verdict on the first decodable frame,
+    /// or, before any frame, the remote attach's guess from the pinned schema name.
     resolved: Option<Resolved>,
+    /// `resolved` came from a DRAINED FRAME, classified by the sink's whole ladder
+    /// (`classify_frame`, content rungs included). False while it is only the
+    /// remote attach's schema-NAME guess.
+    ///
+    /// The name table cannot see content: it maps every
+    /// `sensor_msgs/CompressedImage` to `Image`, while the sink draws one whose
+    /// `data` is an H.264 access unit as `VideoStream`. So the poll thread keeps
+    /// classifying until this is true, and a re-attach never writes the name guess
+    /// over a frame verdict. It is never cleared; `detach` drops the whole stats
+    /// entry.
+    resolved_from_frame: bool,
     /// The ORIGIN ROBOT whose data THIS tap carries.
     ///
     /// Written only through [`DaemonState::set_origin_robot`], which releases the
@@ -3923,9 +3937,10 @@ impl Ctx {
 
         // 3. Tap the now-local mirror by the IDENTICAL local tap path, and report
         //    the controller-provided schema + its archetype (there is no frame yet
-        //    to resolve from; the poll thread back-fills the archetype once frames
-        //    flow). classify_schema is the name-based table; a schema not in it
-        //    stays archetype=null until the first frame (no fabrication).
+        //    to resolve from; once frames flow the poll thread replaces this with
+        //    the verdict on the first decodable frame). classify_schema is the
+        //    name-based table; a schema not in it stays archetype=null until the
+        //    first frame (no fabrication).
         //    `route_key` was resolved at the top (the entity-stability check).
         let archetype = classify_schema(&schema_name);
         // Attach under the lock, but DROP the guard before any rollback (the release
@@ -3986,9 +4001,12 @@ impl Ctx {
                             // tell a version skew from a type it never compiled.
                             stat.pinned_schema = Some(schema_name.clone());
                             // Seed the resolution from the known type so status/list show
-                            // it immediately (the poll thread refines the archetype on the
-                            // first frame if the name was not in the classify table).
-                            if let Some(arch) = archetype {
+                            // it immediately. The poll thread replaces it with the verdict
+                            // on the first decodable frame, and a re-attach must not write
+                            // this name guess back over that verdict: the name table says
+                            // `Image` for every CompressedImage, which the sink draws as
+                            // `VideoStream` when its data is H.264.
+                            if let Some(arch) = archetype.filter(|_| !stat.resolved_from_frame) {
                                 stat.resolved = Some(Resolved {
                                     schema: schema_name.clone(),
                                     archetype: arch,
@@ -4055,6 +4073,15 @@ impl Ctx {
         self.invalidate_mirror_provenance_cache();
         // Keep the reapply-warn snapshot current (a new remote tap changes the set).
         self.refresh_attached_snapshot();
+        // From here on, report what the stat holds: the name guess on a fresh
+        // attach, the frame verdict once a frame has been classified (a re-attach
+        // of a streaming topic, or a fresh attach the poll thread already served).
+        // The warning below reads it too, so a re-attach of a topic whose frames
+        // DO render does not claim that it renders nothing.
+        let archetype = self
+            .cached_resolution(&topic)
+            .map(|r| r.archetype)
+            .or(archetype);
         // Decision: a checked-but-unmappable REMOTE topic is LOUD too — its
         // schema resolved (it is served), but it maps to no viz archetype, so it renders
         // nothing. The reply carries `view_kinds: null`; this surfaces it in the log.
@@ -6469,6 +6496,7 @@ fn record_resolution(
         Ok(r) => {
             stat.undecodable = None;
             stat.resolved = Some(r.clone());
+            stat.resolved_from_frame = true;
             report_schema_hash_resolved(&mut stat.unknown_hash, DiagnosisVantage::Resolver, topic);
         }
         Err(ResolveFailure::UnknownHash(diagnosis)) => {
@@ -7806,8 +7834,11 @@ fn poll_loop(
                 if let Some(header) = p.frames.last().and_then(|f| WireHeader::read_from_buf(f)) {
                     stat.observe_seq(header.sequence, p.frames.len() as u64, now, &p.topic);
                 }
-                // Resolve the schema ONCE, from the first decodable frame.
-                if stat.resolved.is_none() {
+                // Resolve the schema ONCE, from the first decodable frame. A
+                // remote attach's name guess does not count as resolved: the
+                // frame verdict replaces it, and only a CHANGED archetype counts
+                // as a new resolution for the layout reflow below.
+                if !stat.resolved_from_frame {
                     if let Some(first) = p.frames.first() {
                         // Classified, not a bare `Option`. A topic whose
                         // frames this build cannot decode never resolves, so it
@@ -7819,7 +7850,9 @@ fn poll_loop(
                         // instead of just printing a hash.
                         let candidate = stat.pinned_schema.clone();
                         let outcome = resolve_from_frame(&walker, first, candidate.as_deref());
-                        newly_resolved |= outcome.is_ok();
+                        let before = stat.resolved.as_ref().map(|r| r.archetype);
+                        newly_resolved |=
+                            outcome.as_ref().is_ok_and(|r| Some(r.archetype) != before);
                         record_resolution(stat, &p.topic, &outcome);
                     }
                 }

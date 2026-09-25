@@ -78,6 +78,15 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   changed to netd-style per-connection release-on-close.
 - `detach` releases the netd demand (refcounted daemon-side; the last release
   retires the mirror) and frees the tap.
+- A remote attach seeds the topic's archetype from its schema NAME
+  (`classify_schema`) so the reply and `status` have an answer before any
+  frame. The name table cannot see content, so the poll thread keeps
+  classifying until a frame decodes and replaces the guess with the frame's
+  verdict (`TopicStat::resolved_from_frame`); a re-attach never writes the
+  name guess back over it. A `sensor_msgs/CompressedImage` whose `data` is
+  H.264 maps to `Image` by name and to `VideoStream` by its frames. Pinned by
+  `vizd_e2e_test.rs`'s
+  `a_remote_h264_compressed_image_attach_reports_the_video_stream_archetype_e2e`.
 
 ### Wake discipline
 

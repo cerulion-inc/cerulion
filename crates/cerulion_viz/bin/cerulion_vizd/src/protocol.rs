@@ -993,6 +993,12 @@ pub struct RunsResponse {
 /// `attach` success payload. `schema`/`archetype` are `null` when the topic was
 /// silent at attach (a data-only tap has no history, so resolution is
 /// best-effort); they fill in once frames flow (visible via `status`/`list`).
+///
+/// A REMOTE attach (`robot` set) knows its schema before any frame, so its
+/// `archetype` starts as the one that schema NAME maps to. Once a frame decodes,
+/// `status`, `list` and the reply to a re-attach carry the archetype the frames
+/// classify as instead, which can differ: a `sensor_msgs/CompressedImage` maps to
+/// `Image` by name and renders as `VideoStream` when its `data` is H.264.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttachResponse {
     /// Correlation id.
