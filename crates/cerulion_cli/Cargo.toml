@@ -69,6 +69,17 @@ ctrlc = { version = "3", features = ["termination"] }
 # script cannot complete live names, and sourcing both mechanisms would have the
 # last one win. Only the dynamic engine is wired.
 clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
+# Usage telemetry (`src/telemetry.rs`): the `telemetry` verb, the first-run
+# notice and `cli_command_run`. Sends nothing unless the build carries a
+# PostHog key and consent resolves enabled. Never linked into a robot crate.
+cerulion_telemetry = { path = "../cerulion_telemetry" }
+
+[features]
+default = ["telemetry"]
+# The PostHog client behind `src/telemetry.rs`. Off, every telemetry call is
+# a no-op, `cerulion telemetry status` reports "not compiled", and no network
+# dependency is linked.
+telemetry = ["cerulion_telemetry/posthog"]
 
 # bagd is folded into this binary as the
 # `cerulion bagd` subcommand (`BagdArgs` + `bagd_cli_main`). Unix-gated —
