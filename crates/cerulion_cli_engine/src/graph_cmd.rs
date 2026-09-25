@@ -8194,10 +8194,13 @@ enum Deployment {
     /// supervisor (`graph_run_supervisor`).
     Supervisor,
     /// `process_groups:` on a NON-Unix host (future Windows) → run the
-    /// MONOLITH with a loud notice (`reason`): the cross-process barrier is a
-    /// POSIX `shm_open` `MAP_SHARED` primitive, so multi-process cannot run
-    /// there — but the graph itself runs single-process with identical results
-    /// (the determinism firewall), just without process isolation.
+    /// MONOLITH with a loud notice (`reason`): every mode's cross-process
+    /// plumbing is POSIX `shm_open` `MAP_SHARED` (the per-rank trace rings and
+    /// the `block`-edge credit words a run maps whatever its mode, and the
+    /// shared barrier the `CERULION_EXECUTION_MODE=lockstep` opt-out adds), so
+    /// multi-process cannot run there. The graph itself still runs
+    /// single-process with identical results (the determinism firewall), just
+    /// without process isolation.
     MonolithFallback { reason: &'static str },
     /// The plain single-process path: no `process_groups:`, or the user forced
     /// it with `--single-process`.
@@ -8207,9 +8210,9 @@ enum Deployment {
 /// The `Deployment::MonolithFallback` notice text (the WHY; the dispatch site
 /// adds the graph name as a structured field).
 const NON_UNIX_MONOLITH_FALLBACK: &str =
-    "graph declares `process_groups:` but this host is not a Unix — running SINGLE-PROCESS \
-     (monolith fallback). The cross-process barrier is a POSIX shm_open MAP_SHARED primitive \
-     (available on Linux and macOS), unavailable on this platform. \
+    "graph declares `process_groups:` but this host is not a Unix: running SINGLE-PROCESS \
+     (monolith fallback). A deployment's cross-process plumbing is POSIX shm_open MAP_SHARED \
+     shared memory (available on Linux and macOS), unavailable on this platform. \
      The graph still runs with identical results (the determinism firewall: same fire \
      set/order/data), just without process isolation.";
 
@@ -8677,12 +8680,15 @@ impl ChildGuard {
         self.reaped = true;
     }
 
-    /// Send SIGINT to the child (best-effort) so it self-drops
-    /// from the barrier cohort (`leave_barrier_cohort`) and exits 0 gracefully. Used
-    /// when a peer exits CLEANLY and the supervisor winds the survivors down —
-    /// without it the departing worker's self-drop already removed the barrier
-    /// stall, so the survivors would keep running until the drain-deadline SIGKILL
-    /// (worse than the ~5s barrier poison). No-op once reaped.
+    /// Send SIGINT to the child (best-effort) so it exits 0 gracefully, and,
+    /// under the `CERULION_EXECUTION_MODE=lockstep` opt-out, self-drops from the
+    /// barrier cohort first (`leave_barrier_cohort`). Used when a peer exits
+    /// CLEANLY and the supervisor winds the survivors down. Without it the
+    /// survivors would keep running until the drain-deadline SIGKILL: under the
+    /// opt-out the departing worker's self-drop has already removed the barrier
+    /// stall that would otherwise have stopped them sooner (the ~5s barrier
+    /// poison), and under the free-run default no peer's departure reaches them
+    /// at all. No-op once reaped.
     ///
     /// ALSO fanned out on the Ctrl-C→Draining transition. A terminal
     /// Ctrl-C delivers SIGINT to the whole foreground process group, making the
@@ -18348,10 +18354,12 @@ pub(crate) struct CreditDeathWatch {
     /// `credit_death_actions`. Lives for the supervisor's whole scope.
     ///
     /// MONOTONE, with no eviction. Nothing in this deployment restarts a dead
-    /// worker (`--peer-loss continue` drops it from the barrier and runs
-    /// degraded), so that is correct today — but if a rank ever comes BACK,
-    /// it stays "dead" here and its consumer's warn would be silently
-    /// suppressed. A restart story has to clear this set.
+    /// worker (`--peer-loss continue` keeps the survivors running degraded, and
+    /// under the `CERULION_EXECUTION_MODE=lockstep` opt-out drops the dead rank
+    /// from the barrier cohort as well), so that is correct as the deployment
+    /// behaves. If a rank ever came BACK, it would stay "dead" here and its
+    /// consumer's warn would be silently suppressed: restarting a rank has to
+    /// clear this set.
     dead_so_far: std::collections::BTreeSet<u32>,
 }
 

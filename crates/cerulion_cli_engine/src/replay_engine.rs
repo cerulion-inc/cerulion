@@ -231,10 +231,15 @@ pub struct ReplayOutcome {
     pub record_health: RecordHealthReport,
     /// The ragged-shutdown-tail tolerances that ENGAGED this replay,
     /// one human-readable line each. A multi-process `--record` run SIGINT'd
-    /// between the ranks' final barrier generations leaves a peer rank's
-    /// recorded stream ending a step (or a few) before rank 0's — the
-    /// AUTHORITATIVE replay clock — so the monolith re-execution legitimately
-    /// re-fires that peer's nodes past the recording's end (Principle #7). Both
+    /// mid-shutdown leaves a peer rank's recorded stream ending a step (or a
+    /// few) before rank 0's, the AUTHORITATIVE replay clock, so the monolith
+    /// re-execution legitimately re-fires that peer's nodes past the
+    /// recording's end (Principle #7). Under the FREE-RUN default that is the
+    /// ordinary shape: each rank closes its own wall-following step boundaries
+    /// with no rendezvous holding the ranks together, so the signal lands at a
+    /// different step on each. Under the `CERULION_EXECUTION_MODE=lockstep`
+    /// opt-out the ragged edge is what falls between the ranks' final barrier
+    /// generations instead. Both
     /// the structural trace gate and the per-topic frame diff tolerate that
     /// re-fire over the SAME window (the two gates must AGREE); every
     /// engaged tolerance is recorded HERE so the report never SILENTLY drops
@@ -11745,9 +11750,9 @@ fn classify_topics(
 /// Per-rank ragged-shutdown-tail context, derived from the recorded
 /// STEP_BOUNDARY stream in ONE streaming pass.
 ///
-/// A multi-process `--record` run SIGINT'd between the ranks' final barrier
-/// generations can leave a PEER rank's recorded STEP_BOUNDARY stream ending one
-/// (or a few) steps before rank 0's — the AUTHORITATIVE replay clock
+/// A multi-process `--record` run SIGINT'd mid-shutdown can leave a PEER
+/// rank's recorded STEP_BOUNDARY stream ending one
+/// (or a few) steps before rank 0's, the AUTHORITATIVE replay clock
 /// ([`RankBoundaryCursors::next_authoritative`] pulls rank 0's boundaries, so
 /// the replay runs exactly rank-0-many steps). The monolith re-execution then
 /// runs every step rank 0 recorded and legitimately RE-FIRES that peer rank's
@@ -11758,8 +11763,14 @@ fn classify_topics(
 /// per-topic frame diff consult this context to tolerate it identically — the
 /// two gates must not disagree about the same window.
 ///
+/// Under the FREE-RUN default the ranks close their own wall-following step
+/// boundaries with no rendezvous holding them together, so a shutdown lands at
+/// a different step on each; under the `CERULION_EXECUTION_MODE=lockstep`
+/// opt-out the ragged edge is what falls between their final barrier
+/// generations. The tolerance is the same either way.
+///
 /// Multi-rank bags only: a single-rank bag has one authoritative stream and no
-/// tail, so every width is 0 and the tolerance can NEVER engage — single-rank
+/// tail, so every width is 0 and the tolerance can NEVER engage: single-rank
 /// output stays byte-identical.
 struct RaggedTailContext {
     /// `testified[rank]` = how far that rank's recording PROVES its schedule

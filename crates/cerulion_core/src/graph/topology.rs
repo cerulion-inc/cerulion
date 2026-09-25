@@ -1546,9 +1546,12 @@ impl GraphTopology {
     /// [`TransportError`] — hand-edited files are untrusted input):
     ///
     /// 1. **No empty level** (contiguity): the levels vector has no empty
-    ///    entry — the multi-process barrier advances ONE generation per
-    ///    level, so an empty level would desync the per-step generation
-    ///    math across processes.
+    ///    entry. Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the
+    ///    cross-process barrier advances ONE generation per level, so an empty
+    ///    level would desync the per-step generation math across processes;
+    ///    under the free-run default there is no shared counter to desync, and
+    ///    the invariant still holds because the executor and the recorded
+    ///    boundary stream are indexed by level on every rank.
     /// 2. **Every trigger edge strictly level-increasing**: for every
     ///    TRIGGERING consumer edge, `level(producer) < level(consumer)` —
     ///    else the consumer would fire in the same step-phase as (or before)
@@ -2025,15 +2028,17 @@ impl Levels {
 ///
 /// A cascade slides a dense chain later, appending levels when the chain has
 /// no slack below the current max (the flagship perception-pipeline shape).
-/// Growth HELPS a single-process (monolith) graph — measured −10% p50 with a
-/// tail collapse — but is NOT free for a multi-process split: the
-/// level-lockstep barrier advances ONE generation per level, so +1 level =
-/// +1 cross-process rendezvous per step (measured ~19% chain-cadence cost at
-/// neutral p50). Growth is therefore gated on the EMITTED shape — a
-/// graph destined for a multi-group `process_groups:` partition refines under
-/// [`Deny`], a single-group (monolith) graph under [`Allow`]. The gate is a
-/// pure point-predicate on each cascade's target-level set, so refinement
-/// stays byte-reproducible (Principle #7) in BOTH modes.
+/// Growth HELPS a single-process (monolith) graph (measured 10% lower p50 with
+/// a tail collapse) but is NOT free for a multi-process split run under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out: there the cross-process barrier
+/// advances ONE generation per level, so +1 level = +1 cross-process
+/// rendezvous per step (the ~19% chain-cadence cost at neutral p50 was measured
+/// in that mode). Growth is therefore gated on the EMITTED shape, not on the
+/// execution mode, which is resolved later and is the user's to change between
+/// runs: a graph destined for a multi-group `process_groups:` partition refines
+/// under [`Deny`], a single-group (monolith) graph under [`Allow`]. The gate is
+/// a pure point-predicate on each cascade's target-level set, so refinement
+/// stays byte-reproducible (Principle #7) whichever growth setting it runs on.
 ///
 /// [`Allow`]: LevelGrowth::Allow
 /// [`Deny`]: LevelGrowth::Deny
@@ -2043,7 +2048,7 @@ pub enum LevelGrowth {
     /// earlier behavior, and the DEFAULT — so every construction that
     /// omits the field is byte-stable with the pre-gate output. Correct for a
     /// single-group (monolith) destination, where each extra level is a free
-    /// scheduler phase, not a cross-process barrier generation.
+    /// scheduler phase and no cross-process rendezvous can be built over it.
     #[default]
     Allow,
     /// A cascade whose target levels would EXCEED the Kahn input's max level
@@ -2052,8 +2057,8 @@ pub enum LevelGrowth {
     /// cascades (every target within the original `0..base.len()` range)
     /// still apply: the gate kills GROWTH, not cascading. Set by the
     /// shape-gated `cerulion graph partition` wiring when the graph
-    /// bands into multiple process groups, so refinement never adds a
-    /// cross-process barrier generation.
+    /// bands into multiple process groups, so refinement never adds a level a
+    /// lockstep run would spend a cross-process barrier generation on.
     Deny,
 }
 

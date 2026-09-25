@@ -57,11 +57,15 @@ use iceoryx2::prelude::{FileName, SemanticString};
 
 /// The handed-quantum floor: 1ms in nanoseconds.
 ///
-/// The global gating quantum is `tightest_timing_ns.unwrap_or(FLOOR).max(FLOOR)`
-/// — exactly the derivation `build_live_deterministic_with_manager_and_barrier`
-/// applies to the supervisor-handed quantum in
-/// `cerulion_core::graph::runtime`. A graph with no declared timing (all
-/// data-triggered) falls back to this 1ms heartbeat floor.
+/// The planner floors the deployment's quantum to
+/// `tightest_timing_ns.unwrap_or(FLOOR).max(FLOOR)`, exactly the derivation
+/// `build_live_deterministic_with_manager_and_barrier` applies to the
+/// supervisor-handed quantum in `cerulion_core::graph::runtime`. That quantum
+/// GATES the steps only under the `CERULION_EXECUTION_MODE=lockstep` opt-out;
+/// a free-run rank, the default, follows the wall instead and reads the figure
+/// for nothing but its build line and the capture-plane cadence. A graph with
+/// no declared timing (all data-triggered) falls back to this 1ms heartbeat
+/// floor.
 pub const HANDED_QUANTUM_FLOOR_NS: u64 = 1_000_000;
 
 /// Per-worker READY budget (ms): the max the SUPERVISOR waits for ONE spawned
@@ -623,12 +627,15 @@ pub struct WorkerPlan {
     /// carrying a same-level NON-TRIGGER edge this partition SPLITS across two
     /// process groups.
     ///
-    /// A flagged level crosses TWO barrier generations per step (one between
-    /// its snapshot and tick halves, then the ordinary end-of-level one), which
-    /// is what restores the monolith's snapshot-before-any-tick guarantee across
-    /// processes. Every other level crosses exactly one, so a graph with no
-    /// split pair pays nothing — see
-    /// [`crate::multiprocess::mid_level_barrier_flags`].
+    /// Under the `CERULION_EXECUTION_MODE=lockstep` opt-out a flagged level
+    /// crosses TWO barrier generations per step (one between its snapshot and
+    /// tick halves, then the ordinary end-of-level one), which is what restores
+    /// the monolith's snapshot-before-any-tick guarantee across processes.
+    /// Every other level crosses exactly one, so a graph with no split pair
+    /// pays nothing: see [`crate::multiprocess::mid_level_barrier_flags`]. The
+    /// free-run default builds no barrier, so it burns no generations and the
+    /// flags reach only the worker's build line; a graph that needs the
+    /// cross-process snapshot ordering is a graph to run under the opt-out.
     ///
     /// **IDENTICAL on every worker, by construction.** The flags decide how many
     /// generations a level burns, so two workers disagreeing on one level
@@ -706,9 +713,13 @@ pub struct WorkerPlan {
     /// built + READY, so no worker publishes before every worker's subscribers
     /// exist. Closes two startup races: (a) an early worker's first publishes
     /// racing a later worker's subscriber connect (run-to-run startup
-    /// nondeterminism — Principle #7), and (b) a sequential-spawn gap exceeding
-    /// the ~5s barrier boundary timeout spuriously poisoning an earlier worker
-    /// blocked at its first level boundary.
+    /// nondeterminism, Principle #7), and (b), under the
+    /// `CERULION_EXECUTION_MODE=lockstep` opt-out, a sequential-spawn gap
+    /// exceeding the ~5s barrier boundary timeout spuriously poisoning an
+    /// earlier worker blocked at its first level boundary. Race (a) is the one
+    /// the free-run default still has: a free-run rank blocks at no boundary,
+    /// so it has no timeout to trip, and the GO sentinel is what still orders
+    /// its first publish after every sibling's subscribers exist.
     pub go_path: String,
     /// Max wall time (ms) the worker waits for the GO sentinel after signaling
     /// READY, set by the PLANNER to `GO_BASE_MS + n_workers * READY_BUDGET_MS`
@@ -961,9 +972,11 @@ fn default_trace_limit() -> usize {
 
 /// The full multi-process deployment plan for a graph.
 ///
-/// One [`WorkerPlan`] per process group (in rank order) plus the deployment-wide
-/// shared barrier identifiers and the `expected` participant count the barrier
-/// owner rendezvouses on.
+/// One [`WorkerPlan`] per process group (in rank order) plus the
+/// deployment-wide shared barrier identifiers and the `expected` participant
+/// count. The plan is minted the same way in both execution modes: the
+/// barrier fields NAME a barrier, and only the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out creates one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentPlan {
     /// One worker per process group, in rank order (`workers[i].rank == i`).
@@ -973,8 +986,9 @@ pub struct DeploymentPlan {
     /// The shared barrier id — echoed on every [`WorkerPlan::barrier_id`].
     pub barrier_id: String,
     /// The barrier participant count = the number of workers = the number of
-    /// process groups. The spawner passes this to
-    /// `MappedBarrier::create_owned(ns, id, expected)`.
+    /// process groups. Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the
+    /// spawner passes this to `MappedBarrier::create_owned(ns, id, expected)`;
+    /// under the free-run default it creates no barrier and nothing reads it.
     pub expected: usize,
 }
 
