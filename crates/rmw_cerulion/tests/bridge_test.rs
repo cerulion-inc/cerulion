@@ -122,6 +122,10 @@ struct CDoubleSeq {
     data: *mut f64,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 /// std_msgs/String-like: { data: string }
@@ -358,6 +362,10 @@ fn double_seq(values: &[f64]) -> CDoubleSeq {
         data,
         size: len,
         capacity: len,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     }
 }
 
@@ -425,6 +433,10 @@ fn mixed_fixed_and_variable_fields_roundtrip() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -473,6 +485,10 @@ fn malformed_frames_are_rejected() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -592,6 +608,10 @@ fn corrupt_sequence_header_errors_instead_of_panicking() {
             data: std::ptr::NonNull::<f64>::dangling().as_ptr(),
             size: usize::MAX, // corrupt
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -611,7 +631,7 @@ fn corrupt_sequence_header_errors_instead_of_panicking() {
 /// { names: string[] } — sequence of strings (Complex op).
 #[repr(C)]
 struct CStringSeqMsg {
-    names: CRosSeqRaw,
+    names: CPrimSeqRaw,
 }
 
 /// Generic rosidl sequence header for complex tests.
@@ -620,6 +640,20 @@ struct CRosSeqRaw {
     data: *mut c_void,
     size: usize,
     capacity: usize,
+}
+
+/// Primitive and string sequences carry the two Lyrical Buffer flags after
+/// the header (message sequences do not); the flags exist on the era the
+/// crate is built for, so this fixture is exactly the distro's struct.
+#[repr(C)]
+struct CPrimSeqRaw {
+    data: *mut c_void,
+    size: usize,
+    capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 fn string_seq_members() -> *const rosidl_typesupport_introspection_c__MessageMembers {
@@ -700,20 +734,28 @@ fn complex_codec_sequence_of_strings_roundtrips() {
     let mut elems: Vec<CRosString> =
         vec![heap_string("alpha"), heap_string(""), heap_string("γréek")];
     let msg = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: elems.as_mut_ptr() as *mut c_void,
             size: elems.len(),
             capacity: elems.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let frame =
         unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) }.expect("flatten");
 
     let mut out = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let ok = unsafe {
@@ -826,10 +868,14 @@ fn complex_codec_flatten_is_deterministic() {
     let bridge = unsafe { BridgedMessage::new(string_seq_members()) }.expect("bridge");
     let mut elems = vec![heap_string("repeat")];
     let msg = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: elems.as_mut_ptr() as *mut c_void,
             size: 1,
             capacity: 1,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let a = unsafe { bridge.flatten(&msg as *const _ as *const c_void, 5, 50) }.expect("a");
@@ -845,10 +891,14 @@ fn hostile_element_count_is_rejected_on_decode() {
 
     // Well-formed empty message → valid frame, then poison the count.
     let msg = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let mut frame =
@@ -862,10 +912,14 @@ fn hostile_element_count_is_rejected_on_decode() {
     frame[abs..abs + 4].copy_from_slice(&u32::MAX.to_le_bytes());
 
     let mut out = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let ok = unsafe {
@@ -1099,7 +1153,7 @@ fn channel_float32_alignment_interops_with_native_reader() {
     #[repr(C)]
     struct CChannel {
         name: CRosString,
-        values: CRosSeqRaw,
+        values: CPrimSeqRaw,
     }
     let members = make_members(
         "sensor_msgs__msg",
@@ -1126,10 +1180,14 @@ fn channel_float32_alignment_interops_with_native_reader() {
     let mut values = [1.5f32, -2.5, 4.25];
     let msg = CChannel {
         name: heap_string("rgb"), // odd length 3 → alignment padding needed
-        values: CRosSeqRaw {
+        values: CPrimSeqRaw {
             data: values.as_mut_ptr() as *mut c_void,
             size: values.len(),
             capacity: values.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let frame =
@@ -1148,10 +1206,14 @@ fn channel_float32_alignment_interops_with_native_reader() {
 fn hostile_count_with_small_buffer_is_rejected_deterministically() {
     let bridge = unsafe { BridgedMessage::new(string_seq_members()) }.expect("bridge");
     let msg = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let mut frame =
@@ -1163,10 +1225,14 @@ fn hostile_count_with_small_buffer_is_rejected_deterministically() {
     frame[abs..abs + 4].copy_from_slice(&1000u32.to_le_bytes());
 
     let mut out = CStringSeqMsg {
-        names: CRosSeqRaw {
+        names: CPrimSeqRaw {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let ok = unsafe {
@@ -1248,7 +1314,7 @@ fn flatten_into_matches_flatten_for_uint8_payload() {
     #[repr(C)]
     struct CByteSeqMsg {
         stamp: u32,
-        data: CRosSeqRaw,
+        data: CPrimSeqRaw,
     }
     let members = make_members(
         "test_msgs__msg",
@@ -1273,10 +1339,14 @@ fn flatten_into_matches_flatten_for_uint8_payload() {
         .collect();
     let msg = CByteSeqMsg {
         stamp: 99,
-        data: CRosSeqRaw {
+        data: CPrimSeqRaw {
             data: payload.as_mut_ptr() as *mut c_void,
             size: payload.len(),
             capacity: payload.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let frame = assert_flatten_into_identical(&bridge, &msg as *const _ as *const c_void);
@@ -1311,6 +1381,10 @@ fn flatten_into_matches_flatten_for_empty_sequences() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -1428,6 +1502,10 @@ fn frame_size_rejects_hostile_counts() {
             data: std::ptr::NonNull::<f64>::dangling().as_ptr(),
             size: usize::MAX,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::null_mut(),
@@ -1446,6 +1524,10 @@ fn frame_size_rejects_hostile_counts() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         name: CRosString {
             data: std::ptr::NonNull::<u8>::dangling().as_ptr(),
@@ -1563,6 +1645,10 @@ struct CU8Seq {
     data: *mut u8,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -1588,6 +1674,10 @@ fn u8_seq(values: &[u8]) -> CU8Seq {
         data,
         size: len,
         capacity: len,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     }
 }
 
@@ -1616,6 +1706,10 @@ fn c_uint8_sequence_decode_is_byte_exact() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     let ok = unsafe {
@@ -1664,6 +1758,10 @@ fn c_uint8_decode_fully_replaces_prior_buffer_no_stale_tail() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     // First decode the LONG payload (allocates 400 malloc'd bytes).
@@ -1731,6 +1829,10 @@ fn c_uint8_empty_sequence_decodes_to_size_zero() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
     };
     // Prime with the non-empty payload (bridge mallocs the buffer).
@@ -1873,4 +1975,50 @@ fn loan_pad_ranges_cover_exactly_the_padding() {
         no_pad.loan_pad_ranges().is_empty(),
         "a gapless layout has nothing to zero"
     );
+}
+
+/// Lyrical and Rolling: a top-level `uint8[]` INSTANCE whose header says
+/// Buffer-backed holds a Buffer object behind `data`, not elements. The
+/// size pass, the write pass and the fill all refuse it (a bogus non-null
+/// pointer would be read or freed if any of them did not), and the same
+/// message with the flag clear goes through.
+#[cfg(cerulion_has_is_rosidl_buffer)]
+#[test]
+fn c_buffer_backed_top_level_instance_is_refused_by_size_flatten_and_fill() {
+    let bridge = unsafe { BridgedMessage::new(u8_seq_members()) }.expect("bridge");
+    let mut backing = [1u8, 2, 3];
+    let mut msg = CU8SeqMsg {
+        data: CU8Seq {
+            data: backing.as_mut_ptr(),
+            size: backing.len(),
+            capacity: backing.len(),
+            is_rosidl_buffer: true,
+            owns_rosidl_buffer: false,
+        },
+    };
+    let size = unsafe { bridge.frame_size(&msg as *const _ as *const c_void) };
+    assert!(
+        size.is_err(),
+        "the size pass must refuse a Buffer-backed instance"
+    );
+    let frame = unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) };
+    let err = frame.expect_err("the write pass must refuse a Buffer-backed instance");
+    assert!(err.to_string().contains("rosidl Buffer"), "got: {err}");
+    // The fill refuses the same instance and leaves its pointer untouched.
+    let plain = CU8SeqMsg {
+        data: u8_seq(&[9, 8, 7]),
+    };
+    let good = unsafe { bridge.flatten(&plain as *const _ as *const c_void, 0, 0) }.expect("plain");
+    let ok =
+        unsafe { bridge.unflatten(&good[WireHeader::SIZE..], &mut msg as *mut _ as *mut c_void) };
+    assert!(!ok, "the fill must refuse a Buffer-backed instance");
+    assert_eq!(msg.data.data as usize, backing.as_mut_ptr() as usize);
+    assert_eq!(msg.data.size, 3);
+    // Control: the flag is the ONLY difference.
+    msg.data.is_rosidl_buffer = false;
+    let size = unsafe { bridge.frame_size(&msg as *const _ as *const c_void) }.expect("plain size");
+    assert!(size > 0);
+    let frame =
+        unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) }.expect("plain flatten");
+    assert!(frame.len() > WireHeader::SIZE);
 }

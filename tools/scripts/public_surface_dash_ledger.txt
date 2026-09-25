@@ -256,7 +256,7 @@
 28 crates/rmw_cerulion/src/api/pubsub.rs
 8 crates/rmw_cerulion/src/borrow_degrade_latch.rs
 13 crates/rmw_cerulion/src/decode_failure_latch.rs
-9 crates/rmw_cerulion/src/era.rs
+6 crates/rmw_cerulion/src/era.rs
 4 crates/rmw_cerulion/src/era_check.rs
 11 crates/rmw_cerulion/src/ffi/era_pins.rs
 1 crates/rmw_cerulion/src/ffi/introspection_cpp.rs

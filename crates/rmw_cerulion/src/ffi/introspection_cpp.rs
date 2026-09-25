@@ -7,10 +7,15 @@
 //! C++ (namespaced, includes `<string>`), which bindgen handles poorly,
 //! but the two structs we need are plain data + C function pointers —
 //! a stable, documented layout (message_introspection.hpp). The layout
-//! below matches **Jazzy and rolling** (`is_key_` on MessageMember,
+//! below matches **Jazzy and Kilted** (`is_key_` on MessageMember,
 //! `has_any_key_member_` on MessageMembers — both added for Iron+
-//! keyed-topic support). Older distros (Humble) lack those fields and
-//! are NOT supported by this bridge; the deployed .so targets Jazzy.
+//! keyed-topic support) and, under `cfg(cerulion_has_is_rosidl_buffer)`,
+//! the **Lyrical/Rolling** shape, which appends one `bool is_rosidl_buffer_`
+//! to MessageMember (112 to 120 bytes) and changes nothing else. The cfg is
+//! derived by build.rs from the very bindings this build compiles against,
+//! so the mirror and the C-side `era_pins` can never disagree about the
+//! era. Older distros (Humble, Foxy) lack `is_key_` and are NOT supported
+//! by this bridge yet.
 //!
 //! Container access is exclusively through the member's function
 //! pointers (`size/get/get_const/fetch/assign/resize`) — never through
@@ -32,7 +37,7 @@ pub const INTROSPECTION_CPP_IDENTIFIER: &[u8] = b"rosidl_typesupport_introspecti
 pub const CPP_MSG_INIT_ALL: u32 = 0;
 
 /// Mirror of `rosidl_typesupport_introspection_cpp::MessageMember`
-/// (Jazzy/rolling layout).
+/// (Jazzy/Kilted layout, plus the Lyrical/Rolling tail field under its cfg).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CppMessageMember {
@@ -61,6 +66,16 @@ pub struct CppMessageMember {
     pub assign_function: Option<unsafe extern "C" fn(*mut c_void, usize, *const c_void)>,
     /// Resize the sequence (allocates through the C++ container).
     pub resize_function: Option<unsafe extern "C" fn(*mut c_void, usize)>,
+    /// Lyrical/Rolling only: whether the member is a `rosidl_runtime_cpp::Buffer`
+    /// (ros2/rosidl#942, appended last so every earlier offset is unchanged).
+    /// Read by `is_unbounded_u8_vector` and by the C++ forge classifier:
+    /// a Buffer member is a 16-byte pimpl object whose bytes live behind a
+    /// heap-allocated impl, never a `std::vector`, so it takes the
+    /// introspection accessor path (resize, get, copy) and is never forged
+    /// or handed to the vector shim. It also keeps the stride matching the
+    /// distro's member array.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    pub is_rosidl_buffer_: bool,
 }
 
 /// Mirror of `rosidl_typesupport_introspection_cpp::MessageMembers`
@@ -130,7 +145,23 @@ compile_error!(
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
 
+    #[cfg(not(cerulion_has_is_rosidl_buffer))]
     assert!(size_of::<CppMessageMember>() == 112);
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    assert!(size_of::<CppMessageMember>() == 120);
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    assert!(offset_of!(CppMessageMember, is_rosidl_buffer_) == 112);
+    // The C++ mirror and the bindgen-generated C member must be the same
+    // size in every era the bridge supports (Jazzy onward, where `is_key_`
+    // exists): the two introspection languages grow in lockstep, so a
+    // mirror that lags its era is caught here at compile time, not by a
+    // misread member array at runtime. Pre-Jazzy builds refuse the C++ arm
+    // at registration instead, so the check is not asserted there.
+    #[cfg(cerulion_has_is_key)]
+    assert!(
+        size_of::<CppMessageMember>()
+            == size_of::<super::rosidl_typesupport_introspection_c__MessageMember>()
+    );
     assert!(align_of::<CppMessageMember>() == 8);
     assert!(offset_of!(CppMessageMember, name_) == 0);
     assert!(offset_of!(CppMessageMember, type_id_) == 8);
@@ -210,6 +241,51 @@ extern "C" {
     pub fn rmw_cerulion_vector_u8_capacity(v: *const c_void) -> usize;
     /// `data()` of a `std::vector<uint8_t>` (test fixtures).
     pub fn rmw_cerulion_vector_u8_data(v: *const c_void) -> *const u8;
+
+    /// The introspection accessors, each called inside a `noexcept` C++
+    /// wrapper that catches every exception (Lyrical's `rosidl::Buffer`
+    /// accessors throw on a non-CPU backend) and returns 0 on success,
+    /// nonzero when the accessor threw. A nonzero status is a refused frame
+    /// on the Rust side, never a foreign unwind. No accessor pointer is
+    /// called directly from Rust; `size_function` is the one exception,
+    /// documented as non-throwing on every backend.
+    pub(crate) fn rmw_cerulion_member_get_const(
+        f: unsafe extern "C" fn(*const c_void, usize) -> *const c_void,
+        m: *const c_void,
+        index: usize,
+        out: *mut *const c_void,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_get(
+        f: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void,
+        m: *mut c_void,
+        index: usize,
+        out: *mut *mut c_void,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_resize(
+        f: unsafe extern "C" fn(*mut c_void, usize),
+        m: *mut c_void,
+        size: usize,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_fetch(
+        f: unsafe extern "C" fn(*const c_void, usize, *mut c_void),
+        m: *const c_void,
+        index: usize,
+        out: *mut c_void,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_assign(
+        f: unsafe extern "C" fn(*mut c_void, usize, *const c_void),
+        m: *mut c_void,
+        index: usize,
+        value: *const c_void,
+    ) -> std::os::raw::c_int;
+    /// Test fixture: an accessor that always throws (proves the catch).
+    #[cfg(test)]
+    pub(crate) fn rmw_cerulion_throwing_get_const(m: *const c_void, index: usize) -> *const c_void;
+    /// `sizeof(rosidl_typesupport_introspection_cpp::MessageMember)` from the
+    /// distro's own C++ header, or 0 when that header was not on the shim's
+    /// include path (a vendored build). Read by a test only.
+    #[cfg(test)]
+    pub(crate) fn rmw_cerulion_cpp_message_member_sizeof() -> usize;
     /// Adopt-take: release a primitive `std::vector`'s
     /// BUFFER through `::operator delete` — the pair `std::allocator`
     /// allocates with — never libc `free`. The one production caller is the
@@ -255,8 +331,18 @@ extern "C" {
 /// excludes a rosidl `BoundedVector<uint8_t, N>`, whose layout differs
 /// from `std::vector`. The caller additionally checks `!is_bool` and
 /// that this is a dynamic (non-fixed) array; a fixed `uint8[N]` array is
-/// classified elsewhere and never reaches this predicate's fast path.
+/// classified elsewhere and never reaches this predicate's fast path. On
+/// Lyrical and Rolling a member flagged `is_rosidl_buffer_` is a rosidl
+/// Buffer, never a vector, and is excluded first.
 pub(crate) fn is_unbounded_u8_vector(member: &CppMessageMember) -> bool {
+    // Lyrical and Rolling: an unbounded `uint8[]` member is a
+    // `rosidl::Buffer<uint8_t>` (16 bytes, storage behind a heap pimpl), not
+    // a `std::vector`; the shim's `static_cast` would read its two pointers
+    // and the 8 bytes past the object as a vector triplet. Never a vector.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    if member.is_rosidl_buffer_ {
+        return false;
+    }
     member.type_id_ == crate::type_bridge::ros_type::UINT8 && !member.is_upper_bound_
 }
 
@@ -469,4 +555,55 @@ pub unsafe fn cppstring_bytes<'a>(s: *const c_void, max: usize) -> Result<&'a [u
         return Err("std::string with null data and nonzero size (corrupt)");
     }
     Ok(std::slice::from_raw_parts(data as *const u8, len))
+}
+
+#[cfg(test)]
+mod accessor_wrapper_tests {
+    use super::*;
+
+    /// An accessor that throws is caught by the wrapper and reported as a
+    /// nonzero status with the out pointer untouched; the process neither
+    /// aborts nor unwinds into Rust.
+    #[test]
+    fn a_throwing_accessor_is_a_nonzero_status_not_an_unwind() {
+        let mut out: *const c_void = std::ptr::null();
+        let status = unsafe {
+            rmw_cerulion_member_get_const(
+                rmw_cerulion_throwing_get_const,
+                std::ptr::null(),
+                0,
+                &mut out,
+            )
+        };
+        assert_ne!(status, 0, "the throw must surface as a status");
+        assert!(out.is_null());
+    }
+
+    /// On a real-header build the hand-written mirror is exactly the C++
+    /// header's `MessageMember`; a vendored build has no header to compare
+    /// with and reports 0, which this test treats as "not applicable" rather
+    /// than as agreement.
+    #[test]
+    fn the_cpp_member_mirror_matches_the_distro_header_where_one_exists() {
+        let from_header = unsafe { rmw_cerulion_cpp_message_member_sizeof() };
+        if from_header == 0 {
+            return;
+        }
+        assert_eq!(std::mem::size_of::<CppMessageMember>(), from_header);
+    }
+
+    /// A non-throwing accessor passes its value through with status 0.
+    #[test]
+    fn a_plain_accessor_passes_through_with_status_zero() {
+        unsafe extern "C" fn first(m: *const c_void, _i: usize) -> *const c_void {
+            m
+        }
+        let marker = 7u8;
+        let mut out: *const c_void = std::ptr::null();
+        let status = unsafe {
+            rmw_cerulion_member_get_const(first, &marker as *const u8 as *const c_void, 0, &mut out)
+        };
+        assert_eq!(status, 0);
+        assert_eq!(out as usize, &marker as *const u8 as usize);
+    }
 }

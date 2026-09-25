@@ -1025,7 +1025,15 @@ impl CppBridgedMessage {
                         let dst = cur.append_zeroed(count).map_err(|d| self.encode_err(d))?;
                         for (i, b) in dst.iter_mut().enumerate() {
                             let mut v: bool = false;
-                            fetch(field, i, &mut v as *mut bool as *mut c_void);
+                            if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                                fetch,
+                                field,
+                                i,
+                                &mut v as *mut bool as *mut c_void,
+                            ) != 0
+                            {
+                                return Err(self.encode_err("sequence accessor threw"));
+                            }
                             *b = v as u8;
                         }
                     } else if count == 0 {
@@ -1038,7 +1046,20 @@ impl CppBridgedMessage {
                         let get = member.get_const_function.ok_or_else(|| {
                             self.encode_err("sequence missing get_const_function")
                         })?;
-                        let base = get(field, 0) as *const u8;
+                        // Through the noexcept wrapper: a rosidl Buffer on a
+                        // non-CPU backend THROWS from this accessor, and a
+                        // throw across the accessor pointer would be a
+                        // foreign unwind; a nonzero status refuses the frame.
+                        let mut elem: *const c_void = std::ptr::null();
+                        if ffi::introspection_cpp::rmw_cerulion_member_get_const(
+                            get, field, 0, &mut elem,
+                        ) != 0
+                        {
+                            return Err(self.encode_err(
+                                "sequence accessor threw (a rosidl Buffer on a non-CPU backend)",
+                            ));
+                        }
+                        let base = elem as *const u8;
                         if base.is_null() {
                             return Err(self.encode_err("sequence element pointer is null"));
                         }
@@ -1626,8 +1647,17 @@ fn cpp_op_var_idx(op: &CppFieldOp) -> usize {
 /// plus the C++-only precondition: the process's `std::vector` really is
 /// the three-pointer triplet ([`vector_triplet_layout_verified`]). A
 /// BOUNDED sequence is additionally a different C++ type here (rosidl's
-/// `BoundedVector`), which is reason enough on its own.
+/// `BoundedVector`), which is reason enough on its own; and on Lyrical and
+/// Rolling a `rosidl::Buffer` member is refused first (no triplet exists).
 fn is_forgeable_sequence_cpp(member: &CppMessageMember, triplet_layout_ok: bool) -> bool {
+    // Lyrical and Rolling: a `rosidl::Buffer` member (`is_rosidl_buffer_`)
+    // carries no in-struct triplet at all (its storage sits in a
+    // heap-allocated impl behind a pointer), so there is nothing to aim: a
+    // forge would overwrite the two pointers and 8 bytes past the object.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    if member.is_rosidl_buffer_ {
+        return false;
+    }
     triplet_layout_ok
         && member.is_array_
         && member.array_size_ == 0
@@ -1701,7 +1731,11 @@ unsafe fn write_prim_seq_cpp(
         let Some(resize) = member.resize_function else {
             return false;
         };
-        resize(field, count);
+        // Through the noexcept wrapper (see the encode twin): a throwing
+        // accessor is a refused frame, never a foreign unwind.
+        if ffi::introspection_cpp::rmw_cerulion_member_resize(resize, field, count) != 0 {
+            return false;
+        }
     }
     if count == 0 {
         return true;
@@ -1712,14 +1746,26 @@ unsafe fn write_prim_seq_cpp(
         };
         for (i, &b) in bytes.iter().enumerate() {
             let v: bool = b != 0;
-            assign(field, i, &v as *const bool as *const c_void);
+            if ffi::introspection_cpp::rmw_cerulion_member_assign(
+                assign,
+                field,
+                i,
+                &v as *const bool as *const c_void,
+            ) != 0
+            {
+                return false;
+            }
         }
         true
     } else {
         let Some(get) = member.get_function else {
             return false;
         };
-        let base = get(field, 0) as *mut u8;
+        let mut elem: *mut c_void = std::ptr::null_mut();
+        if ffi::introspection_cpp::rmw_cerulion_member_get(get, field, 0, &mut elem) != 0 {
+            return false;
+        }
+        let base = elem as *mut u8;
         if base.is_null() {
             return false;
         }
@@ -1790,7 +1836,13 @@ unsafe fn element_ptr(
     let get = member
         .get_const_function
         .ok_or("sequence missing get_const_function")?;
-    let p = get(field, i);
+    // Every introspection accessor is called through its noexcept catcher:
+    // a throwing accessor (a rosidl Buffer on a non-CPU backend) is a
+    // refused frame, never a foreign unwind.
+    let mut p: *const c_void = std::ptr::null();
+    if ffi::introspection_cpp::rmw_cerulion_member_get_const(get, field, i, &mut p) != 0 {
+        return Err("sequence accessor threw (a rosidl Buffer on a non-CPU backend)");
+    }
     if p.is_null() {
         return Err("sequence element pointer is null");
     }
@@ -1803,7 +1855,10 @@ unsafe fn element_ptr_mut(
     i: usize,
 ) -> Option<*mut c_void> {
     let get = member.get_function?;
-    let p = get(field, i);
+    let mut p: *mut c_void = std::ptr::null_mut();
+    if ffi::introspection_cpp::rmw_cerulion_member_get(get, field, i, &mut p) != 0 {
+        return None;
+    }
     if p.is_null() {
         None
     } else {
@@ -1897,7 +1952,15 @@ unsafe fn encode_message_payload_cpp(
                 buf.resize(count, 0);
                 for (i, b) in buf.iter_mut().enumerate() {
                     let mut v: bool = false;
-                    fetch(field_ptr, i, &mut v as *mut bool as *mut c_void);
+                    if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                        fetch,
+                        field_ptr,
+                        i,
+                        &mut v as *mut bool as *mut c_void,
+                    ) != 0
+                    {
+                        return Err("sequence accessor threw");
+                    }
                     *b = v as u8;
                 }
             } else if count > 0 {
@@ -2043,7 +2106,9 @@ unsafe fn prepare_seq_cpp(member: &CppMessageMember, field: *mut c_void, count: 
     let Some(resize) = member.resize_function else {
         return false;
     };
-    resize(field, count);
+    if ffi::introspection_cpp::rmw_cerulion_member_resize(resize, field, count) != 0 {
+        return false;
+    }
     true
 }
 
@@ -2244,7 +2309,17 @@ impl CppBridgedMessage {
                             owned.resize(start + count, 0);
                             for (i, b) in owned[start..].iter_mut().enumerate() {
                                 let mut v: bool = false;
-                                fetch(field, i, &mut v as *mut bool as *mut c_void);
+                                if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                                    fetch,
+                                    field,
+                                    i,
+                                    &mut v as *mut bool as *mut c_void,
+                                ) != 0
+                                {
+                                    return Err(SealRefusal::Encode(
+                                        self.encode_err("sequence accessor threw"),
+                                    ));
+                                }
                                 *b = v as u8;
                             }
                             items.push(SealItem::CopyOwned {
@@ -2446,6 +2521,45 @@ impl CppBridgedMessage {
 
 #[cfg(test)]
 mod cpp_package_tests {
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    fn u8_sequence_member(is_rosidl_buffer: bool) -> super::CppMessageMember {
+        super::CppMessageMember {
+            name_: c"data".as_ptr(),
+            type_id_: super::ros_type::UINT8,
+            string_upper_bound_: 0,
+            members_: std::ptr::null(),
+            is_key_: false,
+            is_array_: true,
+            array_size_: 0,
+            is_upper_bound_: false,
+            offset_: 0,
+            default_value_: std::ptr::null(),
+            size_function: None,
+            get_const_function: None,
+            get_function: None,
+            fetch_function: None,
+            assign_function: None,
+            resize_function: None,
+            is_rosidl_buffer_: is_rosidl_buffer,
+        }
+    }
+
+    /// Lyrical and Rolling: a `uint8[]` member flagged as a rosidl Buffer is
+    /// never forged and never handed to the `std::vector` shim, while the
+    /// same member without the flag (a real vector) is both. The flag is
+    /// the ONLY difference between the two fixtures.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    #[test]
+    fn a_rosidl_buffer_member_is_never_forged_nor_treated_as_a_u8_vector() {
+        use crate::ffi::introspection_cpp::is_unbounded_u8_vector;
+        let buffer = u8_sequence_member(true);
+        assert!(!super::is_forgeable_sequence_cpp(&buffer, true));
+        assert!(!is_unbounded_u8_vector(&buffer));
+        let vector = u8_sequence_member(false);
+        assert!(super::is_forgeable_sequence_cpp(&vector, true));
+        assert!(is_unbounded_u8_vector(&vector));
+    }
+
     use super::cpp_package;
 
     /// Both accepted namespace spellings normalize to ONE
