@@ -95,13 +95,86 @@ env:
   PINNED_NIGHTLY: nightly-2026-04-07
 
 jobs:
+  # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
+  # that care. Two runner-seconds of work plus a checkout.
+  #
+  # Only `deb-smoke` reads it today, and only to RUN ITSELF on a pull request it
+  # would otherwise skip. Nothing in this file uses a class to SKIP a job that
+  # would otherwise run, which is the direction that could weaken a gate: the
+  # rules live in `tools/scripts/ci_changed_paths.sh` with the reasoning and a
+  # `--self-test` table, and `lint` runs that table.
+  #
+  # On `push`, `merge_group` and `workflow_dispatch` there is no pull request to
+  # diff, so every class is `false` and the jobs that consult it fall back to the
+  # event test they had before.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      packaging: ${{ steps.classify.outputs.packaging }}
+    steps:
+      # `fetch-depth: 0` because the diff is against the pull request's BASE
+      # commit, which a shallow checkout does not have. It is the whole cost of
+      # this job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Classify the changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "not a pull request: every class is false"
+            echo "packaging=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # On a `pull_request` event the checkout is the MERGE commit, so
+          # `diff <base> HEAD` is exactly what the pull request changes.
+          # `--no-renames` so a rename arrives as its DELETE plus its ADD.
+          # With rename detection left on, `--name-only` prints the DESTINATION
+          # path alone, so renaming a listed packaging input to an unlisted path
+          # would classify as `packaging=false` and skip the job that reads it.
+          git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+          echo "== changed paths =="
+          cat "$RUNNER_TEMP/changed.txt"
+          ./tools/scripts/ci_changed_paths.sh < "$RUNNER_TEMP/changed.txt" \
+            | tee -a "$GITHUB_OUTPUT"
+
   deb-smoke:
     name: Debian and APT package smoke
     runs-on: ubuntu-22.04
+    needs: [changes]
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
-    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+    #
+    # EXCEPT on a pull request that touches the packaging inputs themselves. The
+    # cost policy holds because almost no pull request can break this job; the
+    # ones that can are the ones that edit the scripts it drives, the license
+    # inventory it assembles or the packaging docs that describe its output, and
+    # for those "breakage is caught on the merge to main" means a revert instead
+    # of a red check. `tools/scripts/ci_changed_paths.sh` holds the list and
+    # derives it from this job's own steps.
+    #
+    # `merge_group` stays excluded either way: the queue would pay for the same
+    # work a second time over the same commits, and `main`'s push run is still
+    # the control.
+    #
+    # `!cancelled()` is load bearing. `needs: [changes]` makes the classifier a
+    # prerequisite on EVERY event, and GitHub skips a dependent when its
+    # dependency fails, so without the guard a checkout or classification
+    # failure would silently skip this job on `push`, where it runs
+    # unconditionally today. With it, a push runs the smoke whatever the
+    # classifier did, and a pull request whose classifier failed reads an empty
+    # `packaging` and skips, which is exactly the behaviour it has today.
+    if: >-
+      !cancelled()
+      && ((github.event_name != 'pull_request' && github.event_name != 'merge_group')
+      || (github.event_name == 'pull_request' && needs.changes.outputs.packaging == 'true'))
     # Measured 22 min on the PR head (the debug-binary tar + dpkg-deb step
     # alone is ~12 min); 30 left eight minutes of headroom on a
     # compression-bound job.
@@ -455,6 +528,12 @@ jobs:
 
       - name: Crates.io publish retry self-test
         run: ./tools/scripts/test_publish_crates.sh
+
+      # The path classifier the `changes` job runs. Its table is what decides
+      # whether a pull request pays for the 22-minute packaging smoke, so it is
+      # executed here rather than only read by shellcheck below.
+      - name: Changed-path classifier self-test
+        run: ./tools/scripts/ci_changed_paths.sh --self-test
 
       # A static linter is the only automated reader most of these scripts
       # get: CI executes only a few of them (the two gates this workflow runs,
