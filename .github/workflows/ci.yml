@@ -1399,6 +1399,16 @@ jobs:
     # reported as a cancellation. Same rule as every number above: the ceiling
     # guards a HUNG job, not a budget. Tighten it once three or four green runs
     # have put a real wall on a leg — that is an OPEN ITEM, not an oversight.
+    #
+    # THE RUNS ARE IN, and the answer is that it STAYS at 60. Sixteen green
+    # legs across four runs: 16.4, 18.0, 18.3, 18.8, 19.7, 20.4, 20.7, 21.2,
+    # 24.4, 26.8, 26.9 min — and one at 40.7. The outlier is the number that
+    # decides this. It was not a slow suite: that leg's own `Free disk space`
+    # step, which normally runs 1.2 to 4.3 min, took 21.4 min on a stalled
+    # runner, and the rest of the job was ordinary. A ceiling has to survive
+    # the runner having a bad day, because a cancelled green suite costs a
+    # rerun of the whole workflow. 60 is 1.5x the worst observed leg; the
+    # ~26 min a healthy leg takes is not the number to size against.
     timeout-minutes: 60
     # Even with the SDK-bloat reclaim below, the union of the
     # external-source feature + the multi-process spawner overflowed the runner
@@ -2440,13 +2450,20 @@ jobs:
   # (it needs a live CycloneDDS peer), so what runs here is the pure decision
   # engine. The `humble` variant stays CHECK-only, as the project docs say.
   #
-  # TIMEOUT 60: not measured on a runner, and deliberately generous rather than
-  # tight. `cerulion_link` / `cerulion_remoted` cold-compile the ~390-crate
-  # iroh tree and `cerulion_accountd` a web stack (axum/hyper/rusqlite), none of
-  # which any other job in this file caches for them. A cold-cache timeout is
-  # self-sustaining (the job dies before `actions/cache` can save), so the
-  # headroom is taken BEFORE the first red run. Recorded as an open item: tune
-  # it down once two or three green runs have put a real number on it.
+  # TIMEOUT 60 -> 40, and the open item that asked for this is now closed.
+  # 60 was taken BEFORE the first run of this job, deliberately generous: its
+  # packages cold-compile the ~390-crate iroh tree (`cerulion_link`,
+  # `cerulion_remoted`) and a web stack (`cerulion_accountd`: axum, hyper,
+  # rusqlite), nothing else in this file caches those for them, and a
+  # cold-cache timeout is self-sustaining because the job dies before
+  # `actions/cache` can save. The note asked for two or three green runs to put
+  # a real number on it.
+  #
+  # SIX green legs now have, across four runs and both runners, cache hit and
+  # cache miss: 7.8, 9.4, 11.6, 11.8, 13.8, 16.6 min. The worst of those is the
+  # macOS leg of a run with no cache at all, which is the cold case the 60 was
+  # bought for. 40 is 2.4x it, and it still guards a HUNG job rather than
+  # rationing a healthy one, which is the rule this file applies everywhere.
   # ==========================================================================
   crate-tests:
     name: Crate tests (${{ matrix.os }})
@@ -2458,7 +2475,7 @@ jobs:
         # so each leg renders its own required check name.
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 40
     env:
       # `line-tables-only`, matching the other TEST jobs: backtraces keep
       # file:line (what makes a red run diagnosable) while the target dir stays
