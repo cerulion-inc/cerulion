@@ -222,6 +222,7 @@ impl Publisher {
         timestamp_ns: Option<u64>,
     ) -> PyResult<Loan> {
         let mut this = slf.borrow_mut();
+        this.reap();
         let layout = schemas
             .inner
             .layout(name)
@@ -331,6 +332,7 @@ impl Publisher {
                 self.max_payload_len
             )));
         }
+        self.reap();
         let mut loan = self
             .publisher
             .loan_raw_uninit(total)

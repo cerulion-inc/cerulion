@@ -10,7 +10,7 @@
 #![allow(clippy::print_stdout)]
 
 use cerulion_core::clock::real_ns;
-use cerulion_core::codegen::parse_rosmsg;
+use cerulion_core::codegen::{parse_rosmsg, FrameValueKind};
 use cerulion_core::dynamic::{FrameView, SchemaSet};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::transport::TransportManager;
@@ -304,16 +304,28 @@ fn aligned_frame<'s>(bytes: &[u8], scratch: &'s mut Vec<u8>) -> &'s [u8] {
 /// Split an encoded `std_msgs/Header` body (`stamp.sec`, `stamp.nanosec`,
 /// then the `frame_id` string) without trusting its length: the top-level
 /// `FrameView` check does not validate a nested entry's contents.
-fn header_fields(header: &[u8]) -> Result<(i32, u32, &str), String> {
-    let short = || format!("nested header is {} bytes, shorter than 16", header.len());
-    let sec = header.get(0..4).ok_or_else(short)?;
-    let nanosec = header.get(4..8).ok_or_else(short)?;
-    let frame_id = header.get(16..).ok_or_else(short)?;
-    Ok((
-        i32::from_le_bytes(sec.try_into().map_err(|_| short())?),
-        u32::from_le_bytes(nanosec.try_into().map_err(|_| short())?),
-        std::str::from_utf8(frame_id).map_err(|e| e.to_string())?,
-    ))
+/// The LaserScan's `std_msgs/Header` (`stamp.sec`, `stamp.nanosec`,
+/// `frame_id`), read through a full walk so the nested header's own offset
+/// table is bounds-checked rather than assumed.
+fn header_fields(set: &SchemaSet, bytes: &[u8]) -> Result<(i32, u32, String), String> {
+    let decoded = FrameView::new(set.walker(), bytes)
+        .and_then(|view| view.decode(set.walker()))
+        .map_err(|e| format!("invalid typed frame: {e}"))?;
+    let Some(FrameValueKind::Nested(header)) = decoded.field("header") else {
+        return Err("LaserScan has no nested header".to_string());
+    };
+    let Some(FrameValueKind::Nested(stamp)) = header.field("stamp") else {
+        return Err("header has no nested stamp".to_string());
+    };
+    let (Some(FrameValueKind::I32(sec)), Some(FrameValueKind::U32(nanosec))) =
+        (stamp.field("sec"), stamp.field("nanosec"))
+    else {
+        return Err("header stamp is not (int32 sec, uint32 nanosec)".to_string());
+    };
+    let Some(FrameValueKind::Str(frame_id)) = header.field("frame_id") else {
+        return Err("header frame_id is not a UTF-8 string".to_string());
+    };
+    Ok((*sec, *nanosec, (*frame_id).to_string()))
 }
 
 fn check_typed_frame<T: ShmMessage>(set: &SchemaSet, bytes: &[u8]) -> Result<(), String> {
@@ -386,7 +398,7 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
                         let value =
                             sensor_msgs::LaserScanShm::from_bytes(&bytes[WireHeader::SIZE..])
                                 .snapshot();
-                        let (stamp_sec, stamp_nanosec, frame_id) = header_fields(&value.header)?;
+                        let (stamp_sec, stamp_nanosec, frame_id) = header_fields(&set, bytes)?;
                         println!(
                             "frame index={i} schema={schema} values=angle_min={} angle_max={} angle_increment={} time_increment={} scan_time={} range_min={} range_max={} ranges={:?} intensities={:?} header_stamp_sec={} header_stamp_nanosec={} frame_id={}",
                             value.angle_min,

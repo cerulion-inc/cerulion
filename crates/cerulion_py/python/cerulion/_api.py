@@ -197,7 +197,13 @@ class Publisher:
         """Publish a complete wire frame, preserving its offset table."""
         if self._schema is not None:
             self._check_schema_binding()
-        self._native.publish_frame(frame_bytes, timestamp_ns)
+        try:
+            self._native.publish_frame(frame_bytes, timestamp_ns)
+        except BufferError as e:
+            raise TypeError(
+                "frame must be a contiguous bytes-like object of single-byte "
+                "items (bytes, bytearray, memoryview of bytes, np.uint8 array)"
+            ) from e
 
 
 class Loan:
