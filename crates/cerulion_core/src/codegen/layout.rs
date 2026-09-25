@@ -36,7 +36,10 @@ use super::schema::{FieldType, MessageSchema};
 use std::collections::BTreeMap;
 
 /// Layout of one fixed-section field.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serializes (serde) as a plain struct so a language binding can read the
+/// descriptor as JSON — see [`WireLayout::to_json`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FieldLayout {
     /// Field name (schema order is preserved in [`WireLayout::fixed_fields`]).
     pub name: String,
@@ -58,7 +61,11 @@ pub struct FieldLayout {
 /// [offset table   (8 × variable_fields.len() bytes)]
 /// [variable payload …]
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serializes (serde) as a plain struct; [`WireLayout::to_json`] is the
+/// deterministic JSON descriptor a language binding consumes
+/// (`cerulion_core::dynamic`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WireLayout {
     /// Qualified schema name (`"pkg/Name"` or bare).
     pub qualified_name: String,
@@ -88,7 +95,9 @@ pub struct WireLayout {
 }
 
 /// Layout info for one variable (offset-table) field.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serializes (serde) as a plain struct — see [`WireLayout::to_json`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VariableFieldLayout {
     /// Field name (matches the rosidl introspection member name).
     pub name: String,
@@ -135,8 +144,22 @@ impl WireLayout {
     /// `FrameWalker`'s frame audit and `rmw_cerulion`'s forged loaned take
     /// (which would otherwise hand a C++ `std::vector` header/table bytes as
     /// its elements). ONE definition, so the two gates cannot drift.
+    /// This arithmetic is unchecked; dynamic entry points validate the layout
+    /// before calling it.
     pub fn data_floor(&self) -> usize {
         self.offset_table_offset() + self.offset_table_bytes()
+    }
+
+    /// The layout as a compact JSON descriptor (`serde_json::to_string`).
+    ///
+    /// Deterministic: struct fields serialize in declaration order and the
+    /// field vectors keep schema declaration order, so the same layout
+    /// always renders the same string (pinned against a hand-written
+    /// oracle in `dynamic::tests`). This is the descriptor a language
+    /// binding reads to drive [`crate::dynamic::FrameEncoder`] /
+    /// [`crate::dynamic::FrameView`] field access by name.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
     }
 }
 

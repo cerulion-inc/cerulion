@@ -17,13 +17,9 @@ use crate::schema_store::{builtin_has_qualified, SchemaStore, StoredSchema};
 use crate::utils::to_pascal_case;
 use crate::workspace_lock::WorkspaceLock;
 
-/// Maximum accepted `FixedArray` length in workspace schema YAML.
-///
-/// `MessageSchema::wire_fixed_size()` uses checked arithmetic and panics
-/// (with a field-naming message) on hostile lengths at codegen time; this
-/// CLI pre-validation rejects oversized lengths with a `CliError` so user
-/// input can never reach that panic.
-pub const MAX_FIXED_ARRAY_LEN: usize = 1_048_576;
+/// Inline fixed-length cap, shared with `cerulion_core::dynamic` (the ONE
+/// YAML schema parser) so CLI and bindings refuse the same declarations.
+pub use cerulion_core::dynamic::MAX_FIXED_ARRAY_LEN;
 
 /// `schema info`-context remedy for [`CliError::SchemaNotFound`]:
 /// names BOTH lookup sources and the
@@ -245,8 +241,8 @@ fn schema_info_entries(
 /// The graph-run path uses this to compute each workspace
 /// schema's recipe-3 `schema_hash` for the YAML-`schema:`-vs-macro-output
 /// divergence warn. It shares the IR-building loop with [`schema_info`]
-/// (via `parse_schema_fields_into` — same strict field-key parsing +
-/// `FixedArray` length guards) but discards the per-field display
+/// (both call the core parser — same strict field-key parsing +
+/// `FixedArray` length guards) but skips the per-field display
 /// rendering `schema info` needs — this caller only wants the hashable IR.
 ///
 /// The returned schemas are UNRESOLVED (every `Nested` reference is
@@ -262,61 +258,12 @@ fn schema_info_entries(
 /// Workspace schemas are package-less, so each returned schema's
 /// [`MessageSchema::qualified_name`] is its bare name.
 pub fn parse_message_schemas(content: &str) -> CliResult<Vec<MessageSchema>> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(content)?;
-
-    let schemas = doc
-        .get("schemas")
-        .and_then(|s| s.as_mapping())
-        .ok_or_else(|| {
-            CliError::Validation("invalid schema format: missing 'schemas' key".to_string())
-        })?;
-
-    let mut out = Vec::new();
-    for (schema_name, schema_def) in schemas {
-        // A non-string schema-NAME key (e.g. a YAML int/bool) cannot match
-        // a real `schema:` string and, as a map KEY downstream, would
-        // collide other coerced names under one "unknown" bucket — silently
-        // defeating the divergence check. Reject loudly, mirroring the
-        // field-key path in `parse_schema_fields_into`. (The caller
-        // downgrades this to a warn + skip, so it stays non-fatal but
-        // visible — never silent.)
-        let name_str = schema_name
-            .as_str()
-            .ok_or_else(|| {
-                CliError::Validation(format!(
-                    "schema name key {:?} is not a string; schema names must be \
-                     strings (e.g. 'Image')",
-                    schema_name
-                ))
-            })?
-            .to_string();
-        // An EMPTY (or blank) entry key is refused at the ONE parse
-        // gate every consumer routes through — a `Foo.yaml` whose sole entry
-        // is keyed `""` otherwise parses, so its stem bound a validated port
-        // `Foo` to the empty schema key: an unusable topic binding, silently.
-        // Refusing it here makes the file unparseable everywhere at once
-        // (the stem tier ERRORS at validation, the listing skips it with a
-        // warn, no claim is minted) instead of one guard per consumer.
-        if name_str.trim().is_empty() {
-            return Err(CliError::Validation(
-                "schema entry key is empty; schema names must be non-empty strings (a `schemas:` \
-                 mapping key like `Goal` or `pkg/Type`)"
-                    .to_string(),
-            ));
-        }
-        // The IR keeps the DECLARED spelling: the entry name is
-        // the wire-hash identity, and a workspace node's build script reads
-        // the same YAML key into `MessageSchema::new` ("one yaml, one hash"),
-        // so canonicalizing it here made the CLI hash `pkg/Type`
-        // while the built node hashed `pkg::Type` — a live divergence. The
-        // ONE identity for CLAIMS and lookups is applied where those are
-        // keyed (`workspace_yaml_bare_claims_of`, the listing, `schema info`),
-        // never on the hashed name.
-        let mut schema = MessageSchema::new(name_str.clone());
-        let _ = parse_schema_fields_into(&name_str, schema_def, &mut schema)?;
-        out.push(schema);
-    }
-    Ok(out)
+    // Parse twice on purpose (this is a cold path): the raw parse preserves
+    // `CliError::Yaml` for malformed documents, while the core parse remains
+    // the ONE schema-rule implementation shared with bindings.
+    serde_yaml::from_str::<serde_yaml::Value>(content)?;
+    cerulion_core::dynamic::parse_yaml_schemas(content)
+        .map_err(|e| CliError::Validation(e.to_string()))
 }
 
 /// Drop every schema whose fixed-section size arithmetic overflows
@@ -4774,24 +4721,36 @@ pub fn schema_list_opt(schemas_dir: Option<&Path>) -> SchemaListing {
     }
 }
 
-/// Shared field-parse loop for [`schema_info`] and [`parse_message_schemas`].
+/// Field-parse loop for [`schema_info`]'s display rows.
 ///
 /// Walks the `fields:` mapping of one schema document in declaration order,
 /// rejecting non-string field keys loudly, parsing each `<type> <name>` key
-/// (strict 2-token form + `FixedArray`/`StringFixed` length guards via
-/// [`parse_schema_field_key`]), and pushing each parsed field onto `schema`.
-/// Returns the per-field display entries `schema info` needs;
-/// `parse_message_schemas` discards them.
-///
-/// Single source of truth for the parse so the two callers can never drift
-/// on field-key strictness or the nested-marker rendering.
+/// through the core parser ([`cerulion_core::dynamic::parse_field_key`] —
+/// the same strict 2-token form + `FixedArray`/`StringFixed` length guards
+/// [`parse_message_schemas`] applies), and pushing each parsed field onto
+/// `schema`. Returns the per-field display entries `schema info` needs.
 fn parse_schema_fields_into(
     schema_name: &str,
     schema_def: &serde_yaml::Value,
     schema: &mut MessageSchema,
 ) -> CliResult<Vec<SchemaFieldEntry>> {
+    let schema_def = schema_def.as_mapping().ok_or_else(|| {
+        CliError::Validation(format!(
+            "schema '{}': definition must be a mapping (`description:` / `fields:`), got a scalar, sequence or null",
+            schema_name
+        ))
+    })?;
     let mut field_entries = vec![];
-    if let Some(fields) = schema_def.get("fields").and_then(|f| f.as_mapping()) {
+    let fields = schema_def
+        .get(serde_yaml::Value::from("fields"))
+        .filter(|value| !value.is_null());
+    if let Some(fields) = fields {
+        let fields = fields.as_mapping().ok_or_else(|| {
+            CliError::Validation(format!(
+                "schema '{}': `fields:` must be a mapping of '<type> <name>' keys",
+                schema_name
+            ))
+        })?;
         for (field_key, _value) in fields {
             let key_str = field_key.as_str().ok_or_else(|| {
                 CliError::Validation(format!(
@@ -4800,7 +4759,9 @@ fn parse_schema_fields_into(
                     schema_name, field_key
                 ))
             })?;
-            let (field_type, field_name) = parse_schema_field_key(schema_name, key_str)?;
+            let (field_type, field_name) =
+                cerulion_core::dynamic::parse_field_key(schema_name, key_str)
+                    .map_err(|e| CliError::Validation(e.to_string()))?;
             let is_nested = field_type_is_nested(&field_type);
             field_entries.push(SchemaFieldEntry {
                 name: field_name.clone(),
@@ -4821,38 +4782,6 @@ fn parse_schema_fields_into(
         }
     }
     Ok(field_entries)
-}
-
-/// Parse one schema-YAML field key of the form `<type> <name>`.
-///
-/// Strict and loud (parser hardening):
-/// - keys without exactly 2 whitespace tokens are rejected with a
-///   `CliError` naming the offending key and the expected form;
-/// - `FixedArray` lengths above [`MAX_FIXED_ARRAY_LEN`] are rejected with
-///   a `CliError` so the CLI never reaches the codegen-time
-///   `wire_fixed_size()` overflow panic.
-fn parse_schema_field_key(schema_name: &str, key: &str) -> CliResult<(FieldType, String)> {
-    let tokens: Vec<&str> = key.split_whitespace().collect();
-    let [type_token, name_token] = tokens.as_slice() else {
-        return Err(CliError::Validation(format!(
-            "schema '{}': invalid field key {:?} — expected exactly \
-             '<type> <name>' (e.g. 'uint32 height'), got {} token(s)",
-            schema_name,
-            key,
-            tokens.len()
-        )));
-    };
-
-    let field_type = FieldType::parse(type_token).map_err(|e| {
-        CliError::Validation(format!(
-            "schema '{}': invalid type in field key {:?}: {}",
-            schema_name, key, e
-        ))
-    })?;
-
-    validate_fixed_array_lengths(schema_name, key, &field_type)?;
-
-    Ok((field_type, name_token.to_string()))
 }
 
 /// True if `field_type` is a nested schema reference, OR an array
@@ -4876,53 +4805,6 @@ fn field_type_is_nested(field_type: &FieldType) -> bool {
             field_type_is_nested(element_type)
         }
         _ => false,
-    }
-}
-
-/// Recursively reject inline fixed-length declarations above
-/// [`MAX_FIXED_ARRAY_LEN`].
-///
-/// Covers BOTH inline-sized variants that feed
-/// `MessageSchema::wire_fixed_size()`'s checked arithmetic:
-/// - `FixedArray { length }` — the element count, and
-/// - `StringFixed(n)` — the inline byte capacity.
-///
-/// `StringFixed` is `is_definitely_fixed()`, so a hostile `n` (e.g.
-/// `string_fixed[18446744073709551615]`) reaches `wire_fixed_size()` and
-/// overflows `offset.checked_add(n)` → codegen-time panic. Pre-validating
-/// it here (same cap as `FixedArray`) keeps user input on the `CliError`
-/// path instead of the panic path. An earlier `_ => Ok(())` fallthrough
-/// let `StringFixed` slip past this guard.
-fn validate_fixed_array_lengths(
-    schema_name: &str,
-    key: &str,
-    field_type: &FieldType,
-) -> CliResult<()> {
-    match field_type {
-        FieldType::FixedArray {
-            element_type,
-            length,
-        } => {
-            if *length > MAX_FIXED_ARRAY_LEN {
-                return Err(CliError::Validation(format!(
-                    "schema '{}': field key {:?} declares a FixedArray of \
-                     length {} — the maximum supported length is {}",
-                    schema_name, key, length, MAX_FIXED_ARRAY_LEN
-                )));
-            }
-            validate_fixed_array_lengths(schema_name, key, element_type)
-        }
-        FieldType::StringFixed(length) => {
-            if *length > MAX_FIXED_ARRAY_LEN {
-                return Err(CliError::Validation(format!(
-                    "schema '{}': field key {:?} declares a StringFixed of \
-                     length {} — the maximum supported length is {}",
-                    schema_name, key, length, MAX_FIXED_ARRAY_LEN
-                )));
-            }
-            Ok(())
-        }
-        _ => Ok(()),
     }
 }
 
@@ -6281,6 +6163,28 @@ mod tests {
             msg.contains("schema name") && msg.contains("not a string"),
             "must reject a non-string schema name loudly: {msg}"
         );
+    }
+
+    #[test]
+    fn test_parse_message_schemas_keeps_malformed_yaml_as_yaml_error() {
+        let err = parse_message_schemas("schemas: [unclosed").expect_err("malformed YAML");
+        assert!(matches!(err, CliError::Yaml(_)));
+        assert!(err.to_string().starts_with("YAML error:"));
+    }
+
+    #[test]
+    fn test_parse_message_schemas_rejects_scalar_schema_definition() {
+        let err = parse_message_schemas("schemas:\n  Foo: 3\n").expect_err("scalar schema");
+        assert!(
+            matches!(err, CliError::Validation(message) if message.contains("must be a mapping"))
+        );
+    }
+
+    #[test]
+    fn test_parse_message_schemas_rejects_invalid_fields_shape() {
+        let err = parse_message_schemas("schemas:\n  Foo:\n    fields: bad\n")
+            .expect_err("scalar fields");
+        assert!(matches!(err, CliError::Validation(message) if message.contains("fields")));
     }
 
     /// A well-formed workspace schema parses to a single `MessageSchema`
