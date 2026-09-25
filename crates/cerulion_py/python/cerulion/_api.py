@@ -324,8 +324,7 @@ class Frame:
     def __init__(self, native):
         self._native = native
         self._typed = None
-        self._message = None
-        self._message_key = None
+        self._messages = {}
 
     def _check_alive(self):
         if self.is_released:
@@ -375,10 +374,11 @@ class Frame:
 
     def release(self):
         """Return the SHM slot to the publisher pool (idempotent)."""
-        cached = self._message() if self._message is not None else None
-        if cached is not None:
-            cached._detach()
-        self._message = None
+        messages, self._messages = self._messages, {}
+        for ref in messages.values():
+            message = ref()
+            if message is not None:
+                message._detach()
         self._native.release()
 
     def view(self, schemas=None, schema=None):
@@ -391,16 +391,17 @@ class Frame:
             raise TypeError("schemas and schema must be provided together")
         self._check_alive()
         key = (id(schemas), schemas._generation, schema)
-        cached = self._message() if self._message is not None else None
-        if cached is not None and self._message_key == key:
+        ref = self._messages.get(key)
+        cached = ref() if ref is not None else None
+        if cached is not None:
             return cached
         descriptor = schemas._native.resolve_frame(self._native, schema)
         layout = schemas.layout(descriptor["schema"])
         message = Message(self.payload, layout, schemas, descriptor["variables"], self)
         # Weak: a strong cache would cycle with ``Message._owner`` and pin
         # the slot's buffer export until cyclic GC.
-        self._message = weakref.ref(message)
-        self._message_key = key
+        self._messages = {k: r for k, r in self._messages.items() if r() is not None}
+        self._messages[key] = weakref.ref(message)
         return message
 
     def __enter__(self):
