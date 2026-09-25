@@ -9,10 +9,12 @@
 
 use std::io::Write;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::auth;
 use cerulion_cli_engine::error::{CliError, CliResult};
+use cerulion_cli_engine::login_cmd::LoginOutcome;
 use cerulion_telemetry::consent::{self, Source};
 use cerulion_telemetry::{guard, Client, Common, EventSpec, Props, DEFAULT_SHUTDOWN_BUDGET};
 
@@ -23,6 +25,17 @@ pub const CLI_COMMAND_RUN: EventSpec = EventSpec {
     name: "cli_command_run",
     allowlist: &["verb", "subverb", "exit_code", "duration_bucket"],
 };
+
+/// A completed device login. The account is the event's `distinct_id`.
+pub const CLI_LOGIN_COMPLETED: EventSpec = EventSpec {
+    name: "cli_login_completed",
+    allowlist: &["is_account_switch"],
+};
+
+/// Whether this process may send: set once [`CommandRun::start`] has
+/// decided to record, so a login inside the run that printed the notice, or
+/// inside an unrecorded verb, sends nothing either.
+static SENDING: AtomicBool = AtomicBool::new(false);
 
 /// Printed to stderr once per machine, on the first run that could send.
 pub const NOTICE: &str = "\
@@ -127,6 +140,7 @@ impl CommandRun {
             // so it cannot be known to have been shown: send nothing.
             Err(_) => return None,
         }
+        SENDING.store(true, Ordering::Relaxed);
         Some(CommandRun {
             client,
             verb: verb.to_owned(),
@@ -151,7 +165,7 @@ impl CommandRun {
             code,
             self.started.elapsed(),
         );
-        match signed_in_account() {
+        match auth::load().state().and_then(|s| hosted_sub(&s.account_id)) {
             Some(sub) => self.client.capture(CLI_COMMAND_RUN, &sub, props),
             None => {
                 if let Ok(Some(anon_id)) = consent::anon_id() {
@@ -168,10 +182,59 @@ impl CommandRun {
 /// the account service's user id). Any other shape, such as the base64url id
 /// a self-hosted account service issues, is never sent as a person id: the
 /// event falls back to the anonymous id.
-fn signed_in_account() -> Option<String> {
-    let loaded = auth::load();
-    let id = &loaded.state()?.account_id;
-    guard::check_sub(id).ok().map(|()| id.clone())
+fn hosted_sub(account_id: &str) -> Option<String> {
+    guard::check_sub(account_id)
+        .ok()
+        .map(|()| account_id.to_owned())
+}
+
+/// The anonymous id to carry into a device login, so the account service can
+/// merge this machine's anonymous events into the account that signs in.
+/// `None` when this process sends nothing, and when `auth.json` already names
+/// an account: the id has then been merged into THAT account, and carrying it
+/// into a login as someone else would merge the two people.
+pub fn login_anon_id() -> Option<String> {
+    if !SENDING.load(Ordering::Relaxed) || auth::load().state().is_some() {
+        return None;
+    }
+    consent::anon_id().ok().flatten()
+}
+
+/// After a successful login: on an account switch, replace the anonymous id
+/// so it is never attributed to the previous account again; then, when this
+/// process sends, record `cli_login_completed`. `carried` is the id
+/// [`login_anon_id`] put in the device-start body. It is also merged into the
+/// account from here, which covers an account service that ignores the
+/// field; a service that already merged it makes this a repeat of the same
+/// merge.
+pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
+    #[cfg(feature = "telemetry")]
+    if outcome.switched_account && consent::file_path().is_ok_and(|p| p.exists()) {
+        let _ = consent::rotate_anon_id();
+    }
+    if !SENDING.load(Ordering::Relaxed) || !consent::status().enabled {
+        return;
+    }
+    let Some(sub) = hosted_sub(&outcome.state.account_id) else {
+        return;
+    };
+    let Some(mut client) = Client::from_env(common()) else {
+        return;
+    };
+    if let Some(anon_id) = carried {
+        client.alias(&sub, anon_id);
+    }
+    client.capture(
+        CLI_LOGIN_COMPLETED,
+        &sub,
+        login_props(outcome.switched_account),
+    );
+    client.shutdown(DEFAULT_SHUTDOWN_BUDGET);
+}
+
+/// `cli_login_completed` properties.
+pub fn login_props(is_account_switch: bool) -> Props {
+    vec![("is_account_switch".into(), is_account_switch.into())]
 }
 
 /// Human wording for the rule that decided the status.
@@ -253,6 +316,11 @@ mod tests {
             assert_eq!(kept, props);
         }
         guard::check_event_name(CLI_COMMAND_RUN.name).expect("event name");
+        guard::check_event_name(CLI_LOGIN_COMPLETED.name).expect("event name");
+        for switch in [false, true] {
+            let (_, dropped) = guard::filter(login_props(switch), CLI_LOGIN_COMPLETED.allowlist);
+            assert!(dropped.is_empty(), "{dropped:?}");
+        }
         let c = common();
         for value in [&c.surface, &c.env, &c.app_version] {
             guard::check_str(value).expect(value);

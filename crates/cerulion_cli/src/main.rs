@@ -224,7 +224,13 @@ fn dispatch(cli: Cli) -> ExitCode {
     }
 
     if command_needs_identity(&cli.command) {
-        if let Err(e) = login_cmd::ensure_login_gate(&mut std::io::stderr()) {
+        let anon_id = telemetry::login_anon_id();
+        let gate =
+            login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), anon_id.as_deref());
+        if let Ok(Some(outcome)) = &gate {
+            telemetry::login_completed(outcome, anon_id.as_deref());
+        }
+        if let Err(e) = gate {
             eprintln!("Error: {e}");
             // Exit 7 (not the generic FAILURE=1): the login gate is a
             // "command did not run" refusal, and 1 collides with `bag play
@@ -1983,7 +1989,10 @@ fn run(cli: Cli) -> CliResult<()> {
         // flow (re-auth / account switch); the first identity-needing command
         // auto-triggers the SAME flow via the gate. The prompt rides stderr.
         Commands::Login => {
-            login_cmd::run_login(&mut std::io::stderr())?;
+            let anon_id = telemetry::login_anon_id();
+            let outcome =
+                login_cmd::run_login_carrying(&mut std::io::stderr(), anon_id.as_deref())?;
+            telemetry::login_completed(&outcome, anon_id.as_deref());
             Ok(())
         }
         // Account self-service device management (list / revoke). The
