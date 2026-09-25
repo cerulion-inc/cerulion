@@ -682,7 +682,8 @@ write_install_marker() {
         printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
         return 0
     fi
-    if ! printf '{"method":"install.sh","version":"%s"}\n' "$version" > "$marker_tmp" ||
+    if [ -d "$marker_path" ] || [ -L "$marker_path" ] ||
+        ! printf '{"method":"install.sh","version":"%s"}\n' "$version" > "$marker_tmp" ||
         ! chmod 0644 "$marker_tmp" ||
         ! mv -f "$marker_tmp" "$marker_path"; then
         rm -f "$marker_tmp" || :

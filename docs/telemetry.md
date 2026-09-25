@@ -7,9 +7,10 @@ off.
 
 ## When anything is sent
 
-Only a release build sends events. The release artifacts (the install
-script, the Debian package and the Homebrew formula) carry a telemetry key, baked in when
-they are built. A build from source (`cargo install`, `cargo build`) has no
+Only a release build that carries a telemetry key sends events. The key is
+baked into the release artifacts (the install script, the Debian package and
+the Homebrew formula) when they are built, if the release pipeline provides
+one; an artifact built without it sends nothing. A build from source (`cargo install`, `cargo build`) has no
 key and sends nothing, whatever the settings below say, unless you supply a
 key yourself through `POSTHOG_API_KEY`, which also takes precedence over a
 baked key.
