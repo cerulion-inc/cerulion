@@ -143,8 +143,9 @@ let written = cur.finish();                          // == n
 ## View contract - `FrameView`
 
 `FrameView::new(walker, frame)` resolves the header's `schema_hash` through the
-`FrameWalker` and validates the whole structure once; every accessor afterwards
-is a bounds-safe slice of `frame[..total_size]`. `with_layout` skips the hash
+`FrameWalker` and validates the header and top-level offset table once (the inner
+structure of a nested variable entry is checked only by `decode`); every accessor
+afterwards is a bounds-safe slice of `frame[..total_size]`. `with_layout` skips the hash
 lookup for a cached layout. `str_field` is the loud UTF-8 arm (the walker degrades
 to bytes), `prim_array_field` hands out an element-aligned `PrimArray`, and
 `decode` is the convenience over `FrameWalker::walk_by_hash` for the full typed

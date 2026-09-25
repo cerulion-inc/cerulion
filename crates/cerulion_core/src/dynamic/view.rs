@@ -27,6 +27,13 @@ use crate::wire::WireHeader;
 /// copy. Only the bytes inside `total_size` are ever read; the payload is
 /// `frame[32..total_size]`.
 ///
+/// Validation covers the header and the top-level offset table only: the
+/// bytes inside a variable entry (a nested message's own offsets, the
+/// elements of a string array) are not checked here. A binding that hands
+/// out a raw [`variable_field`](FrameView::variable_field) slice must treat
+/// its inner structure as unvalidated; [`FrameView::decode`] runs the walker
+/// over it.
+///
 /// A [`FrameWalker`] accepts anything in (4) except the floor/bounds rules
 /// (out-of-order, overlapping and misaligned top-level entries are legal
 /// wire for it); this view is stricter because a binding hands these slices
@@ -108,6 +115,7 @@ impl<'l, 'a> FrameView<'l, 'a> {
         let frame = &frame[..total_size];
         let payload = &frame[WireHeader::SIZE..];
         let payload_len = payload.len();
+        let mut max_end = 0usize;
         for (i, vf) in layout.variable_fields.iter().enumerate() {
             let (off, len) = read_offset_entry(payload, layout.fixed_size, i);
             if len == 0 {
@@ -151,19 +159,25 @@ impl<'l, 'a> FrameView<'l, 'a> {
                     elem_size: align,
                 });
             }
-            for (j, earlier) in layout.variable_fields.iter().enumerate().take(i) {
-                let (eoff, elen) = read_offset_entry(payload, layout.fixed_size, j);
-                if elen == 0 {
-                    continue;
-                }
-                let eend = (eoff as usize).saturating_add(elen as usize);
-                if (off as usize) < eend && (eoff as usize) < end {
-                    return Err(DynamicError::OverlappingEntries {
-                        first: earlier.name.clone(),
-                        second: vf.name.clone(),
-                    });
+            // Entries laid out in field order (every Cerulion writer) start
+            // at or past every earlier end, so the pairwise scan runs only
+            // for an out-of-order entry.
+            if (off as usize) < max_end {
+                for (j, earlier) in layout.variable_fields.iter().enumerate().take(i) {
+                    let (eoff, elen) = read_offset_entry(payload, layout.fixed_size, j);
+                    if elen == 0 {
+                        continue;
+                    }
+                    let eend = (eoff as usize).saturating_add(elen as usize);
+                    if (off as usize) < eend && (eoff as usize) < end {
+                        return Err(DynamicError::OverlappingEntries {
+                            first: earlier.name.clone(),
+                            second: vf.name.clone(),
+                        });
+                    }
                 }
             }
+            max_end = max_end.max(end);
         }
 
         Ok(Self {

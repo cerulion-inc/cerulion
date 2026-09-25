@@ -1159,6 +1159,26 @@ fn view_rejects_overlapping_entries() {
 }
 
 #[test]
+fn view_checks_out_of_order_entries_for_overlap() {
+    let (frame, set) = probe_frame_and_walker();
+    // name @40 len 2 sits after samples @24..40: disjoint, out of field order.
+    let mut swapped = frame.clone();
+    swapped[40..44].copy_from_slice(&40u32.to_le_bytes());
+    swapped[48..52].copy_from_slice(&24u32.to_le_bytes());
+    assert!(FrameView::new(set.walker(), &swapped).is_ok());
+    // name @40 len 2 lies inside samples @32..48.
+    let mut inside = frame;
+    inside[40..44].copy_from_slice(&40u32.to_le_bytes());
+    assert_eq!(
+        view_err(&set, &inside),
+        DynamicError::OverlappingEntries {
+            first: "name".into(),
+            second: "samples".into(),
+        }
+    );
+}
+
+#[test]
 fn view_accepts_zero_length_and_unwritten_entries() {
     let (frame, set) = probe_frame_and_walker();
     let mut empty_samples = frame.clone();
@@ -1431,12 +1451,16 @@ fn surviving_after_drop(schemas: Vec<MessageSchema>, rejected: &[&str]) -> Vec<S
 fn dependents_binding_bare_header_to_a_rejected_std_msgs_header_are_dropped() {
     let kept = surviving_after_drop(
         vec![
+            ros_schema("uint32 seq\n", "other/Header"),
             ros_schema("Header header\nuint32 id\n", "demo/Stamped"),
             ros_schema("uint32 id\n", "demo/Plain"),
         ],
         &["std_msgs/Header"],
     );
-    assert_eq!(kept, vec!["demo/Plain".to_string()]);
+    assert_eq!(
+        kept,
+        vec!["other/Header".to_string(), "demo/Plain".to_string()]
+    );
 }
 
 #[test]
@@ -1473,7 +1497,7 @@ fn an_explicit_package_binds_only_that_package() {
             ros_schema("uint8 v\n", "demo/Inner"),
             ros_schema("other/Inner inner\n", "demo/Outer"),
         ],
-        &["demo/Other"],
+        &["demo/Inner"],
     );
     assert_eq!(
         kept,
