@@ -364,11 +364,16 @@ fn check_representable(schema: MessageSchema) -> Result<MessageSchema, DynamicEr
 /// Remove every schema that references a rejected one, transitively. Left in
 /// place, such a parent would re-resolve the missing target as opaque bytes
 /// and silently load with a different layout and hash than it declares.
-fn drop_dependents(
+pub(super) fn drop_dependents(
     schemas: &mut Vec<MessageSchema>,
     mut rejected: BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) {
+    let known: BTreeSet<String> = schemas
+        .iter()
+        .map(MessageSchema::qualified_name)
+        .chain(rejected.iter().cloned())
+        .collect();
     loop {
         let before = schemas.len();
         let mut newly = BTreeSet::new();
@@ -376,7 +381,7 @@ fn drop_dependents(
             let Some(target) = schema
                 .fields
                 .iter()
-                .find_map(|f| rejected_reference(&f.field_type, schema, &rejected))
+                .find_map(|f| rejected_reference(&f.field_type, schema, &known, &rejected))
             else {
                 return true;
             };
@@ -394,11 +399,13 @@ fn drop_dependents(
     }
 }
 
-/// The rejected schema `ty` references, if any. An unqualified reference
-/// binds within the referencing schema's own package first, then bare.
+/// The rejected schema `ty` references, if any: the reference is bound among
+/// `known` exactly as `codegen::resolve_fixed_nested` binds it, and only that
+/// binding counts.
 fn rejected_reference(
     ty: &FieldType,
     owner: &MessageSchema,
+    known: &BTreeSet<String>,
     rejected: &BTreeSet<String>,
 ) -> Option<String> {
     match ty {
@@ -406,16 +413,47 @@ fn rejected_reference(
             schema_name,
             package,
             ..
-        } => {
-            let candidates = match package.as_ref().or(owner.package.as_ref()) {
-                Some(pkg) => vec![format!("{pkg}/{schema_name}"), schema_name.clone()],
-                None => vec![schema_name.clone()],
-            };
-            candidates.into_iter().find(|c| rejected.contains(c))
-        }
+        } => bind_reference(
+            schema_name,
+            package.as_deref(),
+            owner.package.as_deref(),
+            known,
+        )
+        .filter(|target| rejected.contains(target)),
         FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
-            rejected_reference(element_type, owner, rejected)
+            rejected_reference(element_type, owner, known, rejected)
         }
+        _ => None,
+    }
+}
+
+/// The qualified name a nested reference binds to: an explicit package
+/// only; else the parent's package (bare for a package-less parent); else
+/// bare `Header` as `std_msgs/Header`; else a unique bare-name match.
+fn bind_reference(
+    name: &str,
+    package: Option<&str>,
+    parent_package: Option<&str>,
+    known: &BTreeSet<String>,
+) -> Option<String> {
+    let qualify = |pkg: Option<&str>| match pkg {
+        Some(pkg) => format!("{pkg}/{name}"),
+        None => name.to_string(),
+    };
+    if package.is_some() {
+        let exact = qualify(package);
+        return known.contains(&exact).then_some(exact);
+    }
+    let local = qualify(parent_package);
+    if known.contains(&local) {
+        return Some(local);
+    }
+    if name == "Header" && known.contains("std_msgs/Header") {
+        return Some("std_msgs/Header".to_string());
+    }
+    let mut matches = known.iter().filter(|k| k.rsplit('/').next() == Some(name));
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => Some(only.clone()),
         _ => None,
     }
 }
