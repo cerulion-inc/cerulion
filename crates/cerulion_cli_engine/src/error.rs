@@ -99,10 +99,17 @@ mod tests {
         });
         assert_eq!(
             render_user_error(&error),
-            "Node 'echo' error: failed to load library: \
-             libpython3.12.so.1.0: cannot open shared object file\nthe node cdylib could not \
-             find libpython; for a Python node (`node.py`), rebuild with `cerulion node build \
-             <type>` (bakes the interpreter's LIBDIR rpath); otherwise set LD_LIBRARY_PATH"
+            format!(
+                "Node 'echo' error: failed to load library: \
+                 libpython3.12.so.1.0: cannot open shared object file\nthe node cdylib could \
+                 not find libpython; for a Python node (`node.py`), rebuild with `cerulion node \
+                 build <type>` (bakes the interpreter's LIBDIR rpath); otherwise set {}",
+                if cfg!(target_os = "macos") {
+                    "DYLD_LIBRARY_PATH"
+                } else {
+                    "LD_LIBRARY_PATH"
+                }
+            )
         );
     }
 
