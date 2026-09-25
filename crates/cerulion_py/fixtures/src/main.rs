@@ -360,7 +360,8 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
     let sub = mgr.create_subscriber(topic).map_err(|e| e.to_string())?;
     println!("READY");
     std::io::stdout().flush().map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    // An unrepresentable deadline (e.g. `u64::MAX` ms) waits without bound.
+    let deadline = Instant::now().checked_add(Duration::from_millis(timeout_ms));
     match schema {
         "geometry_msgs/Vector3" => {
             for i in 0..count {
@@ -381,7 +382,7 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
                         println!("frame_hex={}", frame_hex(bytes));
                         break;
                     }
-                    if Instant::now() >= deadline {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
                         println!("TIMEOUT");
                         return Ok(ExitCode::from(2));
                     }
@@ -417,7 +418,7 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
                         println!("frame_hex={}", frame_hex(bytes));
                         break;
                     }
-                    if Instant::now() >= deadline {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
                         println!("TIMEOUT");
                         return Ok(ExitCode::from(2));
                     }
