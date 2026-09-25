@@ -12,5 +12,4 @@ crate-type = ["cdylib"]
 [dependencies]
 cerulion_pynode = { path = "../../../crates/cerulion_pynode" }
 
-[lints]
-workspace = true
+[workspace]

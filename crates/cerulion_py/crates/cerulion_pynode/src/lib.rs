@@ -1233,6 +1233,10 @@ macro_rules! export_node {
                 $crate::cerulion_core::graph::node::install_cdylib_stderr_tracing(
                     if rust_log.is_empty() { None } else { Some(rust_log.as_str()) },
                 );
+                let iox2_log = ctx.env_str("IOX2_LOG_LEVEL", "");
+                $crate::cerulion_core::iceoryx_logger::init_iceoryx_log_level(
+                    if iox2_log.is_empty() { None } else { Some(iox2_log.as_str()) },
+                );
                 match $crate::Host::init(ctx, $module, &[$($path),*], $info) {
                     Ok(host) => {
                         let handle = NEXT_HANDLE.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);

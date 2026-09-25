@@ -246,14 +246,6 @@ pub fn node_create_with_options(
                 )));
             }
         }
-        if matches!(policy, Some(cerulion_core::MacroPolicy::Sync { .. }))
-            && options.inputs.len() < 2
-        {
-            return Err(CliError::Validation(
-                "a sync_window_ms Python node needs at least two inputs (-i SCHEMA NAME); every input joins the aligned set"
-                    .to_string(),
-            ));
-        }
     }
 
     let node_dir = nodes_dir.join(node_type);
@@ -1988,15 +1980,6 @@ mod tests {
                 },
                 Some(cerulion_core::MacroPolicy::Period { period_ms: 10 }),
                 "duplicate port name 'same'",
-            ),
-            (
-                NodeCreateOptions {
-                    inputs: vec![port("left")],
-                    language: NodeLanguage::Python,
-                    ..NodeCreateOptions::default()
-                },
-                Some(cerulion_core::MacroPolicy::Sync { window_ms: 10 }),
-                "needs at least two inputs",
             ),
         ];
         for (options, policy, expected) in cases {

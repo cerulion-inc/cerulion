@@ -249,41 +249,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cerulion_pynode_builtin"
-version = "0.1.0"
-dependencies = [
- "cerulion_pynode",
-]
-
-[[package]]
-name = "cerulion_pynode_counter"
-version = "0.1.0"
-dependencies = [
- "cerulion_pynode",
-]
-
-[[package]]
-name = "cerulion_pynode_doubler"
-version = "0.1.0"
-dependencies = [
- "cerulion_pynode",
-]
-
-[[package]]
-name = "cerulion_pynode_errors"
-version = "0.1.0"
-dependencies = [
- "cerulion_pynode",
-]
-
-[[package]]
-name = "cerulion_pynode_wrongmeta"
-version = "0.1.0"
-dependencies = [
- "cerulion_pynode",
-]
-
-[[package]]
 name = "cexpr"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

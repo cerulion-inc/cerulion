@@ -11,7 +11,7 @@ name = "cerulion_py"
 crate-type = ["cdylib"]
 
 [workspace]
-members = [".", "fixtures", "crates/cerulion_pynode", "fixtures/pynodes/*"]
+members = [".", "fixtures", "crates/cerulion_pynode"]
 
 # Copied verbatim from the root Cargo.toml's [workspace.lints] (rust +
 # clippy tables): this is a SEPARATE workspace so the same lint set is

@@ -78,6 +78,7 @@ def _run(name, case, ticks=1):
     path = os.path.join(PYNODE_DIR, "release", f"libcerulion_pynode_{name}{DYLIB}")
     env = _node_env(name)
     env["CERULION_PYNODE_CASE"] = case
+    env.pop("CERULION_PYNODE_ABSENT_KEY", None)
     return subprocess.run(
         [FIXTURE, "host-pynode", path, str(ticks)],
         capture_output=True,

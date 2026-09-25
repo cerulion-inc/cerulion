@@ -64,6 +64,9 @@ per-command prefix for Python wheel commands.
 A Python node must declare exactly one scheduling policy: `period_ms`, one
 `trigger=True` input, or `sync_window_ms` for multiple trigger inputs. The
 `node create --lang python` command (alias `node new`) therefore requires `-T` or `--policy`.
+`node create` writes one input; for `sync_window_ms`, add the other aligned
+inputs to `node.py` with `trigger=True` and run `cerulion node build`
+(`node modify` does not edit Python nodes).
 
 The embedded host supports one interpreter per process and serializes Python
 execution through the GIL. Python-created threads and `fork()` are unsupported.
