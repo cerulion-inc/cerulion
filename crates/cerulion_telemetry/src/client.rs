@@ -99,9 +99,20 @@ mod enabled {
         /// `None` (complete no-op) unless `POSTHOG_API_KEY` is set AND consent
         /// resolves enabled. Host from `POSTHOG_HOST`, default [`DEFAULT_HOST`].
         pub fn from_env(common: Common) -> Option<Client> {
+            Client::from_env_or_key(None, common)
+        }
+
+        /// [`Client::from_env`], with `fallback_key` (a key baked into a
+        /// release binary) used when `POSTHOG_API_KEY` is unset or blank.
+        pub fn from_env_or_key(fallback_key: Option<&str>, common: Common) -> Option<Client> {
             let api_key = std::env::var("POSTHOG_API_KEY")
                 .ok()
-                .filter(|k| !k.trim().is_empty())?;
+                .filter(|k| !k.trim().is_empty())
+                .or_else(|| {
+                    fallback_key
+                        .filter(|k| !k.trim().is_empty())
+                        .map(str::to_owned)
+                })?;
             if !consent::status().enabled {
                 return None;
             }
@@ -408,6 +419,11 @@ mod disabled {
     impl Client {
         /// Feature off: always `None`.
         pub fn from_env(_common: Common) -> Option<Client> {
+            None
+        }
+
+        /// Feature off: always `None`.
+        pub fn from_env_or_key(_fallback_key: Option<&str>, _common: Common) -> Option<Client> {
             None
         }
 

@@ -672,6 +672,24 @@ setup_path_for_shells() {
     return 0
 }
 
+# The install-provenance marker: one line of JSON beside the binaries naming
+# this installer, which the CLI reports as its install method in usage
+# telemetry. It is best effort; a failure warns and never fails the install.
+write_install_marker() {
+    marker_path="$install_dir/.cerulion-provenance.json"
+    marker_tmp=$(mktemp "$install_dir/.cerulion-provenance.json.XXXXXX" 2>/dev/null || :)
+    if [ -z "$marker_tmp" ]; then
+        printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
+        return 0
+    fi
+    if ! printf '{"method":"install.sh","version":"%s"}\n' "$version" > "$marker_tmp" ||
+        ! chmod 0644 "$marker_tmp" ||
+        ! mv -f "$marker_tmp" "$marker_path"; then
+        rm -f "$marker_tmp"
+        printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
+    fi
+}
+
 self_test() {
     # The self-test installs into scratch directories many times over; none of
     # those installs may touch the profile files or the env file of the user
@@ -1445,6 +1463,14 @@ EOF
         [ -e "$leftover_path" ] ||
             continue
         die "self-test: successful upgrade left temporary files"
+    done
+    [ "$(cat "$upgrade_install_dir/.cerulion-provenance.json")" = \
+        '{"method":"install.sh","version":"v0.1.0"}' ] ||
+        die "self-test: the install marker was not written"
+    for leftover_path in "$upgrade_install_dir"/.cerulion-provenance.json.*; do
+        [ -e "$leftover_path" ] ||
+            continue
+        die "self-test: the install marker left a temporary file"
     done
 
     # An archive that carries the ROS 2 Jazzy rmw and the heap hook installs
@@ -2508,6 +2534,7 @@ for binary in $archive_files; do
     fi
 done
 
+write_install_marker
 printf 'Installed Cerulion %s for %s into %s\n' "$version" "$target" "$install_dir"
 for library in $installed_libraries; do
     case "$library" in

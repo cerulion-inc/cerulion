@@ -14,7 +14,6 @@ rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Consent resolver and property guard for Cerulion desk surfaces (a no-op without the `posthog` feature)"
-publish = false
 
 [lints]
 workspace = true

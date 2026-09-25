@@ -8,10 +8,11 @@ off.
 ## When anything is sent
 
 Only a release build sends events. The release artifacts (the install
-script, the Debian package and the Homebrew formula) carry a telemetry key. A
-build from source (`cargo install`, `cargo build`) has no key and sends
-nothing, whatever the settings below say, unless you supply a key yourself
-through `POSTHOG_API_KEY`.
+script, the Debian package and the Homebrew formula) carry a telemetry key, baked in when
+they are built. A build from source (`cargo install`, `cargo build`) has no
+key and sends nothing, whatever the settings below say, unless you supply a
+key yourself through `POSTHOG_API_KEY`, which also takes precedence over a
+baked key.
 
 Robot and runtime code never sends anything. The graph runtime, the
 transport, the recorder, the network daemons and every node run without this
@@ -32,7 +33,7 @@ The events:
 
 | Event | Sent by | Properties |
 |---|---|---|
-| `cli_command_run` | every CLI command | `verb` and `subverb` (the command's name, such as `graph` and `run`), `exit_code`, and `duration_bucket` (`lt_1s`, `1s_10s`, `10s_1m`, `1m_10m`, `gte_10m`) |
+| `cli_command_run` | every CLI command | `verb` and `subverb` (the command's name, such as `graph` and `run`), `exit_code`, and `duration_bucket` (`lt_1s`, `1s_10s`, `10s_1m`, `1m_10m`, `gte_10m`), and `install_method` (`install.sh`, `deb` or `brew`, read from the marker file the installer left beside the binary; absent for a source build) |
 | `cli_login_completed` | `cerulion login`, and the login a command starts on a machine that never signed in | `is_account_switch` (whether a different account was signed in before) |
 | `graph_run_started` | `cerulion graph run`, when the run is requested (before the graph is loaded and checked, so a rejected run records one too; `graph_run_completed` then has `is_success` false) | `is_single_process` |
 | `graph_run_completed` | `cerulion graph run`, when it ends | `duration_bucket`, `is_success` |

@@ -18,7 +18,7 @@ categories = ["science::robotics", "command-line-utilities"]
 # the directory holds now or gains later, an integration test tree or an
 # agent instruction file, serves work inside this repository: a dependent
 # never builds from it, so it stays out of the package.
-include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+include = ["build.rs", "src/", "Cargo.toml", "README.md", "LICENSE"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/cerulion-{ version }-{ target }.tar.gz"
@@ -72,7 +72,7 @@ clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
 # Usage telemetry (`src/telemetry.rs`): the `telemetry` verb, the first-run
 # notice and `cli_command_run`. Sends nothing unless the build carries a
 # PostHog key and consent resolves enabled. Never linked into a robot crate.
-cerulion_telemetry = { path = "../cerulion_telemetry" }
+cerulion_telemetry = { workspace = true }
 
 [features]
 default = ["telemetry"]

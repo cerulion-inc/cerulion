@@ -147,6 +147,10 @@ jobs:
       - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
+          # The usage-telemetry project key, baked into the CLI by
+          # crates/cerulion_cli/build.rs. A write-only project key; when the
+          # secret is unset the artifacts carry no key and send nothing.
+          CERULION_POSTHOG_KEY: ${{ secrets.CERULION_POSTHOG_KEY }}
         run: |
           if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc

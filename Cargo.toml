@@ -473,6 +473,7 @@ cerulion_link = { path = "crates/cerulion_link", version = "=1.0.0" }
 cerulion_mdns = { path = "crates/cerulion_mdns", version = "=1.0.0" }
 cerulion_netd = { path = "crates/cerulion_netd", version = "=1.0.0", default-features = false }
 cerulion_pairing = { path = "crates/cerulion_pairing", version = "=1.0.0" }
+cerulion_telemetry = { path = "crates/cerulion_telemetry", version = "=1.0.0" }
 cerulion_wireclient = { path = "crates/cerulion_wireclient", version = "=1.0.0" }
 native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0" }
 

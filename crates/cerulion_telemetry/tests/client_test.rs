@@ -504,3 +504,44 @@ fn an_unrepresentable_budget_is_clamped_instead_of_panicking() {
     assert_eq!(client.shutdown(Duration::MAX), ShutdownOutcome::Flushed);
     assert_eq!(client.shutdown(Duration::MAX), ShutdownOutcome::Noop);
 }
+
+#[test]
+fn a_baked_key_is_used_only_when_the_environment_has_none() {
+    let _lock = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("CERULION_HOME", dir.path().join("h"));
+    std::env::remove_var("DO_NOT_TRACK");
+    std::env::remove_var("CERULION_TELEMETRY");
+    std::env::remove_var("POSTHOG_API_KEY");
+    let (host, rx) = mock_server();
+    std::env::set_var("POSTHOG_HOST", &host);
+
+    assert!(Client::from_env_or_key(None, common()).is_none());
+    assert!(Client::from_env_or_key(Some("  "), common()).is_none());
+    std::env::set_var("CERULION_TELEMETRY", "0");
+    assert!(
+        Client::from_env_or_key(Some("phc_baked"), common()).is_none(),
+        "opt-out wins over a baked key"
+    );
+    std::env::remove_var("CERULION_TELEMETRY");
+
+    let mut client = Client::from_env_or_key(Some("phc_baked"), common()).expect("baked key");
+    client.alias(SUB, ANON);
+    let (_, body) = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+    assert_eq!(body["api_key"], "phc_baked");
+    client.shutdown(Duration::from_secs(2));
+
+    let (host, rx) = mock_server();
+    std::env::set_var("POSTHOG_HOST", &host);
+    std::env::set_var("POSTHOG_API_KEY", "phc_env");
+    let mut client = Client::from_env_or_key(Some("phc_baked"), common()).expect("env key");
+    client.alias(SUB, ANON);
+    let (_, body) = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+    assert_eq!(
+        body["api_key"], "phc_env",
+        "the environment overrides the baked key"
+    );
+    client.shutdown(Duration::from_secs(2));
+    std::env::remove_var("POSTHOG_API_KEY");
+    std::env::remove_var("POSTHOG_HOST");
+}
