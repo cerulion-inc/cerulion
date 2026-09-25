@@ -718,7 +718,7 @@ fn resim_exit_code(_command: Commands) -> u8 {
         "Error: `cerulion bag play --resim` is only supported on Unix platforms (the bag reader \
          depends on Unix-only POSIX trace-ring types)"
     );
-    ExitCode::FAILURE
+    1
 }
 
 /// Resolve + spawn `cerulion-connectd`, streaming its stdio and
@@ -2491,7 +2491,12 @@ fn run(cli: Cli) -> CliResult<()> {
                                      --single-process` (Ctrl+C to stop)"
                                 );
                                 telemetry::emit(telemetry_events::ROS2_BRIDGE_STARTED, Vec::new());
-                                graph_cmd::graph_run(
+                                telemetry::emit(
+                                    telemetry_events::GRAPH_RUN_STARTED,
+                                    telemetry_events::graph_run_started(true),
+                                );
+                                let started = std::time::Instant::now();
+                                let result = graph_cmd::graph_run(
                                     &ws.root,
                                     &ws.graphs_dir,
                                     &graph,
@@ -2520,7 +2525,15 @@ fn run(cli: Cli) -> CliResult<()> {
                                     // path (the gating clock is wall-driven), so
                                     // there is nothing to decline.
                                     false, // no_rings
-                                )
+                                );
+                                telemetry::emit(
+                                    telemetry_events::GRAPH_RUN_COMPLETED,
+                                    telemetry_events::graph_run_completed(
+                                        started.elapsed(),
+                                        result.is_ok(),
+                                    ),
+                                );
+                                result
                             }
                             None => Ok(()),
                         }
