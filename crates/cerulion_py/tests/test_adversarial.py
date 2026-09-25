@@ -101,40 +101,25 @@ def test_wrong_dtype_ndarray_raises_typeerror(session):
         pub.publish(np.zeros(8, dtype=np.float32))
 
 
-def test_memoryview_released_on_foreign_thread(session):
-    """Frame is `unsendable`: a memoryview released on another thread must not
-    panic the pyclass borrow - bookkeeping is skipped (RuntimeWarning) and the
-    slot is returned when the Frame itself drops."""
+def _release_on_thread(mv):
     import threading
-    import warnings
 
-    topic = unique_topic("xthread")
-    sub = session.subscriber(topic, depth=2)
-    pub = session.publisher(topic, 1, max_payload_len=64)
-    pub.publish(b"data")
-    frame = sub.receive(2000)
-    assert frame is not None
-    mv = frame.raw  # memoryview over the native Frame's buffer export
+    errors = []
 
-    def release_offthread():
-        mv.release()
+    def worker():
+        try:
+            mv.release()
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
 
-    worker = threading.Thread(target=release_offthread)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        worker.start()
-        worker.join()
-    assert any(w.category is RuntimeWarning for w in caught), [
-        str(w.message) for w in caught
-    ]
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(10)
+    assert not t.is_alive()
+    assert errors == []
 
-    # The frame is still live and receivable-after on the owning thread.
-    frame.release()
-    # Reclamation proof: the skipped decrement left `exports` elevated,
-    # so the slot is only returned at Frame drop. Deleting the frame on
-    # the owning thread must free it - hold `max_borrowed_samples`
-    # unreleased frames at once, which a leaked slot would prevent.
-    del frame
+
+def _hold_all_borrowed(sub, pub):
     held = []
     for _ in range(sub.max_borrowed_samples):
         pub.publish(b"again")
@@ -145,39 +130,80 @@ def test_memoryview_released_on_foreign_thread(session):
         f.release()
 
 
-def test_loan_memoryview_released_on_foreign_thread(session):
-    """Releasing `loan.payload`'s memoryview on a foreign thread must not
-    panic the unsendable Loan borrow (same pyo3 class as Frame): the
-    decrement is skipped with a RuntimeWarning, so commit() keeps
-    refusing while exports read as outstanding, and dropping the Loan
-    still frees the slot."""
-    import threading
+def test_memoryview_released_on_foreign_thread(session):
+    """Frame is `unsendable`: a memoryview released on another thread must not
+    panic the pyclass borrow, and its export is still uncounted, so a later
+    owner-thread `release()` returns the slot at once."""
     import warnings
 
-    pub = session.publisher(unique_topic("loan-frn"), 1, max_payload_len=64)
-    loan = pub.loan(8)
-    mv = loan.payload
-    errors = []
+    topic = unique_topic("xthread")
+    sub = session.subscriber(topic, depth=2)
+    pub = session.publisher(topic, 1, max_payload_len=64)
+    pub.publish(b"data")
+    frame = sub.receive(2000)
+    assert frame is not None
+    mv = frame.raw  # memoryview over the native Frame's buffer export
 
-    def worker():
-        try:
-            mv.release()
-        except Exception as e:  # pragma: no cover
-            errors.append(e)
-
-    t = threading.Thread(target=worker)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        t.start()
-        t.join(10)
-    assert not t.is_alive()
-    assert errors == []
+        _release_on_thread(mv)
+    assert not any(w.category is RuntimeWarning for w in caught), [
+        str(w.message) for w in caught
+    ]
+
+    # The frame stays referenced, so only release() can free its slot:
+    # holding `max_borrowed_samples` frames at once proves it did.
+    frame.release()
+    _hold_all_borrowed(sub, pub)
+    assert frame.is_released
+
+
+def test_last_view_of_released_frame_freed_on_foreign_thread(session):
+    """A released frame whose last view dies on a foreign thread warns (the
+    slot cannot drop off the owner) and frees the slot at frame drop."""
+    import warnings
+
+    topic = unique_topic("xthread-late")
+    sub = session.subscriber(topic, depth=2)
+    pub = session.publisher(topic, 1, max_payload_len=64)
+    pub.publish(b"data")
+    frame = sub.receive(2000)
+    assert frame is not None
+    mv = frame.raw
+    frame.release()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _release_on_thread(mv)
     assert any(w.category is RuntimeWarning for w in caught), [
         str(w.message) for w in caught
     ]
-    # The skipped decrement leaves exports > 0: commit still refuses.
-    with pytest.raises(cerulion.EncodeError, match="loan.payload views"):
-        loan.commit()
+    del frame
+    _hold_all_borrowed(sub, pub)
+
+
+def test_loan_memoryview_released_on_foreign_thread(session):
+    """Releasing `loan.payload`'s memoryview on a foreign thread must not
+    panic the unsendable Loan borrow, and uncounts the export: commit()
+    then succeeds and the subscriber receives the written bytes."""
+    import warnings
+
+    topic = unique_topic("loan-frn")
+    sub = session.subscriber(topic, depth=2)
+    pub = session.publisher(topic, 1, max_payload_len=64)
+    loan = pub.loan(8)
+    mv = loan.payload
+    mv[:8] = b"xthread!"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _release_on_thread(mv)
+    assert not any(w.category is RuntimeWarning for w in caught), [
+        str(w.message) for w in caught
+    ]
+    loan.commit()
+    frame = sub.receive(2000)
+    assert frame is not None
+    assert frame.to_bytes() == b"xthread!"
+    frame.release()
 
 
 def test_owner_thread_release_after_prior_frame_dropped(session):
