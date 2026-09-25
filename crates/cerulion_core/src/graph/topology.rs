@@ -1235,9 +1235,11 @@ impl GraphTopology {
         // would violate strict increase (transitively), appending levels as
         // needed, so a whole dense chain slides later uniformly and vacates
         // the fast chain's gating level. Cross-process consistency at ANY
-        // count holds by construction: the assignment is FROZEN in the yaml
-        // and every process derives its barrier generations from the same
-        // block.
+        // count holds by construction: the assignment is FROZEN in the yaml,
+        // so every process reads the same levels from the same block. That is
+        // all a free-run rank needs (it steps its own levels on its own
+        // clock); under the `CERULION_EXECUTION_MODE=lockstep` opt-out it is
+        // also what makes every process derive the same barrier generations.
         //
         // A node's CHAIN RATE is its observed fire cadence, which the
         // profiler measures at the OUTGOING edge:

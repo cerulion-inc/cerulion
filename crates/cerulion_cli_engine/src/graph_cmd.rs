@@ -5694,13 +5694,16 @@ pub fn graph_run(
 
     // Deployment dispatch. A graph declaring
     // `process_groups:` runs MULTI-PROCESS (the SUPERVISOR — build the full
-    // graph ONCE for planning, then spawn one worker process per group,
-    // coordinated by a shared SHM barrier) — unless `--single-process` forces
+    // graph ONCE for planning, then spawn one worker process per group; by
+    // default the ranks FREE-RUN, and the `CERULION_EXECUTION_MODE=lockstep`
+    // opt-out is what coordinates them on a shared SHM barrier), unless
+    // `--single-process` forces
     // the monolith, or the host is non-Unix (monolith FALLBACK with a loud
-    // notice; macOS is NOT gated out: the barrier is real POSIX SHM on every
-    // Unix, so only future-Windows falls back). `--time-source external` is
-    // REJECTED on the supervisor arm (multi-process is always
-    // deterministic-live on the barrier-gated clock).
+    // notice; macOS is NOT gated out: the opt-out's barrier is real POSIX SHM
+    // on every Unix, so only future-Windows falls back). `--time-source
+    // external` is REJECTED on the supervisor arm (a multi-process run always
+    // gates on a clock the runtime owns, the wall-following one by default and
+    // the barrier-gated one under the opt-out).
     // The decision matrix is the pure `resolve_deployment` (oracle-tested).
     // Single-process `graph run` (no `process_groups`) falls through unchanged.
     match deployment {
@@ -6353,32 +6356,48 @@ pub fn graph_run(
 ///
 /// This is the WORKER half of the multi-process spawner. The SUPERVISOR
 /// plans the deployment ([`plan_deployment`](crate::multiprocess::plan_deployment)),
-/// mints the shared iceoryx2 `Config` + creates the shared barrier, writes one
+/// mints the shared iceoryx2 `Config`, writes one
 /// plan file per process group, and execs `cerulion graph run-worker --plan <f>`
 /// (with cwd = the workspace root) per worker. THIS reconstructs the worker's
-/// context from the plan and runs it as ONE deterministic-live context of the
+/// context from the plan and runs it as ONE live context of the
 /// cross-process DAG split.
+///
+/// The plan's stamped execution mode decides the shape, exactly as the
+/// supervisor's own rustdoc says: the FREE-RUN default gives this rank its own
+/// clock and no rendezvous with any peer, and the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out is the mode with the shared
+/// barrier. `resolve_worker_build_path` turns the stamped mode plus the trace
+/// bit into the `WorkerBuildPath` every step below branches on.
 ///
 /// Steps (each mirrors the corresponding part of [`graph_run`], filtered to the
 /// plan's subgraph):
 /// 1. read + `serde_json` the plan; reject an empty `ix_config_json` LOUDLY.
 /// 2. `serde_json` the shared iceoryx2 `Config` back out of the plan.
-/// 3. build the gating `VirtualClock` ONCE (shared transport + build fn — an
-///    `Arc::ptr_eq` clock contract).
+/// 3. build the gating clock ONCE (shared transport + build fn, an
+///    `Arc::ptr_eq` clock contract): a controlled `VirtualClock` on the lockstep
+///    and traced free-run paths, the `RealClock` on the ring-less free-run path.
 /// 4. init the transport singleton on the SHARED config
 ///    ([`TransportManager::init_with_config`](cerulion_core::TransportManager::init_with_config)).
-/// 5. OPEN the supervisor-owned barrier (bounded retry — exec races the create).
+/// 5. LOCKSTEP OPT-OUT ONLY: open the supervisor-owned barrier (bounded retry,
+///    since exec races the create). A free-run rank opens none and maps none.
 /// 6. resolve the subgraph's node cdylibs (the plan's subgraph already holds ONLY
 ///    this worker's nodes, so this is `graph_run`'s load loop verbatim).
-/// 7. build via
+/// 7. build on this rank's path: by default
+///    [`GraphRuntime::build_live_free_run`](cerulion_core::GraphRuntime::build_live_free_run)
+///    with no ring, or
+///    [`GraphRuntime::build_live_deterministic_free_run`](cerulion_core::GraphRuntime::build_live_deterministic_free_run)
+///    with one, both with no barrier, no participant map and no handed quantum;
+///    under the opt-out
 ///    [`GraphRuntime::build_live_deterministic_with_manager_and_barrier`](cerulion_core::GraphRuntime::build_live_deterministic_with_manager_and_barrier),
-///    handing it the shared barrier, this worker's global-level participant map,
+///    handed the shared barrier, this worker's global-level participant map,
 ///    and the shared handed quantum.
 /// 8. touch the READY sentinel (owned publishers now exist — the supervisor's
 ///    cross-process build-order handshake).
 /// 9. `run_live` until Ctrl+C / node shutdown, then poll
-///    [`is_barrier_failed`](cerulion_core::GraphRuntime::is_barrier_failed): on a
-///    barrier-boundary timeout (a peer stalled/crashed) exit with code 2, else
+///    [`is_barrier_failed`](cerulion_core::GraphRuntime::is_barrier_failed),
+///    structurally `false` on a free-run rank (no participant, so no poison):
+///    under the opt-out a
+///    barrier-boundary timeout (a peer stalled/crashed) exits with code 2, else
 ///    clean exit 0 (Principle #3 — a poisoned peer must be a LOUD, distinguishable
 ///    failure).
 ///
@@ -8091,9 +8110,12 @@ fn drain_window_from_env() -> Duration {
 /// (nonzero exit, or `Lost`/unpollable) while the deployment is in Normal mode.
 ///
 /// `Continue` (the LOCKED default) keeps the survivors running DEGRADED: the
-/// supervisor drops the dead peer from the shared barrier cohort (so its slot no
-/// longer stalls the survivors at the next level boundary), logs loudly, records
-/// the loss, and keeps joining. `Fail` selects the fail-loud contract
+/// supervisor logs loudly, records the loss, and keeps joining. Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out it also drops the dead peer from
+/// the shared barrier cohort, so its slot no longer stalls the survivors at the
+/// next level boundary; under the free-run default there is no cohort to drop
+/// from and the survivors were never stalled by the death, which the degraded
+/// summary says in those words. `Fail` selects the fail-loud contract
 /// (return `Err`, SIGKILL every sibling).
 ///
 /// Selected by the user-facing `graph run --peer-loss <continue|fail>` flag,
@@ -8105,7 +8127,8 @@ fn drain_window_from_env() -> Duration {
 /// crate does not depend on clap — same pattern as [`TimeSource`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PeerLossPolicy {
-    /// Keep the survivors running degraded; drop the dead peer from the barrier.
+    /// Keep the survivors running degraded; under the `lockstep` opt-out also
+    /// drop the dead peer from the barrier.
     Continue,
     /// Fail-loud on any worker death (return `Err`, SIGKILL siblings).
     Fail,

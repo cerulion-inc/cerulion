@@ -336,8 +336,12 @@ its sink, so a slow chain marches until it sits at the deepest faster
 chain's sink level (leaving every faster chain's waiting span); a cascade
 that would push a faster chain's node is refused, so the max-rate chain's
 nodes never move; un-costed nodes stay put. A grown count is safe: the
-assignment is frozen in the yaml, so every process derives the same barrier
-generations from the same block) and bakes the result into the graph yaml as a
+assignment is frozen in the yaml, so every process levelizes its own subgraph
+against the SAME levels. Under the free-run default that shared levelization is
+the whole of it: each rank steps its own levels on its own clock and no rank
+waits on another. Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the same
+frozen block is also what makes every process derive the same barrier
+generations) and bakes the result into the graph yaml as a
 top-level `level_assignments:` block (node → level, every node covered),
 emitted in the SAME consented rewrite as `process_groups:`, which is banded
 over the REFINED levels, so the two blocks are always coherent.
