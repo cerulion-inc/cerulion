@@ -282,23 +282,23 @@ mod feature_on {
     #[test]
     fn concurrent_first_runs_show_the_notice_once() {
         let env = isolated();
-        let shown = std::sync::atomic::AtomicUsize::new(0);
-        let printers = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            for _ in 0..8 {
-                s.spawn(|| {
-                    let printed = consent::show_notice_once(|| {
-                        shown.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let outcomes: Vec<(bool, bool)> = std::thread::scope(|s| {
+            let runs: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut ran = false;
+                        let printed = consent::show_notice_once(|| ran = true).expect("ok");
+                        (ran, printed)
                     })
-                    .expect("ok");
-                    if printed {
-                        printers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                });
-            }
+                })
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).collect()
         });
-        assert_eq!(shown.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(printers.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            outcomes.iter().all(|(ran, printed)| ran == printed),
+            "each caller reports whether it ran the printer: {outcomes:?}"
+        );
+        assert_eq!(outcomes.iter().filter(|(ran, _)| *ran).count(), 1);
         assert!(read_file(&env).notice_shown);
         assert!(!consent::show_notice_once(|| panic!("already shown")).expect("ok"));
     }
@@ -312,6 +312,24 @@ mod feature_on {
         assert!(consent::show_notice_once(|| shown += 1).expect("ok"));
         assert_eq!(shown, 1);
         assert!(read_file(&env).notice_shown);
+    }
+
+    #[test]
+    fn a_mistyped_field_keeps_the_opt_out_through_the_notice_repair() {
+        let env = isolated();
+        std::fs::create_dir_all(&env.home).unwrap();
+        std::fs::write(
+            env.home.join("telemetry.json"),
+            r#"{"enabled":false,"anon_id":42,"notice_shown":"yes"}"#,
+        )
+        .unwrap();
+        assert_eq!(consent::status(), st(false, Source::File));
+        assert!(consent::show_notice_once(|| {}).expect("ok"));
+        let file = read_file(&env);
+        assert!(!file.enabled, "the opt-out survives the repair");
+        assert!(file.notice_shown);
+        assert!(cerulion_telemetry::guard::is_anon_id(&file.anon_id));
+        assert_eq!(consent::status(), st(false, Source::File));
     }
 
     #[test]
