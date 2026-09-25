@@ -17,7 +17,7 @@ Source: `crates/cerulion_core/src/dynamic/` - `schema_yaml.rs`, `schema_set.rs`,
 | Re-exports (`MessageSchema`, `FieldType`, `WireLayout`, `FrameWalker`, `FrameValueKind`, `PrimArray`, `WireHeader`, `OffsetEntry`, …) | The binding surface for those types. Their *definitions* live in `codegen`/`wire`; the re-export path is the stable name. |
 | `WireLayout::to_json()` | Deterministic: serde field order = struct declaration order, vectors in declaration order; pinned by an oracle string. |
 | Bytes produced by `FrameEncoder` | Byte-identical to the generated `<Name>Shm` writer + `OutputProxy` path for the same values, `sequence` excepted (see below). Pinned against generated `ChannelFloat32`, `Image` and `ChannelFloat32Shm`. |
-| `FrameEncoder::required_len`/`begin`, every `FrameCursor` method and every `FrameView` method except `decode` (it builds the full value tree) | No heap allocation on the SUCCESS path (`dynamic_zero_alloc_test`). Error arms may allocate (they carry the field/schema name as a `String`). |
+| `FrameEncoder::required_len`/`begin`, every `FrameCursor` method and every `FrameView` method except `FrameView::decode` (which materialises a `FrameValue` via `FrameWalker::walk_by_hash` and allocates) | No heap allocation on the SUCCESS path (`dynamic_zero_alloc_test`). Error arms may allocate (they carry the field/schema name as a `String`). |
 | `DynamicError` | ONE `#[non_exhaustive]` `thiserror` enum; every malformed-frame class is a distinct variant (table below). Adding a variant is non-breaking for `match _ =>` users; removing/renaming is breaking. |
 
 Not stable (may change without notice): `Debug` output, error `Display` wording,

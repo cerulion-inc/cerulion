@@ -43,6 +43,12 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
 - Facade (`python/cerulion/_api.py`) owns Python ergonomics; `src/` owns
   transport semantics. Non-contiguous or non-byte buffers are rejected as
   `TypeError` at the facade.
+- Typed layer (`SchemaSet`, `Layout`, `Message`, `Frame.view()`): read-only
+  NumPy views on receive, writable views on loans. `string[]` / `Type[]` are
+  pre-framed BYTES only on publish/loan; loan views are block-scoped (a live
+  export at `with`-exit discards the loan: `EncodeError`); a set mutation that
+  changes a typed publisher's hash fails with `SchemaMismatch`.
+
 
 ## Layout
 

@@ -2787,8 +2787,8 @@ You generally don't set these; the CLI generates the right feature wiring per no
 ## Python client
 
 `cerulion_py` is a standalone PyO3 wheel (its own cargo workspace, not a
-member of the root one) giving Python processes raw access to the same
-transport: 32-byte wire headers plus opaque payload bytes, over iceoryx2
+member of the root one) giving Python processes raw and schema-aware access to
+the same transport: 32-byte wire headers plus payload bytes, over iceoryx2
 shared memory. One process-wide transport lives behind `connect()`:
 a Python process that loads it must not also load another module
 embedding `cerulion_core`.
@@ -2816,14 +2816,42 @@ frame.to_bytes()                                   # materialised (copies)
 frame.release()                                    # returns the borrowed slot
 ```
 
+Typed clients load a `SchemaSet` and bind it to publishers and subscribers:
+
+```python
+schemas = cerulion.SchemaSet()
+schemas.add_yaml("""
+schemas:
+  Point:
+    fields:
+      float64 x: {}
+      float64 y: {}
+""")
+layout = schemas.layout("Point")
+topic = "/demo/typed"
+pub = session.publisher(topic, schema="Point", schemas=schemas)
+sub = session.subscriber(topic, schema="Point", schemas=schemas)
+with pub.loan() as point:                          # writable zero-copy loan
+    point.x, point.y = 1.5, -2.0
+frame = sub.receive(1000)
+point = frame.view()                                # read-only zero-copy view
+owned = point.copy()                                # materialised owned copy
+frame.release()
+```
+
 `publish()` requires a contiguous buffer of single-byte items (`bytes`,
 `bytearray`, `memoryview` of bytes, `np.uint8` arrays; other dtypes need
 `arr.view(np.uint8)`). Received frames hold borrowed loan slots
 (`sub.max_borrowed_samples`, default 2): `release()` them promptly, and
 drop their views first: a live view keeps the slot borrowed. Client errors
 derive from `cerulion.CerulionError` (`TransportError`, `SchemaMismatch`,
-`BorrowLimitExceeded`, `ReleasedFrame`, `EncodeError`); invalid arguments
-raise the built-in exceptions listed in `docs/python.md`.
+`BorrowLimitExceeded`, `ReleasedFrame`, `EncodeError`, `DecodeError`, and
+`SchemaError`); invalid arguments raise the built-in exceptions listed in
+`docs/python.md`. Schema-aware clients additionally expose `SchemaSet.layout(name)`
+and typed `Frame.view()`/`Publisher.loan(**lengths)` for read-only NumPy views
+and writable zero-copy loans. `Publisher.publish(dict)` materialises a
+complete typed frame; `Publisher.publish_frame(bytes)` is the advanced raw
+complete-frame path.
 
 Full contract, including the zero-copy wording and the interop fixture:
 `docs/python.md`.

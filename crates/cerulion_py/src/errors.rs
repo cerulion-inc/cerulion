@@ -7,10 +7,12 @@
 //! arm for variants added later - new variants degrade to `TransportError`
 //! (the catch-all bucket) rather than failing to compile silently elsewhere.
 
+use cerulion_core::dynamic::{DynamicError, WalkError};
 use cerulion_core::TransportError as CerTransportError;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
-use pyo3::PyErr;
+use pyo3::types::PyAnyMethods;
+use pyo3::{PyErr, Python};
 
 create_exception!(
     cerulion,
@@ -48,6 +50,18 @@ create_exception!(
     CerulionError,
     "A publish/loan request cannot be encoded into the publisher's slot."
 );
+create_exception!(
+    cerulion,
+    DecodeError,
+    CerulionError,
+    "A wire frame could not be decoded according to its schema."
+);
+create_exception!(
+    cerulion,
+    SchemaError,
+    CerulionError,
+    "A schema could not be loaded or resolved."
+);
 
 /// Map a core [`CerTransportError`] onto the Python exception hierarchy.
 ///
@@ -66,7 +80,7 @@ pub(crate) fn map_transport_err(e: CerTransportError) -> PyErr {
     let msg = e.to_string();
     match e {
         CerTransportError::SchemaMismatch { .. } | CerTransportError::SchemaHashMismatch { .. } => {
-            SchemaMismatch::new_err(msg)
+            Python::attach(|py| schema_mismatch(py, msg))
         }
         CerTransportError::LoanCapacity { .. } => TransportError::new_err(msg),
         CerTransportError::NodeCreation { .. } => TransportError::new_err(msg),
@@ -104,5 +118,126 @@ pub(crate) fn map_transport_err(e: CerTransportError) -> PyErr {
         // `#[non_exhaustive]`: any variant added upstream degrades to the
         // generic TransportError bucket.
         _ => TransportError::new_err(msg),
+    }
+}
+
+fn dynamic_exception(py: Python<'_>, decode: bool, kind: &str, message: String) -> PyErr {
+    let ty = if decode {
+        py.get_type::<DecodeError>()
+    } else {
+        py.get_type::<SchemaError>()
+    };
+    let err = ty
+        .call1((message,))
+        .expect("constructing a native exception cannot fail");
+    err.setattr("kind", kind)
+        .expect("setting a native exception kind cannot fail");
+    PyErr::from_value(err)
+}
+
+fn walk_kind(error: &WalkError) -> &'static str {
+    match error {
+        WalkError::UnknownSchema(_) => "UnknownSchema",
+        WalkError::UnknownSchemaHash(_) => "UnknownSchemaHash",
+        WalkError::FrameTooShort { .. } => "FrameTooShort",
+        WalkError::FixedFieldOutOfBounds { .. } => "FixedFieldOutOfBounds",
+        WalkError::OffsetTableTruncated { .. } => "OffsetTableTruncated",
+        WalkError::VariableFieldOutOfBounds { .. } => "VariableFieldOutOfBounds",
+        WalkError::NestedResolutionFailed { .. } => "NestedResolutionFailed",
+        WalkError::ElementBodyNotExactlyConsumed { .. } => "ElementBodyNotExactlyConsumed",
+    }
+}
+
+pub(crate) fn map_dynamic_err(py: Python<'_>, error: DynamicError) -> PyErr {
+    let message = error.to_string();
+    match &error {
+        DynamicError::Yaml(_)
+        | DynamicError::MissingSchemasKey
+        | DynamicError::InvalidSchemaName(_)
+        | DynamicError::SchemaNotMapping { .. }
+        | DynamicError::FieldsNotMapping { .. }
+        | DynamicError::InvalidFieldKey { .. }
+        | DynamicError::FixedLengthTooLarge { .. }
+        | DynamicError::Rosmsg { .. }
+        | DynamicError::Io { .. }
+        | DynamicError::SchemaNotWireRepresentable { .. }
+        | DynamicError::UnknownSchema(_)
+        | DynamicError::InvalidLayout { .. } => {
+            dynamic_exception(py, false, dynamic_kind(&error), message)
+        }
+        DynamicError::UnknownSchemaHash(_) | DynamicError::SchemaHashMismatch { .. } => {
+            schema_mismatch(py, message)
+        }
+        DynamicError::VariableCountMismatch { .. }
+        | DynamicError::LengthNotElementMultiple { .. }
+        | DynamicError::FrameTooLarge { .. }
+        | DynamicError::BufferTooSmall { .. } => EncodeError::new_err(message),
+        DynamicError::FrameTooShort { .. }
+        | DynamicError::TotalSizeExceedsBuffer { .. }
+        | DynamicError::TotalSizeBelowPrefix { .. }
+        | DynamicError::OffsetTableMismatch { .. }
+        | DynamicError::OffsetBelowDataFloor { .. }
+        | DynamicError::VariableFieldOutOfBounds { .. }
+        | DynamicError::OverlappingEntries { .. }
+        | DynamicError::MisalignedElements { .. }
+        | DynamicError::MisalignedBuffer { .. }
+        | DynamicError::InvalidUtf8 { .. }
+        | DynamicError::UnknownFixedField(_)
+        | DynamicError::UnknownVariableField(_)
+        | DynamicError::NotAStringField(_)
+        | DynamicError::NotAPrimitiveArrayField(_) => {
+            dynamic_exception(py, true, dynamic_kind(&error), message)
+        }
+        DynamicError::Walk(walk) => dynamic_exception(py, true, walk_kind(walk), message),
+        _ => dynamic_exception(py, true, "DynamicError", message),
+    }
+}
+
+pub(crate) fn schema_mismatch(py: Python<'_>, message: String) -> PyErr {
+    let err = py
+        .get_type::<SchemaMismatch>()
+        .call1((message,))
+        .expect("constructing a native schema mismatch cannot fail");
+    err.setattr("kind", "SchemaMismatch")
+        .expect("setting a native schema mismatch kind cannot fail");
+    PyErr::from_value(err)
+}
+
+fn dynamic_kind(error: &DynamicError) -> &'static str {
+    match error {
+        DynamicError::Yaml(_) => "Yaml",
+        DynamicError::MissingSchemasKey => "MissingSchemasKey",
+        DynamicError::InvalidSchemaName(_) => "InvalidSchemaName",
+        DynamicError::SchemaNotMapping { .. } => "SchemaNotMapping",
+        DynamicError::FieldsNotMapping { .. } => "FieldsNotMapping",
+        DynamicError::InvalidFieldKey { .. } => "InvalidFieldKey",
+        DynamicError::FixedLengthTooLarge { .. } => "FixedLengthTooLarge",
+        DynamicError::Rosmsg { .. } => "Rosmsg",
+        DynamicError::Io { .. } => "Io",
+        DynamicError::SchemaNotWireRepresentable { .. } => "SchemaNotWireRepresentable",
+        DynamicError::UnknownSchema(_) => "UnknownSchema",
+        DynamicError::UnknownSchemaHash(_) => "UnknownSchemaHash",
+        DynamicError::InvalidLayout { .. } => "InvalidLayout",
+        DynamicError::SchemaHashMismatch { .. } => "SchemaHashMismatch",
+        DynamicError::VariableCountMismatch { .. } => "VariableCountMismatch",
+        DynamicError::LengthNotElementMultiple { .. } => "LengthNotElementMultiple",
+        DynamicError::FrameTooLarge { .. } => "FrameTooLarge",
+        DynamicError::BufferTooSmall { .. } => "BufferTooSmall",
+        DynamicError::FrameTooShort { .. } => "FrameTooShort",
+        DynamicError::TotalSizeExceedsBuffer { .. } => "TotalSizeExceedsBuffer",
+        DynamicError::TotalSizeBelowPrefix { .. } => "TotalSizeBelowPrefix",
+        DynamicError::OffsetTableMismatch { .. } => "OffsetTableMismatch",
+        DynamicError::OffsetBelowDataFloor { .. } => "OffsetBelowDataFloor",
+        DynamicError::VariableFieldOutOfBounds { .. } => "VariableFieldOutOfBounds",
+        DynamicError::OverlappingEntries { .. } => "OverlappingEntries",
+        DynamicError::MisalignedElements { .. } => "MisalignedElements",
+        DynamicError::MisalignedBuffer { .. } => "MisalignedBuffer",
+        DynamicError::InvalidUtf8 { .. } => "InvalidUtf8",
+        DynamicError::UnknownFixedField(_) => "UnknownFixedField",
+        DynamicError::UnknownVariableField(_) => "UnknownVariableField",
+        DynamicError::NotAStringField(_) => "NotAStringField",
+        DynamicError::NotAPrimitiveArrayField(_) => "NotAPrimitiveArrayField",
+        DynamicError::Walk(walk) => walk_kind(walk),
+        _ => "DynamicError",
     }
 }

@@ -114,6 +114,69 @@ del a
 False 1
 ```
 
+## Schemas
+
+Typed publishers and subscribers use a `SchemaSet` loaded from Cerulion YAML.
+`schemas.layout("Point")` returns the cached fixed/variable layout and
+`schemas.schema_hash("Point")` returns its wire hash. Adding another schema
+invalidates cached layout objects.
+Fixed fields are exposed as Python scalars or read-only NumPy views, while
+variable arrays remain views into the received frame. `publish()` accepts a
+dictionary or a `Message`; it materialises the complete wire frame once.
+
+```python
+schemas = cerulion.SchemaSet()
+schemas.add_yaml("""
+schemas:
+  Point:
+    fields:
+      float64 x: {}
+      float64 y: {}
+""")
+point_pub = session.publisher("/cerulion_py/docs/typed", schema="Point", schemas=schemas)
+point_sub = session.subscriber("/cerulion_py/docs/typed", schema="Point", schemas=schemas)
+point_pub.publish({"x": 1.5, "y": -2.0})
+point_frame = point_sub.receive(1000)
+print(point_frame.view().copy())
+point_frame.release()
+```
+
+```text
+{'x': 1.5, 'y': -2.0}
+```
+
+## Typed messages
+
+`Publisher.loan(**lengths)` reserves a writable shared-memory slot for a
+typed message. `Frame.view()` maps a received frame without copying; its
+fixed arrays and variable arrays are read-only views. Use `.copy()` when a
+materialized, writeable owned dictionary is needed. A dictionary passed to
+`publish()` is encoded into a complete frame and therefore is materialized
+before the single transport copy.
+
+Field views handed out inside a `loan()` block (NumPy arrays and raw
+memoryviews over the slot) are block-scoped: if one is still alive when
+the `with` block exits, commit fails, the loan is discarded unsent, and
+`EncodeError` is raised - delete the view or use `.copy()` first. On a
+loan, a `string[]` or nested-message `Type[]` field is exposed as the raw
+pre-framed byte slice, and its `loan(**lengths)` keyword is the framed
+BYTE length; the same fields on `publish()` accept only pre-framed bytes
+(element-wise encoding of `string[]`/`nested[]` is not supported).
+
+```python
+with point_pub.loan() as point:
+    point.x = 2.5
+    point.y = -4.0
+point_frame = point_sub.receive(1000)
+point = point_frame.view()
+print(point.x, point.copy())
+point_frame.release()
+```
+
+```text
+2.5 {'x': 2.5, 'y': -4.0}
+```
+
 ## Errors
 
 Client errors derive from `cerulion.CerulionError`:
@@ -129,6 +192,10 @@ Client errors derive from `cerulion.CerulionError`:
   `max_payload_len`, or committing a loan while a live buffer view
   exists. A core `LoanCapacity` failure (loan-pool exhaustion) maps to
   `TransportError`, not `EncodeError`.
+- `DecodeError` - malformed wire layout or invalid UTF-8 in a fixed or
+  variable string field of a received frame.
+- `SchemaError` - invalid schema documents, unknown schemas, or incompatible
+  fixed layouts.
 
 Invalid arguments raise built-in exceptions instead: `TypeError` for a
 wrong argument type or a non-contiguous or non-byte buffer, `ValueError`

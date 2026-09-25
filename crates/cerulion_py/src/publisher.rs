@@ -12,7 +12,9 @@
 
 use crate::errors::{map_transport_err, EncodeError};
 use crate::frame::{release_export, stamp_export, warn_offthread_release, Exports};
+use crate::typed::PySchemaSet;
 use cerulion_core::clock::real_ns;
+use cerulion_core::dynamic::{FrameEncoder, FrameView};
 use cerulion_core::transport::publisher::RawShmLoan;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{CerulionPublisher, TransportManager};
@@ -48,10 +50,22 @@ impl Publisher {
         mut loan: RawShmLoan,
         payload_len: usize,
         timestamp_ns: Option<u64>,
+        preserve_layout: bool,
     ) -> PyResult<()> {
         let seq = self.next_sequence;
-        let mut header =
-            WireHeader::new(self.schema_hash, seq, timestamp_ns.unwrap_or_else(real_ns));
+        let mut header = if preserve_layout {
+            WireHeader::read_from_buf(loan.bytes_mut()).ok_or_else(|| {
+                EncodeError::new_err("typed loan does not contain a complete wire header")
+            })?
+        } else {
+            let mut header =
+                WireHeader::new(self.schema_hash, seq, timestamp_ns.unwrap_or_else(real_ns));
+            header.total_size = (WireHeader::SIZE + payload_len) as u32;
+            header
+        };
+        header.schema_hash = self.schema_hash;
+        header.sequence = seq;
+        header.timestamp_ns = timestamp_ns.unwrap_or_else(real_ns);
         header.total_size = (WireHeader::SIZE + payload_len) as u32;
         // Header written LAST: body bytes were placed first (or zero-
         // initialised by `loan()`), so no uninitialised range is visible.
@@ -163,7 +177,7 @@ impl Publisher {
         // covering every byte of the slot before `assume_init` (the real
         // header is stamped by `commit_loan` below).
         let loan = unsafe { loan.assume_init() };
-        self.commit_loan(loan, len, timestamp_ns)
+        self.commit_loan(loan, len, timestamp_ns, false)
     }
 
     /// Loan a zero-initialised SHM slot for a `payload_len`-byte body.
@@ -196,7 +210,139 @@ impl Publisher {
             exports: Exports::new(),
             closed: false,
             pending_drop: false,
+            variable_entries: None,
         })
+    }
+
+    fn loan_typed(
+        slf: &Bound<'_, Self>,
+        schemas: PyRef<'_, PySchemaSet>,
+        name: &str,
+        var_lens: Vec<usize>,
+        timestamp_ns: Option<u64>,
+    ) -> PyResult<Loan> {
+        let mut this = slf.borrow_mut();
+        this.reap();
+        let layout = schemas
+            .inner
+            .layout(name)
+            .ok_or_else(|| EncodeError::new_err(format!("unknown schema {name}")))?;
+        let encoder = FrameEncoder::new(layout)
+            .map_err(|e| Python::attach(|py| crate::errors::map_dynamic_err(py, e)))?;
+        let total = encoder
+            .required_len(&var_lens)
+            .map_err(|e| Python::attach(|py| crate::errors::map_dynamic_err(py, e)))?;
+        let payload_len = total
+            .checked_sub(WireHeader::SIZE)
+            .ok_or_else(|| EncodeError::new_err("typed frame is shorter than its header"))?;
+        if payload_len > this.max_payload_len {
+            return Err(EncodeError::new_err(format!(
+                "typed frame payload {payload_len} exceeds max_payload_len {}",
+                this.max_payload_len
+            )));
+        }
+        let mut raw = this
+            .publisher
+            .loan_raw_uninit(total)
+            .map_err(map_transport_err)?;
+        for byte in raw.bytes_uninit_mut() {
+            byte.write(0);
+        }
+        // SAFETY: the loop above zero-initialised every byte of the slot.
+        let mut loan = unsafe { raw.assume_init() };
+        encoder
+            .begin(
+                loan.bytes_mut(),
+                &var_lens,
+                timestamp_ns.unwrap_or_else(real_ns),
+            )
+            .map_err(|e| Python::attach(|py| crate::errors::map_dynamic_err(py, e)))?;
+        let entries = {
+            let frame_bytes = loan.bytes_mut();
+            let view = FrameView::with_layout(layout, frame_bytes)
+                .map_err(|e| Python::attach(|py| crate::errors::map_dynamic_err(py, e)))?;
+            let payload = view.payload();
+            layout
+                .variable_fields
+                .iter()
+                .map(|field| {
+                    let bytes = view
+                        .variable_field(&field.name)
+                        .map_err(|e| Python::attach(|py| crate::errors::map_dynamic_err(py, e)))?;
+                    let offset = (bytes.as_ptr() as usize)
+                        .checked_sub(payload.as_ptr() as usize)
+                        .ok_or_else(|| {
+                            PyValueError::new_err(
+                                "variable field slice lies outside the loan payload",
+                            )
+                        })?;
+                    Ok((offset, bytes.len()))
+                })
+                .collect::<PyResult<Vec<_>>>()?
+        };
+        drop(this);
+        Ok(Loan {
+            publisher: slf.clone().unbind(),
+            loan: Some(loan),
+            payload_len,
+            timestamp_ns,
+            exports: Exports::new(),
+            closed: false,
+            pending_drop: false,
+            variable_entries: Some(entries),
+        })
+    }
+
+    fn publish_frame(
+        &mut self,
+        py: Python<'_>,
+        frame: PyBuffer<u8>,
+        timestamp_ns: Option<u64>,
+    ) -> PyResult<()> {
+        let src = frame
+            .as_slice(py)
+            .ok_or_else(|| PyTypeError::new_err("frame must be a contiguous bytes-like object"))?;
+        if src.len() < WireHeader::SIZE {
+            return Err(EncodeError::new_err(
+                "frame is shorter than the wire header",
+            ));
+        }
+        let header_bytes: [u8; WireHeader::SIZE] = std::array::from_fn(|index| src[index].get());
+        let header = WireHeader::read_from_buf(&header_bytes)
+            .ok_or_else(|| EncodeError::new_err("frame is shorter than the wire header"))?;
+        let total = header.total_size as usize;
+        if total < WireHeader::SIZE || total > src.len() {
+            return Err(EncodeError::new_err(
+                "frame total_size is outside its buffer",
+            ));
+        }
+        if header.schema_hash != self.schema_hash {
+            return Err(crate::errors::schema_mismatch(
+                py,
+                format!(
+                    "frame schema hash {:#x} does not match the publisher's {:#x}",
+                    header.schema_hash, self.schema_hash
+                ),
+            ));
+        }
+        let payload_len = total - WireHeader::SIZE;
+        if payload_len > self.max_payload_len {
+            return Err(EncodeError::new_err(format!(
+                "frame payload {payload_len} exceeds max_payload_len {}",
+                self.max_payload_len
+            )));
+        }
+        self.reap();
+        let mut loan = self
+            .publisher
+            .loan_raw_uninit(total)
+            .map_err(map_transport_err)?;
+        for (dst, value) in loan.bytes_uninit_mut().iter_mut().zip(&src[..total]) {
+            dst.write(value.get());
+        }
+        // SAFETY: every byte in the requested frame range was initialized above.
+        let loan = unsafe { loan.assume_init() };
+        self.commit_loan(loan, payload_len, timestamp_ns, true)
     }
 }
 
@@ -217,6 +363,7 @@ pub struct Loan {
     exports: Arc<Exports>,
     closed: bool,
     pending_drop: bool,
+    variable_entries: Option<Vec<(usize, usize)>>,
 }
 
 #[pymethods]
@@ -305,6 +452,10 @@ impl Loan {
         self.payload_len
     }
 
+    fn variable_entries(&self) -> Option<Vec<(usize, usize)>> {
+        self.variable_entries.clone()
+    }
+
     /// Optional explicit wire timestamp for the next commit.
     #[getter]
     fn timestamp_ns(&self) -> Option<u64> {
@@ -339,11 +490,13 @@ impl Loan {
         this.closed = true;
         let payload_len = this.payload_len;
         let timestamp_ns = this.timestamp_ns;
+        let preserve_layout = this.variable_entries.is_some();
         let publisher = this.publisher.clone_ref(py);
         drop(this);
-        let result = publisher
-            .borrow_mut(py)
-            .commit_loan(loan, payload_len, timestamp_ns);
+        let result =
+            publisher
+                .borrow_mut(py)
+                .commit_loan(loan, payload_len, timestamp_ns, preserve_layout);
         result
     }
 

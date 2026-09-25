@@ -1,5 +1,6 @@
 import ctypes
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -80,6 +81,19 @@ def fnv1a64(data):
     for b in data:
         h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return h
+
+
+def shm_mappings():
+    """[start, end) ranges of /dev/shm/iox2_ mappings (data segments, not [anon shmem])."""
+    ranges = []
+    with open("/proc/self/maps") as f:
+        for line in f:
+            if "iox2_" not in line:
+                continue
+            match = re.match(r"([0-9a-f]+)-([0-9a-f]+)", line)
+            if match:
+                ranges.append((int(match.group(1), 16), int(match.group(2), 16)))
+    return ranges
 
 
 def expected_header_bytes(schema_hash, total_size, sequence, timestamp_ns):
