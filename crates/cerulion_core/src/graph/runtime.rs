@@ -2040,6 +2040,126 @@ fn set_nonblocking(raw: std::os::unix::io::RawFd, node_id: &Arc<str>) -> bool {
 /// recheck — the timer backstop bounds it to ≤recheck, the same discipline as an
 /// ignored listener `try_wait_one` error; it is never mistaken for a wake and
 /// never panics.
+/// ONE non-blocking readiness sweep over every LISTENER in a wake-source list.
+///
+/// # Why this exists
+///
+/// The two idle poll loops (`spin_sources` and `monitor_wait_block`'s recheck)
+/// used to ask each listener "is there anything" by DRAINING it. Under
+/// iceoryx2 0.10 a drain of an empty listener is two `recvmsg` calls, two
+/// sequentially consistent barriers and a walk of the shared-memory counting
+/// bitset, MEASURED at 251 ns on x86_64 Linux. A census of the live loop
+/// on the round-trip bench graph counted 969 recheck drains and 38 spin drains
+/// per step against 2 on the step path, so those two loops are where
+/// essentially all of the drain cost is.
+///
+/// This asks the same question with one `poll(2)` for the WHOLE set, and the
+/// caller then drains only the listeners the sweep names. MEASURED on the same
+/// platform: 100 ns for the poll against 251 ns per listener for the drains it
+/// replaces, and the poll does not grow with the number of listeners.
+///
+/// # Why the doorbell fd is a correct readiness signal
+///
+/// iceoryx2 0.10 sends the doorbell byte only on the IDLE to PENDING
+/// transition and skips the send while the listener is already NOTIFIED, and
+/// nothing consumes the byte except a drain. So the fd is readable if and only
+/// if there are undrained activations, and it stays readable until a drain
+/// takes them. `poll(2)` is level triggered by definition, so a byte that
+/// arrived before a sweep began is reported by that sweep and by every sweep
+/// after it until it is drained. `the_doorbell_fd_is_a_level_triggered_readiness_signal`
+/// pins both halves against a live listener rather than against this comment.
+///
+/// # Why a `poll` and not `WaitSet::wait_and_process_once_with_timeout`
+///
+/// A zero-timeout WaitSet sweep measures 76.5 ns, slightly better than the
+/// poll, but only over a set that is ALREADY attached. `WaitSetReactor::run_once`
+/// re-attaches every source on every cycle, so there is no standing attachment
+/// to sweep, and attaching one guard per listener per spin turn costs far more
+/// than the drains this replaces. The poll needs no attachment at all.
+///
+/// # The firewall (Principle #7)
+///
+/// This reads file descriptors and nothing else. It touches no barrier state,
+/// no gating clock, no lockstep flag, no scheduler and no SHM message queue,
+/// which is what lets it stay on the record-only side of the live loop exactly
+/// as the drains it replaces did. `the_readiness_sweep_reads_only_file_descriptors`
+/// pins that by walking this source.
+pub(crate) struct ListenerSweep {
+    /// One entry per LISTENER source, in `poll(2)` order.
+    fds: Vec<libc::pollfd>,
+    /// `src[i]` is the index into the caller's `sources` of `fds[i]`.
+    src: Vec<usize>,
+}
+
+impl ListenerSweep {
+    /// Collect the listener file descriptors out of a wake-source list. Fd
+    /// (device) sources are deliberately EXCLUDED: `spin_sources` has always
+    /// skipped them, and the park polls them on its own path with its own
+    /// staleness rules. Built once per live-loop iteration beside `sources`,
+    /// never per poll turn.
+    pub(crate) fn new(sources: &[(waitset::WaitSource<'_>, Arc<str>)]) -> Self {
+        // hot-path-alloc-known: two `Vec`s per WAIT on the live loop, the exact
+        // sibling of the `sources` list they mirror, which records the same cost
+        // at its own site in `live_step`. The poll TURNS are then allocation
+        // free, which is the point: the old shape paid two `recvmsg` calls per
+        // listener per turn. Both buffers are blocked from being hoisted onto
+        // the struct by the same thing `sources` is: refilling a field would
+        // need `&mut self` while `sources` holds `&self`. They go cold the day
+        // the listener list gets an ownership model that does not borrow.
+        let mut fds = Vec::with_capacity(sources.len());
+        // hot-path-alloc-known: the index half of the pair above, same cost,
+        // same blocker, same fix.
+        let mut src = Vec::with_capacity(sources.len());
+        for (idx, (source, _node_id)) in sources.iter().enumerate() {
+            if let waitset::WaitSource::Listener(listener) = source {
+                use iceoryx2_bb_posix::file_descriptor::FileDescriptorBased;
+                // SAFETY (native_handle): the integer is used only as a poll
+                // target for the lifetime of this borrow; nothing here stores
+                // or closes it. Same contract as `event_listener_fd`.
+                let raw = unsafe { listener.file_descriptor().native_handle() };
+                fds.push(libc::pollfd {
+                    fd: raw,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                src.push(idx);
+            }
+        }
+        Self { fds, src }
+    }
+
+    /// ONE `poll(2)` with a zero timeout. Returns whether any listener is
+    /// readable; [`Self::ready`] then names which.
+    ///
+    /// A syscall error is "nothing ready", the same way an `Err` from a drain
+    /// was: a transient failure must not be mistaken for a wake, and the timer
+    /// backstop re-asks within the recheck interval.
+    pub(crate) fn poll_ready(&mut self) -> bool {
+        if self.fds.is_empty() {
+            return false;
+        }
+        for pfd in self.fds.iter_mut() {
+            pfd.revents = 0;
+        }
+        // SAFETY: `fds` is a valid contiguous array of `len` pollfds for the
+        // duration of the call; timeout 0 makes it non-blocking.
+        let rc = unsafe { libc::poll(self.fds.as_mut_ptr(), self.fds.len() as libc::nfds_t, 0) };
+        rc > 0
+    }
+
+    /// The `sources` indices whose listener the last [`Self::poll_ready`]
+    /// found readable. `POLLERR`, `POLLHUP` and `POLLNVAL` count as readable so
+    /// a broken listener is handed to the drain, which is the arm that already
+    /// knows how to treat a listener error as "no event".
+    pub(crate) fn ready(&self) -> impl Iterator<Item = usize> + '_ {
+        const READY: libc::c_short = libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+        self.fds
+            .iter()
+            .zip(self.src.iter())
+            .filter_map(move |(pfd, idx)| (pfd.revents & READY != 0).then_some(*idx))
+    }
+}
+
 fn park_poll_fd_ready(raw: std::os::unix::io::RawFd) -> bool {
     let mut pfd = libc::pollfd {
         fd: raw,
@@ -11706,9 +11826,13 @@ impl GraphRuntime {
             // tests rely on. If a future change ever registers a wake source for
             // non-trigger inputs, it would change the live-loop WAKE cadence
             // (NOT the deterministic fire set/order — that stays in `step`).
+            // ONE sweep buffer per live-loop iteration, built beside the
+            // `sources` list it mirrors and reused by every poll turn of both
+            // the spin and the park recheck below.
+            let mut sweep = ListenerSweep::new(&sources);
             if !sources.is_empty()
                 && !spin_budget.is_zero()
-                && self.spin_sources(&sources, spin_budget)
+                && self.spin_sources(&sources, &mut sweep, spin_budget)
             {
                 // An event arrived within the spin budget.
                 // `spin_sources` drained ONLY that listener's NOTIFICATION
@@ -11751,7 +11875,7 @@ impl GraphRuntime {
                 // the park opt-out internally: with the park inactive it
                 // sleep-recheck-paces (no CPU monitor-wait primitive is used)
                 // while still polling the wake predicates every recheck.
-                self.monitor_wait_block(&sources, timeout)
+                self.monitor_wait_block(&sources, &mut sweep, timeout)
             } else if sources.is_empty() {
                 false
             } else {
@@ -11878,35 +12002,67 @@ impl GraphRuntime {
     fn spin_sources(
         &self,
         sources: &[(waitset::WaitSource<'_>, Arc<str>)],
+        sweep: &mut ListenerSweep,
         budget: Duration,
     ) -> bool {
         let deadline = std::time::Instant::now() + budget;
         loop {
             let mut got = false;
-            for (source, _node_id) in sources {
-                // Only LISTENER sources are user-space-polled here. Fd
-                // (device) sources are intentionally SKIPPED — they are caught by
-                // the idle wait that follows this spin (the WaitSet block when the
-                // park is off, or the park's own recheck fd poll when
-                // it is on); a poll(2) syscall inside THIS tight user-space spin
-                // would defeat the spin's whole purpose (staying in user space to
-                // skip the epoll/C-state round-trip).
-                let waitset::WaitSource::Listener(listener) = source else {
-                    continue;
-                };
-                // Drain THIS listener's notification queue to empty
-                // (record-only; mirrors `waitset.rs`'s reactor drain). A
-                // `try_wait_one` error is treated as "no event" — a transient
-                // listener error must not be mistaken for a wake (it would
-                // skip the WaitSet block and burn the iteration), and the
-                // blocking WaitSet path below remains the authoritative wake.
-                // iceoryx2 0.10: one `try_wait` drains the queue and returns the
-                // number of ACTIVATIONS delivered — read that count rather than
-                // counting callback invocations (0.10 coalesces repeats of one
-                // event id into a single callback carrying `count`).
-                if let Ok(activations) = listener.try_wait(|_activation| {}) {
-                    if activations > 0 {
-                        got = true;
+            // ASK ONCE for the whole set, then drain only what answered.
+            //
+            // Only LISTENER sources are polled here. Fd (device) sources are
+            // intentionally SKIPPED (they are not in the sweep at all) — they
+            // are caught by the idle wait that follows this spin: the WaitSet
+            // block when the park is off, or the park's own recheck fd poll
+            // when it is on.
+            //
+            // This used to DRAIN every listener to ask the question, which
+            // under iceoryx2 0.10 is two `recvmsg` calls plus two barriers per
+            // listener per turn. The sweep is one `poll(2)` for the whole set
+            // and the drain now runs only where there is something to drain,
+            // which is the point: a spin turn that finds nothing is the case a
+            // spin performs most.
+            if sweep.poll_ready() {
+                for idx in sweep.ready() {
+                    let Some((waitset::WaitSource::Listener(listener), _node_id)) =
+                        sources.get(idx)
+                    else {
+                        continue;
+                    };
+                    // Drain THIS listener's notification queue to empty
+                    // (record-only; mirrors `waitset.rs`'s reactor drain). An
+                    // error is treated as "no event" — a transient listener
+                    // error must not be mistaken for a wake (it would skip the
+                    // WaitSet block and burn the iteration), and the blocking
+                    // WaitSet path below remains the authoritative wake.
+                    // One `try_wait` drains the queue and returns the number of
+                    // ACTIVATIONS delivered; read that count rather than
+                    // counting callback invocations, because a repeat of one
+                    // event id arrives as a single callback carrying its count.
+                    //
+                    // The drain is what CLEARS the event, and the sweep only
+                    // changed how the turn asks. Keeping it is what makes this
+                    // rewrite a change of QUESTION and not of behaviour.
+                    //
+                    // No test can fail on its removal today, and that is a
+                    // measured statement, not an assumption: `drain_level`
+                    // drains EVERY wake listener in the level unconditionally
+                    // on every step (the `DrainSource::Unified` arm and the
+                    // Sync per-set arm both `try_wait` before they read
+                    // anything), so no listener in `sources` can carry an event
+                    // across a step for an idle poll to find. Removing this
+                    // line leaves all eight park and wake suites green. It
+                    // stays because it is the ONLY thing standing between a
+                    // future wake source with no step-path drain and a live
+                    // loop that never parks again, and it costs a `try_wait`
+                    // only on a turn that found something (2 per step by
+                    // census, against 1007 idle polls). A source walk in
+                    // `listener_sweep_iox2_test` is what fails if either half
+                    // of that pair is deleted.
+                    if let Ok(activations) = listener.try_wait(|_activation| {}) {
+                        if activations > 0 {
+                            got = true;
+                        }
                     }
                 }
             }
@@ -11955,7 +12111,8 @@ impl GraphRuntime {
             // mirroring the production `live_step` source list.
             .chain(self.external_wake_sources())
             .collect();
-        self.spin_sources(&sources, budget)
+        let mut sweep = ListenerSweep::new(&sources);
+        self.spin_sources(&sources, &mut sweep, budget)
     }
 
     /// Is a shallow monitor-wait park active for this runtime's live
@@ -12393,6 +12550,7 @@ impl GraphRuntime {
     fn monitor_wait_block(
         &self,
         sources: &[(waitset::WaitSource<'_>, Arc<str>)],
+        sweep: &mut ListenerSweep,
         timeout: Duration,
     ) -> bool {
         // Record this park ENTRY (once per call, before the loop) — the
@@ -12559,24 +12717,43 @@ impl GraphRuntime {
             // A wake from an external/doorbell raw fd going ready (the
             // recheck loop now polls Fd sources — see the `Fd` arm below).
             let mut fd_got = false;
-            for (source, _node_id) in sources {
-                match source {
-                    waitset::WaitSource::Listener(listener) => {
-                        // A `try_wait_one` `Err` / `Ok(None)` is treated as "no
-                        // event" (mirrors `spin_sources`): a transient listener
-                        // error must not be mistaken for a wake. The timer/doorbell
-                        // backstop makes an ignored `Err` a BOUNDED delay
-                        // (≤`recheck` / ≤`timeout`), never a LOST fire — the
-                        // authoritative read is still `step()`/`drain_level` off the
-                        // untouched SHM queue.
-                        // iceoryx2 0.10: one drain call; the returned activation
-                        // count is the wake signal (see `spin_sources`).
-                        if let Ok(activations) = listener.try_wait(|_activation| {}) {
-                            if activations > 0 {
-                                listener_got = true;
-                            }
+            // ASK ONCE for every listener, then drain only what answered — the
+            // same shape as `spin_sources`, and for the same reason. A live-loop
+            // census on the round-trip bench graph counted 969 of these recheck
+            // polls per step against 38 spin polls and 2 step-path drains, so
+            // this loop is where the drain cost of the whole live path sits.
+            // The Fd arm below is unchanged.
+            if sweep.poll_ready() {
+                for idx in sweep.ready() {
+                    let Some((waitset::WaitSource::Listener(listener), _node_id)) =
+                        sources.get(idx)
+                    else {
+                        continue;
+                    };
+                    // An `Err` is treated as "no event" (mirrors
+                    // `spin_sources`): a transient listener error must not be
+                    // mistaken for a wake. The timer/doorbell backstop makes an
+                    // ignored `Err` a BOUNDED delay (at most `recheck` / at most
+                    // `timeout`), never a LOST fire — the authoritative read is
+                    // still `step()`/`drain_level` off the untouched SHM queue.
+                    // One drain call; the returned activation count is the wake
+                    // signal, and the drain is still what CLEARS the event.
+                    // Same standing as the spin's drain above: nothing
+                    // observable fails when it is removed, because the step
+                    // path drains every wake listener unconditionally, and it
+                    // is kept and source-walked for the same reason.
+                    if let Ok(activations) = listener.try_wait(|_activation| {}) {
+                        if activations > 0 {
+                            listener_got = true;
                         }
                     }
+                }
+            }
+            for (source, _node_id) in sources {
+                match source {
+                    // Listeners are handled by the sweep above; this arm walks
+                    // the list only for the Fd sources.
+                    waitset::WaitSource::Listener(_) => {}
                     // Poll external/doorbell raw fds (DeviceFd +
                     // DoorbellFd) each recheck. Earlier the park SKIPPED Fd
                     // sources, so on a primitive target (WFE/WAITPKG) an external
