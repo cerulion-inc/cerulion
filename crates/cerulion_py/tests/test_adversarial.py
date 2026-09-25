@@ -337,6 +337,32 @@ def test_next_on_the_subscriber_releases_its_previous_frame(session):
     second.release()
 
 
+
+def test_a_subscriber_used_with_next_is_freed_without_the_cycle_collector(session):
+    """`next(sub)` keeps no reference cycle: dropping the last reference frees
+    the subscriber at once, with cyclic garbage collection disabled."""
+    import gc
+    import weakref
+
+    topic = unique_topic("iter-next-free")
+    sub = session.subscriber(topic, depth=2)
+    pub = session.publisher(topic, 1, max_payload_len=64)
+    pub.publish(b"one")
+    frame = next(sub)
+    assert frame.to_bytes() == b"one"
+    frame.release()
+    del frame
+    alive = weakref.ref(sub)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del sub
+        assert alive() is None
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def _max_open_loans(pub):
     loans = []
     try:
