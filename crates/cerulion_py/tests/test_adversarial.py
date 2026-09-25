@@ -70,14 +70,29 @@ def test_loan_oversize_slice_write(session):
 
 
 def test_loan_commit_with_live_view(session):
-    pub = session.publisher(unique_topic("live"), 1, max_payload_len=64)
+    topic = unique_topic("live")
+    sub = session.subscriber(topic, depth=2)
+    pub = session.publisher(topic, 1, max_payload_len=64)
     loan = pub.loan(4)
     view = loan.payload
+    view[:] = b"live"
     with pytest.raises(cerulion.EncodeError, match="loan.payload views"):
         loan.commit()
+    assert sub.receive(0) is None  # the refused commit sent nothing
     del view
     loan.commit()
     assert loan.is_open is False
+    frame = sub.receive(2000)
+    assert frame is not None
+    assert frame.to_bytes() == b"live"
+    frame.release()
+
+
+def test_oversize_noncontiguous_publish_raises_typeerror(session):
+    pub = session.publisher(unique_topic("over-nc"), 1, max_payload_len=64)
+    strided = np.zeros(256, dtype=np.uint8)[::2]  # 128 bytes, not contiguous
+    with pytest.raises(TypeError, match="contiguous"):
+        pub.publish(strided)
 
 
 def test_type_errors(session):
@@ -177,6 +192,44 @@ def test_last_view_of_released_frame_freed_on_foreign_thread(session):
     assert any(w.category is RuntimeWarning for w in caught), [
         str(w.message) for w in caught
     ]
+    del frame
+    _hold_all_borrowed(sub, pub)
+
+
+def test_released_frame_slot_returns_at_next_receive_while_referenced(session):
+    """The last view of a released frame closing on a foreign thread returns
+    the slot at the subscriber's next receive, even with the frame object
+    still referenced."""
+    import warnings
+
+    topic = unique_topic("xthread-park")
+    sub = session.subscriber(topic, depth=2)
+    pub = session.publisher(topic, 1, max_payload_len=64)
+    pub.publish(b"data")
+    frame = sub.receive(2000)
+    assert frame is not None
+    mv = frame.raw
+    frame.release()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _release_on_thread(mv)
+    assert any("next receive" in str(w.message) for w in caught), [
+        str(w.message) for w in caught
+    ]
+    _hold_all_borrowed(sub, pub)
+    assert frame.is_released
+
+
+def test_iterator_does_not_retain_last_frame(session):
+    """Leaving a `for frame in sub` loop and dropping the frame frees its
+    slot: the iterator keeps no strong reference."""
+    topic = unique_topic("iter-drop")
+    sub = session.subscriber(topic, depth=2)
+    pub = session.publisher(topic, 1, max_payload_len=64)
+    pub.publish(b"iter")
+    for frame in sub:
+        assert frame.to_bytes() == b"iter"
+        break
     del frame
     _hold_all_borrowed(sub, pub)
 

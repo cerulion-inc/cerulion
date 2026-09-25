@@ -1,6 +1,8 @@
+import ctypes
 import os
 import struct
 import subprocess
+import sys
 
 import pytest
 
@@ -10,6 +12,58 @@ FIXTURE_ENV = "CERULION_PY_FIXTURE"
 DEFAULT_FIXTURE = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "target", "release", "cerulion_py_fixture")
 )
+
+
+# mach/vm_region.h: VM_REGION_EXTENDED_INFO and the share modes of a mapping
+# backed by a shared memory object (SM_SHARED, SM_TRUESHARED,
+# SM_SHARED_ALIASED); a private copy is SM_PRIVATE, SM_COW or SM_EMPTY.
+_VM_REGION_EXTENDED_INFO = 13
+_SHARED_MODES = frozenset((4, 5, 7))
+
+
+class _VmRegionExtendedInfo(ctypes.Structure):
+    _fields_ = [
+        ("protection", ctypes.c_int),
+        ("user_tag", ctypes.c_uint),
+        ("pages_resident", ctypes.c_uint),
+        ("pages_shared_now_private", ctypes.c_uint),
+        ("pages_swapped_out", ctypes.c_uint),
+        ("pages_dirtied", ctypes.c_uint),
+        ("ref_count", ctypes.c_uint),
+        ("shadow_depth", ctypes.c_ushort),
+        ("external_pager", ctypes.c_ubyte),
+        ("share_mode", ctypes.c_ubyte),
+        ("pages_reusable", ctypes.c_uint),
+    ]
+
+
+def macos_shared_mapping(ptr):
+    """True when ``ptr`` lies in a shared-memory mapping (macOS only).
+
+    Asks the kernel for the region containing ``ptr`` with
+    ``mach_vm_region``; a receive that copied into process heap reports a
+    private share mode instead."""
+    assert sys.platform == "darwin", "macos_shared_mapping is macOS-only"
+    libc = ctypes.CDLL(None)
+    task = ctypes.c_uint32.in_dll(libc, "mach_task_self_")
+    address = ctypes.c_uint64(ptr)
+    size = ctypes.c_uint64(0)
+    info = _VmRegionExtendedInfo()
+    count = ctypes.c_uint32(ctypes.sizeof(info) // 4)
+    object_name = ctypes.c_uint32(0)
+    kr = libc.mach_vm_region(
+        task,
+        ctypes.byref(address),
+        ctypes.byref(size),
+        ctypes.c_int(_VM_REGION_EXTENDED_INFO),
+        ctypes.byref(info),
+        ctypes.byref(count),
+        ctypes.byref(object_name),
+    )
+    assert kr == 0, f"mach_vm_region failed: {kr}"
+    if not address.value <= ptr < address.value + size.value:
+        return False
+    return info.share_mode in _SHARED_MODES
 
 
 def unique_topic(name):

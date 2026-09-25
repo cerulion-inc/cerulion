@@ -7,7 +7,7 @@
 //! the `CerulionSubscriber` itself never leaves the attached thread.
 
 use crate::errors::{map_transport_err, TransportError as PyTransportError};
-use crate::frame::Frame;
+use crate::frame::{Frame, SlotHome};
 use cerulion_core::clock::real_ns;
 use cerulion_core::transport::failure_regime_latch::{
     lock_regime_latch, FailureRegimeLatch, RegimeDecision,
@@ -15,8 +15,10 @@ use cerulion_core::transport::failure_regime_latch::{
 use cerulion_core::{CerulionSubscriber, TransportManager};
 use pyo3::exceptions::PyRuntimeWarning;
 use pyo3::prelude::*;
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::os::fd::RawFd;
+use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -30,6 +32,9 @@ pub struct Subscriber {
     /// one per observing entity and condition (the shared latch's
     /// keying rule); `receive` is `&self`, so it lives behind a Mutex.
     drain_latch: Mutex<FailureRegimeLatch>,
+    /// Parked samples and recycled export counters of this subscriber's
+    /// frames.
+    home: Rc<RefCell<SlotHome>>,
 }
 
 impl Subscriber {
@@ -43,6 +48,7 @@ impl Subscriber {
     /// Pop one frame, mapping the sample into a `Frame`. Shared by
     /// `try_receive` and the `receive` loop.
     fn receive_one(&self) -> PyResult<Option<Frame>> {
+        self.home.borrow_mut().reap();
         let res = self
             .sub
             .try_receive_one_owned()
@@ -56,7 +62,7 @@ impl Subscriber {
                 let header = sample.wire_header().ok_or_else(|| {
                     PyTransportError::new_err("received a frame with a malformed wire header")
                 })?;
-                Ok(Some(Frame::new(sample, header, recv_ns)))
+                Ok(Some(Frame::new(sample, header, recv_ns, &self.home)))
             }
             None => Ok(None),
         }
@@ -98,10 +104,12 @@ impl Subscriber {
         let sub = mgr
             .create_subscriber_with_buffers(topic, mgr.default_topic_config(), depth)
             .map_err(map_transport_err)?;
+        let home = SlotHome::shared(sub.max_borrowed_samples());
         Ok(Self {
             sub,
             depth,
             drain_latch: Mutex::new(FailureRegimeLatch::new()),
+            home,
         })
     }
 

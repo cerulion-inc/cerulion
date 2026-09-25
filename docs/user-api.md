@@ -2820,9 +2820,10 @@ frame.release()                                    # returns the borrowed slot
 `bytearray`, `memoryview` of bytes, `np.uint8` arrays; other dtypes need
 `arr.view(np.uint8)`). Received frames hold borrowed loan slots
 (`sub.max_borrowed_samples`, default 2): `release()` them promptly, and
-drop their views first: a live view keeps the slot borrowed. Errors all
+drop their views first: a live view keeps the slot borrowed. Client errors
 derive from `cerulion.CerulionError` (`TransportError`, `SchemaMismatch`,
-`BorrowLimitExceeded`, `ReleasedFrame`, `EncodeError`).
+`BorrowLimitExceeded`, `ReleasedFrame`, `EncodeError`); invalid arguments
+raise the built-in exceptions listed in `docs/python.md`.
 
 Full contract, including the zero-copy wording and the interop fixture:
 `docs/python.md`.
