@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `cerulion_py_fixture` - the Rust peer for the cerulion_py test suite.
 //!
-//! Two modes: `publish` stamps deterministic-pattern wire frames a Python
-//! subscriber can oracle-check; `subscribe` receives frames and prints a
+//! Modes: `write-bag` writes a deterministic oracle MCAP bag; `publish`
+//! stamps deterministic-pattern wire frames a Python subscriber can
+//! oracle-check; `subscribe` receives frames and prints a
 //! one-line digest (sequence, header fields, FNV-1a of the body) Python
 //! publishers can be asserted against.
 
@@ -125,7 +126,8 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
         .map(|(m, r)| (m.as_str(), r))
         .unwrap_or(("", &[]));
     match mode {
-        "publish" | "subscribe" | "publish-typed" | "subscribe-typed" | "host-pynode" => {}
+        "publish" | "subscribe" | "publish-typed" | "subscribe-typed" | "host-pynode"
+        | "write-bag" => {}
         _ => return Err(format!("unknown mode '{mode}'\n{USAGE}")),
     }
     if mode == "host-pynode" {
@@ -142,6 +144,9 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
     // discarded - the mode handler re-reads them) so an invalid
     // invocation fails before `TransportManager::init`.
     match mode {
+        "write-bag" => {
+            flag(&args, "path")?;
+        }
         "publish" => {
             flag(&args, "topic")?;
             flag_u64(&args, "schema-hash")?;
@@ -184,6 +189,10 @@ fn run() -> Result<ExitCode, String> {
         .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
         .with_writer(std::io::stderr)
         .try_init();
+
+    if mode == "write-bag" {
+        return cmd_write_bag(&args);
+    }
 
     TransportManager::init(TransportConfig {
         node_name: "cerulion_py_fixture".to_string(),
@@ -243,6 +252,114 @@ fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
         }
     }
     Ok(args)
+}
+
+const BAG_HASH_A: u64 = 0x0BAD_C0DE_0BAD_C0DE;
+const BAG_HASH_B: u64 = 0x1234_5678_9ABC_DEF0;
+const VECTOR3_MSG: &str = "float64 x\nfloat64 y\nfloat64 z\n";
+
+fn bag_oracle_frame(hash: u64, sequence: u32) -> Vec<u8> {
+    let payload: Vec<u8> = (0..(8 + (sequence as usize % 5)))
+        .map(|i| (sequence as usize * 7 + i) as u8)
+        .collect();
+    let total = WireHeader::SIZE + payload.len();
+    let mut frame = vec![0u8; total];
+    WireHeader {
+        schema_hash: hash,
+        total_size: total as u32,
+        offset_table_offset: 0,
+        offset_table_count: 0,
+        sequence,
+        timestamp_ns: 2_000_000_000 + u64::from(sequence) * 10_000_000,
+    }
+    .write_to_buf(&mut frame);
+    frame[WireHeader::SIZE..].copy_from_slice(&payload);
+    frame
+}
+
+fn vector3_bag_frame() -> Result<Vec<u8>, String> {
+    let schema = parse_rosmsg(VECTOR3_MSG, "Vector3", Some("geometry_msgs"))
+        .map_err(|error| error.to_string())?;
+    let (schemas, _) = SchemaSet::from_schemas(vec![schema]).map_err(|error| error.to_string())?;
+    let layout = schemas
+        .layout("geometry_msgs/Vector3")
+        .ok_or("Vector3 layout unavailable")?;
+    let encoder = FrameEncoder::new(layout).map_err(|error| error.to_string())?;
+    let total = encoder
+        .required_len(&[])
+        .map_err(|error| error.to_string())?;
+    let mut frame = vec![0u8; total];
+    let mut cursor = encoder
+        .begin(&mut frame, &[], 3_000_000_000)
+        .map_err(|error| error.to_string())?;
+    cursor.set_sequence(0);
+    cursor
+        .fixed_field_mut("x")
+        .map_err(|error| error.to_string())?
+        .copy_from_slice(&1.5f64.to_le_bytes());
+    cursor
+        .fixed_field_mut("y")
+        .map_err(|error| error.to_string())?
+        .copy_from_slice(&(-2.0f64).to_le_bytes());
+    cursor
+        .fixed_field_mut("z")
+        .map_err(|error| error.to_string())?
+        .copy_from_slice(&0.25f64.to_le_bytes());
+    Ok(frame)
+}
+
+fn cmd_write_bag(args: &Args) -> Result<ExitCode, String> {
+    let path = flag(args, "path")?;
+    let vector3 = vector3_bag_frame()?;
+    let vector3_hash = WireHeader::read_from_buf(&vector3)
+        .ok_or("Vector3 frame header unavailable")?
+        .schema_hash;
+    let topics = [
+        cerulion_bag::TopicSchema {
+            topic: "/py_bag/a".to_string(),
+            schema_name: "py_bag/A".to_string(),
+            schema_hash: BAG_HASH_A,
+            wire_fixed_size: 0,
+        },
+        cerulion_bag::TopicSchema {
+            topic: "/py_bag/b".to_string(),
+            schema_name: "py_bag/B".to_string(),
+            schema_hash: BAG_HASH_B,
+            wire_fixed_size: 0,
+        },
+        cerulion_bag::TopicSchema {
+            topic: "/py_bag/vec".to_string(),
+            schema_name: "geometry_msgs/Vector3".to_string(),
+            schema_hash: vector3_hash,
+            wire_fixed_size: 24,
+        },
+    ];
+    let mut writer =
+        cerulion_bag::BagWriter::create(path, cerulion_bag::BagWriterConfig::default(), &topics)
+            .map_err(|error| error.to_string())?;
+    let order = [
+        ("/py_bag/a", BAG_HASH_A, 0u32),
+        ("/py_bag/b", BAG_HASH_B, 0),
+        ("/py_bag/a", BAG_HASH_A, 1),
+        ("/py_bag/a", BAG_HASH_A, 2),
+        ("/py_bag/b", BAG_HASH_B, 1),
+        ("/py_bag/a", BAG_HASH_A, 3),
+        ("/py_bag/b", BAG_HASH_B, 2),
+        ("/py_bag/a", BAG_HASH_A, 4),
+    ];
+    for (topic, hash, sequence) in order {
+        let frame = bag_oracle_frame(hash, sequence);
+        let timestamp = 2_000_000_000 + u64::from(sequence) * 10_000_000;
+        writer
+            .write_message(topic, sequence, timestamp, timestamp, &[&frame])
+            .map_err(|error| error.to_string())?;
+    }
+    writer
+        .write_message("/py_bag/vec", 0, 3_000_000_000, 3_000_000_000, &[&vector3])
+        .map_err(|error| error.to_string())?;
+    writer.finalize().map_err(|error| error.to_string())?;
+    println!("WROTE 9");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, String> {
@@ -857,7 +974,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
     Ok(ExitCode::SUCCESS)
 }
 
-const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]";
+const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]\n  cerulion_py_fixture write-bag --path FILE";
 
 fn main() -> ExitCode {
     match run() {

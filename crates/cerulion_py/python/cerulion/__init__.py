@@ -13,6 +13,7 @@ from cerulion._native import (
     CerulionError,
     EncodeError,
     DecodeError,
+    BagError,
     ReleasedFrame,
     SchemaError,
     SchemaMismatch,
@@ -20,6 +21,7 @@ from cerulion._native import (
     real_ns,
 )
 from cerulion._typed import Layout, Message, SchemaSet
+from cerulion._bag import Bag, Record, TopicInfo, open_bag
 
 from cerulion._api import (
     DEFAULT_MAX_PAYLOAD_LEN,
@@ -36,6 +38,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "BorrowLimitExceeded",
+    "Bag",
+    "BagError",
     "CerulionError",
     "DEFAULT_MAX_PAYLOAD_LEN",
     "EncodeError",
@@ -49,11 +53,14 @@ __all__ = [
     "SchemaSet",
     "Layout",
     "Message",
+    "Record",
     "Session",
     "Subscriber",
     "TransportError",
+    "TopicInfo",
     "WIRE_HEADER_SIZE",
     "connect",
+    "open_bag",
     "real_ns",
     "NodeContext",
     "input",

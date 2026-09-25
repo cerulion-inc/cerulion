@@ -62,6 +62,12 @@ create_exception!(
     CerulionError,
     "A schema could not be loaded or resolved."
 );
+create_exception!(
+    cerulion,
+    BagError,
+    CerulionError,
+    "A recording bag could not be opened or read."
+);
 
 /// Map a core [`CerTransportError`] onto the Python exception hierarchy.
 ///
@@ -119,6 +125,11 @@ pub(crate) fn map_transport_err(e: CerTransportError) -> PyErr {
         // generic TransportError bucket.
         _ => TransportError::new_err(msg),
     }
+}
+
+/// Map every [`cerulion_bag::BagError`] onto Python `BagError`.
+pub(crate) fn map_bag_err(e: cerulion_bag::BagError) -> PyErr {
+    BagError::new_err(e.to_string())
 }
 
 fn dynamic_exception(py: Python<'_>, decode: bool, kind: &str, message: String) -> PyErr {
