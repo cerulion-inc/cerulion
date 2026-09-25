@@ -342,10 +342,11 @@ and no stub job standing in for a skipped required check.
 `lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
 `viz-tests`, and the push-only `fuzz`, `miri` and latency jobs), so a red `lint` still
 saves their runner minutes. It does NOT gate the three that do: `test-archive`,
-`test-linux` and `test-macos` start at t=0. A `lint` verdict was never a data dependency
-for them, and while it gated them the wall was `lint` plus the longest test job instead of
-the longest test job. `test-linux` keeps `needs: [test-archive]`, which IS a data
-dependency: it runs the binaries that job builds.
+`test-linux` and `test-macos`. `test-archive` and `test-macos` start at t=0; `test-linux`
+starts when `test-archive` finishes, because it keeps `needs: [test-archive]`, which IS a
+data dependency: it runs the binaries that job builds. A `lint` verdict was never a data
+dependency for any of the three, and while it gated them the wall was `lint` plus the
+longest test job instead of the longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
 2-way (`[0,1]`: every macOS shard pays a fixed build and setup cost, so the macOS side
