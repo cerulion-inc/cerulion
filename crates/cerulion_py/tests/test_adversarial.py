@@ -318,6 +318,25 @@ def test_independent_iterators_do_not_release_each_others_frames(session):
     f2.release()
 
 
+def test_next_on_the_subscriber_releases_its_previous_frame(session):
+    """`next(sub)` returns frames in order and releases the frame the previous
+    `next(sub)` returned, without touching a frame from a separate `iter(sub)`."""
+    topic = unique_topic("iter-next")
+    sub = session.subscriber(topic, depth=4)
+    pub = session.publisher(topic, 1, max_payload_len=64)
+    for payload in (b"one", b"two", b"three"):
+        pub.publish(payload)
+    other = next(iter(sub))
+    first = next(sub)
+    assert other.to_bytes() == b"one" and first.to_bytes() == b"two"
+    second = next(sub)
+    assert second.to_bytes() == b"three"
+    assert first.is_released is True
+    assert other.is_released is False
+    other.release()
+    second.release()
+
+
 def _max_open_loans(pub):
     loans = []
     try:

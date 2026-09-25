@@ -163,6 +163,7 @@ class Loan:
 class Subscriber:
     def __init__(self, native):
         self._native = native
+        self._next_iter = None
 
     @property
     def topic(self):
@@ -189,6 +190,13 @@ class Subscriber:
 
     def __iter__(self):
         return _FrameIterator(self)
+
+    def __next__(self):
+        """``next(sub)``: like one long-lived ``for`` loop, it releases the
+        frame the previous ``next(sub)`` returned before blocking."""
+        if self._next_iter is None:
+            self._next_iter = _FrameIterator(self)
+        return next(self._next_iter)
 
 
 class _FrameIterator:
