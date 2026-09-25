@@ -33,7 +33,7 @@ The events:
 
 | Event | Sent by | Properties |
 |---|---|---|
-| `cli_command_run` | every CLI command | `verb` and `subverb` (the command's name, such as `graph` and `run`), `exit_code`, and `duration_bucket` (`lt_1s`, `1s_10s`, `10s_1m`, `1m_10m`, `gte_10m`), and `install_method` (`install.sh`, `deb` or `brew`, read from the marker file the installer left beside the binary; absent for a source build) |
+| `cli_command_run` | every CLI command | `verb` and `subverb` (the command's name, such as `graph` and `run`), `exit_code`, and `duration_bucket` (`lt_1s`, `1s_10s`, `10s_1m`, `1m_10m`, `gte_10m`), and `install_method` (`install.sh`, `deb` or `brew`, read from the marker file the installer left beside the binary, where a package's marker wins over one left by `install.sh`; absent for a source build) |
 | `cli_login_completed` | `cerulion login`, and the login a command starts on a machine that never signed in | `is_account_switch` (whether a different account was signed in before) |
 | `graph_run_started` | `cerulion graph run` and `cerulion ros2 attach`, when a run is requested inside a workspace (before the graph is loaded and checked, so a run rejected there records one too; `graph_run_completed` then has `is_success` false) | `is_single_process` |
 | `graph_run_completed` | `cerulion graph run` and `cerulion ros2 attach`, when the run ends | `duration_bucket`, `is_success` |

@@ -6,6 +6,7 @@
 //! * `install.sh` writes `.cerulion-provenance.json` beside the binaries.
 //! * The Debian package and the Homebrew formula ship
 //!   `share/cerulion/install.json` one level above their `bin` directory.
+//!   When both markers exist, the package's marker wins.
 //!
 //! Only a method from [`KNOWN_METHODS`] is ever returned, so the marker's
 //! contents never reach an event.
@@ -23,12 +24,16 @@ pub fn parse_method(json: &str) -> Option<&'static str> {
     KNOWN_METHODS.iter().copied().find(|known| *known == method)
 }
 
-/// Where the markers for a binary in `bin_dir` live, in lookup order.
+/// Where the markers for a binary in `bin_dir` live, in lookup order. The
+/// package manager's marker comes first: a package installed over an
+/// `install.sh` copy in the same directory leaves that script's marker
+/// behind, and the package is what now owns the binary.
 pub fn marker_paths(bin_dir: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![bin_dir.join(".cerulion-provenance.json")];
+    let mut paths = Vec::with_capacity(2);
     if let Some(prefix) = bin_dir.parent() {
         paths.push(prefix.join("share").join("cerulion").join("install.json"));
     }
+    paths.push(bin_dir.join(".cerulion-provenance.json"));
     paths
 }
 
@@ -73,7 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn the_marker_beside_the_binary_wins() {
+    fn the_package_marker_wins_over_a_stale_script_marker() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         let share = dir.path().join("share").join("cerulion");
@@ -81,14 +86,14 @@ mod tests {
         std::fs::create_dir_all(&share).unwrap();
         let paths = marker_paths(&bin);
         assert_eq!(method_at(&paths), None, "no marker is a source build");
-        std::fs::write(share.join("install.json"), r#"{"method":"deb"}"#).unwrap();
-        assert_eq!(method_at(&paths), Some("deb"));
         std::fs::write(
             bin.join(".cerulion-provenance.json"),
             r#"{"method":"install.sh"}"#,
         )
         .unwrap();
         assert_eq!(method_at(&paths), Some("install.sh"));
+        std::fs::write(share.join("install.json"), r#"{"method":"deb"}"#).unwrap();
+        assert_eq!(method_at(&paths), Some("deb"));
     }
 
     #[test]
