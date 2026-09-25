@@ -76,6 +76,13 @@ def test_workspace_and_rosmsg_loading(tmp_path):
     schemas = cerulion.SchemaSet.from_workspace(tmp_path)
     (tmp_path / "empty").mkdir()
     builtin = cerulion.SchemaSet.from_workspace(tmp_path / "empty").names()
+    assert len(builtin) == 254
+    assert {
+        "builtin_interfaces/Time",
+        "geometry_msgs/Vector3",
+        "sensor_msgs/LaserScan",
+        "std_msgs/Header",
+    } <= set(builtin)
     assert not {"Probe", "pkg/X"} & set(builtin)
     assert schemas.names() == builtin + ["Probe", "pkg/X"]
     assert schemas.layout("pkg/X").fixed_size == 4

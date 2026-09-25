@@ -77,9 +77,9 @@ pub fn render_user_error(error: &CliError) -> String {
             .any(|marker| reason.contains(marker));
         if loader_failure && reason.contains("libpython") {
             return format!(
-                "{rendered}\nPython node cdylib could not find libpython; rebuild with \
-                 `cerulion node build <type>` (bakes the interpreter's LIBDIR rpath) or set \
-                 {LIBRARY_PATH_VAR}"
+                "{rendered}\nthe node cdylib could not find libpython; for a Python node \
+                 (`node.py`), rebuild with `cerulion node build <type>` (bakes the \
+                 interpreter's LIBDIR rpath); otherwise set {LIBRARY_PATH_VAR}"
             );
         }
     }
@@ -100,9 +100,9 @@ mod tests {
         assert_eq!(
             render_user_error(&error),
             "Node 'echo' error: failed to load library: \
-             libpython3.12.so.1.0: cannot open shared object file\nPython node cdylib could not \
-             find libpython; rebuild with `cerulion node build <type>` (bakes the interpreter's \
-             LIBDIR rpath) or set LD_LIBRARY_PATH"
+             libpython3.12.so.1.0: cannot open shared object file\nthe node cdylib could not \
+             find libpython; for a Python node (`node.py`), rebuild with `cerulion node build \
+             <type>` (bakes the interpreter's LIBDIR rpath); otherwise set LD_LIBRARY_PATH"
         );
     }
 

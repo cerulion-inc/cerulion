@@ -26,7 +26,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::rc::Rc;
 #[cfg(all(not(Py_LIMITED_API), not(cerulion_pynode_limited)))]
-use std::sync::{Once, OnceLock};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Arc, Once, OnceLock};
 
 pub use cerulion_core;
 
@@ -103,15 +104,15 @@ fn python_error(error: PyErr) -> String {
     })
 }
 
-#[pyclass(unsendable)]
+#[pyclass]
 struct HostCtx {
-    ptr: Rc<Cell<*mut NodeContext>>,
+    ptr: Arc<AtomicPtr<NodeContext>>,
 }
 
 #[pymethods]
 impl HostCtx {
     fn now_ns(&self) -> PyResult<u64> {
-        let ptr = self.ptr.get();
+        let ptr = self.ptr.load(Ordering::Acquire);
         if ptr.is_null() {
             return Err(PyRuntimeError::new_err("node context is no longer alive"));
         }
@@ -122,7 +123,7 @@ impl HostCtx {
 
     #[pyo3(signature = (name, default=None))]
     fn env(&self, name: &str, default: Option<String>) -> PyResult<Option<String>> {
-        let ptr = self.ptr.get();
+        let ptr = self.ptr.load(Ordering::Acquire);
         if ptr.is_null() {
             return Err(PyRuntimeError::new_err("node context is no longer alive"));
         }
@@ -132,7 +133,7 @@ impl HostCtx {
     }
 
     fn request_shutdown(&self) -> PyResult<()> {
-        let ptr = self.ptr.get();
+        let ptr = self.ptr.load(Ordering::Acquire);
         if ptr.is_null() {
             return Err(PyRuntimeError::new_err("node context is no longer alive"));
         }
@@ -528,7 +529,7 @@ fn initialize_python() -> Result<(), String> {
 
 pub struct Host {
     ctx: Box<NodeContext>,
-    ctx_ptr: Rc<Cell<*mut NodeContext>>,
+    ctx_ptr: Arc<AtomicPtr<NodeContext>>,
     runtime: Py<PyAny>,
     schemas: SchemaSet,
     input_names: Vec<String>,
@@ -547,7 +548,7 @@ unsafe impl Send for Host {}
 
 impl Drop for Host {
     fn drop(&mut self) {
-        self.ctx_ptr.set(std::ptr::null_mut());
+        self.ctx_ptr.store(std::ptr::null_mut(), Ordering::Release);
     }
 }
 
@@ -890,7 +891,7 @@ impl Host {
             let metadata = Self::metadata(info, &classes[0].1)?;
             let workspace = node_workspace(&ctx, sys_path)?;
             let schemas = node_schemas(&workspace)?;
-            let ctx_ptr = Rc::new(Cell::new((&mut *ctx) as *mut NodeContext));
+            let ctx_ptr = Arc::new(AtomicPtr::new((&mut *ctx) as *mut NodeContext));
             let host_ctx = Py::new(
                 py,
                 HostCtx {
@@ -1196,7 +1197,7 @@ impl Host {
                 .map_err(python_error)?;
             Ok(())
         });
-        self.ctx_ptr.set(std::ptr::null_mut());
+        self.ctx_ptr.store(std::ptr::null_mut(), Ordering::Release);
         result
     }
 }

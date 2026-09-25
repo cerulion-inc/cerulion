@@ -325,3 +325,24 @@ def test_fixture_info_bytes_match_python_declarations(monkeypatch):
             assert stale_hash != declared["outputs"][0]["schema_hash"]
         else:
             assert info == declared
+
+
+def test_output_limit_smaller_than_the_fixed_frame_is_rejected():
+    schemas = cerulion.SchemaSet()
+    assert schemas.add_rosmsg(
+        "float64 x\nfloat64 y\nfloat64 z\n", "geometry_msgs/Vector3"
+    ) == []
+
+    @cerulion.node(period_ms=50)
+    class TooSmall:
+        cmd = cerulion.output("geometry_msgs/Vector3", max_slice_len_default=55)
+
+        def tick(self):
+            pass
+
+    with pytest.raises(ValueError) as error:
+        TooSmall.__cerulion_info__(schemas)
+    assert str(error.value) == (
+        "output 'cmd': max_slice_len_default 55 is smaller than the 56-byte "
+        "geometry_msgs/Vector3 frame"
+    )

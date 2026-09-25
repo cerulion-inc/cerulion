@@ -44,6 +44,11 @@ else:
                             raise
                     else:
                         raise RuntimeError(f"loan accepted length {length!r}")
+            if case == "ctx_in_tick":
+                if self.env("CERULION_PYNODE_CASE") != "ctx_in_tick":
+                    raise RuntimeError("env lookup from the tick thread failed")
+                if not isinstance(self.now_ns(), int):
+                    raise RuntimeError("now_ns from the tick thread is not an int")
             if case == "tick_exception":
                 raise RuntimeError("fixture tick failure")
             if case == "retain_view" and self.inp is not None:

@@ -1102,6 +1102,7 @@ pub fn node_build_with_progress(
         });
     }
 
+    let mut pyo3_python = None;
     if node_dir.join("node.py").is_file() {
         let python = resolve_python(&node_dir);
         regenerate_python_info_with(&node_dir, node_type, &python)?;
@@ -1114,6 +1115,7 @@ pub fn node_build_with_progress(
         })?;
         regenerate_python_build_rs_with(&node_dir, node_type, &python, &paths)?;
         regenerate_python_sys_path_with(&node_dir, node_type, &paths.site_paths)?;
+        pyo3_python = Some(python);
     }
 
     // Probe BEFORE invoking cargo: a malformed declaration must stop the build
@@ -1191,6 +1193,9 @@ pub fn node_build_with_progress(
     let mut cmd = std::process::Command::new("cargo");
     cmd.args(cargo_build_args(node_type, release, &features));
     cmd.current_dir(workspace_root);
+    if let Some(python) = &pyo3_python {
+        cmd.env("PYO3_PYTHON", python);
+    }
 
     on_cargo_start(&node_build_progress_line(node_type));
     let output = cmd.output().map_err(|e| CliError::BuildFailed {

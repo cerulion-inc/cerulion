@@ -10,12 +10,16 @@ DYLIB = ".dylib" if sys.platform == "darwin" else ".so"
 
 
 FIXTURE = os.environ.get("CERULION_PY_FIXTURE")
-PYNODE_DIR = os.environ.get("CERULION_PYNODE_DIR")
+_DEFAULT_PYNODE_DIR = os.path.join(os.path.dirname(__file__), "..", "target", "pynodes")
+PYNODE_DIR = os.environ.get("CERULION_PYNODE_DIR") or (
+    _DEFAULT_PYNODE_DIR if os.path.isdir(_DEFAULT_PYNODE_DIR) else None
+)
 
 
 pytestmark = pytest.mark.skipif(
     not FIXTURE or not PYNODE_DIR,
-    reason="set CERULION_PY_FIXTURE and CERULION_PYNODE_DIR to run embedded pynode fixtures",
+    reason="set CERULION_PY_FIXTURE and build the fixtures/pynodes crates into "
+    "target/pynodes (or set CERULION_PYNODE_DIR) to run embedded pynode fixtures",
 )
 
 
@@ -258,6 +262,23 @@ def test_host_pynode_ticks_on_a_thread_other_than_the_initializing_one():
         "tick=0 code=0 out=0100000000000000",
         "tick=1 code=0 out=0300000000000000",
     ]
+
+
+def test_node_context_is_usable_from_a_tick_on_another_thread():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
+    env = _node_env("errors")
+    env["CERULION_PYNODE_CASE"] = "ctx_in_tick"
+    env["CERULION_PYNODE_TICK_THREAD"] = "1"
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", path, "2"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    ticks = [line for line in result.stdout.splitlines() if line.startswith("tick=")]
+    assert [line.split(" out=")[0] for line in ticks] == ["tick=0 code=0", "tick=1 code=0"]
 
 
 def test_extra_thread_warning_is_latched():
