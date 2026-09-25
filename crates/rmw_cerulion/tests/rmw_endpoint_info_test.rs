@@ -408,7 +408,13 @@ fn subscription_endpoint_info_round_trips_all_fields() {
         assert_eq!(info.endpoint_type, ffi::RMW_ENDPOINT_SUBSCRIPTION);
         // No rmw_get_gid_for_subscription surface; assert the deterministic
         // gid is present (entity counter starts at 1, so never all-zero).
-        assert_ne!(info.endpoint_gid, [0u8; 16], "subscription gid is set");
+        // endpoint_gid is RMW_GID_STORAGE_SIZE bytes (24 before Iron, 16 from
+        // Iron on), so the zero oracle takes that size, never a literal 16.
+        assert_ne!(
+            info.endpoint_gid,
+            [0u8; ffi::RMW_GID_STORAGE_SIZE as usize],
+            "subscription gid is set"
+        );
         assert_eq!(
             info.qos_profile.durability,
             ffi::RMW_QOS_POLICY_DURABILITY_VOLATILE
@@ -545,8 +551,8 @@ fn two_subscriptions_same_topic_yield_two_entries() {
         let g0 = (*arr.info_array.add(0)).endpoint_gid;
         let g1 = (*arr.info_array.add(1)).endpoint_gid;
         assert_ne!(g0, g1, "distinct entity gids");
-        assert_ne!(g0, [0u8; 16]);
-        assert_ne!(g1, [0u8; 16]);
+        assert_ne!(g0, [0u8; ffi::RMW_GID_STORAGE_SIZE as usize]);
+        assert_ne!(g1, [0u8; ffi::RMW_GID_STORAGE_SIZE as usize]);
 
         assert_eq!(rmw_destroy_subscription(node, sub_a), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, sub_b), RMW_RET_OK);

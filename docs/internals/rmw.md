@@ -298,7 +298,7 @@ build.rs layers three era probes on top of the source selection:
   `is_rosidl_buffer_` under `cfg(cerulion_has_is_rosidl_buffer)` (stride 112 to 120; each
   field landed in the C and C++ structs in the same rosidl release, so the C capability
   tokens are the build-time proxies for the C++ mirror's era, and a compile-time pin holds
-  the mirror's size equal to the bindgen-generated C member's). Pre-Jazzy builds compile
+  the mirror's size equal to the bindgen-generated C member's), and the Humble and Iron message shape (no `is_key_` or `has_any_key_member_`) under `cfg(not(cerulion_has_is_key))`; the service mirror's trailing `event_members_` is keyed on `cfg(cerulion_has_event_members)`, present from Iron on and absent on Humble. Pre-Galactic builds (Foxy, Galactic: 96-byte members) compile
   the C++ typesupport arm of both resolvers to a loud REGISTRATION refusal: one `error!`
   through the single `CppBridgeGate::emit_refusal` seam, a CONSTANT paragraph with the
   verdict in a structured `verdict=` field (never a `"{}"` pass-through, which the repo's
@@ -309,7 +309,7 @@ build.rs layers three era probes on top of the source selection:
   production silence impossible while the resolver-routed C++ e2e binaries (fixtures
   hand-built against the compiled struct, layout-self-consistent by construction) keep
   their surface. `test-seams` is in no default feature set and no shipping recipe enables
-  it. The pre-Jazzy C++ bridge variant is not implemented. The C introspection path reads
+  it. The pre-Galactic C++ bridge variant is not implemented. The C introspection path reads
   bindgen-generated members; its hand-written sequence mirrors are pinned to their bindgen
   twins on every era (primitive and string sequences carry the Lyrical Buffer flags,
   message sequences never do), and a Buffer-backed member or instance is never forged,

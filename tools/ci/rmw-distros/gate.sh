@@ -22,10 +22,12 @@ set -u
 #   lyrical: builds from generated bindings and its whole suite is green (the C++ mirror carries the
 #            Lyrical tail field under cfg(cerulion_has_is_rosidl_buffer)); first run at this state:
 #            33 targets, 479 tests run, 0 failed;
-#   humble:  the compile stops at rmw's 24-byte GID storage against the 16-byte one the crate writes
-#            (4 errors);
-#   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 24 more missing symbols,
-#            25 errors).
+#   humble:  builds from generated bindings and its whole suite is green (24-byte GID storage padded,
+#            int8 request guids cast, the C++ mirror in its pre-Iron shape under
+#            cfg(not(cerulion_has_is_key)));
+#   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 20 more missing symbols,
+#            21 errors: the four pre-Iron type mismatches Foxy shared with Humble no longer occur once
+#            Humble builds, so Foxy's count is 21 where it was 25 before Humble support).
 # A `build` row also pins floors the suite must clear before "green" means anything: at least
 # min_targets target summaries and min_tests tests run (ok, failed or ignored), pinned PER ROW from
 # that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run; 33 and 479
@@ -34,8 +36,8 @@ set -u
 case "$distro" in
     jazzy)   expect=build; min_targets=25; min_tests=400; known_failures="" ;;
     lyrical) expect=build; min_targets=25; min_tests=400; known_failures="" ;;
-    humble)  expect=refuse; errors=4;  marker="expected an array with a size of 24, found one with a size of 16" ;;
-    foxy)    expect=refuse; errors=25; marker="cannot find type \`rmw_feature_t\` in module \`ffi\`" ;;
+    humble)  expect=build; min_targets=25; min_tests=400; known_failures="" ;;
+    foxy)    expect=refuse; errors=21; marker="cannot find type \`rmw_feature_t\` in module \`ffi\`" ;;
     *) echo "FATAL: no expected state for distro '$distro'"; exit 1 ;;
 esac
 

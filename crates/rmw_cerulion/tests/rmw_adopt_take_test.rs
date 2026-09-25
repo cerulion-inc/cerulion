@@ -2414,6 +2414,7 @@ fn cpp_member(name: &str, type_id: u8, offset: u32) -> CppMessageMember {
         type_id_: type_id,
         string_upper_bound_: 0,
         members_: std::ptr::null(),
+        #[cfg(cerulion_has_is_key)]
         is_key_: false,
         is_array_: false,
         array_size_: 0,
@@ -2458,6 +2459,7 @@ fn cframe_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
         message_name_: cstr(unique),
         member_count_: members.len() as u32,
         size_of_: std::mem::size_of::<CppFrame>(),
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: Some(cframe_init),

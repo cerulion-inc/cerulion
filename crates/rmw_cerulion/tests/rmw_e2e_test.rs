@@ -771,6 +771,7 @@ fn cpp_typesupport_untouched_loan_serves_defaults() {
             type_id_: ROS_TYPE_DOUBLE,
             string_upper_bound_: 0,
             members_: std::ptr::null(),
+            #[cfg(cerulion_has_is_key)]
             is_key_: false,
             is_array_: false,
             array_size_: 0,
@@ -800,6 +801,7 @@ fn cpp_typesupport_untouched_loan_serves_defaults() {
             message_name_: cstr(&format!("Qcpp{suffix}")),
             member_count_: members.len() as u32,
             size_of_: std::mem::size_of::<CQuat>(),
+            #[cfg(cerulion_has_is_key)]
             has_any_key_member_: false,
             members_: members.as_ptr(),
             init_function: Some(cquat_cpp_init),
