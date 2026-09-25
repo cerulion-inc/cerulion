@@ -48,7 +48,10 @@ random `anon:<uuid>` before that. The random id lives in the consent file.
 
 When a machine that has never signed in runs its first login, the login
 request carries the random id so the events from before the login are
-joined to the account. Nothing else is added to the login. When a different
+joined to the account. Nothing else is added to the login. If that first
+login happens in the run that printed the notice, which sends nothing, an
+empty `telemetry_alias_pending` file next to the consent file marks the join
+as owed, and the next run that sends makes it and deletes the file. When a different
 account signs in on the same machine, the random id is replaced, so later
 anonymous events are never joined to the previous account.
 

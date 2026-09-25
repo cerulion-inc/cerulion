@@ -10,6 +10,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::auth;
@@ -36,6 +37,24 @@ pub const CLI_LOGIN_COMPLETED: EventSpec = EventSpec {
 /// decided to record, so a login inside the run that printed the notice, or
 /// inside an unrecorded verb, sends nothing either.
 static SENDING: AtomicBool = AtomicBool::new(false);
+
+/// Set when [`CommandRun::start`] could have sent but printed the notice
+/// instead: a first login inside this run leaves its anonymous id pending.
+static NOTICE_RUN: AtomicBool = AtomicBool::new(false);
+
+/// Set when [`login_anon_id`] found an unmerged anonymous id it could not
+/// carry because this run sends nothing.
+static UNCARRIED: AtomicBool = AtomicBool::new(false);
+
+/// The process's one client, installed by [`CommandRun::start`] and shut down
+/// once by [`CommandRun::finish`], so every event of an invocation shares
+/// one [`DEFAULT_SHUTDOWN_BUDGET`].
+static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
+
+/// Next to the consent file: an anonymous id that a signed-in account has
+/// not been merged with yet. Holds no data; its presence is the flag.
+#[cfg(feature = "telemetry")]
+const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 
 /// Printed to stderr once per machine, on the first run that could send.
 pub const NOTICE: &str = "\
@@ -110,7 +129,6 @@ pub fn is_recorded(verb: &str, subverb: Option<&str>) -> bool {
 
 /// A started invocation, finished by [`CommandRun::finish`].
 pub struct CommandRun {
-    client: Client,
     verb: String,
     subverb: Option<String>,
     started: Instant,
@@ -134,15 +152,17 @@ impl CommandRun {
             Ok(false) => {
                 eprintln!("{NOTICE}\n");
                 let _ = consent::mark_notice_shown();
+                NOTICE_RUN.store(true, Ordering::Relaxed);
                 return None;
             }
             // Without a readable consent file the notice cannot be tracked,
             // so it cannot be known to have been shown: send nothing.
             Err(_) => return None,
         }
+        merge_pending_alias(&client);
+        *CLIENT.lock().unwrap_or_else(PoisonError::into_inner) = Some(client);
         SENDING.store(true, Ordering::Relaxed);
         Some(CommandRun {
-            client,
             verb: verb.to_owned(),
             subverb: subverb.map(str::to_owned),
             started: Instant::now(),
@@ -152,30 +172,70 @@ impl CommandRun {
     /// Record the outcome and flush within [`DEFAULT_SHUTDOWN_BUDGET`]. The
     /// identity is read here, after the command ran, so a first `login`
     /// is attributed to the account it just signed in.
-    pub fn finish(mut self, code: ExitCode) {
-        // Consent is read again: a `cerulion telemetry off` from another
-        // terminal while this command ran must still stop its event.
-        if !consent::status().enabled {
-            self.client.shutdown(DEFAULT_SHUTDOWN_BUDGET);
-            return;
-        }
+    pub fn finish(self, code: ExitCode) {
         let props = command_run_props(
             &self.verb,
             self.subverb.as_deref(),
             code,
             self.started.elapsed(),
         );
-        match auth::load().state().and_then(|s| hosted_sub(&s.account_id)) {
-            Some(sub) => self.client.capture(CLI_COMMAND_RUN, &sub, props),
-            None => {
-                if let Ok(Some(anon_id)) = consent::anon_id() {
-                    self.client
-                        .capture_anonymous(CLI_COMMAND_RUN, &anon_id, props);
-                }
+        emit(CLI_COMMAND_RUN, props);
+        SENDING.store(false, Ordering::Relaxed);
+        let client = CLIENT.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(mut client) = client {
+            client.shutdown(DEFAULT_SHUTDOWN_BUDGET);
+        }
+    }
+}
+
+/// Queue one event on this invocation's client, attributed to the signed-in
+/// account or else the anonymous id. A no-op when this process sends
+/// nothing. Consent is read again at every event, so a `cerulion telemetry
+/// off` from another terminal while a long command runs stops its events.
+pub fn emit(spec: EventSpec, props: Props) {
+    if !SENDING.load(Ordering::Relaxed) || !consent::status().enabled {
+        return;
+    }
+    let guard = CLIENT.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(client) = guard.as_ref() else {
+        return;
+    };
+    match auth::load().state().and_then(|s| hosted_sub(&s.account_id)) {
+        Some(sub) => client.capture(spec, &sub, props),
+        None => {
+            if let Ok(Some(anon_id)) = consent::anon_id() {
+                client.capture_anonymous(spec, &anon_id, props);
             }
         }
-        self.client.shutdown(DEFAULT_SHUTDOWN_BUDGET);
     }
+}
+
+#[cfg(feature = "telemetry")]
+fn pending_alias_path() -> Option<std::path::PathBuf> {
+    Some(
+        consent::file_path()
+            .ok()?
+            .with_file_name(PENDING_ALIAS_FILE),
+    )
+}
+
+/// Merge an anonymous id left pending by a first login that ran while the
+/// notice was printed, now that this run may send. The marker is removed
+/// either way once read: without a hosted account there is nothing to merge.
+fn merge_pending_alias(client: &Client) {
+    #[cfg(feature = "telemetry")]
+    {
+        let Some(path) = pending_alias_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let sub = auth::load().state().and_then(|s| hosted_sub(&s.account_id));
+        if let (Some(sub), Ok(Some(anon_id))) = (sub, consent::anon_id()) {
+            client.alias(&sub, &anon_id);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    #[cfg(not(feature = "telemetry"))]
+    let _ = client;
 }
 
 /// The signed-in account id, if it is a hosted account id (a lowercase UUID,
@@ -194,10 +254,15 @@ fn hosted_sub(account_id: &str) -> Option<String> {
 /// an account: the id has then been merged into THAT account, and carrying it
 /// into a login as someone else would merge the two people.
 pub fn login_anon_id() -> Option<String> {
-    if !SENDING.load(Ordering::Relaxed) || auth::load().state().is_some() {
+    if auth::load().state().is_some() {
         return None;
     }
-    consent::anon_id().ok().flatten()
+    let anon_id = consent::anon_id().ok().flatten()?;
+    if SENDING.load(Ordering::Relaxed) {
+        return Some(anon_id);
+    }
+    UNCARRIED.store(NOTICE_RUN.load(Ordering::Relaxed), Ordering::Relaxed);
+    None
 }
 
 /// After a successful login: on an account switch, replace the anonymous id
@@ -209,8 +274,20 @@ pub fn login_anon_id() -> Option<String> {
 /// merge.
 pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
     #[cfg(feature = "telemetry")]
-    if outcome.switched_account && consent::file_path().is_ok_and(|p| p.exists()) {
-        let _ = consent::rotate_anon_id();
+    {
+        if outcome.switched_account && consent::file_path().is_ok_and(|p| p.exists()) {
+            if let Some(path) = pending_alias_path() {
+                let _ = std::fs::remove_file(path);
+            }
+            let _ = consent::rotate_anon_id();
+        }
+        // The run that printed the notice sends nothing, so the merge waits
+        // for the next run that may send (see `merge_pending_alias`).
+        if UNCARRIED.load(Ordering::Relaxed) && !outcome.switched_account {
+            if let Some(path) = pending_alias_path() {
+                let _ = std::fs::write(path, b"");
+            }
+        }
     }
     if !SENDING.load(Ordering::Relaxed) || !consent::status().enabled {
         return;
@@ -218,7 +295,8 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
     let Some(sub) = hosted_sub(&outcome.state.account_id) else {
         return;
     };
-    let Some(mut client) = Client::from_env(common()) else {
+    let guard = CLIENT.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(client) = guard.as_ref() else {
         return;
     };
     if let Some(anon_id) = carried {
@@ -229,7 +307,6 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
         &sub,
         login_props(outcome.switched_account),
     );
-    client.shutdown(DEFAULT_SHUTDOWN_BUDGET);
 }
 
 /// `cli_login_completed` properties.
