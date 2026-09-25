@@ -8,7 +8,6 @@
 //! `cerulion_telemetry`); events carry no topic, host, path or payload data,
 //! only the platform and whole minutes of uptime.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -135,14 +134,17 @@ pub struct Telemetry {
 impl Telemetry {
     /// Send `vizd_started` and start the heartbeat.
     pub fn start() -> Option<Telemetry> {
-        Telemetry::start_unless(&AtomicBool::new(false))
+        Telemetry::start_unless(&Mutex::new(false))
     }
 
-    /// [`Telemetry::start`], sending nothing once `abandoned` is set.
-    fn start_unless(abandoned: &AtomicBool) -> Option<Telemetry> {
+    /// [`Telemetry::start`], sending nothing once `abandoned` is set. The
+    /// flag stays locked from its check until `vizd_started` is queued, so
+    /// an abandon either precedes the event or follows it, never races it.
+    fn start_unless(abandoned: &Mutex<bool>) -> Option<Telemetry> {
         let client = Client::from_env(common())?;
         let anon_id = consent::anon_id().ok().flatten()?;
-        if abandoned.load(Ordering::SeqCst) {
+        let gate = abandoned.lock().ok()?;
+        if *gate {
             return None;
         }
         let client = Arc::new(Mutex::new(Some(client)));
@@ -174,6 +176,7 @@ impl Telemetry {
                 client.capture_anonymous(VIZD_STARTED, &anon_id, started_props());
             }
         }
+        drop(gate);
         Some(Telemetry {
             heartbeat: Some(heartbeat),
             client,
@@ -184,12 +187,17 @@ impl Telemetry {
     /// locked by another process never delays the daemon or its shutdown.
     pub fn start_in_background() -> Starting {
         let (ready, receiver) = mpsc::channel();
-        let abandoned = Arc::new(AtomicBool::new(false));
+        let abandoned = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&abandoned);
         let _ = thread::Builder::new()
             .name("vizd-telemetry-start".into())
             .spawn(move || {
-                let _ = ready.send(Telemetry::start_unless(&flag));
+                // A start that finishes after shutdown gave up on it stops
+                // its own heartbeat and flushes what it queued.
+                if let Err(mpsc::SendError(Some(late))) = ready.send(Telemetry::start_unless(&flag))
+                {
+                    late.shutdown();
+                }
             });
         Starting {
             ready: receiver,
@@ -221,7 +229,7 @@ impl Telemetry {
 /// Telemetry that may still be starting; see [`Telemetry::start_in_background`].
 pub struct Starting {
     ready: mpsc::Receiver<Option<Telemetry>>,
-    abandoned: Arc<AtomicBool>,
+    abandoned: Arc<Mutex<bool>>,
 }
 
 impl Starting {
@@ -233,7 +241,11 @@ impl Starting {
         match self.ready.recv_timeout(DEFAULT_SHUTDOWN_BUDGET) {
             Ok(Some(telemetry)) => telemetry.shutdown_by(deadline),
             Ok(None) | Err(RecvTimeoutError::Disconnected) => {}
-            Err(RecvTimeoutError::Timeout) => self.abandoned.store(true, Ordering::SeqCst),
+            Err(RecvTimeoutError::Timeout) => {
+                if let Ok(mut abandoned) = self.abandoned.lock() {
+                    *abandoned = true;
+                }
+            }
         }
     }
 }

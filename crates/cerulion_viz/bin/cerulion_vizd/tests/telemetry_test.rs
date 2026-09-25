@@ -18,6 +18,8 @@ fn heartbeat_interval_is_fifteen_minutes() {
 
 #[test]
 fn event_names_and_common_values_pass_the_guard() {
+    assert_eq!(VIZD_STARTED.name, "vizd_started");
+    assert_eq!(VIZD_HEARTBEAT.name, "vizd_heartbeat");
     for spec in [VIZD_STARTED, VIZD_HEARTBEAT] {
         guard::check_event_name(spec.name).expect(spec.name);
     }
