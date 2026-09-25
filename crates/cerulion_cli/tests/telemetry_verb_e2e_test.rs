@@ -277,10 +277,12 @@ fn an_alias_left_pending_by_the_notice_run_is_merged_by_the_next_send() {
         .into_iter::<serde_json::Value>()
         .flat_map(|batch| batch.unwrap()["batch"].as_array().unwrap().clone())
         .collect();
-    let alias = events
+    let aliases: Vec<&serde_json::Value> = events
         .iter()
-        .find(|e| e["event"] == "$create_alias")
-        .unwrap_or_else(|| panic!("no alias event: {body}"));
+        .filter(|e| e["event"] == "$create_alias")
+        .collect();
+    assert_eq!(aliases.len(), 1, "exactly one alias: {body}");
+    let alias = aliases[0];
     assert_eq!(alias["properties"]["alias"], anon_id, "{alias}");
     assert_eq!(alias["distinct_id"], sub, "{alias}");
     assert!(
