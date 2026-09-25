@@ -23601,6 +23601,72 @@ nodes:
         );
     }
 
+    /// **A free-run rank whose trace-ring create is REFUSED must still
+    /// wall-follow.**
+    ///
+    /// The degrade at (7.5) is a DESIGNED path: the worker re-asks the
+    /// `/dev/shm` free-space gate for ITSELF, so a deployment whose earlier
+    /// ranks used the space up refuses the later ones, and the create can fail
+    /// for ordinary OS reasons besides. `build_path` derives from the ring
+    /// INTENT, so such a rank was ALREADY BUILT on a controlled clock carrying
+    /// a locally derived quantum and no barrier participant. Arm the
+    /// wall-following discipline only on the create's SUCCESS path and that
+    /// rank advances one fixed quantum per loop iteration, at whatever rate its
+    /// loop happens to spin, while its peers advance by measured wall elapsed
+    /// from the same shared epoch: its `Period` cadence, its `expect_within`
+    /// and `promise_within` windows, its `Sync` windows and every
+    /// `timestamp_ns` it stamps come off that timeline, under a warn that
+    /// says the graph runs normally.
+    ///
+    /// STRUCTURAL over the comment- and literal-stripped body, for the reason
+    /// the walk above is: reaching the degrade behaviourally needs a real
+    /// supervisor, a real worker and a hostile `/dev/shm` (or the
+    /// forced-failure seam), plus a measurement of the rank's boundary stream.
+    /// What a unit test CAN pin is the placement the property reduces to, and
+    /// the placement IS the property: the arming sits ahead of the ring block,
+    /// so no create outcome stands between the build and it.
+    ///
+    /// The second assertion forbids the other repair. A second arming call in
+    /// the `Err` degrade arm would restore the behaviour while spelling the
+    /// derivation twice, which is how the two seams the single decision at
+    /// (2.5) exists to prevent come apart again.
+    #[test]
+    fn a_free_run_rank_whose_ring_create_is_refused_still_wall_follows() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "fn graph_run_worker(")
+            .expect("the worker fn must still exist; this pin moved with it");
+
+        let free_cfg = body
+            .find("configure_traced_runtime_free_run(")
+            .expect("the worker configures the traced free-run clock");
+        // The ring block: every create outcome is read inside it, so "before
+        // this block" is "before any create outcome exists".
+        let ring_block = body
+            .find("if let Some(intent) = ring_intent {")
+            .expect("the worker still opens its trace ring under the stamped intent");
+        assert!(
+            free_cfg < ring_block,
+            "the wall-following arming must precede the trace-ring block ENTIRELY. Armed \
+             inside it, a rank whose create is REFUSED runs a controlled clock nobody tied \
+             to the wall: one fixed quantum per loop iteration, while its peers advance by \
+             measured wall elapsed from the shared epoch they all start at"
+        );
+        assert_eq!(
+            body.matches("configure_traced_runtime_free_run(").count(),
+            1,
+            "exactly ONE arming site: a second one in the degrade arm buys the behaviour \
+             back at the price of the single derivation"
+        );
+        // ANTI-TAUTOLOGY: the stripped view really holds this function's code,
+        // and the create outcome really is read inside the block this pin
+        // bounds the arming by.
+        assert!(
+            body[ring_block..].contains("match create_outcome {"),
+            "the stripper ate the worker body, or the create outcome left the ring block \
+             and this pin no longer bounds anything"
+        );
+    }
+
     /// The supervisor CREATES every credit word, and
     /// checks the edge list for duplicates — BEFORE it spawns any worker.
     ///
