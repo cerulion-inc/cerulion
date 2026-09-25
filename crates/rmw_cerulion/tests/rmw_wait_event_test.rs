@@ -28,8 +28,9 @@
 //! * a wait with no entities spends its timeout (bounded sleep, no spin);
 //! * the PARK tier: on Linux a publish wakes a parked wait through the
 //!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; the fd block is
-//!   never entered while a bell is mapped), off Linux the doorbell is a
-//!   compile-time stub and the same rounds pin the fd tier — and
+//!   entered only for a wait the doorbell did not serve, because a FORCED
+//!   park runs the bounded `FirstRungOnce` shape), off Linux the doorbell
+//!   is a compile-time stub and the same waits pin the fd tier. And
 //!   `CERULION_MONITOR_WAIT=0` forces the fd tier EVERYWHERE, which is
 //!   why the fd-counter pins below run under it (they pin the SAME tier
 //!   on every platform).
@@ -1901,15 +1902,22 @@ fn an_empty_wait_never_spins_under_a_nonzero_budget() {
 /// DOORBELL — the SHM line the rmw publisher armed at create and rings on
 /// every send (`notify_sent_sample`). Default env
 /// (`CERULION_MONITOR_WAIT` unset = auto ON): on Linux the wait must map
-/// exactly the one subscription topic's bell, take the park tier for
-/// EVERY block (`fd_blocks == 0`), and score at least one doorbell wake
-/// across the rounds; off Linux the doorbell is a compile-time stub, the
-/// park tier must never engage, and the SAME rounds must wake through the
-/// fd path instead — both halves asserted, so the test is meaningful on
-/// every platform (the Linux half is the one CI arm that proves the
-/// publisher's arming + the wait's bells meet on one page). The take +
-/// payload oracle rides along each round: the park is a WAKE tier, never
-/// a data path.
+/// exactly the one subscription topic's bell, take the park tier, score at
+/// least one doorbell wake across the waits, and enter the fd tier only
+/// for a wait the doorbell did not serve; off Linux the doorbell is a
+/// compile-time stub, the park tier must never engage, and the SAME waits
+/// must wake through the fd path instead. Both halves are asserted, so the
+/// test is meaningful on every platform (the Linux half proves the
+/// publisher's arming and the wait's bells meet on one page). The take +
+/// payload oracle rides along each wait: the park is a WAKE tier, never a
+/// data path.
+///
+/// The fd count is BOUNDED rather than zero for the same reason as the
+/// two-publisher survivor arm below: a FORCED park on x86 runs the
+/// `FirstRungOnce` shape, parking once for the ladder's first rung and
+/// handing the rest of the idle to the fd tier, so a cross-thread publish
+/// landing after that rung wakes an fd block with the product behaving
+/// correctly.
 #[test]
 #[serial]
 fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
@@ -1936,7 +1944,8 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
         assert!(!publisher.is_null());
         let ws = rmw_create_wait_set(context, 8);
 
-        for round in 0..10u32 {
+        const WAITS: u32 = 10;
+        for round in 0..WAITS {
             let seen = blocks_entered(ws);
             let handle = wait_on_sub_in_thread((*subscription).data, ws, Duration::from_secs(5));
             // Publish INSIDE a fresh block (park or fd — whichever tier
@@ -1992,18 +2001,21 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
             );
             assert!(
                 park_blocks >= 1,
-                "with a mapped bell every block must take the park tier"
-            );
-            assert_eq!(
-                data.fd_blocks.load(Ordering::Relaxed),
-                0,
-                "a parked wait set never falls back to the fd block"
+                "with a mapped bell the wait must take the park tier"
             );
             assert!(
                 park_wakes >= 1,
-                "across 10 parked-publish rounds at least one wake must ride \
+                "across {WAITS} parked-publish waits at least one wake must ride \
                  the doorbell (0 = the publisher's ring never reaches the \
                  park, which then times out at the rung cadence instead)"
+            );
+            let fd_blocks = data.fd_blocks.load(Ordering::Relaxed);
+            let unserved = u64::from(WAITS).saturating_sub(park_wakes);
+            assert!(
+                fd_blocks <= unserved,
+                "a parked wait set falls back to the fd block only for a wait the \
+                 doorbell did not serve: fd_blocks={fd_blocks} against {unserved} \
+                 unserved wait(s) of {WAITS}"
             );
         } else {
             assert_eq!(
@@ -2478,12 +2490,23 @@ fn a_second_queued_sample_is_ready_at_the_next_wait_without_a_wake() {
 /// therefore open the bell UNOWNED (created if absent, never unlinked).
 /// Pin: two publishers on one topic, destroy the FIRST, then a NEW
 /// subscription + wait set, publishes from the survivor: under the forced
-/// park (Linux) every wake rides the doorbell and the fd block is never
-/// entered; off Linux the same rounds wake through the fd. Mutant:
-/// restore the owned open ⇒ the new wait set scores fd wakes only
-/// (Linux-only kill — the park is stubbed off Linux). Residual, stated in
-/// the source: one page per topic can outlive every publisher on the machine
-/// until the next creator.
+/// park (Linux) at least one wake rides the doorbell, and the fd tier is
+/// entered only for a wait the park did not serve; off Linux the same
+/// waits wake through the fd. Mutant: restore the owned open ⇒ the new
+/// wait set scores fd wakes only, so `park_wakes_doorbell` reads 0 and the
+/// arm fails (a Linux-only kill: the park is stubbed off Linux).
+///
+/// Why the fd count is BOUNDED rather than zero: a FORCED park on x86 runs
+/// the `FirstRungOnce` shape, which parks once for the ladder's first rung
+/// (a few hundred µs) and hands the rest of the idle to the fd tier. A
+/// cross-thread publish that lands after that rung therefore wakes an fd
+/// block, legitimately and with the product behaving correctly, so a
+/// `fd_blocks == 0` claim is a claim about the machine's scheduling rather
+/// than about bell ownership. Bounding the fd blocks by the number of
+/// waits the doorbell did NOT serve keeps the tier claim exactly as strong
+/// where it is decidable. Residual, stated in the source: one page per
+/// topic can outlive every publisher on the machine until the next
+/// creator.
 #[test]
 #[serial]
 fn two_publishers_one_topic_the_survivor_still_rings_a_new_wait_set() {
@@ -2514,7 +2537,8 @@ fn two_publishers_one_topic_the_survivor_still_rings_a_new_wait_set() {
         let ws = rmw_create_wait_set(context, 8);
         let data = &*((*ws).data as *const WaitSetData);
 
-        for round in 0..6u32 {
+        const WAITS: u32 = 6;
+        for round in 0..WAITS {
             let seen = blocks_entered(ws);
             let handle = wait_on_sub_in_thread((*subscription).data, ws, Duration::from_secs(5));
             await_fresh_block(ws, seen);
@@ -2564,15 +2588,18 @@ fn two_publishers_one_topic_the_survivor_still_rings_a_new_wait_set() {
         if cfg!(target_os = "linux") {
             assert_eq!(data.doorbell_topics(), 1);
             assert!(data.park_blocks.load(Ordering::Relaxed) >= 1);
-            assert_eq!(
-                data.fd_blocks.load(Ordering::Relaxed),
-                0,
-                "a parked wait set never falls back to the fd block"
-            );
             assert!(
                 park_wakes >= 1,
                 "the survivor's rings must reach a wait set created AFTER the first \
                  publisher died (0 = the dead publisher unlinked the page under it)"
+            );
+            let fd_blocks = data.fd_blocks.load(Ordering::Relaxed);
+            let unserved = u64::from(WAITS).saturating_sub(park_wakes);
+            assert!(
+                fd_blocks <= unserved,
+                "a parked wait set falls back to the fd block only for a wait the \
+                 doorbell did not serve: fd_blocks={fd_blocks} against {unserved} \
+                 unserved wait(s) of {WAITS}"
             );
         } else {
             assert_eq!(data.park_blocks.load(Ordering::Relaxed), 0);

@@ -2189,25 +2189,33 @@ mod tests {
 
     /// A read-modify-write wraps `load` + `write_to` in ONE lock, and `write_to`
     /// locks too — so the nested acquisition must run under the lock it is already
-    /// inside instead of contending with itself. Without the re-entrancy it would
-    /// burn `LOCK_WAIT` and then fail, which is why the elapsed time is asserted:
-    /// a self-deadlock that reports still takes a second.
+    /// inside instead of contending with itself. Without the re-entrancy the
+    /// inner acquisition spends `LOCK_WAIT` and then returns `WouldBlock`, so
+    /// the nested write's own result reports a self-deadlock; what the ledger
+    /// assertion adds is that the shortcut was AVAILABLE, read directly rather
+    /// than inferred from how long the call took.
     #[test]
     fn a_nested_lock_runs_under_the_one_it_is_already_inside() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         write_to(&path, &state(true, 11)).unwrap();
 
-        let started = std::time::Instant::now();
+        let mut ledger_inside = false;
         let carried = with_store_lock(&path, || {
+            ledger_inside = HELD_LOCKS.with(|h| h.borrow().contains(&store_lock_path(&path)));
             let prior = load_from(&path).state().map(|s| s.expires_at_ns);
             write_to(&path, &state(true, prior.unwrap_or(0) + 1)).map(|()| prior)
         })
         .expect("a nested write must not contend with its own lock");
         assert_eq!(carried, Some(11));
         assert!(
-            started.elapsed() < LOCK_WAIT,
-            "a nested write must not wait on the lock it already holds"
+            ledger_inside,
+            "the outer lock must be on this thread's ledger, which is the only \
+             thing that lets the nested acquisition run under it"
+        );
+        assert!(
+            HELD_LOCKS.with(|h| h.borrow().is_empty()),
+            "the outer call must clear the ledger on the way out"
         );
         let LoadedAuth::Present(now) = load_from(&path) else {
             panic!("the store must still parse");
@@ -2220,6 +2228,13 @@ mod tests {
     /// A panic inside the critical section must not leave the store locked for
     /// the rest of the process — the next writer would then wait a second and
     /// refuse, turning one failure into every subsequent one.
+    ///
+    /// The release is OBSERVED, never timed. A ceiling on a path that should
+    /// not wait at all can only be tripped by a machine that is slower than
+    /// expected, and it observes nothing a stalled writer's own error does not
+    /// already report. Both halves of the release are read directly instead:
+    /// this thread's re-entrancy ledger must be empty, and a SIBLING thread
+    /// (which cannot use that ledger) must be able to take the kernel lock.
     #[test]
     fn a_panicking_write_releases_the_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -2231,9 +2246,27 @@ mod tests {
         }));
         assert!(panicked.is_err(), "the panic must propagate");
 
-        let started = std::time::Instant::now();
-        write_to(&path, &state(true, 4)).expect("the next writer must not be locked out");
-        assert!(started.elapsed() < LOCK_WAIT, "…and must not have waited");
+        // Half one: the re-entrancy ledger is THREAD-LOCAL, so an entry the
+        // unwind failed to remove would let every later write on this thread
+        // take the re-entrant shortcut and skip the kernel lock entirely. A
+        // same-thread writer therefore cannot see that leak at all.
+        assert!(
+            HELD_LOCKS.with(|h| h.borrow().is_empty()),
+            "the unwind must clear this thread's re-entrancy ledger"
+        );
+
+        // Half two: a SIBLING thread has no ledger entry, so it has to take the
+        // flock for real. A lock the unwind left held answers WouldBlock and
+        // this write reports it.
+        let sibling_path = path.clone();
+        std::thread::spawn(move || write_to(&sibling_path, &state(true, 4)))
+            .join()
+            .expect("the sibling writer thread")
+            .expect("the next writer must not be locked out");
+        let LoadedAuth::Present(now) = load_from(&path) else {
+            panic!("the store must still parse");
+        };
+        assert_eq!(now.expires_at_ns, 4, "the sibling's write landed intact");
     }
 
     /// Two threads are two writers and must serialize through the KERNEL (the
