@@ -225,6 +225,7 @@ struct QosRun {
 
 fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -235,6 +236,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
         prefix: "cqbq".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -242,6 +244,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
                 outputs: vec![out_def("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "qos".to_string(),
                 node_type: "qos_node".to_string(),
@@ -252,6 +255,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
                 outputs: vec![out_def("cmd_out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "drain".to_string(),
@@ -464,6 +468,7 @@ impl FloodDepthProducer {
 
 fn run_sample(steps: usize) -> (u64, u64) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -474,6 +479,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
         prefix: "cqbs".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "flood_depth".to_string(),
@@ -481,6 +487,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
                 outputs: vec![out_def("out"), out_def("aux_out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth_probe".to_string(),

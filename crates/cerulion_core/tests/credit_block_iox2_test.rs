@@ -265,6 +265,7 @@ fn credit_ns(tag: &str) -> String {
 /// One node's `NodeDef`.
 fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: id.to_string(),
@@ -294,6 +295,7 @@ fn topic_in(name: &str) -> InputDef {
 
 fn config_of(prefix: &str, tag: &str, nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1659,6 +1661,7 @@ fn crediting_one_producer_less_block_input_does_not_exempt_its_neighbour() {
     // TWO producer-less `block` consumers on DIFFERENT topics; only the first
     // is credited.
     let cfg = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

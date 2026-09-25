@@ -138,6 +138,7 @@ fn build_cdylib_collapse_graph(
     let delivered = Arc::new(AtomicU64::new(0));
     let last_value = Arc::new(AtomicU64::new(u64::MAX));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -148,6 +149,7 @@ fn build_cdylib_collapse_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "fixed_producer".to_string(),
@@ -155,6 +157,7 @@ fn build_cdylib_collapse_graph(
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "dut".to_string(),
                 node_type: "period_input".to_string(),
@@ -165,6 +168,7 @@ fn build_cdylib_collapse_graph(
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "delivery_sink".to_string(),

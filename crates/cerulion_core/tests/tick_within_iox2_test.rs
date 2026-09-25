@@ -70,6 +70,7 @@ impl FastTickNode {
 
 fn tick_graph(node_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -79,6 +80,7 @@ fn tick_graph(node_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeEnt
         identity: "tick_within_test".to_string(),
         prefix: "tw".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "node".to_string(),
             node_type: node_type.to_string(),

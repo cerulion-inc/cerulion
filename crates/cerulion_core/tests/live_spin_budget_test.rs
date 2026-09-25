@@ -213,6 +213,7 @@ fn chain_graph(
     fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -223,6 +224,7 @@ fn chain_graph(
         prefix: "lsb".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "relay".to_string(),
                 node_type: "relay".to_string(),
@@ -233,6 +235,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "mid".to_string(),
                 node_type: "mid".to_string(),
@@ -243,6 +246,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),
@@ -906,6 +910,7 @@ impl Periodic {
 /// same Arc), so `clock.set(t)` directly drives `spin_budget`'s `now_ns` read.
 fn build_period_graph() -> (GraphRuntime, Arc<VirtualClock>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -915,6 +920,7 @@ fn build_period_graph() -> (GraphRuntime, Arc<VirtualClock>) {
         identity: "live_spin_budget_period_test".to_string(),
         prefix: "lsbp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "producer".to_string(),
             node_type: "periodic".to_string(),

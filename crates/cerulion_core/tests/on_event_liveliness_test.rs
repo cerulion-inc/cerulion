@@ -117,6 +117,7 @@ fn liveliness_graph(
     lost_fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -127,6 +128,7 @@ fn liveliness_graph(
         prefix: "oel".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "feed_producer".to_string(),
@@ -140,6 +142,7 @@ fn liveliness_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "liveliness_consumer".to_string(),
@@ -320,6 +323,7 @@ fn dual_graph(
     stale_fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -330,6 +334,7 @@ fn dual_graph(
         prefix: "oeld".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "slow_feed_producer".to_string(),
@@ -343,6 +348,7 @@ fn dual_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "dual_liveliness_consumer".to_string(),

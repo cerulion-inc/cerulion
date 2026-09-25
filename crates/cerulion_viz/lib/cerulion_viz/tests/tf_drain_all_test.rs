@@ -172,6 +172,7 @@ fn drain_all_consumer_captures_every_queued_tf_frame() {
     .with_unified_drain(false);
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),
@@ -181,6 +182,7 @@ fn drain_all_consumer_captures_every_queued_tf_frame() {
         identity: "go2_tf_drain_e2e".to_string(),
         prefix: "drain".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "tf_viz".to_string(),
             node_type: "tf_drain_consumer".to_string(),

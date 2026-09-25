@@ -52,6 +52,7 @@ const CROSS_NS: u64 = 6_800;
 
 fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: id.to_string(),
@@ -86,6 +87,7 @@ fn infos(config: &GraphConfig) -> IndexMap<String, NodeInfo> {
 
 fn config_of(nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         name: None,
@@ -216,6 +218,7 @@ fn chain(
             let src = format!("n{}/out", i - 1);
             // leak-free owned strings via a small local vec
             let ndef = NodeDef {
+                fuse: None,
                 ros2: None,
                 id: id.clone(),
                 node_type: id.clone(),
@@ -721,6 +724,7 @@ fn gen_dag(
             Vec::new()
         };
         nodes.push(NodeDef {
+            fuse: None,
             ros2: None,
             id: ids[i].clone(),
             node_type: ids[i].clone(),

@@ -919,6 +919,54 @@ fn a_throttled_consumer_keeps_the_queued_path() {
 }
 
 // ==========================================================================
+// Rule: the consumer does not declare `fuse: false`
+// ==========================================================================
+
+/// A node that declares `fuse: false` ends the chain at itself, and the census
+/// SAYS so rather than silently honouring it.
+///
+/// The one bar a graph author chooses rather than a rule deriving. A census
+/// that honoured the declaration without reporting it would leave the author
+/// unable to check that it took, which is the whole reason the report exists.
+#[test]
+fn a_node_that_declares_fuse_false_ends_the_chain_at_itself() {
+    let opted = CHAIN_YAML.replace(
+        "  - id: relay\n    type: relay\n",
+        "  - id: relay\n    type: relay\n    fuse: false\n",
+    );
+    assert!(
+        opted.contains("fuse: false"),
+        "the fixture must carry the key"
+    );
+    let h = Harness::new(&opted, &chain_specs());
+    let census = h.monolith();
+
+    // The hop INTO the opted-out node is refused; the hop OUT of it is not,
+    // because the key ends a chain at the node rather than forbidding it to
+    // head one.
+    assert_eq!(chains(&census), vec!["relay->sink"]);
+    assert_eq!(
+        verdicts(&census),
+        vec!["relay.inp <- src : opted-out", "sink.inp <- relay : FUSED"]
+    );
+    assert_eq!(
+        sentence(&census, "opted-out"),
+        "the consumer declares `fuse: false`, so a chain ends at it"
+    );
+    assert_total(&census);
+
+    // ANTI-TAUTOLOGY: `fuse: true` reads as the key being absent, so the arm
+    // above cannot pass against an analysis that refuses any node carrying the
+    // key at all.
+    let stated = opted.replace("fuse: false", "fuse: true");
+    let h = Harness::new(&stated, &chain_specs());
+    let census = h.monolith();
+    assert_eq!(chains(&census), vec!["src->relay->sink"]);
+    assert_eq!(census.bars(), Vec::new());
+    assert_total(&census);
+}
+
+// ==========================================================================
 // Rule: the context a fused consumer reads is already final
 // ==========================================================================
 

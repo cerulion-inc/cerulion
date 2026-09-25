@@ -142,6 +142,7 @@ fn build_graph(
     .with_label("sync_nontrigger_sink");
 
     let config = GraphConfig {
+        execution: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),
@@ -152,6 +153,7 @@ fn build_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "sync_nontrigger_node".to_string(),
@@ -178,6 +180,7 @@ fn build_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sync_nontrigger_sink".to_string(),
@@ -521,6 +524,7 @@ fn build_seq_graph(
     .with_label("sync_nontrigger_sink");
 
     let config = GraphConfig {
+        execution: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),
@@ -531,6 +535,7 @@ fn build_seq_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "sync_nontrigger_node".to_string(),
@@ -557,6 +562,7 @@ fn build_seq_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sync_nontrigger_sink".to_string(),

@@ -171,6 +171,7 @@ const NO_PUBLISH: &str = "could not publish a node-death capture request";
 fn build_panicking_runtime(prefix: &str, panic_from: u64) -> GraphRuntime {
     let ticks = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -180,6 +181,7 @@ fn build_panicking_runtime(prefix: &str, panic_from: u64) -> GraphRuntime {
         identity: "flashback_fault".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "panicker".to_string(),
             node_type: "panic_node".to_string(),

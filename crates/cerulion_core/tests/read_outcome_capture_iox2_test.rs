@@ -553,6 +553,7 @@ fn two_node_graph(
     consumer: Box<dyn NodeEntry>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -563,6 +564,7 @@ fn two_node_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "ro_src".to_string(),
@@ -576,6 +578,7 @@ fn two_node_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ro_sink".to_string(),
@@ -764,6 +767,7 @@ fn role_view(records: &[TraceRingRecord]) -> Vec<(u64, u32, u16, u16, ReadSiteRo
 /// A source `NodeDef` (one `Vector3` output "out", no inputs).
 fn src_def(id: &str) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "ro_src".to_string(),
@@ -781,6 +785,7 @@ fn src_def(id: &str) -> NodeDef {
 /// A sink `NodeDef` with the given ordered `(input name, source)` wiring.
 fn sink_def(id: &str, inputs: &[(&str, &str)]) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "ro_sink".to_string(),
@@ -798,6 +803,7 @@ fn sink_def(id: &str, inputs: &[(&str, &str)]) -> NodeDef {
 /// A bare `GraphConfig` around `nodes` under `prefix`.
 fn graph_of(prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2147,6 +2153,7 @@ fn run_relay_capture(tag: &str, record: bool, steps: u64) -> RelayCapture {
         topic: None,
     };
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2158,6 +2165,7 @@ fn run_relay_capture(tag: &str, record: bool, steps: u64) -> RelayCapture {
         nodes: vec![
             src_def("producer"),
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ro_relay".to_string(),
@@ -3936,6 +3944,7 @@ fn the_wide_shared_topic_interleave_is_bit_identical_across_runs() {
 /// optionally overridden to the absolute `topic`.
 fn relay_def(id: &str, input: &str, source: &str, topic: Option<&str>) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "ro_relay".to_string(),
@@ -6174,6 +6183,7 @@ fn wave_graph(
         (None, "producer/out".to_string())
     };
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -6188,6 +6198,7 @@ fn wave_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "ro_src".to_string(),
@@ -6201,6 +6212,7 @@ fn wave_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ro_sink".to_string(),

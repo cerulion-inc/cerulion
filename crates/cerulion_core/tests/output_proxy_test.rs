@@ -729,6 +729,7 @@ impl NodeEntry for DiscardingProducer {
 fn output_discard_count_is_observable_through_node_handle_e2e() {
     let discards_attempted = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -738,6 +739,7 @@ fn output_discard_count_is_observable_through_node_handle_e2e() {
         identity: "output_discard_nodehandle_test".to_string(),
         prefix: "odn".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "prod".to_string(),
             node_type: "discarding".to_string(),
@@ -893,6 +895,7 @@ fn notify_undelivered_count_is_observable_through_node_handle_e2e() {
 
     let node_local_count = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -902,6 +905,7 @@ fn notify_undelivered_count_is_observable_through_node_handle_e2e() {
         identity: "notify_undelivered_nodehandle_test".to_string(),
         prefix: "nun".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "prod".to_string(),
             node_type: "notifying".to_string(),

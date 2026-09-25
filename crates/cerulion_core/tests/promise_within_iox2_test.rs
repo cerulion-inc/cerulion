@@ -89,6 +89,7 @@ impl PlainDrainConsumer {
 
 fn promise_graph(producer_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -99,6 +100,7 @@ fn promise_graph(producer_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn 
         prefix: "pw".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -112,6 +114,7 @@ fn promise_graph(producer_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn 
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "drain".to_string(),
@@ -542,6 +545,7 @@ impl NodeEntry for DrainPromiseProducer {
 fn run_drain_promise(steps: usize) -> (u64, u64) {
     let events_seen = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -552,6 +556,7 @@ fn run_drain_promise(steps: usize) -> (u64, u64) {
         prefix: "pwd".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "drainpromise".to_string(),
@@ -565,6 +570,7 @@ fn run_drain_promise(steps: usize) -> (u64, u64) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "drain".to_string(),

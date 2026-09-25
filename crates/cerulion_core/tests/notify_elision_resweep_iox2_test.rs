@@ -119,6 +119,7 @@ fn build_offgate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
     let fire_count = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -129,6 +130,7 @@ fn build_offgate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "offgate_producer".to_string(),
@@ -142,6 +144,7 @@ fn build_offgate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "draining_consumer".to_string(),
@@ -203,6 +206,7 @@ fn build_ongate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
     let fire_count = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -213,6 +217,7 @@ fn build_ongate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "ongate_producer".to_string(),
@@ -226,6 +231,7 @@ fn build_ongate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "draining_consumer".to_string(),

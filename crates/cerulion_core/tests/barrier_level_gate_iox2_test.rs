@@ -215,6 +215,7 @@ fn in_def(name: &str, source: &str) -> InputDef {
 /// A relay `NodeDef`: one trigger input `inp` from `source`, one output `out`.
 fn relay_node(id: &str, source: &str) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "chain_relay".to_string(),
@@ -226,6 +227,7 @@ fn relay_node(id: &str, source: &str) -> NodeDef {
 /// The sink `NodeDef`: one trigger input `inp` from `source`, no output.
 fn sink_node(id: &str, source: &str) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "chain_sink".to_string(),
@@ -240,6 +242,7 @@ fn monolith_graph(
     observed: Arc<Mutex<Vec<f64>>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -275,6 +278,7 @@ fn monolith_graph(
 /// handoff, graph-owned single-writer here).
 fn context_a_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -299,6 +303,7 @@ fn context_b_graph(
     observed: Arc<Mutex<Vec<f64>>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2041,6 +2046,7 @@ impl PeriodSource {
 /// consumer-less).
 fn period_source_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2050,6 +2056,7 @@ fn period_source_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) 
         identity: "barrier_gate_period_src".to_string(),
         prefix: "blgp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "p0".to_string(),
             node_type: "period_source".to_string(),

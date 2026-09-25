@@ -123,6 +123,7 @@ fn shim_now_ns_tracks_active_clock_and_dispatches_once() {
     let _ = NOW_CLOCK.set(clock.clone());
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -132,6 +133,7 @@ fn shim_now_ns_tracks_active_clock_and_dispatches_once() {
         identity: "now_shim".to_string(),
         prefix: "now_shim".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "sink".to_string(),
             node_type: "now_sink".to_string(),
@@ -246,6 +248,7 @@ fn shim_now_ns_is_virtual_while_real_ns_is_wall() {
     let _ = REAL_NOW_OBS.set(obs.clone());
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -255,6 +258,7 @@ fn shim_now_ns_is_virtual_while_real_ns_is_wall() {
         identity: "realnow".to_string(),
         prefix: "realnow".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "sink".to_string(),
             node_type: "real_now_sink".to_string(),
@@ -353,6 +357,7 @@ impl ExtSink {
 
 fn ext_sink_config() -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -362,6 +367,7 @@ fn ext_sink_config() -> GraphConfig {
         identity: "ext_shim".to_string(),
         prefix: "ext_shim".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "sink".to_string(),
             node_type: "ext_sink".to_string(),

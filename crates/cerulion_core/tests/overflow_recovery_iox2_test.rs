@@ -149,6 +149,7 @@ impl Probe {
 
 fn recovery_graph(probe: &Probe) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -159,6 +160,7 @@ fn recovery_graph(probe: &Probe) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
         prefix: "ovr".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "stamp_producer".to_string(),
@@ -172,6 +174,7 @@ fn recovery_graph(probe: &Probe) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "aging_consumer".to_string(),

@@ -253,6 +253,7 @@ fn chain_graph(
     samples: Arc<Mutex<Vec<(f64, f64, f64)>>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -263,6 +264,7 @@ fn chain_graph(
         prefix: "sb".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "relay".to_string(),
                 node_type: "relay".to_string(),
@@ -273,6 +275,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),

@@ -181,6 +181,7 @@ impl Consumer {
 /// keys by node ID).
 fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -190,6 +191,7 @@ fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn
         identity: "mwp_ticker".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -221,6 +223,7 @@ fn consumer_graph(
     fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -230,6 +233,7 @@ fn consumer_graph(
         identity: "mwp_consumer".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),
@@ -1603,6 +1607,7 @@ mod box_same_core {
         // that isolates slice cadence + yield (a doorbell would add a second
         // wake mechanism without changing what a missing yield starves).
         let config = GraphConfig {
+            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -1612,6 +1617,7 @@ mod box_same_core {
             identity: "same_core_ponger_ctx".to_string(),
             prefix: "samecoreg".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "ponger".to_string(),
                 node_type: "same_core_ponger".to_string(),
