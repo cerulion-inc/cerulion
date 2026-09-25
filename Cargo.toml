@@ -39,6 +39,7 @@ members = [
     # Studio app can link the client lib. No iroh / no network I/O — pure
     # formats, crypto, and state machines.
     "crates/cerulion_pairing",
+    "crates/cerulion_telemetry", # desk-only consent and usage events (no-op without `posthog`)
     "crates/test_fixtures/test_node_cdylib",
     "crates/test_fixtures/test_node_macro_cdylib",
     "crates/test_fixtures/test_node_failing_cdylib",
@@ -322,6 +323,7 @@ default-members = [
     "crates/rmw_cerulion",
     # Desk-half identity layer (light, permissive; no rerun/DDS pull).
     "crates/cerulion_pairing",
+    "crates/cerulion_telemetry",
     "crates/test_fixtures/*",
     # The tiny permissive wire decoder is lean (thiserror only), so it
     # IS in the default set. `cerulion_link` is NOT — it pulls the iroh tree.
