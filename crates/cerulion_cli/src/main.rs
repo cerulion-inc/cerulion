@@ -3,6 +3,7 @@
 
 mod cli;
 mod completion;
+mod telemetry;
 // Pins for the shell-facing WIRING (which arg carries
 // which completer, the path hints, the create arms completing nothing). A
 // binary-crate unit test because `cerulion_cli` has no library target, so an
@@ -26,7 +27,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches};
 
 use cerulion_cli_engine::error::CliResult;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
@@ -91,7 +92,23 @@ fn main() -> ExitCode {
         return code;
     }
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // One `cli_command_run` per invocation, recorded around the whole
+    // dispatch so every intercept below is covered. `None` (nothing is
+    // recorded or sent) without a key, without consent, for the internal
+    // subprocess verbs, and on the run that prints the first-run notice.
+    let command_run = telemetry::CommandRun::start(&matches);
+    let code = dispatch(cli);
+    if let Some(command_run) = command_run {
+        command_run.finish(code);
+    }
+    code
+}
+
+/// Everything `main` does after parsing: the intercepts, the login gate and
+/// the generic [`run`] dispatch.
+fn dispatch(cli: Cli) -> ExitCode {
     // bagd is folded into `cerulion` as a subcommand: dispatch
     // the recorder subcommand BEFORE `init_logging` so `bagd_cli_main` installs
     // its own logging default (the old standalone binary's exact behavior; its
@@ -2012,6 +2029,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
             }
         },
+        Commands::Telemetry { action } => telemetry::run_verb(action, &mut std::io::stdout()),
         Commands::Tui => cerulion_cli_tui::run().map_err(|e| {
             cerulion_cli_engine::error::CliError::Validation(format!(
                 "`cerulion tui` failed: {e}. It needs an interactive terminal: if you ran it \
@@ -3680,6 +3698,9 @@ fn command_needs_identity(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::Login
+            // Consent must be changeable without an account: opting out
+            // may not require signing in first.
+            | Commands::Telemetry { .. }
             // Emitting a completion script is a pure local text
             // render — gating it behind the login flow would make `cerulion
             // completions zsh` in a shell rc file block startup on a device
@@ -3871,6 +3892,13 @@ mod login_gate_exemption_tests {
     #[test]
     fn login_verb_is_exempt() {
         assert!(!command_needs_identity(&Commands::Login));
+    }
+
+    #[test]
+    fn telemetry_verb_is_exempt() {
+        assert!(!command_needs_identity(&Commands::Telemetry {
+            action: cli::TelemetryAction::Off,
+        }));
     }
 
     #[test]
