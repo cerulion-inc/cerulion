@@ -597,14 +597,24 @@ impl GatingClock {
     ///   which hands a quantum ⇒ [`Quantum`](Self::Quantum); under the
     ///   `CERULION_EXECUTION_MODE=free_run` opt-in every rank is
     ///   on its own wall-faithful clock: a TRACED free-run rank (`traced`: the
-    ///   run mints its scheduler-trace rings, i.e. anything but `--no-rings`)
+    ///   run ASKS FOR scheduler-trace rings, i.e. anything but `--no-rings`)
     ///   follows the wall on a controlled clock from a shared epoch ⇒
     ///   [`RecordedWall`](Self::RecordedWall), a ring-less one is on the
     ///   read-only `RealClock` ⇒ [`Wall`](Self::Wall) (the mode is threaded
     ///   from the ONE resolution `graph run` makes, so this label and the run's
-    ///   `coordination` stamp cannot disagree; the worker keys its
-    ///   clock discipline on the same predicate, so the label describes the
-    ///   clock the rank really ran on);
+    ///   `coordination` stamp cannot disagree);
+    ///
+    ///   `traced` is the run's INTENT, and the label says so. The caller
+    ///   renders the descriptor BEFORE dispatch, when no ring exists, so the
+    ///   only fact available is whether rings were asked for. The worker keys
+    ///   its clock discipline on the same stamped intent, so a worker whose
+    ///   own ring create is REFUSED still wall-follows and the label still
+    ///   describes its clock. The one divergence left is the supervisor's own
+    ///   `/dev/shm` free-space gate: a plane it refuses stamps no tags, every
+    ///   rank resolves the ring-less shape on the `RealClock`, and the label
+    ///   stands as the intent it recorded. Making it describe the outcome
+    ///   means classifying after the trace-plane decision, or rewriting the
+    ///   field alongside `declared_unavailable`;
     /// * a `--time-source virtual` monolith runs the polled loop and never
     ///   reaches `live_step` ⇒ [`Polled`](Self::Polled);
     /// * a RECORDING monolith is configured `gating_follows_wall` on a
