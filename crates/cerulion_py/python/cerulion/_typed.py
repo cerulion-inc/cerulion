@@ -290,6 +290,17 @@ def _scalar_array(name, field_type, value):
     return source
 
 
+def _shaped_array(name, field_type, value, shape):
+    """`_scalar_array` for a field of exactly ``shape``: a scalar or a
+    wrong-length array is refused instead of being broadcast."""
+    source = _scalar_array(name, field_type, value)
+    if source.shape != tuple(shape):
+        raise _native.EncodeError(
+            f"field {name!r} expects shape {tuple(shape)}, got {source.shape}"
+        )
+    return source
+
+
 def _scalar_value(name, field_type, value):
     """One scalar ``field_type`` value, validated like `_scalar_array`."""
     if field_type == "Bool":
@@ -691,7 +702,7 @@ class Message:
                     and field.field_type["FixedArray"]["element_type"] in _SCALARS
                 ):
                     element = field.field_type["FixedArray"]["element_type"]
-                    rec[name] = _scalar_array(name, element, value)
+                    rec[name] = _shaped_array(name, element, value, rec[name].shape)
                     return
                 rec[name] = value
                 return
@@ -745,7 +756,7 @@ class Message:
                 return
             array = self.__getattr__(name)
             element = field.field_type["DynamicArray"]["element_type"]
-            array[...] = _scalar_array(name, element, value)
+            array[...] = _shaped_array(name, element, value, array.shape)
         except (ValueError, TypeError) as exc:
             raise _native.EncodeError(str(exc)) from exc
 

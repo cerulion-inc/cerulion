@@ -102,7 +102,9 @@ def test_workspace_and_rosmsg_loading(tmp_path):
 )
 def test_schema_errors_are_typed_and_failed_additions_are_atomic(document, kind):
     schemas = cerulion.SchemaSet()
+    schemas.add_rosmsg("uint32 id\n", "pkg/Kept")
     before = schemas.names()
+    assert "pkg/Kept" in before
     with pytest.raises(cerulion.SchemaError) as exc:
         schemas.add_yaml(document)
     assert exc.value.kind == kind
