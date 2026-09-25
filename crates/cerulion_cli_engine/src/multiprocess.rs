@@ -589,9 +589,17 @@ pub fn credit_edge_drift_refusal(
 /// The deterministic deployment plan for one process group.
 ///
 /// Everything the spawner needs to launch ONE worker process: its
-/// [`subgraph`](Self::subgraph) config, its cross-process `rank`, its barrier
-/// participant-map (`global_level_map`), the shared handed quantum, and the
-/// plain-string barrier / ready-sentinel identifiers.
+/// [`subgraph`](Self::subgraph) config, its cross-process `rank`, the
+/// [`execution_mode`](Self::execution_mode) stamp that decides its coordination
+/// shape, and the plain-string ready-sentinel identifier.
+///
+/// The plan is stamped the SAME WAY in either mode, so the barrier fields
+/// ([`global_level_map`](Self::global_level_map),
+/// [`handed_quantum_ns`](Self::handed_quantum_ns),
+/// [`barrier_ns`](Self::barrier_ns) and [`barrier_id`](Self::barrier_id)) ride
+/// EVERY plan, a free-run one included, and a free-run worker opens no barrier
+/// and reads none of them. Which fields a worker acts on is decided by
+/// [`execution_mode`](Self::execution_mode), never by their presence here.
 ///
 /// Not `PartialEq`-derivable because [`GraphConfig`] is not `PartialEq`; tests
 /// compare via serde round-trip + field-level assertions instead.

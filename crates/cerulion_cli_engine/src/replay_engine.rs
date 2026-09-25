@@ -230,21 +230,38 @@ pub struct ReplayOutcome {
     /// JSON (additive field — `report_version` unchanged; old readers ignore it).
     pub record_health: RecordHealthReport,
     /// The ragged-shutdown-tail tolerances that ENGAGED this replay,
-    /// one human-readable line each. A multi-process `--record` run SIGINT'd
-    /// mid-shutdown leaves a peer rank's recorded stream ending a step (or a
-    /// few) before rank 0's, the AUTHORITATIVE replay clock, so the monolith
-    /// re-execution legitimately re-fires that peer's nodes past the
-    /// recording's end (Principle #7). Under the FREE-RUN default that is the
-    /// ordinary shape: each rank closes its own wall-following step boundaries
-    /// with no rendezvous holding the ranks together, so the signal lands at a
-    /// different step on each. Under the `CERULION_EXECUTION_MODE=lockstep`
-    /// opt-out the ragged edge is what falls between the ranks' final barrier
-    /// generations instead. Both
-    /// the structural trace gate and the per-topic frame diff tolerate that
-    /// re-fire over the SAME window (the two gates must AGREE); every
-    /// engaged tolerance is recorded HERE so the report never SILENTLY drops
-    /// real signal. EMPTY on any bag with no ragged tail (single-rank bags
-    /// always) — and skipped from the `--report` JSON when empty, keeping every
+    /// one human-readable line each. A ragged tail is a rank whose recorded
+    /// STEP_BOUNDARY stream stops BEFORE the last step this replay drives that
+    /// rank to, so the re-execution runs steps the recording does not testify
+    /// to. Both what opens such a window and what that last step IS are set by
+    /// the bag's `coordination` stamp, so the two modes are stated apart.
+    ///
+    /// Under the FREE-RUN default there is no authoritative rank. Each pass is
+    /// driven off its OWN rank's recorded boundaries (`PassBoundaries::Rank`),
+    /// and the window's upper bound is that rank's own last recorded step
+    /// (`RaggedTailContext::from_summaries`, the `CoordinationMode::FreeRun`
+    /// arm). No rank is therefore over-driven because a PEER ran longer: a rank
+    /// whose final recorded step banked fires has an EMPTY window, because its
+    /// proven end EQUALS its bound and the window rule's "ended early" clause
+    /// is false at every step. What can still open one is per-rank and ONE STEP
+    /// wide: a rank whose final boundary banked NO fires is proven only through
+    /// the step before it, since that boundary has no successor to prove it.
+    ///
+    /// Under the `CERULION_EXECUTION_MODE=lockstep` opt-out rank 0's boundary
+    /// stream IS the one authoritative replay clock (`PassBoundaries::Lockstep`
+    /// pulls it and advances every peer cursor index-locked), the replay is ONE
+    /// whole-graph monolith re-execution exactly rank-0-many steps long, and
+    /// every rank's bound is rank 0's last step. A run SIGINT'd mid-shutdown
+    /// between the ranks' final barrier generations leaves a peer's stream
+    /// ending a step (or a few) short of that bound, and the monolith
+    /// legitimately RE-FIRES that peer's nodes past its own recorded end
+    /// (Principle #7). That peer-tail half of the tolerance engages HERE ONLY.
+    ///
+    /// Both the structural trace gate and the per-topic frame diff tolerate the
+    /// re-fire over the SAME window (the two gates must AGREE); every engaged
+    /// tolerance is recorded HERE so the report never SILENTLY drops real
+    /// signal. EMPTY on any bag with no ragged tail (single-rank bags always),
+    /// and skipped from the `--report` JSON when empty, keeping every
     /// non-ragged report byte-identical (additive field; old readers ignore it).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tolerated_ragged_tails: Vec<String>,
@@ -11750,24 +11767,29 @@ fn classify_topics(
 /// Per-rank ragged-shutdown-tail context, derived from the recorded
 /// STEP_BOUNDARY stream in ONE streaming pass.
 ///
-/// A multi-process `--record` run SIGINT'd mid-shutdown can leave a PEER
-/// rank's recorded STEP_BOUNDARY stream ending one
-/// (or a few) steps before rank 0's, the AUTHORITATIVE replay clock
+/// Under the `CERULION_EXECUTION_MODE=lockstep` opt-out a multi-process
+/// `--record` run SIGINT'd between the ranks' final barrier generations can
+/// leave a PEER rank's recorded STEP_BOUNDARY stream ending one (or a few)
+/// steps before rank 0's, which is the AUTHORITATIVE replay clock THERE
 /// ([`RankBoundaryCursors::next_authoritative`] pulls rank 0's boundaries, so
-/// the replay runs exactly rank-0-many steps). The monolith re-execution then
+/// that replay runs exactly rank-0-many steps). The monolith re-execution then
 /// runs every step rank 0 recorded and legitimately RE-FIRES that peer rank's
-/// nodes in the steps past its OWN recorded end (Principle #7 — the same graph,
+/// nodes in the steps past its OWN recorded end (Principle #7: the same graph,
 /// same clock, one process). That re-fire is the SAME tolerated window the
 /// boundary gate accepts ([`validate_step_boundaries`] phase 2: "a stream
 /// ending early (tail) → tolerated"), so BOTH the structural trace gate and the
-/// per-topic frame diff consult this context to tolerate it identically — the
+/// per-topic frame diff consult this context to tolerate it identically: the
 /// two gates must not disagree about the same window.
 ///
-/// Under the FREE-RUN default the ranks close their own wall-following step
-/// boundaries with no rendezvous holding them together, so a shutdown lands at
-/// a different step on each; under the `CERULION_EXECUTION_MODE=lockstep`
-/// opt-out the ragged edge is what falls between their final barrier
-/// generations. The tolerance is the same either way.
+/// Under the FREE-RUN default each rank closes its own wall-following step
+/// boundaries with no rendezvous holding them together, and is then driven
+/// across those SAME boundaries and no further, so the peer-tail shape above
+/// cannot arise: [`Self::from_summaries`] bounds each rank by its OWN last
+/// recorded step, and a rank whose final recorded step banked fires gets width
+/// 0. What survives there is the fire-less-final-step window, which is per rank
+/// and one step wide in EITHER mode. The window RULE is shared; the BOUND it is
+/// measured against is not, and [`Self::authoritative_last`] is where the two
+/// part.
 ///
 /// Multi-rank bags only: a single-rank bag has one authoritative stream and no
 /// tail, so every width is 0 and the tolerance can NEVER engage: single-rank
@@ -16782,10 +16804,14 @@ impl BoundaryCursor<'_> {
     }
 }
 
-/// The replay loop's per-rank STEP_BOUNDARY sources.
+/// The replay loop's per-rank STEP_BOUNDARY sources, for the LOCKSTEP arm of
+/// [`PassBoundaries`]. A free-run pass drives its OWN rank's
+/// [`BoundaryCursor`] instead and builds none of these, because it has no
+/// authoritative rank to build them around (see
+/// [`RankBoundaryCursors::check_peer_agreement`] below).
 ///
-/// `cursors[0]` (rank 0) is the AUTHORITATIVE gating-clock source — the loop
-/// re-advances the replayed clock to ITS targets. Peer ranks' cursors (1..k)
+/// `cursors[0]` (rank 0) is that arm's AUTHORITATIVE gating-clock source: the
+/// loop re-advances the replayed clock to ITS targets. Peer ranks' cursors (1..k)
 /// are advanced one boundary per authoritative boundary, in LOCKSTEP, and each
 /// peer boundary is RE-CHECKED against the authoritative one (the
 /// user-facing cross-rank AGREEMENT refusal, exit 2, before the first

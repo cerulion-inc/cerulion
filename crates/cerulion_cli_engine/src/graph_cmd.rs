@@ -11495,16 +11495,30 @@ fn graph_run_supervisor(
                         tracing::debug!(group = %group, "worker drained (clean exit)");
                     } else {
                         // Draining: workers self-drop + exit 0 on a clean
-                        // shutdown, so a NONZERO drain exit is UNEXPECTED (a barrier
-                        // poison or a crash raced the drain). Still TOLERATED — a
-                        // shutdown never fail-louds — but name it as unexpected. No
+                        // shutdown, so a NONZERO drain exit is UNEXPECTED. The
+                        // CAUSE is mode-dependent and the text says only what
+                        // this run can produce: a FREE-RUN deployment creates no
+                        // barrier at all (`barrier_owner` is `None` on every
+                        // free-run run), so a poison is not among its causes and
+                        // naming one would send an operator looking for a
+                        // rendezvous that never existed. Gated the same way as
+                        // the degraded-run summary below. Still TOLERATED (a
+                        // shutdown never fail-louds) but named as unexpected. No
                         // supervisor drop here: everyone is departing and the drain
                         // deadline backstops any straggler.
-                        tracing::warn!(
-                            group = %group,
-                            status = %status,
-                            "worker exited NONZERO during drain — unexpected (workers self-drop + exit 0 on a clean shutdown; a nonzero drain exit means a barrier poison or crash raced the drain); tolerating"
-                        );
+                        if barrier_owner.is_some() {
+                            tracing::warn!(
+                                group = %group,
+                                status = %status,
+                                "worker exited NONZERO during drain: unexpected (workers self-drop + exit 0 on a clean shutdown; a nonzero drain exit means a barrier poison or a crash raced the drain); tolerating"
+                            );
+                        } else {
+                            tracing::warn!(
+                                group = %group,
+                                status = %status,
+                                "worker exited NONZERO during drain: unexpected (workers self-drop + exit 0 on a clean shutdown; this free-run deployment has no barrier, so a crash raced the drain); tolerating"
+                            );
+                        }
                     }
                 }
                 ChildPoll::Lost if normal => {
