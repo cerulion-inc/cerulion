@@ -3,7 +3,20 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Millisecond-precision UTC RFC 3339, always with a `Z` suffix.
+/// Whether `s` has exactly the `YYYY-MM-DDTHH:MM:SS.mmmZ` shape [`format()`]
+/// produces: ASCII digits in every numeric position, fixed separators.
+pub fn is_well_formed(s: &str) -> bool {
+    const SHAPE: &[u8; 24] = b"dddd-dd-ddTdd:dd:dd.dddZ";
+    s.len() == SHAPE.len()
+        && s.bytes().zip(SHAPE.iter()).all(|(b, &want)| match want {
+            b'd' => b.is_ascii_digit(),
+            _ => b == want,
+        })
+}
+
+/// Millisecond-precision UTC RFC 3339, always with a `Z` suffix. Instants
+/// before 1970 format as the epoch: every caller stamps `SystemTime::now()`,
+/// and a clock that far off has no meaningful time to report.
 pub fn format(t: SystemTime) -> String {
     let since = t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
     let secs = since.as_secs();

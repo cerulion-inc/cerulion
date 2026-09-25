@@ -50,6 +50,7 @@ impl Event {
     ) -> Option<Event> {
         guard::check_event_name(spec.name).ok()?;
         let (props, _) = guard::filter(props, spec.allowlist);
+        guard::check_sub(distinct_id).ok()?;
         Event::build(
             spec.name,
             distinct_id,
@@ -72,6 +73,7 @@ impl Event {
     ) -> Option<Event> {
         guard::check_event_name(spec.name).ok()?;
         let (props, _) = guard::filter(props, spec.allowlist);
+        guard::check_anon_id(anon_id).ok()?;
         Event::build(
             spec.name,
             anon_id,
@@ -84,7 +86,8 @@ impl Event {
     /// `$create_alias`: merge `anon_id` into `sub`. `None` (dropped and
     /// counted) when either id fails the guard's value rules.
     pub fn alias(sub: &str, anon_id: &str, uuid: String, timestamp: String) -> Option<Event> {
-        guard::check_id(anon_id).ok()?;
+        guard::check_anon_id(anon_id).ok()?;
+        guard::check_sub(sub).ok()?;
         Event::build(
             "$create_alias",
             sub,
@@ -101,16 +104,17 @@ impl Event {
     /// survives it.
     pub fn set_once(sub: &str, uuid: String, timestamp: String, props: Props) -> Option<Event> {
         let (props, _) = guard::filter(props, SET_ONCE_ALLOWLIST);
-        guard::check_id(sub).ok()?;
+        guard::check_sub(sub).ok()?;
         if props.is_empty() {
             return None;
         }
         Event::build("$set", sub, uuid, timestamp, Kind::SetOnce { props })
     }
 
-    /// Every identifier that ends up in `distinct_id` passes the same value
-    /// rules as a property: an email, path or URL there is exactly as much a
-    /// leak as in a property. Failing ids drop the event and count once.
+    /// Callers have already checked `distinct_id` against the shape their
+    /// constructor needs (`sub` or `anon:` id). `uuid` and `timestamp` are
+    /// caller strings too, so they must be a lowercase UUID and an RFC 3339
+    /// timestamp; a failure drops the event and counts once.
     fn build(
         name: &str,
         distinct_id: &str,
@@ -118,7 +122,8 @@ impl Event {
         timestamp: String,
         kind: Kind,
     ) -> Option<Event> {
-        guard::check_id(distinct_id).ok()?;
+        guard::check_uuid(&uuid).ok()?;
+        guard::check_timestamp(&timestamp).ok()?;
         Some(Event {
             name: name.to_owned(),
             distinct_id: distinct_id.to_owned(),
@@ -149,11 +154,16 @@ pub fn event_json(event: &Event, common: &Common) -> serde_json::Value {
     let mut properties = Map::new();
     properties.insert("$lib".into(), json!(LIB_NAME));
     properties.insert("$lib_version".into(), json!(LIB_VERSION));
-    properties.insert("surface".into(), json!(common.surface));
-    properties.insert("env".into(), json!(common.env));
-    properties.insert("app_version".into(), json!(common.app_version));
-    if let Some(channel) = &common.channel {
-        properties.insert("channel".into(), json!(channel));
+    let stamped = [
+        ("surface", Some(&common.surface)),
+        ("env", Some(&common.env)),
+        ("app_version", Some(&common.app_version)),
+        ("channel", common.channel.as_ref()),
+    ];
+    for (key, value) in stamped {
+        if let Some(value) = value.filter(|v| guard::check_str(v).is_ok()) {
+            properties.insert(key.into(), json!(value));
+        }
     }
     match &event.kind {
         Kind::Capture { props } => insert_props(&mut properties, props),

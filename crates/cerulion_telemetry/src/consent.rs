@@ -246,7 +246,9 @@ mod enabled {
     fn load_or_create(path: &Path) -> Result<TelemetryFile, Error> {
         match read(path) {
             Ok(Some(mut file)) => {
-                if file.anon_id.is_empty() {
+                // Empty, hand-edited or another schema's id: replace it, keeping
+                // `enabled` and `notice_shown`.
+                if !crate::guard::is_anon_id(&file.anon_id) {
                     file.anon_id = TelemetryFile::fresh().anon_id;
                     file.updated_at = rfc3339::format(SystemTime::now());
                     write_atomic(path, &file)?;
@@ -336,7 +338,21 @@ mod enabled {
         fs::rename(&tmp, path).map_err(|source| {
             let _ = fs::remove_file(&tmp);
             io(source)
-        })
+        })?;
+        sync_dir(dir).map_err(io)
+    }
+
+    /// Make the rename itself durable, so a crash right after an opt-out
+    /// cannot bring back the previous record. Windows has no directory
+    /// handle to sync; its rename is already durable once it returns.
+    #[cfg(unix)]
+    fn sync_dir(dir: &Path) -> std::io::Result<()> {
+        fs::File::open(dir)?.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

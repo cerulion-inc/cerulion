@@ -49,6 +49,7 @@ pub enum Rejection {
     Empty,
     NotAnId,
     NotAnEventName,
+    NotATimestamp,
 }
 
 /// Process-wide count of dropped properties, observable for tests and a
@@ -69,15 +70,76 @@ pub const ANON_PREFIX: &str = "anon:";
 /// empty, an email, a static sentinel like `"unknown"`, is rejected and
 /// counted like a dropped property.
 pub fn check_id(id: &str) -> Result<(), Rejection> {
-    let result = if id.is_empty() {
-        Err(Rejection::Empty)
-    } else if let Err(why) = check_str(id) {
-        Err(why)
-    } else if is_lowercase_uuid(id.strip_prefix(ANON_PREFIX).unwrap_or(id)) {
+    counted(id_shape(id).map(|_| ()))
+}
+
+/// Check a signed-in account id: a lowercase hyphenated UUID with no
+/// `anon:` prefix. Rejected and counted otherwise.
+pub fn check_sub(id: &str) -> Result<(), Rejection> {
+    counted(id_shape(id).and_then(|anon| {
+        if anon {
+            Err(Rejection::NotAnId)
+        } else {
+            Ok(())
+        }
+    }))
+}
+
+/// Check an anonymous id: `anon:` followed by a lowercase hyphenated UUID.
+/// Rejected and counted otherwise.
+pub fn check_anon_id(id: &str) -> Result<(), Rejection> {
+    counted(id_shape(id).and_then(|anon| {
+        if anon {
+            Ok(())
+        } else {
+            Err(Rejection::NotAnId)
+        }
+    }))
+}
+
+/// Check an event `uuid`: a lowercase hyphenated UUID. Rejected and counted
+/// otherwise.
+pub fn check_uuid(uuid: &str) -> Result<(), Rejection> {
+    counted(if is_lowercase_uuid(uuid) {
         Ok(())
     } else {
         Err(Rejection::NotAnId)
+    })
+}
+
+/// Check an event `timestamp`: exactly the `YYYY-MM-DDTHH:MM:SS.mmmZ` shape
+/// [`crate::rfc3339::format()`] produces. Rejected and counted otherwise.
+pub fn check_timestamp(timestamp: &str) -> Result<(), Rejection> {
+    counted(if crate::rfc3339::is_well_formed(timestamp) {
+        Ok(())
+    } else {
+        Err(Rejection::NotATimestamp)
+    })
+}
+
+/// Whether `id` is `anon:<lowercase uuid>`. Pure, not counted.
+pub fn is_anon_id(id: &str) -> bool {
+    id.strip_prefix(ANON_PREFIX).is_some_and(is_lowercase_uuid)
+}
+
+/// `Ok(true)` for `anon:<uuid>`, `Ok(false)` for a bare UUID. Not counted.
+fn id_shape(id: &str) -> Result<bool, Rejection> {
+    if id.is_empty() {
+        return Err(Rejection::Empty);
+    }
+    check_str(id)?;
+    let (anon, rest) = match id.strip_prefix(ANON_PREFIX) {
+        Some(rest) => (true, rest),
+        None => (false, id),
     };
+    if is_lowercase_uuid(rest) {
+        Ok(anon)
+    } else {
+        Err(Rejection::NotAnId)
+    }
+}
+
+fn counted(result: Result<(), Rejection>) -> Result<(), Rejection> {
     if result.is_err() {
         DROPPED.fetch_add(1, Ordering::Relaxed);
     }

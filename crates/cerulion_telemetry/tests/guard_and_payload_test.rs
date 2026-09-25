@@ -10,6 +10,8 @@ use cerulion_telemetry::{url_hash, Allowlist, Common, EventSpec, Value, LIB_VERS
 const CMD_ALLOWLIST: Allowlist = &["command", "duration_ms", "is_tty", "exit_code"];
 const SUB: &str = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
 const ANON: &str = "anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8";
+const U: &str = "01890a5d-ac96-7abc-8def-0123456789ab";
+const T: &str = "2026-09-09T21:00:00.000Z";
 const CMD: EventSpec = EventSpec {
     name: "cli_command_run",
     allowlist: CMD_ALLOWLIST,
@@ -174,17 +176,15 @@ fn every_identifier_that_fails_the_guard_drops_the_event_and_counts_once() {
     let once = || vec![("first_surface".into(), Value::from("cli"))];
     for id in bad {
         let before = guard::dropped_count();
-        assert!(Event::capture(CMD, id, "u".into(), "t".into(), ok_props()).is_none());
-        assert!(
-            Event::capture_anonymous(FIRST_RUN, id, "u".into(), "t".into(), ok_props()).is_none()
-        );
-        assert!(Event::alias(id, ANON, "u".into(), "t".into()).is_none());
-        assert!(Event::alias(SUB, id, "u".into(), "t".into()).is_none());
-        assert!(Event::set_once(id, "u".into(), "t".into(), once()).is_none());
+        assert!(Event::capture(CMD, id, U.into(), T.into(), ok_props()).is_none());
+        assert!(Event::capture_anonymous(FIRST_RUN, id, U.into(), T.into(), ok_props()).is_none());
+        assert!(Event::alias(id, ANON, U.into(), T.into()).is_none());
+        assert!(Event::alias(SUB, id, U.into(), T.into()).is_none());
+        assert!(Event::set_once(id, U.into(), T.into(), once()).is_none());
         assert_eq!(guard::dropped_count() - before, 5, "{id:?}");
         let before = guard::dropped_count();
         let leaky = vec![("email".into(), Value::from("bob@example.com"))];
-        assert!(Event::set_once(id, "u".into(), "t".into(), leaky).is_none());
+        assert!(Event::set_once(id, U.into(), T.into(), leaky).is_none());
         assert_eq!(
             guard::dropped_count() - before,
             2,
@@ -192,12 +192,10 @@ fn every_identifier_that_fails_the_guard_drops_the_event_and_counts_once() {
         );
     }
     let before = guard::dropped_count();
-    assert!(Event::capture(CMD, SUB, "u".into(), "t".into(), ok_props()).is_some());
-    assert!(
-        Event::capture_anonymous(FIRST_RUN, ANON, "u".into(), "t".into(), ok_props()).is_some()
-    );
-    assert!(Event::alias(SUB, ANON, "u".into(), "t".into()).is_some());
-    assert!(Event::set_once(SUB, "u".into(), "t".into(), once()).is_some());
+    assert!(Event::capture(CMD, SUB, U.into(), T.into(), ok_props()).is_some());
+    assert!(Event::capture_anonymous(FIRST_RUN, ANON, U.into(), T.into(), ok_props()).is_some());
+    assert!(Event::alias(SUB, ANON, U.into(), T.into()).is_some());
+    assert!(Event::set_once(SUB, U.into(), T.into(), once()).is_some());
     assert_eq!(guard::dropped_count(), before);
 }
 
@@ -228,8 +226,8 @@ fn event_names_outside_the_snake_case_contract_drop_the_event_and_count_once() {
         };
         let before = guard::dropped_count();
         assert_eq!(guard::check_event_name(name), Err(*why), "{name:?}");
-        assert!(Event::capture(spec, SUB, "u".into(), "t".into(), props()).is_none());
-        assert!(Event::capture_anonymous(spec, ANON, "u".into(), "t".into(), props()).is_none());
+        assert!(Event::capture(spec, SUB, U.into(), T.into(), props()).is_none());
+        assert!(Event::capture_anonymous(spec, ANON, U.into(), T.into(), props()).is_none());
         assert_eq!(guard::dropped_count() - before, 3, "{name:?}");
     }
     for name in ["x", "cli_command_run", "node_build_failed", "v2_step3"] {
@@ -239,7 +237,7 @@ fn event_names_outside_the_snake_case_contract_drop_the_event_and_count_once() {
         name: "signup_alice@example.com",
         allowlist: CMD_ALLOWLIST,
     };
-    let event = Event::capture(spec, SUB, "u".into(), "t".into(), props());
+    let event = Event::capture(spec, SUB, U.into(), T.into(), props());
     let batch = batch_json("phc_x", &event.into_iter().collect::<Vec<_>>(), &common());
     assert_eq!(batch["batch"].as_array().map(Vec::len), Some(0));
     assert!(!batch.to_string().contains("alice"));
@@ -256,22 +254,22 @@ fn golden_anonymous_alias_and_set_once_events_in_one_batch() {
         Event::capture_anonymous(
             FIRST_RUN,
             "anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8",
-            "u1".into(),
-            "t1".into(),
+            "00000000-0000-4000-8000-000000000001".into(),
+            "2026-09-09T21:00:00.001Z".into(),
             vec![("is_tty".into(), Value::from(false))],
         )
         .expect("well-formed anon id passes the guard"),
         Event::alias(
             "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc",
             "anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8",
-            "u2".into(),
-            "t2".into(),
+            "00000000-0000-4000-8000-000000000002".into(),
+            "2026-09-09T21:00:00.002Z".into(),
         )
         .expect("well-formed anon id passes the guard"),
         Event::set_once(
             "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc",
-            "u3".into(),
-            "t3".into(),
+            "00000000-0000-4000-8000-000000000003".into(),
+            "2026-09-09T21:00:00.003Z".into(),
             vec![
                 ("first_surface".into(), Value::from("cli")),
                 (
@@ -289,8 +287,8 @@ fn golden_anonymous_alias_and_set_once_events_in_one_batch() {
             {
                 "event": "cli_first_run",
                 "distinct_id": "anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8",
-                "uuid": "u1",
-                "timestamp": "t1",
+                "uuid": "00000000-0000-4000-8000-000000000001",
+                "timestamp": "2026-09-09T21:00:00.001Z",
                 "properties": {
                     "$lib": "cerulion_telemetry",
                     "$lib_version": LIB_VERSION,
@@ -304,8 +302,8 @@ fn golden_anonymous_alias_and_set_once_events_in_one_batch() {
             {
                 "event": "$create_alias",
                 "distinct_id": "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc",
-                "uuid": "u2",
-                "timestamp": "t2",
+                "uuid": "00000000-0000-4000-8000-000000000002",
+                "timestamp": "2026-09-09T21:00:00.002Z",
                 "properties": {
                     "$lib": "cerulion_telemetry",
                     "$lib_version": LIB_VERSION,
@@ -318,8 +316,8 @@ fn golden_anonymous_alias_and_set_once_events_in_one_batch() {
             {
                 "event": "$set",
                 "distinct_id": "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc",
-                "uuid": "u3",
-                "timestamp": "t3",
+                "uuid": "00000000-0000-4000-8000-000000000003",
+                "timestamp": "2026-09-09T21:00:00.003Z",
                 "properties": {
                     "$lib": "cerulion_telemetry",
                     "$lib_version": LIB_VERSION,
@@ -349,8 +347,8 @@ fn reserved_common_keys_cannot_be_spoofed_even_when_allowlisted() {
     let event = Event::capture(
         SPEC,
         SUB,
-        "u".into(),
-        "t".into(),
+        U.into(),
+        T.into(),
         vec![
             ("surface".into(), Value::from("web")),
             ("env".into(), Value::from("dev")),
@@ -382,8 +380,8 @@ fn set_once_with_nothing_allowed_builds_no_event() {
     assert_eq!(
         Event::set_once(
             SUB,
-            "u".into(),
-            "t".into(),
+            U.into(),
+            T.into(),
             vec![("email".into(), Value::from("bob@example.com"))],
         ),
         None
@@ -410,4 +408,63 @@ fn url_hash_matches_hindsight_convention() {
     assert_eq!(url_hash("https://example.com/a"), "2dce0a4c5044");
     assert_eq!(url_hash(""), "e3b0c44298fc");
     assert_eq!(url_hash("abc"), "ba7816bf8f01");
+}
+
+#[test]
+fn each_constructor_rejects_the_opposite_id_shape() {
+    let _turn = counter_turn();
+    let props = || vec![("is_tty".into(), Value::from(true))];
+    let once = || vec![("first_surface".into(), Value::from("cli"))];
+    let before = guard::dropped_count();
+    assert!(Event::capture(CMD, ANON, U.into(), T.into(), props()).is_none());
+    assert!(Event::capture_anonymous(FIRST_RUN, SUB, U.into(), T.into(), props()).is_none());
+    assert!(Event::alias(ANON, ANON, U.into(), T.into()).is_none());
+    assert!(Event::alias(SUB, SUB, U.into(), T.into()).is_none());
+    assert!(Event::set_once(ANON, U.into(), T.into(), once()).is_none());
+    assert_eq!(guard::dropped_count() - before, 5);
+}
+
+#[test]
+fn uuid_and_timestamp_that_fail_their_shape_drop_the_event() {
+    let _turn = counter_turn();
+    let props = || vec![("is_tty".into(), Value::from(true))];
+    for bad in [
+        "",
+        "bob@example.com",
+        "/home/bob",
+        "01890A5D-AC96-7ABC-8DEF-0123456789AB",
+    ] {
+        let before = guard::dropped_count();
+        assert!(Event::capture(CMD, SUB, bad.into(), T.into(), props()).is_none());
+        assert_eq!(guard::dropped_count() - before, 1, "{bad:?}");
+    }
+    for bad in [
+        "",
+        "bob@example.com",
+        "/home/bob",
+        "2026-09-09T21:00:00Z",
+        "2026-09-09 21:00:00.000Z",
+        "2026-09-09T21:00:00.000+00:00",
+    ] {
+        let before = guard::dropped_count();
+        assert!(Event::capture(CMD, SUB, U.into(), bad.into(), props()).is_none());
+        assert_eq!(guard::dropped_count() - before, 1, "{bad:?}");
+    }
+}
+
+#[test]
+fn common_values_that_fail_the_guard_are_not_stamped() {
+    let leaky = Common {
+        surface: "bob@example.com".into(),
+        env: "/home/bob".into(),
+        app_version: "https://example.com".into(),
+        channel: Some("x".repeat(129)),
+    };
+    let event = Event::capture(CMD, SUB, U.into(), T.into(), Vec::new()).expect("valid event");
+    let json = event_json(&event, &leaky);
+    for key in ["surface", "env", "app_version", "channel"] {
+        assert!(json["properties"].get(key).is_none(), "{key}");
+    }
+    let json = event_json(&event, &common());
+    assert_eq!(json["properties"]["surface"], "cli");
 }

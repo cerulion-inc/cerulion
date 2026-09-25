@@ -308,6 +308,23 @@ mod feature_on {
     }
 
     #[test]
+    fn malformed_stored_anon_id_is_replaced_keeping_the_other_fields() {
+        let env = isolated();
+        std::fs::create_dir_all(&env.home).unwrap();
+        std::fs::write(
+            env.home.join("telemetry.json"),
+            r#"{"enabled":false,"anon_id":"legacy-id","notice_shown":true}"#,
+        )
+        .unwrap();
+        let id = consent::anon_id().expect("ok").expect("Some");
+        assert!(cerulion_telemetry::guard::is_anon_id(&id), "{id}");
+        let file = read_file(&env);
+        assert_eq!(file.anon_id, id);
+        assert!(!file.enabled);
+        assert!(file.notice_shown);
+    }
+
+    #[test]
     fn empty_cerulion_home_falls_back_to_home_dir() {
         let _env = isolated();
         std::env::set_var("CERULION_HOME", "");
