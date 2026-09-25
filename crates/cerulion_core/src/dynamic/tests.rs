@@ -1257,3 +1257,81 @@ fn error_display_names_the_field() {
     .to_string()
     .contains("samples"));
 }
+
+#[test]
+fn workspace_yaml_wins_a_name_collision_with_the_msg_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas/pkg/msg")).expect("mkdir");
+    std::fs::write(
+        ws.join("schemas/a.yaml"),
+        "schemas:\n  pkg/Point:\n    fields:\n      uint32 x: {}\n",
+    )
+    .expect("write");
+    std::fs::write(ws.join("schemas/pkg/msg/Point.msg"), "uint64 x\n").expect("write");
+
+    let (set, _) = SchemaSet::from_workspace_dir(ws).expect("loads");
+    let point = set.layout("pkg/Point").expect("pkg/Point");
+    assert_eq!(
+        point.fixed_size, 4,
+        "YAML (uint32) must win over the store (uint64)"
+    );
+}
+
+#[test]
+fn workspace_drops_parents_of_a_skipped_schema() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas")).expect("mkdir");
+    std::fs::write(ws.join("schemas/good.yaml"), PROBE_YAML).expect("write");
+    std::fs::write(
+        ws.join("schemas/wrap.yaml"),
+        "schemas:\n  Big:\n    fields:\n      uint8[1048576] a: {}\n  Wrap:\n    fields:\n      Big[4096] b: {}\n  Holder:\n    fields:\n      Wrap[] items: {}\n",
+    )
+    .expect("write");
+
+    let (set, warnings) = SchemaSet::from_workspace_dir(ws).expect("loads");
+    assert!(set.layout("Probe").is_some());
+    assert!(set.layout("Big").is_some());
+    assert!(set.layout("Wrap").is_none());
+    assert!(set.layout("Holder").is_none(), "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("'Holder'") && w.contains("references skipped schema 'Wrap'")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn encoder_rejects_a_misaligned_buffer_before_writing() {
+    let set = probe_set();
+    let layout = set.layout("Probe").expect("Probe");
+    let encoder = FrameEncoder::new(layout).expect("encoder");
+    let idx = layout
+        .variable_fields
+        .iter()
+        .position(|f| f.name == "samples")
+        .expect("samples");
+    let mut lens = vec![0; layout.variable_fields.len()];
+    lens[idx] = 8;
+    let total = encoder.required_len(&lens).expect("len");
+    let mut buf = AlignedFrame([0xAA; 96]);
+    let err = encoder
+        .begin(&mut buf.0[1..1 + total], &lens, 0)
+        .map(|_| ())
+        .expect_err("misaligned");
+    assert!(
+        matches!(err, DynamicError::MisalignedBuffer { ref field, elem_size: 8, .. } if field == "samples"),
+        "{err:?}"
+    );
+    assert!(buf.0.iter().all(|&b| b == 0xAA), "nothing written");
+
+    let aligned = encoder.begin(&mut buf.0[..total], &lens, 0).map(|_| ());
+    assert!(aligned.is_ok());
+    assert!(FrameView::new(set.walker(), &buf.0[..total]).is_ok());
+
+    let empty = vec![0; layout.variable_fields.len()];
+    let short = encoder.required_len(&empty).expect("len");
+    assert!(encoder.begin(&mut buf.0[1..1 + short], &empty, 0).is_ok());
+}

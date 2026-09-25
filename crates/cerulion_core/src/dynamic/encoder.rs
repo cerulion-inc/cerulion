@@ -91,7 +91,9 @@ impl<'l> FrameEncoder<'l> {
     /// `total_size` are untouched.
     ///
     /// Errors: those of [`required_len`](Self::required_len) plus
-    /// [`DynamicError::BufferTooSmall`].
+    /// [`DynamicError::BufferTooSmall`] and [`DynamicError::MisalignedBuffer`]
+    /// (a nonempty primitive array would land at an address
+    /// [`FrameView`](super::FrameView) refuses; checked before any write).
     pub fn begin<'b>(
         &self,
         buf: &'b mut [u8],
@@ -103,6 +105,25 @@ impl<'l> FrameEncoder<'l> {
         let Some(frame) = buf.get_mut(..total) else {
             return Err(DynamicError::BufferTooSmall { need: total, have });
         };
+        let base = frame.as_ptr() as usize + WireHeader::SIZE;
+        let mut misaligned = None;
+        self.place(var_lens, |idx, off, len| {
+            let align = self.var_align[idx];
+            if misaligned.is_none()
+                && len > 0
+                && align > 1
+                && !base.wrapping_add(off as usize).is_multiple_of(align)
+            {
+                misaligned = Some((idx, off, align));
+            }
+        })?;
+        if let Some((idx, offset, elem_size)) = misaligned {
+            return Err(DynamicError::MisalignedBuffer {
+                field: self.layout.variable_fields[idx].name.clone(),
+                offset,
+                elem_size,
+            });
+        }
         frame.fill(0);
         let fixed_size = self.layout.fixed_size;
         {
