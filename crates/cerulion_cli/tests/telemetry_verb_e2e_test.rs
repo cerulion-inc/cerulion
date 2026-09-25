@@ -222,9 +222,8 @@ fn a_hosted_account_is_the_distinct_id_and_only_allowlisted_props_leave() {
         assert!(body.contains(key), "{key} missing: {body}");
     }
     let batch: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let props = batch["batch"][0]["properties"].as_object().unwrap();
-    let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
-    keys.sort_unstable();
+    let events = batch["batch"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{body}");
     let allowed = [
         "$lib",
         "$lib_version",
@@ -237,7 +236,11 @@ fn a_hosted_account_is_the_distinct_id_and_only_allowlisted_props_leave() {
         "surface",
         "verb",
     ];
-    assert!(keys.iter().all(|k| allowed.contains(k)), "{keys:?}");
+    for event in events {
+        let props = event["properties"].as_object().unwrap();
+        let keys: Vec<&str> = props.keys().map(String::as_str).collect();
+        assert!(keys.iter().all(|k| allowed.contains(k)), "{keys:?}");
+    }
     assert!(!body.contains(home.path().to_str().unwrap()), "{body}");
 }
 

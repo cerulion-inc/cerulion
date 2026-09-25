@@ -283,17 +283,22 @@ mod feature_on {
     fn concurrent_first_runs_show_the_notice_once() {
         let env = isolated();
         let shown = std::sync::atomic::AtomicUsize::new(0);
+        let printers = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {
             for _ in 0..8 {
                 s.spawn(|| {
-                    consent::show_notice_once(|| {
+                    let printed = consent::show_notice_once(|| {
                         shown.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     })
                     .expect("ok");
+                    if printed {
+                        printers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 });
             }
         });
         assert_eq!(shown.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(printers.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(read_file(&env).notice_shown);
         assert!(!consent::show_notice_once(|| panic!("already shown")).expect("ok"));
     }
