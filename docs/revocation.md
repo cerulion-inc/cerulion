@@ -91,7 +91,7 @@ silent no-op, and a missing or unusable cache never denies access.
 
 Both desk paths dial the same `cerulion/wire/1` control plane and run the same shared
 substrate, so they cannot diverge in what a push does or reports. The outcome is
-observable state, not just a log line (Principle #3):
+observable state, not just a log line:
 `IrohMirrorPlane::last_push_outcome(robot)` on the WAN plane and
 `ConnectSummary::epoch_push` for a `cerulion connect` session, both
 `cerulion_wireclient::epoch::EpochPushOutcome`. Both are SURFACED on their production

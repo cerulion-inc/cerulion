@@ -91,7 +91,7 @@ profiler will (correctly, loudly) isolate them.
 
 A node that falls short of **its own** fire target within the observed window
 gets **no cost entry**: fabricating one from too few samples would poison the
-fusion maths (Principle #13). It is listed under `isolated:` instead, warned loudly
+fusion maths: a measurement nobody took is never invented. It is listed under `isolated:` instead, warned loudly
 (one warn per node, with its observed fire count vs its target, or the
 "silent through warm-up — no target derived" marker instead of a number), and
 the auto-partitioner keeps it in **its own process group** (never fused).

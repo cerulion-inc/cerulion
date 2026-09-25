@@ -33,7 +33,7 @@ from inside the workspace checkout (it is a workspace member and resolves
 through the root `Cargo.lock`). netd itself pulls no DDS crate; the published
 `cerulion-rustdds`/`cerulion-ros2-client` forks are `cerulion_dds`'s
 dependency and resolve from crates.io. For unpublished fork work, add the
-temporary local overrides described in `docs/packaging/dds-forks.md` and
+temporary local overrides described in `docs/internals/packaging-dds-forks.md` and
 remove them before committing.
 
 ## 2. Demand / mirror plane

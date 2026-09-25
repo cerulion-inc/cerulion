@@ -40,7 +40,7 @@ else, so re-simulating a `ros2 attach` bag on a desk with no DDS robot produces
 **no output**: its `dds_bridge` node still needs its external DDS inputs. Use
 plain playback to view an attached ROS 2 recording without the robot.
 Re-simulation is also unpaced: its loop never reads the wall clock, which is
-what makes it deterministic (Principle #7). Together those two properties mean
+what makes it deterministic. Together those two properties mean
 `--resim` cannot drive a viewer.
 
 ### `--resim` is NEUTRAL; `--verify` is the verdict
@@ -57,6 +57,24 @@ VERDICT (`--report`, `--tolerance`) needs `--verify`.
 1 = data violation, 2 = bag I/O or not-replay-grade, 3 = node cdylib load error
 or a node that panicked, 4 = tolerance-YAML validation error, 5 = internal, 6 =
 structural trace divergence.
+
+A pass names the bag, the ticks it re-executed and the topics it credited:
+
+```
+replay PASS: <bag> (<N> tick(s) replayed, <M>/<M> topic(s) matched byte-for-byte and were credited)
+```
+
+A divergence names the topic, the field and what it measured, and exits 1.
+This is the [perception example](../examples/perception/)'s own output, where
+the detector's boxes moved by eight pixels:
+
+```
+FRAME-CONTENT DIVERGENCE: <bag>
+  2822 tick(s) replayed; 1/2 topic(s) matched; 1 violation(s):
+  - /percepmin/detector/detections [tolerance-exceeded]: field 'boxes' exceeded
+    the bbox_iou tolerance on '/percepmin/detector/detections':
+    worst value 0.42857142857142855 vs threshold 0.5 (worst at frame 0)
+```
 
 One refusal worth knowing by name: a bag (or graph file) whose declared `name:`
 iceoryx2 cannot represent (longer than 128 bytes, or carrying any non-ASCII
@@ -119,6 +137,41 @@ indistinguishable from a cut worker, because only a LATER boundary can prove a
 step completed and the final step has none. The cost is the same under either
 reading, and the note states it: an over-fire in that one
 step, for that one rank, is not caught.
+
+### Tolerances: relaxing the comparison per field
+
+`--verify` is byte-exact unless a tolerance document says otherwise. The
+document names topics, and inside each topic the fields to judge
+semantically; everything it does not name stays byte-exact.
+
+```yaml
+# tolerance.yaml
+topics:
+  /percepmin/detector/detections:
+    fields:
+      boxes:
+        kind: bbox_iou
+        min_iou: 0.5
+      scores:
+        kind: max_abs
+        threshold: 0.05
+      class_ids:
+        kind: set_equal
+```
+
+```
+cerulion bag play "$BAG" --resim all --verify --tolerance tolerance.yaml
+```
+
+The metrics are `bit_exact`, `max_abs`, `max_rel`, `rmse`, `bbox_iou`,
+`set_equal`, `set_subset` and `ordered_list_equal`. Resolution runs
+`fields[path]`, then a topic-wide `metric:`, then a document-wide
+`default_metric:`, so a bare topic entry covers every field of that topic and a
+`default_metric` covers every field of every topic. A misspelled key, an
+out-of-range threshold, a topic or field the graph does not carry, or a metric
+that cannot be applied to a field's type is exit 4, before any node loads.
+[`examples/perception/tolerance.yaml`](../examples/perception/tolerance.yaml)
+is the document behind the perception regression example.
 
 ---
 
@@ -568,6 +621,35 @@ per-topic accounting, rendered from its **per-tap** health record so that:
 The bag carries the full detail (including first/last sequence and the
 reconciliation terms) in its `__cerulion/record_health.json` attachment, which
 the summary always names.
+
+---
+
+## `cerulion bag migrate`
+
+A bag embeds the graph the run executed. When a key in that embedded document
+is one the graph format no longer defines, `bag play --resim` refuses the bag.
+`bag migrate` writes a corrected copy:
+
+```
+cerulion bag migrate <BAG> [-o PATH] [--dry-run] [--yes]
+```
+
+It lists every key it would remove, with the path and the line it sits on in the
+embedded document, then asks before writing. `--dry-run` shows the list and
+writes nothing, and wins over `--yes`; `--yes` writes without asking and is
+required when stdin is not a terminal.
+
+| Property | Behaviour |
+|---|---|
+| Input | Read, never modified. The migrated bag is a second file, `<name>.migrated.mcap` beside the original unless `-o` says otherwise. |
+| Output path | An existing path is refused rather than overwritten. |
+| Everything else | Recorded frames, the scheduler trace and every other attachment are copied through unchanged. |
+| A bag that already parses | Refused: there is nothing to migrate and no copy worth making. |
+
+The shape this really happens on: a legacy bag that embedded the on-disk
+`graphs/<name>.yaml` rather than the config the run executed, so a
+since-removed setting travelled into the bag. An MCAP attachment is sealed,
+which is why this writes a copy instead of editing in place.
 
 ---
 

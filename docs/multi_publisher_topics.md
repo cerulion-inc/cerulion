@@ -141,8 +141,8 @@ below name where its guarantees stop.
 | ROS2 weakness | Cerulion answer |
 |---|---|
 | Nondeterministic cross-publisher order | **Within one process the scheduler preserves producer execution order**, so a single-process graph's accumulate-all sequence is reproducible. Writers split across processes have no cross-writer total order; a recording retains each frame's writer provenance, so replay reproduces what was recorded |
-| Silent queue overflow | **No silent drops**, Principle #6 (no data loss): an eviction is counted per publisher stream and surfaced through `backpressure_drop_oldest_count` and the `#[on_event]` handler, so the consumer is not left guessing why a key vanished. Every edge of that accounting errs toward under-reporting rather than fabricating a loss |
-| No replay fidelity | **Replay = Live** (Principle #7): a recorded `/diagnostics` or crash-event sequence re-executes from the recording instead of being re-published into a live transport, so the consumer sees the recorded order |
+| Silent queue overflow | **No silent drops**: an eviction is counted per publisher stream and surfaced through `backpressure_drop_oldest_count` and the `#[on_event]` handler, so the consumer is not left guessing why a key vanished. Every edge of that accounting errs toward under-reporting rather than fabricating a loss |
+| No replay fidelity | **A replay matches the live run**: a recorded `/diagnostics` or crash-event sequence re-executes from the recording instead of being re-published into a live transport, so the consumer sees the recorded order |
 
 Replay is the practical consequence: the ordered sequence of
 `/diagnostics`, `/rosout` or crash and liveliness events that preceded a
