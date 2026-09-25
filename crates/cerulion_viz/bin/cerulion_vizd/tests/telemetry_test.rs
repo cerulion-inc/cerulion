@@ -63,7 +63,8 @@ fn heartbeat_ticks_in_order_and_stops_promptly_on_drop() {
     let (tx, rx) = mpsc::channel();
     let beat = Heartbeat::spawn(Duration::from_millis(20), move |n| {
         let _ = tx.send(n);
-    });
+    })
+    .expect("spawn");
     let seen: Vec<u64> = (0..3)
         .map(|_| rx.recv_timeout(Duration::from_secs(5)).expect("tick"))
         .collect();
@@ -78,8 +79,28 @@ fn heartbeat_ticks_in_order_and_stops_promptly_on_drop() {
 
 #[test]
 fn dropping_a_long_interval_heartbeat_does_not_wait_for_the_interval() {
-    let beat = Heartbeat::spawn(Duration::from_secs(3600), |_| {});
+    let beat = Heartbeat::spawn(Duration::from_secs(3600), |_| {}).expect("spawn");
     let start = Instant::now();
     drop(beat);
     assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn dropping_a_heartbeat_stuck_in_a_tick_is_bounded() {
+    let (entered_tx, entered) = mpsc::channel();
+    let beat = Heartbeat::spawn(Duration::from_millis(10), move |_| {
+        let _ = entered_tx.send(());
+        std::thread::sleep(Duration::from_secs(5));
+    })
+    .expect("spawn");
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("tick entered");
+    let start = Instant::now();
+    drop(beat);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "drop waited {:?}",
+        start.elapsed()
+    );
 }

@@ -63,16 +63,23 @@ pub fn heartbeat_props(uptime: Duration) -> Props {
 }
 
 /// A thread that calls `tick(n)` every `interval` (n = 1, 2, ...) until
-/// dropped. Dropping it wakes the thread at once and joins it.
+/// dropped. Dropping it wakes the thread at once and waits at most
+/// [`DEFAULT_SHUTDOWN_BUDGET`] for it to finish; a tick stuck past that (a
+/// consent read on a hung filesystem) is left to die with the process.
 pub struct Heartbeat {
     stop: Option<mpsc::Sender<()>>,
+    finished: mpsc::Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Heartbeat {
-    /// Start the ticking thread.
-    pub fn spawn(interval: Duration, mut tick: impl FnMut(u64) + Send + 'static) -> Heartbeat {
+    /// Start the ticking thread, or `None` if the OS refuses one.
+    pub fn spawn(
+        interval: Duration,
+        mut tick: impl FnMut(u64) + Send + 'static,
+    ) -> Option<Heartbeat> {
         let (stop, stopped) = mpsc::channel::<()>();
+        let (finish, finished) = mpsc::channel::<()>();
         let thread = thread::Builder::new()
             .name("vizd-telemetry-heartbeat".into())
             .spawn(move || {
@@ -81,27 +88,33 @@ impl Heartbeat {
                     ticks += 1;
                     tick(ticks);
                 }
+                drop(finish);
             })
-            .ok();
-        Heartbeat {
+            .ok()?;
+        Some(Heartbeat {
             stop: Some(stop),
-            thread,
-        }
+            finished,
+            thread: Some(thread),
+        })
     }
 }
 
 impl Drop for Heartbeat {
     fn drop(&mut self) {
         drop(self.stop.take());
-        if let Some(thread) = self.thread.take() {
+        let finished = matches!(
+            self.finished.recv_timeout(DEFAULT_SHUTDOWN_BUDGET),
+            Err(RecvTimeoutError::Disconnected)
+        );
+        if let (true, Some(thread)) = (finished, self.thread.take()) {
             let _ = thread.join();
         }
     }
 }
 
 /// The daemon's telemetry: the client plus its heartbeat. `None` when
-/// telemetry is off, unkeyed, or has no anonymous id, in which case no
-/// thread is started.
+/// telemetry is off, unkeyed, has no anonymous id, or cannot start its
+/// heartbeat thread; nothing is sent then.
 pub struct Telemetry {
     heartbeat: Option<Heartbeat>,
     client: Arc<Mutex<Option<Client>>>,
@@ -112,16 +125,20 @@ impl Telemetry {
     pub fn start() -> Option<Telemetry> {
         let client = Client::from_env(common())?;
         let anon_id = consent::anon_id().ok().flatten()?;
-        client.capture_anonymous(VIZD_STARTED, &anon_id, started_props());
         let client = Arc::new(Mutex::new(Some(client)));
         let beat = Arc::clone(&client);
         let started = Instant::now();
         let heartbeat = Heartbeat::spawn(HEARTBEAT_INTERVAL, move |_| {
-            // Consent is re-read on every beat, so `cerulion telemetry off` or
-            // `DO_NOT_TRACK` stops a running daemon's heartbeats.
+            // Consent and the anonymous id are re-read on every beat, so
+            // `cerulion telemetry off` or `DO_NOT_TRACK` stops a running
+            // daemon's heartbeats, and an id rotated by an account switch
+            // is used from the next beat on.
             if !consent::status().enabled {
                 return;
             }
+            let Some(anon_id) = consent::anon_id().ok().flatten() else {
+                return;
+            };
             if let Ok(guard) = beat.lock() {
                 if let Some(client) = guard.as_ref() {
                     client.capture_anonymous(
@@ -131,7 +148,12 @@ impl Telemetry {
                     );
                 }
             }
-        });
+        })?;
+        if let Ok(guard) = client.lock() {
+            if let Some(client) = guard.as_ref() {
+                client.capture_anonymous(VIZD_STARTED, &anon_id, started_props());
+            }
+        }
         Some(Telemetry {
             heartbeat: Some(heartbeat),
             client,
