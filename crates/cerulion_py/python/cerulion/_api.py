@@ -292,7 +292,7 @@ class Subscriber:
         self._native = native
         self._schemas = schemas
         self._schema = schema
-        self._next_iter = None
+        self._next_prev = None
 
     @property
     def topic(self):
@@ -328,9 +328,18 @@ class Subscriber:
     def __next__(self):
         """``next(sub)``: like one long-lived ``for`` loop, it releases the
         frame the previous ``next(sub)`` returned before blocking."""
-        if self._next_iter is None:
-            self._next_iter = _FrameIterator(self)
-        return next(self._next_iter)
+        frame, self._next_prev = _advance(self, self._next_prev)
+        return frame
+
+
+def _advance(subscriber, prev_ref):
+    """Release the frame behind ``prev_ref`` (if the caller still holds it),
+    block for the next frame, and return it with a weak reference to it."""
+    prev = None if prev_ref is None else prev_ref()
+    if prev is not None:
+        prev.release()
+    frame = subscriber.receive(None)
+    return frame, None if frame is None else weakref.ref(frame)
 
 
 class _FrameIterator:
@@ -348,12 +357,7 @@ class _FrameIterator:
 
     def __next__(self):
         prev_ref, self._prev = self._prev, None
-        prev = None if prev_ref is None else prev_ref()
-        if prev is not None:
-            prev.release()
-        frame = self._subscriber.receive(None)
-        if frame is not None:
-            self._prev = weakref.ref(frame)
+        frame, self._prev = _advance(self._subscriber, prev_ref)
         return frame
 
 
