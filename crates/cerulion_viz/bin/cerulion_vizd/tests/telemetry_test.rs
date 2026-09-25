@@ -30,8 +30,16 @@ fn event_names_and_common_values_pass_the_guard() {
 
 #[test]
 fn started_carries_the_platform() {
-    let keys: Vec<String> = started_props().into_iter().map(|(k, _)| k).collect();
-    assert_eq!(keys, ["os", "arch"]);
+    assert_eq!(
+        started_props(),
+        vec![
+            ("os".to_string(), Value::Str(std::env::consts::OS.into())),
+            (
+                "arch".to_string(),
+                Value::Str(std::env::consts::ARCH.into())
+            ),
+        ]
+    );
 }
 
 #[test]
