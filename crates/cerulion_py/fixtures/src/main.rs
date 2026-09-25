@@ -10,8 +10,12 @@
 #![allow(clippy::print_stdout)]
 
 use cerulion_core::clock::real_ns;
-use cerulion_core::codegen::{parse_rosmsg, FrameValueKind};
-use cerulion_core::dynamic::{FrameView, SchemaSet};
+use cerulion_core::clock::RealClock;
+use cerulion_core::codegen::{parse_rosmsg, FrameValueKind, MessageSchema};
+use cerulion_core::dynamic::{FrameEncoder, FrameView, SchemaSet};
+use cerulion_core::graph::node::{
+    AnyPublisher, AnySubscriber, DylibNodeEntry, NodeContext, NodeEntry, ShutdownSignal,
+};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::transport::TransportManager;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
@@ -19,6 +23,7 @@ use cerulion_core::TransportConfig;
 use native_ros2_messages::{geometry_msgs, sensor_msgs};
 use std::io::Write;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Deterministic body byte `k` of frame `i` - the Python oracle
@@ -43,6 +48,30 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+fn builtin_schemas() -> Result<Vec<MessageSchema>, String> {
+    native_ros2_messages::BUILTIN_MSGS
+        .iter()
+        .map(|&(package, name, text)| {
+            parse_rosmsg(text, name, Some(package)).map_err(|e| format!("{package}/{name}: {e}"))
+        })
+        .collect()
+}
+
+fn fixture_schemas(workspace: &std::path::Path) -> Result<SchemaSet, String> {
+    let builtin = builtin_schemas()?;
+    let (workspace_set, _warnings) =
+        SchemaSet::from_workspace_dir(workspace).map_err(|error| error.to_string())?;
+    let mut schemas = builtin;
+    for schema in workspace_set.schemas() {
+        let qualified_name = schema.qualified_name();
+        schemas.retain(|builtin| builtin.qualified_name() != qualified_name);
+        schemas.push(schema.clone());
+    }
+    SchemaSet::from_schemas(schemas)
+        .map(|(schemas, _)| schemas)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug)]
@@ -96,8 +125,17 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
         .map(|(m, r)| (m.as_str(), r))
         .unwrap_or(("", &[]));
     match mode {
-        "publish" | "subscribe" | "publish-typed" | "subscribe-typed" => {}
+        "publish" | "subscribe" | "publish-typed" | "subscribe-typed" | "host-pynode" => {}
         _ => return Err(format!("unknown mode '{mode}'\n{USAGE}")),
+    }
+    if mode == "host-pynode" {
+        parse_host_pynode(rest)?;
+        return Ok((
+            mode,
+            Args {
+                flags: std::collections::HashMap::new(),
+            },
+        ));
     }
     let args = parse_args(rest).map_err(|e| format!("{e}\n{USAGE}"))?;
     // Required-flag and numeric checks run here (the results are
@@ -142,6 +180,10 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
 fn run() -> Result<ExitCode, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let (mode, args) = parse_cli(&argv)?;
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
 
     TransportManager::init(TransportConfig {
         node_name: "cerulion_py_fixture".to_string(),
@@ -155,8 +197,297 @@ fn run() -> Result<ExitCode, String> {
         "subscribe" => cmd_subscribe(&mgr, &args),
         "publish-typed" => cmd_publish_typed(&mgr, &args),
         "subscribe-typed" => cmd_subscribe_typed(&mgr, &args),
+        "host-pynode" => cmd_host_pynode(&mgr, &argv[1..]),
         _ => unreachable!("mode already validated"),
     }
+}
+
+/// `host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]`.
+struct HostPynodeArgs<'a> {
+    path: &'a str,
+    ticks: usize,
+    also: Option<&'a str>,
+    bench: bool,
+    seed: Option<u32>,
+}
+
+fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
+    let [path, ticks, options @ ..] = argv else {
+        return Err("host-pynode requires <path.so> <ticks>".to_string());
+    };
+    let mut args = HostPynodeArgs {
+        path,
+        ticks: ticks
+            .parse::<usize>()
+            .map_err(|error| format!("invalid tick count: {error}"))?,
+        also: None,
+        bench: false,
+        seed: None,
+    };
+    let mut options = options.iter();
+    while let Some(option) = options.next() {
+        match option.as_str() {
+            "--also" => {
+                let path = options.next().ok_or("--also requires a node path")?;
+                args.also = Some(path);
+            }
+            "--bench" => args.bench = true,
+            "--seed" => {
+                let seed = options.next().ok_or("--seed requires a sequence number")?;
+                args.seed = Some(
+                    seed.parse::<u32>()
+                        .map_err(|error| format!("--seed: {error}"))?,
+                );
+            }
+            other => return Err(format!("unknown host-pynode option '{other}'\n{USAGE}")),
+        }
+    }
+    Ok(args)
+}
+
+fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, String> {
+    let HostPynodeArgs {
+        path,
+        ticks,
+        also,
+        bench,
+        seed,
+    } = parse_host_pynode(argv)?;
+    for node_path in [Some(path), also].into_iter().flatten() {
+        let mut entry = DylibNodeEntry::load(std::path::Path::new(node_path))
+            .map_err(|error| error.to_string())?;
+        let info = entry.info_json().map_err(|error| error.to_string())?;
+        let document: serde_json::Value =
+            serde_json::from_str(&info).map_err(|error| error.to_string())?;
+        let node_name = std::path::Path::new(node_path)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("pynode");
+        let workspace = std::env::var("CERULION_WORKSPACE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?);
+        let fixture_name = node_name
+            .strip_prefix("libcerulion_pynode_")
+            .unwrap_or(node_name);
+        let fixture_workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("pynodes")
+            .join(fixture_name);
+        let workspace = if fixture_workspace.is_dir() {
+            fixture_workspace
+        } else {
+            workspace
+        };
+        let schemas = fixture_schemas(&workspace)?;
+        let mut publishers = indexmap::IndexMap::new();
+        let mut subscribers = indexmap::IndexMap::new();
+        let mut input_publishers = Vec::new();
+        let mut output_subscribers = Vec::new();
+        for input in document["inputs"]
+            .as_array()
+            .ok_or("node info inputs is not an array")?
+        {
+            let name = input["name"].as_str().ok_or("input has no name")?;
+            let topic = format!("{node_name}/{name}");
+            let declared_hash = input["schema_hash"]
+                .as_u64()
+                .ok_or("input has no schema hash")?;
+            let layout = schemas
+                .layout_for_hash(declared_hash)
+                .or_else(|| schemas.layout("Probe"))
+                .ok_or_else(|| format!("input schema hash {declared_hash:#x} is unavailable"))?;
+            let hash = layout.schema_hash;
+            let total = FrameEncoder::new(layout)
+                .map_err(|error| error.to_string())?
+                .required_len(&[])
+                .map_err(|error| error.to_string())?;
+            let max_len = MaxSliceLen::try_new(total as u32).ok_or("input frame is too large")?;
+            let harness = mgr
+                .create_publisher(&topic, max_len, 1)
+                .map_err(|error| error.to_string())?;
+            let node_sub = mgr
+                .create_subscriber(&topic)
+                .map_err(|error| error.to_string())?;
+            input_publishers.push((name.to_string(), harness, hash));
+            subscribers.insert(name.to_string(), AnySubscriber::Ipc(node_sub));
+        }
+        for output in document["outputs"]
+            .as_array()
+            .ok_or("node info outputs is not an array")?
+        {
+            let name = output["name"].as_str().ok_or("output has no name")?;
+            let topic = format!("{node_name}/{name}");
+            let declared_hash = output["schema_hash"]
+                .as_u64()
+                .ok_or("output has no schema hash")?;
+            let layout = schemas
+                .layout_for_hash(declared_hash)
+                .or_else(|| schemas.layout("Probe"))
+                .ok_or_else(|| format!("output schema hash {declared_hash:#x} is unavailable"))?;
+            let total = FrameEncoder::new(layout)
+                .map_err(|error| error.to_string())?
+                .required_len(&[])
+                .map_err(|error| error.to_string())?;
+            let declared_max = output["max_slice_len_default"].as_u64();
+            let max_len = match declared_max {
+                Some(value) => {
+                    let value = u32::try_from(value)
+                        .map_err(|_| "output max_slice_len_default is too large")?;
+                    if value < total as u32 {
+                        return Err(format!(
+                            "output '{name}' max_slice_len_default {value} is smaller than required frame length {total}"
+                        ));
+                    }
+                    MaxSliceLen::try_new(value).ok_or("output frame is too large")?
+                }
+                None => MaxSliceLen::try_new(total as u32).ok_or("output frame is too large")?,
+            };
+            if let Some(seed) = seed {
+                mgr.set_replay_sequence_seeds([(topic.clone(), seed)].into());
+            }
+            let node_pub = mgr
+                .create_publisher(&topic, max_len, 1)
+                .map_err(|error| error.to_string())?;
+            let harness = mgr
+                .create_subscriber(&topic)
+                .map_err(|error| error.to_string())?;
+            publishers.insert(name.to_string(), AnyPublisher::Ipc(node_pub));
+            output_subscribers.push((name.to_string(), harness));
+        }
+        println!("node_info={info}");
+        let mut runtime_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        runtime_env.insert(
+            "CERULION_WORKSPACE".to_string(),
+            workspace.to_string_lossy().into_owned(),
+        );
+        let context = NodeContext::with_runtime_env(
+            publishers,
+            subscribers,
+            Arc::new(RealClock),
+            ShutdownSignal::new(),
+            Arc::new(runtime_env),
+        );
+        if let Err(error) = entry.init(context) {
+            eprintln!("init failed: {error}");
+            return Ok(ExitCode::FAILURE);
+        }
+        let tick_on_worker = std::env::var_os("CERULION_PYNODE_TICK_THREAD").is_some();
+        let mut elapsed_ns = Vec::with_capacity(ticks);
+        for tick in 0..ticks {
+            for (_, publisher, hash) in &mut input_publishers {
+                let layout = schemas
+                    .layout_for_hash(*hash)
+                    .ok_or("input schema disappeared")?;
+                let encoder = FrameEncoder::new(layout).map_err(|error| error.to_string())?;
+                let total = encoder
+                    .required_len(&[])
+                    .map_err(|error| error.to_string())?;
+                let mut loan = publisher
+                    .loan_raw_uninit(total)
+                    .map_err(|error| error.to_string())?;
+                for byte in loan.bytes_uninit_mut() {
+                    byte.write(0);
+                }
+                let mut loan = unsafe {
+                    // SAFETY: every byte in the exact-size loan was initialized above.
+                    loan.assume_init()
+                };
+                let mut cursor = encoder
+                    .begin(loan.bytes_mut(), &[], tick as u64)
+                    .map_err(|error| error.to_string())?;
+                let value = cursor
+                    .fixed_field_mut("value")
+                    .map_err(|error| error.to_string())?;
+                match value.len() {
+                    4 => value.copy_from_slice(&(tick as u32).to_le_bytes()),
+                    8 => value.copy_from_slice(&(tick as i64).to_le_bytes()),
+                    size => return Err(format!("unsupported fixture value width {size}")),
+                }
+                publisher
+                    .send_raw_loan(loan)
+                    .map_err(|error| error.to_string())?;
+                publisher.check_subscriber_events();
+                publisher
+                    .notify_sent_sample()
+                    .map_err(|error| error.to_string())?;
+            }
+            let started = Instant::now();
+            let tick_result = if tick_on_worker {
+                std::thread::scope(|scope| scope.spawn(|| entry.tick()).join())
+                    .map_err(|_| "tick worker thread panicked")?
+            } else {
+                entry.tick()
+            };
+            elapsed_ns.push(started.elapsed().as_nanos() as u64);
+            match tick_result {
+                Ok(()) => {
+                    let mut output = String::new();
+                    let mut sequence = None;
+                    for (_, subscriber) in &mut output_subscribers {
+                        if let Some(sample) = subscriber
+                            .try_receive_one_owned()
+                            .map_err(|error| error.to_string())?
+                        {
+                            sequence = WireHeader::read_from_buf(sample.payload())
+                                .map(|header| header.sequence);
+                            output = sample.payload()[WireHeader::SIZE..]
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect();
+                        }
+                    }
+                    match (bench, seed, sequence) {
+                        (true, _, _) => {}
+                        (false, Some(_), Some(sequence)) => {
+                            println!("tick={tick} code=0 out={output} seq={sequence}")
+                        }
+                        (false, _, _) => println!("tick={tick} code=0 out={output}"),
+                    }
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    let text = text
+                        .split_once(" error: ")
+                        .map(|(_, detail)| detail)
+                        .unwrap_or(&text);
+                    let mut output_frames = 0;
+                    for (_, subscriber) in &mut output_subscribers {
+                        if subscriber
+                            .try_receive_one_owned()
+                            .map_err(|error| error.to_string())?
+                            .is_some()
+                        {
+                            output_frames += 1;
+                        }
+                    }
+                    if bench {
+                        eprintln!("tick={tick} code=1 err={text} out_frames={output_frames}");
+                    } else {
+                        println!("tick={tick} code=1 err={text} out_frames={output_frames}");
+                    }
+                }
+            }
+        }
+        if bench && !elapsed_ns.is_empty() {
+            elapsed_ns.sort_unstable();
+            let mean =
+                elapsed_ns.iter().map(|value| *value as f64).sum::<f64>() / elapsed_ns.len() as f64;
+            let percentile = |fraction: f64| {
+                let index = ((elapsed_ns.len() - 1) as f64 * fraction).round() as usize;
+                elapsed_ns[index]
+            };
+            println!(
+                "bench_ticks={} mean_ns={mean:.1} p50_ns={} p99_ns={}",
+                elapsed_ns.len(),
+                percentile(0.50),
+                percentile(0.99)
+            );
+        }
+        if let Err(error) = entry.shutdown() {
+            println!("shutdown code=1 err={error}");
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 // Vector3 has three f64 fields, so its fixed body is 3 * 8 = 24 bytes.
@@ -272,13 +603,7 @@ fn cmd_publish_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, St
 /// received frame's offset table and nested bodies before the generated
 /// reader, which trusts them, touches it.
 fn builtin_schema_set() -> Result<SchemaSet, String> {
-    let schemas = native_ros2_messages::BUILTIN_MSGS
-        .iter()
-        .map(|&(package, name, text)| {
-            parse_rosmsg(text, name, Some(package)).map_err(|e| format!("{package}/{name}: {e}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    SchemaSet::from_schemas(schemas)
+    SchemaSet::from_schemas(builtin_schemas()?)
         .map(|(set, _)| set)
         .map_err(|e| e.to_string())
 }
@@ -532,7 +857,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
     Ok(ExitCode::SUCCESS)
 }
 
-const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M";
+const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]";
 
 fn main() -> ExitCode {
     match run() {

@@ -30,6 +30,7 @@ from cerulion._api import (
     Subscriber,
     connect,
 )
+from cerulion._node import NodeContext, _Runtime, input, node, output
 
 __version__ = "0.1.0"
 
@@ -54,4 +55,8 @@ __all__ = [
     "WIRE_HEADER_SIZE",
     "connect",
     "real_ns",
+    "NodeContext",
+    "input",
+    "node",
+    "output",
 ]

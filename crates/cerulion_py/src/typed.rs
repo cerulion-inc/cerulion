@@ -2,10 +2,11 @@
 //! Schema-aware native helpers for the Python typed facade.
 
 use crate::errors::map_dynamic_err;
-use crate::frame::Frame;
 use cerulion_core::dynamic::{
-    DynamicError, FrameValue, FrameValueKind, FrameView, PrimArray, PrimType, SchemaSet,
+    parse_rosmsg, DynamicError, FrameValue, FrameValueKind, FrameView, MessageSchema, PrimArray,
+    PrimType, SchemaSet,
 };
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -28,9 +29,25 @@ impl PySchemaSet {
     }
 
     #[staticmethod]
+    fn builtins() -> PyResult<Self> {
+        let (inner, warnings) = SchemaSet::from_schemas(builtin_schemas())
+            .map_err(|e| PyValueError::new_err(format!("cannot create builtin SchemaSet: {e}")))?;
+        Ok(Self { inner, warnings })
+    }
+
+    #[staticmethod]
     fn from_workspace(path: PathBuf) -> PyResult<Self> {
-        let (inner, warnings) = SchemaSet::from_workspace_dir(&path)
+        let (workspace, mut warnings) = SchemaSet::from_workspace_dir(&path)
             .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
+        let mut schemas = builtin_schemas();
+        for schema in workspace.schemas() {
+            let qualified_name = schema.qualified_name();
+            schemas.retain(|builtin| builtin.qualified_name() != qualified_name);
+            schemas.push(schema.clone());
+        }
+        let (inner, build_warnings) = SchemaSet::from_schemas(schemas)
+            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
+        warnings.extend(build_warnings);
         for warning in &warnings {
             tracing::warn!(warning = %warning, "schema workspace warning");
         }
@@ -91,6 +108,25 @@ impl PySchemaSet {
         })
     }
 
+    fn output_meta(&self, name: &str) -> PyResult<(u64, usize, Option<u32>)> {
+        self.inner.output_meta(name).ok_or_else(|| {
+            Python::attach(|py| map_dynamic_err(py, DynamicError::UnknownSchema(name.to_string())))
+        })
+    }
+
+    /// Length of the smallest frame of `name`: every variable field empty,
+    /// alignment padding included, as `FrameEncoder` lays it out.
+    fn min_frame_len(&self, py: Python<'_>, name: &str) -> PyResult<usize> {
+        let layout = self
+            .inner
+            .layout(name)
+            .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
+            .map_err(|e| map_dynamic_err(py, e))?;
+        cerulion_core::dynamic::FrameEncoder::new(layout)
+            .and_then(|encoder| encoder.required_len(&vec![0; layout.variable_fields.len()]))
+            .map_err(|e| map_dynamic_err(py, e))
+    }
+
     fn schema_name_for_hash(&self, hash: u64) -> Option<String> {
         self.inner.schema_name_for_hash(hash).map(ToOwned::to_owned)
     }
@@ -103,11 +139,19 @@ impl PySchemaSet {
     fn resolve_frame(
         &self,
         py: Python<'_>,
-        frame: PyRef<'_, Frame>,
+        frame: PyBuffer<u8>,
         name: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
+        let cells = frame
+            .as_slice(py)
+            .ok_or_else(|| PyValueError::new_err("frame must be a contiguous bytes-like object"))?;
+        // SAFETY: PyO3 guarantees `cells` is a contiguous read-only buffer of
+        // u8 cells for this `PyBuffer<u8>`. The returned slice is read-only,
+        // and the Python exporter remains held by `frame` for this call.
+        let exported =
+            unsafe { std::slice::from_raw_parts(cells.as_ptr().cast::<u8>(), frame.len_bytes()) };
         let mut scratch = Vec::new();
-        let bytes = aligned_for_validation(frame.wire_bytes()?, &mut scratch);
+        let bytes = aligned_for_validation(exported, &mut scratch);
         let view = match name {
             Some(name) => {
                 let layout = self
@@ -228,6 +272,22 @@ impl PySchemaSet {
             .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
         Ok(frame)
     }
+}
+
+fn builtin_schemas() -> Vec<MessageSchema> {
+    let mut out = Vec::with_capacity(native_ros2_messages::BUILTIN_MSGS.len());
+    for (package, name, text) in native_ros2_messages::BUILTIN_MSGS {
+        match parse_rosmsg(text, name, Some(package)) {
+            Ok(schema) => out.push(schema),
+            Err(error) => tracing::warn!(
+                package,
+                name,
+                error = ?error,
+                "Python schema set could not parse a vendored built-in message"
+            ),
+        }
+    }
+    out
 }
 
 /// Widest primitive alignment a typed frame field can require (`f64`/`u64`).

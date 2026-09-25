@@ -11,7 +11,7 @@ name = "cerulion_py"
 crate-type = ["cdylib"]
 
 [workspace]
-members = [".", "fixtures"]
+members = [".", "fixtures", "crates/cerulion_pynode"]
 
 # Copied verbatim from the root Cargo.toml's [workspace.lints] (rust +
 # clippy tables): this is a SEPARATE workspace so the same lint set is
@@ -43,5 +43,6 @@ strip = true
 [dependencies]
 pyo3 = { version = "=0.29.2", features = ["abi3-py311", "extension-module"] }
 cerulion_core = { path = "../cerulion_core" }
+native_ros2_messages = { path = "../native_ros2_messages" }
 libc = "=0.2.186"
 tracing = "=0.1.44"

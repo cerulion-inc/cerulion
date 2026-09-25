@@ -37,7 +37,7 @@ use crate::cli::Cli;
 /// per-PROCESS, so two tests scaffolding different workspaces would see each
 /// other's. Poisoning is ignored — a panicking test leaves the guard poisoned
 /// but the state is fully re-established by the next `enter_workspace`.
-fn env_lock() -> MutexGuard<'static, ()> {
+pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
@@ -45,9 +45,18 @@ fn env_lock() -> MutexGuard<'static, ()> {
 }
 
 /// Restores the process cwd and `HOME` when the test ends, panic or not.
-struct EnvGuard {
+pub(crate) struct EnvGuard {
     cwd: PathBuf,
     home: Option<OsString>,
+}
+
+impl EnvGuard {
+    pub(crate) fn capture() -> Self {
+        Self {
+            cwd: std::env::current_dir().expect("read cwd"),
+            home: std::env::var_os("HOME"),
+        }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -96,10 +105,7 @@ fn write(path: &Path, contents: &str) {
 /// move the process into it.
 fn enter_workspace() -> Fixture {
     let lock = env_lock();
-    let guard = EnvGuard {
-        cwd: std::env::current_dir().expect("read cwd"),
-        home: std::env::var_os("HOME"),
-    };
+    let guard = EnvGuard::capture();
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
 

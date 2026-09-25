@@ -295,7 +295,9 @@ use std::time::Duration;
 
 use cerulion_cli_engine::graph_cmd::{build_node_def, graph_create, node_stage};
 use cerulion_cli_engine::ipc_cleanup::cleanup_dead_iceoryx2_nodes;
-use cerulion_cli_engine::node_cmd::{node_build, node_create_with_options, NodeCreateOptions};
+use cerulion_cli_engine::node_cmd::{
+    node_build, node_create_with_options, NodeCreateOptions, NodeLanguage,
+};
 use cerulion_cli_engine::workspace::workspace_create;
 // The shared, oracle-tested flatness-gate decision (drop-one-outlier
 // robust ratio + uniform-stall discriminator) ported from flat_latency_test /
@@ -1268,6 +1270,7 @@ fn test_cli_e2e_user_graph_latency() {
             inputs: vec![],
             trigger: None,
             raw_ffi: false,
+            language: NodeLanguage::Rust,
         },
     )
     .expect("node_create ping");
@@ -1284,6 +1287,7 @@ fn test_cli_e2e_user_graph_latency() {
             inputs: vec![("sensor_msgs::Image".to_string(), "ping_in".to_string())],
             trigger: Some("ping_in".to_string()),
             raw_ffi: false,
+            language: NodeLanguage::Rust,
         },
     )
     .expect("node_create pong");
@@ -1300,6 +1304,7 @@ fn test_cli_e2e_user_graph_latency() {
             inputs: vec![("sensor_msgs::Image".to_string(), "echo_in".to_string())],
             trigger: Some("echo_in".to_string()),
             raw_ffi: false,
+            language: NodeLanguage::Rust,
         },
     )
     .expect("node_create latency");

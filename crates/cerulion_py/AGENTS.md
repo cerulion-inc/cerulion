@@ -48,7 +48,9 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
   pre-framed BYTES only on publish/loan; loan views are block-scoped (a live
   export at `with`-exit discards the loan: `EncodeError`); a set mutation that
   changes a typed publisher's hash fails with `SchemaMismatch`.
-
+- `crates/cerulion_pynode` embeds ONE CPython per node process (GIL-serialized;
+  no Python threads, `fork`, or signal handlers). Its fixtures under
+  `fixtures/pynodes/` are separate cdylib crates: rebuild them after any change.
 
 ## Layout
 

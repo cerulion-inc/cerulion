@@ -43,7 +43,7 @@ use crate::message::ShmMessage;
 use crate::transport::input_view::InputView;
 use crate::transport::output_proxy::OutputProxy;
 use crate::transport::publisher::CerulionPublisher;
-use crate::transport::subscriber::{CerulionSubscriber, ReceivedMessage};
+use crate::transport::subscriber::{CerulionSubscriber, RawInputView, ReceivedMessage};
 use crate::transport::TransportManager;
 
 /// Cooperative shutdown signal shared between `GraphRuntime` and every node
@@ -1303,6 +1303,23 @@ impl AnySubscriber {
         }
     }
 
+    /// Dispatches to [`CerulionSubscriber::view_raw`].
+    pub fn view_raw(&mut self) -> TransportResult<Option<RawInputView<'_>>> {
+        match self {
+            Self::Ipc(s) => s.view_raw(),
+        }
+    }
+
+    /// Dispatches to [`CerulionSubscriber::view_raw_expecting`].
+    pub fn view_raw_expecting(
+        &mut self,
+        schema_hash: u64,
+    ) -> TransportResult<Option<RawInputView<'_>>> {
+        match self {
+            Self::Ipc(s) => s.view_raw_expecting(schema_hash),
+        }
+    }
+
     /// Returns the topic name.
     pub fn topic(&self) -> &str {
         match self {
@@ -2246,6 +2263,13 @@ impl NodeContext {
     /// See [`Self::env`] for an example in a node's `init`.
     pub fn env_str(&self, key: &str, default: &str) -> String {
         self.env_lookup(key).unwrap_or_else(|| default.to_string())
+    }
+
+    /// String-typed env var lookup that reports absence as `None`, for
+    /// callers that must tell an unset key from one set to `""`. Reads the
+    /// same frozen snapshot as [`Self::env_str`].
+    pub fn env_opt(&self, key: &str) -> Option<String> {
+        self.env_lookup(key)
     }
 
     /// Env-var read backend. Always reads from the

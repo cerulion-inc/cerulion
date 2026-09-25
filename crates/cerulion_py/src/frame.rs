@@ -244,14 +244,6 @@ impl Frame {
         }
         Ok(())
     }
-
-    pub(crate) fn wire_bytes(&self) -> PyResult<&[u8]> {
-        self.check_live()?;
-        self.sample
-            .as_ref()
-            .map(|sample| sample.payload())
-            .ok_or_else(|| PyTransportError::new_err("frame holds no sample"))
-    }
 }
 
 #[pymethods]

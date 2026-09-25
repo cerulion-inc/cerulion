@@ -32,6 +32,15 @@ pub enum TimeSource {
     Virtual,
 }
 
+/// Authoring language for a generated node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum NodeLanguage {
+    /// Generate a Rust macro node (the default).
+    Rust,
+    /// Generate an embedded-CPython cdylib node.
+    Python,
+}
+
 impl From<TimeSource> for EngineTimeSource {
     fn from(ts: TimeSource) -> Self {
         match ts {
@@ -1060,6 +1069,7 @@ pub enum WorkspaceAction {
 #[derive(Subcommand)]
 pub enum NodeAction {
     /// Create a new node type
+    #[command(alias = "new")]
     Create {
         /// Node type name
         // Deliberately NO completer. A create argument names
@@ -1067,13 +1077,19 @@ pub enum NodeAction {
         // exactly the set this verb REJECTS (`NodeExists`). Offering them
         // completes a guaranteed error. The correct candidate set is empty.
         node_type: String,
+        /// Authoring language for the generated node.
+        #[arg(long, value_enum, default_value_t = NodeLanguage::Rust)]
+        lang: NodeLanguage,
         /// Add an output port: SCHEMA NAME (both required). At most one `-o`
-        /// per `node create`; add more with `cerulion node modify`.
+        /// per Rust `node create`; add more with `cerulion node modify`. A
+        /// Python node takes `-o` repeatedly.
         #[arg(short = 'o', long = "output", num_args = 2, value_names = ["SCHEMA", "NAME"])]
         output: Vec<String>,
         /// Add a non-trigger input port: SCHEMA NAME (both required). At most
-        /// one `-i` per `node create`; add more with `cerulion node modify`.
-        /// For the input that should fire the node, use `-T` instead.
+        /// one `-i` per Rust `node create`; add more with `cerulion node modify`.
+        /// A Python node takes `-i` repeatedly (every input of a
+        /// `sync_window_ms` Python node joins the aligned set). For the input
+        /// that should fire the node, use `-T` instead.
         #[arg(short = 'i', long = "input", num_args = 2, value_names = ["SCHEMA", "NAME"])]
         input: Vec<String>,
         /// Add the TRIGGER input: SCHEMA NAME (both required). The input is
