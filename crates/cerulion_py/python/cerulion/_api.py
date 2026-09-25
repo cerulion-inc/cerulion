@@ -185,8 +185,10 @@ class Publisher:
             entries = native.variable_entries() or []
             descriptors = {}
             for field, entry in zip(layout.variable_fields, entries):
-                name, offset, byte_len = entry
-                descriptors[name] = _dynamic_descriptor(field.field_type, offset, byte_len)
+                offset, byte_len = entry
+                descriptors[field.name] = _dynamic_descriptor(
+                    field.field_type, offset, byte_len
+                )
             message = Message(memoryview(native), layout, self._schemas, descriptors, loan)
             return _TypedLoanContext(loan, message)
         if payload_len is None:
