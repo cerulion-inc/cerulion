@@ -196,10 +196,16 @@ fn delivers_a_guarded_batch_to_the_batch_endpoint() {
 /// A timed-out shutdown accounts for every unsent batch exactly once: as
 /// `queue_dropped` when the worker acknowledged the abort in time, or as
 /// `in_flight` when a slow scheduler left the POST pinned at the deadline.
+/// Every caller pins a single one-event POST, so at most that one event can
+/// be in flight; anything queued behind it must show up as dropped.
 fn assert_cancelled(outcome: ShutdownOutcome, client: &Client, unsent: u64) {
     let ShutdownOutcome::TimedOut { in_flight } = outcome else {
         panic!("expected a timed-out shutdown, got {outcome:?}");
     };
+    assert!(
+        in_flight <= 1,
+        "only the pinned event can be in flight, got {in_flight}"
+    );
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         let counted = client.queue_dropped() + in_flight as u64;
