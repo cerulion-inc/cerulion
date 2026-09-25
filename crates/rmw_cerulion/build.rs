@@ -79,6 +79,21 @@ use std::path::PathBuf;
 mod era_check;
 use era_check::{check_distro_claim, observed_era_label, DistroClaimVerdict};
 
+/// Every doc comment bindgen lifts from the ROS headers is wrapped in a
+/// `text` code fence, so the doxygen text ships verbatim on the generated
+/// bindings while rustdoc never reads an indented line of it as a Rust
+/// code block (which `cargo test` would compile as a doctest). Any triple
+/// backtick inside the text is spaced out so it cannot close the fence.
+#[derive(Debug)]
+struct DocCommentsAsText;
+
+impl bindgen::callbacks::ParseCallbacks for DocCommentsAsText {
+    fn process_comment(&self, comment: &str) -> Option<String> {
+        let body = comment.replace("```", "` ` `");
+        Some(format!("```text\n{body}\n```"))
+    }
+}
+
 /// Capability cfg table: (`cerulion_has_<cap>` suffix, marker token
 /// grepped — case-sensitive substring — in the selected bindings file).
 ///
@@ -358,6 +373,13 @@ fn main() {
         // Path 1: bindgen against real headers.
         let mut builder = bindgen::Builder::default()
             .header("wrapper.h")
+            // The doxygen text from the ROS headers stays on the generated
+            // bindings (a consumer reading the docs gets it), but as
+            // preformatted text: copied verbatim, its indented lines are
+            // rustdoc code blocks that `cargo test` compiles as doctests and
+            // fails on (23 of them on the first real-header run), and a
+            // `text` fence is never a doctest. See `DocCommentsAsText`.
+            .parse_callbacks(Box::new(DocCommentsAsText))
             .layout_tests(true)
             .derive_default(true)
             .prepend_enum_name(false)

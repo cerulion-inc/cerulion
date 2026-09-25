@@ -1,0 +1,100 @@
+name: rmw distro lanes
+
+# One hosted lane per ROS 2 distro in the support set (Jazzy, the validated distro, as the regression
+# guard; Lyrical, Humble and Foxy as they land), inside the stock ros:<distro>-ros-base image,
+# building rmw_cerulion against that distro's REAL headers (bindgen; the vendored fallback is refused).
+# Each lane asserts the distro's KNOWN state through tools/ci/rmw-distros/gate.sh, so the lane is
+# green while the state is true and turns red the moment the truth moves in either direction.
+# Runs on PRs and pushes to main that touch the rmw path (the crate, its in-tree dependencies, the workspace manifests). No lane is a required context on main, so a
+# path-filtered lane that does not run can never leave a PR pending.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/rmw_cerulion/**'
+      - 'crates/cerulion_core/**'
+      - 'crates/cerulion_heaphook/**'
+      - 'crates/native_ros2_messages/**'
+      - 'tools/ci/rmw-distros/**'
+      - '.github/workflows/rmw-distros.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/rmw_cerulion/**'
+      - 'crates/cerulion_core/**'
+      - 'crates/cerulion_heaphook/**'
+      - 'crates/native_ros2_messages/**'
+      - 'tools/ci/rmw-distros/**'
+      - '.github/workflows/rmw-distros.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+concurrency:
+  # A pull request's runs supersede each other; every main push and every dispatch keeps its own run,
+  # so a later push can never replace a pending result for an earlier main commit.
+  group: rmw-distros-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lane:
+    name: rmw distro lane (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [jazzy, lyrical, humble, foxy]
+    container:
+      image: ros:${{ matrix.distro }}-ros-base
+      options: --shm-size=1g
+    env:
+      # The toolchain action exports CARGO_TERM_COLOR=always; the gate harvests cargo's status lines,
+      # so colour stays off (harvest.sh also strips escapes, belt and braces).
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install the bindgen toolchain
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git clang libclang-dev pkg-config procps
+      - name: Install Rust (stable, with rustfmt for the bindgen layout-test reader)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Fingerprint the distro headers
+        # The image tag floats; bindgen's input is the header tree, so the cache follows the headers,
+        # never a tag that may have been republished. Every ament prefix's include tree is hashed,
+        # and an empty find fails the step rather than keying the cache on the hash of nothing.
+        id: headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +u; source "/opt/ros/${{ matrix.distro }}/setup.bash"; set -u
+          files=$(for p in ${AMENT_PREFIX_PATH//:/ }; do [ -d "$p/include" ] && find "$p/include" -type f \( -name '*.h' -o -name '*.hpp' \); done | sort)
+          n=$(printf '%s\n' "$files" | grep -c . || true)
+          [ "$n" -gt 0 ] || { echo "::error::no headers found under any ament prefix ($AMENT_PREFIX_PATH)"; exit 1; }
+          hh=$(printf '%s\n' "$files" | xargs sha256sum | sha256sum | cut -c1-16)
+          echo "hash=$hh" >> "$GITHUB_OUTPUT"
+          echo "distro header tree hash: $hh over $n files"
+      - name: Self-test the gate's log harvester
+        run: bash tools/ci/rmw-distros/gate_selftest.sh
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-
+      - name: Gate (expected state for this distro)
+        run: bash tools/ci/rmw-distros/gate.sh "${{ matrix.distro }}"
