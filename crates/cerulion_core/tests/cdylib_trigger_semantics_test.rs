@@ -85,6 +85,7 @@ fn build_single(
     buffer: usize,
 ) -> GraphRuntime {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -94,6 +95,7 @@ fn build_single(
         identity: format!("cts_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "node".to_string(),
             node_type: node_type.to_string(),
@@ -221,6 +223,7 @@ fn data_trigger_cdylib_fires_once_per_frame_zero_on_silence() {
 
 fn build_sync(prefix: &str, topic_cam: &str, topic_imu: &str) -> GraphRuntime {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -230,6 +233,7 @@ fn build_sync(prefix: &str, topic_cam: &str, topic_imu: &str) -> GraphRuntime {
         identity: format!("cts_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "node".to_string(),
             node_type: "sync_node".to_string(),
@@ -376,6 +380,7 @@ fn raw_ffi_cdylib_no_policy_emits_default_policy_warn() {
     // (cerulion_core), so `#[traced_test]` captures it (the cdylib's own
     // tracing is irrelevant here).
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -385,6 +390,7 @@ fn raw_ffi_cdylib_no_policy_emits_default_policy_warn() {
         identity: "cts_warn".to_string(),
         prefix: "ctsw".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "raw".to_string(),
             node_type: "raw".to_string(),
@@ -423,6 +429,7 @@ fn run_live_refuses_loaded_host_driven_cdylib() {
     // (kind 3); `run_live`'s entry collect reads it and REFUSES the launch —
     // a provably-inert external node can never fire on the live path.
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -432,6 +439,7 @@ fn run_live_refuses_loaded_host_driven_cdylib() {
         identity: "cts_refuse".to_string(),
         prefix: "ctsr".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "camera".to_string(),
             node_type: "external_node".to_string(),

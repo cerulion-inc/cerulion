@@ -202,6 +202,7 @@ impl WideProducer {
 /// (fire ordering + times) matters, not any read value.
 fn wide_producer_def(id: &str) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "wide_producer".to_string(),
@@ -224,6 +225,7 @@ fn wide_ids(n: usize) -> Vec<String> {
 /// inputs → no DAG edges → ONE wide level 0. Returns the config + factories.
 fn wide_graph(prefix: &str, ids: &[String]) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -456,6 +458,7 @@ fn run_freeze(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, [u64; 4])> 
     // order). With a LIVE read (no snapshot) it would see the same-step value;
     // the snapshot freezes it to the prior step.
     nodes.push(NodeDef {
+        fuse: None,
         ros2: None,
         id: "consumer".to_string(),
         node_type: "freeze_consumer".to_string(),
@@ -480,6 +483,7 @@ fn run_freeze(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, [u64; 4])> 
         outputs: vec![],
     });
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -700,6 +704,7 @@ fn run_panic_iso(
     // output (never loaned by the closure body) to carry a port; it fires in
     // PARALLEL (no-port-from-the-snapshot-set Period closure → not serial-gated).
     nodes.push(NodeDef {
+        fuse: None,
         ros2: None,
         id: "panic".to_string(),
         node_type: "panic_node".to_string(),
@@ -714,6 +719,7 @@ fn run_panic_iso(
     });
     for i in 0..SURVIVORS {
         nodes.push(NodeDef {
+            fuse: None,
             ros2: None,
             id: format!("s{i:02}"),
             node_type: "survivor_node".to_string(),
@@ -728,6 +734,7 @@ fn run_panic_iso(
         });
     }
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -900,6 +907,7 @@ fn run_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntry> {
     // The gated closure consumer, declared LAST → ticks after the macros in
     // decision order; routed to the serial path by serial_fire_node_ids.
     nodes.push(NodeDef {
+        fuse: None,
         ros2: None,
         id: "gated".to_string(),
         node_type: "gated_closure".to_string(),
@@ -910,6 +918,7 @@ fn run_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntry> {
         outputs: vec![],
     });
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1087,6 +1096,7 @@ fn run_block_under_parallel(prefix: &str, threads: &str, steps: u32, extra: usiz
     let mut nodes: Vec<NodeDef> = Vec::new();
     // The fast block producer (level 0).
     nodes.push(NodeDef {
+        fuse: None,
         ros2: None,
         id: "bprod".to_string(),
         node_type: "block_fast_producer".to_string(),
@@ -1110,6 +1120,7 @@ fn run_block_under_parallel(prefix: &str, threads: &str, steps: u32, extra: usiz
     // is NON-trigger → no DAG edge → it is a LEVEL-0 ROOT in the SAME wide level
     // as bprod + the macros (not level 1).
     nodes.push(NodeDef {
+        fuse: None,
         ros2: None,
         id: "bcons".to_string(),
         node_type: "block_slow_consumer".to_string(),
@@ -1121,6 +1132,7 @@ fn run_block_under_parallel(prefix: &str, threads: &str, steps: u32, extra: usiz
     });
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1237,6 +1249,7 @@ fn run_two_block_pairs(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntr
     let _guard = FireThreadsGuard::set(threads);
 
     let mk_producer = |id: &str| NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "block_fast_producer".to_string(),
@@ -1250,6 +1263,7 @@ fn run_two_block_pairs(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntr
         }],
     };
     let mk_consumer = |id: &str, src: &str| NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "block_slow_consumer".to_string(),
@@ -1270,6 +1284,7 @@ fn run_two_block_pairs(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntr
         mk_consumer("cb", "pb/out"),
     ];
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1405,6 +1420,7 @@ fn interleaved_gated_node_merges_in_decision_order() {
             // level-0 sibling); the input is NON-TRIGGER so it does NOT push the
             // closure to a later level (it stays at level 0, decision position 2).
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "gated".to_string(),
                 node_type: "gated_closure".to_string(),
@@ -1423,6 +1439,7 @@ fn interleaved_gated_node_merges_in_decision_order() {
         ];
 
         let config = GraphConfig {
+            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -1604,6 +1621,7 @@ fn wide_rayon_level_stamps_nonzero_global_level() {
     // all at global level 1, all in ONE wide level (trigger edge = level edge).
     for id in &consumer_ids {
         nodes.push(NodeDef {
+            fuse: None,
             ros2: None,
             id: id.clone(),
             node_type: "wide_consumer".to_string(),
@@ -1615,6 +1633,7 @@ fn wide_rayon_level_stamps_nonzero_global_level() {
         });
     }
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

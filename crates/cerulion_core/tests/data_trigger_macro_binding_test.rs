@@ -62,6 +62,7 @@ fn build_for_test_synthesizes_binding_from_macro_data_trigger() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -72,6 +73,7 @@ fn build_for_test_synthesizes_binding_from_macro_data_trigger() {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "src".to_string(),
                 node_type: "src".to_string(),
@@ -85,6 +87,7 @@ fn build_for_test_synthesizes_binding_from_macro_data_trigger() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "consumer".to_string(),
@@ -140,6 +143,7 @@ fn macro_data_trigger_consumer_fires_when_source_publishes() {
     });
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -150,6 +154,7 @@ fn macro_data_trigger_consumer_fires_when_source_publishes() {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "src".to_string(),
                 node_type: "src".to_string(),
@@ -163,6 +168,7 @@ fn macro_data_trigger_consumer_fires_when_source_publishes() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "consumer".to_string(),
@@ -216,6 +222,7 @@ fn build_fails_when_macro_data_trigger_input_name_not_in_yaml_inputs() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -225,6 +232,7 @@ fn build_fails_when_macro_data_trigger_input_name_not_in_yaml_inputs() {
         identity: "a3_missing_input".to_string(),
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),
@@ -275,6 +283,7 @@ fn build_fails_when_macro_data_trigger_input_loops_to_self() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -284,6 +293,7 @@ fn build_fails_when_macro_data_trigger_input_loops_to_self() {
         identity: "a3_self_loop".to_string(),
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "looper".to_string(),
             node_type: "looper".to_string(),
@@ -346,6 +356,7 @@ fn build_fails_when_macro_data_trigger_loops_to_own_overridden_output() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -355,6 +366,7 @@ fn build_fails_when_macro_data_trigger_loops_to_own_overridden_output() {
         identity: "a3_override_loop".to_string(),
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "looper".to_string(),
             node_type: "looper".to_string(),
@@ -420,6 +432,7 @@ fn name_mismatch_error_lists_existing_yaml_inputs() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -430,6 +443,7 @@ fn name_mismatch_error_lists_existing_yaml_inputs() {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "src".to_string(),
                 node_type: "src".to_string(),
@@ -452,6 +466,7 @@ fn name_mismatch_error_lists_existing_yaml_inputs() {
                 ],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "consumer".to_string(),

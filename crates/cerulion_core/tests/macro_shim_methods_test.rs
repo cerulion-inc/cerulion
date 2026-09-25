@@ -96,6 +96,7 @@ fn shim_methods_reach_runtime_clock_and_shutdown_signal() {
         .expect("OBSERVED set exactly once");
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -105,6 +106,7 @@ fn shim_methods_reach_runtime_clock_and_shutdown_signal() {
         identity: "shim_methods".to_string(),
         prefix: "shim_methods".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "sink".to_string(),
             node_type: "shim_sink".to_string(),

@@ -140,6 +140,7 @@ fn build_graph(
     String,
 ) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -150,6 +151,7 @@ fn build_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "text_producer".to_string(),
@@ -163,6 +165,7 @@ fn build_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "portwrite".to_string(),
                 node_type: "port_write".to_string(),
@@ -179,6 +182,7 @@ fn build_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "drain".to_string(),
                 node_type: "image_drain".to_string(),

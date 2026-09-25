@@ -306,6 +306,7 @@ fn crlf_line_endings_are_preserved_outside_the_block() {
 /// use.
 fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         name: None,
@@ -313,6 +314,7 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
         prefix: "p".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -326,6 +328,7 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),
@@ -336,6 +339,7 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "laggard".to_string(),
                 node_type: "laggard".to_string(),
@@ -1496,6 +1500,7 @@ fn inp(name: &str, source: &str) -> InputDef {
 
 fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: id.to_string(),
@@ -1506,6 +1511,7 @@ fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
 
 fn config_of(nodes: Vec<NodeDef>, multi: Vec<String>) -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         name: None,

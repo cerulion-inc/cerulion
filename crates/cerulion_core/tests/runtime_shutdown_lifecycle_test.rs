@@ -57,6 +57,7 @@ fn build_runtime_with_counters(counters: Arc<LifecycleCounters>, period_ms: u64)
     });
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -66,6 +67,7 @@ fn build_runtime_with_counters(counters: Arc<LifecycleCounters>, period_ms: u64)
         identity: "shutdown_lifecycle_test".to_string(),
         prefix: "sl_test".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -203,6 +205,7 @@ fn init_failure_midway_shuts_down_already_initd_nodes() {
         });
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -213,6 +216,7 @@ fn init_failure_midway_shuts_down_already_initd_nodes() {
         prefix: "ift".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "node_a".to_string(),
                 node_type: "a".to_string(),
@@ -226,6 +230,7 @@ fn init_failure_midway_shuts_down_already_initd_nodes() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "node_b".to_string(),
                 node_type: "b".to_string(),

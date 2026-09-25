@@ -119,6 +119,7 @@ impl DropOldestSibling {
 /// Returns (producer_fire_count, depth_consumer_block_deferred_count).
 fn run_degrade() -> (u64, u64) {
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -129,6 +130,7 @@ fn run_degrade() -> (u64, u64) {
         prefix: "cbd".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "degrade_block_producer".to_string(),
@@ -136,6 +138,7 @@ fn run_degrade() -> (u64, u64) {
                 outputs: vec![vec3_out("out"), vec3_out("aux_out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "depth_consumer".to_string(),
                 node_type: "depth_probe".to_string(),
@@ -152,6 +155,7 @@ fn run_degrade() -> (u64, u64) {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "dropper".to_string(),
                 node_type: "drop_oldest_sibling".to_string(),

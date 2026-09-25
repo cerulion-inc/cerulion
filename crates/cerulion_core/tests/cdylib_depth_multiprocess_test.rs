@@ -103,6 +103,7 @@ fn dylib_declared_depth_survives_into_multiprocess_provisioning_harvest() {
     process_groups.insert("perception".to_string(), vec!["consumer".to_string()]);
 
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups,
@@ -113,6 +114,7 @@ fn dylib_declared_depth_survives_into_multiprocess_provisioning_harvest() {
         prefix: "cd4".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "mp_feed_producer".to_string(),
@@ -120,6 +122,7 @@ fn dylib_declared_depth_survives_into_multiprocess_provisioning_harvest() {
                 outputs: vec![out_def("out"), out_def("aux_out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth_probe".to_string(),

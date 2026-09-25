@@ -187,6 +187,7 @@ struct Rig {
 /// one `CompressedImage` output).
 fn graph_config(prefix: &str, h264_topic: &str, max_slice_len: usize) -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -196,6 +197,7 @@ fn graph_config(prefix: &str, h264_topic: &str, max_slice_len: usize) -> GraphCo
         identity: format!("cam_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "camera".to_string(),
             node_type: "camera_jpeg".to_string(),

@@ -65,6 +65,7 @@ fn build_runtime_recording_env_var(
 
     let node_id = unique_id("env_iso");
     let config = GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -74,6 +75,7 @@ fn build_runtime_recording_env_var(
         identity: "env_iso".to_string(),
         prefix: "envt".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: node_id.clone(),
             node_type: node_id,

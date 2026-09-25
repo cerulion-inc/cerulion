@@ -83,6 +83,7 @@ fn make_entry(info: NodeInfo) -> Box<dyn NodeEntry> {
 /// actually used.
 fn graph_config(node_id: &str) -> GraphConfig {
     GraphConfig {
+        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -92,6 +93,7 @@ fn graph_config(node_id: &str) -> GraphConfig {
         identity: format!("warn_{node_id}"),
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: node_id.to_string(),
             node_type: node_id.to_string(),
