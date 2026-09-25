@@ -2,7 +2,7 @@
 //!
 //! A process may host one interpreter at a time. The host assumes GIL
 //! serialization, no Python-created threads or fork. During initialization,
-//! The host installs no Python signal handlers and never changes the process's
+//! the host installs no Python signal handlers and never changes the process's
 //! SIGINT disposition. Build one node cdylib per CPython minor:
 //! the resulting library has a `libpython` `NEEDED` entry and is not an abi3
 //! extension. This host is intended for deterministic graph ticks, not kHz
