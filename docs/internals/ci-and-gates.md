@@ -327,7 +327,7 @@ against the type it has to parse as by a unit test in
 
 ## CI job map (`.github/workflows/ci.yml`)
 
-`lint` gates every test job and runs: `cargo fmt --all --check` plus a workspace-root WALK
+`lint` runs: `cargo fmt --all --check` plus a workspace-root WALK
 that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/*`, every
 `examples/*`, the fuzz workspace); `cargo clippy --workspace --all-targets -- -D warnings`;
 the hot-path alloc lint and its self-test; the agent-docs gate; the leak guard's self-test
@@ -338,6 +338,15 @@ deduplicates a symlink into a scanned subdirectory); and `actionlint` over every
 EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_request` and
 `merge_group` events like everything else: there is no cost gate, no routing expression
 and no stub job standing in for a skipped required check.
+
+`lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
+`viz-tests`, and the push-only `fuzz`, `miri` and latency jobs), so a red `lint` still
+saves their runner minutes. It does NOT gate the three that do: `test-archive`,
+`test-linux` and `test-macos`. `test-archive` and `test-macos` start at t=0; `test-linux`
+starts when `test-archive` finishes, because it keeps `needs: [test-archive]`, which IS a
+data dependency: it runs the binaries that job builds. A `lint` verdict was never a data
+dependency for any of the three, and while it gated them the wall was `lint` plus the
+longest test job instead of the longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
 2-way (`[0,1]`: every macOS shard pays a fixed build and setup cost, so the macOS side
