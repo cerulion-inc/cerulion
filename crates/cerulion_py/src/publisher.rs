@@ -276,7 +276,7 @@ impl Publisher {
                                 "variable field slice lies outside the loan payload",
                             )
                         })?;
-                    Ok((field.name.clone(), offset, bytes.len()))
+                    Ok((offset, bytes.len()))
                 })
                 .collect::<PyResult<Vec<_>>>()?
         };
@@ -363,7 +363,7 @@ pub struct Loan {
     exports: Arc<Exports>,
     closed: bool,
     pending_drop: bool,
-    variable_entries: Option<Vec<(String, usize, usize)>>,
+    variable_entries: Option<Vec<(usize, usize)>>,
 }
 
 #[pymethods]
@@ -452,7 +452,7 @@ impl Loan {
         self.payload_len
     }
 
-    fn variable_entries(&self) -> Option<Vec<(String, usize, usize)>> {
+    fn variable_entries(&self) -> Option<Vec<(usize, usize)>> {
         self.variable_entries.clone()
     }
 
