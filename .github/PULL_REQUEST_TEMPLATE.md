@@ -1,55 +1,39 @@
 ## Summary
 
-<!-- 1-2 sentence overview. What does this pull request accomplish? -->
+<!-- One paragraph: what this changes and why it matters to someone using Cerulion.
+     A pull request body is read by people outside the project, so write it for a
+     stranger: plain language, no internal shorthand, no first person, no questions.
+     Keep the whole body to about 40 lines. -->
+<!-- Name the related issue in that paragraph, for example: Closes #123 -->
 
-## What Changed
+## What changed
 
-<!-- Organize changes by category. Use tables for structured data, bullets for simple changes. -->
+<!-- 3 to 8 bullets, each naming a file or a behaviour. No checkpoint tables, no
+     to-do or follow-up lists, no HTML, and no pasted test output: CI is the record. -->
 
-### Category Name
-<!-- e.g., "New Feature", "Bug Fix", "Test Coverage", "Documentation" -->
+-
 
-- Change description
+## How to verify
 
-## Checkpoints
-
-<!-- List acceptance criteria. Mark each as PASS/FAIL with details. -->
-
-| Checkpoint | Description | Status |
-|------------|-------------|--------|
-| 1 | Description | :white_check_mark: **PASS** |
-
-## How to Test
+<!-- The exact commands a reader can paste, or the name of the CI check that covers
+     this change. Name the packages you touched: the root workspace has no
+     `cargo test --workspace` step (it deadlocks on iceoryx2's shared-memory
+     singleton), so ci.yml enumerates its packages and `cerulion_core` goes through
+     the shard runner. -->
 
 ```bash
-# Commands to verify this pull request. Name the packages you touched: the ROOT
-# workspace has no `cargo test --workspace` step (it deadlocks on iceoryx2's
-# SHM singleton), so ci.yml's root-workspace test steps enumerate their
-# packages, and `cerulion_core` goes through the shard runner.
 cargo test -p <crate>
 ./tools/scripts/ci_test_shard.sh cerulion_core <shard> 4   # a cerulion_core shard
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-## Test Output
+<!-- Optional: when the change moves latency or CI time, uncomment the section below,
+     fill in the table, and add one line saying where the numbers came from (machine,
+     build, sample count). Leave it commented out otherwise.
 
-```
-# Paste actual test output here
-```
+## Measurements
 
-## Checklist
-
-- [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] The `.github/workflows/ci.yml` test steps for the crates you touched pass locally
-      (or `./tools/scripts/ci_test_shard.sh <package> <shard> <count>` for a `cerulion_core` shard).
-      The root workspace deliberately has no `cargo test --workspace` step: it deadlocks on
-      iceoryx2's shared-memory singleton. (`examples/go2` is its own workspace and does run
-      `cargo test --workspace` inside it; that one is fine.)
-- [ ] Iceoryx2 tests run with `--test-threads=1` (if applicable)
-- [ ] No new hot-path allocations (or annotated with `// hot-path-alloc-ok: <reason>`)
-- [ ] Summary above describes what changed and why
-- [ ] Linked the related issue (e.g., `Closes #123`)
-- [ ] Public items have doc comments
-- [ ] PR is scoped to one logical change
-- [ ] Self-reviewed the diff before requesting review
+| Metric | Before | After |
+| - | - | - |
+| | | |
+-->
