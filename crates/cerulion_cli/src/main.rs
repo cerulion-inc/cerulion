@@ -627,7 +627,12 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                     telemetry_events::BAG_RECORD_COMPLETED,
                     telemetry_events::bag_record_completed(
                         started.elapsed(),
-                        summary.bytes,
+                        summary
+                            .bag_paths
+                            .iter()
+                            .filter_map(|path| std::fs::metadata(path).ok())
+                            .map(|meta| meta.len())
+                            .sum(),
                         summary.per_topic.len(),
                     ),
                 ),

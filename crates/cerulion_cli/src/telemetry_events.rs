@@ -11,6 +11,7 @@ use cerulion_telemetry::{EventSpec, Props};
 
 use crate::telemetry::duration_bucket;
 
+/// Recorded when a run is requested, before the graph is loaded and checked.
 pub const GRAPH_RUN_STARTED: EventSpec = EventSpec {
     name: "graph_run_started",
     allowlist: &["is_single_process"],
@@ -39,6 +40,7 @@ pub const RESIM_COMPLETED: EventSpec = EventSpec {
     name: "resim_completed",
     allowlist: &["duration_bucket", "exit_code", "is_divergent"],
 };
+/// Recorded when `ros2 attach` hands its bridge graph to `graph run`.
 pub const ROS2_BRIDGE_STARTED: EventSpec = EventSpec {
     name: "ros2_bridge_started",
     allowlist: &[],
@@ -91,7 +93,8 @@ pub fn node_build_completed(elapsed: Duration, is_success: bool, is_release: boo
     ]
 }
 
-/// `topic_count` is the number of topics that recorded at least one message.
+/// `bytes` is the bag files' size on disk; `topic_count` is the number of
+/// topics that recorded at least one message.
 pub fn bag_record_completed(elapsed: Duration, bytes: u64, topic_count: usize) -> Props {
     vec![
         bucket(elapsed),

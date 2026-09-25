@@ -34,14 +34,14 @@ The events:
 |---|---|---|
 | `cli_command_run` | every CLI command | `verb` and `subverb` (the command's name, such as `graph` and `run`), `exit_code`, and `duration_bucket` (`lt_1s`, `1s_10s`, `10s_1m`, `1m_10m`, `gte_10m`) |
 | `cli_login_completed` | `cerulion login`, and the login a command starts on a machine that never signed in | `is_account_switch` (whether a different account was signed in before) |
-| `graph_run_started` | `cerulion graph run`, before the graph starts | `is_single_process` |
+| `graph_run_started` | `cerulion graph run`, when the run is requested (before the graph is loaded and checked, so a rejected run records one too; `graph_run_completed` then has `is_success` false) | `is_single_process` |
 | `graph_run_completed` | `cerulion graph run`, when it ends | `duration_bucket`, `is_success` |
 | `node_build_completed` | `cerulion node build` | `duration_bucket`, `is_success`, `is_release` |
-| `bag_record_completed` | `cerulion bag record`, on success | `duration_bucket`, `size_bucket` (`lt_1mb`, `1mb_10mb`, `10mb_100mb`, `100mb_1gb`, `gte_1gb`), `topic_count` (topics that recorded a message) |
+| `bag_record_completed` | `cerulion bag record`, on success | `duration_bucket`, `size_bucket` (the bag files' size on disk: `lt_1mb`, `1mb_10mb`, `10mb_100mb`, `100mb_1gb`, `gte_1gb`), `topic_count` (topics that recorded a message) |
 | `bag_record_failed` | `cerulion bag record`, on failure | `duration_bucket` |
 | `bag_replay_completed` | `cerulion bag play` | `duration_bucket`, `is_success` |
 | `resim_completed` | `cerulion bag play --resim` | `duration_bucket`, `exit_code`, `is_divergent` |
-| `ros2_bridge_started` | `cerulion ros2 attach`, when its bridge graph starts | none |
+| `ros2_bridge_started` | `cerulion ros2 attach`, when it hands its bridge graph to `graph run` (before that graph is checked; the paired `graph_run_completed` reports whether it ran) | none |
 | `connect_session_completed` | `cerulion connect` | `duration_bucket`, `exit_code` |
 | `pair_completed` | `cerulion pair` | `is_success` |
 | `vizd_started` | the vizd daemon, once at start | `os`, `arch` |
