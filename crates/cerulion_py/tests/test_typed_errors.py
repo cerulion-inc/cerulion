@@ -266,3 +266,20 @@ def test_view_cache_is_keyed_on_schema_and_generation(session):
     frame.release()
 
 
+
+
+def test_string_field_rejects_a_non_string_value(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(SCHEMA)
+    topic = unique_topic("typed-string-type")
+    pub = session.publisher(topic, schema="Probe", schemas=schemas)
+    sub = session.subscriber(topic, schema="Probe", schemas=schemas)
+    for bad in (1, 2.5, None):
+        with pytest.raises(cerulion.EncodeError, match="expects str or bytes"):
+            pub.publish({"id": 1, "values": [2], "name": bad})
+    assert pub.sequence == 0
+    pub.publish({"id": 1, "values": [2], "name": b"raw"})
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert frame.view(schemas, "Probe").name == "raw"
+    frame.release()

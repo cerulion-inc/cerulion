@@ -231,10 +231,39 @@ def _dynamic_descriptor(field_type, offset, byte_len):
     return ("raw", offset, byte_len)
 
 
+_BYTES_LIKE = (bytes, bytearray, memoryview)
+
+
+def _string_bytes(name, value):
+    """UTF-8 bytes of a string field value: a ``str`` or raw bytes."""
+    if isinstance(value, str):
+        return value.encode()
+    if isinstance(value, _BYTES_LIKE):
+        return bytes(value)
+    raise _native.EncodeError(
+        f"string field {name!r} expects str or bytes, not {type(value).__name__}"
+    )
+
+
+def _bytes_value(name, value):
+    """Raw bytes of a buffer-protocol value; an int or str is refused, not
+    reinterpreted (``bytes(3)`` would be three NUL bytes)."""
+    if not isinstance(value, (int, str)):
+        try:
+            return bytes(memoryview(value))
+        except TypeError:
+            pass
+    raise _native.EncodeError(
+        f"field {name!r} expects a bytes-like object, not {type(value).__name__}"
+    )
+
+
 def _value_wire_length(schemas, field_type, value, parent=None, name=None):
     if isinstance(field_type, str):
-        if field_type in ("String", "Bytes"):
-            return len(value.encode() if isinstance(value, str) else bytes(value))
+        if field_type == "String":
+            return len(_string_bytes(name, value))
+        if field_type == "Bytes":
+            return len(_bytes_value(name, value))
     if isinstance(field_type, dict) and "FixedArray" in field_type:
         # A fixed array in the variable section has variable-size
         # elements: like string[]/nested[], it takes pre-framed bytes.
@@ -265,7 +294,7 @@ def _value_wire_length(schemas, field_type, value, parent=None, name=None):
         )
     if isinstance(field_type, dict) and "Nested" in field_type:
         if not isinstance(value, dict):
-            return len(bytes(value))
+            return len(_bytes_value(name, value))
         target = schemas.layout(_nested_name(schemas, field_type["Nested"], parent))
         return len(_encode_message(schemas, target.qualified_name, value, None)) - _native.WIRE_HEADER_SIZE
     raise _native.EncodeError("cannot determine variable field length")
@@ -583,7 +612,7 @@ class Message:
                             target[child] = source[..., index]
                     return
                 if isinstance(field.field_type, dict) and "StringFixed" in field.field_type:
-                    raw = str(value).encode()
+                    raw = _string_bytes(name, value)
                     size = field.field_type["StringFixed"]
                     if len(raw) > size:
                         raise _native.EncodeError(
@@ -595,7 +624,7 @@ class Message:
                 return
             descriptor = self._variables[name]
             if field.field_type == "String":
-                raw = str(value).encode()
+                raw = _string_bytes(name, value)
                 if len(raw) != _byte_len(descriptor):
                     raise _native.EncodeError(
                         f"string field {name} requires {_byte_len(descriptor)} bytes"
@@ -603,7 +632,7 @@ class Message:
                 self._payload[_offset(descriptor) : _end(descriptor)] = raw
                 return
             if field.field_type == "Bytes":
-                raw = bytes(value)
+                raw = _bytes_value(name, value)
                 if len(raw) != _byte_len(descriptor):
                     raise _native.EncodeError(
                         f"bytes field {name} requires {_byte_len(descriptor)} bytes"
