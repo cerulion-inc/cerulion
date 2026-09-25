@@ -31,6 +31,8 @@ pub const DEFAULT_SHUTDOWN_BUDGET: Duration = Duration::from_millis(300);
 pub const QUEUE_CAPACITY: usize = 64;
 /// Per-request HTTP timeout (connect + transfer).
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longest wait [`Client::shutdown`] accepts; a larger budget is clamped.
+pub const MAX_SHUTDOWN_BUDGET: Duration = Duration::from_secs(60);
 /// Default PostHog ingestion host.
 pub const DEFAULT_HOST: &str = "https://us.i.posthog.com";
 
@@ -39,7 +41,7 @@ pub use enabled::Client;
 
 #[cfg(feature = "posthog")]
 mod enabled {
-    use super::{ShutdownOutcome, DEFAULT_HOST, HTTP_TIMEOUT, QUEUE_CAPACITY};
+    use super::{ShutdownOutcome, DEFAULT_HOST, HTTP_TIMEOUT, MAX_SHUTDOWN_BUDGET, QUEUE_CAPACITY};
     use crate::consent;
     use crate::guard;
     use crate::payload::{self, Event};
@@ -111,9 +113,13 @@ mod enabled {
         }
 
         /// Construct against an explicit host (tests, or a surface that already
-        /// resolved config). `None` if a [`Common`] string fails the guard or
-        /// the HTTP client cannot be built.
+        /// resolved config). `None` if `host` is not an `https` URL (plain
+        /// `http` is accepted for a loopback host only), a [`Common`] string
+        /// fails the guard, or the HTTP client cannot be built.
         pub fn new(api_key: String, host: &str, common: Common) -> Option<Client> {
+            if !host_is_allowed(host) {
+                return None;
+            }
             let strings = [
                 Some(&common.surface),
                 Some(&common.env),
@@ -229,8 +235,9 @@ mod enabled {
             if self.shut {
                 return ShutdownOutcome::Noop;
             }
-            self.shut = true;
+            let budget = budget.min(MAX_SHUTDOWN_BUDGET);
             let deadline = Instant::now() + budget;
+            self.shut = true;
             {
                 let mut state = lock(&self.shared.state);
                 state.closed = true;
@@ -248,13 +255,16 @@ mod enabled {
                 GATE_IDLE | GATE_ABANDONED => 0,
                 n => n,
             };
-            let mut state = lock(&self.shared.state);
-            let abandoned = state.events.len() as u64;
-            state.events.clear();
-            drop(state);
-            self.shared
-                .queue_dropped
-                .fetch_add(abandoned, Ordering::Relaxed);
+            // Past the deadline nothing may block: if the worker holds the
+            // queue it sees `abort` before its next POST and counts the queue.
+            if let Ok(mut state) = self.shared.state.try_lock() {
+                let abandoned = state.events.len() as u64;
+                state.events.clear();
+                drop(state);
+                self.shared
+                    .queue_dropped
+                    .fetch_add(abandoned, Ordering::Relaxed);
+            }
             ShutdownOutcome::TimedOut { in_flight }
         }
 
@@ -288,6 +298,24 @@ mod enabled {
     impl Drop for Client {
         fn drop(&mut self) {
             self.shutdown(super::DEFAULT_SHUTDOWN_BUDGET);
+        }
+    }
+
+    /// `https`, or `http` to a loopback address (a local test server).
+    fn host_is_allowed(host: &str) -> bool {
+        let Ok(url) = reqwest::Url::parse(host) else {
+            return false;
+        };
+        match url.scheme() {
+            "https" => url.host().is_some(),
+            "http" => url.host_str().is_some_and(|h| {
+                h == "localhost"
+                    || h.trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }),
+            _ => false,
         }
     }
 
