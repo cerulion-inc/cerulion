@@ -78,6 +78,8 @@ serde_json = "1"
 # cerulion_remoted, cerud, cerulion_viz) and is already allow-listed by
 # `deny.toml` — this adds a version, not a new dependency to audit.
 sha2 = "0.10"
+# Cold-path encoding for the private robot bootstrap process boundary.
+hex = "0.4"
 regex = "1.10"
 # Must track `cerulion_core`'s iceoryx2 version (0.9). The CLI's
 # `topic_cmd::topic_list` / `topic_info` introspection path calls

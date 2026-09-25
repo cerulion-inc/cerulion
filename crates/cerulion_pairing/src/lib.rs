@@ -63,6 +63,7 @@ pub mod client;
 mod crypto;
 mod error;
 pub mod format;
+pub mod identity;
 pub mod pake;
 pub mod pop;
 pub mod verify;

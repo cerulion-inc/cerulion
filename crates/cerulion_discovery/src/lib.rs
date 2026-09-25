@@ -43,3 +43,4 @@
 
 pub mod ladder;
 pub mod peer_cache;
+pub mod robot_state;

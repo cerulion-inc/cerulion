@@ -75,6 +75,14 @@ const AGENT_TOKEN: &str = "cerulion";
 /// would have to re-word for its own verb.
 #[derive(Debug, thiserror::Error)]
 pub enum MdnsError {
+    /// Existing endpoint facts could not be read during a refresh.
+    #[error("mDNS: cannot read robot endpoint facts at {}: {source}", path.display())]
+    FactsRead {
+        /// The shared public facts path.
+        path: PathBuf,
+        /// The filesystem failure.
+        source: std::io::Error,
+    },
     /// The `ServiceInfo` could not be built (an mdns-sd validation refusal — a
     /// hostile instance label, an over-length TXT value that survived the
     /// per-key validation, …).
@@ -118,11 +126,8 @@ pub enum MdnsError {
 // partial file NEVER fails or delays the beacon — the facts-derived keys are
 // simply omitted.
 
-/// The default on-robot state root — MIRRORS `cerulion_remoted`'s
-/// `cerud::constants::DEFAULT_STATE_ROOT` (not linkable here). Overridable via
-/// [`STATE_ROOT_ENV`], exactly like remoted.
-const DEFAULT_STATE_ROOT: &str = "/var/lib/cerulion";
 /// The state-root override env var (mirrors remoted's `--state-root` clap env).
+#[cfg(test)]
 const STATE_ROOT_ENV: &str = "CERULION_STATE_ROOT";
 /// remoted's namespaced subdir under the state root (mirrors `config.rs`).
 const REMOTED_STATE_SUBDIR: &str = "remoted";
@@ -158,19 +163,14 @@ struct BeaconFactsOnDisk {
 }
 
 /// The path remoted publishes its beacon facts to:
-/// `<state-root>/remoted/beacon_facts.json`, state root =
-/// [`STATE_ROOT_ENV`] or [`DEFAULT_STATE_ROOT`] (mirrors remoted's convention).
-///
-/// NOTE: the advertiser reads the state root from the ENV only. remoted's
-/// `--state-root` flag also has `env = "CERULION_STATE_ROOT"`, so a co-visible
-/// env keeps the two in sync — but a remoted started with the FLAG and a
-/// non-default path (no matching env) diverges from this reader, and the
-/// enrichment (best-effort) is silently omitted. Co-set the env for enrichment.
-fn beacon_facts_path() -> PathBuf {
-    let root = std::env::var(STATE_ROOT_ENV).unwrap_or_else(|_| DEFAULT_STATE_ROOT.to_string());
-    PathBuf::from(root)
-        .join(REMOTED_STATE_SUBDIR)
-        .join(BEACON_FACTS_FILENAME)
+/// `<state-root>/remoted/beacon_facts.json`. Automatic startup and this reader
+/// share the per-user root resolver; an explicit deployment override wins.
+fn beacon_facts_path() -> Option<PathBuf> {
+    Some(
+        cerulion_discovery::robot_state::resolve()?
+            .join(REMOTED_STATE_SUBDIR)
+            .join(BEACON_FACTS_FILENAME),
+    )
 }
 
 /// Load remoted's PUBLIC beacon facts, if present. An ABSENT file → `None`
@@ -182,18 +182,25 @@ fn beacon_facts_path() -> PathBuf {
 /// [`parse_beacon_facts`]. Either way the enrichment is additive and NEVER fails
 /// or delays the beacon (once per advertise, so a `warn!` cannot flood).
 fn load_beacon_facts() -> Option<BeaconTxtFacts> {
-    let path = beacon_facts_path();
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_beacon_facts(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "beacon facts file exists but could NOT be read (permission / I/O); mDNS TXT enrichment (eid/iroh_port/claimable) omitted this advertise — check the file's permissions (it is PUBLIC, meant to be world-readable)"
-            );
+    match read_beacon_facts() {
+        Ok(facts) => facts,
+        Err(error) => {
+            tracing::warn!(error = %error, "robot endpoint facts unavailable; LAN advertisement omits their TXT fields");
             None
         }
+    }
+}
+
+// Refresh callers receive I/O failures so their bounded loop can stop and log
+// once. The initial advertisement reports the error while keeping LAN available.
+fn read_beacon_facts() -> Result<Option<BeaconTxtFacts>, MdnsError> {
+    let Some(path) = beacon_facts_path() else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(parse_beacon_facts(&text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(MdnsError::FactsRead { path, source }),
     }
 }
 
@@ -334,6 +341,7 @@ pub fn srv_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16
 /// ignores the extra keys — NOT byte-identical to the old beacon. Address
 /// auto-detection is enabled so the daemon fills the A/AAAA records — the `""`
 /// ip is intentional.
+#[cfg(test)]
 fn build_gateway_service_info(robot: &str, port: u16) -> Result<ServiceInfo, MdnsError> {
     let facts = load_beacon_facts();
     build_gateway_service_info_with_facts(robot, port, facts.as_ref())
@@ -385,7 +393,8 @@ pub fn advertise_gateway(robot: &str, port: u16) -> Result<MdnsAdvertiseGuard, M
     // guard construction would leak its background
     // thread. Info-first leaves `register` as the only fallible step after
     // the daemon exists, and that path shuts it down explicitly below.
-    let info = build_gateway_service_info(robot, port)?;
+    let facts = load_beacon_facts();
+    let info = build_gateway_service_info_with_facts(robot, port, facts.as_ref())?;
     let fullname = info.get_fullname().to_string();
     let daemon = ServiceDaemon::new().map_err(|e| MdnsError::DaemonStart { source: e })?;
     if let Err(e) = daemon.register(info) {
@@ -404,7 +413,13 @@ pub fn advertise_gateway(robot: &str, port: u16) -> Result<MdnsAdvertiseGuard, M
         fullname = %fullname,
         "advertising the gateway over mDNS (_cerulion._tcp)"
     );
-    Ok(MdnsAdvertiseGuard { daemon, fullname })
+    Ok(MdnsAdvertiseGuard {
+        daemon,
+        fullname,
+        robot: robot.into(),
+        port,
+        facts,
+    })
 }
 
 /// Live mDNS advertisement handle. Held for the gateway's lifetime; its
@@ -415,14 +430,49 @@ pub struct MdnsAdvertiseGuard {
     /// The registered service fullname (`<instance>._cerulion._tcp.local.`),
     /// the key `unregister` takes.
     fullname: String,
+    robot: String,
+    port: u16,
+    facts: Option<BeaconTxtFacts>,
 }
 
 impl MdnsAdvertiseGuard {
+    /// Update the existing registration after this robot's server writes its facts.
+    /// Partial, stale-identity, and unchanged facts do not replace the record.
+    pub fn refresh_robot_facts(&mut self, expected_eid: &str) -> Result<bool, MdnsError> {
+        let Some(facts) = read_beacon_facts()? else {
+            return Ok(false);
+        };
+        if !should_refresh_facts(self.facts.as_ref(), &facts, expected_eid) {
+            return Ok(false);
+        }
+        let info = build_gateway_service_info_with_facts(&self.robot, self.port, Some(&facts))?;
+        self.daemon
+            .register(info)
+            .map_err(|source| MdnsError::Register {
+                robot: self.robot.clone(),
+                source,
+            })?;
+        self.facts = Some(facts);
+        Ok(true)
+    }
+
     /// The registered service fullname (`<instance>._cerulion._tcp.local.`) —
     /// the Principle-#3 observable a caller reports or a test asserts on.
     pub fn fullname(&self) -> &str {
         &self.fullname
     }
+}
+
+fn should_refresh_facts(
+    current: Option<&BeaconTxtFacts>,
+    incoming: &BeaconTxtFacts,
+    expected_eid: &str,
+) -> bool {
+    is_valid_eid(expected_eid)
+        && incoming.eid.as_deref() == Some(expected_eid)
+        && incoming.iroh_port.is_some_and(|port| port != 0)
+        && incoming.claimable.as_deref() == Some("0")
+        && current != Some(incoming)
 }
 
 impl Drop for MdnsAdvertiseGuard {
@@ -449,6 +499,32 @@ impl Drop for MdnsAdvertiseGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn late_robot_facts_refresh_only_the_expected_complete_changed_identity() {
+        let mut facts = full_facts();
+        facts.claimable = Some("0".into());
+        let eid = facts.eid.clone().unwrap();
+        assert!(should_refresh_facts(None, &facts, &eid));
+        assert!(!should_refresh_facts(Some(&facts), &facts, &eid));
+        assert!(!should_refresh_facts(None, &facts, &"44".repeat(32)));
+        for change in 0..3 {
+            let mut incomplete = facts.clone();
+            match change {
+                0 => incomplete.iroh_port = Some(0),
+                1 => incomplete.eid = None,
+                _ => incomplete.claimable = Some("1".into()),
+            }
+            assert!(!should_refresh_facts(None, &incomplete, &eid));
+        }
+        let mut restarted = facts.clone();
+        restarted.iroh_port = Some(55555);
+        assert!(should_refresh_facts(Some(&facts), &restarted, &eid));
+        let info = build_gateway_service_info_with_facts("robot", 7447, Some(&restarted)).unwrap();
+        assert_eq!(info.get_port(), 7447);
+        assert_eq!(info.get_property_val_str("iroh_port"), Some("55555"));
+        assert_eq!(info.get_property_val_str("claimable"), Some("0"));
+    }
+
     use super::*;
 
     #[test]
@@ -780,12 +856,23 @@ mod tests {
     }
 
     /// RAII: restore `CERULION_STATE_ROOT` to its pre-test value on drop.
-    struct StateRootGuard(Option<std::ffi::OsString>);
+    struct StateRootGuard(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
     impl StateRootGuard {
         fn set(value: &std::path::Path) -> Self {
             let prev = std::env::var_os(STATE_ROOT_ENV);
             std::env::set_var(STATE_ROOT_ENV, value);
-            StateRootGuard(prev)
+            StateRootGuard(prev, std::env::var_os("CERULION_HOME"))
+        }
+    }
+    impl StateRootGuard {
+        fn config_only(value: &std::path::Path) -> Self {
+            let guard = Self(
+                std::env::var_os(STATE_ROOT_ENV),
+                std::env::var_os("CERULION_HOME"),
+            );
+            std::env::remove_var(STATE_ROOT_ENV);
+            std::env::set_var("CERULION_HOME", value);
+            guard
         }
     }
     impl Drop for StateRootGuard {
@@ -793,6 +880,10 @@ mod tests {
             match &self.0 {
                 Some(v) => std::env::set_var(STATE_ROOT_ENV, v),
                 None => std::env::remove_var(STATE_ROOT_ENV),
+            }
+            match &self.1 {
+                Some(v) => std::env::set_var("CERULION_HOME", v),
+                None => std::env::remove_var("CERULION_HOME"),
             }
         }
     }
@@ -828,6 +919,29 @@ mod tests {
         );
         assert_eq!(info.get_property_val_str("iroh_port"), Some("50505"));
         assert_eq!(info.get_property_val_str("claimable"), Some("0"));
+    }
+
+    #[test]
+    fn refresh_read_errors_are_returned_for_one_shot_reporting() {
+        let _env_lk = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = StateRootGuard::set(dir.path());
+        let path = dir.path().join("remoted/beacon_facts.json");
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(
+            matches!(read_beacon_facts(), Err(MdnsError::FactsRead { path: failed, .. }) if failed == path)
+        );
+    }
+
+    #[test]
+    fn automatic_state_root_uses_the_login_config_home() {
+        let _env_lk = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = StateRootGuard::config_only(dir.path());
+        assert_eq!(
+            beacon_facts_path(),
+            Some(dir.path().join("robot-state/remoted/beacon_facts.json"))
+        );
     }
 
     #[test]

@@ -67,6 +67,7 @@ use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use native_ros2_messages::geometry_msgs::Vector3;
 
 mod mp_support;
+mod serving_login_support;
 use mp_support::{dylib_file, fixture_cdylib, read_file, send_signal, ChildGuard};
 
 const PERIOD_FIXTURE: &str = "test_node_macro_period_cdylib";
@@ -180,11 +181,15 @@ fn build_networked_mp_workspace(root: &Path, prefix: &str, port: u16) {
 /// `CERULION_GATEWAY_PORT`). NOT `CERULION_NETWORK=off`: this test's PURPOSE
 /// is the networked run.
 fn spawn_supervisor(root: &Path) -> (ChildGuard, PathBuf, PathBuf) {
+    let login_home = serving_login_support::expired_login(root);
     let stdout_path = root.join("run.stdout");
     let stderr_path = root.join("run.stderr");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
     cmd.args(["graph", "run", "gwmp", "--no-validate"])
         .current_dir(root)
+        .env("CERULION_HOME", &login_home)
+        .env_remove("CERULION_LOGIN_GATE")
+        .env_remove("CERULION_NETWORK")
         .env_remove("CARGO_TARGET_DIR")
         .env("RUST_LOG", "cerulion=info,cerulion_cli_engine=info")
         .env("NO_COLOR", "1")

@@ -3649,8 +3649,8 @@ impl RunNetwork {
 ///
 /// EVERY normal real-clock live run: `graph run` (monolith AND multi-process),
 /// `node run`'s temp single-node graph, and `ros2 attach`'s bridge graph (the
-/// flagship automagic surface). There is deliberately NO entry-point gating —
-/// the permissive suppressors above are the complete list.
+/// flagship automagic surface). They share this network decision; actual serving
+/// additionally requires a saved prior login at the execution boundary.
 ///
 /// `graph profile` is the one deliberate EXCEPTION: a bounded MEASUREMENT run,
 /// not a deployment, so it stays LOCAL-ONLY BY DESIGN — [`graph_profile`]
@@ -4715,6 +4715,7 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
             handoff_path.display()
         ))
     })?;
+    crate::login_cmd::require_serving_login()?;
     let graph_name = handoff.graph_name.clone();
     let permissive = handoff.posture == GatewayPostureCarrier::PermissiveDefault;
 
@@ -5343,22 +5344,25 @@ pub fn graph_run(
         )));
     }
 
-    // Resolve the network DECISION EARLY — before the auto-partition
+    // Resolve the network DECISION EARLY, before the auto-partition
     // pre-flight can write the graph file (the rule: a refused run leaves
     // the file byte-untouched). Networked multi-process is FIRST-CLASS,
     // so run SHAPE is NOT an input; the ONE
-    // decision drives both run shapes. The only hard refusal here is record-plus-ingress
-    // (`--record` + a declared-`ingress:` network block — surfaced via `?`),
-    // which must fail before any file mutation. The graph/worker processes
+    // decision drives both run shapes. Recording with a declared `ingress:`
+    // network block, and serving with no prior login, both refuse before any
+    // file mutation. The graph/worker processes
     // stay network-free (`network: None`); the separate GATEWAY process owns
     // the network plane. The `network:` block is unaffected by partitioning, so
     // deciding on the pre-preflight config is stable.
     let run_network = resolve_run_network(&config, network_off, time_source, record.is_some())?;
+    if run_network.network_config().is_some() {
+        crate::login_cmd::require_serving_login()?;
+    }
     // The permissive default applies to every normal
     // real-clock live run reaching this function — `graph run`, `node run`'s
     // temp single-node graph, AND `ros2 attach` (the flagship automagic surface:
-    // attach a robot and it is network-viewable with zero config). There is NO
-    // entry-point gating; the only permissive suppressors are `--network off` /
+    // attach a robot and it is network-viewable with zero config). Serving
+    // requires a saved prior login; network suppressors are `--network off` /
     // `CERULION_NETWORK=off`, the virtual/external clocks, and the
     // record+declared-ingress refusal — all already folded into `run_network`
     // above. (`graph profile` never routes through this function — see the
@@ -5808,8 +5812,8 @@ pub fn graph_run(
     // factories via `info(&self)` — it never consumes them). `None` for a
     // LOCAL-ONLY run (`Off`/`Inert`). Both the record path and the Real live
     // arm spawn from this; the Virtual arm is always `Off`/`Inert` (network is
-    // replay-inert), so this stays `None` there. No entry-point gating (by
-    // design — see the `run_network` resolution above).
+    // replay-inert), so this stays `None` there. The shared serving-login check
+    // already ran after network resolution, before any partition writes.
     let gateway_launch = resolve_gateway_launch(
         &run_network,
         &config,

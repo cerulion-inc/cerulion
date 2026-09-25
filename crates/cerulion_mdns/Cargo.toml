@@ -50,6 +50,7 @@ include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
 workspace = true
 
 [dependencies]
+cerulion_discovery = { workspace = true }
 # Pure-Rust mDNS-SD. No C deps; advertises `_cerulion._tcp` on the LAN.
 # SAME version as `cerulion_cli_engine`'s dep — the browse half and this advertise
 # half must speak one protocol implementation.

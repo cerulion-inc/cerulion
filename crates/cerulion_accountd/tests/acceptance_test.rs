@@ -597,6 +597,13 @@ async fn post_v1_robots_owner_grant_claims_an_unclaimed_robot_end_to_end() {
         .unwrap();
     assert_eq!(got["owner_account_id"], installer_account_b64);
     assert_eq!(got["hostname"], "orin-lab-01");
+    assert_eq!(
+        got["robot_transport_key"],
+        robot_transport_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
 
     let (other_session, _other_account) =
         login(&addr, &http, &email, "stranger@desk.example").await;
@@ -1497,8 +1504,12 @@ async fn list_robots_is_owner_scoped_and_never_leaks_another_account() {
     let b1_sk = SigningKey::from_bytes(&[0xB1; 32]);
     let b1 = register_robot_http(&addr, &http, &session_b, &b1_sk, "go2-gamma").await;
 
-    // `GET /v1/robots` as `session`, returned as a sorted (robot_id, hostname) list.
-    async fn list(addr: &str, http: &reqwest::Client, session: &str) -> Vec<(String, String)> {
+    // Pin each endpoint key to the registration that proved possession of it.
+    async fn list(
+        addr: &str,
+        http: &reqwest::Client,
+        session: &str,
+    ) -> Vec<(String, String, String)> {
         let resp = http
             .get(format!("{addr}/v1/robots"))
             .bearer_auth(session)
@@ -1507,7 +1518,7 @@ async fn list_robots_is_owner_scoped_and_never_leaks_another_account() {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
-        let mut pairs: Vec<(String, String)> = body["robots"]
+        let mut pairs: Vec<(String, String, String)> = body["robots"]
             .as_array()
             .unwrap()
             .iter()
@@ -1515,6 +1526,7 @@ async fn list_robots_is_owner_scoped_and_never_leaks_another_account() {
                 (
                     r["robot_id"].as_str().unwrap().to_string(),
                     r["hostname"].as_str().unwrap().to_string(),
+                    r["robot_transport_key"].as_str().unwrap().to_string(),
                 )
             })
             .collect();
@@ -1524,8 +1536,26 @@ async fn list_robots_is_owner_scoped_and_never_leaks_another_account() {
 
     // Hand oracle: A sees exactly {a1, a2}; B sees exactly {b1}.
     let mut want_a = vec![
-        (a1.clone(), "orin-alpha".to_string()),
-        (a2.clone(), "orin-beta".to_string()),
+        (
+            a1.clone(),
+            "orin-alpha".to_string(),
+            a1_sk
+                .verifying_key()
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        ),
+        (
+            a2.clone(),
+            "orin-beta".to_string(),
+            a2_sk
+                .verifying_key()
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        ),
     ];
     want_a.sort();
     assert_eq!(
@@ -1535,7 +1565,16 @@ async fn list_robots_is_owner_scoped_and_never_leaks_another_account() {
     );
     assert_eq!(
         list(&addr, &http, &session_b).await,
-        vec![(b1.clone(), "go2-gamma".to_string())],
+        vec![(
+            b1.clone(),
+            "go2-gamma".to_string(),
+            b1_sk
+                .verifying_key()
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )],
         "account B must see only its own robot — never A's"
     );
     // The fixtures are genuinely distinct, so the two oracles above are not vacuously

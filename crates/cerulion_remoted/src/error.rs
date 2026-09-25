@@ -4,6 +4,10 @@
 /// Everything that can go wrong bringing up or serving the remote plane.
 #[derive(Debug, thiserror::Error)]
 pub enum RemotedError {
+    /// First-time robot provisioning could not be completed.
+    #[error("provisioning: {0}")]
+    Provision(String),
+
     /// An error from the iroh link layer (endpoint bind, accept).
     #[error("cerulion_link: {0}")]
     Link(#[from] cerulion_link::LinkError),

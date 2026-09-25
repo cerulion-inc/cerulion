@@ -62,6 +62,8 @@
 // `cerulion_cli_engine/tests/library_print_ban_test.rs`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod account_access;
+
 /// The `_cerulion._tcp` mDNS beacon netd raises when it becomes this
 /// machine's serving gateway, the advertisement that was lost with
 /// the `run-gateway` child.
@@ -85,6 +87,8 @@ pub mod net;
 pub mod protocol;
 pub mod query;
 pub mod registry;
+pub mod robot_supervisor;
+pub mod serving_login;
 
 // The iroh WAN plane, gated behind the `wan` feature, now DEFAULT-ON (the
 // decision ships the WAN plane by default; `--no-default-features` is the lean
@@ -92,6 +96,11 @@ pub mod registry;
 // but because netd is excluded from `default-members` (see `Cargo.toml`). `wan` holds
 // the WAN robot registry + the dual-plane picker; `iroh_plane` the folded re-inject
 // engine.
+#[cfg(feature = "wan")]
+pub mod identity_snapshot;
+
+#[cfg(feature = "wan")]
+pub mod account_controller;
 #[cfg(feature = "wan")]
 pub mod iroh_plane;
 #[cfg(feature = "wan")]

@@ -49,6 +49,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 /// This machine's install-determined role: a **Studio** install
@@ -89,8 +91,8 @@ pub enum MachineRole {
 /// Holds bearer secrets — always written 0600 via [`write_to`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthState {
-    /// The cloud `AccountId`, `base64url`-encoded (matches `/v1/me`'s
-    /// `account_id`). Opaque to the CLI — it identifies the logged-in account.
+    /// The account service identity exactly as returned by `/v1/me`: a hosted
+    /// UUID or a legacy id. Pairing derives its separate 32-byte account id.
     pub account_id: String,
     /// The opaque session token (the WAN-gate credential; short-lived).
     pub session_token: String,
@@ -303,12 +305,7 @@ pub fn wan_gate(state: &AuthState, now_ns: u64) -> WanGate {
 /// deployment isolation knob), else `~/.cerulion`. `None` only when there is no
 /// home directory AND no override.
 pub fn cerulion_config_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("CERULION_HOME") {
-        if !home.is_empty() {
-            return Some(PathBuf::from(home));
-        }
-    }
-    Some(dirs::home_dir()?.join(".cerulion"))
+    cerulion_discovery::robot_state::config_dir()
 }
 
 /// `~/.cerulion/auth.json` (env-aware; `None` when no config dir resolves).
@@ -771,7 +768,10 @@ pub fn cache_verified_device_cert_at_absent_consumers(cert_b64: &str, cert_accou
     };
     let _ = with_store_lock(&auth_path, || {
         match load().state() {
-            Some(state) if state.account_id == cert_account => {}
+            Some(state)
+                if crate::account_identity::pairing_account_id(&state.account_id)
+                    .ok()
+                    .is_some_and(|account| URL_SAFE_NO_PAD.encode(account.0) == cert_account) => {}
             other => {
                 tracing::info!(
                     cert_account = %cert_account,
@@ -1033,7 +1033,7 @@ impl std::error::Error for ClearCertError {}
 /// to stop being the store. A separate, never-renamed file is a stable thing to
 /// serialize on, and being empty it can be locked without opening a credential
 /// for writing.
-pub const STORE_LOCK_FILE: &str = ".studio-auth.lock";
+pub const STORE_LOCK_FILE: &str = cerulion_discovery::robot_state::AUTH_STORE_LOCK_FILE;
 
 /// Where [`STORE_LOCK_FILE`] sits for a given `auth.json` path.
 #[must_use]
@@ -1219,7 +1219,7 @@ pub(crate) fn atomic_write_secret(final_path: &Path, bytes: &[u8]) -> std::io::R
 /// [`atomic_write_secret`]'s first half: everything up to (not including) the
 /// rename that publishes it. Split out so a caller writing SEVERAL secrets can
 /// learn that all of them are writable before any of them is visible.
-fn stage_secret(final_path: &Path, bytes: &[u8]) -> std::io::Result<StagedCert> {
+pub(crate) fn stage_secret(final_path: &Path, bytes: &[u8]) -> std::io::Result<StagedCert> {
     if let Some(parent) = final_path.parent() {
         if !parent.as_os_str().is_empty() {
             create_secret_dir(parent)?;
@@ -1252,6 +1252,21 @@ pub struct StagedCert {
 }
 
 impl StagedCert {
+    /// Publish a complete secret only when its destination is absent.
+    /// A crash before the link leaves only a private staging file; a crash after
+    /// it leaves complete bytes. Neither an existing file nor a symlink is replaced.
+    #[cfg(unix)]
+    pub(crate) fn commit_new(self) -> std::io::Result<()> {
+        std::fs::hard_link(&self.tmp, &self.final_path)?;
+        if let Some(parent) = self.final_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        // Keep `committed` false: Drop unlinks the staging name, while the final
+        // hard link retains the synced inode. A failed directory sync also leaves
+        // a complete final file for the next locked attempt to validate.
+        Ok(())
+    }
+
     /// The path this will publish to, for the caller's own log lines.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -1286,9 +1301,8 @@ impl StagedCert {
 
 impl Drop for StagedCert {
     fn drop(&mut self) {
-        // A committed staging file was RENAMED away, so there is nothing to
-        // remove; an uncommitted one leaves the destination untouched, so all this
-        // removes is the hidden temp.
+        // A replaced staging file was renamed away. Otherwise remove only the
+        // hidden temp; an exclusively published final hard link remains intact.
         if self.committed {
             return;
         }

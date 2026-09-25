@@ -178,6 +178,72 @@ pub enum MirrorRelease {
 /// on the LAST release. `Send + Sync`: shared across the daemon's per-connection +
 /// idle-watch threads.
 pub trait MirrorPlane: Send + Sync {
+    /// Cold control operations through the same controller that owns WAN mirrors.
+    /// Lean/LAN-only planes explicitly refuse this capability.
+    fn account_access(
+        &self,
+        _action: &crate::account_access::AccountAccessRequest,
+    ) -> Result<crate::account_access::AccountAccessReply, String> {
+        Err("account robot access is unavailable in this network daemon".into())
+    }
+
+    /// Install public membership while serialized with daemon demand bookkeeping.
+    fn install_account_snapshot(
+        &self,
+        snapshot: &crate::account_access::AccountSnapshot,
+        _registry: &mut crate::registry::DemandRegistry,
+    ) -> Result<crate::account_access::AccountAccessReply, String> {
+        self.account_access(&crate::account_access::AccountAccessRequest::Install {
+            snapshot: Box::new(snapshot.clone()),
+        })
+    }
+
+    /// Check admission before every demand, including reuse of an existing mirror.
+    fn prepare_demand(
+        &self,
+        _key: &TopicKey,
+        _registry: &mut crate::registry::DemandRegistry,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Recheck local identity without account-service I/O or new dials. Never
+    /// wait for a query mutex while the caller holds daemon registry bookkeeping.
+    fn refresh_identity(
+        &self,
+        _registry: &mut crate::registry::DemandRegistry,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Release a route pin only after the daemon has retired its registry entry.
+    fn mirror_retired(&self, _key: &TopicKey) {}
+
+    /// Which plane serves `key`, when this plane can say.
+    ///
+    /// The frames carry no evidence of the transport that brought them: both
+    /// planes re-inject into the same local shared memory under the same topic
+    /// name, so nothing downstream can tell a locally mirrored robot from one
+    /// dialed over the internet. This is the only place that answer exists, and it
+    /// is what `status` reports.
+    ///
+    /// The default is `None`, which means "this plane does not attribute keys",
+    /// never "the local plane". A composing plane answers from the route it
+    /// actually pinned when it ensured the mirror, so the answer describes what
+    /// happened rather than what a picker would decide again now.
+    fn serving_plane(&self, _key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
+        None
+    }
+
+    /// Resolve an exact schema type through an authorized account robot catalog.
+    fn account_schema_by_type(
+        &self,
+        _robot_id: [u8; 32],
+        _requested: &str,
+    ) -> Result<cerulion_core::SchemaReply, String> {
+        Err("account robot schema access is unavailable in this network daemon".into())
+    }
+
     /// Ensure the shared desk mirror for `key` exists, validating inbound frames
     /// against `schema_hash`. Called ONLY on a genuine first ensure — the refcount
     /// plane guarantees this fires exactly ONCE per live mirror (a re-demand of a
@@ -351,6 +417,11 @@ impl GatewayMirrorPlane {
 }
 
 impl MirrorPlane for GatewayMirrorPlane {
+    /// This plane has exactly one transport, so every key it serves is local.
+    fn serving_plane(&self, _key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
+        Some(crate::protocol::ServingPlane::Zenoh)
+    }
+
     fn ensure_mirror(&self, key: &TopicKey, schema_hash: u64) -> Result<(), MirrorError> {
         // Register the shared ingress bridge at the CANONICAL topic name (mirror
         // by topic — the `robot` is provenance, see the module docs). This creates

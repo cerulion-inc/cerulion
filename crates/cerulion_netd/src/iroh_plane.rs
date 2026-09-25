@@ -74,6 +74,9 @@ use std::future::Future;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use cerulion_core::transport::cerulion_q::{
+    CatalogReply, SchemaReply, CATALOG_WIRE_VERSION, SCHEMA_WIRE_VERSION,
+};
 use cerulion_core::transport::demand_authorizer::{
     AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
 };
@@ -82,18 +85,19 @@ use cerulion_core::wire::MaxSliceLen;
 use cerulion_core::TransportManager;
 use cerulion_link::{
     accept_uni_frame_stream, alpn, build_endpoint, dial, direct_addr, open_frame_stream,
-    read_frame, write_frame, Connection, Endpoint, EndpointAddr, EndpointConfig, RecvStream,
-    SendStream, DEFAULT_MAX_FRAME_LEN,
+    read_frame, write_frame, Connection, Endpoint, EndpointAddr, EndpointConfig, QuicOpsStream,
+    RecvStream, SendStream, DEFAULT_MAX_FRAME_LEN,
 };
 use cerulion_pairing::client::DeviceIdentity;
 // The SHARED epoch-push substrate — the SAME decisions the `cerulion connect`
 // verb makes on ITS dial (one implementation, never a fork).
 use cerulion_wireclient::epoch::{
-    classify_epoch_reply, note_transport_failure, prepare_epoch_push, EpochPushPlan,
+    classify_epoch_reply, note_transport_failure, prepare_epoch_push, sanitize_peer_text,
+    EpochPushPlan,
 };
 pub use cerulion_wireclient::epoch::{EpochPushOutcome, EpochPushSeverity};
 use cerulion_wireclient::protocol::{
-    decode_first_reply, StreamPreamble, WireRequest, WireResponse,
+    decode_first_reply, is_unpaired_refusal, StreamPreamble, WireRequest, WireResponse,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -101,7 +105,7 @@ use tokio::task::JoinHandle;
 
 use crate::mirror::{MirrorError, MirrorPlane, MirrorRelease};
 use crate::registry::TopicKey;
-use crate::wan::WanRegistry;
+use crate::wan::{WanRegistry, WanRobot};
 
 /// The default bound on a WAN dial + each control/stream await. Held under the
 /// daemon's registry lock (see the module docs), so it is SHORTER than
@@ -109,6 +113,37 @@ use crate::wan::WanRegistry;
 /// loud rather than pin every other control op. Overridable via
 /// [`IrohMirrorPlane::with_dial_timeout`] (tests shorten it).
 pub const DEFAULT_WAN_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// TLS reachability of a registered endpoint, without requesting access or data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RobotProbeOutcome {
+    /// The endpoint completed TLS with the expected robot key.
+    Online,
+    /// The endpoint was not reached within the caller's budget.
+    /// This is not evidence that the robot is powered off.
+    NotReached { reason: String },
+}
+
+/// Close a transient connection even when a total deadline cancels its future.
+struct CloseOnDrop(Option<Connection>);
+
+impl CloseOnDrop {
+    fn new(connection: &Connection) -> Self {
+        Self(Some(connection.clone()))
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.take() {
+            connection.close(0u32.into(), b"transient operation finished");
+        }
+    }
+}
 
 /// The per-mirror ingress buffer ceiling — DERIVED from cerulion_core's
 /// `graph::config::DEFAULT_MAX_SLICE_LEN` (128 MiB), the SAME value netd's zenoh plane
@@ -135,6 +170,20 @@ struct RobotConn {
     control_poisoned: bool,
 }
 
+struct CatalogFailure {
+    unpaired: bool,
+    reason: String,
+}
+
+impl From<String> for CatalogFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            unpaired: false,
+            reason,
+        }
+    }
+}
+
 /// The plane's mutable async state (behind a tokio [`AsyncMutex`] so it can be held
 /// across `.await`s — the daemon serializes calls anyway, so contention is nil): the
 /// LAZY desk iroh endpoint (built on the first ensure) + the per-robot connections.
@@ -144,6 +193,7 @@ struct IrohState {
     endpoint: Option<Endpoint>,
     /// robot name → its live connection.
     robots: HashMap<String, RobotConn>,
+    account_invalidated: bool,
 }
 
 /// The iroh WAN mirror plane. Owns the desk's iroh endpoint, the per-robot
@@ -220,6 +270,7 @@ impl IrohMirrorPlane {
             inner: Arc::new(AsyncMutex::new(IrohState {
                 endpoint: None,
                 robots: HashMap::new(),
+                account_invalidated: false,
             })),
             dial_timeout: DEFAULT_WAN_DIAL_TIMEOUT,
             desk_key,
@@ -245,6 +296,255 @@ impl IrohMirrorPlane {
     pub fn with_authorizer(mut self, authorizer: Arc<dyn DemandAuthorizer>) -> Self {
         self.authorizer = authorizer;
         self
+    }
+
+    /// Retire this account's WAN sessions and prevent new demands on this plane.
+    ///
+    /// Account/key changes require a new plane and registry. The caller must also
+    /// retire its mirror bookkeeping before installing that replacement.
+    pub fn invalidate_account(&self) -> Result<(), String> {
+        let proof_result = self.registry.replace_owner_certificate(None);
+        let cleanup_result = self.rt.block_on(async {
+            let mut state = self.inner.lock().await;
+            state.account_invalidated = true;
+            let mut retired = Vec::new();
+            for (robot, connection) in state.robots.drain() {
+                connection
+                    .connection
+                    .close(0u32.into(), b"account invalidated");
+                for (topic, reader) in connection.readers {
+                    reader.abort();
+                    let _ = reader.await;
+                    retired.push(TopicKey::new(&robot, &topic));
+                }
+            }
+            retired.sort();
+            let mut cleanup_error = None;
+            for key in retired {
+                if let Err(error) = self.manager.unregister_mirror_provenance(&key.topic) {
+                    cleanup_error.get_or_insert_with(|| {
+                        format!("could not remove retired WAN mirror provenance: {error}")
+                    });
+                }
+            }
+            self.epoch_pushes.lock().await.clear();
+            match self.missing_cache_noted.lock() {
+                Ok(mut noted) => noted.clear(),
+                Err(_) => {
+                    cleanup_error.get_or_insert_with(|| {
+                        "could not clear retired WAN epoch diagnostics".into()
+                    });
+                }
+            }
+            if let Some(endpoint) = state.endpoint.take() {
+                endpoint.close().await;
+            }
+            cleanup_error.map_or(Ok(()), Err)
+        });
+        proof_result.and(cleanup_result)
+    }
+
+    /// Replace membership within the same account and reuse its existing endpoint.
+    /// Unchanged peers keep their readers. Removed or changed peers are retired;
+    /// the returned keys must also be removed from daemon assignment bookkeeping.
+    ///
+    /// The account controller must serialize this call with its pinned assignments.
+    /// On any cleanup error it must invalidate the whole plane and retire all of
+    /// its assignments: transport teardown cannot be rolled back.
+    pub fn update_membership(
+        &self,
+        robots: HashMap<String, WanRobot>,
+    ) -> Result<Vec<TopicKey>, String> {
+        if robots
+            .keys()
+            .any(|robot| robot.is_empty() || robot.trim() != robot)
+        {
+            return Err("WAN robot membership requires nonempty canonical identifiers".into());
+        }
+        self.rt.block_on(async {
+            let mut state = self.inner.lock().await;
+            if state.account_invalidated {
+                return Err(
+                    "WAN account changed; recreate the account plane before dialing".into(),
+                );
+            }
+            let previous = self.registry.membership_snapshot()?;
+            let mut changed: Vec<_> = previous
+                .iter()
+                .filter(|(robot, peer)| robots.get(*robot) != Some(*peer))
+                .map(|(robot, _)| robot.clone())
+                .collect();
+            changed.sort();
+            let mut retired = Vec::new();
+            for robot in &changed {
+                if let Some(connection) = state.robots.remove(robot) {
+                    connection
+                        .connection
+                        .close(0u32.into(), b"robot membership changed");
+                    for (topic, reader) in connection.readers {
+                        reader.abort();
+                        let _ = reader.await;
+                        retired.push(TopicKey::new(robot, &topic));
+                    }
+                }
+            }
+            retired.sort();
+            let mut cleanup_error = None;
+            for key in &retired {
+                if let Err(error) = self.manager.unregister_mirror_provenance(&key.topic) {
+                    cleanup_error.get_or_insert_with(|| {
+                        format!("could not remove retired WAN mirror provenance: {error}")
+                    });
+                }
+            }
+            {
+                let mut epochs = self.epoch_pushes.lock().await;
+                for robot in &changed {
+                    epochs.remove(robot);
+                }
+            }
+            match self.missing_cache_noted.lock() {
+                Ok(mut noted) => {
+                    for robot in &changed {
+                        noted.remove(robot);
+                    }
+                }
+                Err(_) => {
+                    cleanup_error.get_or_insert_with(|| {
+                        "could not clear retired WAN epoch diagnostics".into()
+                    });
+                }
+            }
+            if let Some(error) = cleanup_error {
+                state.account_invalidated = true;
+                return Err(error);
+            }
+            if let Err(error) = self.registry.replace_membership(robots) {
+                state.account_invalidated = true;
+                return Err(error);
+            }
+            Ok(retired)
+        })
+    }
+
+    /// Check TLS reachability only. No control request, enrollment or demand is
+    /// sent. The total budget includes waiting for the plane and endpoint setup.
+    pub fn probe_robot(&self, robot: &str, timeout: Duration) -> Result<RobotProbeOutcome, String> {
+        self.rt.block_on(async {
+            match tokio::time::timeout(timeout, async {
+                let mut state = self.inner.lock().await;
+                let wan = self
+                    .registry
+                    .get(robot)?
+                    .ok_or_else(|| format!("robot '{robot}' has no WAN endpoint configured"))?;
+                let endpoint = self.query_endpoint(&mut state).await?;
+                let peer = if wan.direct_addrs.is_empty() {
+                    EndpointAddr::new(wan.eid)
+                } else {
+                    direct_addr(wan.eid, wan.direct_addrs.iter().copied())
+                };
+                match dial(&endpoint, peer, alpn::WIRE).await {
+                    Ok(connection) => {
+                        let _close = CloseOnDrop::new(&connection);
+                        if connection.remote_id() != wan.eid {
+                            return Err("robot TLS identity did not match the registry".into());
+                        }
+                        Ok(RobotProbeOutcome::Online)
+                    }
+                    Err(error) => Ok(RobotProbeOutcome::NotReached {
+                        reason: sanitize_peer_text(&error.to_string()),
+                    }),
+                }
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(RobotProbeOutcome::NotReached {
+                    reason: "robot reachability check exceeded its time budget".into(),
+                }),
+            }
+        })
+    }
+
+    /// Fetch fresh authorized metadata after enrollment and the cached epoch push.
+    /// The total budget covers every phase, including waiting for the plane.
+    /// Active topic readers keep their existing connection.
+    pub fn query_catalog(&self, robot: &str, timeout: Duration) -> Result<CatalogReply, String> {
+        self.rt.block_on(async {
+            tokio::time::timeout(timeout, async {
+                let mut state = self.inner.lock().await;
+                let endpoint = self.query_endpoint(&mut state).await?;
+                let mut connection = self.dial_robot(&endpoint, robot).await?;
+                let _close = CloseOnDrop::new(&connection.connection);
+                self.fetch_catalog(
+                    &mut connection.control_send,
+                    &mut connection.control_recv,
+                    robot,
+                )
+                .await
+                .map_err(|failure| failure.reason)
+            })
+            .await
+            .map_err(|_| "robot catalog query exceeded its time budget".to_owned())?
+        })
+    }
+
+    /// Fetch the schema for a topic after enrollment and the cached epoch push.
+    /// A robot without a schema provider returns its structured not-found reply.
+    /// The total budget covers every phase; no topic is demanded by this query.
+    pub fn query_schema(
+        &self,
+        robot: &str,
+        topic: &str,
+        timeout: Duration,
+    ) -> Result<SchemaReply, String> {
+        self.rt.block_on(async {
+            tokio::time::timeout(timeout, async {
+                let mut state = self.inner.lock().await;
+                let endpoint = self.query_endpoint(&mut state).await?;
+                let mut connection = self.dial_robot(&endpoint, robot).await?;
+                let _close = CloseOnDrop::new(&connection.connection);
+                let bytes = self
+                    .control_round_trip(
+                        &mut connection.control_send,
+                        &mut connection.control_recv,
+                        &WireRequest::Schema {
+                            topic: topic.into(),
+                        },
+                    )
+                    .await?;
+                match decode_first_reply(&bytes) {
+                    Ok(WireResponse::Schema(mut reply)) => {
+                        if reply.version != SCHEMA_WIRE_VERSION || reply.requested != topic {
+                            return Err("robot returned an incompatible schema reply".into());
+                        }
+                        if reply.error.is_some() != reply.docs.is_empty() {
+                            return Err("robot returned an inconsistent schema result".into());
+                        }
+                        reply.robot = robot.into();
+                        reply.error = reply.error.map(|error| sanitize_peer_text(&error));
+                        Ok(reply)
+                    }
+                    Ok(WireResponse::Error { message, .. }) => Err(sanitize_peer_text(&message)),
+                    Err(Some(reason)) => Err(sanitize_peer_text(&reason)),
+                    _ => Err("robot returned an unexpected schema reply".into()),
+                }
+            })
+            .await
+            .map_err(|_| "robot schema query exceeded its time budget".to_owned())?
+        })
+    }
+
+    async fn query_endpoint(&self, state: &mut IrohState) -> Result<Endpoint, String> {
+        if state.account_invalidated {
+            return Err("WAN account changed; recreate the account plane before dialing".into());
+        }
+        if let Some(endpoint) = &state.endpoint {
+            return Ok(endpoint.clone());
+        }
+        let endpoint = self.build_desk_endpoint().await?;
+        state.endpoint = Some(endpoint.clone());
+        Ok(endpoint)
     }
 
     /// The number of live WAN robot connections (diagnostics / tests).
@@ -302,10 +602,9 @@ impl IrohMirrorPlane {
     /// classification above it.) A netd that never dials still pays nothing: the deferral's
     /// whole point is preserved, it is now genuinely "first dial" rather than "never".
     ///
-    /// The account is not yet PRESENTED on the wire — a separate seam owns that. What is
-    /// live today is the diagnostic and the observable
-    /// ([`Self::desk_account_resolved`], which reads the registry cell this call
-    /// initializes).
+    /// This account is diagnostic state. The injected owner certificate is
+    /// presented separately, and only after a machine-readable unpaired refusal.
+    /// [`Self::desk_account_resolved`] observes this lazy resolution.
     fn resolve_dial_account(&self, robot: &str) {
         let account = self.registry.account();
         // The classifying info/warn lines fire once per process inside the registry;
@@ -350,7 +649,7 @@ impl IrohMirrorPlane {
     /// surfaces an unpaired/unclaimed REFUSAL). Every await is bounded. Returns a fresh
     /// [`RobotConn`] with no readers.
     async fn dial_robot(&self, endpoint: &Endpoint, robot: &str) -> Result<RobotConn, String> {
-        let wan = self.registry.get(robot).ok_or_else(|| {
+        let wan = self.registry.get(robot)?.ok_or_else(|| {
             format!(
                 "robot '{robot}' has no WAN endpoint configured (not in the WAN registry) — \
                  cannot dial it over iroh"
@@ -366,19 +665,25 @@ impl IrohMirrorPlane {
         } else {
             direct_addr(wan.eid, wan.direct_addrs.iter().copied())
         };
-        let connection = self
-            .bounded("dial", dial(endpoint, peer, alpn::WIRE))
-            .await?
-            .map_err(|e| format!("dial robot '{robot}' over iroh: {e}"))?;
-        let (mut control_send, mut control_recv) = self
-            .bounded("open control stream", open_frame_stream(&connection))
-            .await?
-            .map_err(|e| format!("open control stream to robot '{robot}': {e}"))?;
-        // The catalog fetch is the ADMISSION gate: an unpaired desk key / unclaimed
-        // robot is routed to the robot's skeleton path, which answers an AcceptDecision
-        // here → a loud refusal (never a silent dead connection).
-        self.fetch_catalog(&mut control_send, &mut control_recv, robot)
-            .await?;
+        let mut connection = match self.dial_wire_once(endpoint, peer.clone(), robot).await {
+            Ok(connection) => connection,
+            Err(failure) => {
+                if !failure.unpaired {
+                    return Err(failure.reason);
+                }
+                let Some(proof) = self.registry.owner_certificate()? else {
+                    return Err(failure.reason);
+                };
+                self.present_owner_certificate(endpoint, peer.clone(), proof)
+                    .await?;
+                // One fresh catalog attempt only. A second refusal is terminal,
+                // including a second unpaired marker or a newly revoked device.
+                self.dial_wire_once(endpoint, peer, robot)
+                    .await
+                    .map_err(|failure| failure.reason)?
+            }
+        };
+        let close = CloseOnDrop::new(&connection.connection);
         // Now that we are ADMITTED, deliver the robot's latest revocation
         // epoch. Ordered AFTER the catalog gate so an unpaired/unclaimed refusal keeps
         // its own precise message; ordered BEFORE the connection is handed out so the
@@ -389,12 +694,69 @@ impl IrohMirrorPlane {
         // connection on epoch freshness". Only a control-stream TRANSPORT failure
         // propagates, because it leaves the framing desynced and every later demand on
         // this connection would fail anyway (see `push_epoch`'s docs).
-        self.push_epoch(&mut control_send, &mut control_recv, robot)
-            .await?;
+        if let Err(error) = self
+            .push_epoch(
+                &mut connection.control_send,
+                &mut connection.control_recv,
+                robot,
+            )
+            .await
+        {
+            connection
+                .connection
+                .close(0u32.into(), b"epoch exchange failed");
+            return Err(error);
+        }
         tracing::info!(
             robot = %robot,
             "cerulion-netd: iroh WAN connection established (admitted)"
         );
+        close.disarm();
+        Ok(connection)
+    }
+
+    async fn dial_wire_once(
+        &self,
+        endpoint: &Endpoint,
+        peer: EndpointAddr,
+        robot: &str,
+    ) -> Result<RobotConn, CatalogFailure> {
+        let connection = self
+            .bounded("dial", dial(endpoint, peer, alpn::WIRE))
+            .await?
+            .map_err(|e| {
+                format!(
+                    "dial robot '{robot}' over iroh: {}",
+                    sanitize_peer_text(&e.to_string())
+                )
+            })?;
+        let close = CloseOnDrop::new(&connection);
+        let opened = self
+            .bounded("open control stream", open_frame_stream(&connection))
+            .await
+            .and_then(|result| {
+                result.map_err(|e| {
+                    format!(
+                        "open control stream: {}",
+                        sanitize_peer_text(&e.to_string())
+                    )
+                })
+            });
+        let (mut control_send, mut control_recv) = match opened {
+            Ok(streams) => streams,
+            Err(error) => {
+                connection.close(0u32.into(), b"control stream failed");
+                return Err(error.into());
+            }
+        };
+        if let Err(failure) = self
+            .fetch_catalog(&mut control_send, &mut control_recv, robot)
+            .await
+        {
+            connection.close(0u32.into(), b"catalog admission failed");
+            return Err(failure);
+        }
+        close.disarm();
         Ok(RobotConn {
             connection,
             control_send,
@@ -402,6 +764,62 @@ impl IrohMirrorPlane {
             readers: HashMap::new(),
             control_poisoned: false,
         })
+    }
+
+    async fn present_owner_certificate(
+        &self,
+        endpoint: &Endpoint,
+        peer: EndpointAddr,
+        proof: Arc<cerulion_pairing::verify::OwnerCertificatePresentationWire>,
+    ) -> Result<(), String> {
+        let connection = self
+            .bounded("owner certificate dial", dial(endpoint, peer, alpn::OPS))
+            .await?
+            .map_err(|e| {
+                format!(
+                    "owner certificate dial: {}",
+                    sanitize_peer_text(&e.to_string())
+                )
+            })?;
+        let _close = CloseOnDrop::new(&connection);
+        let opened = self
+            .bounded("owner certificate stream", open_frame_stream(&connection))
+            .await
+            .and_then(|result| {
+                result.map_err(|e| {
+                    format!(
+                        "owner certificate stream: {}",
+                        sanitize_peer_text(&e.to_string())
+                    )
+                })
+            });
+        let (send, recv) = match opened {
+            Ok(streams) => streams,
+            Err(error) => {
+                connection.close(0u32.into(), b"owner certificate stream failed");
+                return Err(error);
+            }
+        };
+        let mut stream = QuicOpsStream::new(send, recv);
+        let mut exchange = tokio::task::spawn_blocking(move || {
+            cerulion_wireclient::owner_pair::present_owner_certificate(&mut stream, &proof)
+        });
+        let result = tokio::time::timeout(self.dial_timeout, &mut exchange).await;
+        // Closing the connection also wakes the synchronous adapter on timeout.
+        // Never return a partially consumed ops stream to the wire connection.
+        connection.close(0u32.into(), b"owner certificate exchange finished");
+        match result {
+            Ok(joined) => joined
+                .map_err(|e| format!("owner certificate task: {e}"))?
+                .map_err(|e| e.to_string()),
+            Err(_) => {
+                let _ = exchange.await;
+                Err(format!(
+                    "owner certificate exchange timed out after {:?}",
+                    self.dial_timeout
+                ))
+            }
+        }
     }
 
     /// One control round-trip on a raw stream pair (write a request, read its reply) —
@@ -428,10 +846,10 @@ impl IrohMirrorPlane {
     ) -> Result<Vec<u8>, String> {
         self.bounded("control write", write_frame(send, frame))
             .await?
-            .map_err(|e| format!("control write: {e}"))?;
+            .map_err(|e| format!("control write: {}", sanitize_peer_text(&e.to_string())))?;
         self.bounded("control read", read_frame(recv, DEFAULT_MAX_FRAME_LEN))
             .await?
-            .map_err(|e| format!("control read: {e}"))
+            .map_err(|e| format!("control read: {}", sanitize_peer_text(&e.to_string())))
     }
 
     /// A control round-trip on a [`RobotConn`] — POISONS the connection on any
@@ -452,30 +870,47 @@ impl IrohMirrorPlane {
     }
 
     /// Fetch the catalog — the admission gate. A refusal (`AcceptDecision`) becomes a
-    /// loud reason; the catalog itself is discarded (the demand carries the hash).
+    /// loud reason. Metadata queries fetch again after pushing the cached epoch.
     async fn fetch_catalog(
         &self,
         send: &mut SendStream,
         recv: &mut RecvStream,
         robot: &str,
-    ) -> Result<(), String> {
+    ) -> Result<CatalogReply, CatalogFailure> {
         let bytes = self
             .control_round_trip(send, recv, &WireRequest::Catalog)
             .await?;
         match decode_first_reply(&bytes) {
-            Ok(WireResponse::Catalog(_)) => Ok(()),
-            Ok(WireResponse::Error { message, .. }) => Err(message),
+            Ok(WireResponse::Catalog(mut reply)) => {
+                if reply.version != CATALOG_WIRE_VERSION {
+                    return Err("robot returned an incompatible catalog version"
+                        .to_owned()
+                        .into());
+                }
+                if let Some(error) = reply.error {
+                    return Err(sanitize_peer_text(&error).into());
+                }
+                reply.robot = robot.into();
+                Ok(reply)
+            }
+            Ok(WireResponse::Error { message, .. }) => Err(sanitize_peer_text(&message).into()),
             Ok(other) => Err(format!(
-                "robot '{robot}' answered the catalog request with an unexpected reply: {other:?}"
-            )),
-            Err(Some(reason)) => Err(format!(
-                "robot '{robot}' refused the wire plane: {reason} (pair the desk first: \
-                 `cerulion pair {robot}`)"
-            )),
+                "robot '{robot}' answered the catalog request with an unexpected reply: {}",
+                sanitize_peer_text(&format!("{other:?}"))
+            )
+            .into()),
+            Err(Some(reason)) => Err(CatalogFailure {
+                unpaired: is_unpaired_refusal(&bytes),
+                reason: format!(
+                    "robot '{robot}' refused the wire plane: {}",
+                    sanitize_peer_text(&reason)
+                ),
+            }),
             Err(None) => Err(format!(
                 "robot '{robot}' reply decoded as neither a wire response nor an accept decision \
                  (an incompatible robot or a corrupt stream)"
-            )),
+            )
+            .into()),
         }
     }
 
@@ -619,20 +1054,26 @@ impl IrohMirrorPlane {
                 },
             )
             .await?;
-        let resp: WireResponse =
-            serde_json::from_slice(&bytes).map_err(|e| format!("decode demand reply: {e}"))?;
+        let resp: WireResponse = serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "decode demand reply: {}",
+                sanitize_peer_text(&e.to_string())
+            )
+        })?;
         match resp {
             WireResponse::DemandAccepted { topic } if topic == key.topic => {}
             WireResponse::Error { message, .. } => {
                 return Err(format!(
-                    "robot rejected the demand for '{}': {message}",
-                    key.topic
+                    "robot rejected the demand for '{}': {}",
+                    key.topic,
+                    sanitize_peer_text(&message)
                 ))
             }
             other => {
                 return Err(format!(
-                    "expected DemandAccepted for '{}', got {other:?}",
-                    key.topic
+                    "expected DemandAccepted for '{}', got {}",
+                    key.topic,
+                    sanitize_peer_text(&format!("{other:?}"))
                 ))
             }
         }
@@ -645,21 +1086,39 @@ impl IrohMirrorPlane {
                 accept_uni_frame_stream(&robot_conn.connection),
             )
             .await?
-            .map_err(|e| format!("accept uni stream for '{}': {e}", key.topic))?;
+            .map_err(|e| {
+                format!(
+                    "accept uni stream for '{}': {}",
+                    key.topic,
+                    sanitize_peer_text(&e.to_string())
+                )
+            })?;
         let preamble_bytes = self
             .bounded(
                 "uni-stream preamble",
                 read_frame(&mut ustream, DEFAULT_MAX_FRAME_LEN),
             )
             .await?
-            .map_err(|e| format!("read preamble for '{}': {e}", key.topic))?;
-        let preamble: StreamPreamble = serde_json::from_slice(&preamble_bytes)
-            .map_err(|e| format!("decode uni-stream preamble for '{}': {e}", key.topic))?;
+            .map_err(|e| {
+                format!(
+                    "read preamble for '{}': {}",
+                    key.topic,
+                    sanitize_peer_text(&e.to_string())
+                )
+            })?;
+        let preamble: StreamPreamble = serde_json::from_slice(&preamble_bytes).map_err(|e| {
+            format!(
+                "decode uni-stream preamble for '{}': {}",
+                key.topic,
+                sanitize_peer_text(&e.to_string())
+            )
+        })?;
         // Refuse a stream whose preamble names a DIFFERENT topic than we demanded.
         if preamble.topic != key.topic {
             return Err(format!(
                 "robot opened a uni stream for '{}' but we demanded '{}' — refusing to mirror it",
-                preamble.topic, key.topic
+                sanitize_peer_text(&preamble.topic),
+                key.topic
             ));
         }
 
@@ -739,12 +1198,19 @@ impl IrohMirrorPlane {
                 },
             )
             .await?;
-        let resp: WireResponse =
-            serde_json::from_slice(&bytes).map_err(|e| format!("decode undemand reply: {e}"))?;
+        let resp: WireResponse = serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "decode undemand reply: {}",
+                sanitize_peer_text(&e.to_string())
+            )
+        })?;
         match resp {
             WireResponse::Undemanded { .. } => Ok(()),
-            WireResponse::Error { message, .. } => Err(message),
-            other => Err(format!("expected Undemanded for '{topic}', got {other:?}")),
+            WireResponse::Error { message, .. } => Err(sanitize_peer_text(&message)),
+            other => Err(format!(
+                "expected Undemanded for '{topic}', got {}",
+                sanitize_peer_text(&format!("{other:?}"))
+            )),
         }
     }
 
@@ -764,7 +1230,11 @@ impl IrohMirrorPlane {
         // `is_allowed` predicate on the ROBOT serving plane). A robot ABSENT from the WAN
         // registry falls through to `dial_robot`'s "not configured" error unchanged (it
         // never dials anyway), so the gate is scoped to registered robots.
-        if self.registry.is_wan_robot(&key.robot) {
+        let mut st = self.inner.lock().await;
+        if st.account_invalidated {
+            return Err("WAN account changed; recreate the account plane before dialing".into());
+        }
+        if self.registry.is_wan_robot(&key.robot)? {
             let subject = DemandSubject::Wan {
                 demander_key: self.desk_key,
             };
@@ -788,8 +1258,6 @@ impl IrohMirrorPlane {
             }
         }
 
-        let mut st = self.inner.lock().await;
-
         // Drop a cached POISONED connection before reuse (a prior control error
         // desynced its framing — re-dial a fresh one).
         if st
@@ -801,7 +1269,7 @@ impl IrohMirrorPlane {
                 robot = %key.robot,
                 "cerulion-netd: dropping a poisoned iroh connection before re-dial"
             );
-            st.robots.remove(&key.robot);
+            self.retire_robot_connection(&mut st, &key.robot).await?;
         }
 
         // Endpoint is Clone (Arc-backed); clone it out so the borrow of `st.endpoint`
@@ -832,7 +1300,7 @@ impl IrohMirrorPlane {
             // the next demand re-dials cleanly rather than reusing a broken conn.
             if let Some(rc) = st.robots.get(&key.robot) {
                 if rc.control_poisoned || rc.readers.is_empty() {
-                    st.robots.remove(&key.robot); // drop closes the QUIC connection
+                    self.retire_robot_connection(&mut st, &key.robot).await?;
                 }
             }
         } else {
@@ -870,6 +1338,85 @@ impl IrohMirrorPlane {
             }
         }
         result
+    }
+
+    /// Check a pinned demand without waiting behind another WAN operation.
+    /// A busy state is an error, never evidence that its reader is absent.
+    pub fn has_reader(&self, key: &TopicKey) -> Result<bool, String> {
+        let state = self
+            .inner
+            .try_lock()
+            .map_err(|_| "WAN reader state is busy; retry the demand".to_string())?;
+        if state.account_invalidated {
+            return Err("WAN account changed; recreate the account plane before dialing".into());
+        }
+        Ok(state.robots.get(&key.robot).is_some_and(|connection| {
+            !connection.control_poisoned
+                && connection.connection.close_reason().is_none()
+                && connection
+                    .readers
+                    .get(&key.topic)
+                    .is_some_and(|reader| !reader.is_finished())
+        }))
+    }
+
+    /// Retire one robot's current readers while preserving account membership.
+    ///
+    /// The caller must retire every pinned daemon assignment for this robot,
+    /// including readers that already died. Other robots and the shared endpoint
+    /// remain live. On cleanup failure, invalidate the whole account plane before
+    /// creating a replacement; partial teardown cannot be rolled back.
+    pub fn retire_robot(&self, robot: &str) -> Result<(), String> {
+        if robot.is_empty() || robot.trim() != robot {
+            return Err("WAN retirement requires a nonempty canonical identifier".into());
+        }
+        self.rt.block_on(async {
+            let mut state = self.inner.lock().await;
+            self.retire_robot_connection(&mut state, robot).await
+        })
+    }
+
+    /// Keep exclusive state ownership through connection and reader cleanup.
+    /// Dropping JoinHandles detaches them: a late death callback could otherwise
+    /// remove the replacement connection's reader for the same robot and topic.
+    async fn retire_robot_connection(
+        &self,
+        state: &mut IrohState,
+        robot: &str,
+    ) -> Result<(), String> {
+        let mut cleanup_error = None;
+        if let Some(connection) = state.robots.remove(robot) {
+            connection
+                .connection
+                .close(0u32.into(), b"robot connection retired");
+            let mut readers: Vec<_> = connection.readers.into_iter().collect();
+            readers.sort_by(|a, b| a.0.cmp(&b.0));
+            for (topic, reader) in readers {
+                reader.abort();
+                let _ = reader.await;
+                if let Err(error) = self.manager.unregister_mirror_provenance(&topic) {
+                    cleanup_error.get_or_insert_with(|| {
+                        format!("could not remove retired WAN mirror provenance: {error}")
+                    });
+                }
+            }
+        }
+        // A metadata-only query can leave diagnostics without a cached connection.
+        self.epoch_pushes.lock().await.remove(robot);
+        match self.missing_cache_noted.lock() {
+            Ok(mut noted) => {
+                noted.remove(robot);
+            }
+            Err(_) => {
+                cleanup_error
+                    .get_or_insert_with(|| "could not clear retired WAN epoch diagnostics".into());
+            }
+        }
+        if let Some(error) = cleanup_error {
+            state.account_invalidated = true;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// The async read behind [`Self::last_push_outcome`] — usable from INSIDE the
@@ -929,16 +1476,17 @@ impl IrohMirrorPlane {
                 "cerulion-netd: iroh WAN connection closed (no more demanded topics)"
             );
         }
-        drop(st);
-
         // 3. Best-effort C0 provenance cleanup so `topic list` stops folding the
-        //    torn-down mirror into REMOTE.
-        if let Err(e) = self.manager.unregister_mirror_provenance(&key.topic) {
-            tracing::warn!(
-                robot = %key.robot, topic = %key.topic, error = %e,
-                "cerulion-netd: iroh mirror torn down but could not remove its provenance"
-            );
-        }
+        //    torn-down mirror into REMOTE. Keep ownership until cleanup finishes:
+        //    a replacement may register the same topic after this guard drops.
+        finish_retirement(st, || {
+            if let Err(e) = self.manager.unregister_mirror_provenance(&key.topic) {
+                tracing::warn!(
+                    robot = %key.robot, topic = %key.topic, error = %e,
+                    "cerulion-netd: iroh mirror torn down but could not remove its provenance"
+                );
+            }
+        });
         tracing::info!(
             robot = %key.robot,
             topic = %key.topic,
@@ -1018,16 +1566,34 @@ async fn on_reader_death(
     if rc.readers.is_empty() {
         st.robots.remove(&robot); // drop closes the QUIC connection.
     }
-    drop(st);
-    if let Err(e) = manager.unregister_mirror_provenance(&topic) {
-        tracing::warn!(
-            robot = %robot, topic = %topic, error = %e,
-            "cerulion-netd: could not remove provenance after an iroh reader death"
-        );
-    }
+    finish_retirement(st, || {
+        if let Err(e) = manager.unregister_mirror_provenance(&topic) {
+            tracing::warn!(
+                robot = %robot, topic = %topic, error = %e,
+                "cerulion-netd: could not remove provenance after an iroh reader death"
+            );
+        }
+    });
 }
 
+/// Keep removed state exclusively owned until its observable cleanup is complete.
+/// Otherwise a replacement can register provenance that the old cleanup deletes.
+fn finish_retirement(state: tokio::sync::MutexGuard<'_, IrohState>, cleanup: impl FnOnce()) {
+    cleanup();
+    drop(state);
+}
+
+#[cfg(test)]
+#[path = "iroh_cleanup_tests.rs"]
+mod cleanup_tests;
+
 impl MirrorPlane for IrohMirrorPlane {
+    /// This plane has exactly one transport, so every key it serves crossed the
+    /// internet plane.
+    fn serving_plane(&self, _key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
+        Some(crate::protocol::ServingPlane::Iroh)
+    }
+
     fn ensure_mirror(&self, key: &TopicKey, schema_hash: u64) -> Result<(), MirrorError> {
         self.rt
             .block_on(self.ensure_async(key, schema_hash))

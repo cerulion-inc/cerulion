@@ -1702,6 +1702,20 @@ fn start_daemon_with_egress(
     Arc<SpyPlane>,
     Arc<SpyEgressPlane>,
 ) {
+    start_daemon_with_egress_policy(tag, grace, Default::default())
+}
+
+fn start_daemon_with_egress_policy(
+    tag: &str,
+    grace: Duration,
+    egress_login: cerulion_netd::serving_login::EgressLoginPolicy,
+) -> (
+    RunningNetd,
+    PathBuf,
+    PathBuf,
+    Arc<SpyPlane>,
+    Arc<SpyEgressPlane>,
+) {
     let (dir, sock) = unique_socket(tag);
     let spy = Arc::new(SpyPlane::default());
     let egress_spy = Arc::new(SpyEgressPlane::default());
@@ -1714,6 +1728,7 @@ fn start_daemon_with_egress(
         NetdConfig {
             idle_grace: grace,
             idle_watch_poll: Duration::from_millis(25),
+            egress_login,
             ..NetdConfig::default()
         },
     )
@@ -3094,4 +3109,78 @@ fn a_plane_that_cannot_run_the_query_is_an_error_not_an_empty_answer() {
     drop(c);
     netd.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn raw_egress_login_policy_rechecks_before_registration_and_plane_calls() {
+    use cerulion_netd::serving_login::{EgressLoginPolicy, REFUSAL};
+    let login = tempfile::tempdir().unwrap();
+    let auth_path = login.path().join("auth.json");
+    let (netd, dir, sock, _mirror, plane) = start_daemon_with_egress_policy(
+        "eglogin",
+        LONG_GRACE,
+        EgressLoginPolicy::PriorLogin {
+            auth_path: Some(auth_path.clone()),
+        },
+    );
+    let (mut client, _) = Client::connect(&sock);
+    for id in [1, 2] {
+        let reply = client.request(&register_egress(id, &["/refused"]));
+        assert_eq!(reply, Response::error(Some(id), REFUSAL, None, None));
+    }
+    assert_eq!(plane.register_count(), 0);
+    match client.request(&release_egress(3)) {
+        Response::EgressRelease(reply) => assert_eq!(reply.released_topics, 0),
+        reply => panic!("unexpected reply: {reply:?}"),
+    }
+    assert!(!auth_path.exists());
+    let expired = br#"{"account_id":"saved-account","session_token":"expired-session","refresh_token":"expired-refresh","expires_at_ns":1,"logged_in_ever":true}"#;
+    std::fs::write(&auth_path, expired).unwrap();
+    match client.request(&register_egress(4, &["/accepted"])) {
+        Response::Egress(reply) => {
+            assert_eq!(reply.registered_topics, 1);
+            assert!(reply.gateway_started);
+        }
+        reply => panic!("unexpected reply: {reply:?}"),
+    }
+    assert_eq!(plane.register_count(), 1);
+    assert_eq!(std::fs::read(&auth_path).unwrap(), expired);
+    for invalid in [None, Some(&b"{"[..]), Some(&b"{}"[..])] {
+        if let Some(bytes) = invalid {
+            std::fs::write(&auth_path, bytes).unwrap();
+        } else {
+            std::fs::remove_file(&auth_path).unwrap();
+        }
+        assert_eq!(
+            client.request(&register_egress(5, &["/later"])),
+            Response::error(Some(5), REFUSAL, None, None)
+        );
+    }
+    assert_eq!(plane.register_count(), 1);
+    match client.request(&release_egress(6)) {
+        Response::EgressRelease(reply) => assert_eq!(reply.released_topics, 1),
+        reply => panic!("unexpected reply: {reply:?}"),
+    }
+    drop(client);
+    drop(netd);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn raw_egress_requires_a_resolved_home_when_policy_is_enabled() {
+    use cerulion_netd::serving_login::{EgressLoginPolicy, REFUSAL};
+    let (netd, dir, sock, _mirror, plane) = start_daemon_with_egress_policy(
+        "eghome",
+        LONG_GRACE,
+        EgressLoginPolicy::PriorLogin { auth_path: None },
+    );
+    let (mut client, _) = Client::connect(&sock);
+    assert_eq!(
+        client.request(&register_egress(1, &["/refused"])),
+        Response::error(Some(1), REFUSAL, None, None)
+    );
+    assert_eq!(plane.register_count(), 0);
+    drop(client);
+    drop(netd);
+    std::fs::remove_dir_all(dir).unwrap();
 }

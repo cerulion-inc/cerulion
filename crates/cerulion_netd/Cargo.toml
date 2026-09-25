@@ -153,6 +153,10 @@ ctrlc = { version = "3", features = ["termination"] }
 # flock(2) for the single-daemon pidfile lock (hygiene.rs) — the stale-proof,
 # TOCTOU-free single-daemon guarantee (kernel releases the lock on process death).
 libc = "0.2"
+# Safe deadline-bound Unix connect on the cold local control path. Already locked.
+socket2 = "=0.6.5"
+# Safe readiness waits on borrowed control-socket descriptors. Already locked.
+rustix = { version = "=1.1.3", features = ["event"] }
 
 # ── iroh WAN plane deps. `optional = true` — pulled ONLY when the `wan`
 #    feature is active. `wan` is DEFAULT-ON (see the `[features]` block above), so a

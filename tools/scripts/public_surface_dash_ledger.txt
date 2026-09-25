@@ -192,7 +192,7 @@
 2 crates/cerulion_macros/src/parse.rs
 8 crates/cerulion_macros/src/state_derive.rs
 7 crates/cerulion_macros/src/validate.rs
-6 crates/cerulion_mdns/src/lib.rs
+5 crates/cerulion_mdns/src/lib.rs
 10 crates/cerulion_netd/src/beacon.rs
 11 crates/cerulion_netd/src/catalog_events.rs
 20 crates/cerulion_netd/src/client.rs
@@ -202,7 +202,7 @@
 9 crates/cerulion_netd/src/egress.rs
 1 crates/cerulion_netd/src/health.rs
 11 crates/cerulion_netd/src/iroh_plane.rs
-11 crates/cerulion_netd/src/main.rs
+9 crates/cerulion_netd/src/main.rs
 9 crates/cerulion_netd/src/mirror.rs
 4 crates/cerulion_netd/src/net.rs
 2 crates/cerulion_netd/src/protocol.rs
