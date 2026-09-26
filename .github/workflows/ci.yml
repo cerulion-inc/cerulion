@@ -2129,10 +2129,13 @@ jobs:
     # suite, so the ceiling is raised with them. It guards a HUNG job, not a
     # runtime budget.
     # 75 → 60 (the 3-way split), and DOWN for the first time in this file's
-    # history, because for the first time there is a per-step measurement to
-    # set it from rather than a prediction. The longest leg is 26.6 min with a
-    # warm cargo cache and 42.7 min with none; 60 leaves 40 percent headroom
-    # over the WORSE of those two. A ceiling that tracks the measured wall
+    # history, because for the first time there are per-step MEASUREMENTS to
+    # derive it from rather than a guess. The per-step costs are measured, on
+    # the 2-way runs tabulated above; the longest 3-way leg is PROJECTED from
+    # them at 26.6 min warm and 42.7 min cold, and no three-shard run has put
+    # an observed wall on it yet. 60 leaves 40 percent headroom over the WORSE
+    # of those two projections. Re-set it from the first three green 3-way
+    # runs, which replace the projection with a measurement. A ceiling that tracks the measured wall
     # turns a hang into a fast red instead of a 75-minute one, which is the
     # point of having one. Every raise above is a run that was CANCELLED with
     # every suite green, so the rule those raises teach still holds: tighten

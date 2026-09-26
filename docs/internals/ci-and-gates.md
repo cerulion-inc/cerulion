@@ -356,7 +356,8 @@ while the other idled, and the skew INVERTED with the cache state (the pinned tr
 tail costs 6 min warm against 18 cold, so a hand tilt tuned on either column is wrong in
 the other). A third leg divides the variable work by 3 while the fixed per-leg cost
 (`cargo build --workspace`, toolchain, nextest install) is paid once more, which is
-better in both cache states: 26.6 min warm and 42.4 cold for the longest leg. Each leg
+better in both cache states: a longest leg PROJECTED from those per-step costs at 26.6
+min warm and 42.7 cold, not yet an observed three-shard wall. Each leg
 runs `./tools/scripts/ci_test_shard.sh cerulion_core <shard> <count>`, which ENUMERATES
 `crates/cerulion_core/tests/*.rs` at depth 1 and takes every file whose position is
 `index mod count`, GENERATED, never hand-listed, save for ONE pinned name
