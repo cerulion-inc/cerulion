@@ -1842,6 +1842,12 @@ pub fn warn_backpressure_classification_drift(
 /// finding. The remedy is ALSO carried as a stable `remedy=` token so the
 /// operator-facing grep key does not depend on prose.
 ///
+/// Both arms' messages are CONSTANT strings: the composed sentence rides a
+/// `fix=` field, and the prose points at the `level` and `consumer` fields
+/// rather than splicing their values, which is the repo's logging rule (a
+/// datum belongs in a structured field, so an operator can grep by key and a
+/// JSON subscriber gets one).
+///
 /// Under the `lockstep` opt-out the same finding is the INPUT to a fix rather
 /// than an unactioned advisory: see [`mid_level_barrier_flags`] and the
 /// two-arm rationale above. Under the free-run default the classification is
@@ -1869,18 +1875,17 @@ pub fn report_split_same_level_non_trigger_pairs(
                 level = pair.level,
                 remedy = %pair.remedy.token(),
                 execution_mode = %"lockstep",
+                fix = %fix,
                 "this partition SPLITS a same-level non-trigger edge across process \
                  groups. Under the `CERULION_EXECUTION_MODE=lockstep` opt-out global level \
-                 {} therefore takes a MID-LEVEL barrier rendezvous (two generations per step \
-                 instead of one), which orders every group's step-start snapshots before any \
-                 group ticks, restoring the monolith's guarantee, so the live run is \
-                 deterministic and its `--record` bag re-executes. RESIDUAL: if `{}` declares \
-                 a `block` input or publishes onto a `block` topic, its own snapshot runs \
-                 inside the fused block group, AFTER this rendezvous, and is NOT ordered: \
-                 only in that case is a remedy still needed. {}",
-                pair.level,
-                pair.consumer,
-                fix
+                 `level` therefore takes a MID-LEVEL barrier rendezvous (two generations per \
+                 step instead of one), which orders every group's step-start snapshots before \
+                 any group ticks, restoring the monolith's guarantee, so the live run is \
+                 deterministic and its `--record` bag re-executes. RESIDUAL: if the node named \
+                 by `consumer` declares a `block` input or publishes onto a `block` topic, its \
+                 own snapshot runs inside the fused block group, AFTER this rendezvous, and is \
+                 NOT ordered: only in that case is a remedy still needed. The workarounds for \
+                 this finding are in `fix`."
             ),
             ExecutionMode::FreeRun => tracing::info!(
                 graph = %graph_name,
@@ -1893,21 +1898,19 @@ pub fn report_split_same_level_non_trigger_pairs(
                 level = pair.level,
                 remedy = %pair.remedy.token(),
                 execution_mode = %"free_run",
+                fix = %fix,
                 "this partition SPLITS a same-level non-trigger edge across process \
-                 groups. The free-run default creates NO barrier, so global level {} takes \
-                 NO rendezvous and nothing orders this edge: the consumer's step-start \
+                 groups. The free-run default creates NO barrier, so global level `level` \
+                 takes NO rendezvous and nothing orders this edge: the consumer's step-start \
                  snapshot and the producer's tick run concurrently, which frame the tick \
                  pairs with is decided by OS scheduling, and two live runs of this graph can \
-                 record different frames on `{}`'s output. The `--record` bag still \
-                 re-executes: a free-run bag is replayed one rank at a time and every \
-                 cross-rank edge is served from the RECORDED frames, so this run's pairing is \
-                 reproduced rather than re-derived. Setting \
+                 record different frames on the output of the node named by `consumer`. The \
+                 `--record` bag still re-executes: a free-run bag is replayed one rank at a \
+                 time and every cross-rank edge is served from the RECORDED frames, so this \
+                 run's pairing is reproduced rather than re-derived. Setting \
                  `CERULION_EXECUTION_MODE=lockstep` orders the LIVE pairing instead, at the \
                  cost of a mid-level barrier rendezvous on this level (two generations per \
-                 step instead of one). {}",
-                pair.level,
-                pair.consumer,
-                fix
+                 step instead of one). The workarounds for this finding are in `fix`."
             ),
         }
     }

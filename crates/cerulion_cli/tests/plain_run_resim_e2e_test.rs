@@ -557,6 +557,34 @@ enum Gating {
     FreeRun,
 }
 
+/// The frame-stamp rule implied by the `gating` label an arm states.
+///
+/// ONE source for the two halves of the same fact. A shared arm body already
+/// says which gating clock it expects `run.json` to name (`want_gating`), and
+/// the stamp rule is a PROPERTY of that clock rather than an independent
+/// choice: `quantum` is the tightest period, so a step never owes a
+/// `period_ms` node a second fire and every frame carries its own boundary
+/// target; `recorded_wall` is constant within a step, so it admits the bounded
+/// catch-up burst. Deriving the rule here is what stops a body shared by arms
+/// of DIFFERENT modes from judging one of them under the other's rule, which
+/// is strictly weaker (see [`gating_stamp_violation`]) and would pass a fault
+/// the strict rule catches.
+///
+/// An unknown label PANICS rather than defaulting: a new gating clock has to
+/// state its stamp contract, and a silent fallback to the loose rule is the
+/// exact hole this exists to close.
+fn stamp_rule_for(want_gating: &str) -> Gating {
+    match want_gating {
+        "quantum" => Gating::Lockstep,
+        "recorded_wall" => Gating::FreeRun,
+        other => panic!(
+            "no frame-stamp rule is stated for the gating label `{other}`: name its \
+             contract in `stamp_rule_for`, never judge it under whichever rule happens to \
+             be the default"
+        ),
+    }
+}
+
 /// **THE GATING-CLOCK STAMP RULE**, as a pure function over one topic's stamps
 /// so that BOTH of its sides can be pinned by hand oracles rather than by a run
 /// that happens to produce the shape.
@@ -2632,8 +2660,8 @@ fn a_run_writes_its_window_recorder_decision_into_run_json() {
 /// `0.0`, the CI stand-in for "rebuild the node with a changed constant".
 const PERTURBED_FIXTURE: &str = "test_node_macro_period_perturbed_cdylib";
 
-/// How many run+capture attempts arm 6 makes to obtain a capture its oracle can
-/// judge, before failing loudly.
+/// How many run+capture attempts arms 6 to 8 make to obtain a capture their
+/// oracle can judge, before failing loudly.
 ///
 /// TWO preconditions are the machine's rather than the candidate's, and both
 /// are retried here rather than weakened:
@@ -2641,16 +2669,16 @@ const PERTURBED_FIXTURE: &str = "test_node_macro_period_perturbed_cdylib";
 /// * LOSS-FREE. A window tap that overflowed on a busy machine drops frames the
 ///   re-execution then reproduces, which `--verify` reports as a divergence.
 /// * MID-RUN. The capture must begin past step 0, or `plan_restore` answers
-///   `FromStart` and the arm never reaches the admission it exists to pin. That
-///   is a race with the window's head trim, not a property of the code.
+///   `FromStart` and the arm never reaches the mid-run resume it exists to pin.
+///   That is a race with the window's head trim, not a property of the code.
 ///
 /// A fresh attempt, never a weaker oracle (the `--record` siblings do the same).
 const CLEAN_CAPTURE_ATTEMPTS: usize = 3;
 
-/// How many ticker frames arm 6 waits out before taking its capture.
+/// How many ticker frames arms 6 to 8 wait out before taking their capture.
 ///
 /// [`WORKER_STEPPED_FRAMES`] proves the worker is PAST its first step, which is
-/// all arm 3's attach needs. This arm needs the run FURTHER along: the rolling
+/// all arm 3's attach needs. These arms need the run FURTHER along: the rolling
 /// window must hold a deep enough suffix that its head is genuinely trimmed, or
 /// the capture's first rank-0 boundary is step 0. A CONDITION rather than a
 /// sleep, for the usual reason and in the usual direction: a fixed span loses
@@ -3085,8 +3113,10 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
 ///
 /// The claims, in the order the sibling arms settled on: the run's `run.json`
 /// reads the `gating` label the mode implies (`want_gating`); the recorded
-/// frames match the fixture HAND ORACLE; the capture stamps the coordination
-/// the mode implies (`want_coordination`) AND is genuinely mid-run (a
+/// frames match the fixture HAND ORACLE, under the frame-stamp rule that label
+/// implies (see [`stamp_rule_for`], so the `lockstep` arm is judged under the
+/// STRICT rule); the capture stamps the coordination the mode implies
+/// (`want_coordination`) AND is genuinely mid-run (a
 /// from-start capture would pass the rest of this arm without exercising the
 /// resume) AND claims `resimmable: true`; then `bag play --resim all --verify`
 /// exits 0 TWICE with byte-identical `--report` JSON whose `resume` block names
@@ -3220,8 +3250,8 @@ fn one_rank_capture_resims_and_verifies_under(
         assert_frames_match_the_fixture_oracle(
             &capture,
             &prefix,
-            "the free-run capture",
-            Gating::FreeRun,
+            &format!("the {want_coordination} capture"),
+            stamp_rule_for(want_gating),
         );
 
         let reader = cerulion_bag::BagReader::open(&capture).expect("open the capture");
@@ -3248,8 +3278,8 @@ fn one_rank_capture_resims_and_verifies_under(
             // the code under test made it come out that way.
             last_retry = format!(
                 "attempt {attempt}: the capture's first rank-0 STEP_BOUNDARY is step 0, so it \
-                 begins FROM START and `plan_restore` would answer `FromStart`; the admission \
-                 under test is never reached"
+                 begins FROM START and `plan_restore` would answer `FromStart`; the mid-run \
+                 resume under test is never reached"
             );
             eprintln!("{last_retry}");
             continue;
