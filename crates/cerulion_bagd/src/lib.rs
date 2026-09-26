@@ -16588,7 +16588,7 @@ impl Recorder {
         // never had one (see `build_capture_state_coverage`).
         let declared_nodes = plane.declared_ring_nodes();
         let (anchor, state_coverage, anchor_report, anchor_summary, (anchor_facts, rings_seen)) =
-            match plane.select_anchor(floor_ns, started_ns) {
+            match plane.select_anchor(floor_ns, started_ns, finished.seq) {
                 Ok(selection) => {
                     // The SET, one member per rank, in ring order. Ring order is
                     // the manifest's order and is stable across captures, so two
@@ -16730,6 +16730,59 @@ impl Recorder {
                         frames_missing_after_anchor_ms: achieved_from_ns
                             .map(|from| from.saturating_sub(taken_at_ns) / 1_000_000)
                             .unwrap_or(0),
+                        // The SET, un-folded, beside the folded scalars above.
+                        //
+                        // Keyed by the rank read off the member's OWN records
+                        // rather than by a counter or by the ring's position:
+                        // the rank is a fact the producer stamped into every
+                        // record (the C1 header), and the ring-to-rank join the
+                        // rest of the bag is keyed by is read the same way, so
+                        // the manifest's per-rank block and
+                        // `state_coverage.json`'s cannot name different ranks
+                        // for one ring.
+                        //
+                        // A member whose records carry no readable rank is
+                        // SKIPPED rather than filed under a guessed one. It is a
+                        // shape the harvester does not produce (an anchor with
+                        // no record), and inventing rank 0 for it would put two
+                        // rings in one entry and silently lose one.
+                        per_rank: members
+                            .iter()
+                            .filter_map(|m| {
+                                let rank = m.checkpoint.producer_rank()?;
+                                Some((
+                                    rank,
+                                    flashback_plane::RankAnchor {
+                                        capture_seq: m.capture_seq,
+                                        step: m.checkpoint.step,
+                                        taken_at_ns: m.checkpoint.taken_at_ns,
+                                        nodes: m.checkpoint.anchors.len(),
+                                        complete: m.checkpoint.complete_anchors(),
+                                        records: m.checkpoint.record_count(),
+                                        fit: m.fit,
+                                        // Measured from the SAME achieved reach
+                                        // the scalars are, against THIS rank's
+                                        // own instant: a rank whose member sits
+                                        // before the reach and one whose member
+                                        // sits after it are the two sides the
+                                        // pair exists to tell apart, and a fold
+                                        // cannot show both at once.
+                                        frames_before_anchor_ms: achieved_from_ns
+                                            .map(|from| {
+                                                m.checkpoint.taken_at_ns.saturating_sub(from)
+                                                    / 1_000_000
+                                            })
+                                            .unwrap_or(0),
+                                        frames_missing_after_anchor_ms: achieved_from_ns
+                                            .map(|from| {
+                                                from.saturating_sub(m.checkpoint.taken_at_ns)
+                                                    / 1_000_000
+                                            })
+                                            .unwrap_or(0),
+                                    },
+                                ))
+                            })
+                            .collect(),
                     };
                     // Both spans are measured from the SAME folded instant, which
                     // is what keeps the field docs' "at most one of the two is
@@ -25471,7 +25524,9 @@ mod commit_ordering_tests {
         let held = lock_anchors(&anchors);
         assert_eq!(held.checkpoints(), 1);
         assert_eq!(held.admitted(), 1);
-        let selection = held.select(0, u64::MAX).expect("the anchor is selectable");
+        let selection = held
+            .select(0, u64::MAX, 1)
+            .expect("the anchor is selectable");
         let (checkpoint, _) = selection.sole();
         assert_eq!(checkpoint.run_id, RUN);
         assert_eq!(checkpoint.step, 22);
@@ -25734,7 +25789,7 @@ mod capture_coverage_tests {
                 },
             );
         }
-        let selection = window.select(0, u64::MAX).expect("a selection");
+        let selection = window.select(0, u64::MAX, 1).expect("a selection");
         let checkpoints: Vec<&anchor_window::Checkpoint> =
             selection.selected.values().map(|m| &m.checkpoint).collect();
         let (bytes, _rings) = build_capture_state_coverage(&checkpoints, armed, declared);

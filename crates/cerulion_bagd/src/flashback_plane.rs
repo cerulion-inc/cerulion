@@ -761,9 +761,10 @@ impl FlashbackPlane {
         &self,
         floor_ns: u64,
         started_ns: u64,
+        capture_seq: u64,
     ) -> Result<AnchorSelection, NoAnchorReason> {
         let deadline = self.claimed_window_start_ns(started_ns).max(floor_ns);
-        lock_anchors(&self.anchors).select(floor_ns, deadline)
+        lock_anchors(&self.anchors).select(floor_ns, deadline, capture_seq)
     }
 
     /// PURE: the instant the capture's CLAIMED pre-window starts, derived
@@ -2070,6 +2071,78 @@ pub(crate) struct CaptureManifest<'a> {
 /// `embedded` says what state is IN the bag, and `resimmable` says whether this
 /// bag can be resumed from it. A reader is never left to infer the second from
 /// the first.
+/// ONE rank's member of the anchor set, as the manifest reports it.
+///
+/// # Why every scalar is repeated here
+///
+/// The scalars on [`AnchorReport::Embedded`] are a FOLD over the set (counts
+/// sum, the instants are the latest rank's, the fit is the worst rank's), and a
+/// fold is lossy by construction: from `step: 44` alone a reader cannot tell a
+/// lockstep capture at step 44 from a two-rank capture whose ranks sit at 41 and
+/// 44. The fold is what an old reader needs and is kept exactly; this map is
+/// what a reader that understands ranks needs, and the two are consistent
+/// because the fold is computed FROM this map's inputs.
+///
+/// Keyed by RANK rather than by ring name because the rank is what every other
+/// per-rank surface in a bag is keyed by (`state_coverage.json`'s ring-to-rank
+/// map, the state records' own header), and a ring's shared-memory name is an
+/// implementation detail a reader should not have to join through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RankAnchor {
+    /// The CAPTURE EVENT this rank's restore point was selected for.
+    ///
+    /// The whole point of the per-rank block. Every member of one capture's set
+    /// carries that capture's number, so a resume handed anchors from two
+    /// captures can SEE that it was, rather than silently resuming a graph from
+    /// two different instants.
+    pub capture_seq: u64,
+    /// This rank's own step. The ranks genuinely differ under free run.
+    pub step: u64,
+    /// This rank's own harvest instant.
+    pub taken_at_ns: u64,
+    /// Nodes' anchors this rank's checkpoint carries.
+    pub nodes: usize,
+    /// How many of those are COMPLETE.
+    pub complete: usize,
+    /// Records this rank contributed to `__cerulion/state`.
+    pub records: usize,
+    /// How THIS rank's member compares with what the capture claimed.
+    pub fit: AnchorFit,
+    /// This rank's own `frames_before_anchor_ms`.
+    pub frames_before_anchor_ms: u64,
+    /// This rank's own `frames_missing_after_anchor_ms`.
+    pub frames_missing_after_anchor_ms: u64,
+}
+
+impl RankAnchor {
+    /// The JSON object one rank renders to.
+    fn render(&self) -> String {
+        let fit = match self.fit {
+            AnchorFit::CoversTheClaimedWindow => "covers_the_claimed_window",
+            AnchorFit::NewerThanTheClaimedWindow => "newer_than_the_claimed_window",
+        };
+        format!(
+            "{{\"capture_seq\":{},\
+             \"step\":{},\
+             \"taken_at_ns\":{},\
+             \"nodes\":{},\
+             \"complete\":{},\
+             \"records\":{},\
+             \"fit\":\"{fit}\",\
+             \"frames_before_anchor_ms\":{},\
+             \"frames_missing_after_anchor_ms\":{}}}",
+            self.capture_seq,
+            self.step,
+            self.taken_at_ns,
+            self.nodes,
+            self.complete,
+            self.records,
+            self.frames_before_anchor_ms,
+            self.frames_missing_after_anchor_ms,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AnchorReport {
     /// A checkpoint is embedded.
@@ -2128,6 +2201,18 @@ pub(crate) enum AnchorReport {
         /// state is stated by `achieved_from_ns: null` rather than by inventing a
         /// span for it.
         frames_missing_after_anchor_ms: u64,
+        /// The SET, one entry per rank, keyed by rank.
+        ///
+        /// Every scalar above is a FOLD over this map, and the map is what the
+        /// fold cannot say: which rank sat at which step, which rank's member
+        /// only covers part of the claimed window, and which CAPTURE each member
+        /// was selected for. A lockstep or k=1 capture has exactly one entry
+        /// whose numbers equal the scalars.
+        ///
+        /// Never empty for an `Embedded` report: the report exists because a
+        /// selection returned a non-empty set, and every member of that set
+        /// becomes an entry here.
+        per_rank: std::collections::BTreeMap<u32, RankAnchor>,
     },
     /// None is embedded, and why.
     Absent(NoAnchorReason),
@@ -2200,7 +2285,17 @@ impl AnchorReport {
                 taken_at_ns,
                 frames_before_anchor_ms,
                 frames_missing_after_anchor_ms,
+                per_rank,
             } => {
+                // A JSON OBJECT keyed by the rank as a decimal string, in rank
+                // order. An ARRAY would make the rank a position a reader has to
+                // trust, and a sparse rank space (rank 2 alive, rank 1 with no
+                // ring at all) makes that position a lie.
+                let per_rank: String = per_rank
+                    .iter()
+                    .map(|(rank, entry)| format!("\"{rank}\":{}", entry.render()))
+                    .collect::<Vec<String>>()
+                    .join(",");
                 let fit = match fit {
                     AnchorFit::CoversTheClaimedWindow => "covers_the_claimed_window",
                     AnchorFit::NewerThanTheClaimedWindow => "newer_than_the_claimed_window",
@@ -2216,6 +2311,7 @@ impl AnchorReport {
                      \"taken_at_ns\":{taken_at_ns},\
                      \"frames_before_anchor_ms\":{frames_before_anchor_ms},\
                      \"frames_missing_after_anchor_ms\":{frames_missing_after_anchor_ms},\
+                     \"per_rank\":{{{per_rank}}},\
                      \"resimmable\":{resimmable},\
                      \"resim_covered_through_ns\":{covered},\
                      \"resimmable_reason\":\"{reason}\"}}"
@@ -2418,6 +2514,60 @@ pub(crate) fn render_capture_manifest(m: &CaptureManifest<'_>, plane: &Flashback
 
 #[cfg(test)]
 mod tests {
+    /// The capture number the hand-built one-rank fixtures below are selected
+    /// under. Non-zero so a stamp that was never written reads 0 and fails.
+    const CAPTURE_SEQ: u64 = 12;
+
+    /// Give a ONE-RANK `Embedded` report the per-rank entry its own scalars
+    /// imply, so a hand fixture cannot state the two apart.
+    ///
+    /// For k=1 the production fold is the identity: the sole member's step,
+    /// instant, counts, fit and spans ARE the scalars. A fixture that wrote them
+    /// apart would be a shape the recorder cannot produce, and every arm reading
+    /// it would be asserting against fiction. Derived here rather than typed
+    /// twice for the same reason.
+    fn with_sole_rank(report: AnchorReport, capture_seq: u64) -> AnchorReport {
+        match report {
+            AnchorReport::Embedded {
+                run_id,
+                step,
+                nodes,
+                complete,
+                records,
+                fit,
+                taken_at_ns,
+                frames_before_anchor_ms,
+                frames_missing_after_anchor_ms,
+                ..
+            } => AnchorReport::Embedded {
+                run_id,
+                step,
+                nodes,
+                complete,
+                records,
+                fit,
+                taken_at_ns,
+                frames_before_anchor_ms,
+                frames_missing_after_anchor_ms,
+                per_rank: std::collections::BTreeMap::from([(
+                    0,
+                    RankAnchor {
+                        capture_seq,
+                        step,
+                        taken_at_ns,
+                        nodes,
+                        complete,
+                        records,
+                        fit,
+                        frames_before_anchor_ms,
+                        frames_missing_after_anchor_ms,
+                    },
+                )]),
+            },
+            absent => absent,
+        }
+    }
+
     use super::*;
 
     use cerulion_core::flashback::resim::ResimGap;
@@ -2642,6 +2792,175 @@ mod tests {
         assert!(text.contains("\"pinned\":false"));
     }
 
+    /// ORACLE 5: the per-rank block JOINS the scalars, it does not replace them,
+    /// and a reader written before it existed is unmoved.
+    ///
+    /// The two halves are asserted apart. First, a k=2 manifest still parses in
+    /// the TYPED reader at [`FlashbackManifest`], which is what `bag info`
+    /// deserializes: the reader names no `anchor` field and sets no
+    /// `deny_unknown_fields`, so the addition is tolerated by construction, and
+    /// this arm is what stops that from silently ceasing to be true. Second,
+    /// every scalar key the old `anchor` block carried is STILL THERE with the
+    /// folded value beside the new map, so a hand-rolled reader looking up
+    /// `anchor.step` finds a number rather than `null`.
+    #[test]
+    fn a_two_rank_manifest_joins_the_per_rank_block_to_the_untouched_scalars() {
+        // A k=2 report: the ranks sit at different steps, the counts SUM, the
+        // instant and step are the LATEST rank's, the fit is the WORST rank's.
+        // Every number below is written out literally.
+        let two = AnchorReport::Embedded {
+            run_id: 7,
+            step: 44,
+            nodes: 3,
+            complete: 3,
+            records: 5,
+            fit: AnchorFit::NewerThanTheClaimedWindow,
+            taken_at_ns: 14_000,
+            frames_before_anchor_ms: 14,
+            frames_missing_after_anchor_ms: 0,
+            per_rank: std::collections::BTreeMap::from([
+                (
+                    0,
+                    RankAnchor {
+                        capture_seq: 1,
+                        step: 41,
+                        taken_at_ns: 10_000,
+                        nodes: 2,
+                        complete: 2,
+                        records: 3,
+                        fit: AnchorFit::CoversTheClaimedWindow,
+                        frames_before_anchor_ms: 10,
+                        frames_missing_after_anchor_ms: 0,
+                    },
+                ),
+                (
+                    1,
+                    RankAnchor {
+                        capture_seq: 1,
+                        step: 44,
+                        taken_at_ns: 14_000,
+                        nodes: 1,
+                        complete: 1,
+                        records: 2,
+                        fit: AnchorFit::NewerThanTheClaimedWindow,
+                        frames_before_anchor_ms: 14,
+                        frames_missing_after_anchor_ms: 0,
+                    },
+                ),
+            ]),
+        };
+        let text = manifest(two, 12);
+
+        // HALF ONE: the typed reader still reads it.
+        let typed: FlashbackManifest = serde_json::from_str(&text)
+            .expect("a k=2 manifest must still parse in the typed reader");
+        assert_eq!(typed.seq, Some(1));
+        assert_eq!(typed.frames, Some(10));
+
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+
+        // HALF TWO: every scalar key is where it was, carrying the fold.
+        assert_eq!(doc["anchor"]["embedded"], serde_json::json!(true));
+        assert_eq!(doc["anchor"]["run_id"], serde_json::json!(7));
+        assert_eq!(doc["anchor"]["step"], serde_json::json!(44));
+        assert_eq!(doc["anchor"]["nodes"], serde_json::json!(3));
+        assert_eq!(doc["anchor"]["complete"], serde_json::json!(3));
+        assert_eq!(doc["anchor"]["records"], serde_json::json!(5));
+        assert_eq!(
+            doc["anchor"]["fit"],
+            serde_json::json!("newer_than_the_claimed_window")
+        );
+        assert_eq!(doc["anchor"]["taken_at_ns"], serde_json::json!(14_000));
+        assert_eq!(
+            doc["anchor"]["frames_before_anchor_ms"],
+            serde_json::json!(14)
+        );
+        assert_eq!(
+            doc["anchor"]["frames_missing_after_anchor_ms"],
+            serde_json::json!(0)
+        );
+
+        // …and the new block sits BESIDE them, keyed by rank, each entry its
+        // rank's own numbers rather than the fold.
+        assert_eq!(
+            doc["anchor"]["per_rank"]["0"]["step"],
+            serde_json::json!(41)
+        );
+        assert_eq!(
+            doc["anchor"]["per_rank"]["0"]["nodes"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            doc["anchor"]["per_rank"]["0"]["records"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            doc["anchor"]["per_rank"]["0"]["taken_at_ns"],
+            serde_json::json!(10_000)
+        );
+        assert_eq!(
+            doc["anchor"]["per_rank"]["0"]["fit"],
+            serde_json::json!("covers_the_claimed_window"),
+            "ORACLE 12 at the manifest: rank 0's own fit, not the folded worst"
+        );
+        assert_eq!(
+            doc["anchor"]["per_rank"]["1"]["step"],
+            serde_json::json!(44)
+        );
+        assert_eq!(
+            doc["anchor"]["per_rank"]["1"]["fit"],
+            serde_json::json!("newer_than_the_claimed_window")
+        );
+        assert_eq!(
+            doc["anchor"]["per_rank"]["1"]["frames_before_anchor_ms"],
+            serde_json::json!(14)
+        );
+    }
+
+    /// ORACLE 13, arm (c), ANTI-VACUITY: a k=1 capture's single entry carries the
+    /// manifest's own `seq`, never absent and never zero.
+    ///
+    /// The arm that fails if the identity is written once at the manifest level
+    /// and never onto the rank entries: `seq` would still read 12 at the top and
+    /// the per-rank block would read 0 or be missing, and a resume would have
+    /// nothing per rank to compare.
+    #[test]
+    fn a_one_rank_entry_carries_the_captures_own_number() {
+        let text = manifest(
+            with_sole_rank(
+                AnchorReport::Embedded {
+                    run_id: 1,
+                    step: 9,
+                    nodes: 1,
+                    complete: 1,
+                    records: 1,
+                    fit: AnchorFit::CoversTheClaimedWindow,
+                    taken_at_ns: 0,
+                    frames_before_anchor_ms: 0,
+                    frames_missing_after_anchor_ms: 0,
+                    per_rank: std::collections::BTreeMap::new(),
+                },
+                CAPTURE_SEQ,
+            ),
+            12,
+        );
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            doc["anchor"]["per_rank"]["0"]["capture_seq"],
+            serde_json::json!(CAPTURE_SEQ),
+            "the sole entry names the capture that selected it"
+        );
+        // …and it is really the ONE entry, so the arm is not reading a second
+        // rank's number by accident.
+        assert_eq!(
+            doc["anchor"]["per_rank"]
+                .as_object()
+                .expect("per_rank is an object")
+                .len(),
+            1
+        );
+    }
+
     fn manifest(anchor: AnchorReport, trace_records_carried: u64) -> String {
         manifest_with(anchor, trace_records_carried, &no_trace())
     }
@@ -2771,18 +3090,22 @@ mod tests {
         for (label, anchor) in [
             (
                 "embedded",
-                AnchorReport::Embedded {
-                    run_id: 7,
-                    step: 41,
-                    nodes: 2,
-                    complete: 2,
-                    records: 4,
-                    fit: AnchorFit::CoversTheClaimedWindow,
-                    // These arms do not exercise the anchor instant.
-                    taken_at_ns: 0,
-                    frames_before_anchor_ms: 100,
-                    frames_missing_after_anchor_ms: 0,
-                },
+                with_sole_rank(
+                    AnchorReport::Embedded {
+                        run_id: 7,
+                        step: 41,
+                        nodes: 2,
+                        complete: 2,
+                        records: 4,
+                        fit: AnchorFit::CoversTheClaimedWindow,
+                        // These arms do not exercise the anchor instant.
+                        taken_at_ns: 0,
+                        frames_before_anchor_ms: 100,
+                        frames_missing_after_anchor_ms: 0,
+                        per_rank: std::collections::BTreeMap::new(),
+                    },
+                    CAPTURE_SEQ,
+                ),
             ),
             (
                 "absent",
@@ -2874,18 +3197,22 @@ mod tests {
     /// that this bag cannot be resimmed and why.
     #[test]
     fn an_embedded_anchor_without_a_trace_never_claims_to_be_resimmable() {
-        let embedded = AnchorReport::Embedded {
-            run_id: 0xABCD,
-            step: 4200,
-            nodes: 3,
-            complete: 2,
-            records: 9,
-            fit: AnchorFit::CoversTheClaimedWindow,
-            // These arms do not exercise the anchor instant.
-            taken_at_ns: 0,
-            frames_before_anchor_ms: 15_000,
-            frames_missing_after_anchor_ms: 0,
-        };
+        let embedded = with_sole_rank(
+            AnchorReport::Embedded {
+                run_id: 0xABCD,
+                step: 4200,
+                nodes: 3,
+                complete: 2,
+                records: 9,
+                fit: AnchorFit::CoversTheClaimedWindow,
+                // These arms do not exercise the anchor instant.
+                taken_at_ns: 0,
+                frames_before_anchor_ms: 15_000,
+                frames_missing_after_anchor_ms: 0,
+                per_rank: std::collections::BTreeMap::new(),
+            },
+            CAPTURE_SEQ,
+        );
         let text = manifest(embedded.clone(), 0);
         assert!(text.contains("\"embedded\":true"), "{text}");
         assert!(text.contains("\"run_id\":43981"), "{text}");
@@ -2959,19 +3286,23 @@ mod tests {
     /// count would print `true` for all four.
     #[test]
     fn a_capture_with_a_trace_still_reports_the_gap_that_stops_it() {
-        let embedded = AnchorReport::Embedded {
-            run_id: 7,
-            step: 40,
-            nodes: 2,
-            complete: 1,
-            records: 4,
-            fit: AnchorFit::CoversTheClaimedWindow,
-            // These arms do not exercise the anchor instant.
-            taken_at_ns: 0,
-            // Not what this arm is about — the neutral value.
-            frames_before_anchor_ms: 0,
-            frames_missing_after_anchor_ms: 0,
-        };
+        let embedded = with_sole_rank(
+            AnchorReport::Embedded {
+                run_id: 7,
+                step: 40,
+                nodes: 2,
+                complete: 1,
+                records: 4,
+                fit: AnchorFit::CoversTheClaimedWindow,
+                // These arms do not exercise the anchor instant.
+                taken_at_ns: 0,
+                // Not what this arm is about — the neutral value.
+                frames_before_anchor_ms: 0,
+                frames_missing_after_anchor_ms: 0,
+                per_rank: std::collections::BTreeMap::new(),
+            },
+            CAPTURE_SEQ,
+        );
         for (gap, marker) in [
             (
                 ResimGap::FaultReplay { departures: 3 },
@@ -3380,18 +3711,22 @@ mod tests {
     fn the_anchor_block_says_which_side_of_the_anchor_the_gap_is_on() {
         // The anchor sits INSIDE the achieved range: 3 s of the bag predates it.
         let inside = manifest(
-            AnchorReport::Embedded {
-                run_id: 1,
-                step: 9,
-                nodes: 1,
-                complete: 1,
-                records: 1,
-                fit: AnchorFit::CoversTheClaimedWindow,
-                // These arms do not exercise the anchor instant.
-                taken_at_ns: 0,
-                frames_before_anchor_ms: 3_000,
-                frames_missing_after_anchor_ms: 0,
-            },
+            with_sole_rank(
+                AnchorReport::Embedded {
+                    run_id: 1,
+                    step: 9,
+                    nodes: 1,
+                    complete: 1,
+                    records: 1,
+                    fit: AnchorFit::CoversTheClaimedWindow,
+                    // These arms do not exercise the anchor instant.
+                    taken_at_ns: 0,
+                    frames_before_anchor_ms: 3_000,
+                    frames_missing_after_anchor_ms: 0,
+                    per_rank: std::collections::BTreeMap::new(),
+                },
+                CAPTURE_SEQ,
+            ),
             0,
         );
         let doc: serde_json::Value = serde_json::from_str(&inside).expect("json");
@@ -3400,18 +3735,22 @@ mod tests {
 
         // The ceiling evicted PAST the anchor: 8 s the resume needs are gone.
         let missing = manifest(
-            AnchorReport::Embedded {
-                run_id: 1,
-                step: 9,
-                nodes: 1,
-                complete: 1,
-                records: 1,
-                fit: AnchorFit::CoversTheClaimedWindow,
-                // These arms do not exercise the anchor instant.
-                taken_at_ns: 0,
-                frames_before_anchor_ms: 0,
-                frames_missing_after_anchor_ms: 8_000,
-            },
+            with_sole_rank(
+                AnchorReport::Embedded {
+                    run_id: 1,
+                    step: 9,
+                    nodes: 1,
+                    complete: 1,
+                    records: 1,
+                    fit: AnchorFit::CoversTheClaimedWindow,
+                    // These arms do not exercise the anchor instant.
+                    taken_at_ns: 0,
+                    frames_before_anchor_ms: 0,
+                    frames_missing_after_anchor_ms: 8_000,
+                    per_rank: std::collections::BTreeMap::new(),
+                },
+                CAPTURE_SEQ,
+            ),
             0,
         );
         let doc: serde_json::Value = serde_json::from_str(&missing).expect("json");
@@ -3485,18 +3824,22 @@ mod tests {
     #[test]
     fn an_anchor_newer_than_the_claimed_window_is_served_with_that_fact() {
         let text = manifest(
-            AnchorReport::Embedded {
-                run_id: 1,
-                step: 9,
-                nodes: 1,
-                complete: 1,
-                records: 1,
-                fit: AnchorFit::NewerThanTheClaimedWindow,
-                // These arms do not exercise the anchor instant.
-                taken_at_ns: 0,
-                frames_before_anchor_ms: 29_000,
-                frames_missing_after_anchor_ms: 0,
-            },
+            with_sole_rank(
+                AnchorReport::Embedded {
+                    run_id: 1,
+                    step: 9,
+                    nodes: 1,
+                    complete: 1,
+                    records: 1,
+                    fit: AnchorFit::NewerThanTheClaimedWindow,
+                    // These arms do not exercise the anchor instant.
+                    taken_at_ns: 0,
+                    frames_before_anchor_ms: 29_000,
+                    frames_missing_after_anchor_ms: 0,
+                    per_rank: std::collections::BTreeMap::new(),
+                },
+                CAPTURE_SEQ,
+            ),
             0,
         );
         assert!(
@@ -4216,7 +4559,9 @@ mod tests {
 
         // A checkpoint at 10 s — FIVE SECONDS AFTER the trigger.
         lock_anchors(&plane.anchors).admit(10_000 * MS, probe_anchor(700));
-        let selection = plane.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = plane
+            .select_anchor(floor_ns, trigger, CAPTURE_SEQ)
+            .expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 700);
         assert_eq!(
@@ -4239,7 +4584,9 @@ mod tests {
             "still an early capture: 20 s into a 30 s window"
         );
         lock_anchors(&later.anchors).admit(15_000 * MS, probe_anchor(800));
-        let selection = later.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = later
+            .select_anchor(floor_ns, trigger, CAPTURE_SEQ)
+            .expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 800);
         assert_eq!(
@@ -4268,7 +4615,9 @@ mod tests {
         // the claimed window start (85 s). Under the original close-time deadline
         // (100 s) this reported `CoversTheClaimedWindow`.
         lock_anchors(&plane.anchors).admit(90_000 * MS, probe_anchor(500));
-        let selection = plane.select_anchor(floor_ns, TRIGGER_NS).expect("selected");
+        let selection = plane
+            .select_anchor(floor_ns, TRIGGER_NS, CAPTURE_SEQ)
+            .expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 500);
         assert_eq!(
@@ -4286,7 +4635,9 @@ mod tests {
             held.clear();
             held.admit(80_000 * MS, probe_anchor(400));
         }
-        let selection = plane.select_anchor(floor_ns, TRIGGER_NS).expect("selected");
+        let selection = plane
+            .select_anchor(floor_ns, TRIGGER_NS, CAPTURE_SEQ)
+            .expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 400);
         assert_eq!(fit, AnchorFit::CoversTheClaimedWindow);
@@ -4333,7 +4684,9 @@ mod tests {
         // AT the floor: this checkpoint covers every frame the capture carries,
         // which is the most any anchor could do.
         lock_anchors(&plane.anchors).admit(floor_ns, probe_anchor(900));
-        let selection = plane.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = plane
+            .select_anchor(floor_ns, trigger, CAPTURE_SEQ)
+            .expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 900);
         assert_eq!(
@@ -4350,7 +4703,9 @@ mod tests {
             held.clear();
             held.admit(floor_ns + MS, probe_anchor(901));
         }
-        let selection = plane.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = plane
+            .select_anchor(floor_ns, trigger, CAPTURE_SEQ)
+            .expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 901);
         assert_eq!(
@@ -4367,7 +4722,9 @@ mod tests {
         let ordinary = FlashbackPlane::new(settings(std::path::PathBuf::from("/tmp/fb")), None);
         let floor_ns = 70_000 * MS;
         lock_anchors(&ordinary.anchors).admit(80_000 * MS, probe_anchor(902));
-        let selection = ordinary.select_anchor(floor_ns, trigger).expect("selected");
+        let selection = ordinary
+            .select_anchor(floor_ns, trigger, CAPTURE_SEQ)
+            .expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 902);
         assert_eq!(
@@ -4383,18 +4740,22 @@ mod tests {
     #[test]
     fn an_embedded_anchor_states_how_much_of_the_bag_predates_it() {
         let text = manifest(
-            AnchorReport::Embedded {
-                run_id: 1,
-                step: 9,
-                nodes: 1,
-                complete: 1,
-                records: 1,
-                fit: AnchorFit::CoversTheClaimedWindow,
-                // These arms do not exercise the anchor instant.
-                taken_at_ns: 0,
-                frames_before_anchor_ms: 14_500,
-                frames_missing_after_anchor_ms: 0,
-            },
+            with_sole_rank(
+                AnchorReport::Embedded {
+                    run_id: 1,
+                    step: 9,
+                    nodes: 1,
+                    complete: 1,
+                    records: 1,
+                    fit: AnchorFit::CoversTheClaimedWindow,
+                    // These arms do not exercise the anchor instant.
+                    taken_at_ns: 0,
+                    frames_before_anchor_ms: 14_500,
+                    frames_missing_after_anchor_ms: 0,
+                    per_rank: std::collections::BTreeMap::new(),
+                },
+                CAPTURE_SEQ,
+            ),
             0,
         );
         assert!(
@@ -4635,7 +4996,7 @@ mod tests {
         // lived a whole span) and so does the claimed-window deadline, so the
         // boot anchor is NEWER than the window this capture claims.
         const TRIGGER_NS: u64 = 8_000_000_000;
-        let selection = plane.select_anchor(0, TRIGGER_NS).expect(
+        let selection = plane.select_anchor(0, TRIGGER_NS, CAPTURE_SEQ).expect(
             "project rule: a young run must still resim, since an anchor exists and must be \
              served, not refused for being newer than a window the run is too young \
              to have",
@@ -4658,7 +5019,7 @@ mod tests {
         let empty = FlashbackPlane::new(settings(dir.clone()), None);
         assert!(
             matches!(
-                empty.select_anchor(0, TRIGGER_NS),
+                empty.select_anchor(0, TRIGGER_NS, CAPTURE_SEQ),
                 Err(crate::anchor_window::NoAnchorReason::NothingRetained)
             ),
             "a run whose state plane never armed has nothing to serve, and that is the \

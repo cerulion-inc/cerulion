@@ -334,6 +334,27 @@ impl Checkpoint {
     pub(crate) fn record_groups(&self) -> impl Iterator<Item = &Arc<Vec<StateRecord>>> {
         self.anchors.iter().map(|a| &a.records)
     }
+
+    /// Records it holds, across every anchor.
+    ///
+    /// NOT the number of anchors and NOT the number of groups: a multi-part
+    /// anchor is several records in one group, and the manifest's `records` is
+    /// what was written onto the state channel.
+    pub(crate) fn record_count(&self) -> usize {
+        self.anchors.iter().map(|a| a.records.len()).sum()
+    }
+
+    /// The RANK that produced it, read off its first record's header.
+    ///
+    /// Read rather than carried, for the reason
+    /// [`producer_rank`] is read rather than carried: the rank is IN the record,
+    /// and a second copy on the checkpoint would be a second thing to keep in
+    /// step with the wire. `None` for a checkpoint holding no record at all,
+    /// which is a shape the harvester does not produce and which is answered
+    /// rather than assumed.
+    pub(crate) fn producer_rank(&self) -> Option<u32> {
+        self.anchors.iter().find_map(|a| producer_rank(&a.records))
+    }
 }
 
 /// What one eviction pass did.
@@ -423,6 +444,21 @@ pub(crate) struct SelectedAnchor {
     /// inside the claimed window while another's only candidate is newer than
     /// it.
     pub fit: AnchorFit,
+    /// The number of the CAPTURE EVENT this member was selected for.
+    ///
+    /// Stamped at SELECTION, never at harvest, and the distinction is the whole
+    /// reason the field can exist at all: [`AnchorWindow::admit`] pushes a
+    /// checkpoint on the recorder's drive loop long before any capture is
+    /// triggered, so a checkpoint cannot know which capture would take it, while
+    /// `select` is called ONCE per capture with that capture's own frozen
+    /// `(floor_ns, deadline_ns)` pair. One retained checkpoint may therefore be
+    /// selected by several captures in turn and carry a different number into
+    /// each one.
+    ///
+    /// What it is FOR: a restore point that names its capture lets a reader
+    /// refuse a resume assembled from two different captures' anchors, which is
+    /// otherwise a silent wrong answer rather than an error.
+    pub capture_seq: u64,
 }
 
 /// What one capture's selection returned: the SET, and the ranks it could not
@@ -982,10 +1018,19 @@ impl AnchorWindow {
     /// `Err` only when NO ring contributed, and then with the worst reason the
     /// rings gave, so a capture that would have been refused before this change
     /// is still refused for the same reason.
+    ///
+    /// # The capture identity
+    ///
+    /// `capture_seq` is the number of the capture making this call, and every
+    /// member of the returned set is stamped with it. It is the caller's because
+    /// the retention has no idea a capture exists: see
+    /// [`SelectedAnchor::capture_seq`] for why the stamp cannot be applied at
+    /// harvest time instead.
     pub(crate) fn select(
         &self,
         floor_ns: u64,
         deadline_ns: u64,
+        capture_seq: u64,
     ) -> Result<AnchorSelection, NoAnchorReason> {
         let mut rings: BTreeSet<&str> = self
             .declared_nodes
@@ -995,7 +1040,7 @@ impl AnchorWindow {
         rings.extend(self.checkpoints.iter().map(|c| c.ring.as_str()));
         let mut out = AnchorSelection::default();
         for ring in rings {
-            match self.select_one_ring(ring, floor_ns, deadline_ns) {
+            match self.select_one_ring(ring, floor_ns, deadline_ns, capture_seq) {
                 Ok(picked) => {
                     out.selected.insert(ring.to_string(), picked);
                 }
@@ -1062,6 +1107,7 @@ impl AnchorWindow {
         ring: &str,
         floor_ns: u64,
         deadline_ns: u64,
+        capture_seq: u64,
     ) -> Result<SelectedAnchor, NoAnchorReason> {
         let mut held = 0usize;
         let mut complete_held = 0usize;
@@ -1099,10 +1145,12 @@ impl AnchorWindow {
             (Some(c), _) => Ok(SelectedAnchor {
                 checkpoint: c.clone(),
                 fit: AnchorFit::CoversTheClaimedWindow,
+                capture_seq,
             }),
             (None, Some(c)) => Ok(SelectedAnchor {
                 checkpoint: c.clone(),
                 fit: AnchorFit::NewerThanTheClaimedWindow,
+                capture_seq,
             }),
             (None, None) => Err(NoAnchorReason::AllOlderThanTheFrames),
         }
@@ -1478,6 +1526,11 @@ impl AnchorHarvester {
 
 #[cfg(test)]
 mod tests {
+    /// The capture number every arm below selects under, unless the arm is
+    /// ABOUT the number. A non-zero literal so a stamp that was never written
+    /// reads as 0 and fails rather than matching by luck.
+    const CAPTURE: u64 = 3;
+
     use super::*;
     use cerulion_core::state::SkipCause;
     use cerulion_core::state_ring::{
@@ -1638,7 +1691,7 @@ mod tests {
 
         // The discriminator: a deadline BETWEEN the two admissions still selects
         // it. Under a last-writer stamp it would be refused as too new.
-        let selection = w.select(0, 12_000 * MS).expect("selected");
+        let selection = w.select(0, 12_000 * MS, CAPTURE).expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 500);
         assert_eq!(fit, AnchorFit::CoversTheClaimedWindow);
@@ -1653,7 +1706,9 @@ mod tests {
         }
 
         // A capture at T = 50 s, post window 15 s ⇒ deadline 35 s, floor 20 s.
-        let selection = w.select(20_000 * MS, 35_000 * MS).expect("selected");
+        let selection = w
+            .select(20_000 * MS, 35_000 * MS, CAPTURE)
+            .expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(
             picked.step, 200,
@@ -1664,7 +1719,9 @@ mod tests {
         // Raise the floor past every checkpoint at or before the deadline: the
         // only candidate left is NEWER than the claimed window, and is served
         // WITH that fact rather than silently.
-        let selection = w.select(38_000 * MS, 35_000 * MS).expect("selected");
+        let selection = w
+            .select(38_000 * MS, 35_000 * MS, CAPTURE)
+            .expect("selected");
         let (picked, fit) = selection.sole();
         assert_eq!(picked.step, 300);
         assert_eq!(
@@ -1677,7 +1734,7 @@ mod tests {
         // checkpoint whose forward frames are not in the bag would diverge for a
         // reason the recording caused.
         assert_eq!(
-            w.select(45_000 * MS, 46_000 * MS).err(),
+            w.select(45_000 * MS, 46_000 * MS, CAPTURE).err(),
             Some(NoAnchorReason::AllOlderThanTheFrames)
         );
         // …and an empty retention is a DIFFERENT reason, because the remedies
@@ -1685,7 +1742,7 @@ mod tests {
         // short to reach one".
         let empty = AnchorWindow::new(30_000 * MS, 1 << 30);
         assert_eq!(
-            empty.select(0, 0).err(),
+            empty.select(0, 0, CAPTURE).err(),
             Some(NoAnchorReason::NothingRetained)
         );
     }
@@ -1787,7 +1844,7 @@ mod tests {
         // defect that fix closes, since a run whose anchors the ceiling ate reads
         // identically to one that never anchored.
         assert_eq!(
-            w.select(0, 0).err(),
+            w.select(0, 0, CAPTURE).err(),
             Some(NoAnchorReason::RetentionCeilingExhausted)
         );
     }
@@ -2208,7 +2265,7 @@ mod tests {
 
         // …and the clamped checkpoint is still SELECTABLE at its clamped stamp,
         // so the hardening costs no anchor.
-        let selection = w.select(0, 10_000 * MS).expect("selected");
+        let selection = w.select(0, 10_000 * MS, CAPTURE).expect("selected");
         let (picked, _) = selection.sole();
         assert_eq!(picked.step, 20);
     }
@@ -2234,7 +2291,7 @@ mod tests {
             "precondition: the ceiling really bit"
         );
         assert_eq!(
-            w.select(0, u64::MAX).err(),
+            w.select(0, u64::MAX, CAPTURE).err(),
             Some(NoAnchorReason::RetentionCeilingExhausted),
             "an emptied-by-the-ceiling retention must not report `no_anchor_retained`"
         );
@@ -2244,7 +2301,7 @@ mod tests {
         // emptiness.
         let never = AnchorWindow::new(30_000 * MS, 1 << 30);
         assert_eq!(
-            never.select(0, u64::MAX).err(),
+            never.select(0, u64::MAX, CAPTURE).err(),
             Some(NoAnchorReason::NothingRetained)
         );
 
@@ -2268,13 +2325,13 @@ mod tests {
     fn an_in_flight_refusal_reported_by_the_harvest_also_names_the_ceiling() {
         let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
         assert_eq!(
-            w.select(0, u64::MAX).err(),
+            w.select(0, u64::MAX, CAPTURE).err(),
             Some(NoAnchorReason::NothingRetained),
             "precondition: nothing has been refused yet"
         );
         w.note_ceiling_refusal(1);
         assert_eq!(
-            w.select(0, u64::MAX).err(),
+            w.select(0, u64::MAX, CAPTURE).err(),
             Some(NoAnchorReason::RetentionCeilingExhausted),
             "a big-state robot whose anchors never fit must be told it is the CEILING, not \
              told its run never anchored"
@@ -2435,7 +2492,9 @@ mod tests {
             2,
             "one step on two rings is two checkpoints"
         );
-        let selection = w.select(0, 20_000 * MS).expect("both ranks selected");
+        let selection = w
+            .select(0, 20_000 * MS, CAPTURE)
+            .expect("both ranks selected");
         assert_eq!(selection.selected.len(), 2);
         assert!(selection.shortfall.is_empty());
 
@@ -2469,7 +2528,7 @@ mod tests {
         w.admit(11_000 * MS, rank_anchor(1, 7, 44, 0, &[2; 64]));
 
         let selection = w
-            .select(0, 12_000 * MS)
+            .select(0, 12_000 * MS, CAPTURE)
             .expect("one deadline, two ranks, two answers");
         let pairs: Vec<(&str, u64)> = selection
             .selected
@@ -2503,7 +2562,9 @@ mod tests {
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
         w.admit(10_010 * MS, rank_anchor(0, 7, 41, 1, &[1; 64]));
 
-        let selection = w.select(0, 12_000 * MS).expect("rank 0 still answers");
+        let selection = w
+            .select(0, 12_000 * MS, CAPTURE)
+            .expect("rank 0 still answers");
         assert_eq!(
             selection.selected.keys().collect::<Vec<_>>(),
             vec!["rank0"],
@@ -2520,7 +2581,9 @@ mod tests {
         // BOTH and an EMPTY shortfall, so the arm above is the shortfall rule
         // and not a selection that simply never returns two.
         w.admit(10_020 * MS, rank_anchor(1, 7, 44, 0, &[2; 64]));
-        let whole = w.select(0, 12_000 * MS).expect("both ranks selected");
+        let whole = w
+            .select(0, 12_000 * MS, CAPTURE)
+            .expect("both ranks selected");
         assert_eq!(whole.selected.len(), 2);
         assert!(whole.shortfall.is_empty());
     }
@@ -2541,7 +2604,7 @@ mod tests {
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
 
         let selection = w
-            .select(0, 12_000 * MS)
+            .select(0, 12_000 * MS, CAPTURE)
             .expect("a partial checkpoint IS an answer");
         assert_eq!(selection.selected.len(), 1);
         assert_eq!(selection.selected["rank0"].checkpoint.step, 41);
@@ -2570,7 +2633,9 @@ mod tests {
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
         w.admit(10_010 * MS, rank_skip(1, 7, 41, 0));
 
-        let selection = w.select(0, 12_000 * MS).expect("both ranks answer");
+        let selection = w
+            .select(0, 12_000 * MS, CAPTURE)
+            .expect("both ranks answer");
         assert_eq!(
             selection.selected.len(),
             2,
@@ -2584,6 +2649,99 @@ mod tests {
             selection.selected["rank1"].checkpoint.complete_anchors(),
             0,
             "…and the set member is honest about restoring nothing"
+        );
+    }
+
+    /// ORACLE 13, arms (a) and (b): every member of a capture's set carries THAT
+    /// capture's number, and the SAME checkpoint selected again by the next
+    /// capture carries the next number.
+    ///
+    /// The stamp is what a resume reads to refuse a set assembled from two
+    /// captures, so a stamp applied at HARVEST would be wrong in exactly the
+    /// case the refusal exists for: a checkpoint is admitted on the drive loop
+    /// long before any capture is triggered, and one retained checkpoint is
+    /// legitimately selected by several captures in turn.
+    #[test]
+    fn every_member_carries_the_selecting_captures_number_not_the_harvests() {
+        let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
+        // Both admitted long before either capture below exists. Rank 1's is
+        // the OLDER of the two, which is the member a harvest-time stamp would
+        // get most wrong.
+        w.admit(10_000 * MS, rank_anchor(1, 7, 41, 0, &[2; 64]));
+        w.admit(10_500 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
+
+        // ARM (a): capture 9 selects both, and both carry 9.
+        let ninth = w.select(0, 12_000 * MS, 9).expect("both ranks selected");
+        assert_eq!(ninth.selected.len(), 2);
+        assert_eq!(ninth.selected["rank0"].capture_seq, 9);
+        assert_eq!(
+            ninth.selected["rank1"].capture_seq, 9,
+            "the rank admitted first carries the SELECTING capture's number, \
+             not a number from its own harvest"
+        );
+
+        // ARM (b): capture 10 selects the SAME two checkpoints and they carry 10.
+        let tenth = w
+            .select(0, 12_000 * MS, 10)
+            .expect("both ranks selected again");
+        assert_eq!(tenth.selected["rank0"].capture_seq, 10);
+        assert_eq!(tenth.selected["rank1"].capture_seq, 10);
+        // …and it really is the same checkpoint, so arm (b) is about the STAMP
+        // and not about a different member being chosen.
+        assert_eq!(
+            tenth.selected["rank0"].checkpoint.step,
+            ninth.selected["rank0"].checkpoint.step
+        );
+        assert_eq!(
+            tenth.selected["rank0"].checkpoint.taken_at_ns,
+            ninth.selected["rank0"].checkpoint.taken_at_ns
+        );
+    }
+
+    /// ORACLE 12: the FITS may differ across ranks, and each rank reports its own.
+    ///
+    /// Rank 0's newest candidate sits at or before the capture's deadline, so it
+    /// COVERS the claimed window. Rank 1 holds only a checkpoint taken AFTER the
+    /// deadline (but at or above the floor), so its best answer is the oldest
+    /// candidate, reported NEWER than the claimed window. A selection that
+    /// published one fit for the set would tell a reader one of those two facts
+    /// about a rank for which it is false.
+    #[test]
+    fn the_fits_differ_across_ranks_and_each_rank_reports_its_own() {
+        let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
+        w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
+        // AFTER the deadline below, so rank 1 has no candidate inside the window.
+        w.admit(14_000 * MS, rank_anchor(1, 7, 44, 0, &[2; 64]));
+
+        let selection = w
+            .select(0, 12_000 * MS, CAPTURE)
+            .expect("both ranks answer");
+        assert_eq!(
+            selection.selected["rank0"].fit,
+            AnchorFit::CoversTheClaimedWindow
+        );
+        assert_eq!(
+            selection.selected["rank1"].fit,
+            AnchorFit::NewerThanTheClaimedWindow,
+            "rank 1's only candidate is newer than the window this capture claims"
+        );
+
+        // THE CONTROL: under lockstep the two ranks sit at one instant inside the
+        // window and the two fits are EQUAL, so the arm above is measuring the
+        // per-rank answer and not a selection that always disagrees.
+        let mut lockstep = AnchorWindow::new(30_000 * MS, 1 << 30);
+        lockstep.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
+        lockstep.admit(10_010 * MS, rank_anchor(1, 7, 41, 0, &[2; 64]));
+        let both = lockstep
+            .select(0, 12_000 * MS, CAPTURE)
+            .expect("both ranks answer");
+        assert_eq!(
+            both.selected["rank0"].fit, both.selected["rank1"].fit,
+            "a lockstep cut gives one answer to both ranks"
+        );
+        assert_eq!(
+            both.selected["rank0"].fit,
+            AnchorFit::CoversTheClaimedWindow
         );
     }
 
@@ -2702,7 +2860,7 @@ mod tests {
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
         w.admit(25_000 * MS, rank_anchor(0, 7, 42, 0, &[1; 64]));
 
-        let selection = w.select(0, 20_000 * MS).expect("selected");
+        let selection = w.select(0, 20_000 * MS, CAPTURE).expect("selected");
         assert_eq!(selection.selected.len(), 1, "one ring is one member");
         assert!(selection.shortfall.is_empty());
         let (picked, fit) = selection.sole();
@@ -2728,7 +2886,7 @@ mod tests {
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
         w.note_ceiling_refusal(1);
 
-        let selection = w.select(0, 20_000 * MS).expect("rank 0 answers");
+        let selection = w.select(0, 20_000 * MS, CAPTURE).expect("rank 0 answers");
         assert_eq!(selection.selected.keys().collect::<Vec<_>>(), vec!["rank0"]);
         assert_eq!(
             selection.shortfall.get("rank1"),

@@ -822,6 +822,32 @@ fn a_capture_carries_the_newest_checkpoints_records_verbatim() {
         "the manifest's record count must be what the bag actually holds"
     );
 
+    // THE PER-RANK BLOCK, over the production path. This run has one rank, so
+    // the block has exactly one entry and its numbers are the scalars above —
+    // the k=1 identity the fold has by construction, asserted here against a
+    // manifest a real recorder wrote rather than a hand-built report.
+    let per_rank = m["anchor"]["per_rank"]
+        .as_object()
+        .expect("every embedded anchor block carries its set, keyed by rank");
+    assert_eq!(per_rank.len(), 1, "a one-rank run writes one entry");
+    let rank0 = &per_rank["0"];
+    assert_eq!(rank0["step"], serde_json::json!(20));
+    assert_eq!(rank0["nodes"], serde_json::json!(2));
+    assert_eq!(rank0["complete"], serde_json::json!(2));
+    assert_eq!(rank0["records"], serde_json::json!(newer.len()));
+    assert_eq!(
+        rank0["fit"], m["anchor"]["fit"],
+        "one rank, so the entry's fit and the folded scalar are the same answer"
+    );
+    // The CAPTURE IDENTITY, against the capture's own number rather than a
+    // literal: the manifest states `seq` once at the top, and the entry must
+    // name THAT capture. A stamp taken at harvest, or never written, reads 0
+    // here while `seq` reads what the gate assigned.
+    assert_eq!(
+        rank0["capture_seq"], m["seq"],
+        "the restore point names the capture event that selected it"
+    );
+
     std::fs::remove_dir_all(&h.dir).ok();
 }
 
