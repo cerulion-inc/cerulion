@@ -1525,6 +1525,15 @@ pub enum GraphAction {
     /// levels each group owns and whether the partition can run as written
     /// (an invalid partition is printed in full and the command exits
     /// nonzero). Uses the same levelization the runtime uses.
+    ///
+    /// The report closes with the chains block: the linear single-consumer
+    /// trigger chains that could run as one fused synchronous call sequence
+    /// inside one process, and for every other consumer edge the reason it
+    /// keeps the queued path. The two add up to every consumer edge in the
+    /// graph. The chains are judged against the graph's declared colocation
+    /// (its `process_groups:` block, or one process); a run writes its own
+    /// census into its run directory. Nothing in the runtime fuses chains
+    /// yet: the block reports what the graph would allow.
     Levels {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]
@@ -2122,6 +2131,27 @@ mod graph_levels_dispatch_tests {
         assert!(
             Cli::try_parse_from(["cerulion", "graph", "levels"]).is_err(),
             "`graph levels` without a graph name must be rejected"
+        );
+    }
+
+    /// The verb runs and exits, so it keeps the quiet one-shot filter: a
+    /// lifecycle breadcrumb on top of a report is noise.
+    #[test]
+    fn graph_levels_is_a_one_shot_verb() {
+        let cli =
+            Cli::try_parse_from(["cerulion", "graph", "levels", "perception"]).expect("parse");
+        assert_eq!(cli.command.log_verb_class(), VerbLogClass::OneShot);
+    }
+
+    /// `chains` is NOT a verb of its own: the census is part of the `graph
+    /// levels` report. A stray subcommand must be a loud parse error, never a
+    /// silent acceptance that would leave a removed verb half alive in the
+    /// shell's history and in scripts.
+    #[test]
+    fn graph_chains_is_not_a_verb() {
+        assert!(
+            Cli::try_parse_from(["cerulion", "graph", "chains", "perception"]).is_err(),
+            "`graph chains` must be rejected: the census is part of `graph levels`"
         );
     }
 }

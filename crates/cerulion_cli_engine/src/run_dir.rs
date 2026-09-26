@@ -248,6 +248,10 @@ pub struct RunDescriptorSpec<'a> {
     /// scheduler ADVANCES and one produced by a clock it merely READS are
     /// byte-identical records with opposite meanings. See [`GatingClock`].
     pub gating: GatingClock,
+    /// This run's chain census, or `None` when it could not be computed (node
+    /// source that does not parse). A census is bookkeeping, so an absent one
+    /// is recorded as absent and never guessed.
+    pub chains: Option<ChainSummary>,
     /// The EFFECTIVE graph config, serialized.
     pub graph_yaml: String,
     /// The env snapshot, serialized.
@@ -276,6 +280,42 @@ pub struct RunDescriptor {
     /// descriptor, i.e. at the same instant the directory is removed.
     #[cfg(unix)]
     _lock: crate::run_lock::RunLock,
+}
+
+/// One chain a run's graph could execute as a fused synchronous chain, as
+/// `run.json` declares it.
+///
+/// Recorded on every run so the shape of real graphs can be read off real
+/// runs rather than guessed: nothing in the executor consumes it yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainDecl {
+    /// The chain's nodes, head first.
+    pub nodes: Vec<String>,
+    /// The hop topics, one fewer than `nodes`.
+    pub topics: Vec<String>,
+    /// The head's DAG level.
+    pub head_level: usize,
+}
+
+/// A run's chain census, reduced to what its manifest records.
+///
+/// The counts are TOTAL over the graph's consumer edges: `consumer_edges` is
+/// the denominator, `fusable_hops` the fused half, and `queued_by_reason` names
+/// the rest, so a reader can add them up rather than trusting a ratio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSummary {
+    /// How many chains qualify.
+    pub fusable_chains: usize,
+    /// How many consumer edges are hops of those chains.
+    pub fusable_hops: usize,
+    /// How many consumer edges the graph declares.
+    pub consumer_edges: usize,
+    /// The node count of the longest chain, 0 when none qualifies.
+    pub longest_chain_nodes: usize,
+    /// Why the remaining edges keep the queued path, most frequent first.
+    pub queued_by_reason: Vec<(String, usize)>,
+    /// The chains themselves.
+    pub chains: Vec<ChainDecl>,
 }
 
 /// One trace ring a run has CREATED, as `run.json` declares it.
@@ -1514,10 +1554,48 @@ fn render_run_manifest(spec: &RunDescriptorSpec<'_>, run_id: u128, dir: &Path) -
         // The SHM tag ledger, in ONE vocabulary with
         // `declare_run_rings`' later write (which PRESERVES what is here).
         "shm": render_shm_entries(&spec.shm),
+        // The chain census this run's graph implies, under the colocation the
+        // run EXECUTES. `null` means it could not be computed, never that the
+        // graph has no chains.
+        "chains": render_chain_summary(spec.chains.as_ref()),
     }))
     .expect("run.json is a static-shape object; serialization cannot fail");
     bytes.push(b'\n');
     bytes
+}
+
+/// Render a run's chain census for `run.json`, or JSON `null` when there is
+/// none.
+///
+/// `queued_by_reason` is an ARRAY of `{reason, edges}` rather than an object
+/// keyed by the reason, because the RANKING is the useful half: the first
+/// entry is what an operator would act on, and a JSON object's key order is
+/// not a value a reader may rely on. A reader that wants a map builds one in a
+/// line; a reader handed a map cannot recover the ranking.
+fn render_chain_summary(summary: Option<&ChainSummary>) -> serde_json::Value {
+    let Some(s) = summary else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "fusable_chains": s.fusable_chains,
+        "fusable_hops": s.fusable_hops,
+        "consumer_edges": s.consumer_edges,
+        "longest_chain_nodes": s.longest_chain_nodes,
+        "queued_by_reason": s
+            .queued_by_reason
+            .iter()
+            .map(|(reason, edges)| serde_json::json!({ "reason": reason, "edges": edges }))
+            .collect::<Vec<_>>(),
+        "chains": s
+            .chains
+            .iter()
+            .map(|c| serde_json::json!({
+                "nodes": c.nodes,
+                "topics": c.topics,
+                "head_level": c.head_level,
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The run directory's permission bits: OWNER ONLY (`rwx------`).
@@ -1886,6 +1964,7 @@ mod tests {
 
     fn spec<'a>(graph_yaml: &'a str, groups: bool) -> RunDescriptorSpec<'a> {
         RunDescriptorSpec {
+            chains: None,
             run_id: mint_run_id(),
             graph_name: "go2 attach",
             run_started_at_ns: 1_753_000_000_000_000_000,
@@ -2306,6 +2385,7 @@ mod tests {
             source: TagSource::Explicit,
         };
         let spec = RunDescriptorSpec {
+            chains: None,
             run_id: mint_run_id(),
             graph_name: "merge",
             run_started_at_ns: 7,
@@ -2371,11 +2451,87 @@ mod tests {
         );
     }
 
+    /// A run's manifest carries its chain census, and says nothing when there
+    /// is none.
+    ///
+    /// Both arms, because the two are different facts: an absent census means
+    /// the run could not compute one, and a `chains` object reporting zero
+    /// chains means the graph has none. A renderer that wrote `null` for both
+    /// would make a graph with no chains indistinguishable from a workspace
+    /// whose node source does not parse.
+    #[test]
+    fn the_manifest_carries_the_chain_census_and_says_so_when_there_is_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = |chains: Option<ChainSummary>| RunDescriptorSpec {
+            chains,
+            run_id: 1,
+            graph_name: "percept",
+            run_started_at_ns: 7,
+            network: NetworkPostureLabel::Off,
+            partition: PartitionProvenance::Declared,
+            process_groups: false,
+            shm: Vec::new(),
+            gating: GatingClock::Wall,
+            graph_yaml: "name: percept\n".to_string(),
+            env_json: b"{}".to_vec(),
+            recorder_json: b"{}".to_vec(),
+        };
+
+        let none: serde_json::Value =
+            serde_json::from_slice(&render_run_manifest(&base(None), 1, tmp.path()))
+                .expect("manifest json");
+        assert_eq!(
+            none["chains"],
+            serde_json::Value::Null,
+            "a run that could not compute a census records that, never a zero"
+        );
+
+        let summary = ChainSummary {
+            fusable_chains: 1,
+            fusable_hops: 2,
+            consumer_edges: 4,
+            longest_chain_nodes: 3,
+            queued_by_reason: vec![("fan-out".to_string(), 2)],
+            chains: vec![ChainDecl {
+                nodes: vec!["cam".to_string(), "rect".to_string(), "det".to_string()],
+                topics: vec!["/p/cam/out".to_string(), "/p/rect/out".to_string()],
+                head_level: 0,
+            }],
+        };
+        let doc: serde_json::Value =
+            serde_json::from_slice(&render_run_manifest(&base(Some(summary)), 1, tmp.path()))
+                .expect("manifest json");
+        let chains = &doc["chains"];
+        assert_eq!(chains["fusable_chains"], 1);
+        assert_eq!(chains["fusable_hops"], 2);
+        assert_eq!(chains["consumer_edges"], 4);
+        assert_eq!(chains["longest_chain_nodes"], 3);
+        assert_eq!(
+            chains["queued_by_reason"],
+            serde_json::json!([{ "reason": "fan-out", "edges": 2 }]),
+            "the reasons keep their ranking, so a reader can quote the top one"
+        );
+        assert_eq!(
+            chains["chains"],
+            serde_json::json!([{
+                "nodes": ["cam", "rect", "det"],
+                "topics": ["/p/cam/out", "/p/rect/out"],
+                "head_level": 0,
+            }]),
+            "a chain names its nodes head first and the topic of every hop"
+        );
+        // The census is a NEW key beside the ones a reader already uses; a
+        // renderer that replaced the object would be a broken reader.
+        assert_eq!(doc["graph_name"], "percept");
+        assert_eq!(doc["gating"], GatingClock::Wall.label());
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_declared_ring_reaches_the_recorders_own_reader_and_the_manifest_survives() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let spec = RunDescriptorSpec {
+            chains: None,
             run_id: mint_run_id(),
             graph_name: "percept",
             run_started_at_ns: 7,
@@ -2658,6 +2814,7 @@ mod tests {
     fn declaring_a_declined_run_writes_a_state_a_reader_can_act_on() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let spec = RunDescriptorSpec {
+            chains: None,
             run_id: mint_run_id(),
             graph_name: "percept",
             run_started_at_ns: 7,
@@ -2721,6 +2878,7 @@ mod tests {
     fn a_rank_that_could_not_create_its_ring_is_recorded_by_number() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let spec = RunDescriptorSpec {
+            chains: None,
             run_id: mint_run_id(),
             graph_name: "percept",
             run_started_at_ns: 7,
