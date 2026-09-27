@@ -139,7 +139,7 @@ combination is refused by name with the reason, never silently ignored.
 | `-r`, `--rate N` | playback | Playback rate multiplier. `1.0` = the recorded pace (default), `2.0` = twice as fast, `0.5` = half speed. Must be finite and `> 0`. |
 | `--loop` | playback | Restart at the beginning when the bag ends, until interrupted. |
 | `--topics TOPIC` | playback | Play only these topics (repeatable). A name the bag does not carry is a loud error listing what it does. |
-| `-s`, `--start-offset S` | playback | Skip the first `S` SECONDS of BAG TIME (fractional accepted). Per CHANNEL, measured from that channel's own first frame: wire stamps in different channels are different producers' clocks, so there is no one bag-wide `t0` to seek against. Re-applied on every `--loop` pass. Refused under `--resim` by name: re-executing from the middle needs a per-rank resume ANCHOR, which no recording carries. |
+| `-s`, `--start-offset S` | playback | Skip the first `S` SECONDS of BAG TIME (fractional accepted). Per CHANNEL, measured from that channel's own first frame: wire stamps in different channels are different producers' clocks, so there is no one bag-wide `t0` to seek against. Re-applied on every `--loop` pass. Refused under `--resim` by name: a resim re-executes from the anchor the recording carries, not from an arbitrary offset into it. |
 | `--resim <NODES\|all>` | n/a | RE-EXECUTE the bag's graph instead of republishing its frames. `all` re-executes every node; a node subset is not supported and is refused by name rather than widened to `all`. |
 | `--verify` | resim | Byte-compare every re-executed frame against the recording and apply the 0 to 6 exit contract. Without it, the run claims nothing and exits 0. |
 | `-u`, `--duration D` | both | Cover only the first `D` SECONDS of BAG TIME (fractional accepted). Playback stops republishing a channel once it has advanced that far through its OWN timeline, and it stays stopped for the rest of the pass, because the one way a later frame reads as back inside the window is a stamp that went BACKWARDS, which is a producer RESTART (the epoch reset) rather than a new window; a resim stops re-executing a rank once a recorded boundary reaches the run's bag-time ORIGIN plus `D`. The window is half-open on BOTH halves (ONE rule, `replay_rank::beyond_duration_bound`), so `--duration 0` covers nothing and a bound EXACTLY equal to a frame's (or a boundary's) own bag-time elapsed EXCLUDES it. (One rule for both halves matters: if playback excluded at `> D` while a resim excluded at `>= D`, `bag play --duration 0` would republish each channel's first frame while `bag play --resim all --duration 0` executed nothing.) Legal in both resim modes: it bounds the RUN, not the comparison. **The bound is in TIME, not in steps**: a per-rank resim has k step axes and no shared step number, while a bound in TIME has a shared ORIGIN: `replay_rank::run_epoch_ns`, the MINIMUM first-boundary target across the ranks. That is what makes `D` mean one thing for the whole run; it does NOT make the run rank-uniform. Under free-run each rank's clock starts at its own live-loop entry, so the ranks share an origin rather than an epoch value, `D` names one wall interval measured from that origin rather than each rank's own first `D` seconds, and a rank that entered later loses more of its OWN tail. Expect per-rank `ticks_replayed` under a bound to differ (see `rank_execution` in the report). `--max-ticks` is not accepted: it is clap's unknown-argument error (exit 2), never a silently accepted no-op. |
@@ -150,10 +150,10 @@ combination is refused by name with the reason, never silently ignored.
 Why the playback flags are refused under `--resim`: `--rate` has no wall pace to
 multiply (a resim runs on the recording's own gating clock), `--loop` would not
 re-execute the same starting state a second time, a resim's topic set follows
-the nodes that execute rather than a filter, and `--start-offset` would need a
-per-rank resume ANCHOR (the graph state each worker held at that instant),
-which is the same thing a mid-run free-run bag is refused for; neither
-is supported.
+the nodes that execute rather than a filter, and `--start-offset` would need an
+ANCHOR at an arbitrary instant (the graph state each worker held there), where
+a resim re-executes from the anchor the recording carries. Anchors at an
+arbitrary offset are not supported.
 
 `--duration` is the one bound that crosses the line, because it answers a
 question about the RUN rather than about the comparison: "how much of this
