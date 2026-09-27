@@ -232,6 +232,45 @@ and `docs/user-api.md` exists in the CLI, is enforced by the public-surface gate
 carries a markdown TABLE row, because a table cell is where those two pages spell their
 verbs.
 
+## The dependency-architecture rules
+
+Which crate may depend on what is an architecture decision, and each one was written as a
+sentence: in `.github/workflows/ci.yml`, in the root `Cargo.toml`, in a crate manifest
+header, in a crate `AGENTS.md`, or in `docs/internals/`. The machine half of every sentence
+is `crates/cerulion_hygiene/tests/dependency_rules_test.rs`, so an optional, renamed or
+transitive edge that breaks one fails `cargo test`. Each test quotes the sentence it
+enforces.
+
+| Test | The rule |
+|---|---|
+| `default_member_build_is_iroh_free` | A `cargo build` with no `-p` reaches the iroh tree. `cerulion_netd`, `cerulion_link`, `cerulion_wireclient`, `cerulion_remoted`, `cerulion_connectd` and `cerulion_accountd` are workspace members and not default members for this reason, and lean consumers of netd depend with `default-features = false`. |
+| `netd_per_package_build_pulls_the_iroh_wan_plane` | `cargo build -p cerulion_netd` stops reaching iroh, which means the shipped daemon lost the WAN plane that its `wan` feature carries by default. Also the positive control for the rule above: the two differ only in the root set. |
+| `default_member_build_is_rerun_free` | A `cargo build` with no `-p` reaches the Rerun SDK. Rasterization is desk-side, so `cerulion_viz` and `cerulion_vizd` build with `-p`. |
+| `desk_viz_still_pulls_rerun` | `cargo build -p cerulion_viz` stops reaching rerun, which means either the desk viz stack lost its render edge or the rule above probes nothing. |
+| `the_robot_demo_workspace_is_rerun_free` | Any `examples/go2` crate takes a rerun dependency of any kind. Read from that workspace's committed manifests and lockfile, so dev edges, build edges and every platform count. |
+| `the_robot_workspace_reader_sees_normal_and_dev_packages` | The reader above stops seeing `go2_tf` (normal) or `tempfile` (dev only), which means it is reading the wrong workspace or a lockfile that no longer covers it. |
+| `the_dds_stack_is_confined_to_cerulion_dds` | A second workspace member declares a DDS dependency, or the default build reaches the DDS stack along a route that avoids `cerulion_dds`. |
+| `the_lean_crates_declare_exactly_their_allowed_dependencies` | `cerulion_discovery` declares anything but serde, serde_json, dirs and tracing, or `cerulion_hygiene` anything but libc and tracing. Exact in both directions: an allowance nobody removed pre-authorises the next edge. |
+| `the_confined_crates_reach_nothing_they_forbid` | `cerulion_pairing` reaches iroh or rerun, `cerud` reaches iceoryx2 or zenoh, or `cerulion_link` reaches `cerulion_core`. |
+| `the_heavy_members_stay_out_of_default_members` | One of the eight deliberate `default-members` exclusions is back in the default set. Names the crate that would arrive with it. |
+| `the_forbidden_families_exist_in_this_workspace` | A family pattern matches no package in the resolve at all, which would let every rule written over it pass while proving nothing. |
+| `the_checker_reports_a_forbidden_crate_when_one_is_present` | The one checker every rule above calls stops reporting a violation under roots that carry one. |
+| `the_resolver_covers_every_package_cargo_tree_reports` | The dependency closure the rules are stated over misses a package `cargo tree -e normal` reports, which is a place a forbidden crate could sit unseen. A floor on the reported count keeps a broken `cargo tree` invocation from satisfying it with silence. |
+
+The rules are stated over `cargo metadata --format-version 1`, run once per test binary. The
+emitted `resolve.nodes` graph is not walked directly: it carries one feature set per package,
+unified across every member that selects it, so netd appears there with `wan` on and iroh
+attached even though the default build reaches netd through an edge that says
+`default-features = false`. The file runs cargo's feature algorithm itself from a chosen set
+of roots instead, and uses `resolve.nodes` only to map a manifest dependency onto the package
+id cargo picked for it. No target filtering is applied, so a `cfg(windows)` edge counts and
+the verdict is the same on every machine. The default-build rules walk normal AND build
+edges, because a build dependency on a forbidden crate compiles that crate during a
+`cargo build` exactly as a normal one does.
+
+The `iroh-leanness` and `rerun-leanness` jobs in `.github/workflows/ci.yml` assert the first
+five of these rules over `cargo tree`, and still run.
+
 ## The leak guard
 
 `tools/scripts/leak_scan.py` keeps machine names, addresses, home paths, logins, people and
