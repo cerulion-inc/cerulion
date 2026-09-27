@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # The public-surface review prompt
 
-This is the fixed prompt `.github/workflows/public-surface-review.yml` hands to
-the model on every pull request. It is in the tree, not in the workflow, so a
-change to what the review looks for is a reviewable diff of its own.
+This is the fixed prompt for the public-surface review, run locally over one
+pull request's diff. It is in the tree, so a change to what the review looks
+for is a reviewable diff of its own.
 
 It is the diff-scoped form of the from-scratch audit that produced the
 work-state gate's pattern keys. The patterns catch the wording they can name;
