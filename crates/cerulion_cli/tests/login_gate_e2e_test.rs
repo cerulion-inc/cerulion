@@ -6,18 +6,37 @@
 //! `ensure_login_gate` directly against a real account service and never spawns
 //! the binary.
 //!
-//! Self-contained: each test isolates `CERULION_HOME` to its own tempdir (never
-//! reads the real `~/.cerulion`) and runs from a non-workspace cwd, so it needs
-//! no fixtures and touches no shared state (parallel-safe, no `#[serial]`).
+//! Each test isolates `CERULION_HOME` to its own tempdir (never reads the real
+//! `~/.cerulion`) and runs from a non-workspace cwd, so the file needs no
+//! fixtures. Every arm but one touches nothing outside that tempdir, and no arm
+//! needs `#[serial]`.
 //!
-//! ONE arm is not purely local, and cannot be. `clean` is exempt precisely
-//! because it sweeps THIS machine's iceoryx2 bookkeeping, so the only way to
-//! prove the exemption at the boundary a user feels is to let that sweep run.
-//! It runs in the `--report-only` form, which removes no state file and no
-//! orphan port tag; the dead-node sweep it still performs is the same one
-//! `graph run` performs at its own startup and reaches provably dead nodes
-//! only, so nothing a concurrent test owns is reachable by it and the file
-//! stays parallel-safe.
+//! ## The one arm that reaches machine state
+//!
+//! `clean` is exempt precisely BECAUSE it sweeps this machine's iceoryx2
+//! bookkeeping, so proving the exemption at the boundary a user feels means
+//! letting that sweep run. This file does NOT claim that arm is hermetic. What
+//! it costs is bounded three ways:
+//!
+//! * it runs `--report-only`, which removes no `.shm_state` file and no orphan
+//!   port tag and skips the second sweep;
+//! * the dead-node sweep it still performs reaches only nodes iceoryx2 reports
+//!   as DEAD, and is the same sweep `graph run` performs at its own startup, so
+//!   a concurrent test's LIVE node is not reachable by it. Two processes
+//!   sweeping the same dead node is `lock contention`, which the report
+//!   classifies and the verb still exits 0 on;
+//! * the arm's assertions are a floor, never a fixture: exit 0, and the one
+//!   report line `shm_state::render_lines` emits on every path it can take.
+//!   Neither depends on what the registry happens to hold.
+//!
+//! Isolating it further is not reachable from a test. `Config::set_root_path`
+//! is an in-process call and the binary reads no environment variable for the
+//! root, so a SPAWNED `cerulion` cannot be pointed at a private registry
+//! without adding a production seam. `#[serial]` would buy nothing either: it
+//! is a mutex inside ONE test binary, while the default namespace is a machine
+//! resource other test binaries reach at the same moment. That is the same
+//! reasoning `trace_inspect_and_clean_cli_test.rs` records for the DESTRUCTIVE
+//! `cerulion clean` it already drives over the real binary.
 //!
 //! ## Which arm runs here, and why
 //!
