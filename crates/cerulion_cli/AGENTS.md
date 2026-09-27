@@ -26,20 +26,20 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 
 ## Testing
 
-- Wiring tests are binary-crate unit tests (no lib target):
-  `cargo test -p cerulion_cli --bin cerulion`. They move the process cwd + `HOME` under
-  a file-local mutex declared as the fixture's LAST field - Rust drops fields in
-  declaration order, so a mutex declared first releases before the env guards restore.
+- Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
+  They move the process cwd + `HOME` under a file-local mutex declared as the fixture's LAST
+  field, never the first (Rust drops fields in declaration order).
+- No `clean` arm may touch the machine's iceoryx2 registry: spawn from a temp cwd holding
+  `config/iceoryx2.toml` with a private `root-path` and require the report to name that root back
+  (`tests/trace_inspect_and_clean_cli_test.rs`).
 - The e2e binaries drive the REAL binary; run each `#[serial]` one individually with
   `-- --test-threads=1`. Build fixtures first:
-  - `replay_cli_test`: `cargo build -p test_node_macro_period_cdylib
-    -p test_node_macro_period_perturbed_cdylib -p test_node_macro_period_panic_cdylib
-    -p test_node_nondeterministic_cdylib`
+  - `replay_cli_test`: `cargo build -p test_node_macro_period_cdylib -p
+    test_node_macro_period_perturbed_cdylib -p test_node_macro_period_panic_cdylib -p test_node_nondeterministic_cdylib`
   - `mp_record_e2e_test`, `mp_auto_partition_e2e_test`, `network_gateway{,_mp}_e2e_test`:
     `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`
-  - `signal_matrix_e2e_test`: `cargo build -p test_node_macro_period_cdylib`
-  - `credit_death_e2e_test`: + `..._trigger_block_cdylib`. `mp_split_pair`:
-    `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`
+  - `signal_matrix_e2e_test`: `cargo build -p test_node_macro_period_cdylib`. `credit_death_e2e_test`: + `..._trigger_block_cdylib`.
+    `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`
 
 ## Gotchas
 
