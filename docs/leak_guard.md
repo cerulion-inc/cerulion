@@ -91,6 +91,13 @@ reds on prose is a guard nobody keeps. A repository whose name is a single word 
 separator is therefore invisible to the shape, which is exactly what the private tier's
 `repo-slug:` key is for.
 
+What the slug shape cannot tell apart is a closed repository from a name that was never a
+repository: the forge answers 404 to both. A slug shaped token that is not a reference at
+all, an `api_v2` written straight against a `#8`, therefore reads as one. Across the
+tracked tree that shape occurs zero times, and the fix where it does occur is one
+character: a space before the number sign (`api_v2 #8`) is prose, and the ask the
+conversation job posts says so. In a file, the line pragma says it once and for good.
+
 A finding prints the reference stripped to what a reader needs to find it on the line, an
 owner and a repository or a tracker host, never the full link, and both classes are
 identity bearing: the value prints only on a terminal with the private tier loaded, and

@@ -411,7 +411,7 @@ jobs:
             echo "already asked about this body"
           else
             printf '%s\n\n%s\n' \
-              "This text points at a repository or a tracker that people outside this project cannot open. Please edit the reference out, or replace it with a link anyone can follow. The reference itself is not printed anywhere by this check." \
+              "This text points at a repository or a tracker that people outside this project cannot open. Please edit the reference out, or replace it with a link anyone can follow, so that everyone reading can get to what it names. If it is not a repository reference at all, a space before the number sign is enough: \`name #8\` reads as prose, \`name#8\` reads as a repository. The reference itself is not printed anywhere by this check." \
               "$marker" | gh api "repos/$REPO/issues/$NUMBER/comments" -F body=@- >/dev/null
           fi
           echo "::error ::a reference in this body is not openable by a stranger"
