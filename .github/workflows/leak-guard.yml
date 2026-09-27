@@ -52,9 +52,9 @@ on:
   issues:
     types: [opened, edited]
   issue_comment:
-    types: [created, edited]
+    types: [created, edited, deleted]
   pull_request_review_comment:
-    types: [created, edited]
+    types: [created, edited, deleted]
 
 # The title and body come from the event payload, so no pull-requests scope is
 # needed; the three code jobs write nothing. The conversation job raises its own
@@ -344,6 +344,7 @@ jobs:
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
           EVENT_NAME: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
           LG_BODY: ${{ github.event.comment.body || github.event.issue.body }}
         run: |
           set -uo pipefail
@@ -352,8 +353,16 @@ jobs:
             *) label=comment-body ;;
           esac
           rc=0
-          python3 -B tools/scripts/leak_scan.py messages --require-private --format github \
-            --skip-code --body-env LG_BODY --body-label "$label" || rc=$?
+          if [ "${ACTION:-}" = deleted ]; then
+            # The text is gone, so there is nothing to scan and nothing to ask
+            # about. A deleted body is a CLEAN body: the step below takes back
+            # the ask left for it and clears the label if that was the last one,
+            # which is the only way a label on a deleted comment ever comes off.
+            echo "the body was deleted; treating it as clean"
+          else
+            python3 -B tools/scripts/leak_scan.py messages --require-private --format github \
+              --skip-code --body-env LG_BODY --body-label "$label" || rc=$?
+          fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
 
       # The job cannot stop the text from existing, so this is the whole
@@ -451,7 +460,12 @@ jobs:
             exit 0
           fi
 
-          gh api "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=leak" >/dev/null
+          # The ask goes up BEFORE the label, so the label is the last write this
+          # run makes. A clean run for another body that removed the label just
+          # before this point either sees the ask on one of its re-reads and puts
+          # the label back, or has already finished, and then the add below
+          # stands. Claiming the label first would leave a posted ask with no
+          # label whenever a clean run deleted it in between.
           asked=0
           while read -r id found; do
             [ "${found:-}" = "$marker" ] && asked=1
@@ -463,5 +477,6 @@ jobs:
               "This text points at a repository or a tracker that people outside this project cannot open. Please edit the reference out, or replace it with a link anyone can follow, so that everyone reading can get to what it names. If it is not a repository reference at all, a space before the number sign is enough: \`name #8\` reads as prose, \`name#8\` reads as a repository. The reference itself is not printed anywhere by this check." \
               "$marker" | gh api "repos/$REPO/issues/$NUMBER/comments" -F body=@- >/dev/null
           fi
+          gh api "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=leak" >/dev/null
           echo "::error ::a reference in this body is not openable by a stranger"
           exit 1

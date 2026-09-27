@@ -678,23 +678,48 @@ REF_DEADLINE = 120.0
 REF_AGENT = 'leak-scan (repository reachability check)'
 
 
-# A fenced block, and an inline code span of any backtick run length. Markdown
-# closes a span with a run of exactly the same length, and the forge does not
-# autolink anything inside either, so a reference there is a quotation of a
+# An inline code span of any backtick run length. Markdown closes a span with a
+# run of exactly the same length, and the forge does not autolink anything
+# inside a span or a fenced block, so a reference there is a quotation of a
 # reference and not one a reader can follow.
-FENCE_RX = re.compile(r'^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)',
-                      re.S | re.M)
 SPAN_RX = re.compile(r'(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)', re.S)
+FENCE_OPEN_RX = re.compile(r'[ \t]{0,3}(`{3,}|~{3,})')
+
+
+def _blank(text):
+    return re.sub(r'[^\n]', ' ', text)
 
 
 def blank_code(text):
     """`text` with every fenced block and inline code span replaced, character
     for character, by spaces. Length, line count and every offset are preserved,
     so a line number and a column still point where they did. Only the
-    conversation surfaces use this: in a source file a code span is just text."""
-    def spaces(m):
-        return re.sub(r'[^\n]', ' ', m.group(0))
-    return SPAN_RX.sub(spaces, FENCE_RX.sub(spaces, text))
+    conversation surfaces use this: in a source file a code span is just text.
+
+    Fences are walked line by line rather than matched by one regular
+    expression, because a closing fence is valid at the opener's length OR
+    LONGER and no backreference can say that. Getting it wrong is not a near
+    miss: an opener of three backticks closed by four would leave no close at
+    all, the block would run to the end of the body, and every reference after
+    it would be blanked out of the scan. An opener that is never closed does run
+    to the end, which is what the format says and what this does."""
+    out, fence = [], None
+    for line in text.split('\n'):
+        if fence is None:
+            m = FENCE_OPEN_RX.match(line)
+            # An opening backtick fence may not carry a backtick in its info
+            # string; that spelling is a code span, not a fence.
+            if m and not (m.group(1)[0] == '`' and '`' in line[m.end():]):
+                fence = (m.group(1)[0], len(m.group(1)))
+                out.append(_blank(line))
+                continue
+            out.append(line)
+            continue
+        out.append(_blank(line))
+        closing = re.fullmatch(r'[ \t]{0,3}(' + re.escape(fence[0]) + r'+)[ \t]*', line)
+        if closing and len(closing.group(1)) >= fence[1]:
+            fence = None
+    return SPAN_RX.sub(lambda m: _blank(m.group(0)), '\n'.join(out))
 
 
 def tracker_rx(hosts):
@@ -3057,7 +3082,7 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 216
+EXPECTED_ARMS = 218
 
 
 def _png(chunks):
@@ -4473,6 +4498,16 @@ def self_test(out, base_env, argv0):
             str(sorted(every)))
         arm('ref-with-skip-code-only-the-followable-reference-is-a-finding',
             rc2 == EXIT_HIT and kept == {(REF_DEFECT, 1)}, str(sorted(kept)))
+        arm('ref-a-longer-closing-fence-closes-the-block',
+            blank_code(tick * 3 + '\nhidden ' + RO + '/' + R_GONE + '#1\n' + tick * 4
+                       + '\nvisible ' + RO + '/' + R_GONE + '#2\n')
+            == '   \n' + ' ' * len('hidden ' + RO + '/' + R_GONE + '#1') + '\n    \n'
+               + 'visible ' + RO + '/' + R_GONE + '#2\n',
+            repr(blank_code(tick * 3 + '\nx\n' + tick * 4 + '\nvisible\n')))
+        arm('ref-an-unclosed-fence-runs-to-the-end',
+            blank_code(tick * 3 + '\na\nb\n') == '   \n \n \n'
+            and blank_code(tick * 3 + 'rust\na\n' + tick * 3 + '\nb\n')
+            == '       \n \n   \nb\n')
         arm('ref-blank-code-oracles',
             blank_code('a ' + tick + 'x' + tick + ' b') == 'a     b'
             and blank_code(tick * 3 + '\nq\n' + tick * 3 + '\nz\n')
