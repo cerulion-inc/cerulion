@@ -730,7 +730,7 @@ def tracker_rx(hosts):
                       + '|'.join(re.escape(h) for h in hosts) + r')(?![A-Za-z0-9.-])', re.I)
 
 
-def forge_status(owner, repo, remaining=None):
+def forge_status(owner, repo, remaining=None, clock=time.monotonic):
     """Ask the forge, as nobody in particular, whether a stranger gets a page.
     A HEAD for the repository's own page: no token, no credentials, no body, and
     to the host the reference names and to no other host. Returns the status
@@ -738,23 +738,38 @@ def forge_status(owner, repo, remaining=None):
     is retried once; the caller reads both as unverified.
 
     `remaining` is what is left of the run's whole time budget. It caps this
-    request's own timeout and it cancels the retry, so the budget binds the
-    request IN FLIGHT and not only the decision to start the next one."""
+    request's own timeout and it decides whether there is room to retry, so the
+    budget binds the request IN FLIGHT and not only the decision to start the
+    next one. The budget is spent as it goes: what the first attempt and the
+    backoff actually took is measured and subtracted before the retry is priced,
+    because pricing the retry off the figure handed in would let one request,
+    one sleep and one more request together run past the whole run's deadline.
+    `clock` is a seam for the self-test."""
     url = ('https' + '://' + FORGE_HOST + '/' + urllib.parse.quote(owner, safe='')
            + '/' + urllib.parse.quote(repo, safe=''))
     req = urllib.request.Request(url, method='HEAD',
                                  headers={'User-Agent': REF_AGENT, 'Accept': '*/*'})
-    left = REF_TIMEOUT if remaining is None else max(0.1, min(REF_TIMEOUT, remaining))
+    started = clock()
+
+    def left():
+        if remaining is None:
+            return REF_TIMEOUT
+        return min(REF_TIMEOUT, max(0.0, remaining - (clock() - started)))
+
     for attempt in (0, 1):
+        room = left()
         try:
-            with urllib.request.urlopen(req, timeout=left) as resp:
+            with urllib.request.urlopen(req, timeout=max(0.1, room)) as resp:
                 return resp.status
         except urllib.error.HTTPError as e:
             retryable = e.code == 429 or 500 <= e.code < 600
-            room = remaining is None or remaining > left + REF_BACKOFF
-            if attempt == 0 and retryable and room:
+            # Priced before the sleep, so a budget that cannot pay for the
+            # backoff plus one more attempt does not spend the backoff either,
+            # and priced again after it, on what the sleep actually cost.
+            if attempt == 0 and retryable and left() > REF_BACKOFF + 0.1:
                 time.sleep(REF_BACKOFF)
-                continue
+                if left() > 0.1:
+                    continue
             return e.code
         except Exception:
             return None
@@ -3092,7 +3107,7 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 220
+EXPECTED_ARMS = 222
 
 
 def _png(chunks):
@@ -4603,6 +4618,54 @@ def self_test(out, base_env, argv0):
             plain == 503 and full == ([REF_TIMEOUT, REF_TIMEOUT], [REF_BACKOFF])
             and starved == 503 and tight == ([0.1], []),
             'full=%s tight=%s' % (full, tight))
+        # A budget that can pay for one attempt but not for a second plus the
+        # backoff must not spend the backoff and must not run past the deadline.
+        # 7.6 seconds is the case that does it: a 6 second attempt, a 1.5 second
+        # sleep and a second 6 second attempt would be 13.5.
+        spent_clock, seen_t, slept_t = [0.0], [], []
+
+        def timed_open(req, timeout=None):
+            seen_t.append(timeout)
+            spent_clock[0] += REF_TIMEOUT
+            raise urllib.error.HTTPError(req.full_url, 503, 'busy', {}, None)
+
+        real_open, real_sleep = urllib.request.urlopen, time.sleep
+        urllib.request.urlopen = timed_open
+        time.sleep = lambda s: (slept_t.append(s),
+                                spent_clock.__setitem__(0, spent_clock[0] + s))
+        try:
+            code = forge_status(RO, R_PRIV, 7.6, clock=lambda: spent_clock[0])
+        finally:
+            urllib.request.urlopen, time.sleep = real_open, real_sleep
+        arm('ref-a-budget-that-cannot-pay-for-a-retry-does-not-spend-the-backoff',
+            code == 503 and seen_t == [REF_TIMEOUT] and slept_t == []
+            and spent_clock[0] <= 7.6,
+            'seen=%s slept=%s spent=%s' % (seen_t, slept_t, spent_clock[0]))
+        # The backoff can cost far more than it asked for: a descheduled process
+        # wakes late, and a suspended one wakes much later. The budget is priced
+        # again after the sleep on what the clock actually says, so a retry that
+        # was affordable when it was decided on is dropped when it no longer is.
+        # Without the second pricing the run would go on to spend another whole
+        # request past its deadline.
+        slow_clock, seen_s, slept_s = [0.0], [], []
+
+        def slow_open(req, timeout=None):
+            seen_s.append(timeout)
+            slow_clock[0] += 1.0
+            raise urllib.error.HTTPError(req.full_url, 503, 'busy', {}, None)
+
+        real_open, real_sleep = urllib.request.urlopen, time.sleep
+        urllib.request.urlopen = slow_open
+        # the sleep is asked for REF_BACKOFF and takes thirty seconds
+        time.sleep = lambda s: (slept_s.append(s),
+                                slow_clock.__setitem__(0, slow_clock[0] + 30.0))
+        try:
+            late = forge_status(RO, R_PRIV, 20.0, clock=lambda: slow_clock[0])
+        finally:
+            urllib.request.urlopen, time.sleep = real_open, real_sleep
+        arm('ref-a-backoff-that-overran-cancels-the-retry-it-had-earned',
+            late == 503 and slept_s == [REF_BACKOFF] and len(seen_s) == 1,
+            'seen=%s slept=%s' % (seen_s, slept_s))
         # the deadline: a count alone is not a bound, so an injected clock proves
         # the run stops asking and reports unverified instead of running long
         ticks = [0.0]
