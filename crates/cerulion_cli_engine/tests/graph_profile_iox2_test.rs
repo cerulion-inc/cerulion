@@ -812,6 +812,10 @@ fn starved_isolation_gate_classifies_only_the_rate_collapse_signature() {
 // Arm 1: gate-met happy path.
 // ==========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, and a profile run builds several, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn gate_met_profile_writes_full_artifact_no_isolated() {
@@ -911,6 +915,10 @@ fn gate_met_profile_writes_full_artifact_no_isolated() {
 // Arm 2: cap-hit adversarial — unreachable target, artifact still written.
 // ==========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, and a profile run builds several, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn cap_hit_isolates_undersampled_nodes_and_still_writes_artifact() {
@@ -981,6 +989,10 @@ fn cap_hit_isolates_undersampled_nodes_and_still_writes_artifact() {
 // Arm 3: shape determinism across two runs (+ the out_path override).
 // ==========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, and a profile run builds several, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn two_runs_agree_on_artifact_shape() {
@@ -1039,6 +1051,10 @@ fn two_runs_agree_on_artifact_shape() {
 // a durable artifact.
 // ==========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, and a profile run builds several, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn pre_stopped_running_flag_still_writes_isolated_artifact() {
@@ -1103,6 +1119,10 @@ fn build_workspace_with_silent(root: &Path, prefix: &str) {
     .unwrap();
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, and a profile run builds several, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[tracing_test::traced_test]
 #[test]
 #[serial]
@@ -1184,6 +1204,10 @@ fn capped_ring_warns_and_still_costs_flooding_nodes() {
 // would have isolated the whole graph.
 // ==========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, and a profile run builds several, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn auto_derive_costs_low_rate_graph_not_isolated() {
@@ -1457,6 +1481,10 @@ fn auto_derive_silent_node_isolates_with_no_target_marker_and_starved_hint() {
 // only defense against it).
 // ==========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, and a profile run builds several, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[tracing_test::traced_test]
 #[test]
 #[serial]
@@ -1551,6 +1579,10 @@ fn auto_mode_early_stop_costs_sampled_nodes_not_isolated() {
 // costed assert dies too).
 // ==========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, and a profile run builds several, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[tracing_test::traced_test]
 #[test]
 #[serial]

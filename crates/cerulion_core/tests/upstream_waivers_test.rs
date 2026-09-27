@@ -51,78 +51,118 @@
 use std::path::{Path, PathBuf};
 
 /// `<binary>::<test>` for every arm carrying the 2034 macOS waiver.
+/// Every arm carrying the 2034 macOS waiver, as `(path from the workspace root,
+/// test name)`.
+///
+/// Workspace rooted for the same reason the 2035 list is: a waiver inventory
+/// scoped to the crate where a defect was first seen is incomplete by
+/// construction. This one was core only until CI found eight more in the CLI
+/// engine, whose profile runs build several plugin graphs in one process, which
+/// is the defect's exact trigger.
 const WAIVED_2034: &[(&str, &str)] = &[
     (
-        "cdylib_block_degrade_test",
+        "crates/cerulion_core/tests/cdylib_block_degrade_test.rs",
         "dylib_block_degrade_is_deterministic",
     ),
     (
-        "cdylib_collapse_no_publish_test",
+        "crates/cerulion_core/tests/cdylib_collapse_no_publish_test.rs",
         "cdylib_pre_first_delivery_never_publishes_is_deterministic",
     ),
     (
-        "cdylib_dropoldest_overflow_test",
+        "crates/cerulion_core/tests/cdylib_dropoldest_overflow_test.rs",
         "slow_cdylib_consumer_overflow_is_deterministic",
     ),
     (
-        "cdylib_non_trigger_hold_test",
+        "crates/cerulion_core/tests/cdylib_non_trigger_hold_test.rs",
         "cdylib_hold_replay_is_deterministic",
     ),
     (
-        "cdylib_portwrite_e2e_test",
+        "crates/cerulion_core/tests/cdylib_portwrite_e2e_test.rs",
         "cdylib_and_in_process_twin_produce_byte_identical_payloads",
     ),
     (
-        "cdylib_qos_behavioral_test",
+        "crates/cerulion_core/tests/cdylib_qos_behavioral_test.rs",
         "qos_watchdog_counters_are_deterministic",
     ),
     (
-        "cdylib_qos_behavioral_test",
+        "crates/cerulion_core/tests/cdylib_qos_behavioral_test.rs",
         "sample_decimation_on_dylib_is_deterministic",
     ),
     (
-        "cdylib_sync_backpressure_parity_test",
+        "crates/cerulion_core/tests/cdylib_sync_backpressure_parity_test.rs",
         "a_block_producer_stops_at_the_declared_depth_through_the_ffi",
     ),
     (
-        "cdylib_sync_backpressure_parity_test",
+        "crates/cerulion_core/tests/cdylib_sync_backpressure_parity_test.rs",
         "a_sample_gate_decides_which_frames_are_eligible_to_align_through_the_ffi",
     ),
     (
-        "cdylib_sync_backpressure_parity_test",
+        "crates/cerulion_core/tests/cdylib_sync_backpressure_parity_test.rs",
         "the_block_contract_is_identical_in_process_and_through_the_ffi",
     ),
     (
-        "cdylib_sync_backpressure_parity_test",
+        "crates/cerulion_core/tests/cdylib_sync_backpressure_parity_test.rs",
         "the_sample_contract_is_identical_in_process_and_through_the_ffi",
     ),
     (
-        "cdylib_sync_backpressure_parity_test",
+        "crates/cerulion_core/tests/cdylib_sync_backpressure_parity_test.rs",
         "two_dylib_runs_are_byte_identical",
     ),
     (
-        "cdylib_sync_nontrigger_test",
+        "crates/cerulion_core/tests/cdylib_sync_nontrigger_test.rs",
         "determinism_two_dylib_runs_byte_identical",
     ),
     (
-        "cdylib_sync_nontrigger_test",
+        "crates/cerulion_core/tests/cdylib_sync_nontrigger_test.rs",
         "in_process_twin_parity_identical_sequence",
     ),
     (
-        "cdylib_unbounded_sync_fire_test",
+        "crates/cerulion_core/tests/cdylib_unbounded_sync_fire_test.rs",
         "fire_and_delivery_are_deterministic",
     ),
     (
-        "cdylib_unified_drain_test",
+        "crates/cerulion_core/tests/cdylib_unified_drain_test.rs",
         "seam_forces_cdylib_back_to_separate_byte_identical",
     ),
     (
-        "chunk_c_ffi_error_test",
+        "crates/cerulion_core/tests/chunk_c_ffi_error_test.rs",
         "cdylib_tick_lifecycle_codes_1_and_2",
     ),
     (
-        "rayon_fire_cdylib_serial_test",
+        "crates/cerulion_core/tests/rayon_fire_cdylib_serial_test.rs",
         "cdylib_gated_serial_trace_byte_identical_parallel_vs_serial",
+    ),
+    (
+        "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
+        "auto_derive_costs_low_rate_graph_not_isolated",
+    ),
+    (
+        "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
+        "auto_mode_early_stop_costs_sampled_nodes_not_isolated",
+    ),
+    (
+        "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
+        "auto_mode_ring_sized_from_max_samples_no_capped_warn",
+    ),
+    (
+        "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
+        "cap_hit_isolates_undersampled_nodes_and_still_writes_artifact",
+    ),
+    (
+        "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
+        "capped_ring_warns_and_still_costs_flooding_nodes",
+    ),
+    (
+        "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
+        "gate_met_profile_writes_full_artifact_no_isolated",
+    ),
+    (
+        "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
+        "pre_stopped_running_flag_still_writes_isolated_artifact",
+    ),
+    (
+        "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
+        "two_runs_agree_on_artifact_shape",
     ),
 ];
 
@@ -159,6 +199,13 @@ fn tests_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")
 }
 
+/// Read a file named by a path relative to the workspace root.
+fn read_at(rel: &str) -> String {
+    let p = workspace_root().join(rel);
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{} is readable: {e}", p.display()))
+}
+
+#[allow(dead_code)]
 fn read(binary: &str) -> String {
     let p: PathBuf = tests_dir().join(format!("{binary}.rs"));
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{} is readable: {e}", p.display()))
@@ -221,7 +268,7 @@ fn both_waivers_are_pinned_to_the_iceoryx2_release_they_describe() {
 #[test]
 fn every_declared_2034_arm_carries_a_macos_scoped_ignore_that_names_the_defect() {
     for (binary, test) in WAIVED_2034 {
-        let src = read(binary);
+        let src = read_at(binary);
         let needle = format!("\nfn {test}(");
         assert!(
             src.contains(&needle),
@@ -260,7 +307,7 @@ fn every_declared_2034_arm_carries_a_macos_scoped_ignore_that_names_the_defect()
 #[cfg(not(target_os = "macos"))]
 fn on_this_platform_no_waived_arm_is_actually_ignored() {
     for (binary, test) in WAIVED_2034 {
-        let src = read(binary);
+        let src = read_at(binary);
         let at = src
             .find(&format!("\nfn {test}("))
             .unwrap_or_else(|| panic!("{binary}::{test} exists"));
