@@ -65,6 +65,7 @@ use cerulion_viz::sink::{
     SinkState,
 };
 use cerulion_viz::tf::{frame_id_of, FrameRegistry};
+use rerun::external::arrow::array::Array;
 
 use common::all_schemas;
 
@@ -83,30 +84,53 @@ float32[2] origin
 float32[] data
 ";
 
-/// The built-in schema set PLUS `unitree_go/HeightMap`.
-fn schemas_with_height_map() -> Vec<MessageSchema> {
+/// A camera message with a `std_msgs/Header` in front of the Go2's
+/// `/frontvideostream` fields. The real Go2 type carries NO header (which is
+/// why `video_h264_test.rs`'s `probe/VideoProbe` has none and never resolves a
+/// frame there); this shape is what a camera that states its mount looks like,
+/// and `header.frame_id` is what the sink poses the rendition child by. Declared
+/// here so the video arm runs through the SAME walker and tf tree as every other
+/// posed topic in this file.
+const STAMPED_VIDEO_MSG: &str = "\
+std_msgs/Header header
+uint64 time_frame
+uint32 video_height
+uint8[] video_data
+";
+const STAMPED_VIDEO_QNAME: &str = "probe/StampedVideo";
+
+/// The built-in schema set PLUS `unitree_go/HeightMap` and `probe/StampedVideo`.
+fn schemas_under_test() -> Vec<MessageSchema> {
     let mut schemas = all_schemas();
     schemas.push(
         parse_rosmsg(HEIGHT_MAP_MSG, "HeightMap", Some("unitree_go")).expect("HeightMap parses"),
+    );
+    schemas.push(
+        parse_rosmsg(STAMPED_VIDEO_MSG, "StampedVideo", Some("probe"))
+            .expect("StampedVideo parses"),
     );
     schemas
 }
 
 fn walker() -> FrameWalker {
-    FrameWalker::new(schemas_with_height_map()).0
+    FrameWalker::new(schemas_under_test()).0
 }
 
 fn layout_of(qname: &str) -> WireLayout {
-    let (mut resolver, _) = LayoutResolver::new(schemas_with_height_map());
+    let (mut resolver, _) = LayoutResolver::new(schemas_under_test());
     resolver.layout_of(qname).expect("schema resolves")
 }
 
-fn height_map_schema_hash() -> u64 {
-    schemas_with_height_map()
+fn schema_hash_of(qname: &str) -> u64 {
+    schemas_under_test()
         .iter()
-        .find(|s| s.qualified_name() == "unitree_go/HeightMap")
-        .expect("HeightMap in the set")
+        .find(|s| s.qualified_name() == qname)
+        .unwrap_or_else(|| panic!("{qname} in the set"))
         .schema_hash()
+}
+
+fn height_map_schema_hash() -> u64 {
+    schema_hash_of("unitree_go/HeightMap")
 }
 
 /// Write one 8-byte offset-table entry (`offset` u32, `length` u32) at
@@ -414,6 +438,13 @@ struct Logged {
     /// renames the frame the entity DEFINES. Must stay empty: the skeleton's
     /// links chain to the robot root's IMPLICIT (path-derived) child frame.
     child_frames: Vec<(String, String)>,
+    /// The entity of every decoded-picture ROW (`Image:buffer`). Proves the
+    /// picture arm of `render_video_sample` ran, so a `CoordinateFrame`
+    /// assertion on the rendition child is not vacuous.
+    pictures: Vec<String>,
+    /// The entity of every `VideoStream:sample` row: the viewer-decodes
+    /// fallback, reached only when this desk has no decoder.
+    viewer_samples: Vec<String>,
 }
 
 impl Logged {
@@ -462,6 +493,17 @@ fn logged(storage: &rerun::sink::MemorySinkStorage) -> Logged {
                     }
                 }
                 "Transform3D:translation" | "Transform3D:quaternion" => is_transform = true,
+                // Counted in ROWS, not chunks: rerun compacts same-entity logs.
+                d if d.contains("Image:buffer") => {
+                    for _ in 0..list.list_array.len() {
+                        out.pictures.push(entity.clone());
+                    }
+                }
+                d if d.contains("VideoStream:sample") => {
+                    for _ in 0..list.list_array.len() {
+                        out.viewer_samples.push(entity.clone());
+                    }
+                }
                 _ => {}
             }
         }
@@ -2115,5 +2157,265 @@ fn a_tf_message_logs_no_transform_at_its_route_entity() {
         l.parent_frame_of("world/tf-tree/odom/base/wrist_mount"),
         Some(None),
         "{l:?}"
+    );
+}
+
+// ── 14. the video rendition CHILD is posed by the same mechanism ─────────────
+//
+// `render_video_sample` logs the decoded picture on a CHILD of the topic entity
+// (`<entity>/viz-video/WxH`), and a child's implicit frame chains to its PATH
+// parent, not to the frame the parent was re-pointed at (the `sweep/0` lesson
+// in section 3): a `CoordinateFrame` only at the bare topic entity leaves the
+// picture at the world origin. So the child needs its OWN row, written with the
+// frame the picture's own unit resolved to, deduped per entity like every data
+// topic. Every other video test in this crate dispatches `probe/VideoProbe`,
+// which has no header, so `resolved_frame` is `None` there and nothing observes
+// these rows: deleting both `emit_frame_at` calls in `render_video_sample`
+// leaves the rest of the suite green and fails the tests below.
+
+/// Eleven consecutive access units of the Go2's 360p rendition: the keyframe
+/// and the ten P-frames after it (provenance and the unit-split rule are on the
+/// same constant in `video_decode_test.rs`). REAL bytes, because the picture
+/// arm runs only when openh264 actually yields a picture, and it holds each
+/// picture for one call: N units render N - 1 pictures.
+const GO2_REAL_GOP: &[u8] = include_bytes!("fixtures/go2_frontvideostream_360p_gop_11au.h264");
+
+/// The first `n` access units of [`GO2_REAL_GOP`]. A unit begins at every
+/// type-7 (SPS) and type-1 (non-IDR slice) NAL: the stream carries no access
+/// unit delimiter and every unit is either a lone non-IDR slice or exactly
+/// `SPS, PPS, IDR`, a shape `video_decode_test.rs` asserts on the bytes.
+fn go2_units(n: usize) -> Vec<&'static [u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0usize;
+    while i + 5 <= GO2_REAL_GOP.len() {
+        if GO2_REAL_GOP[i..i + 4] == [0, 0, 0, 1] {
+            let kind = GO2_REAL_GOP[i + 4] & 0x1F;
+            if kind == 7 || kind == 1 {
+                starts.push(i);
+            }
+            i += 5;
+            continue;
+        }
+        i += 1;
+    }
+    assert!(starts.len() > n, "fixture must carry more than {n} units");
+    (0..n)
+        .map(|k| &GO2_REAL_GOP[starts[k]..starts[k + 1]])
+        .collect()
+}
+
+/// The `video_height` the real 360p capture reports in its own field.
+const GO2_360P_REPORTED_HEIGHT: u32 = 360;
+
+/// Build a `probe/StampedVideo` frame carrying `au` under `header.frame_id`.
+/// Variable declaration order header(0) / video_data(1).
+fn build_stamped_video_frame(
+    frame_id: &str,
+    time_frame: u64,
+    au: &[u8],
+    timestamp_ns: u64,
+) -> Vec<u8> {
+    let layout = layout_of(STAMPED_VIDEO_QNAME);
+    assert_eq!(
+        layout
+            .variable_fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["header", "video_data"],
+        "StampedVideo variable-field declaration order changed - update this builder"
+    );
+    let fixed = layout.fixed_size;
+    let table = layout.offset_table_bytes();
+    let fixed_off = |name: &str| {
+        layout
+            .fixed_fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("StampedVideo has no fixed field '{name}'"))
+            .offset
+    };
+
+    let hdr = header_body(frame_id);
+    let mut payload = vec![0u8; fixed + table];
+    let tf_off = fixed_off("time_frame");
+    payload[tf_off..tf_off + 8].copy_from_slice(&time_frame.to_le_bytes());
+    let vh_off = fixed_off("video_height");
+    payload[vh_off..vh_off + 4].copy_from_slice(&GO2_360P_REPORTED_HEIGHT.to_le_bytes());
+
+    let hdr_off = (fixed + table) as u32;
+    let data_off = hdr_off + hdr.len() as u32;
+    write_offset_entry(&mut payload, fixed, 0, hdr_off, hdr.len() as u32);
+    write_offset_entry(&mut payload, fixed, 1, data_off, au.len() as u32);
+    payload.extend_from_slice(&hdr);
+    payload.extend_from_slice(au);
+
+    frame_with_header(
+        schema_hash_of(STAMPED_VIDEO_QNAME),
+        fixed,
+        2,
+        timestamp_ns,
+        payload,
+    )
+}
+
+/// The frame the camera is mounted in, placed by `/tf` (`base -> head_cam_mount`)
+/// so resolution runs through the observed-transform path. NOT one of the
+/// built-in aliases (`front_camera`, `camera_link`, ...): those resolve with no
+/// `/tf` at all, which would leave the observation path unexercised.
+const CAMERA_FRAME: &str = "head_cam_mount";
+const CAMERA_FRAME_ENTITY: &str = "tf#/world/tf-tree/odom/base/head_cam_mount";
+const CAMERA_TOPIC: &str = "/go2/camera/h264";
+
+/// `/tf` places [`CAMERA_FRAME`], then `units` arrive on [`CAMERA_TOPIC`], each
+/// stamped `frame_id`, at distinct wire stamps.
+fn dispatch_camera(
+    rec: &rerun::RecordingStream,
+    walker: &FrameWalker,
+    frame_id: &str,
+    units: &[&[u8]],
+    state: &mut SinkState,
+) {
+    dispatch(
+        rec,
+        walker,
+        "/tf",
+        &[build_tf_frame("base", CAMERA_FRAME, 1_000)],
+        state,
+    );
+    let frames: Vec<Vec<u8>> = units
+        .iter()
+        .enumerate()
+        .map(|(n, au)| build_stamped_video_frame(frame_id, n as u64, au, 2_000 + n as u64 * 33_000))
+        .collect();
+    dispatch(rec, walker, CAMERA_TOPIC, &frames, state);
+    rec.flush_blocking().expect("flush");
+}
+
+/// The frames logged at exactly `entity`, in log order.
+fn rows_at<'a>(rows: &'a [(String, String)], entity: &str) -> Vec<&'a str> {
+    rows.iter()
+        .filter(|(e, _)| e == entity)
+        .map(|(_, f)| f.as_str())
+        .collect()
+}
+
+#[test]
+fn a_decoded_picture_poses_the_video_child_in_its_units_frame() {
+    let _g = rerun_lock();
+    let (rec, storage) = memory_sink("video_child_posed");
+    let walker = walker();
+    let mut state = SinkState::new();
+    assert!(
+        state.video_decoders().is_available(),
+        "this test build compiles the decoder in; the picture arm is the one under test"
+    );
+
+    // THREE units: openh264 holds each picture for one call, so three units
+    // yield TWO pictures, and two pictures are what make the per-entity dedup
+    // on the child observable (one row, not one per picture).
+    let units = go2_units(3);
+    dispatch_camera(&rec, &walker, CAMERA_FRAME, &units, &mut state);
+
+    let l = logged(&storage);
+    let entity = entity_of(CAMERA_TOPIC);
+    assert_eq!(entity, "world/go2/camera/h264");
+    // 640x360 is what the real SPS decodes to (`video_h264_test.rs` cross-checks
+    // it against the capture's own `video_height`).
+    let child = format!("{entity}/viz-video/640x360");
+    // The arm RAN: two pictures on the child, none handed to the viewer.
+    assert_eq!(l.pictures, vec![child.clone(), child.clone()], "{l:?}");
+    assert!(
+        l.viewer_samples.is_empty(),
+        "a desk with a decoder hands the viewer no samples: {l:?}"
+    );
+    // The child is posed in the mounted camera frame, EXACTLY once for two
+    // pictures...
+    assert_eq!(
+        rows_at(&l.coordinate_frames, &child),
+        vec![CAMERA_FRAME_ENTITY],
+        "{l:?}"
+    );
+    // ...and the bare topic entity carries its own, separate row (once for
+    // three units).
+    assert_eq!(
+        rows_at(&l.coordinate_frames, &entity),
+        vec![CAMERA_FRAME_ENTITY],
+        "{l:?}"
+    );
+}
+
+/// The no-decoder arm: the access unit itself goes to the viewer at its own
+/// stamp, and the child is posed the same way. Cisco's blob being absent is
+/// unreachable in this build (its tests enable `decoder-from-source`), so the
+/// pool's own seam stands in for it.
+#[test]
+fn with_no_decoder_the_video_child_is_still_posed_in_its_units_frame() {
+    let _g = rerun_lock();
+    let (rec, storage) = memory_sink("video_child_posed_no_decoder");
+    let walker = walker();
+    let mut state = SinkState::new();
+    state.set_video_decoders(
+        cerulion_viz::video_decode::VideoDecoders::unavailable_for_test(
+            "test: no Cisco blob cached",
+        ),
+    );
+
+    let units = go2_units(2);
+    dispatch_camera(&rec, &walker, CAMERA_FRAME, &units, &mut state);
+
+    let l = logged(&storage);
+    let entity = entity_of(CAMERA_TOPIC);
+    let child = format!("{entity}/viz-video/640x360");
+    // The fallback RAN: one viewer sample per unit on the child, no picture.
+    assert_eq!(
+        l.viewer_samples,
+        vec![child.clone(), child.clone()],
+        "{l:?}"
+    );
+    assert!(
+        l.pictures.is_empty(),
+        "a desk with no decoder cannot have produced a picture: {l:?}"
+    );
+    // Posed once for two units, on the child and on the topic entity.
+    assert_eq!(
+        rows_at(&l.coordinate_frames, &child),
+        vec![CAMERA_FRAME_ENTITY],
+        "{l:?}"
+    );
+    assert_eq!(
+        rows_at(&l.coordinate_frames, &entity),
+        vec![CAMERA_FRAME_ENTITY],
+        "{l:?}"
+    );
+}
+
+/// The ABSENCE pin: a camera stamped with a frame `/tf` never placed still
+/// renders (unposed beats a black pane) but gets NO fabricated pose, at the
+/// child or at the topic entity.
+#[test]
+fn an_unplaceable_camera_frame_leaves_the_video_child_unposed() {
+    let _g = rerun_lock();
+    let (rec, storage) = memory_sink("video_child_unplaced");
+    let walker = walker();
+    let mut state = SinkState::new();
+
+    // /tf places `head_cam_mount`; the topic claims a frame /tf never mentioned.
+    let units = go2_units(3);
+    dispatch_camera(
+        &rec,
+        &walker,
+        "camera_optical_unmounted",
+        &units,
+        &mut state,
+    );
+
+    let l = logged(&storage);
+    let entity = entity_of(CAMERA_TOPIC);
+    let child = format!("{entity}/viz-video/640x360");
+    assert_eq!(l.pictures, vec![child.clone(), child], "{l:?}");
+    assert!(
+        l.coordinate_frames.is_empty(),
+        "an unplaceable frame poses nothing: {l:?}"
     );
 }

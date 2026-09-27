@@ -179,7 +179,16 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   frame. Pinned by
   `a_delayed_picture_keeps_its_own_units_frame_across_repeated_and_regressing_stamps`,
   `a_picture_held_across_a_long_refusal_run_keeps_its_units_frame` and
-  `a_parameter_set_only_unit_takes_no_place_in_the_feed_order_queue`.
+  `a_parameter_set_only_unit_takes_no_place_in_the_feed_order_queue`. At the
+  sink, the rendition child (`<entity>/viz-video/WxH`) gets its OWN
+  `CoordinateFrame` row: a child's implicit frame chains to its path parent,
+  so a row only at the topic entity would leave the picture at the world
+  origin. Pinned in `coordinate_frame_test.rs` by
+  `a_decoded_picture_poses_the_video_child_in_its_units_frame` (decoded on
+  this desk), `with_no_decoder_the_video_child_is_still_posed_in_its_units_frame`
+  (the viewer-decodes fallback) and
+  `an_unplaceable_camera_frame_leaves_the_video_child_unposed` (no fabricated
+  pose).
 - The rerun gRPC client does NOT auto-reconnect after a server bounce; the viz
   worker owns reconnect orchestration (`reconnect_test.rs`).
 
