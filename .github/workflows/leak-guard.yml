@@ -369,17 +369,19 @@ jobs:
           # The marker names the surface and digests the text that was refused,
           # so one body is asked once however often it is rescanned, and an edit
           # that leaves the reference in place is a new ask.
+          asks="${RUNNER_TEMP:-/tmp}/leak-guard-asks.txt"
           scope=${COMMENT_ID:-body}
           digest=$(printf '%s' "$LG_BODY" | sha256sum | cut -c1-16)
           prefix="<!--leak-guard:$EVENT_NAME:$scope:"
           marker="$prefix$digest-->"
-          # One read of the thread, into a file. Nothing is piped into a reader
+          # One read of the thread, into a file outside the checkout. Nothing is
+          # piped into a reader
           # that may stop early: under pipefail that reads as a failed lookup and
           # the ask would be posted twice.
           gh api --paginate "repos/$REPO/issues/$NUMBER/comments" \
             --jq '.[] | select(.body | test("<!--leak-guard:"))
                   | "\(.id) \(.body | match("<!--leak-guard:[^>]*-->").string)"' \
-            > asks.txt || : > asks.txt
+            > "$asks" || : > "$asks"
 
           if [ "$RC" = 0 ]; then
             others=0
@@ -390,7 +392,7 @@ jobs:
                               >/dev/null 2>&1 || true ;;
                 *) others=1 ;;
               esac
-            done < asks.txt
+            done < "$asks"
             if [ "$others" = 0 ]; then
               gh api "repos/$REPO/issues/$NUMBER/labels/leak" -X DELETE >/dev/null 2>&1 || true
               echo "clean, and no ask is outstanding on this thread"
@@ -404,7 +406,7 @@ jobs:
           asked=0
           while read -r id found; do
             [ "${found:-}" = "$marker" ] && asked=1
-          done < asks.txt
+          done < "$asks"
           if [ "$asked" = 1 ]; then
             echo "already asked about this body"
           else
