@@ -94,6 +94,12 @@ const REGION: &[Scanned] = &[
             "partial history can only fail to withhold budget.",
             "partial listing it happily evicts real captures to satisfy a",
             "partial listing makes the plan DELETE captures it should",
+            // READ BY A PERSON, and kept rather than reworded: the word here is
+            // the NAME of the recorder's rule, whose canonical statement is the
+            // `anchor_window.rs` module-doc heading this list already allows on
+            // that file's line. The sentence CITES the rule; it does not give
+            // the resim verdict's word a second meaning.
+            "rule is STRICTLY NEVER SILENTLY PARTIAL. A member that reached",
         ],
     },
     Scanned {
@@ -299,7 +305,7 @@ fn every_allow_entry_matches_a_line_and_the_region_is_not_empty() {
 /// A LITERAL, and the only number in this file. It moves only when a person has
 /// read the sentence that moved it, which is what makes it a control rather
 /// than a second copy of the list's length.
-const ALLOW_LIST_ENTRIES: usize = 90;
+const ALLOW_LIST_ENTRIES: usize = 91;
 
 /// ORACLE 15, arm (a): the SIX operator-facing sentences say the new fact, in
 /// their new wording, naming the rank whose records are LACKING.

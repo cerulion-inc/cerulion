@@ -2219,7 +2219,7 @@ pub(crate) fn rank_anchor_spans(achieved_from_ns: Option<u64>, taken_at_ns: u64)
 ///
 /// For k=1 the two rules are the same number and the field docs' "at most one
 /// of the two is nonzero" holds exactly as it did. For k>1 BOTH may read
-/// nonzero, and that is the honest report of a set that STRADDLES the achieved
+/// nonzero, and that is what is true of a set that STRADDLES the achieved
 /// reach: one rank's member sits inside the frames the bag carries and
 /// another's sits before them. A reader that needs to know which side a
 /// particular rank is on reads that rank's own entry in `per_rank`, which is
@@ -3321,7 +3321,7 @@ mod tests {
         }
     }
 
-    /// ORACLE 6, the MANIFEST half, RESTATED HONESTLY: a k=1 capture's manifest
+    /// ORACLE 6, the MANIFEST half, RESTATED EXACTLY: a k=1 capture's manifest
     /// is the parent's plus EXACTLY the two additive keys, `per_rank` and
     /// `missing_ranks`, and nothing else moves.
     ///

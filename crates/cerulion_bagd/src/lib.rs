@@ -16788,8 +16788,8 @@ impl Recorder {
                             .collect(),
                     };
                     // The two spans are folded APART, each the largest over the
-                    // ranks, so for k>1 both may read nonzero. That is the honest
-                    // report of a set that STRADDLES the achieved reach: one
+                    // ranks, so for k>1 both may read nonzero. That is what is
+                    // true of a set that STRADDLES the achieved reach: one
                     // rank's member sits inside the frames the bag carries and
                     // another's sits before them, and which rank is on which side
                     // is in `per_rank`. For k=1 the pair is unchanged, so the
