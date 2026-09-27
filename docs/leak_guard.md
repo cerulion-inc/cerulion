@@ -10,7 +10,10 @@ workflow, and the `Leak guard` workflow on every pull request, merge queue batch
 push to `main`, and on every issue and comment body as it is written or edited.
 
 A body is public the moment it is written and no check runs before it is, so that last
-job cannot block anything. On a finding it applies the `leak` label, asks the author once
+job cannot block anything. It reads what people write and skips what bots write: a review
+bot quotes example references in its findings, an example has the shape of the thing it is
+an example of, and its text is machine written from a diff the other three jobs already
+gate. On a finding it applies the `leak` label, asks the author once
 to edit the reference out (one ask per body, so an unchanged body is never asked twice),
 and goes red. The label tracks the THREAD: a clean body takes back the ask left for it,
 and the label comes off when the last outstanding ask on that thread is gone, so a clean

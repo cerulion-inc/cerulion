@@ -297,12 +297,20 @@ jobs:
     name: Leak guard (issue and comment bodies)
     # Issues, issue comments and pull request review comments. These events run
     # in the context of this repository, so the private tier is always here and
-    # is always required. The guard's own ask is skipped: it is a comment like
-    # any other and would otherwise clear the label it just set.
+    # is always required.
+    #
+    # Text written by a bot is out of scope, and that is a measured decision, not
+    # a convenience. The guard's own ask is a comment like any other and would
+    # otherwise clear the label it just set. The review bots quote example
+    # references in their findings, and an example has the shape of the thing it
+    # is an example of: the first pull request to carry this job was labelled by
+    # a reviewer's own prose. Their text is machine written from the diff, and
+    # the diff is already gated by the three jobs above. People are the surface
+    # this job exists for.
     if: >-
       (github.event_name == 'issues' || github.event_name == 'issue_comment'
       || github.event_name == 'pull_request_review_comment')
-      && github.event.comment.user.login != 'github-actions[bot]'
+      && !endsWith(github.actor, '[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # One run at a time per BODY, newest wins. The workflow level group keys on
