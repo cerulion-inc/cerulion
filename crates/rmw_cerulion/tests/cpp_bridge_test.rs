@@ -70,6 +70,7 @@ fn member(
         type_id_: type_id,
         string_upper_bound_: 0,
         members_: nested,
+        #[cfg(cerulion_has_is_key)]
         is_key_: false,
         is_array_: is_array,
         array_size_: 0,
@@ -99,6 +100,7 @@ fn make_members(
         message_name_: cstr(name),
         member_count_: members.len() as u32,
         size_of_: size_of,
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: None,
@@ -2077,6 +2079,7 @@ fn padded_members_cpp_with_init() -> *const CppMessageMembers {
         message_name_: cstr("PadFlagVal"),
         member_count_: members.len() as u32,
         size_of_: std::mem::size_of::<CppPadFlagVal>(),
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: Some(padded_cpp_init),

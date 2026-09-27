@@ -105,6 +105,7 @@ impl bindgen::callbacks::ParseCallbacks for DocCommentsAsText {
 /// |---|---|---|
 /// | `fetch_function` | Humble | ros2/rosidl#652 (2022-01-25; Galactic is byte-identical to Foxy) |
 /// | `is_key` / `any_key_member` | Jazzy | ros2/rosidl#796 (`is_key_` lands MID-struct) |
+/// | `event_members` | Iron | service introspection (`event_members_` appended to ServiceMembers, C and C++ alike) |
 /// | `is_rosidl_buffer` | Lyrical | ros2/rosidl#942 (appended last) |
 /// | `content_filter_options` | Humble | content-filtered topics |
 /// | `event_callback` | Humble | `rmw/event_callback_type.h` |
@@ -129,6 +130,7 @@ const CAPABILITIES: &[(&str, &str)] = &[
     ("fetch_function", "fetch_function"),
     ("is_key", "is_key_"),
     ("any_key_member", "has_any_key_member_"),
+    ("event_members", "event_members_"),
     ("is_rosidl_buffer", "is_rosidl_buffer_"),
     (
         "content_filter_options",

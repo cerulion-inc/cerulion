@@ -1152,7 +1152,14 @@ unsafe fn fill_endpoint_info_array(
         (*slot).node_namespace = node_namespace;
         (*slot).topic_type = topic_type;
         (*slot).endpoint_type = endpoint_type;
-        (*slot).endpoint_gid = rec.endpoint_gid;
+        // RMW_GID_STORAGE_SIZE is 24 before Iron and 16 from Iron on (pinned
+        // per era in ffi/era_pins.rs): build the whole array zeroed, write our
+        // 16 bytes into it, then store it in ONE assignment through the raw
+        // pointer, so the tail is never uninitialized on a 24-byte era and no
+        // reference is ever formed to the slot (dangerous_implicit_autorefs).
+        let mut gid = [0u8; ffi::RMW_GID_STORAGE_SIZE as usize];
+        gid[..16].copy_from_slice(&rec.endpoint_gid);
+        (*slot).endpoint_gid = gid;
         (*slot).qos_profile = endpoint_qos_profile(&rec.qos);
     }
     arr.info_array = info_array;

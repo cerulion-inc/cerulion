@@ -103,6 +103,7 @@ pub const CAPABILITY_MIN_ERA: &[(&str, usize)] = &[
     ("discovery_options", ERA_IRON),
     ("matched_events", ERA_IRON),
     ("type_hash", ERA_IRON),
+    ("event_members", ERA_IRON),
     ("is_key", ERA_JAZZY),
     ("any_key_member", ERA_JAZZY),
     ("is_rosidl_buffer", ERA_LYRICAL),
@@ -890,6 +891,7 @@ mod tests {
         "discovery_options",
         "matched_events",
         "type_hash",
+        "event_members",
     ];
     const JAZZY_SET: &[&str] = &[
         "qos_compatibility",
@@ -903,6 +905,7 @@ mod tests {
         "discovery_options",
         "matched_events",
         "type_hash",
+        "event_members",
         "is_key",
         "any_key_member",
     ];
@@ -918,6 +921,7 @@ mod tests {
         "discovery_options",
         "matched_events",
         "type_hash",
+        "event_members",
         "is_key",
         "any_key_member",
         "is_rosidl_buffer",
@@ -932,7 +936,12 @@ mod tests {
         "message_info_sequence_numbers",
         "features",
     ];
-    const IRON_ONLY: &[&str] = &["discovery_options", "matched_events", "type_hash"];
+    const IRON_ONLY: &[&str] = &[
+        "discovery_options",
+        "matched_events",
+        "type_hash",
+        "event_members",
+    ];
     const JAZZY_ONLY: &[&str] = &["is_key", "any_key_member"];
     const LYRICAL_ONLY: &[&str] = &["is_rosidl_buffer", "event_type_max"];
 
@@ -1127,6 +1136,7 @@ mod tests {
                 "discovery_options",
                 "matched_events",
                 "type_hash",
+                "event_members",
                 "is_key",
                 "any_key_member"
             ],

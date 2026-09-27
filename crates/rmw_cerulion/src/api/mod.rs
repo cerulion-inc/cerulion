@@ -457,6 +457,7 @@ mod dispatch_tests {
             type_id_: ROS_TYPE_DOUBLE,
             string_upper_bound_: 0,
             members_: std::ptr::null(),
+            #[cfg(cerulion_has_is_key)]
             is_key_: false,
             is_array_: false,
             array_size_: 0,
@@ -484,6 +485,7 @@ mod dispatch_tests {
             message_name_: ident("Vector3"),
             member_count_: 3,
             size_of_: 24,
+            #[cfg(cerulion_has_is_key)]
             has_any_key_member_: false,
             members_: members.as_ptr(),
             init_function: None,

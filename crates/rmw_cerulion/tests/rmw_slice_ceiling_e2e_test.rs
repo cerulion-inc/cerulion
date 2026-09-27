@@ -214,6 +214,7 @@ fn cpp_seq_ts(namespace: &str, name: &str) -> *const ffi::rosidl_message_type_su
         type_id_: ROS_TYPE_DOUBLE,
         string_upper_bound_: 0,
         members_: std::ptr::null(),
+        #[cfg(cerulion_has_is_key)]
         is_key_: false,
         is_array_: true,
         array_size_: 0,
@@ -234,6 +235,7 @@ fn cpp_seq_ts(namespace: &str, name: &str) -> *const ffi::rosidl_message_type_su
         message_name_: cstr(name),
         member_count_: 1,
         size_of_: std::mem::size_of::<CppSeqMsg>(),
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: None,
