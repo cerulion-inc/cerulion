@@ -152,3 +152,67 @@ impl<'sample, T: ShmMessage + 'sample> std::ops::Deref for InputView<'sample, T>
         &self.reader
     }
 }
+
+/// The wire-frame checks every view construction shares, and the payload range
+/// they prove is in bounds.
+///
+/// ONE copy of the rule. Two call sites build an [`InputView`]: the receive
+/// path, which borrows an iceoryx2 sample, and the scheduler-bounded path in
+/// [`super::bounded_view`], which borrows bytes a producer has just committed.
+/// Both must refuse the same frames for the same reasons, and a second copy of
+/// four bounds checks is exactly how one of them ends up accepting a frame the
+/// other rejects.
+///
+/// Returns the parsed header and the payload range `[WireHeader::SIZE,
+/// total_size)` within `raw`, which the caller may slice without further
+/// checks. Refuses, in this order:
+///
+/// * a frame shorter than the 32-byte header, which has no header to read;
+/// * a header the reader cannot parse;
+/// * a `schema_hash` that is not `T::SCHEMA_HASH`, which means the two ends
+///   disagree about the message's fields and the frame would be MISREAD rather
+///   than merely unfamiliar;
+/// * a `total_size` below the header or past the frame. Checked explicitly
+///   rather than clamped: a `.max(WireHeader::SIZE)` coercion of a malformed
+///   size would silently serve a reader over bytes the producer never wrote.
+pub(crate) fn validate_wire_frame<T: ShmMessage>(
+    topic: &str,
+    raw: &[u8],
+) -> crate::error::TransportResult<(WireHeader, std::ops::Range<usize>)> {
+    use crate::error::TransportError;
+
+    if raw.len() < WireHeader::SIZE {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "undersized message: {} bytes, need at least {}",
+                raw.len(),
+                WireHeader::SIZE,
+            ),
+        });
+    }
+    let header = WireHeader::read_from_buf(raw).ok_or_else(|| TransportError::Deserialization {
+        topic: topic.to_string(),
+        reason: "failed to parse WireHeader from received message".to_string(),
+    })?;
+    if header.schema_hash != T::SCHEMA_HASH {
+        return Err(TransportError::SchemaMismatch {
+            topic: topic.to_string(),
+            expected_hash: T::SCHEMA_HASH,
+            actual_hash: header.schema_hash,
+        });
+    }
+    let total_size = header.total_size as usize;
+    if total_size < WireHeader::SIZE || total_size > raw.len() {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "wire header total_size {} out of bounds (frame {} bytes, header {} bytes)",
+                total_size,
+                raw.len(),
+                WireHeader::SIZE,
+            ),
+        });
+    }
+    Ok((header, WireHeader::SIZE..total_size))
+}
