@@ -54,6 +54,14 @@ symbol_audit "$here/fixtures/nm-defined-no-control.txt" "" > /dev/null && { echo
 names="$(defined_symbols "$here/fixtures/nm-defined-clean.txt")"
 printf '%s\n' "$names" | grep -qx rmw_get_serialization_format || { echo "SELFTEST FAIL: a versioned symbol name is not stripped to its bare name"; fail=1; }
 printf '%s\n' "$names" | grep -qE '^[0-9a-f]{8}|^[TDB]$' && { echo "SELFTEST FAIL: an address or type column was read as a symbol name"; fail=1; }
+# 9. A `refuse` row must pin its refusal: the two inert defaults gate.sh carries for the next
+#    distro that starts there must be REFUSED, because both pass vacuously (grep -F '' matches
+#    every line, and an absent error count reads back as 0).
+refuse_row_pinned 21 "cannot find type" > /dev/null || { echo "SELFTEST FAIL: a properly pinned refuse row was rejected"; fail=1; }
+refuse_row_pinned 0 "cannot find type" > /dev/null && { echo "SELFTEST FAIL: a refuse row with errors=0 passed"; fail=1; }
+refuse_row_pinned 21 "" > /dev/null && { echo "SELFTEST FAIL: a refuse row with an empty marker passed"; fail=1; }
+refuse_row_pinned "" "cannot find type" > /dev/null && { echo "SELFTEST FAIL: a refuse row with no error count passed"; fail=1; }
+refuse_row_pinned "many" "cannot find type" > /dev/null && { echo "SELFTEST FAIL: a refuse row with a non-decimal error count passed"; fail=1; }
 rm -f "$plain" "$plain.c" "$plain.s" "$plain.n"
-[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test) and the symbol audit over three nm fixtures"
+[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, and the refuse-row pin guard"
 exit "$fail"

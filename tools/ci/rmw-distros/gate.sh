@@ -53,7 +53,8 @@ rmw_subscription_get_network_flow_endpoints
 rmw_qos_profile_check_compatible
 rmw_feature_supported"
 # No row is `refuse` today; the arm stays for the next distro that starts there, so its two inputs
-# carry inert defaults rather than being unset under `set -u`.
+# carry inert defaults rather than being unset under `set -u`. The arm REFUSES those defaults
+# (refuse_row_pinned): an errors=0 or empty-marker row would pass vacuously.
 errors=0
 marker=""
 case "$distro" in
@@ -122,6 +123,8 @@ case "$expect" in
         fi
         ;;
     refuse)
+        # The row must pin its refusal for real before anything is compared against it.
+        refuse_row_pinned "$errors" "$marker" || exit 1
         [ "$rc" -ne 0 ] || { echo "GATE FAIL: $distro BUILT, but the table says it is refused today; flip its row in the PR that lands $distro support"; exit 1; }
         grep -q -F -- "$marker" "$plain_log" || { echo "GATE FAIL: $distro failed WITHOUT the known marker; last lines:"; tail -n 40 "$plain_log"; exit 1; }
         count=$(grep -oE 'due to [0-9]+ previous errors?' "$plain_log" | grep -oE '[0-9]+' | tail -n 1)

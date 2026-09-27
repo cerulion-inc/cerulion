@@ -75,3 +75,27 @@ symbol_audit() {
     done
     return "$bad"
 }
+
+# refuse_row_pinned <errors> <marker>: exit 0 only when a `refuse` row pins BOTH inputs for real.
+# Both of gate.sh's inert defaults pass vacuously otherwise: `grep -F ""` matches every line, so an
+# empty marker accepts any failure at all, and an absent "due to N previous errors" line reads back
+# as 0, so an errors=0 row accepts a build that printed no count. A row that stops pinning its
+# refusal must fail the gate, not sail through it.
+refuse_row_pinned() {
+    local errors="$1" marker="$2"
+    case "$errors" in
+        '' | *[!0-9]*)
+            echo "GATE FAIL: a refuse row must pin a decimal error count, got '$errors'"
+            return 1
+            ;;
+        0)
+            echo "GATE FAIL: a refuse row must pin a NONZERO error count; 0 is the inert default and a build printing no error count at all reads back as 0"
+            return 1
+            ;;
+    esac
+    if [ -z "$marker" ]; then
+        echo "GATE FAIL: a refuse row must pin a NON-EMPTY marker; grep -F '' matches every line, so an empty marker accepts any failure"
+        return 1
+    fi
+    return 0
+}
