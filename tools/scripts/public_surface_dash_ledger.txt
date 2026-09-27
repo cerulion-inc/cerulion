@@ -229,7 +229,7 @@
 9 crates/cerulion_viz/bin/cerulion_vizd/src/protocol.rs
 15 crates/cerulion_viz/bin/cerulion_vizd/src/runs.rs
 30 crates/cerulion_viz/lib/cerulion_viz/src/archetype.rs
-40 crates/cerulion_viz/lib/cerulion_viz/src/blueprint.rs
+39 crates/cerulion_viz/lib/cerulion_viz/src/blueprint.rs
 13 crates/cerulion_viz/lib/cerulion_viz/src/openh264_fetch.rs
 1 crates/cerulion_viz/lib/cerulion_viz/src/plot_rate.rs
 6 crates/cerulion_viz/lib/cerulion_viz/src/pointcloud.rs
