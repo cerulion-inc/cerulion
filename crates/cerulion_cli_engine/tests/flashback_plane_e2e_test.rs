@@ -138,6 +138,7 @@ fn a_run_whose_descriptor_cannot_be_written_still_arms_its_plane() {
     assert!(
         cerulion_cli_engine::run_dir::begin_run_descriptor(
             cerulion_cli_engine::run_dir::RunDescriptorSpec {
+                chains: None,
                 run_id,
                 graph_name: "undescribable",
                 run_started_at_ns: 1,

@@ -127,6 +127,7 @@ fn prod_cons_graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "env_producer".to_string(),
@@ -140,6 +141,7 @@ fn prod_cons_graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "env_consumer".to_string(),

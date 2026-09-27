@@ -125,6 +125,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 /// Fixed f32 + an unbounded `float32[]` (forgeable) + a string (copied).
@@ -247,6 +251,10 @@ unsafe fn build_scanish_in_slot(
         data: ranges_ptr,
         size: ranges_len,
         capacity: ranges_len,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     };
     let sdata = calloc(frame_id.len() + 1, 1) as *mut u8;
     std::ptr::copy_nonoverlapping(frame_id.as_ptr(), sdata, frame_id.len());
@@ -921,6 +929,8 @@ fn cpp_member(name: &str, type_id: u8, offset: u32) -> CppMessageMember {
         fetch_function: None,
         assign_function: None,
         resize_function: None,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer_: false,
     }
 }
 
@@ -1254,6 +1264,10 @@ struct CU8Seq {
     data: *mut u8,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 unsafe extern "C" fn scancaps_init(
@@ -1341,11 +1355,19 @@ fn empty_members_count_by_forgeability_never_inflating_adopted() {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         };
         m.caps = CU8Seq {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         };
         let s = calloc(2, 1) as *mut u8;
         *s = b'e';
@@ -1441,4 +1463,42 @@ extern "C" {
     /// crate on purpose; the fixture declares its own binding to fill a
     /// REAL vector (same idiom as `forged_take_bridge_test.rs`).
     fn rmw_cerulion_vector_u8_assign(v: *mut c_void, data: *const u8, len: usize);
+}
+
+/// Lyrical and Rolling: the borrow seal refuses a Buffer-backed top-level
+/// primitive sequence instance before touching the payload (neither
+/// adopted nor copied), and the same slot with the flag clear seals.
+#[cfg(cerulion_has_is_rosidl_buffer)]
+#[test]
+#[serial]
+fn c_buffer_backed_instance_is_refused_by_the_seal_before_any_mutation() {
+    let bridge = scanish_bridge();
+    let ranges = [0.25f32, 0.5];
+    unsafe {
+        let mut slot = Slot::new();
+        let payload = slot.payload();
+        let heap = calloc(ranges.len(), 4) as *mut f32;
+        std::ptr::copy_nonoverlapping(ranges.as_ptr(), heap, ranges.len());
+        build_scanish_in_slot(payload, 3.0, heap, ranges.len(), "w");
+        let seq = payload.add(std::mem::offset_of!(CScanish, ranges)) as *mut CF32Seq;
+        (*seq).is_rosidl_buffer = true;
+        let before: Vec<u8> = std::slice::from_raw_parts(payload, PAYLOAD_LEN).to_vec();
+
+        let geo = bridge.borrow_geometry().expect("geometry");
+        let refused =
+            bridge.seal_borrowed_frame(payload, PAYLOAD_LEN, &geo, None, GAP_OK, &mut scratch());
+        assert!(
+            matches!(refused, Err(SealRefusal::Encode(_))),
+            "a Buffer-backed instance must be refused as an encode refusal"
+        );
+        let after: Vec<u8> = std::slice::from_raw_parts(payload, PAYLOAD_LEN).to_vec();
+        assert_eq!(before, after, "a refused seal must not touch the payload");
+
+        // Control: the flag is the ONLY difference.
+        (*seq).is_rosidl_buffer = false;
+        let seal = bridge
+            .seal_borrowed_frame(payload, PAYLOAD_LEN, &geo, None, GAP_OK, &mut scratch())
+            .expect("seal");
+        assert_eq!((seal.adopted, seal.escaped, seal.copied), (0, 1, 1));
+    }
 }
