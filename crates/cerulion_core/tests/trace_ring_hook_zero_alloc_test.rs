@@ -287,11 +287,24 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
         runtime.step(Duration::from_millis(1));
     }
     let allocs = ALLOCATOR.disable();
+    // WAIVED, bounded, upstream iceoryx2 0.10.0 issue 2035: every
+    // `Publisher::loan` allocates once, and this graph is 3 wide with one
+    // publishing port per node. Subtract exactly that and assert the ORIGINAL
+    // zero on the remainder, so the recording path still fails on any new
+    // allocation of its own. `upstream_waivers_test` fails closed when the
+    // iceoryx2 pin moves off the version this waiver names.
+    const PUBLISHING_PORTS: u64 = 3;
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(
+        PUBLISHING_PORTS * MEASURE_STEPS as u64,
+    );
+    let ours = allocs.saturating_sub(waived);
     assert_eq!(
-        allocs, 0,
+        allocs, waived,
         "recording-ON PARALLEL step (3-wide level through tick_decided_parallel's \
-         fragment merge + armed read-outcome capture + ring push) must not \
-         heap-allocate at steady state on the calling thread (got {allocs})"
+         fragment merge + armed read-outcome capture + ring push) allocated {allocs} times at \
+         steady state on the calling thread. Exactly {waived} is what upstream 2035 costs here \
+         ({PUBLISHING_PORTS} publishing ports, one loan each per step); the difference of \
+         {ours} is OURS and must be zero."
     );
 
     // Anti-tautology: the hook really pushed through the parallel path — per

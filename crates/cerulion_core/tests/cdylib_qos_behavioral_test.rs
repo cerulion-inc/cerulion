@@ -418,6 +418,10 @@ fn throttle_caps_the_dylib_fire_rate() {
 // (g) determinism of the wire-keyed counters (Principle #7)
 // ===========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn qos_watchdog_counters_are_deterministic() {
@@ -538,6 +542,10 @@ fn sample_gate_on_dylib_aux_decimates_fast_arrivals() {
     );
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn sample_decimation_on_dylib_is_deterministic() {

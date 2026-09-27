@@ -307,6 +307,10 @@ fn raw_ffi_cdylib_without_symbol_reports_capability_false() {
 // (c) the drain-discipline seam extends to cdylibs: =separate forces the cdylib back
 // to Separate with byte-identical delivery.
 // ===========================================================================
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn seam_forces_cdylib_back_to_separate_byte_identical() {

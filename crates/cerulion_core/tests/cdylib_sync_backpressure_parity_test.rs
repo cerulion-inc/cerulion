@@ -771,6 +771,10 @@ fn run_starved_block(prefix: &str, fuse: Box<dyn NodeEntry>) -> u64 {
 /// slot frees, and the producer publishes a FIFTH frame — `depth + 1` unserved
 /// against a declared depth of 4. Under a stripped declaration it free-runs to
 /// 20. Both are caught by one equality.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn a_block_producer_stops_at_the_declared_depth_through_the_ffi() {
@@ -806,6 +810,10 @@ fn block_on_a_per_set_sync_trigger_loses_nothing_through_the_ffi() {
 // 2. `sample(N)` decimates BEFORE matching — through the real FFI, with an
 //    UNGATED discriminator so the membership oracle is attributed to the gate.
 // ===========================================================================
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn a_sample_gate_decides_which_frames_are_eligible_to_align_through_the_ffi() {
@@ -840,6 +848,10 @@ fn a_sample_gate_decides_which_frames_are_eligible_to_align_through_the_ffi() {
 //    declaration must behave identically in-process and through the FFI, and
 //    BOTH sides must equal the hand oracle.
 // ===========================================================================
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn the_block_contract_is_identical_in_process_and_through_the_ffi() {
@@ -856,6 +868,10 @@ fn the_block_contract_is_identical_in_process_and_through_the_ffi() {
     );
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn the_sample_contract_is_identical_in_process_and_through_the_ffi() {
@@ -874,6 +890,10 @@ fn the_sample_contract_is_identical_in_process_and_through_the_ffi() {
 // 4. DETERMINISM (Principle #7): two full dylib runs are byte-identical, and
 //    both equal the oracle — so this is not a self-compare.
 // ===========================================================================
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn two_dylib_runs_are_byte_identical() {

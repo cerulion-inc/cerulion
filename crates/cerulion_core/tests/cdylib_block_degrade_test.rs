@@ -215,6 +215,10 @@ fn dylib_block_input_degrades_on_mixed_topic_producer_not_deferred() {
 }
 
 /// DETERMINISM (Principle #7): two runs byte-identical.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn dylib_block_degrade_is_deterministic() {

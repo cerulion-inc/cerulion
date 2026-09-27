@@ -54,6 +54,45 @@ pub const CHILD_IOX2_ROOT_ENV: &str = "CER_TEST_IOX2_ROOT";
 /// Environment variable carrying [`IsolatedRoot::prefix`] to a child process.
 pub const CHILD_IOX2_PREFIX_ENV: &str = "CER_TEST_IOX2_PREFIX";
 
+/// The iceoryx2 release the two upstream waivers in this tree are pinned to.
+///
+/// Both waivers describe defects in a SPECIFIC release. When the family moves,
+/// they stop describing anything and become a way to ship a regression
+/// unnoticed, so `upstream_waivers_test` fails the moment this stops matching
+/// the resolved dependency.
+pub const UPSTREAM_WAIVER_IOX2_VERSION: &str = "0.10.0";
+
+/// Heap allocations the PUBLISH path makes that are not ours, per `loan`.
+///
+/// iceoryx2 0.10.0's `Publisher::loan` builds a `ChunkMutSharedState` per
+/// sample, which constructs an `ArcSyncPolicy`, which is one 104-byte
+/// `Arc::new(MutexHandle::new())`. Both policies allocate, `send_copy` routes
+/// through the same constructor, and 0.9.1 did not do this, so there is no way
+/// to avoid it through the API. Upstream issue 2035, which proposes splitting
+/// the per-sample state from the shared port state; when that ships, this
+/// becomes 0 and every arm below returns to asserting zero with no other edit.
+///
+/// The zero-allocation gates subtract exactly `loans * this` and then assert
+/// their ORIGINAL bound on the remainder. They are therefore still
+/// discriminating against any NEW allocation on those paths, which is the
+/// property worth keeping: the gate says "one per publishing port per step and
+/// no more", not "allocation is fine here now".
+///
+/// Measured floor of what it costs: a 104-byte allocate-and-free pair is 14 to
+/// 19 ns warm and uncontended. The nanoseconds are not the reason the gate
+/// exists; an allocator call on the publish path can block on the allocator's
+/// lock, fault, or grow the heap, and its tail is unbounded under pressure.
+pub const UPSTREAM_2035_ALLOCS_PER_LOAN: u64 = 1;
+
+/// The allocations `loans` publish-path loans are known to cost under the
+/// pinned iceoryx2 release. Subtract this from a measured count before
+/// asserting, never widen the bound instead: widening hides a second source,
+/// subtracting does not.
+#[must_use]
+pub const fn upstream_2035_publish_allocs(loans: u64) -> u64 {
+    loans * UPSTREAM_2035_ALLOCS_PER_LOAN
+}
+
 /// An iceoryx2 root path and prefix a PARENT and a CHILD process can both name.
 ///
 /// [`iceoryx_test_config`] mints its root and prefix internally, which is right

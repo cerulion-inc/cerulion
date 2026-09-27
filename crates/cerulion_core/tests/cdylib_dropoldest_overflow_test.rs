@@ -253,6 +253,10 @@ fn slow_cdylib_consumer_overflows_and_stays_fresh() {
 /// byte-identical AND match the hand oracle — byte-identity alone would be
 /// tautological (F11 self-compare anti-pattern), so both checks are
 /// required.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn slow_cdylib_consumer_overflow_is_deterministic() {

@@ -228,6 +228,10 @@ fn run_cdylib_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceE
     runtime.trace().to_vec()
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn cdylib_gated_serial_trace_byte_identical_parallel_vs_serial() {
