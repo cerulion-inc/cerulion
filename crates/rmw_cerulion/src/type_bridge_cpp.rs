@@ -78,6 +78,16 @@ pub(crate) const BOOL_SEQ_NO_FETCH_NESTED: &str = concat!(
     bool_seq_no_fetch_reason!()
 );
 
+/// The TAKE side's twin of [`bool_seq_no_fetch_detail`]: the same member,
+/// the same reason, the `assign` accessor instead of `fetch`. Reached
+/// BEFORE any write, so the caller's message is untouched.
+pub(crate) fn bool_seq_no_assign_detail(member: &str) -> String {
+    format!(
+        "bool sequence member '{member}' cannot be decoded: {}",
+        bool_seq_no_fetch_reason!()
+    )
+}
+
 /// [`bool_seq_no_fetch_reason`] naming the member the reader must go and
 /// look at. The enclosing message is the `Encode` error's own `message`
 /// field, so the two together locate the field exactly.
@@ -149,6 +159,16 @@ pub struct CppBridgedMessage {
     /// Forgeable-sequence count — see the C twin's
     /// `forge_count` and [`Self::can_loan_take`].
     forge_count: usize,
+    /// The FIRST `bool[]` member this build cannot write, as
+    /// `(var_idx, member name)`, or `None` when every one of them has its
+    /// `assign` accessor. A property of the TYPE, decided once here rather
+    /// than per frame: before Humble the C++ typesupport generator emits no
+    /// `assign` for `std::vector<bool>`, so every frame carrying such a
+    /// member is undeliverable and the take refuses it BEFORE writing
+    /// anything. Reported through the decode latch with
+    /// [`bool_seq_no_assign_detail`], never as a generic malformed-entry
+    /// warning blaming the wire.
+    unwritable_bool_seq: Option<(usize, String)>,
 }
 
 // SAFETY: `members` points at rosidl's static typesupport data
@@ -318,6 +338,24 @@ impl CppBridgedMessage {
             }
         }
 
+        // The one type-level decode blocker (see the field's doc): a
+        // `bool[]` member whose `assign` accessor this build's C++
+        // `MessageMember` does not carry.
+        let unwritable_bool_seq = ops.iter().find_map(|op| match op {
+            CppFieldOp::PrimSeq {
+                var_idx,
+                is_bool: true,
+                member_index,
+                ..
+            } if member_assign(&member_slice[*member_index]).is_none() => Some((
+                *var_idx,
+                ffi::cstr(member_slice[*member_index].name_)
+                    .unwrap_or("<field>")
+                    .to_string(),
+            )),
+            _ => None,
+        });
+
         Ok(Self {
             qualified_name: root_qualified,
             layout,
@@ -328,6 +366,7 @@ impl CppBridgedMessage {
             nested_layouts,
             loan_pad_ranges,
             forge_count,
+            unwritable_bool_seq,
         })
     }
 
@@ -695,6 +734,15 @@ impl CppBridgedMessage {
                 }
             }
         }
+    }
+
+    /// The first `bool[]` member this build cannot write, if any; see the
+    /// field of the same name. Both take paths consult it BEFORE any write
+    /// and refuse the frame with the member named.
+    pub fn unwritable_bool_seq(&self) -> Option<(usize, &str)> {
+        self.unwritable_bool_seq
+            .as_ref()
+            .map(|(idx, name)| (*idx, name.as_str()))
     }
 
     /// Can this frame's VARIABLE entries be resolved at

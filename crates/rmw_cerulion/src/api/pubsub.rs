@@ -2602,6 +2602,27 @@ unsafe fn take_impl(
                 &data.topic,
             );
         }
+        // A member this build's C++ typesupport gives no way to WRITE
+        // (a `bool[]` before Humble: the generator emits no `assign` for
+        // `std::vector<bool>`) makes every frame of this type undeliverable.
+        // Decided at registration, so this is one `Option` read per frame,
+        // and taken BEFORE `unflatten` so the caller's message is untouched.
+        // The frame is consumed and dropped through the SAME latch and
+        // regime as every other decode refusal, with the member named,
+        // never as a generic malformed-entry warning, which would blame the
+        // wire for a limit of this build.
+        if let Some((var_idx, member)) = data.bridge.unwritable_bool_seq() {
+            crate::decode_failure_latch::report_decode_entry_refused(
+                &data.decode_failures,
+                crate::decode_failure_latch::DecodeSite::Subscription,
+                &data.topic,
+                &data.type_name,
+                msg.payload().len(),
+                var_idx,
+                &crate::type_bridge_cpp::bool_seq_no_assign_detail(member),
+            );
+            return;
+        }
         if data.bridge.unflatten(msg.payload(), ros_message) {
             took = true;
             info_out = Some((header.timestamp_ns, header.sequence as u64));
@@ -3025,6 +3046,24 @@ unsafe fn take_adopted(
     // allocation failure in a copy arm, a malformed body inside a NESTED
     // member, and an unaligned forged entry) still fail mid-decode — exactly
     // as the plain copying take does.
+    // The type-level blocker first (see the copying take's arm): a member
+    // this build cannot write refuses the frame here, before the entry walk
+    // and before any write, with the member named. Read off the bridge, so it
+    // borrows nothing from the held sample.
+    if let Some((var_idx, member)) = data.bridge.unwritable_bool_seq() {
+        let body_len = owned.payload().len() - WireHeader::SIZE;
+        drop(owned);
+        crate::decode_failure_latch::report_decode_entry_refused(
+            &data.decode_failures,
+            crate::decode_failure_latch::DecodeSite::Subscription,
+            &data.topic,
+            &data.type_name,
+            body_len,
+            var_idx,
+            &crate::type_bridge_cpp::bool_seq_no_assign_detail(member),
+        );
+        return RMW_RET_OK;
+    }
     {
         let body = &owned.payload()[WireHeader::SIZE..];
         if let Err((var_idx, verdict)) = data.bridge.frame_entries_readable(body) {
