@@ -155,7 +155,17 @@ build.rs layers three era probes on top of the source selection:
   under the collected include dirs and, when present, passed to clang as a
   `-DCERULION_HAS_*_H` define; `wrapper.h` gates the matching `#include` on it. This is
   what lets bindgen run cleanly on Foxy AND Humble (`rmw/discovery_options.h` is Iron+,
-  so an unconditional include aborted the build on both).
+  so an unconditional include aborted the build on both). What the probes admit also
+  decides the EXPORT set: an entry point whose parameter type a distro's headers do not
+  declare is compiled out WHOLE under its capability cfg, never stubbed, because rcl
+  resolves rmw symbols by name and a defined symbol is a claim the headers cannot back.
+  Ten exports sit behind such a cfg (the four listener callbacks and
+  `rmw_event_set_callback`, the two content filter calls and `rmw_feature_supported`
+  from Humble; `rmw_qos_profile_check_compatible` and the two network flow calls from
+  Galactic), as do the two `rmw_message_info_t` sequence numbers and the context's
+  `actual_domain_id`. Each distro lane audits the built library with `nm` against the
+  list its headers lack, with `rmw_init` as the positive control so an unreadable symbol
+  table cannot pass (`tools/ci/rmw-distros/gate.sh`).
 - **Capability cfgs**: the SELECTED bindings file (generated or vendored, one code
   path) is grepped for marker tokens (`fetch_function`, `is_key_`, `discovery_options`,
   `get_type_hash_func`, …; the table lives in build.rs) and a
@@ -293,13 +303,26 @@ build.rs layers three era probes on top of the source selection:
   (`EnvVarGuard::unset` / `agreeing_runtime_for(baked_distro())`), because their whole
   subject is the contradiction they then arm.
 - **C++ bridge gate**: `ffi/introspection_cpp.rs` hand-mirrors the C++ introspection shape
-  of the era the build compiles against: the JAZZY/KILTED shape (`is_key_` and
-  `has_any_key_member_` arrived at Jazzy), plus the Lyrical/Rolling tail field
-  `is_rosidl_buffer_` under `cfg(cerulion_has_is_rosidl_buffer)` (stride 112 to 120; each
-  field landed in the C and C++ structs in the same rosidl release, so the C capability
-  tokens are the build-time proxies for the C++ mirror's era, and a compile-time pin holds
-  the mirror's size equal to the bindgen-generated C member's), and the Humble and Iron message shape (no `is_key_` or `has_any_key_member_`) under `cfg(not(cerulion_has_is_key))`; the service mirror's trailing `event_members_` is keyed on `cfg(cerulion_has_event_members)`, present from Iron on and absent on Humble. Pre-Galactic builds (Foxy, Galactic: 96-byte members) compile
-  the C++ typesupport arm of both resolvers to a loud REGISTRATION refusal: one `error!`
+  of the era the build compiles against, under the same capability cfgs that name the era,
+  so mirror and classifier cannot disagree: 96 bytes with `resize_function` last under
+  `cfg(not(cerulion_has_fetch_function))` (Foxy, Galactic), 112 with `fetch_function` and
+  `assign_function` from Humble on, no `is_key_` or `has_any_key_member_` under
+  `cfg(not(cerulion_has_is_key))` (Humble, Iron), the JAZZY/KILTED shape with `is_key_`
+  MID-struct, and the Lyrical/Rolling tail field `is_rosidl_buffer_` under
+  `cfg(cerulion_has_is_rosidl_buffer)` (stride 112 to 120). Each field landed in the C and
+  C++ structs in the same rosidl release, so the C capability tokens are the build-time
+  proxies for the C++ mirror's era; a compile-time pin holds the mirror's size equal to the
+  bindgen-generated C member's on every era, and the compiled shim adds a `static_assert`
+  of all three sizes against the distro's own C++ header wherever that header is on the
+  include path. The service mirror's trailing `event_members_` is keyed on
+  `cfg(cerulion_has_event_members)`, present from Iron on and absent before it.
+  SUPPORTED SUBSET: every era resolves the C++ arm, and the ONE member kind no era before
+  Humble can reach is a `bool[]`. There the C++ generator emits no `fetch` or `assign`
+  accessor for `std::vector<bool>` and leaves `get`/`get_const` null, so the bridge refuses
+  that MESSAGE (an `Encode` error naming the member and the reason, with nothing written
+  into the destination frame) rather than the whole build. The remaining REGISTRATION
+  refusal is a vendored development build under a runtime the snapshot does not admit: one
+  `error!`
   through the single `CppBridgeGate::emit_refusal` seam, a CONSTANT paragraph with the
   verdict in a structured `verdict=` field (never a `"{}"` pass-through, which the repo's
   tracing-discipline walk refuses); the bypass composite is `cfg(test)` SILENTLY (the lib's
@@ -309,7 +332,7 @@ build.rs layers three era probes on top of the source selection:
   production silence impossible while the resolver-routed C++ e2e binaries (fixtures
   hand-built against the compiled struct, layout-self-consistent by construction) keep
   their surface. `test-seams` is in no default feature set and no shipping recipe enables
-  it. The pre-Galactic C++ bridge variant is not implemented. The C introspection path reads
+  it. The C introspection path reads
   bindgen-generated members; its hand-written sequence mirrors are pinned to their bindgen
   twins on every era (primitive and string sequences carry the Lyrical Buffer flags,
   message sequences never do), and a Buffer-backed member or instance is never forged,
