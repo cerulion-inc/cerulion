@@ -682,12 +682,27 @@ mod accessor_wrapper_tests {
     }
 
     /// On a real-header build the hand-written mirror is exactly the C++
-    /// header's `MessageMember`; a vendored build has no header to compare
-    /// with and reports 0, which this test treats as "not applicable" rather
-    /// than as agreement.
+    /// header's `MessageMember`.
+    ///
+    /// The probe returns 0 only when
+    /// `rosidl_typesupport_introspection_cpp/message_introspection.hpp` was
+    /// not on the shim's include path, which is the VENDORED build: there is
+    /// no distro header to compare with, and the test says "not applicable"
+    /// rather than claiming agreement. A GENERATED build is the opposite
+    /// case and must never take that exit: the shim's three `static_assert`
+    /// arms all sit behind the same `__has_include`, so a 0 here would mean
+    /// the whole C++ era pin, this test included, silently did nothing on
+    /// the one build shape that can check it.
     #[test]
     fn the_cpp_member_mirror_matches_the_distro_header_where_one_exists() {
         let from_header = unsafe { rmw_cerulion_cpp_message_member_sizeof() };
+        #[cfg(cerulion_rmw_generated_bindings)]
+        assert_ne!(
+            from_header, 0,
+            "a build against real distro headers must find \
+             rosidl_typesupport_introspection_cpp/message_introspection.hpp on the shim's \
+             include path; 0 means the shim's era static_asserts compiled to nothing"
+        );
         if from_header == 0 {
             return;
         }
