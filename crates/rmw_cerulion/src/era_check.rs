@@ -95,6 +95,7 @@ pub const CAPABILITY_MIN_ERA: &[(&str, usize)] = &[
     ("qos_compatibility", ERA_GALACTIC),
     ("message_lost_event", ERA_GALACTIC),
     ("network_flow", ERA_GALACTIC),
+    ("actual_domain_id", ERA_GALACTIC),
     ("fetch_function", ERA_HUMBLE),
     ("content_filter_options", ERA_HUMBLE),
     ("event_callback", ERA_HUMBLE),
@@ -868,11 +869,17 @@ mod tests {
     // production table — the verified per-branch boundaries,
     // restated so a table edit cannot silently agree with itself).
     const FOXY_SET: &[&str] = &[];
-    const GALACTIC_SET: &[&str] = &["qos_compatibility", "message_lost_event", "network_flow"];
+    const GALACTIC_SET: &[&str] = &[
+        "qos_compatibility",
+        "message_lost_event",
+        "network_flow",
+        "actual_domain_id",
+    ];
     const HUMBLE_SET: &[&str] = &[
         "qos_compatibility",
         "message_lost_event",
         "network_flow",
+        "actual_domain_id",
         "fetch_function",
         "content_filter_options",
         "event_callback",
@@ -883,6 +890,7 @@ mod tests {
         "qos_compatibility",
         "message_lost_event",
         "network_flow",
+        "actual_domain_id",
         "fetch_function",
         "content_filter_options",
         "event_callback",
@@ -897,6 +905,7 @@ mod tests {
         "qos_compatibility",
         "message_lost_event",
         "network_flow",
+        "actual_domain_id",
         "fetch_function",
         "content_filter_options",
         "event_callback",
@@ -913,6 +922,7 @@ mod tests {
         "qos_compatibility",
         "message_lost_event",
         "network_flow",
+        "actual_domain_id",
         "fetch_function",
         "content_filter_options",
         "event_callback",
@@ -928,7 +938,12 @@ mod tests {
         "event_type_max",
     ];
 
-    const GALACTIC_ONLY: &[&str] = &["qos_compatibility", "message_lost_event", "network_flow"];
+    const GALACTIC_ONLY: &[&str] = &[
+        "qos_compatibility",
+        "message_lost_event",
+        "network_flow",
+        "actual_domain_id",
+    ];
     const HUMBLE_ONLY: &[&str] = &[
         "fetch_function",
         "content_filter_options",

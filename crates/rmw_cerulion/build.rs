@@ -118,10 +118,11 @@ impl bindgen::callbacks::ParseCallbacks for DocCommentsAsText {
 /// | `type_hash` | Iron | typesupport type-hash trio (RIHS) |
 /// | `features` | Humble | `rmw/features.h` |
 /// | `network_flow` | Galactic | network-flow endpoints |
+/// | `actual_domain_id` | Galactic | `rmw_context_t` gained the resolved domain |
 ///
 /// Token-choice rule: each token appears in the bindgen output IFF the
 /// capability's type/field/constant exists in the sourced headers (all
-/// 15 verified present in the vendored rolling snapshot, and absent
+/// 17 verified present in the vendored rolling snapshot, and absent
 /// per-era in the downloaded foxy/humble/jazzy/lyrical branch headers).
 /// Substring matching is deliberate — `discovery_options` matching
 /// `rmw_discovery_options_t` AND the `rmw_init_options_s` field is the
@@ -149,6 +150,7 @@ const CAPABILITIES: &[(&str, &str)] = &[
     ("type_hash", "get_type_hash_func"),
     ("features", "rmw_feature_t"),
     ("network_flow", "rmw_network_flow_endpoint_array_t"),
+    ("actual_domain_id", "actual_domain_id"),
 ];
 
 /// Post-Foxy headers probed on the filesystem (bindgen path only): when
@@ -435,6 +437,9 @@ fn main() {
     }
     if observed_caps.contains(&"is_rosidl_buffer") {
         shim.define("RMW_CERULION_HAS_IS_ROSIDL_BUFFER", None);
+    }
+    if observed_caps.contains(&"fetch_function") {
+        shim.define("RMW_CERULION_HAS_FETCH_FUNCTION", None);
     }
     shim.file("shim/cppstring_shim.cpp")
         .compile("rmw_cerulion_cppstring_shim");

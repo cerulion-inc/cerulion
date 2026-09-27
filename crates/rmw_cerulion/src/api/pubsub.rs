@@ -2643,8 +2643,7 @@ unsafe fn take_impl(
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
                     Err(_) => 0,
                 };
-                info.publication_sequence_number = seq;
-                info.reception_sequence_number = u64::MAX;
+                super::stamp_sequence_numbers(&mut info, seq);
             }
             info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
             info.from_intra_process = false;
@@ -3483,8 +3482,7 @@ unsafe fn take_adopted(
             Ok(rt) => rt.transport.clock().now_ns() as i64,
             Err(_) => 0,
         };
-        info.publication_sequence_number = seq;
-        info.reception_sequence_number = u64::MAX;
+        super::stamp_sequence_numbers(&mut info, seq);
         info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
         info.from_intra_process = false;
         *message_info = info;
@@ -3927,8 +3925,7 @@ unsafe fn take_loaned_impl(
             Ok(rt) => rt.transport.clock().now_ns() as i64,
             Err(_) => 0,
         };
-        info.publication_sequence_number = seq;
-        info.reception_sequence_number = u64::MAX;
+        super::stamp_sequence_numbers(&mut info, seq);
         info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
         info.from_intra_process = false;
         *message_info = info;
@@ -4072,8 +4069,15 @@ pub unsafe extern "C" fn rmw_subscription_get_actual_qos(
     RMW_RET_OK
 }
 
+// Content-filtered topics arrived with Humble: on an older distro
+// `rmw_subscription_content_filter_options_t` does not exist, so both
+// exports are compiled away WHOLE rather than stubbed (the distro gate
+// reads the built library with `nm` and fails if either is defined where
+// the headers lack the type).
+
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_content_filter_options)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_set_content_filter(
     _subscription: *mut ffi::rmw_subscription_t,
@@ -4084,6 +4088,7 @@ pub unsafe extern "C" fn rmw_subscription_set_content_filter(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_content_filter_options)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_get_content_filter(
     _subscription: *const ffi::rmw_subscription_t,

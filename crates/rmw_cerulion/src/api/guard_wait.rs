@@ -2438,8 +2438,20 @@ pub unsafe extern "C" fn rmw_event_fini(rmw_event: *mut ffi::rmw_event_t) -> rmw
     RMW_RET_OK
 }
 
+// =====================================================================
+// Listener callbacks (Humble and later)
+// =====================================================================
+// `rmw_event_callback_t` arrived with Humble, so these four exports do
+// not exist in the rmw API of an older distro. They are compiled away
+// WHOLE on a build whose headers lack the type, never stubbed: rcl looks
+// symbols up by name, and a symbol an rmw is not supposed to have is a
+// claim the header cannot back. The distro gate reads the built library
+// with `nm` and fails if one of them is defined where the headers lack
+// it.
+
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_event_set_callback(
     _event: *mut ffi::rmw_event_t,
@@ -2451,6 +2463,7 @@ pub unsafe extern "C" fn rmw_event_set_callback(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_set_on_new_message_callback(
     _subscription: *mut ffi::rmw_subscription_t,
@@ -2462,6 +2475,7 @@ pub unsafe extern "C" fn rmw_subscription_set_on_new_message_callback(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_service_set_on_new_request_callback(
     _service: *mut ffi::rmw_service_t,
@@ -2473,6 +2487,7 @@ pub unsafe extern "C" fn rmw_service_set_on_new_request_callback(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_client_set_on_new_response_callback(
     _client: *mut ffi::rmw_client_t,

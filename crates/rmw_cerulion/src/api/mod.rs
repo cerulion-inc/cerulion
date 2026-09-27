@@ -212,6 +212,30 @@ pub(crate) unsafe fn resolve_service_introspection(
     None
 }
 
+/// Stamp the two message-info sequence numbers, where the rmw of this
+/// build carries them: `rmw_message_info_t` grew
+/// `publication_sequence_number` and `reception_sequence_number` at
+/// Humble, and an older distro's struct has neither field. The frame's
+/// own sequence rides the wire header on every era, so a pre-Humble
+/// build loses the rmw fields, never the datum; `reception_sequence_number`
+/// is the "unsupported" sentinel rmw documents, since a shared-memory
+/// take assigns no reception order of its own.
+///
+/// ONE cfg for all four take paths (serialized, copying, adopting and
+/// loaned), so they cannot drift apart per era.
+#[inline]
+pub(crate) fn stamp_sequence_numbers(info: &mut ffi::rmw_message_info_t, publication: u64) {
+    #[cfg(cerulion_has_message_info_sequence_numbers)]
+    {
+        info.publication_sequence_number = publication;
+        info.reception_sequence_number = u64::MAX;
+    }
+    #[cfg(not(cerulion_has_message_info_sequence_numbers))]
+    {
+        let _ = (info, publication);
+    }
+}
+
 unsafe fn resolve_service_for_identifier(
     ts: *const ffi::rosidl_service_type_support_t,
     identifier: &[u8],
