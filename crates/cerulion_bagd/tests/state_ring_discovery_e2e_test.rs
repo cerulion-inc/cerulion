@@ -137,6 +137,15 @@ struct Rank {
     /// Held so the ring's SHM name survives for the rank's lifetime — its drop
     /// unlinks it.
     _owner: StateRingOwner,
+    /// The POSIX SHM OBJECT name of this rank's ring, taken from the owner at
+    /// arming time.
+    ///
+    /// This is the name the recorder hands on into the capture manifest, so it
+    /// is what `StateNodeCoverage::ring` and the keys of `ring_ranks` hold. It
+    /// is NOT the arm tag `state_ring_tag` builds: that tag is hashed into a
+    /// fixed length object name, and the two never compare equal. A test that
+    /// wants to pin the manifest to the ring it armed has to hold this name.
+    ring_name: String,
     rank: u32,
     run_id: u64,
 }
@@ -147,10 +156,12 @@ impl Rank {
         let ring_tag = state_ring_tag(tag, rank).expect("an ordinary rank names a ring");
         let mut owner = StateRingOwner::create(&ring_tag, RING_RECORDS, rank, run_id, &[node_id])
             .expect("create this rank's state ring");
+        let ring_name = owner.name().to_string();
         let producer = owner.producer().expect("the single producer");
         Self {
             producer,
             _owner: owner,
+            ring_name,
             rank,
             run_id,
         }
@@ -335,14 +346,23 @@ fn ranks_armed_before_and_after_bag_creation_are_all_discovered_by_name() {
     // the three ranks appear once each, so it passes on a join that gives rank
     // 0's ring rank 2 and rank 2's ring rank 0, which is the one wrong answer
     // this map exists to prevent, since the reader uses it to decide whose
-    // records a ring's anchors are. The pairing is hand written off the arming
-    // above: `Rank::arm(&tag, 0, "n0")` put node n0 on rank 0's ring, so the
-    // ring n0's coverage names is rank 0's ring, and the same for n1 and n2.
+    // records a ring's anchors are.
+    //
+    // ITS KEYS ARE THE RING'S POSIX SHM OBJECT NAMES, the names
+    // `StateRingOwner::name` hands the recorder, which are minted by hashing
+    // the arm tag into a fixed length name. The arm tag `state_ring_tag`
+    // builds is the INPUT to that hash and never equals the name, so nothing
+    // here may compare the manifest against an arm tag.
+    //
+    // The pairing is therefore anchored to the ARMING above rather than
+    // restated from the manifest it is checking: `Rank::arm(&tag, 0, "n0")`
+    // armed rank 0's ring and `r0.ring_name` is the object name that ring was
+    // created under, so that name is rank 0's, and the same for r1 and r2.
     let expected_ring_ranks: std::collections::BTreeMap<String, u32> =
         std::collections::BTreeMap::from([
-            (cov.nodes["n0"].ring.clone(), 0u32),
-            (cov.nodes["n1"].ring.clone(), 1u32),
-            (cov.nodes["n2"].ring.clone(), 2u32),
+            (r0.ring_name.clone(), 0u32),
+            (r1.ring_name.clone(), 1u32),
+            (r2.ring_name.clone(), 2u32),
         ]);
     assert_eq!(
         expected_ring_ranks.len(),
@@ -355,16 +375,20 @@ fn ranks_armed_before_and_after_bag_creation_are_all_discovered_by_name() {
         "WHICH ring is WHICH rank, not merely that all three ranks appear: {:?}",
         cov.ring_ranks
     );
-    // And the names themselves, so the map is pinned to the rank each ring was
-    // armed under rather than only to the node that happened to live on it.
-    for (rank, id) in [(0u32, "n0"), (1, "n1"), (2, "n2")] {
-        let named = state_ring_tag(&tag, rank).expect("an ordinary rank names a ring");
+    // And the node join on top of it, so the manifest is pinned to the rank
+    // each ring was armed under AND to the node that lives on it, neither one
+    // standing in for the other.
+    for (rank, id, armed) in [(0u32, "n0", &r0), (1, "n1", &r1), (2, "n2", &r2)] {
         assert_eq!(
-            cov.nodes[id].ring, named,
-            "rank {rank}'s ring is the one this test armed under that rank"
+            armed.rank, rank,
+            "the ring being named here is the one armed under rank {rank}"
         );
         assert_eq!(
-            cov.ring_ranks[&named], rank,
+            cov.nodes[id].ring, armed.ring_name,
+            "node {id} sits on the ring this test armed under rank {rank}"
+        );
+        assert_eq!(
+            cov.ring_ranks[&armed.ring_name], rank,
             "and the join reads that ring back as rank {rank}"
         );
     }
