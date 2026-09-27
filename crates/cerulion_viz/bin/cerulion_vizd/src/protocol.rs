@@ -1660,6 +1660,10 @@ pub struct WorkerStatus {
     pub dropped_batches: u64,
     /// Frames coalesced away by the newest-per-tick rendering.
     pub coalesced_frames: u64,
+    /// Queued batches the worker merged into the one it was rendering: it is
+    /// running behind the drain and catching up, the early signal before
+    /// `dropped_batches` moves.
+    pub absorbed_batches: u64,
     /// Live gRPC reconnects performed after a detected viewer disconnect.
     pub reconnects: u64,
 }
@@ -2280,12 +2284,13 @@ mod tests {
                 dropped_frames: 0,
                 dropped_batches: 0,
                 coalesced_frames: 2,
+                absorbed_batches: 0,
                 reconnects: 0,
             },
         });
         assert_eq!(
             resp.to_json_line(),
-            r#"{"id":5,"ok":true,"topics":[{"topic":"/vel","hz":30.0,"frames":90,"schema":"geometry_msgs/Vector3","archetype":"Scalars","entity":"world/vel","components":["Scalars"],"view_kinds":["time_series"]}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":2,"reconnects":0}}"#
+            r#"{"id":5,"ok":true,"topics":[{"topic":"/vel","hz":30.0,"frames":90,"schema":"geometry_msgs/Vector3","archetype":"Scalars","entity":"world/vel","components":["Scalars"],"view_kinds":["time_series"]}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":2,"absorbed_batches":0,"reconnects":0}}"#
         );
     }
 
@@ -2358,12 +2363,13 @@ mod tests {
                 dropped_frames: 0,
                 dropped_batches: 0,
                 coalesced_frames: 0,
+                absorbed_batches: 0,
                 reconnects: 0,
             },
         });
         assert_eq!(
             resp.to_json_line(),
-            r#"{"id":6,"ok":true,"topics":[{"topic":"/go2/camera/jpeg","hz":null,"frames":4200,"schema":"sensor_msgs/CompressedImage","archetype":"EncodedImage","entity":"world/jpeg","components":["EncodedImage"],"view_kinds":["spatial2d"],"producer_count":1,"liveness":{"last_frame_age_ms":120000,"observed_for_ms":600000,"frames_observed":4200},"liveness_state":"idle"}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":0,"reconnects":0}}"#
+            r#"{"id":6,"ok":true,"topics":[{"topic":"/go2/camera/jpeg","hz":null,"frames":4200,"schema":"sensor_msgs/CompressedImage","archetype":"EncodedImage","entity":"world/jpeg","components":["EncodedImage"],"view_kinds":["spatial2d"],"producer_count":1,"liveness":{"last_frame_age_ms":120000,"observed_for_ms":600000,"frames_observed":4200},"liveness_state":"idle"}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":0,"absorbed_batches":0,"reconnects":0}}"#
         );
     }
 
@@ -2482,6 +2488,7 @@ mod tests {
                 dropped_frames: 0,
                 dropped_batches: 0,
                 coalesced_frames: 0,
+                absorbed_batches: 0,
                 reconnects: 0,
             },
         })
@@ -2524,12 +2531,13 @@ mod tests {
                 dropped_frames: 0,
                 dropped_batches: 0,
                 coalesced_frames: 0,
+                absorbed_batches: 0,
                 reconnects: 0,
             },
         });
         assert_eq!(
             resp.to_json_line(),
-            r#"{"id":5,"ok":true,"topics":[{"topic":"/tf","hz":9.9,"frames":99,"schema":"tf2_msgs/TFMessage","archetype":"Transforms","entity":"world","components":["Transform3D"],"view_kinds":["spatial3d"],"robot":"ubuntu"}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":0,"reconnects":0}}"#
+            r#"{"id":5,"ok":true,"topics":[{"topic":"/tf","hz":9.9,"frames":99,"schema":"tf2_msgs/TFMessage","archetype":"Transforms","entity":"world","components":["Transform3D"],"view_kinds":["spatial3d"],"robot":"ubuntu"}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":0,"absorbed_batches":0,"reconnects":0}}"#
         );
     }
 

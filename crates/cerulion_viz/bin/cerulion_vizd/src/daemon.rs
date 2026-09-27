@@ -4321,6 +4321,7 @@ impl Ctx {
             dropped_frames: self.counters.dropped_frames.load(Ordering::Relaxed),
             dropped_batches: self.counters.dropped_batches.load(Ordering::Relaxed),
             coalesced_frames: self.counters.coalesced_frames.load(Ordering::Relaxed),
+            absorbed_batches: self.counters.absorbed_batches.load(Ordering::Relaxed),
             reconnects: self.counters.reconnects.load(Ordering::Relaxed),
         };
         Response::Status(StatusResponse {

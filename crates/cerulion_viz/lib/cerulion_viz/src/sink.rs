@@ -1483,6 +1483,8 @@ pub struct SinkState {
     /// DIFFERS from the last one, so a topic whose `frame_id` is constant (the
     /// normal case — `/lf/sportmodestate` reported `odom` on 594 of 594 observed
     /// frames) costs one chunk per entity per run instead of one per message.
+    /// CLEARED on a viewer reconnect ([`SinkState::clear_rebroadcast_dedup`]):
+    /// the bounced server holds no assignment, whatever this remembers.
     frame_emitted: BTreeMap<String, String>,
     /// Inputs whose message carried a `frame_id` that could NOT be
     /// resolved — warn once each. Nothing is logged for them (a fabricated mount
@@ -1650,16 +1652,19 @@ impl SinkState {
         self.skeleton.log_statics_once(rec);
     }
 
-    /// Forget the per-input `/tf_static` re-broadcast dedup so the NEXT
-    /// re-broadcast re-logs. Called after a live reconnect: the bounced (empty)
-    /// server has NO `/tf_static` mounts, and the dedup would otherwise suppress
-    /// re-logging an unchanged re-broadcast forever — leaving the fresh viewer
-    /// without the static transform tree. Complements
-    /// [`crate::stream::rearm_after_reconnect`] (which re-arms the world-statics
-    /// / blueprint / skeleton guards); together they restore the FULL scene
-    /// setup on a reconnected server.
+    /// Forget every producer-side DEDUP that stands in for "the viewer
+    /// already holds this", so the NEXT message re-logs it. Called after a live
+    /// reconnect: the bounced (empty) server has NO `/tf_static` mounts and NO
+    /// per-entity `CoordinateFrame` assignments, and either dedup would otherwise
+    /// suppress re-logging an unchanged value forever, leaving the fresh viewer
+    /// without the static transform tree, and every data topic (and every video
+    /// rendition child, whose frame rides the same map) drawn UNPOSED at the
+    /// world origin. Complements [`crate::stream::rearm_after_reconnect`] (which
+    /// re-arms the world-statics / blueprint / skeleton guards); together they
+    /// restore the FULL scene setup on a reconnected server.
     pub fn clear_rebroadcast_dedup(&mut self) {
         self.tf_static_last.clear();
+        self.frame_emitted.clear();
     }
 
     /// Forget every input's per-viewer MARKER state after a reconnect —
@@ -3344,6 +3349,7 @@ fn render_classified(
                 timestamp_ns,
                 fv,
                 &payload,
+                &resolved_frame,
                 state,
             );
         }
@@ -3404,6 +3410,17 @@ fn render_classified(
 /// a rendition at all means the topic is interleaving streams this build cannot
 /// separate (warn once — that IS an operator-actionable degradation, and the
 /// counters stay exact whatever the log level).
+///
+/// The picture lands on the rendition's CHILD entity, and, exactly as for the
+/// cloud's `viz-sweep/{k}` sub-entities, a child's implicit frame chains to its
+/// PATH parent, not to the frame the topic entity was re-pointed at. So the child
+/// is posed with the same `resolved_frame` as the topic entity. Otherwise the
+/// topic entity sits in the camera frame (which the `spatial2d` pane rooted at it
+/// adopts as its target frame) while the picture stays in the world hierarchy,
+/// and the viewer draws the pixel quad through the INVERSE camera pose: a
+/// rotated, translated, untextured slab that tracks the robot's attitude, or
+/// nothing at all while the camera frame has no transform yet.
+#[allow(clippy::too_many_arguments)]
 fn render_video_sample(
     rec: &RecordingStream,
     input_name: &str,
@@ -3411,6 +3428,7 @@ fn render_video_sample(
     timestamp_ns: u64,
     fv: &FrameValue,
     payload: &crate::video::H264Payload,
+    resolved_frame: &Option<String>,
     state: &mut SinkState,
 ) {
     match state.video.route(input_name, fv, payload) {
@@ -3447,9 +3465,17 @@ fn render_video_sample(
             // probe is on; the elapsed time is parked on `state` for the caller
             // that holds this frame's wire sequence.
             let probe_decode_t0 = cerulion_core::lat_probe::probe_enabled().then(Instant::now);
-            let decoded = state
-                .video_decoders
-                .decode(input_name, key, payload.bytes, timestamp_ns);
+            // The unit's resolved frame rides INTO the decoder with its stamp and
+            // comes back on the picture that unit yields, in feed order: a stamp
+            // is not a key (cameras repeat and regress them), so the frame is
+            // carried by the pipeline that holds the picture, not looked up.
+            let decoded = state.video_decoders.decode_unit(
+                input_name,
+                key,
+                payload.bytes,
+                timestamp_ns,
+                resolved_frame.clone(),
+            );
             if let Some(t0) = probe_decode_t0 {
                 state.probe_decode_us = t0.elapsed().as_micros() as u64;
             }
@@ -3459,7 +3485,8 @@ fn render_video_sample(
                     // openh264 holds a picture for one call on a stream it cannot
                     // release inline, so the frame that comes out here belongs to
                     // an earlier access unit; `timestamp_ns` would label it one
-                    // frame-period newer than it is.
+                    // frame-period newer than it is. Its pose is that unit's too.
+                    emit_frame_at(rec, &stream_entity, frame.timestamp_ns, &frame.frame, state);
                     crate::archetype::log_raw_image(
                         rec,
                         &stream_entity,
@@ -3483,6 +3510,8 @@ fn render_video_sample(
                 // pane. The decoder logs the reason once; here we only re-declare
                 // the codec, which rerun REQUIRES to decode H.264 at all.
                 crate::video_decode::DecodeOutcome::DecoderUnavailable => {
+                    // The unit itself is what gets logged, at its own stamp.
+                    emit_frame_at(rec, &stream_entity, timestamp_ns, resolved_frame, state);
                     if first_sample {
                         crate::video::log_video_codec(rec, &stream_entity);
                     }

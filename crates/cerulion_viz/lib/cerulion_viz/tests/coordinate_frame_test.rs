@@ -705,6 +705,53 @@ fn the_frame_is_emitted_on_change_not_on_every_message() {
     );
 }
 
+/// The change-triggered dedup is a belief about what the VIEWER holds, and a
+/// reconnect invalidates it: the bounced server has no assignment for any entity,
+/// so the next message after the reconnect arm's `clear_rebroadcast_dedup` must
+/// re-emit the UNCHANGED frame, or every data topic (and every video rendition
+/// child, which rides the same map) sits unposed at the world origin until its
+/// `frame_id` happens to change.
+#[test]
+fn a_reconnect_re_emits_an_unchanged_frame_to_the_fresh_server() {
+    let _g = rerun_lock();
+    let (rec, storage) = memory_sink("frame_after_reconnect");
+    let walker = walker();
+    let mut state = SinkState::new();
+
+    let topic = "/velodyne/points";
+    let frame = |tick: u64| build_cloud_frame("livox_frame", tick);
+    // Two messages, one frame_id: ONE row before the bounce.
+    dispatch(
+        &rec,
+        &walker,
+        topic,
+        &[frame(1_000), frame(2_000)],
+        &mut state,
+    );
+    // The reconnect arm forgets the per-viewer dedups; a third message with the
+    // SAME frame_id re-poses the entity on the fresh server.
+    state.clear_rebroadcast_dedup();
+    dispatch(&rec, &walker, topic, &[frame(3_000)], &mut state);
+    // And the dedup is live again afterwards: a fourth repeat emits nothing.
+    dispatch(&rec, &walker, topic, &[frame(4_000)], &mut state);
+    rec.flush_blocking().expect("flush");
+
+    let entity = entity_of(topic);
+    let emitted: Vec<String> = coordinate_frames(&storage)
+        .into_iter()
+        .filter(|(e, _)| *e == entity)
+        .map(|(_, f)| f)
+        .collect();
+    assert_eq!(
+        emitted,
+        vec![
+            "tf#/world/tf-tree/odom/base/lidar".to_string(),
+            "tf#/world/tf-tree/odom/base/lidar".to_string(),
+        ],
+        "one row before the reconnect, one re-emission after it, none for the repeat"
+    );
+}
+
 /// The TRANSFORM-payload twin: `parent_frame` rides the transform archetype, so it
 /// is written on EVERY row and tracks the message's frame message-by-message.
 ///
