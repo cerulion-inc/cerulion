@@ -211,6 +211,62 @@ pub fn select_ros_prefixes<'a>(
     (usable, skipped)
 }
 
+/// The C++ package header namespaces the COMPILED SHIM includes, which
+/// [`CORE_ROS_INCLUDE_PACKAGES`] deliberately does not carry: that set is the
+/// C packages `wrapper.h` needs for bindgen, and the shim compiles C++.
+///
+/// Derived from the transitive includes of the ONE header the shim includes,
+/// `rosidl_typesupport_introspection_cpp/message_introspection.hpp`, read off
+/// the humble, jazzy and lyrical branches of ros2/rosidl (all three carry the
+/// same four includes, jazzy and later adding `type_hash.h`):
+///
+/// * `rosidl_runtime_c/message_type_support_struct.h` and, from Jazzy,
+///   `rosidl_runtime_c/type_hash.h`, so `rosidl_runtime_c`, already core;
+/// * `rosidl_runtime_cpp/message_initialization.hpp`, so `rosidl_runtime_cpp`,
+///   C++ only and NOT core;
+/// * `rosidl_typesupport_introspection_cpp/visibility_control.h` and the header
+///   itself, so `rosidl_typesupport_introspection_cpp`, C++ only and NOT core.
+///
+/// One level further down come `rosidl_typesupport_interface/macros.h` and
+/// rcutils, both core packages already. The message header pulls no service
+/// header, so `service_introspection.hpp` needs nothing extra.
+pub const CPP_SHIM_INCLUDE_PACKAGES: &[&str] =
+    &["rosidl_typesupport_introspection_cpp", "rosidl_runtime_cpp"];
+
+/// The per-package include directories the COMPILED SHIM needs, resolved the
+/// same way the C ones are: probe `<include dir>/<package>` under every
+/// collected include dir and keep the ones that exist, first match first (the
+/// order clang resolves them in).
+///
+/// WHY this exists apart from the collected set: from Galactic on, ament
+/// installs each package's headers under `include/<package>/<package>/...`, so
+/// `#include <rosidl_typesupport_introspection_cpp/message_introspection.hpp>`
+/// resolves only from `<prefix>/include/<package>`. The collected set carries
+/// that directory for the C packages bindgen needs and for none of the C++
+/// ones, so the shim's `__has_include` read FALSE on every distro from Humble
+/// on and its per-era `static_assert`s compiled to nothing. The FLAT layout
+/// (Foxy and earlier) keeps working either way: the package namespace is a
+/// directory in both layouts, so this resolves it there too, and the flat
+/// include root that already served the header still does.
+///
+/// `dir_exists` is the filesystem, injected so the decision is testable
+/// without one.
+pub fn cpp_shim_include_dirs(
+    collected: &[std::path::PathBuf],
+    dir_exists: &mut dyn FnMut(&std::path::Path) -> bool,
+) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for dir in collected {
+        for pkg in CPP_SHIM_INCLUDE_PACKAGES {
+            let candidate = dir.join(pkg);
+            if dir_exists(&candidate) && !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
 /// A capability header found under an include root OTHER than the one
 /// that serves the anchor header — a MIXED include tree, refused rather
 /// than fingerprinted (a plain existence probe would enable a
@@ -862,6 +918,106 @@ mod tests {
             Err(CapabilityProbeRefusal::NoAnchor {
                 anchor: ANCHOR.to_string()
             })
+        );
+    }
+
+    /// The shim's C++ package directories, over three synthetic prefix trees.
+    /// The oracle is written out per row: which directories EXIST, and which of
+    /// them the resolver must hand the shim. No filesystem is touched.
+    #[test]
+    fn the_shim_resolves_its_cpp_package_dirs_from_the_tree_it_is_given() {
+        use std::path::{Path, PathBuf};
+        fn resolve(existing: &[&str], collected: &[&str]) -> Vec<String> {
+            let owned: Vec<String> = existing.iter().map(|s| (*s).to_string()).collect();
+            let mut probe = |p: &Path| owned.iter().any(|d| d == &p.to_string_lossy());
+            let dirs: Vec<PathBuf> = collected.iter().map(PathBuf::from).collect();
+            cpp_shim_include_dirs(&dirs, &mut probe)
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        }
+
+        // 1. The NESTED layout (Galactic and later): each package's headers live
+        //    under include/<package>/<package>/, so both C++ namespaces resolve,
+        //    and the per-package C directory in the collected set contributes
+        //    nothing. Order is the package list's.
+        assert_eq!(
+            resolve(
+                &[
+                    "/p/include",
+                    "/p/include/rmw",
+                    "/p/include/rosidl_typesupport_introspection_cpp",
+                    "/p/include/rosidl_runtime_cpp",
+                ],
+                &["/p/include/rmw", "/p/include"],
+            ),
+            vec![
+                "/p/include/rosidl_typesupport_introspection_cpp".to_string(),
+                "/p/include/rosidl_runtime_cpp".to_string(),
+            ],
+            "the nested layout must hand the shim both C++ package directories"
+        );
+
+        // 2. The FLAT layout (Foxy): the package namespace is a directory there
+        //    too, holding the headers directly, so the same two resolve. They add
+        //    nothing clang needs (the flat include root already serves the
+        //    header) and cost nothing; what matters is that the flat root is
+        //    still on the shim's list, which the caller keeps.
+        assert_eq!(
+            resolve(
+                &[
+                    "/f/include",
+                    "/f/include/rosidl_typesupport_introspection_cpp",
+                    "/f/include/rosidl_runtime_cpp",
+                ],
+                &["/f/include"],
+            ),
+            vec![
+                "/f/include/rosidl_typesupport_introspection_cpp".to_string(),
+                "/f/include/rosidl_runtime_cpp".to_string(),
+            ],
+            "the flat layout resolves the same namespaces, harmlessly"
+        );
+
+        // 3. NEITHER: a tree with no C++ introspection packages at all (a C-only
+        //    isolated workspace) resolves NOTHING extra, so the shim's
+        //    `__has_include` stays false and its era asserts stay out, which is
+        //    the documented not-applicable case.
+        assert_eq!(
+            resolve(
+                &[
+                    "/c/include",
+                    "/c/include/rmw",
+                    "/c/include/rosidl_runtime_c"
+                ],
+                &[
+                    "/c/include/rmw",
+                    "/c/include/rosidl_runtime_c",
+                    "/c/include"
+                ],
+            ),
+            Vec::<String>::new(),
+            "a tree without the C++ packages must resolve nothing"
+        );
+
+        // 4. Two prefixes serving the same package: each is its own directory and
+        //    both are kept, first match first, while a DUPLICATED collected entry
+        //    contributes the path once.
+        assert_eq!(
+            resolve(
+                &[
+                    "/a/include",
+                    "/a/include/rosidl_runtime_cpp",
+                    "/b/include",
+                    "/b/include/rosidl_runtime_cpp",
+                ],
+                &["/a/include", "/b/include", "/a/include"],
+            ),
+            vec![
+                "/a/include/rosidl_runtime_cpp".to_string(),
+                "/b/include/rosidl_runtime_cpp".to_string(),
+            ],
+            "first match first, and a repeated collected dir adds nothing twice"
         );
     }
 

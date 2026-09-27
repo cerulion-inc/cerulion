@@ -464,9 +464,21 @@ fn a_bool_member_this_build_cannot_write_is_refused_with_the_member_named() {
             if !head.contains("var_idx=0") {
                 return Err(format!("the refusal must name WHICH entry: {head}"));
             }
-            // The suppressed repeat of THIS reporter must never surface
-            // loudly: a Foxy subscriber on a live topic refuses every frame,
-            // so a promoted repeat is the disk-fill class.
+            // The repeats: release-safe, because `debug!` is compiled out
+            // under `release_max_level_info` and a DEBUG count then reads 0
+            // whatever the code did. The expectation therefore routes through
+            // the static-level helper, and the level-free TWIN below is what
+            // still fails in release if the suppressed arm is ever promoted:
+            // a subscriber in this state refuses every frame, so a loud repeat
+            // is the disk-fill class.
+            let suppressed = count_at_exclusively(lines, "DEBUG", &[ENTRY_REFUSED_SUPPRESSED])?;
+            let want = debug_lines_expected(FRAMES as usize - 1);
+            if suppressed != want {
+                return Err(format!(
+                    "{FRAMES} refusals must leave exactly {want} suppressed repeat(s) at \
+                     DEBUG, got {suppressed}"
+                ));
+            }
             never_loud(lines, ENTRY_REFUSED_SUPPRESSED)?;
             Ok(())
         });

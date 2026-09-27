@@ -196,8 +196,12 @@ const void *rmw_cerulion_throwing_get_const(const void *, size_t) { throw 1; }
 }  // extern "C"
 
 // The hand-mirrored C++ MessageMember (src/ffi/introspection_cpp.rs) is pinned
-// against the C++ header itself wherever that header is on the include path
-// (the distro jobs). All three shapes are pinned, keyed on the same defines
+// against the C++ header itself on every real-header build: build.rs gives this
+// translation unit the C++ packages' per-package include directories as well as
+// the C ones bindgen needs, so the include below resolves on the flat
+// pre-Galactic layout AND on the per-package one every later distro installs.
+// Only a build with no ROS headers at all takes the #else. All three shapes are
+// pinned, keyed on the same defines
 // build.rs derives from the bindings: 120 bytes with is_rosidl_buffer_ at 112
 // on Lyrical and Rolling, 112 bytes from Humble to Kilted, and 96 bytes with
 // resize_function last on Foxy and Galactic, which have no fetch or assign.
@@ -222,7 +226,7 @@ static_assert(offsetof(rosidl_typesupport_introspection_cpp::MessageMember, resi
               "resize_function is the last field at 88 before Humble");
 #endif
 // Era-independent twin of the asserts above, read by a Rust test: the C++
-// header's own sizeof, or 0 where the header is not on the include path
+// header's own sizeof, or 0 where no ROS headers were found at all
 // (a vendored build), so the Rust mirror is compared with the C++ truth on
 // every real-header build whatever the era.
 extern "C" size_t rmw_cerulion_cpp_message_member_sizeof() noexcept {

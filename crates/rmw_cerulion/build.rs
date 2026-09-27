@@ -69,7 +69,7 @@
 //!   jazzy/kilted + lyrical/rolling residual.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // The header-provenance checker is SHARED with the
 // crate (single source of truth — `src/era_check.rs` is also
@@ -422,10 +422,11 @@ fn main() {
     // so the cpp bridge is unit-testable on dev machines too. Built AFTER
     // the capability set is known: it carries a static_assert of the
     // hand-mirrored C++ MessageMember against the distro's own C++ header
-    // (active wherever that header is on the include path, i.e. the
-    // real-header builds), and the era with the Lyrical tail field is told
-    // through a define. The distro include roots are passed so the header
-    // is found; the shim itself needs no ROS header to compile.
+    // (active on every real-header build, and skipped on the vendored one,
+    // which has no distro header to compare with), and the era with the
+    // Lyrical tail field is told through a define. The distro include roots
+    // are passed so the header is found; the shim itself needs no ROS header
+    // to compile.
     let mut shim = cc::Build::new();
     // Pin the C++ standard: the shim uses `noexcept` + `std::string`
     // (C++11). Linux g++ defaults high enough to hide this, but macOS
@@ -434,6 +435,26 @@ fn main() {
     shim.cpp(true).flag_if_supported("-std=c++14");
     for dir in &include_dirs {
         shim.include(dir);
+    }
+    // The C++ package namespaces, which the collected set does not carry: it
+    // resolves the per-package directories of the C packages bindgen needs, and
+    // on the ament layout from Galactic on a C++ include resolves only from its
+    // own `<prefix>/include/<package>`. Without these the shim's
+    // `__has_include` read false on every distro from Humble on and its per-era
+    // static_asserts compiled to nothing (`era_check::cpp_shim_include_dirs`
+    // states the derivation and the flat-layout case).
+    let mut cpp_dir_probe = |p: &Path| p.is_dir();
+    let cpp_include_dirs = era_check::cpp_shim_include_dirs(&include_dirs, &mut cpp_dir_probe);
+    for dir in &cpp_include_dirs {
+        shim.include(dir);
+    }
+    if generated && cpp_include_dirs.is_empty() {
+        cargo_warning(
+            "rmw_cerulion: no C++ introspection package include directory found under any \
+             collected include dir, so the compiled shim cannot pin the hand-mirrored C++ \
+             MessageMember against this distro's own header (the Rust-side per-era pins and the \
+             C-twin size check still apply).",
+        );
     }
     if observed_caps.contains(&"is_rosidl_buffer") {
         shim.define("RMW_CERULION_HAS_IS_ROSIDL_BUFFER", None);
