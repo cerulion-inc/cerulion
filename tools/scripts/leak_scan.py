@@ -2612,7 +2612,7 @@ SH = STANDIN_HOST            # a host stand-in
 PERSON = 'Orvald' + ' ' + 'Pentwistle'
 PLAIN_USER = 'thorn' + 'wick'   # a login NO tier in the self-test knows
 RED1 = '<private#1@host>'
-EXPECTED_ARMS = 174
+EXPECTED_ARMS = 175
 
 
 def _png(chunks):
@@ -2807,10 +2807,27 @@ def self_test(out, base_env, argv0):
         def hits(lines, word='HIT'):
             found = set()
             for ln in lines:
-                m = re.match(word + r' (\S+) (.+?):(\d+)(?=:|\s\[|$)', ln)
+                m = re.match(word + r' (\S+) (.+?):(\d+)(?=:\s|:$|\s\[|$)', ln)
                 if m:
                     found.add((m.group(1), m.group(2), int(m.group(3))))
             return found
+
+        # A commit hit is labelled 'commit:' + sha[:12], and a sha prefix is ALL
+        # DIGITS about 0.35 percent of the time. With a non greedy path capture and
+        # a bare colon lookahead the parser then stopped at the FIRST colon and read
+        # the sha itself as the line number, so every plain commit hit on that commit
+        # landed at a bogus line on a path of 'commit'. Identity hits survived it,
+        # because their path continues past the sha and backtracking recovers, which
+        # is why it surfaced as two body line arms failing at random on a required
+        # Lint context rather than as anything legible. Pinned here on a synthetic
+        # all digit label so the lookahead cannot be loosened again.
+        digit_label = 'commit:' + '1' * 12
+        arm('selftest-hits-parses-an-all-digit-commit-label',
+            hits(['HIT style-dash ' + digit_label + ':5: a body line',
+                  'HIT email-personal ' + digit_label + ' author email:0: a value'])
+            == {('style-dash', digit_label, 5),
+                ('email-personal', digit_label + ' author email', 0)},
+            str(hits(['HIT style-dash ' + digit_label + ':5: a body line'])))
 
         def bare_private(lines):
             """True when every private HIT line is label, location and an optional
