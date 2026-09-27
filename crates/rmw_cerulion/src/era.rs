@@ -369,8 +369,8 @@ pub fn test_surface() -> TestSurface {
 }
 
 /// The C introspection era the compiled bindings carry, derived ONCE
-/// from three capability cfgs (`fetch_function` arrived at Galactic,
-/// `is_key_` at Jazzy, `is_rosidl_buffer_` at Lyrical), so the bridge
+/// from three capability cfgs (`fetch_function` is absent before Humble,
+/// `is_key_` arrived at Jazzy, `is_rosidl_buffer_` at Lyrical), so the bridge
 /// classifier cannot receive them swapped. The hand-mirrored C++ bridge is
 /// shaped by the SAME cfgs, so every era from Humble onward is admitted;
 /// only the pre-Galactic shape (96-byte member, no fetch/assign) has no
