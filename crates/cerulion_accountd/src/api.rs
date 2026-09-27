@@ -1052,6 +1052,8 @@ async fn register_robot(
 struct RobotResponse {
     robot_id: String,
     hostname: String,
+    /// Hex transport public key, used to authenticate the robot's endpoint.
+    robot_transport_key: String,
     /// `base64url(AccountId)` of the owner.
     owner_account_id: String,
     org_id: Option<String>,
@@ -1079,6 +1081,7 @@ async fn get_robot(
     Ok(Json(RobotResponse {
         robot_id: URL_SAFE_NO_PAD.encode(robot.robot_id),
         hostname: robot.hostname,
+        robot_transport_key: crate::codec::encode_transport_key_hex(&robot.robot_transport_key),
         owner_account_id: URL_SAFE_NO_PAD.encode(robot.owner_account_id),
         org_id: robot.org_id,
         created_at_ns: robot.created_at_ns,
@@ -1112,6 +1115,7 @@ async fn list_robots(
         .map(|r| RobotResponse {
             robot_id: URL_SAFE_NO_PAD.encode(r.robot_id),
             hostname: r.hostname,
+            robot_transport_key: crate::codec::encode_transport_key_hex(&r.robot_transport_key),
             owner_account_id: URL_SAFE_NO_PAD.encode(r.owner_account_id),
             org_id: r.org_id,
             created_at_ns: r.created_at_ns,

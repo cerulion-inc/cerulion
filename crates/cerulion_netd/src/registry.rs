@@ -481,6 +481,40 @@ impl DemandRegistry {
         }
     }
 
+    /// Forget mirrors whose transport has already been invalidated.
+    ///
+    /// Account/key replacement and removed WAN membership revoke live demands,
+    /// unlike ordinary refcount-zero retirement. The caller must close readers
+    /// and retire physical mirrors first, while serializing new demand admission.
+    /// Remove each connection's hold as well: a later close must not decrement a
+    /// new generation's demand. Connections and local egress registrations survive.
+    /// Returns removed keys in deterministic order, including lingering mirrors.
+    /// If any selected key has an in-flight teardown, returns those busy keys
+    /// without changing anything. A delayed teardown must never retire a newly
+    /// admitted generation of the same key; retry only after it has finished.
+    pub fn invalidate_mirrors(
+        &mut self,
+        keys: &BTreeSet<TopicKey>,
+    ) -> Result<Vec<TopicKey>, Vec<TopicKey>> {
+        let busy: Vec<_> = keys
+            .iter()
+            .filter(|key| self.is_tearing(key))
+            .cloned()
+            .collect();
+        if !busy.is_empty() {
+            return Err(busy);
+        }
+        let removed: Vec<_> = keys
+            .iter()
+            .filter(|key| self.topics.remove(*key).is_some())
+            .cloned()
+            .collect();
+        for held in self.per_conn.values_mut() {
+            held.retain(|key| !keys.contains(key));
+        }
+        Ok(removed)
+    }
+
     /// CLAIM a lingering key for teardown — atomically mark it `tearing`
     /// so no demand can reuse the bridge while the daemon runs the (off-lock)
     /// `release_mirror`. Returns `true` iff the claim succeeded: the entry exists,
@@ -851,6 +885,79 @@ mod tests {
             reg.mark_mirror_present(k); // ensure succeeded
         }
         outcome
+    }
+
+    #[test]
+    fn invalidation_removes_old_holds_without_touching_lan_or_egress() {
+        let now = Instant::now();
+        let mut reg = DemandRegistry::new(now);
+        let old = reg.connect(now);
+        let other = reg.connect(now);
+        let wan = key("account-robot", "/camera");
+        let lan = key("lan-robot", "/imu");
+        demand_and_ensure(&mut reg, old, &wan, HASH_A);
+        demand_and_ensure(&mut reg, other, &wan, HASH_A);
+        demand_and_ensure(&mut reg, old, &lan, HASH_A);
+        assert!(matches!(
+            reg.register_egress(old, vec!["/local/output".into()]),
+            RegisterEgressOutcome::Registered { .. }
+        ));
+        assert_eq!(
+            reg.invalidate_mirrors(&BTreeSet::from([wan.clone()])),
+            Ok(vec![wan.clone()])
+        );
+        assert_eq!(reg.snapshot(), vec![(lan.clone(), 1)]);
+        assert_eq!(reg.active_connections(), 2);
+        assert_eq!(reg.active_egress_registration_count(), 1);
+        assert!(!reg.is_idle());
+        assert_eq!(
+            reg.demand(other, wan.clone(), HASH_B, now),
+            DemandOutcome::FirstDemand { refcount: 1 }
+        );
+        reg.mark_mirror_present(&wan);
+        let closed = reg.disconnect(old, now);
+        assert_eq!(closed.mirror_last_released, vec![lan]);
+        assert_eq!(closed.egress_released, vec!["/local/output"]);
+        assert_eq!(
+            reg.refcount(&wan),
+            1,
+            "an old generation's close cannot decrement the replacement"
+        );
+        assert_eq!(reg.disconnect(other, now).mirror_last_released, vec![wan]);
+    }
+
+    #[test]
+    fn invalidation_waits_for_teardown_then_clears_holds_in_sorted_order() {
+        let now = Instant::now();
+        let mut reg = DemandRegistry::new(now);
+        let conn = reg.connect(now);
+        let first = key("robot", "/a");
+        let second = key("robot", "/z");
+        demand_and_ensure(&mut reg, conn, &second, HASH_A);
+        demand_and_ensure(&mut reg, conn, &first, HASH_A);
+        reg.release(conn, &second, now);
+        assert!(reg.claim_tearing(&second));
+        let selected = BTreeSet::from([second.clone(), first.clone(), key("missing", "/topic")]);
+        assert_eq!(reg.invalidate_mirrors(&selected), Err(vec![second.clone()]));
+        assert_eq!(
+            reg.refcount(&first),
+            1,
+            "a busy result makes no partial change"
+        );
+        assert!(reg.is_tearing(&second));
+        // The original teardown completes before an invalidation can admit a
+        // replacement. This case models a lingering result; a retired one is absent.
+        reg.clear_tearing(&second);
+        assert_eq!(
+            reg.invalidate_mirrors(&selected),
+            Ok(vec![first.clone(), second.clone()])
+        );
+        assert_eq!(reg.mirror_count(), 0);
+        assert_eq!(reg.invalidate_mirrors(&selected), Ok(vec![]));
+        assert_eq!(reg.release(conn, &first, now), ReleaseOutcome::NotHeld);
+        assert_eq!(reg.release(conn, &second, now), ReleaseOutcome::NotHeld);
+        assert!(reg.disconnect(conn, now).mirror_last_released.is_empty());
+        assert!(reg.is_idle());
     }
 
     #[test]

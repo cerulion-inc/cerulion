@@ -252,8 +252,19 @@ impl PairingAuthorizer {
 
     /// The accept-time plane-routing decision for an incoming connection.
     pub fn classify_accept(&self, alpn: &[u8], remote_id: &[u8; 32]) -> AcceptDecision {
+        self.classify_accept_with_enrollment_hint(alpn, remote_id).0
+    }
+
+    /// The enrollment hint and refusal must describe the same trust snapshot.
+    pub(crate) fn classify_accept_with_enrollment_hint(
+        &self,
+        alpn: &[u8],
+        remote_id: &[u8; 32],
+    ) -> (AcceptDecision, bool) {
         let (claimed, access) = self.shared.snapshot_for_key(remote_id);
-        if alpn == cerulion_link::alpn::OPS {
+        let unpaired =
+            alpn == cerulion_link::alpn::WIRE && claimed && matches!(access, KeyAccess::Unpaired);
+        let decision = if alpn == cerulion_link::alpn::OPS {
             // Ops plane: per-verb authz runs downstream in the ops server. At
             // accept we route by reachability — a paired+allowed key gets the
             // full surface; anyone else reaches only the bootstrap surface.
@@ -273,7 +284,8 @@ impl PairingAuthorizer {
             AcceptDecision::UnknownAlpn {
                 alpn: alpn.to_vec(),
             }
-        }
+        };
+        (decision, unpaired)
     }
 
     /// The live shared-trust handle backing this authorizer, so the daemon can

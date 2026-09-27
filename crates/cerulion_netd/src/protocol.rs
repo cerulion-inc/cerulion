@@ -115,7 +115,39 @@ use serde::{Deserialize, Serialize};
 /// wire (see [`RunsQueryResponse::discovery`]), so there is no absent-field default to
 /// distrust; its one optional field, `plane_unsettled_ms`, means UNKNOWN when absent
 /// and suppresses nothing.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// `8`: account snapshots, presence probes and authorized metadata queries use the
+/// existing socket. A local serving-schema snapshot also lets remoted use the
+/// gateway's accumulated bindings without network discovery. Older daemons must
+/// be restarted before these operations.
+pub const PROTOCOL_VERSION: u32 = 8;
+
+const _: () = assert!(crate::account_access::MIN_DAEMON_VERSION <= PROTOCOL_VERSION);
+
+/// First protocol version with the local-only serving-schema snapshot.
+pub const SERVING_SCHEMA_MIN_DAEMON_VERSION: u32 = 8;
+const _: () = assert!(SERVING_SCHEMA_MIN_DAEMON_VERSION <= PROTOCOL_VERSION);
+
+/// Metadata accumulated by this daemon's egress plane, in its exact SHM namespace.
+/// Reading this value never performs network discovery or creates a demand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingSchemaSnapshot {
+    /// Topic bindings, hash bindings and custom schema documents registered locally.
+    pub schema_serving: SchemaServing,
+    /// Serialized iceoryx2 configuration for namespace validation by the reader.
+    pub ix_config_json: String,
+}
+
+/// The required `serving_schema` field separates this reply from all other verbs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingSchemaSnapshotResponse {
+    /// Echoed request identifier.
+    pub id: u64,
+    /// Current local serving metadata, including its namespace.
+    pub serving_schema: ServingSchemaSnapshot,
+}
 
 /// The minimum daemon [`PROTOCOL_VERSION`] that serves the `query_runs`
 /// verb — the version that INTRODUCED it, frozen here rather than spelled inline so
@@ -195,6 +227,18 @@ impl Default for Hello {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
+    /// Read local egress metadata without invoking either network query plane.
+    ServingSchemaSnapshot {
+        /// Correlation id echoed in the response.
+        id: u64,
+    },
+    /// Account robot access through the daemon's single WAN controller.
+    AccountAccess {
+        /// Correlation id echoed in the response.
+        id: u64,
+        /// Bounded public identity operation; no token or private key.
+        action: crate::account_access::AccountAccessRequest,
+    },
     /// Demand a remote `(robot, topic)`: ensure the shared desk mirror exists and
     /// increment this connection's refcount for it. Idempotent per connection (a
     /// re-demand of a key the connection already holds does not double-count).
@@ -360,7 +404,9 @@ impl Request {
     /// The correlation `id` this request carries (echoed in its response).
     pub fn id(&self) -> u64 {
         match self {
-            Request::Demand { id, .. }
+            Request::ServingSchemaSnapshot { id }
+            | Request::AccountAccess { id, .. }
+            | Request::Demand { id, .. }
             | Request::Release { id, .. }
             | Request::Status { id }
             | Request::RegisterEgress { id, .. }
@@ -376,6 +422,8 @@ impl Request {
     /// the client's per-verb version-compat message.
     pub fn method_name(&self) -> &'static str {
         match self {
+            Request::ServingSchemaSnapshot { .. } => "serving_schema_snapshot",
+            Request::AccountAccess { .. } => "account_access",
             Request::Demand { .. } => "demand",
             Request::Release { .. } => "release",
             Request::Status { .. } => "status",
@@ -399,11 +447,34 @@ impl Request {
     /// THAT verb requires (see [`crate::client`]).
     pub fn min_daemon_version(&self) -> u32 {
         match self {
+            Request::Demand { robot, .. } | Request::Release { robot, .. }
+                if robot
+                    .trim()
+                    .starts_with(crate::account_access::ACCOUNT_ROUTE_PREFIX) =>
+            {
+                crate::account_access::MIN_DAEMON_VERSION
+            }
+            Request::QueryCatalog {
+                robot: Some(robot), ..
+            }
+            | Request::QuerySchema {
+                robot: Some(robot), ..
+            }
+            | Request::QueryRuns {
+                robot: Some(robot), ..
+            } if robot
+                .trim()
+                .starts_with(crate::account_access::ACCOUNT_ROUTE_PREFIX) =>
+            {
+                crate::account_access::MIN_DAEMON_VERSION
+            }
             // The catalog-change SUBSCRIPTION needs a v6 daemon. A v<6 daemon
             // has no announce watch and would answer an unknown-method error; gating it
             // here means the consumer gets a precise version message and degrades to
             // its own refresh path, rather than silently waiting forever for a push
             // that can never come.
+            Request::ServingSchemaSnapshot { .. } => SERVING_SCHEMA_MIN_DAEMON_VERSION,
+            Request::AccountAccess { .. } => crate::account_access::MIN_DAEMON_VERSION,
             Request::SubscribeCatalog { .. } => 6,
             // The `runs` verb needs a v7 daemon. A v<7 daemon has no
             // `runs` handler and would answer the generic unknown-method error, which
@@ -469,6 +540,23 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
     }
 }
 
+/// Which transport carried a mirror's frames.
+///
+/// The two planes are not interchangeable and an operator cannot tell them apart
+/// from the frames: both re-inject into the same local shared memory under the
+/// same topic name. A robot on the same local network is reachable over BOTH, so
+/// "the robot is on the internet plane" is a claim about routing that only the
+/// daemon can make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServingPlane {
+    /// The local-network plane: the shared gateway session, mirrored by name.
+    Zenoh,
+    /// The internet plane: dial the robot's endpoint id directly, authenticated by
+    /// its device key, and re-inject what that one connection carries.
+    Iroh,
+}
+
 /// One demand-table row in a [`StatusResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DemandEntry {
@@ -479,6 +567,17 @@ pub struct DemandEntry {
     /// How many connections currently demand this `(robot, topic)` (the shared
     /// mirror's refcount).
     pub refcount: usize,
+    /// Which plane serves this row, when the daemon can say.
+    ///
+    /// `Option`, not a bare [`ServingPlane`], for the reason `connect_endpoints`
+    /// is optional: a daemon that predates this field omits it, and any default
+    /// value would be a POSITIVE claim about routing that such a daemon never
+    /// made. `None` means "this daemon does not report the plane"; a reader must
+    /// never read it as "the local-network plane". A mirror plane that cannot
+    /// attribute a key (a test double, a plane whose route pin is gone) also
+    /// answers `None` rather than guessing.
+    #[serde(default)]
+    pub plane: Option<ServingPlane>,
 }
 
 /// The response to [`Request::Demand`].
@@ -1019,6 +1118,10 @@ pub fn classify_control_line(line: &str) -> ControlLine {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Response {
+    /// Local metadata, discriminated by its required `serving_schema` key.
+    ServingSchemaSnapshot(ServingSchemaSnapshotResponse),
+    /// Account operation result, discriminated by its required `account_access` key.
+    AccountAccess(crate::account_access::AccountAccessResponse),
     /// Demand accepted.
     Demand(DemandResponse),
     /// Release accepted.
@@ -1710,6 +1813,7 @@ mod tests {
                 robot: "ubuntu".to_string(),
                 topic: "/tf".to_string(),
                 refcount: 2,
+                plane: Some(ServingPlane::Iroh),
             }],
             active_connections: 3,
             idle: false,
@@ -1720,6 +1824,8 @@ mod tests {
         assert_eq!(v["idle"], false);
         assert_eq!(v["demands"][0]["refcount"], 2);
         assert_eq!(v["demands"][0]["topic"], "/tf");
+        // The plane rides the same row, as the lowercase token operators grep for.
+        assert_eq!(v["demands"][0]["plane"], "iroh");
         // The folded connect set rides the same response.
         assert_eq!(v["connect_endpoints"][0], "tcp/10.0.0.5:7683");
     }
@@ -1748,6 +1854,33 @@ mod tests {
             Some(Vec::new()),
             "an explicitly empty set means 'nothing folded', which is a real answer"
         );
+    }
+
+    /// A daemon that predates the plane field omits it, and that absence must stay
+    /// UNKNOWN. Reading it as the local-network plane would be a routing claim the
+    /// old daemon never made, and it is the wrong one exactly when it matters: a
+    /// robot reachable over both planes. Hand-written wire lines, so the pin cannot
+    /// be satisfied by round-tripping our own encoder.
+    #[test]
+    fn a_status_row_without_a_plane_decodes_as_unknown_never_as_the_local_plane() {
+        let older = r#"{"id":1,"demands":[{"robot":"r","topic":"/t","refcount":1}],"active_connections":1,"idle":false}"#;
+        let decoded: StatusResponse = serde_json::from_str(older).unwrap();
+        assert_eq!(
+            decoded.demands[0].plane, None,
+            "an absent plane is UNKNOWN, never a claim that the local plane served it"
+        );
+        // The anti-tautology half: a daemon that DOES report a plane is
+        // distinguishable from the one above, on both values.
+        for (token, expected) in [("zenoh", ServingPlane::Zenoh), ("iroh", ServingPlane::Iroh)] {
+            let line = format!(
+                r#"{{"id":1,"demands":[{{"robot":"r","topic":"/t","refcount":1,"plane":"{token}"}}],"active_connections":1,"idle":false}}"#
+            );
+            let decoded: StatusResponse = serde_json::from_str(&line).unwrap();
+            assert_eq!(decoded.demands[0].plane, Some(expected));
+            // The other direction, so the pin is not one-way: this value encodes to
+            // the same token a daemon writes.
+            assert_eq!(serde_json::to_value(expected).unwrap(), token);
+        }
     }
 
     #[test]

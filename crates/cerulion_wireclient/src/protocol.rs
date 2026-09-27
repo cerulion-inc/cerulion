@@ -199,6 +199,27 @@ pub fn decode_first_reply(bytes: &[u8]) -> Result<WireResponse, Option<String>> 
     }
 }
 
+/// Whether a first reply explicitly permits presenting an owner certificate.
+///
+/// Only the machine-readable code on a refusal enables this path. Older peers,
+/// unknown codes, malformed replies, and human-readable reasons never enable it.
+/// Unknown fields fail closed so a mixed wire-response/refusal envelope cannot
+/// bypass the normal first-reply classification.
+pub fn is_unpaired_refusal(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Refusal {
+        decision: String,
+        reason: String,
+        admission_code: String,
+    }
+    serde_json::from_slice::<Refusal>(bytes).is_ok_and(|reply| {
+        // Requiring a string reason preserves the existing refusal envelope.
+        let _ = reply.reason;
+        reply.decision == "refuse" && reply.admission_code == "unpaired"
+    })
+}
+
 /// If `bytes` is an [`AcceptDecision`] describing a NON-admit outcome, return the
 /// human reason; otherwise `None`. A [`AcceptDecision::WireAdmit`] returns `None`
 /// (it is not a refusal). Used only after a [`WireResponse`] decode has failed.
@@ -224,6 +245,34 @@ fn decode_refusal(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_pair_requires_an_unambiguous_machine_readable_unpaired_refusal() {
+        assert!(is_unpaired_refusal(
+            br#"{"decision":"refuse","reason":"device needs admission","admission_code":"unpaired"}"#
+        ));
+        for bytes in [
+            br#"{"decision":"refuse","reason":"unpaired device key"}"#.as_slice(),
+            br#"{"decision":"refuse","reason":"unpaired","admission_code":"revoked"}"#,
+            br#"{"decision":"refuse","reason":"unpaired","admission_code":null}"#,
+            br#"{"decision":"wire_admit","reason":"unpaired","admission_code":"unpaired"}"#,
+            br#"{"decision":"refuse","admission_code":"unpaired"}"#,
+            br#"{"decision":"refuse","reason":42,"admission_code":"unpaired"}"#,
+            br#"{"decision":"refuse","reason":"x","admission_code":"unpaired","admission_code":"revoked"}"#,
+            br#"{"decision":"refuse","decision":"wire_admit","reason":"x","admission_code":"unpaired"}"#,
+            br#"{"decision":"refuse","reason":"x","admission_code":"unpaired","reply":"catalog","topics":[]}"#,
+            br#"{"reply":"error","topic":null,"message":"unpaired"}"#,
+            b"not JSON",
+        ] {
+            assert!(!is_unpaired_refusal(bytes), "{}", String::from_utf8_lossy(bytes));
+        }
+        assert_eq!(
+            decode_first_reply(
+                br#"{"decision":"refuse","reason":"need admission","admission_code":"unpaired"}"#
+            ),
+            Err(Some("need admission".into()))
+        );
+    }
 
     /// The request tags match the robot's documented `verb` vocabulary (hand
     /// oracle — the exact wire strings the robot dispatches on).

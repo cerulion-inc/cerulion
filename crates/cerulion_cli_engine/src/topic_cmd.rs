@@ -2924,6 +2924,21 @@ fn render_robots_section(robots: &[RobotRow], peers: &[DiscoveredPeer]) -> Strin
 /// dispatch site.
 pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool) -> String {
     let mut out = render_robots_section(&disc.robots, &disc.peers);
+    let preceded = !out.is_empty();
+    out.push_str(&render_remote_topics_body(disc, had_endpoints, preceded));
+    out
+}
+
+/// The topics half of the listing, split out so a caller that has already
+/// rendered rows of its own (the account directory) appends the same bytes.
+/// `preceded` says whether anything was rendered above: it only controls the
+/// blank line that keeps the none-discovered notice its own paragraph.
+fn render_remote_topics_body(
+    disc: &RemoteDiscovery,
+    had_endpoints: bool,
+    preceded: bool,
+) -> String {
+    let mut out = String::new();
     let topics = &disc.topics;
     if topics.is_empty() {
         // The "pass --connect tcp/<host>:7683" escape is
@@ -2938,7 +2953,7 @@ pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool)
         let reachable = had_endpoints
             || !disc.robots.is_empty()
             || disc.peers.iter().any(|p| p.rung == DiscoveryRung::Mdns);
-        if !out.is_empty() {
+        if preceded {
             // A ROBOTS section preceded: keep a blank line
             // so the notice reads as its own paragraph.
             out.push('\n');
@@ -3050,12 +3065,32 @@ pub fn render_remote_topics_section_with_mirrors(
     had_endpoints: bool,
     streaming: &[MirrorStreamRow],
 ) -> String {
+    render_remote_topics_section_with_mirrors_and_robot_rows(disc, had_endpoints, streaming, "")
+}
+
+/// Append already-sanitized account-directory rows to ROBOTS while preserving
+/// independent LAN evidence and the existing mirror/topic formatting.
+/// The caller renders these rows with `account_robot_access::render_rows` on Unix.
+pub fn render_remote_topics_section_with_mirrors_and_robot_rows(
+    disc: &RemoteDiscovery,
+    had_endpoints: bool,
+    streaming: &[MirrorStreamRow],
+    account_rows: &str,
+) -> String {
+    let mut out = render_robots_section(&disc.robots, &disc.peers);
+    if !account_rows.is_empty() {
+        if out.is_empty() {
+            out.push_str("\nROBOTS\n");
+        }
+        out.push_str(account_rows);
+    }
     if streaming.is_empty() {
         // No mirrors ⇒ identical to the mirror-less renderer (incl. its
         // one-line none-discovered arms).
-        return render_remote_topics_section(disc, had_endpoints);
+        let preceded = !out.is_empty();
+        out.push_str(&render_remote_topics_body(disc, had_endpoints, preceded));
+        return out;
     }
-    let mut out = render_robots_section(&disc.robots, &disc.peers);
     out.push_str("\nREMOTE TOPICS\n");
     // Union rows keyed by canonical topic: streaming (Some robot) wins over an
     // idle-announce (None) entry for the same topic (dedup — one row, streaming).
@@ -3078,6 +3113,27 @@ pub fn render_remote_topics_section_with_mirrors(
         out.push('\n');
     }
     out
+}
+
+/// Render independently observed account and mirror rows when LAN discovery
+/// failed or was skipped. A missing gather supplies no empty-topic evidence.
+pub fn render_remote_evidence_without_discovery(
+    streaming: &[MirrorStreamRow],
+    account_rows: &str,
+) -> String {
+    if !streaming.is_empty() {
+        return render_remote_topics_section_with_mirrors_and_robot_rows(
+            &RemoteDiscovery::empty(),
+            false,
+            streaming,
+            account_rows,
+        );
+    }
+    if account_rows.is_empty() {
+        String::new()
+    } else {
+        format!("\nROBOTS\n{account_rows}")
+    }
 }
 
 /// Idle "heartbeat" timeout for the event-driven observer loops

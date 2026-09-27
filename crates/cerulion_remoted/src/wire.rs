@@ -23,6 +23,7 @@
 //! handler + the catalog/schema assembly.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -44,7 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tap::{peek_schema_hash, TapManager};
 use crate::trust::TrustError;
-use crate::{RemotedClock, SharedTrust};
+use crate::{AcceptDecision, PairingAuthorizer, RemotedClock, SharedTrust};
 
 /// How often the INDEPENDENT revocation-sweep task (spawned by
 /// [`serve_wire_connection`]) re-checks the demander against the LIVE demand authorizer,
@@ -63,6 +64,10 @@ pub enum WireError {
     /// be initialized (a rare boot-time failure — e.g. shared-memory permissions).
     #[error("wire transport init: {0}")]
     Transport(String),
+
+    /// The local schema provider could not return usable metadata.
+    #[error("wire schema source: {0}")]
+    SchemaSource(String),
 
     /// A `demand` could not attach its tap / open its stream. Carries the topic +
     /// the actionable reason (topic does not exist, no free introspection slot,
@@ -231,12 +236,13 @@ enum ManagerCell {
 pub struct WirePlane {
     robot: String,
     manager: ManagerCell,
-    /// Optional schema source (EMPTY in the production MVP — `remoted` has no
-    /// workspace `.msg` access yet): topic → its root qualified type name.
+    /// Static topic bindings for an explicitly supplied schema source.
     topic_types: BTreeMap<String, String>,
     /// The served schema doc set, keyed by qualified name; the `schema` verb
     /// walks [`collect_schema_closure`] over it.
     schema_docs: BTreeMap<String, SchemaDoc>,
+    /// Fresh local metadata from the existing network daemon, when configured.
+    local_schema_socket: Option<PathBuf>,
     /// The per-demand authorization gate. Each `demand` verb + a periodic
     /// mid-session sweep resolve the DEMANDER (the connection's authenticated remote
     /// peer key) through this. Production installs `PairingAuthorizer` (the SAME live
@@ -266,6 +272,7 @@ impl WirePlane {
             manager: ManagerCell::Lazy(OnceLock::new()),
             topic_types: BTreeMap::new(),
             schema_docs: BTreeMap::new(),
+            local_schema_socket: None,
             demand_authorizer: Arc::new(AllowAllAuthorizer),
             revocation_sweep_interval: DEFAULT_REVOCATION_SWEEP_INTERVAL,
             epoch_sink: None,
@@ -280,10 +287,19 @@ impl WirePlane {
             manager: ManagerCell::Ready(manager),
             topic_types: BTreeMap::new(),
             schema_docs: BTreeMap::new(),
+            local_schema_socket: None,
             demand_authorizer: Arc::new(AllowAllAuthorizer),
             revocation_sweep_interval: DEFAULT_REVOCATION_SWEEP_INTERVAL,
             epoch_sink: None,
         }
+    }
+
+    /// Use the existing local network daemon's current schema metadata.
+    /// Each metadata request checks the daemon's SHM namespace against this plane.
+    /// This path never starts a daemon or queries another machine.
+    pub fn with_local_schema_provider(mut self, socket: PathBuf) -> Self {
+        self.local_schema_socket = Some(socket);
+        self
     }
 
     /// Install the per-demand authorization gate (builder style). Production
@@ -479,6 +495,35 @@ impl WirePlane {
             ),
         }
     }
+
+    async fn current_schema(
+        &self,
+        topic: &str,
+        taps: &mut TapManager,
+    ) -> Result<SchemaReply, WireError> {
+        let Some(socket) = &self.local_schema_socket else {
+            return Ok(self.serve_schema(topic));
+        };
+        let manager = self.manager()?;
+        let schemas = crate::local_schema::load(socket.clone(), manager.iox_shm_identity()).await?;
+        let mut hash = taps.all_cached_schema_hashes().get(topic).copied();
+        if hash.is_none() && schemas.root_type(topic, None).is_none() {
+            let owned_topic = topic.to_owned();
+            hash = tokio::task::spawn_blocking(move || {
+                peek_schema_hash(
+                    &manager,
+                    &owned_topic,
+                    Instant::now() + crate::tap::catalog_peek_budget(),
+                )
+            })
+            .await
+            .map_err(|_| WireError::SchemaSource("schema header inspection failed".into()))?;
+            if let Some(hash) = hash {
+                taps.record_schema_hash(topic, hash);
+            }
+        }
+        Ok(schemas.reply(&self.robot, topic, hash))
+    }
 }
 
 /// Serve ONE admitted `cerulion/wire/1` connection to completion. Accepts the
@@ -503,7 +548,11 @@ impl WirePlane {
 /// tap teardown. Today's account-scoped ACL revokes WHOLE-SUBJECT (a grant confers
 /// `CAP_OBSERVE` over all topics or none), so a de-authorization evicts EVERY demanded
 /// topic at once; per-topic teardown is not implemented (no per-topic authorizer exists).
-pub async fn serve_wire_connection(connection: Connection, plane: Arc<WirePlane>) {
+pub async fn serve_wire_connection(
+    connection: Connection,
+    plane: Arc<WirePlane>,
+    authorizer: Arc<PairingAuthorizer>,
+) {
     let (mut send, recv) = match accept_frame_stream(&connection).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -553,7 +602,8 @@ pub async fn serve_wire_connection(connection: Connection, plane: Arc<WirePlane>
 
     let mut taps = TapManager::new();
     while let Some(request_bytes) = req_rx.recv().await {
-        let response = handle_request(&plane, &connection, &mut taps, &request_bytes).await;
+        let response =
+            handle_request(&plane, &authorizer, &connection, &mut taps, &request_bytes).await;
         // Keep the shared demanded-set in lockstep with the tap set so the sweep re-checks
         // exactly the live streams.
         match &response {
@@ -666,6 +716,7 @@ async fn run_revocation_sweep(
 /// (never silent).
 async fn handle_request(
     plane: &Arc<WirePlane>,
+    authorizer: &PairingAuthorizer,
     connection: &Connection,
     taps: &mut TapManager,
     request_bytes: &[u8],
@@ -689,13 +740,24 @@ async fn handle_request(
     };
 
     match request {
-        WireRequest::Catalog => match build_catalog(plane, taps).await {
-            Ok(reply) => WireResponse::Catalog(reply),
-            Err(e) => WireResponse::Error {
-                topic: None,
-                message: e.to_string(),
-            },
-        },
+        WireRequest::Catalog => {
+            if let Some(refusal) = metadata_refusal(authorizer, connection, None) {
+                return refusal;
+            }
+            let catalog = build_catalog(plane, taps).await;
+            // Catalog peeking awaits real data. Another connection can apply a
+            // revocation during that work, so recheck before returning metadata.
+            if let Some(refusal) = metadata_refusal(authorizer, connection, None) {
+                return refusal;
+            }
+            match catalog {
+                Ok(reply) => WireResponse::Catalog(reply),
+                Err(e) => WireResponse::Error {
+                    topic: None,
+                    message: e.to_string(),
+                },
+            }
+        }
         WireRequest::Demand { topic } => {
             // Per-topic demand authorization. The accept gate already admitted
             // this connection (paired CAP_OBSERVE); the demand authorizer adds per-topic
@@ -742,7 +804,24 @@ async fn handle_request(
                 was_demanded,
             }
         }
-        WireRequest::Schema { topic } => WireResponse::Schema(plane.serve_schema(&topic)),
+        WireRequest::Schema { topic } => {
+            if let Some(refusal) = metadata_refusal(authorizer, connection, Some(&topic)) {
+                return refusal;
+            }
+            let schema = plane.current_schema(&topic, taps).await;
+            // The local provider and any header peek await work. Admission must
+            // still hold when that metadata is about to leave the robot.
+            if let Some(refusal) = metadata_refusal(authorizer, connection, Some(&topic)) {
+                return refusal;
+            }
+            match schema {
+                Ok(reply) => WireResponse::Schema(reply),
+                Err(error) => WireResponse::Error {
+                    topic: Some(topic),
+                    message: error.to_string(),
+                },
+            }
+        }
         WireRequest::Status => WireResponse::Status(StatusReply {
             topics: taps.status(),
         }),
@@ -750,8 +829,8 @@ async fn handle_request(
         // may revoke the VERY desk that pushed it — that is correct and expected (a
         // desk carrying its own revocation still delivers it faithfully). The revocation
         // sweep then evicts its DEMANDED STREAMS on its next tick; a connection with
-        // no demands is not swept (the sweep skips an empty topic set) and simply
-        // lingers harmlessly — every later demand is denied at the gate.
+        // no demands is not swept. Every later catalog, schema and demand request
+        // checks current access; admission never acts as a lasting permission.
         WireRequest::SyncEpoch { epoch_postcard } => {
             match plane.apply_pushed_epoch(&epoch_postcard) {
                 Ok((epoch, applied)) => WireResponse::EpochSynced { epoch, applied },
@@ -769,6 +848,28 @@ async fn handle_request(
             }
         }
     }
+}
+
+/// Apply the same live account/key/CAP_OBSERVE policy as connection admission.
+/// This is independent of the optional epoch sink and per-topic demand hooks.
+fn metadata_refusal(
+    authorizer: &PairingAuthorizer,
+    connection: &Connection,
+    topic: Option<&str>,
+) -> Option<WireResponse> {
+    let reason = match authorizer
+        .classify_accept(cerulion_link::alpn::WIRE, connection.remote_id().as_bytes())
+    {
+        AcceptDecision::WireAdmit => return None,
+        AcceptDecision::Refuse { reason } => reason,
+        // Fixed WIRE ALPN cannot route to another plane. Remain fail-closed if
+        // classification gains a new decision in a future implementation.
+        _ => "wire plane refused: metadata access was not admitted".to_string(),
+    };
+    Some(WireResponse::Error {
+        topic: topic.map(str::to_string),
+        message: reason,
+    })
 }
 
 /// The whole-catalog PEEK budget cap: every `catalog` verb spends AT
@@ -793,6 +894,12 @@ async fn build_catalog(
 ) -> Result<CatalogReply, WireError> {
     let manager = plane.manager()?;
     let robot = plane.robot().to_string();
+    let schemas = match &plane.local_schema_socket {
+        Some(socket) => {
+            Some(crate::local_schema::load(socket.clone(), manager.iox_shm_identity()).await?)
+        }
+        None => None,
+    };
 
     // Cache hits for EVERY topic this connection has recorded a hash for — a live
     // demand AND a prior catalog peek (a demanded-only set would re-peek
@@ -853,10 +960,14 @@ async fn build_catalog(
             if let Some(h) = hash {
                 taps.record_schema_hash(&topic, h);
             }
+            let schema_name = match &schemas {
+                Some(schemas) => schemas.root_type(&topic, hash).map(str::to_owned),
+                None => None,
+            };
             CatalogEntry {
                 topic,
                 schema_hash: hash,
-                schema_name: None,
+                schema_name,
                 provenance: CatalogProvenance::Runtime,
                 // The WAN/iroh remoted plane does not stamp the live
                 // producer count (the LAN gateway's `build_catalog_reply_from_bridge`

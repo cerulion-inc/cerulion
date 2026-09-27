@@ -195,6 +195,13 @@ which a TAB press must not do.";
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Internal login-gated first-serve registration worker.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    BootstrapRobot {
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
+        state_root: PathBuf,
+    },
     /// Workspace management
     Workspace {
         #[command(subcommand)]
@@ -634,6 +641,8 @@ impl Commands {
     pub fn log_verb_class(&self) -> VerbLogClass {
         use VerbLogClass::{LongRunning, OneShot};
         match self {
+            #[cfg(unix)]
+            Commands::BootstrapRobot { .. } => OneShot,
             // ── Long-running / runtime verbs: keep the `info` default ──
             Commands::Graph { action } => match action {
                 // Runtime loops: the live run, the live profiler, and the

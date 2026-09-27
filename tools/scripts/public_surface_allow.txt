@@ -10,7 +10,6 @@
 # Class work-state: an entry excuses the LINE before the file's count is taken,
 # so a legitimate line is never ledger debt, and `*` is refused: <match> names
 # the one line (a piece of the finding's quoted text).
-crates/cerulion_cli_engine/AGENTS.md | examples-shape | cargo ... --example | the line regenerates a test fixture from a crate example: a maintainer recipe, not a usage example
 docs/legal/LICENSE-HISTORY.md | examples-shape | cargo ... --example | the license history records how a fixture was regenerated; not a usage example
 examples/moveit_hero | examples-shape | * | a container gate for rmw_cerulion, not a workspace; whether it becomes one is a maintainer ruling still open
 docs/user-api.md | docs-refs | cerulion heap | the span quotes the heap hook's stderr breadcrumb verbatim, which begins with the word cerulion; it is not a command

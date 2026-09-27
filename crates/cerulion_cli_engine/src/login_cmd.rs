@@ -55,6 +55,13 @@ use serde::Deserialize;
 use crate::auth::{self, AuthState, LocalGate};
 use crate::error::{CliError, CliResult};
 
+/// Require a saved prior login before serving, including when tokens have expired.
+/// This local check never starts the interactive login flow.
+pub fn require_serving_login() -> CliResult<()> {
+    cerulion_netd::serving_login::require_prior_login()
+        .map_err(|reason| CliError::Login(reason.to_string()))
+}
+
 /// The production account-service base URL: the Supabase-backed issuer the web
 /// app serves (`/v1/auth/device/*`, `/v1/auth/refresh`, `/v1/auth/revoke`,
 /// `/v1/me`), so `cerulion login` and app.cerulion.com are ONE identity —
@@ -138,9 +145,66 @@ struct RegisterDeviceResponse {
     #[allow(dead_code)]
     device_id: String,
     device_cert: String,
-    #[allow(dead_code)]
     intermediate: String,
     account_id: String,
+}
+
+struct IssuedRegistration {
+    response: RegisterDeviceResponse,
+    challenge_account: [u8; 32],
+    device_key: [u8; 32],
+}
+
+#[derive(Deserialize)]
+struct AccountProfile {
+    account_id: String,
+    #[serde(default)]
+    pairing_account_id: Option<String>,
+}
+
+fn verified_session_account(
+    profile: AccountProfile,
+    issued: &IssuedRegistration,
+) -> CliResult<String> {
+    let registration = &issued.response;
+    if crate::account_identity::uuid_bytes(&profile.account_id).is_some() {
+        let expected = crate::account_identity::pairing_account_id(&profile.account_id)?;
+        let wire_id = URL_SAFE_NO_PAD.encode(expected.0);
+        if profile.pairing_account_id.as_deref() != Some(wire_id.as_str())
+            || registration.account_id != wire_id
+            || issued.challenge_account != expected.0
+        {
+            return Err(CliError::Login(
+                "the account service returned inconsistent UUID pairing identities".into(),
+            ));
+        }
+        let binding = crate::device_binding::verify_device_binding(
+            &registration.device_cert,
+            &issued.device_key,
+        )?;
+        if binding.account != expected {
+            return Err(CliError::Login(
+                "the issued device certificate names a different pairing account".into(),
+            ));
+        }
+    } else {
+        // Preserve legacy authentication responses. An opaque auth label still
+        // cannot pass the strict pairing resolver used by owner access.
+        if profile.account_id != registration.account_id {
+            return Err(CliError::Login(
+                "the registered device and /v1/me name different accounts".into(),
+            ));
+        }
+        if let Some(advertised) = profile.pairing_account_id.as_deref() {
+            let expected = crate::account_identity::pairing_account_id(&profile.account_id)?;
+            if URL_SAFE_NO_PAD.encode(expected.0) != advertised {
+                return Err(CliError::Login(
+                    "the account service returned an inconsistent pairing identity".into(),
+                ));
+            }
+        }
+    }
+    Ok(profile.account_id)
 }
 
 // ===========================================================================
@@ -274,7 +338,8 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
 
     // 4. Register the device key (→ device cert) and resolve the account id.
     //    Device registration is the design's "register the device key at login"
-    //    — the returned cert is cached and the account id taken from it.
+    //    The returned certificate binds the device to the pairing identity.
+    //    `/v1/me` remains authoritative for the stored authentication identity.
     //    A service that does not implement `/v1/devices` at all (the hosted
     //    Supabase issuer is identity-only) is the ORDINARY case, not a failure:
     //    `register_device` answers `Ok(None)` for that CONFIRMED 404 surface and
@@ -298,10 +363,14 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
     //    previous sign-in and its cert stay exactly as they were.
     let mut discard_cert = false;
     let mut issued_cert: Option<String> = None;
+    let mut issued_intermediate: Option<String> = None;
     let account_id = match register_device(&client, &base, &tokens.session_token)? {
-        Some(reg) => {
-            issued_cert = Some(reg.device_cert);
-            reg.account_id
+        Some(issued) => {
+            let profile = fetch_account_profile(&client, &base, &tokens.session_token)?;
+            let account = verified_session_account(profile, &issued)?;
+            issued_cert = Some(issued.response.device_cert);
+            issued_intermediate = Some(issued.response.intermediate);
+            account
         }
         None => {
             tracing::info!(
@@ -309,7 +378,7 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
                 "the account service issues no device certificates; resolving the account id via /v1/me"
             );
             discard_cert = true;
-            fetch_account_id(&client, &base, &tokens.session_token)?
+            fetch_account_profile(&client, &base, &tokens.session_token)?.account_id
         }
     };
 
@@ -478,6 +547,29 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
                         }
                         return Err(std::io::Error::other("device cert target"));
                     }
+                }
+            }
+        }
+        // Publish the coupled leaf + issuer cache LAST. Its reader also holds
+        // this lock and requires the leaf to equal device.cert and the current
+        // account/key. A crash, failed rename, or identity-only login therefore
+        // leaves either a matching chain or an explicit re-login requirement.
+        // Identity-only login clears device.cert above, invalidating any old
+        // chain without changing the existing cert recovery protocol.
+        if let (Some(cert), Some(intermediate)) =
+            (issued_cert.as_deref(), issued_intermediate.as_deref())
+        {
+            let chain_path = crate::owner_certificate::cache_path(&auth_path);
+            match crate::owner_certificate::stage_at(&chain_path, cert, intermediate) {
+                Ok(pending) => staged.push(pending),
+                Err(e) => {
+                    cert_target_failure = Some(format!("{}: {e}", chain_path.display()));
+                    if let Some(cleared) = &cleared {
+                        if let Err(lost) = cleared.put_back() {
+                            certs_lost = lost;
+                        }
+                    }
+                    return Err(std::io::Error::other("device chain target"));
                 }
             }
         }
@@ -853,7 +945,7 @@ fn register_device(
     client: &reqwest::blocking::Client,
     base: &str,
     session_token: &str,
-) -> CliResult<Option<RegisterDeviceResponse>> {
+) -> CliResult<Option<IssuedRegistration>> {
     let seed = ensure_device_key_seed()?;
     let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
     let public_key = signing.verifying_key().to_bytes();
@@ -896,7 +988,13 @@ fn register_device(
         )));
     }
     resp.json::<RegisterDeviceResponse>()
-        .map(Some)
+        .map(|response| {
+            Some(IssuedRegistration {
+                response,
+                challenge_account: pop_account,
+                device_key: public_key,
+            })
+        })
         .map_err(|e| CliError::Login(format!("could not parse the device-cert response: {e}")))
 }
 
@@ -969,17 +1067,12 @@ pub(crate) fn fetch_pop_challenge(
     Ok(Some((ch.challenge, account)))
 }
 
-/// Resolve the caller's account id via `/v1/me` (the fallback when device
-/// registration did not return it).
-fn fetch_account_id(
+/// Fetch the authenticated account identity, preserving a hosted UUID as itself.
+fn fetch_account_profile(
     client: &reqwest::blocking::Client,
     base: &str,
     session_token: &str,
-) -> CliResult<String> {
-    #[derive(Deserialize)]
-    struct Me {
-        account_id: String,
-    }
+) -> CliResult<AccountProfile> {
     let resp = client
         .get(format!("{base}/v1/me"))
         .bearer_auth(session_token)
@@ -991,8 +1084,7 @@ fn fetch_account_id(
             resp.status()
         )));
     }
-    resp.json::<Me>()
-        .map(|m| m.account_id)
+    resp.json::<AccountProfile>()
         .map_err(|e| CliError::Login(format!("could not parse /v1/me: {e}")))
 }
 
@@ -1087,11 +1179,27 @@ fn write_new_device_key(path: &Path, seed: &[u8; 32]) -> CliResult<()> {
 /// anywhere else would be one that forgets it), so account_cmd and robot_cmd
 /// build through here too.
 pub(crate) fn http_client() -> CliResult<reqwest::blocking::Client> {
+    build_http_client(reqwest::redirect::Policy::default())
+}
+
+/// Keep account catalog and trust-root requests at their validated service origin.
+pub(crate) fn http_client_without_redirects() -> CliResult<reqwest::blocking::Client> {
+    build_http_client(reqwest::redirect::Policy::none())
+}
+
+fn build_http_client(redirect: reqwest::redirect::Policy) -> CliResult<reqwest::blocking::Client> {
     // `install_default` refuses a second install and hands the provider back in
     // the Err — the already-installed case (an earlier client here, or a host
     // that set one), not a failure.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "cerulion-pairing-protocol",
+        reqwest::header::HeaderValue::from_static("1"),
+    );
     reqwest::blocking::Client::builder()
+        .redirect(redirect)
+        .default_headers(headers)
         .timeout(HTTP_TIMEOUT)
         .user_agent(concat!("cerulion-cli/", env!("CARGO_PKG_VERSION")))
         .build()

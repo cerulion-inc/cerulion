@@ -401,7 +401,8 @@ pub fn read_pidfile(pidfile: &Path) -> Option<u32> {
 }
 
 #[cfg(unix)]
-fn euid() -> u32 {
+#[doc(hidden)]
+pub fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }

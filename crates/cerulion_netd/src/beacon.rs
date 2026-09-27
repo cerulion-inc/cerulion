@@ -220,6 +220,15 @@ struct BeaconState {
 }
 
 impl GatewayBeacon {
+    /// Refresh an existing advertisement after automatic robot startup.
+    pub fn refresh_robot_facts(&self, expected_eid: &str) -> Result<bool, MdnsError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.guard.as_mut() {
+            Some(guard) => guard.refresh_robot_facts(expected_eid),
+            None => Ok(false),
+        }
+    }
+
     /// A beacon that has not yet been raised. Advertises for REAL when its
     /// decision says to.
     pub fn new() -> Self {
