@@ -154,27 +154,27 @@ impl CppBridgeGate {
     /// `debug!` repeats, a loud re-announcement at each DECADE of the
     /// running total, and the unconditional
     /// [`cpp_bridge_refusals_fired`] counter — so a refusing build can
-    /// never go silent, and never floods either. One latch: which
-    /// refusing verdict a build carries is a compile-time constant, so no
-    /// SHIPPED build can interleave the two (the tests drive both, and
-    /// re-arm between arms).
+    /// never go silent, and never floods either. One latch: the verdict a
+    /// build carries is a compile-time constant, so no SHIPPED build can
+    /// interleave verdicts (the tests re-arm between arms).
     /// This verdict's rcl error text, rendered ONCE for the process.
     ///
-    /// Only a REFUSING verdict has one; `Supported` never reaches here
-    /// (its caller returns before asking). One cell per refusing verdict
-    /// rather than one shared cell, so a test that drives both — the
-    /// only place both are reachable in one process, since a shipped
-    /// build's verdict is a compile-time constant — cannot serve the
-    /// second verdict the first one's text.
+    /// Only a REFUSING verdict has one, and one verdict refuses today, so
+    /// there is ONE cell and the match names it explicitly. `Supported`
+    /// never reaches here (its caller returns before asking) and gets a
+    /// CONSTANT rather than a share of that cell: a catch-all arm would let
+    /// one stray `Supported` cache an EMPTY paragraph in the refusing
+    /// verdict's cell, and every later refusal would hand rcl that text
+    /// forever. Naming each verdict makes a new refusing verdict a compile
+    /// error instead, which is where its own cell belongs.
     fn rcl_error_text(self) -> &'static std::ffi::CStr {
-        static PRE_JAZZY: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
         static VENDORED_UNNAMED: std::sync::OnceLock<std::ffi::CString> =
             std::sync::OnceLock::new();
-        // `Supported` is unreachable (see above); each refusing verdict owns
-        // its own cell, which keeps this total without an `unwrap`.
         let cell = match self {
             CppBridgeGate::RefuseVendoredUnnamedRuntime => &VENDORED_UNNAMED,
-            _ => &PRE_JAZZY,
+            CppBridgeGate::Supported => {
+                return c"rmw_cerulion: this verdict carries no C++ bridge refusal"
+            }
         };
         cell.get_or_init(|| {
             let paragraph = self.refusal_message().unwrap_or("");
