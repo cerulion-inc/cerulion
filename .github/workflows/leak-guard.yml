@@ -434,13 +434,26 @@ jobs:
           read_asks
 
           if [ "$RC" = 0 ]; then
+            stuck=0
             while read -r id found; do
               [ -n "${id:-}" ] || continue
               case "$found" in
-                "$prefix"*) gh api "repos/$REPO/issues/comments/$id" -X DELETE \
-                              >/dev/null 2>&1 || true ;;
+                "$prefix"*)
+                  if ! gh api "repos/$REPO/issues/comments/$id" -X DELETE >/dev/null 2>&1; then
+                    # A delete that failed because the comment is already gone is
+                    # the outcome asked for. Anything else leaves an ask standing,
+                    # and an ask standing must never end with the label coming off.
+                    if gh api "repos/$REPO/issues/comments/$id" >/dev/null 2>&1; then
+                      stuck=1
+                    fi
+                  fi
+                  ;;
               esac
             done < "$asks"
+            if [ "$stuck" = 1 ]; then
+              echo "::error ::an ask could not be taken back; the leak label is left as it is"
+              exit 1
+            fi
             read_asks
             if [ "$(others_outstanding)" = 1 ]; then
               echo "clean here, but another body on this thread still has an outstanding ask"

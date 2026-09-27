@@ -1459,8 +1459,6 @@ class Scanner(object):
                   skip_private_tags=()):
         """Scan one multi-line unit. Line numbers are line_base + index."""
         sevpath = sevpath if sevpath is not None else path
-        if self.skip_code:
-            text = blank_code(text)
         raw_lines = None
         self.stats.units += text.count('\n') + 1
         views = text_views(text) if deep else [text]
@@ -1502,10 +1500,17 @@ class Scanner(object):
                         break
             if self.refs is not None:
                 cand = None
-                # Two anchors carry every shape: the number sign of a shorthand
-                # and the scheme separator of a link.
+                # The code-span exemption belongs to the REFERENCE classes and to
+                # nothing else. A hostname, a slug or an address in backticks is
+                # as visible to a reader as one in prose, so every other class,
+                # and above all the private tier, reads the body whole; only this
+                # pass reads it with code blanked. blank_code keeps every offset,
+                # so the line numbers below are the ones in the real text.
+                rv = blank_code(v) if self.skip_code else v
+                rlow = rv.lower() if self.skip_code else low
+                rlines = None
                 for a in ('#', '://'):
-                    i = low.find(a)
+                    i = rlow.find(a)
                     while i != -1:
                         if starts is None:
                             starts = _line_starts(low)
@@ -1515,12 +1520,13 @@ class Scanner(object):
                         cand.add(li)
                         if li + 1 >= len(starts):
                             break
-                        i = low.find(a, starts[li + 1])
+                        i = rlow.find(a, starts[li + 1])
                 if cand:
                     if lines is None:
                         lines = v.split('\n')
+                    rlines = rv.split('\n') if self.skip_code else lines
                     for li in sorted(cand):
-                        line = lines[li]
+                        line = rlines[li]
                         for cid, token in self.refs.findings(line):
                             sev = 'HARD' if (cid == REF_DEFECT or self.refs.require) \
                                 else 'REPORT'
@@ -2728,8 +2734,12 @@ def load_allow(args, root, classes):
     hard = set(c.id for c in classes if any(c.sev(m, 'x') == 'HARD' for m in
                                            ('tree', 'diff', 'messages', 'names')))
     hard |= set(s[0] for s in STRUCT_CLASSES + REF_CLASSES if s[1] == 'HARD')
-    # ref-unverified is HARD only under --require-private, so it is waivable
-    # like a report class and is deliberately not in `hard`.
+    # ref-unverified's STATIC severity is scoped, but --require-private and
+    # --hard both make it HARD at run time, and a match-everything waiver is
+    # refused on what a class can be, not on what it happens to be this run:
+    # otherwise `** | ref-unverified | <reason>` would switch off the fail-closed
+    # half of the reference scan in one line. A path-specific waiver still works.
+    hard |= REF_PAIR
     return parse_allow(text, ids, hard)
 
 
@@ -3082,7 +3092,7 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 218
+EXPECTED_ARMS = 220
 
 
 def _png(chunks):
@@ -3747,6 +3757,17 @@ def self_test(out, base_env, argv0):
         arm('allow-bare-private-refused', rc == EXIT_USAGE)
         rc, lines = allow_run('** | home-mac | a long enough reason\n')
         arm('allow-match-all-refused', rc == EXIT_USAGE)
+        # Both reference classes too. ref-unverified's static severity is scoped,
+        # so a rule that reads the static table alone would accept a waiver that
+        # switches off the whole fail-closed half of the reference scan the moment
+        # --require-private or --hard makes it HARD. A path-specific waiver for it
+        # is still accepted, which is what keeps this a refusal and not a ban.
+        rc, lines = allow_run('** | ' + REF_UNVERIFIED + ' | a long enough reason\n')
+        rc2, lines2 = allow_run('*/*.xml | ' + REF_UNVERIFIED + ' | a long enough reason\n')
+        rc3, lines3 = allow_run('** | ' + REF_DEFECT + ' | a long enough reason\n')
+        arm('allow-match-all-refused-for-either-reference-class',
+            rc == EXIT_USAGE and rc3 == EXIT_USAGE and rc2 != EXIT_USAGE,
+            'all=%d defect=%d scoped-path=%d' % (rc, rc3, rc2))
         rc, lines = allow_run('cfg/x.xml | mdns-local | a test fixture host name\n')
         arm('allow-suppresses', not any(p == 'cfg/x.xml' for _, p, _ in hits(lines))
             and any('allowlist=1' in ln and 'suppressed=1' in ln for ln in lines))
@@ -4498,6 +4519,25 @@ def self_test(out, base_env, argv0):
             str(sorted(every)))
         arm('ref-with-skip-code-only-the-followable-reference-is-a-finding',
             rc2 == EXIT_HIT and kept == {(REF_DEFECT, 1)}, str(sorted(kept)))
+        # The code-span exemption is the REFERENCE classes' alone. A host, a
+        # login, an address or a private-tier name is as visible to a reader in
+        # backticks as in prose, so every other class still reads the body whole.
+        # Planted one per line, each inside a code span, and every one must still
+        # be found with --skip-code on.
+        sens = ('a ' + tick + P_MAC + PLAIN_USER + '/x' + tick + '\n'
+                + 'b ' + tick + _addr(10, 77, 13, 9) + tick + '\n'
+                + 'c ' + tick + 'ssh ' + PLAIN_USER + '@' + SH + tick + '\n'
+                + 'd ' + tick + PW + tick + '\n'
+                + 'e ' + tick + RO + '/' + R_GONE + '#7' + tick + '\n')
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--skip-code', '--no-allow'] + mine,
+                        dict(refenv, LG_BODY=sens), repo_ref)
+        got = set((c, n) for c, p, n in hits(lines) if p == 'issue-body')
+        arm('ref-skip-code-exempts-references-only-never-a-sensitive-value',
+            rc == EXIT_HIT
+            and {('home-mac', 1), ('lan-addr', 2), ('login-at-host', 3),
+                 ('private#1@host', 4)} <= got
+            and not any(c in REF_PAIR for c, _ in got), str(sorted(got)))
         arm('ref-a-longer-closing-fence-closes-the-block',
             blank_code(tick * 3 + '\nhidden ' + RO + '/' + R_GONE + '#1\n' + tick * 4
                        + '\nvisible ' + RO + '/' + R_GONE + '#2\n')
