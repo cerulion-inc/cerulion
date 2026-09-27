@@ -128,11 +128,32 @@ const WAIVED_2034: &[(&str, &str)] = &[
 
 /// Binaries whose zero-allocation arms subtract the 2035 publish allocation,
 /// with the number of arms each carries.
+/// Paths are relative to the WORKSPACE root, not to this crate: the ninth arm
+/// lives in `cerulion_cli_engine`, and CI found it after a core-only inventory
+/// missed it. A waiver inventory scoped to one crate is a waiver inventory that
+/// will be incomplete again.
 const WAIVED_2035: &[(&str, usize)] = &[
-    ("step_zero_alloc_test", 6),
-    ("zero_copy_hot_path_test", 2),
-    ("trace_ring_hook_zero_alloc_test", 1),
+    ("crates/cerulion_core/tests/step_zero_alloc_test.rs", 6),
+    ("crates/cerulion_core/tests/zero_copy_hot_path_test.rs", 2),
+    (
+        "crates/cerulion_core/tests/trace_ring_hook_zero_alloc_test.rs",
+        1,
+    ),
+    (
+        "crates/cerulion_cli_engine/tests/bag_play_zero_alloc_test.rs",
+        1,
+    ),
 ];
+
+/// The workspace root, found by walking up to the directory holding the
+/// lockfile, so a waiver in another crate is nameable from here.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|a| a.join("Cargo.lock").exists())
+        .expect("the workspace root is findable from this crate")
+        .to_path_buf()
+}
 
 fn tests_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")
@@ -266,7 +287,9 @@ fn on_this_platform_no_waived_arm_is_actually_ignored() {
 fn every_declared_2035_arm_subtracts_the_known_loans_and_keeps_its_bound() {
     let mut total = 0usize;
     for (binary, arms) in WAIVED_2035 {
-        let src = read(binary);
+        let path = workspace_root().join(binary);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is readable: {e}", path.display()));
         let uses = src.matches("upstream_2035_publish_allocs(").count();
         assert_eq!(
             uses, *arms,
@@ -282,8 +305,8 @@ fn every_declared_2035_arm_subtracts_the_known_loans_and_keeps_its_bound() {
         total += uses;
     }
     assert_eq!(
-        total, 9,
-        "the 2035 waiver covers nine subtraction sites across eight arms (the wide-level arm \
+        total, 10,
+        "the 2035 waiver covers ten subtraction sites across nine arms (the wide-level arm \
          subtracts twice, once per width). A change in that count needs a change here and a \
          reason in the commit"
     );
