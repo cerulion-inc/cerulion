@@ -7259,8 +7259,9 @@ pub fn graph_run_worker(
                     rank = plan.rank,
                     error = %e,
                     "this worker is ARMED for checkpoints but its rank cannot name a \
-                     state ring, so it captures NOTHING and every anchor of this run will be \
-                     reported partial"
+                     state ring, so it captures NOTHING and every anchor of this run LACKS \
+                     the records of the rank this event names. A resim of any capture from \
+                     this run reports PARTIAL and exits 8, naming that rank"
                 );
                 return None;
             }
@@ -7275,8 +7276,8 @@ pub fn graph_run_worker(
         // was set for: a 1 MiB supervisor would admit the plane and a worker of any
         // size would open it.
         //
-        // A refusal here is THIS RANK's alone. It creates no state ring, so the
-        // run's anchors are partial and the recorder reports the hole
+        // A refusal here is THIS RANK's alone. It creates no state ring, so every
+        // anchor of the run LACKS its records and the recorder reports the hole
         // through `missing_state_ring_ranks` — the accurate outcome, and the one
         // that keeps every other rank's anchors rather than throwing the run's
         // whole plane away because one group is fat.

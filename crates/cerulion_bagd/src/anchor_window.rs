@@ -1184,7 +1184,7 @@ impl AnchorWindow {
     /// checkpoint is evidence, and an operator who can see which node is missing
     /// is better served than one handed a refusal. A declared-table rule turns
     /// every such capture into a total refusal, which is a k=1 behaviour change
-    /// this PR's lockstep control forbids.
+    /// the lockstep control below forbids.
     /// [`a_checkpoint_missing_a_declared_node_is_still_selected_and_never_refused`]
     /// is the arm.
     ///
@@ -2686,7 +2686,7 @@ mod tests {
                 rank: Some(1),
                 reason: NoAnchorReason::NothingRetained,
             }),
-            "…and the rank that did not is NAMED, BY RANK, with the reason — the ring \
+            "…and the rank that did not is NAMED, BY RANK, with the reason. The ring \
              universe is the DECLARED table, so a rank holding nothing is still known"
         );
 
@@ -2732,8 +2732,8 @@ mod tests {
     /// The predicate's second rejected alternative, pinned: a rank whose every
     /// node DECLINED is still selected, so the skip reaches the manifest.
     ///
-    /// Its checkpoint restores no state — `complete_anchors` is 0 and the fold
-    /// reports that honestly — but it carries the markers that say WHY each
+    /// Its checkpoint restores no state: `complete_anchors` is 0 and the fold
+    /// reports 0, and it carries the markers that say WHY each
     /// node declined. A rule that admitted only checkpoints with a complete
     /// anchor would drop this ring from the capture's ring-to-rank map, so the
     /// declining rank would vanish from the manifest instead of being reported
@@ -2761,7 +2761,7 @@ mod tests {
         assert_eq!(
             selection.selected["rank1"].checkpoint.complete_anchors(),
             0,
-            "…and the set member is honest about restoring nothing"
+            "…and the set member reports 0 complete anchors, which is what it holds"
         );
     }
 

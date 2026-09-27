@@ -388,8 +388,9 @@ impl PlaneRole {
 ///
 /// # A worker's refusal is its OWN, and its peers keep running
 ///
-/// A refused rank creates no state ring, so a graph-wide anchor is partial
-/// and the recorder reports the hole through `missing_state_ring_ranks` — which is
+/// A refused rank creates no state ring, so every anchor of the run LACKS that
+/// rank's records and the recorder reports the hole through
+/// `missing_state_ring_ranks`, which is
 /// the accurate outcome and already has machinery. The alternative, tearing down the
 /// whole run's plane because one rank is fat, would throw away every other rank's
 /// anchors for no gain; and the ranks cannot vote, since each learns its own size
@@ -528,7 +529,8 @@ fn report_arm_refusal(
             .to_string(),
         PlaneRole::Worker { rank } => format!(
             "rank {rank} captures NOTHING while its peers carry on, so every anchor of this \
-             run will be reported PARTIAL"
+             run LACKS rank {rank}'s records. A resim of any capture from this run reports \
+             PARTIAL and exits 8, naming that rank"
         ),
         // UNREACHABLE today: a supervisor never reaches the memory gate
         // (`pays_the_fork_cost` is false for it), so nothing calls this with that
@@ -605,8 +607,8 @@ fn report_arm_refusal(
 /// # A failure here is LOUD, and it is not fatal
 ///
 /// A rank that cannot create its ring contributes no anchor parts, and a
-/// graph-wide anchor is all-or-nothing across ranks — so this rank alone
-/// voids every anchor of the run. That is worth an `error!`, not a `warn!`, and it
+/// graph-wide anchor is all-or-nothing across ranks, so every anchor of the run
+/// LACKS that rank's records. That is worth an `error!`, not a `warn!`, and it
 /// is deliberately NOT fatal: refusing to run the graph because a checkpoint ring
 /// could not be created would turn an observability feature into an outage. The
 /// recorder half of the same statement is `missing_state_ring_ranks`, which turns
@@ -668,9 +670,10 @@ fn create_state_ring(
                 rank,
                 error = %e,
                 "this run is ARMED for checkpoints but its state-ring name cannot be \
-                 derived, so this rank captures NOTHING — and because a graph-wide anchor is \
-                 all-or-nothing across ranks, every anchor of this run will be reported partial. \
-                 The graph continues running"
+                 derived, so this rank captures NOTHING, and because a graph-wide anchor is \
+                 all-or-nothing across ranks, every anchor of this run LACKS the records of \
+                 the rank this event names. A resim of any capture from this run reports \
+                 PARTIAL and exits 8, naming that rank. The graph continues running"
             );
             return None;
         }
@@ -703,9 +706,10 @@ fn create_state_ring(
                 ring_tag = %ring_tag,
                 error = %e,
                 "this run is ARMED for checkpoints but its state ring could not be \
-                 created, so this rank captures NOTHING — and because a graph-wide anchor is \
-                 all-or-nothing across ranks, every anchor of this run will be reported partial. \
-                 The graph continues running"
+                 created, so this rank captures NOTHING, and because a graph-wide anchor is \
+                 all-or-nothing across ranks, every anchor of this run LACKS the records of \
+                 the rank this event names. A resim of any capture from this run reports \
+                 PARTIAL and exits 8, naming that rank. The graph continues running"
             );
             return None;
         }

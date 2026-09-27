@@ -1350,7 +1350,7 @@ pub fn unlink_stale_state_rings(arm_tag: &str) -> StaleRingSweep {
 /// workers `0..n` — so a hole in the discovered set is not an absence of
 /// information, it is EVIDENCE that a rank which exists failed to publish a ring.
 /// That matters because a graph-wide anchor is all-or-nothing across workers:
-/// a rank contributing nothing makes every anchor of the run partial, and
+/// every anchor of the run LACKS a non-contributing rank's records, and
 /// without this the recorder would simply see fewer rings than there are ranks and
 /// have no way to know it.
 ///

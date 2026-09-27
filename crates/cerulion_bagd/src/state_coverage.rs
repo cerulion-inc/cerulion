@@ -577,8 +577,8 @@ pub struct StateCoverage {
     /// Ranks that provably EXIST and published no ring.
     ///
     /// Ranks are dense, so a hole below the highest discovered rank is evidence,
-    /// not absence of it — and a graph-wide anchor is all-or-nothing across ranks
-    /// so a single missing rank makes every anchor of the run partial.
+    /// not absence of it, and a graph-wide anchor is all-or-nothing across ranks
+    /// so every anchor of the run LACKS a missing rank's records.
     /// Non-empty makes the recording INCOMPLETE.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ranks_missing: Vec<u32>,
@@ -843,9 +843,9 @@ impl StateCoverage {
         if self.armed.is_some() && self.nodes_without_anchor() > 0 {
             out.push(IncompleteReason::NodesWithoutAnchor);
         }
-        // A rank that exists and published no ring voids every
-        // graph-wide anchor of the run (all-or-nothing), so this cannot
-        // be a note beside a bag that otherwise reads complete.
+        // A rank that exists and published no ring leaves every
+        // graph-wide anchor of the run LACKING its records (all-or-nothing), so
+        // this cannot be a note beside a bag that otherwise reads complete.
         if !self.ranks_missing.is_empty() {
             out.push(IncompleteReason::RanksMissing);
         }
@@ -947,8 +947,9 @@ pub fn log_state_coverage_terminal(sc: &StateCoverage) {
                 records = sc.records,
                 "bagd checkpoint coverage INCOMPLETE: a rank BELOW the highest one discovered \
                  published no state ring, and a graph-wide anchor is all-or-nothing across \
-                 ranks — so every anchor of this run is partial (see state_coverage.json's \
-                 ranks_missing)"
+                 ranks, so every anchor of this run LACKS that rank's records (see \
+                 state_coverage.json's ranks_missing). A resim of any capture from this run \
+                 reports PARTIAL and exits 8, naming that rank"
             ),
         }
     }

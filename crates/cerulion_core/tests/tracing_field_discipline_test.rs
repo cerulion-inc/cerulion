@@ -280,7 +280,7 @@ const DECLARED_SITES: &[Declared] = &[
         pass_through: 0,
         messages: &[
             "bagd could not open {} of the {} trace ring(s) this run DECL#e0c05e73",
-            "bagd found node-state rings for HIGHER ranks than {gap} but #f4ea4579",
+            "bagd found node-state rings for HIGHER ranks than {gap} but #247cde38",
             "bagd was BOUND to a run it NEVER HEARD — the watcher opened #777053d7",
             "bagd was BOUND to a run it NEVER HEARD, and it was stopped a#b9e6463c",
             "flashback: {complaint}#0a9cb805",

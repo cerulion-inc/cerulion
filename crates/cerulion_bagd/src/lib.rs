@@ -12803,8 +12803,8 @@ impl Recorder {
         }
         // A HOLE is evidence, not absence of it: ranks are dense, so a rank below
         // the highest one that answered exists and published nothing — and a
-        // graph-wide anchor is all-or-nothing across ranks, so that one
-        // rank voids every anchor of the run. Announced ONCE per rank; the
+        // graph-wide anchor is all-or-nothing across ranks, so every anchor of
+        // the run LACKS that rank's records. Announced ONCE per rank; the
         // durable half is `StateCoverage::ranks_missing`.
         let _ = found;
         let ranks: Vec<u32> = self.state_ring_ranks.iter().copied().collect();
@@ -12816,8 +12816,10 @@ impl Recorder {
                     missing_rank = gap,
                     ranks = ?ranks,
                     "bagd found node-state rings for HIGHER ranks than {gap} but none for {gap} \
-                     itself — that rank exists and published no ring, and a graph-wide anchor is \
-                     all-or-nothing across ranks, so every anchor of this run is partial"
+                     itself: that rank exists and published no ring, and a graph-wide anchor is \
+                     all-or-nothing across ranks, so every anchor of this run LACKS rank {gap}'s \
+                     records. A resim of any capture from this run reports PARTIAL and exits 8, \
+                     naming that rank"
                 );
             }
         }

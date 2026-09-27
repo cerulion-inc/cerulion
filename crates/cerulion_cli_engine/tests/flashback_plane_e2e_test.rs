@@ -520,8 +520,13 @@ fn a_worker_over_the_ceiling_declines_for_itself_and_says_which_rank() {
         "…and must say the run keeps going without it"
     );
     assert!(
-        logs_contain("reported PARTIAL"),
-        "…and what that costs: every anchor of the run becomes partial (§7.3)"
+        logs_contain("LACKS rank 3's records"),
+        "…and what that costs, as the FACT rather than as the verdict's word: every \
+         anchor of the run lacks THIS rank's records"
+    );
+    assert!(
+        logs_contain("reports PARTIAL and exits 8"),
+        "…and the consequence a reader will meet downstream, named with its exit code"
     );
 }
 

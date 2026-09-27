@@ -2879,8 +2879,8 @@ mod tests {
     /// ORACLE 10: a capture missing ONE rank is WRITTEN, and the manifest names
     /// that rank, the cause and the remedy.
     ///
-    /// Two arms over the two causes the ruling separates, each asserted as a
-    /// literal sentence rather than by re-calling the function that produces it:
+    /// Two arms over the two causes that carry different remedies, each asserted
+    /// as a literal sentence rather than by re-calling the function that makes it:
     /// arm (a) a rank that never harvested anything, arm (b) a rank the byte
     /// ceiling emptied. Three reasons reaching a reader as one sentence is the
     /// defect the stamp exists to remove, so the two sentences are asserted to
