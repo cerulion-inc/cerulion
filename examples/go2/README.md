@@ -26,12 +26,8 @@ The companion computer is the Go2 EDU's on-board Jetson, or any Linux
 machine plugged into the robot's LAN. Nothing renders on the robot: it ships
 raw frames, and `cerulion-vizd` on your desk decodes and draws them.
 
-This is a standalone workspace: it has its own `[workspace]` `Cargo.toml`,
-`Cargo.lock` and `deny.toml`, and it is excluded from the repository's root
-workspace. It depends on `cerulion_core` / `native_ros2_messages` through the
-relative paths in `Cargo.toml`, so run every command from inside this
-directory. (Outside the repository, swap them for the published crates.io
-versions.)
+This example is a standalone workspace: run its commands from inside this
+directory. See [how these workspaces work](../README.md#these-are-standalone-workspaces).
 
 ## What ships
 

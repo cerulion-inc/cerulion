@@ -22,7 +22,7 @@ design-ref | \bdesign §\s?\d|§\d+(\.\d+)*\s?Q\d|\baudit amendment\b|\b[Ww]ake 
 
 # A machine NICKNAME ("the Air") carries no host name, no address and no login, so no
 # regex here can name it: it belongs in the private pattern list of leak_scan.py, tagged
-# @nickname (docs/leak_guard.md, "Supply private patterns locally").
+# @nickname (docs/internals/leak-guard.md, "Supply private patterns locally").
 plan-label | \b[A-Z]\d-era\b|\bWS-?\d:|\bRoute-?\d\b|\(I\d{1,2}\)|\bA[01] (?:scope|note|ships?|lands?|acceptance)\b|\blands? with (?:the )?A\d\b|\bout of A\d\b|\((?:a )?later chunks?\)|\blands? in (?:a |the )?later chunks?\b|\bis a later chunk\b|\bin later chunks\b|\bissue spec\b | a milestone, workstream or requirement label means nothing to a reader: name what ships, what does not, and what the requirement is
 promise-voice | \bcoming soon\b|\bnot measured yet\b|(?i:\backnowledged gaps?\b)|\bspeed[- ]bumps?\b | promise nothing: say what is true today ("not supported", "not measured by this suite")
 approval-voice | \bby decision\b(?! position)|\bapproved by\b|\breviewed and approved\b|\bcounsels?\b|\bsign-?offs?\b|\bConfirmed design\b|\bdo not flag it in review\b | keep the fact, drop who approved it and that it was approved at all

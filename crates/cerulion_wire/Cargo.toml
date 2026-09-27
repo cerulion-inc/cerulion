@@ -18,7 +18,7 @@ description = "Minimal, dependency-light reader/encoder for the Cerulion wire fo
 keywords = ["robotics", "wire-format", "zero-copy", "parser", "cerulion"]
 categories = ["parsing", "encoding"]
 # Not published to crates.io yet: it is outside the documented publish set in
-# `docs/PUBLISHING.md`. Flip this to publish the standalone wire reader.
+# `docs/internals/publishing.md`. Flip this to publish the standalone wire reader.
 publish = false
 
 [lints]

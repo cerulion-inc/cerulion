@@ -34,6 +34,32 @@ sh install_rust.sh rustc-version.txt
 
 Downloaded release binaries are built with Rust 1.93.0 from rustup, pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml). For another release, read that workflow at its tag.
 
+## What the Debian package requires, and what it ships
+
+The package depends on `libc6 (>= 2.35)`, `libstdc++6` and `libgcc-s1`, so it
+installs on Ubuntu 22.04 and later, Debian 12 and later, or another distribution
+with glibc 2.35 or newer; `apt` refuses the install on an older release. ROS 2
+is a `Suggests` (`ros-jazzy-ros-base`), not a dependency: the rmw is loaded by a
+ROS 2 process and links no ROS library of its own, so a `Depends` would refuse
+the CLI on every host without the ROS apt repository. On a host without ROS 2
+the CLI installs and the `ros2` verbs report that `ros2` is not on `PATH`.
+
+Every release archive and the Debian package built from it carry four license
+files, because the binaries statically link their whole dependency graph and
+most of those licenses require the text and the copyright notice to accompany a
+binary distribution:
+
+| File | What it is |
+|---|---|
+| `LICENSE` | The AGPL-3.0-only text the combined work is under. |
+| `NOTICE` | Hand-written attribution for the components a reader is most likely to care about, including the vendored ROS 2 message packages. |
+| `LICENSE-BSD-3-CLAUSE` | The BSD text that seven of those message packages require. |
+| `THIRD-PARTY-LICENSES.md` | The exhaustive machine-generated inventory: every crate linked into the three binaries, grouped by license, with each license text reproduced once. |
+
+In the archive the four sit at the top level beside the binaries; in the package
+they install into `/usr/share/doc/cerulion/` alongside the `copyright` file,
+which points at each of them by path.
+
 ## The C toolchain
 
 Building nodes needs a C toolchain, installed before rustup. On Debian and Ubuntu: `sudo apt-get install -y curl git build-essential`. On macOS: `xcode-select --install`. An `apt-get install cerulion` pulls a C toolchain in through the package's Recommends; installing the `.deb` by hand with `dpkg -i` does not.

@@ -47,22 +47,14 @@ interposes glibc's allocator.
 
 ## License files
 
-Every release archive and the Debian package built from it carry four license
-files, because the binaries statically link their whole dependency graph and
-most of those licenses require the text and the copyright notice to accompany
-a binary distribution. `LICENSE` is the AGPL-3.0-only text the combined work
-is under. `NOTICE` is the hand-written attribution for the components a reader
-is most likely to care about, including the vendored ROS 2 message packages.
-`LICENSE-BSD-3-CLAUSE` is the BSD text that seven of those message packages
-require. `THIRD-PARTY-LICENSES.md` is the exhaustive machine-generated
-inventory: every crate linked into the three binaries, grouped by license,
-with each license text reproduced once. It is produced by `cargo about` from
-the locked dependency graph under the policy in `tools/release/about.toml`, whose accepted license list mirrors the `[licenses]` allow list in
-`deny.toml` so the release cannot ship a license CI would refuse. In the
-archive the four sit at the top level beside the binaries; in the package they
-install into `/usr/share/doc/cerulion/` alongside the `copyright` file, which
-points at each of them by path. `build_deb.sh` refuses an archive that is
-missing any of the four rather than producing a package without it.
+[`docs/install.md`](../install.md#what-the-debian-package-requires-and-what-it-ships)
+names the four license files a release archive and its Debian package carry, and
+where they install. `THIRD-PARTY-LICENSES.md` is produced by `cargo about` from
+the locked dependency graph under the policy in `tools/release/about.toml`,
+whose accepted license list mirrors the `[licenses]` allow list in `deny.toml`
+so the release cannot ship a license CI would refuse. `build_deb.sh` refuses an
+archive that is missing any of the four rather than producing a package without
+it.
 
 ## APT installation
 

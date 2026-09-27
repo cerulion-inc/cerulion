@@ -406,6 +406,8 @@ The roadmap is open for use cases and contributions: [discuss a feature](https:/
 
 [Documentation](https://docs.cerulion.com) · [API reference](docs/user-api.md) · [Contributing](.github/CONTRIBUTING.md) · [Issues](https://github.com/cerulion-inc/cerulion/issues) · [Code of conduct](.github/CODE_OF_CONDUCT.md)
 
+In this repository: [Build your first graph](docs/tutorials/01-getting-started.md) walks from an empty workspace to a recorded run you verify a change against, and [Measure latency](docs/tutorials/02-latency-measurement.md) times a single hop and an end-to-end path. [Revoke access](docs/revocation.md) covers taking a robot back from an account or one device.
+
 Report vulnerabilities through the [security policy](.github/SECURITY.md). Cerulion is built by [Cerulion Inc.](https://cerulion.com), a YC company. Commercial questions: licensing@cerulion.com.
 
 ## License

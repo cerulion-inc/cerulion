@@ -166,7 +166,8 @@ LAN_EXAMPLES = frozenset((
 
 GUARD_FILES = frozenset((
     'tools/scripts/leak_scan.py', 'tools/scripts/leak_scan_allow.txt',
-    'tools/scripts/install_hooks.sh', '.github/workflows/leak-guard.yml', 'docs/leak_guard.md'))
+    'tools/scripts/install_hooks.sh', '.github/workflows/leak-guard.yml',
+    'docs/internals/leak-guard.md'))
 GUARD_PREFIXES = ('tools/hooks/',)
 
 OCT = r'(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)'
@@ -3573,7 +3574,7 @@ def self_test(out, base_env, argv0):
             tmp, 'latin')))
         arm('f1-non-utf8-list-is-a-clean-no-run', rc == EXIT_NORUN
             and any('is not UTF-8' in ln for ln in lines))
-        doc = os.path.join(guard_root, 'docs', 'leak_guard.md')
+        doc = os.path.join(guard_root, 'docs', 'internals', 'leak-guard.md')
         doc_ok = True
         if os.path.isfile(doc):
             with open(doc, 'r', encoding='utf-8') as fh:

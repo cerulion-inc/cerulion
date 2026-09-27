@@ -18,11 +18,8 @@ nodes; the small header is copied into the new output message, and the pose is
 written leaf by leaf (`self.detection.pose.position.x = x`) straight into the
 loaned slot.
 
-This is a standalone workspace: it has its own `[workspace]` `Cargo.toml` and is
-excluded from the repo's root workspace (see the root `Cargo.toml` `exclude`).
-It depends on `cerulion_core` / `native_ros2_messages` via the relative paths in
-`Cargo.toml`, so run it from inside this directory. (In-repo examples use path
-deps; outside the repo, swap them for the published crates.io versions.)
+This example is a standalone workspace: run its commands from inside this
+directory. See [how these workspaces work](../README.md#these-are-standalone-workspaces).
 
 ## Run it
 
@@ -40,10 +37,10 @@ cerulion graph validate camera_pipeline
 cerulion graph run camera_pipeline --release --record
 ```
 
-The first node build also compiles the Cerulion runtime, so it takes a few
-minutes; later builds take seconds. On the first run, Cerulion proposes one
-process per node and asks `Apply this partition to the graph file? [y/N]`.
-Press **Enter** to use that layout for this run only.
+The first node build in a workspace also compiles the Cerulion runtime, so it
+takes a few minutes; later builds take seconds. On the first run Cerulion
+proposes one process per node and asks to save that partition; see
+[the first build and the partition prompt](../README.md#the-first-build-and-the-partition-prompt).
 
 In a second terminal, watch the data flow:
 

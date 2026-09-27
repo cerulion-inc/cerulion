@@ -5,7 +5,7 @@ A "why does my replay diverge" reference for re-execution (spelled
 the compile-time determinism lint. Cerulion's replay is **byte-exact**:
 a recorded bag is the golden, your current workspace build is the candidate, and
 every produced frame is diffed byte-for-byte against the recording
-(Principle #7: Replay = Live). That guarantee holds **only if every node body
+(a replay matches the live run). That guarantee holds **only if every node body
 is a pure function of its inputs, its restored state and the framework clock.** A node that reaches
 outside that boundary (the wall clock, an unseeded RNG, the filesystem, thread
 scheduling) produces different bytes on the replay run than it did at record,
@@ -124,7 +124,7 @@ counter, a "who ran first" flag) instead of through the data plane.
 runtime's scheduling of the nodes, which, while deterministic under the
 framework's DAG-level execution, is NOT part of the recorded data, so a
 refactor that changes levelization silently changes what each node observes.
-"Data is truth" (Principle #2): meaning must live in messages, not in the timing
+Data is truth: meaning must live in messages, not in the timing
 of a callback.
 
 **Sanctioned alternative.** Communicate through **topics**. If node B needs to

@@ -36,12 +36,9 @@ buffer is imported as a DMABUF, which this example does not do. Everything
 downstream is zero-copy: `brightness_meter` reads the published bytes in place
 from shared memory and copies nothing.
 
-## How this workspace was made
+## Scaffolding it with the CLI
 
-The workspace was scaffolded with these verbs. The node bodies, the relative
-dependency paths in `Cargo.toml`, the `recordings/` line in `.gitignore`, the
-`max_slice_len` on the image output (1 MiB, above the 614400-byte YUYV frame)
-and the pinned `Cargo.lock` were then written by hand.
+The workspace was scaffolded with these verbs:
 
 ```bash
 cerulion workspace create v4l2_camera
@@ -53,12 +50,12 @@ cerulion node stage v4l2_camera -g v4l2_camera
 cerulion node stage brightness_meter -g v4l2_camera -I image v4l2_camera/image
 ```
 
-This is a standalone workspace: it has its own `[workspace]` `Cargo.toml` and is
-excluded from the repo's root workspace (see the root `Cargo.toml` `exclude`).
-Inside this repository it depends on `cerulion_core` and `native_ros2_messages`
-through the relative paths in `Cargo.toml`, so run it from inside this
-directory. A workspace you create yourself gets the published crates.io
-versions instead.
+The graph then sets `max_slice_len: 1 MiB` on the image output, above the
+614400-byte YUYV frame: a variable-length output's shared-memory budget has to
+cover the largest frame it will publish.
+
+This example is a standalone workspace: run its commands from inside this
+directory. See [how these workspaces work](../README.md#these-are-standalone-workspaces).
 
 ## Run it
 
@@ -76,10 +73,10 @@ cerulion graph validate v4l2_camera
 cerulion graph run v4l2_camera --release --record
 ```
 
-The first node build also compiles the Cerulion runtime, so it takes a few
-minutes; later builds take seconds. On the first run, Cerulion proposes one
-process per node and asks `Apply this partition to the graph file? [y/N]`.
-Press **Enter** to use that layout for this run only.
+The first node build in a workspace also compiles the Cerulion runtime, so it
+takes a few minutes; later builds take seconds. On the first run Cerulion
+proposes one process per node and asks to save that partition; see
+[the first build and the partition prompt](../README.md#the-first-build-and-the-partition-prompt).
 
 If the camera is not `/dev/video0`, name it before the run:
 

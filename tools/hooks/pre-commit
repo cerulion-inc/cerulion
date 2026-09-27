@@ -2,7 +2,7 @@
 # leak guard: pre-commit hook. Scans the staged added lines, the staged file
 # names and the current branch name, and the metadata of staged media, then
 # chains to the hook that was active before. All logic lives in
-# tools/scripts/leak_scan.py; see docs/leak_guard.md.
+# tools/scripts/leak_scan.py; see docs/internals/leak-guard.md.
 # shellcheck source=tools/hooks/leak-guard-lib.sh
 . "$(dirname "$0")/leak-guard-lib.sh"
 leak_guard_run pre-commit

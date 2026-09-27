@@ -4,7 +4,7 @@ This document records the **verified** publishing order and the pre-publish
 checklist for the Cerulion workspace.
 
 Before publishing this workspace, complete the manual DDS fork prerequisites in
-[`docs/packaging/dds-forks.md`](packaging/dds-forks.md). The release workflow
+[`docs/internals/packaging-dds-forks.md`](packaging-dds-forks.md). The release workflow
 publishes only this workspace; it does not publish `cerulion-rustdds` or
 `cerulion-ros2-client`.
 

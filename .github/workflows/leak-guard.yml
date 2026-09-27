@@ -3,7 +3,7 @@ name: Leak guard
 # Keeps machine names, addresses, home paths, logins, people and location
 # metadata out of what this repository publishes: file contents, path and
 # branch names, commit messages and identities, pull request text, and media
-# containers. The scanner is tools/scripts/leak_scan.py; docs/leak_guard.md
+# containers. The scanner is tools/scripts/leak_scan.py; docs/internals/leak-guard.md
 # explains the classes and how to read a hit.
 #
 # Two tiers. GENERIC classes are shapes and ship in the tree. PRIVATE patterns
@@ -11,7 +11,7 @@ name: Leak guard
 # NICKNAME (a machine called by its model, a colour, or "the big one") belongs in
 # that secret, tagged @nickname, beside the host names of the same machines: the
 # shape carries no host name, no address and no login, so no generic class can see
-# it and nothing in the tree may name it. docs/leak_guard.md says how to write the
+# it and nothing in the tree may name it. docs/internals/leak-guard.md says how to write the
 # entry.
 # A private hit prints the file, the line and the pattern INDEX, never the matched
 # text, and a generic hit on a line a private pattern touches (in any view of it)

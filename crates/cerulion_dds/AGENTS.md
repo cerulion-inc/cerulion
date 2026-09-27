@@ -57,4 +57,4 @@ engines only - the live DDS path is pinned by an ignored hardware test.
 
 Deep reference: docs/internals/network-daemons.md - read before modifying
 discovery, the wire rung, or the feature matrix. See also
-docs/packaging/dds-forks.md before changing the published DDS dependencies.
+docs/internals/packaging-dds-forks.md before changing the published DDS dependencies.

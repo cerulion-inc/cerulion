@@ -17,11 +17,9 @@ form. All wiring lives in `graphs/basic_timer.yaml`. The graph file carries
 topology only: each node's trigger policy is on its macro, in
 `nodes/<type>/src/lib.rs`.
 
-## How this workspace was made
+## Scaffolding it with the CLI
 
-The workspace was scaffolded with these verbs. The node bodies and their
-comments, the relative dependency paths in `Cargo.toml`, the `recordings/`
-line in `.gitignore` and the pinned `Cargo.lock` were then written by hand.
+The workspace was scaffolded with these verbs:
 
 ```bash
 cerulion workspace create basic_timer
@@ -33,12 +31,8 @@ cerulion node stage timer -g basic_timer
 cerulion node stage printer -g basic_timer -I count timer/count
 ```
 
-This is a standalone workspace: it has its own `[workspace]` `Cargo.toml` and is
-excluded from the repo's root workspace (see the root `Cargo.toml` `exclude`).
-Inside this repository it depends on `cerulion_core` and `native_ros2_messages`
-through the relative paths in `Cargo.toml`, so run it from inside this
-directory. A workspace you create yourself gets the published crates.io
-versions instead.
+This example is a standalone workspace: run its commands from inside this
+directory. See [how these workspaces work](../README.md#these-are-standalone-workspaces).
 
 ## Run it
 
@@ -56,10 +50,10 @@ cerulion graph validate basic_timer
 cerulion graph run basic_timer --release --record
 ```
 
-The first node build also compiles the Cerulion runtime, so it takes a few
-minutes; later builds take seconds. On the first run, Cerulion proposes one
-process per node and asks `Apply this partition to the graph file? [y/N]`.
-Press **Enter** to use that layout for this run only.
+The first node build in a workspace also compiles the Cerulion runtime, so it
+takes a few minutes; later builds take seconds. On the first run Cerulion
+proposes one process per node and asks to save that partition; see
+[the first build and the partition prompt](../README.md#the-first-build-and-the-partition-prompt).
 
 The run terminal shows the printer firing ten times a second:
 

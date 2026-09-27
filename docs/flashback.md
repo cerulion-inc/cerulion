@@ -77,12 +77,26 @@ window does not run elsewhere, and on other platforms the verb says so. The
 printed path is the name the capture reserves; if something already holds that
 name, an `_N` suffix is appended.
 
-Runtime faults and declared incidents can also trigger captures automatically.
-Per-trigger `CERULION_FLASHBACK_ON_<TRIGGER>` switches control those requests;
-all default on except `SILENT`, which covers routes that have never produced.
-See the [environment-variable reference](user-api.md#environment-variables) for
-the trigger names and defaults. Automatic requests pass through the capture
-gate's coalescing and rate limits; a manual request remains available.
+### Captures the runtime takes on its own
+
+A capture does not need a human. The runtime requests one when it sees a fault,
+and each trigger has its own switch, `CERULION_FLASHBACK_ON_<TRIGGER>`, set to
+`on` or `off`:
+
+| Trigger | Fires when | Default |
+|---|---|---|
+| `WORKER_DEATH` | A worker process exits without being asked to. | on |
+| `PANIC_DISABLE` | A node is disabled after repeated panics, or its entry mutex is poisoned. The process is alive and one node has stopped. | on |
+| `RUN_VANISHED` | The run this recorder was bound to disappeared without announcing anything: a hard crash. | on |
+| `ESTOP` | A human engaged the e-stop over the ops plane. | on |
+| `DECLARED` | The robot's own safety logic declared an incident: a bumper, a safety PLC, a domain e-stop topic, a grasp-failure detector. | on |
+| `STALL` | A topic stops producing while its process stays alive. | on |
+| `RATE` | A topic's rate collapses inside the window. | on |
+| `SILENT` | A route that has never produced at all. Off by default: on a robot where that is ordinary, it would capture on every boot. | off |
+
+An unrecognized value keeps the row's default and prints what you typed; it
+never guesses a direction. Automatic requests pass through the capture gate's
+coalescing and rate limits, and a manual request stays available alongside them.
 
 ### What a capture covers
 
@@ -118,8 +132,13 @@ Open one with `cerulion bag info`. Beyond the frames, a capture carries:
 | `__cerulion/recorder.json` | The host that wrote the bag, so a reader can warn about cross-architecture float skew. |
 | `__cerulion/trace_manifest_rank<N>.json` | Which node ids the rank's trace records refer to. `bag play --resim` needs it to resolve a FIRE to a node. |
 
-`anchor.resimmable` is the field to read first: a plain `true`/`false`, always
-present. (The three-valued one is `cerulion flashback`'s own verdict LINE, which
+`anchor.resimmable` is the field to read first:
+
+```bash
+cerulion bag info recordings/flashbacks/<capture>.mcap
+```
+
+It is a plain `true`/`false`, always present. (The three-valued one is `cerulion flashback`'s own verdict LINE, which
 can say UNKNOWN when the capture's outcome never reached it, and never a silent
 "no".) When it is false, `anchor.resimmable_reason` says why in one sentence,
 the same field the verb's not-resimmable line points at. For a missing TRACE
@@ -250,36 +269,21 @@ actually use: that figure divided by 16, floored at 320 MiB and ceilinged at
 
 "May actually use" is the tighter of the machine's own total and the cgroup
 ceiling binding the process, so a container sizes its window from its own share
-rather than from the host it happens to run on. That cgroup ceiling is the
-smallest of everything binding at once:
-
-- **Every cgroup from the process's own up to the mount point.** A limit set on a
-  parent applies to its children, so a container capped only at a parent (the
-  usual shape for a Kubernetes QoS class or a `systemd` slice) is sized from
-  that cap rather than from the machine.
-- **`memory.high` as well as `memory.max`, on cgroup v2.** `memory.high` is the
-  throttle an allocation meets first, so it decides whenever it sits below
-  `memory.max`. Set above it, it changes nothing.
-
-Mount paths are matched with the kernel's escaping undone, so a cgroup whose
-mount path contains a space, tab or backslash is found and sized from its own
-cap rather than from the machine's total.
-
-Two things are deliberately not read. A cgroup **above** the mount point binds
-but has no readable path from inside the container, so a container capped only
-there is still sized from the machine; reading it would mean guessing at a path
-that addresses whatever else is mounted, and a confidently wrong ceiling is worse
-than a missing one. Swap is a separate budget and would only ever raise the
-figure, which is the wrong direction for a ceiling.
+rather than from the host it happens to run on. Every cgroup from the process's
+own up to the mount point counts, and on cgroup v2 `memory.high` counts beside
+`memory.max`, because the throttle an allocation meets first is the one that
+decides. A desk whose own slice carries a `memory.high` is sized from it too.
 
 Anything unreadable is left out rather than guessed at, so a misread can only
-leave the window larger, and never smaller than the 320 MiB floor. Note this is
-not container-only: a desk whose own slice carries a `memory.high` is sized from
-that throttle too, because that is genuinely how much it can keep resident.
+leave the window larger, never smaller than the 320 MiB floor. Two ceilings are
+deliberately not read: a cgroup **above** the mount point, which binds but has
+no readable path from inside a container, and swap, which would only ever raise
+the figure. Set `CERULION_FLASHBACK_WINDOW_MAX_MB` when you want the size
+decided rather than derived.
 
-Resident-memory convergence on a Jetson-class board is unmeasured. The
-apparent figures above are arithmetic from the ring geometry and are exact;
-treat the convergence *rate* as unmeasured.
+The apparent figures above are arithmetic from the ring geometry and are exact.
+The rate at which resident memory converges on them is not measured on a
+Jetson-class board.
 
 ---
 

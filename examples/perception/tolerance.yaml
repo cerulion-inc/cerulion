@@ -1,7 +1,7 @@
 # The tolerance document for
 # `cerulion bag play <bag> --resim all --verify --tolerance tolerance.yaml`.
 #
-# Re-execution is BYTE-EXACT by default (Principle #7). This document
+# Re-execution is BYTE-EXACT by default. This document
 # relaxes that on the detector's output topic into SEMANTIC checks, the whole
 # point of the demo. Everything not named here stays byte-exact.
 #

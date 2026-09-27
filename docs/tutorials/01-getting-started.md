@@ -47,22 +47,17 @@ Three nodes forming a reactive pipeline:
   A robot or a headless box prints a short code to approve from a browser on any
   machine.
 
-- Rust **1.93+** from [rustup.rs](https://rustup.rs) (the distro `cargo` package is
-  usually too old). `cerulion node build` compiles your nodes with your
-  own `cargo`.
+- The Rust compiler that built your `cerulion` binary. A node is a shared library
+  loaded into the CLI's own process, so a node built by a different rustc release
+  is refused at load, loudly, even when both meet the `1.93` minimum.
 
-  Build the nodes below with the same compiler that built the `cerulion` binary you
-  installed above: a node cdylib built by a different rustc release is refused at
-  load, loudly, even when both meet the `1.93` minimum. A downloaded release binary
-  is pinned to the exact rustc that built it, so the README's
-  [Install](../../README.md#install) section gives the `RUSTUP_TOOLCHAIN=` step for
-  that case. The workspace you create in step 1 also
-  records that compiler in its own `rust-toolchain.toml` when a matching rustup
-  toolchain is already installed, so the builds below select it with no environment
-  variable; when the CLI cannot verify a match it warns, leaves your environment's
-  compiler in charge, and never changes your rustup default. A CLI you built
-  yourself already matches, as long as you do not switch your default toolchain
-  part way through.
+  The install script above provisions that compiler. On Homebrew and apt, run
+  `cerulion-install-rust` once and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your
+  PATH. The workspace you create in Step 1 records that compiler in its own
+  `rust-toolchain.toml` when a rustup toolchain matching it is already installed,
+  so the builds below select it with no environment variable. When your rustup
+  default is a different compiler, name it:
+  `RUSTUP_TOOLCHAIN=1.93.0 cerulion node build <node>`.
 
 Every step below is a `cerulion` verb. You never run `cargo` yourself and you never
 write a `main`: a node is a library the runtime loads, and the graph file is the
@@ -105,13 +100,13 @@ safety_demo/
   .cargo/
     config.toml           # IOX2_LOG_LEVEL=error, RUST_LOG=warn
   .gitignore              # ignores .cerulion/ (the CLI's per-workspace state)
-  graphs/                 # Empty: we add a graph in Step 5
+  graphs/                 # Empty: we add a graph in Step 4
   nodes/                  # Empty: we add nodes next
   schemas/                # Empty: we use built-in ROS 2 types
 ```
 
 `recordings/` is not part of the scaffold. It appears the first time you run a
-graph (Step 6), and it is where the recording lands.
+graph (Step 5), and it is where the recording lands.
 
 > **How workspace discovery works:** When you run any `cerulion` command inside
 > `safety_demo/` (or any subdirectory), the CLI walks upward until it finds a
@@ -119,19 +114,12 @@ graph (Step 6), and it is where the recording lands.
 > means you can run commands from `safety_demo/nodes/lidar_sensor/` and they'll
 > still find the workspace root.
 
-> **Dependency selection:** The choice keys on where the `cerulion` binary
-> lives, not on your current directory. A CLI installed from a release archive,
-> crates.io, Homebrew or apt writes the published crates pinned exactly to its
-> own version (`cerulion_core = "=X.Y.Z"` and `native_ros2_messages = "=X.Y.Z"`).
-> A CLI built inside a `cerulion` source checkout writes absolute paths into that
-> checkout. `workspace create` prints the choice on a `dependencies:` line.
->
-> To override this default, edit `cerulion_core` and
-> `native_ros2_messages` in the generated root `Cargo.toml` under
-> `[workspace.dependencies]`; node manifests inherit those entries with
-> `{ workspace = true }`. You can select another published version or a local
-> checkout with a `path` dependency. Recreating the workspace rewrites the
-> manifest.
+**Dependency selection.** The choice keys on where the `cerulion` binary lives,
+not on your current directory. An installed CLI writes the published crates
+pinned to its own version; a CLI built inside a `cerulion` source checkout
+writes absolute paths into that checkout. To change it, edit `cerulion_core` and
+`native_ros2_messages` under `[workspace.dependencies]` in the generated root
+`Cargo.toml`; node manifests inherit those entries with `{ workspace = true }`.
 
 ---
 
@@ -224,33 +212,54 @@ Outputs:
   scan sensor_msgs/LaserScan
 ```
 
-> **Note on schema introspection:** `cerulion schema info` covers BOTH
-> workspace-local schemas (`schemas/*.yaml`, looked up by file stem or
-> schema name) and built-in ROS2 message types: `cerulion schema info
-> sensor_msgs/LaserScan` (or `sensor_msgs::LaserScan`) prints the exact
-> per-field layout (fixed vs variable), wire fixed size, and schema hash
-> the generated types compiled against, as ONE unified recursive tree:
-> every non-primitive field's schema is expanded inline, indented directly
-> beneath it (e.g. `nav_msgs/Odometry`'s `header`, `pose`, and `twist`
-> expand down to their leaf fields). The same renderer serves every source:
-> a consistent `source:` line names the origin (built-in / workspace file /
-> `.msg` store / a robot over the network). A workspace schema that reuses a
-> built-in name wins for lookups, with a loud shadow warning on stderr.
-> `cerulion schema list` shows everything: workspace schemas plus all
-> built-in types grouped by package.
+### Inspect a schema
 
-> **Why LaserScan?** Unlike simpler messages (e.g., `Range` with a single float),
-> `LaserScan` contains variable-length arrays -- the same pattern used in
-> real-world LIDAR pipelines. This tutorial teaches you to work with
-> non-trivial message types from the start.
+`cerulion schema info` prints a message's wire layout as one recursive tree:
+every non-primitive field expands inline beneath it, and each line carries its
+fixed or variable class.
 
-> **Where port metadata lives:** in the node's `src/lib.rs` itself. There is
-> no sidecar file. `-o`, `-i` and `-T` write the new port as a struct field with
-> the matching `#[output]` / `#[input]` / `#[input(trigger)]` attribute, and
-> `cerulion node info`, `node list` and `node stage` read the ports and the
-> trigger policy back by parsing that same file. The built node reports the same
-> metadata to the runtime, because the macro bakes it in at build time. Either
-> way, the source code is the single source of truth.
+```bash
+cerulion schema info sensor_msgs/LaserScan
+```
+
+**Expected output:**
+
+```
+schema: sensor_msgs/LaserScan
+source: built-in (ROS 2)
+wire fixed size: 28 bytes
+hash: 0x64cc8631dc24946b
+fields: 10
+  header: std_msgs/Header (variable)
+    stamp: builtin_interfaces/Time (fixed)
+      sec: int32 (fixed)
+      nanosec: uint32 (fixed)
+    frame_id: string (variable)
+  angle_min: float32 (fixed)
+  angle_max: float32 (fixed)
+  angle_increment: float32 (fixed)
+  time_increment: float32 (fixed)
+  scan_time: float32 (fixed)
+  range_min: float32 (fixed)
+  range_max: float32 (fixed)
+  ranges: float32[] (variable)
+  intensities: float32[] (variable)
+```
+
+It resolves workspace schemas (`schemas/*.yaml`, by file stem or schema name),
+built-in ROS 2 types (`pkg/Type` or `pkg::Type`), and a robot's custom types
+over the network; the `source:` line names which. A workspace schema that reuses
+a built-in name wins, with a loud shadow warning on stderr. `cerulion schema
+list` shows everything, grouped by package.
+
+`LaserScan` is the type this tutorial uses because it carries variable-length
+arrays, the shape real LIDAR pipelines have.
+
+**Port metadata lives in the node's `src/lib.rs`, not in a sidecar file.** `-o`,
+`-i` and `-T` write the port as a struct field with the matching attribute, and
+`node info`, `node list` and `node stage` read it back by parsing that file. The
+built node reports the same metadata to the runtime, because the macro bakes it
+in at build time.
 
 ---
 
@@ -331,53 +340,30 @@ impl LidarSensorNode {
 ```
 
 **Key points:**
-- `#[cerulion_node(period_ms = 100)]` declares the node type AND its trigger
-  policy: fire every 100 ms (10 Hz). Trigger policy always lives on the macro
-  side; the graph YAML (Step 5) carries topology only: IDs, wiring, schemas.
-  The folder name (`nodes/lidar_sensor/`) is the node type identifier, used
-  by the graph YAML's `type:` field.
-- Ports are declared via field-level `#[input]` / `#[output]` attributes
-  on struct fields. The field's *type* (e.g. `LaserScan`) tells the macro
-  which schema to wire up.
-- Any output field can be written by plain assignment: `self.scan.<field> =
-  expr`. The macro rewrites EVERY such assignment to a fallible SHM write
-  (`__cer_assign_<field>(…)?` under the hood) and the generated schema code
-  resolves fixed vs variable at compile time, so there is nothing to declare on
-  `#[output]`. **Nested fields work the same way, at any depth**:
-  `self.scan.header.frame_id = "laser"` (and `self.imu.orientation.x = 1.0`,
-  `self.image.header.stamp.sec = 5`) are all rewritten as leaf assignments.
-  Because the rewritten write carries `?`, any helper method that writes port
-  fields must return `Result` (the compiler tells you if you forget).
-- **A variable-length field can also be written in place**, which is what this
-  node does for `ranges`. `self.scan.loan_ranges(n)?` returns `&mut [f32]` over
-  `n` elements of the loaned frame; you fill that slice and the frame is
-  already complete. When the data arrives from a device or a decoder, the same
-  idea is spelled `self.scan.ranges.fill_from(producer)?`: the producer is
-  handed the frame's own buffer and writes into it. Assignment
-  (`self.scan.ranges = source`) copies the source into the frame instead, which
-  is the right choice when you already hold the values. Every generated schema
-  carries `loan_<field>`, `fill_from_<field>` and `set_<field>` for each of its
-  variable-length fields.
-- **Every variable-length field of an output schema must be written on every
-  tick** before the message publishes: a frame with an unwritten variable
-  field is discarded with an error log, so write every variable field each
-  tick. `LaserScan` has three: `ranges`, `intensities`, and the nested
-  `header`. That is why the code writes `intensities` and `header` even
-  though this node has no data for them. The rule extends INTO nested
-  schemas: `header` is a `std_msgs/Header`, so its own variable field
-  `frame_id` must be written too, and the leaf assignment
-  `self.scan.header.frame_id = "laser"` satisfies it (Header's `stamp`
-  timestamp is fixed, so it defaults to zero and needs no write).
-- The struct should `#[derive(Default)]`: the macro calls `Default::default()`
-  to create the initial state.
-- `#[cerulion_node_impl]` on the impl block enables the AST rewriter that
-  translates `self.<port>.<field> = expr` into SHM-backed writes. Inside
-  this impl, your `tick` signature is `fn tick(&mut self) -> Result<(), NodeError>`.
-- Direct fixed-field writes (e.g. `self.scan.angle_min = -1.57`) use
-  Rust's `Deref<Target = LaserScanFixedSection>` for zero-cost access to
-  fixed primitives.
-- `LaserScan` uses variable-length `ranges` and `intensities` arrays,
-  which is representative of real LIDAR data.
+- `#[cerulion_node(period_ms = 100)]` declares the node type and its trigger
+  policy: fire every 100 ms. The folder name (`nodes/lidar_sensor/`) is the node
+  type identifier the graph YAML's `type:` field names.
+- Ports are struct fields carrying `#[input]` / `#[output]`. The field's type
+  (here `LaserScan`) selects the schema.
+- **Write any output field by plain assignment**, at any depth:
+  `self.scan.angle_min = -1.57`, `self.scan.header.frame_id = "laser"`. The
+  macro rewrites every such assignment into a fallible shared-memory write, so a
+  helper method that writes port fields must return `Result`.
+- **A variable-length field can be written in place.** `self.scan.loan_ranges(n)?`
+  returns `&mut [f32]` over `n` elements of the loaned frame; fill that slice and
+  the frame is complete. From a device or a decoder,
+  `self.scan.ranges.fill_from(producer)?` hands the producer the frame's own
+  buffer. Assignment copies instead, which is right when you already hold the
+  values. Every generated schema carries `loan_<field>`, `fill_from_<field>` and
+  `set_<field>` for each variable-length field.
+- **Every variable-length field must be written on every tick**, or the frame is
+  discarded with an error log. `LaserScan` has three: `ranges`, `intensities`
+  and the nested `header`, which is why this node writes all three even with no
+  data for two of them. The rule reaches into nested schemas: `header`'s own
+  variable field `frame_id` must be written too.
+- `#[derive(Default)]` supplies the node's initial state, and
+  `#[cerulion_node_impl]` enables the rewriter. Inside it, `tick` is
+  `fn tick(&mut self) -> Result<(), NodeError>`.
 
 ### 3b. `safety_controller` -- the transform node
 
@@ -400,7 +386,7 @@ struct SafetyControllerNode {
     /// Trigger input: fires `tick` when a new scan arrives on the
     /// graph-wired source topic. The `#[input(trigger)]` attribute
     /// declares this as the trigger; the `source:` for `scan` in the
-    /// graph YAML (Step 5) decides which upstream topic feeds it.
+    /// graph YAML (Step 4) decides which upstream topic feeds it.
     #[input(trigger)]
     scan: LaserScan,
 
@@ -467,26 +453,20 @@ impl SafetyControllerNode {
 ```
 
 **Key points:**
-- `#[input(trigger)] scan: LaserScan` declares `scan` as both the node's
-  trigger input and the input port for the laser data. The trigger
-  policy lives on the macro side (the `#[input(trigger)]` marker); the
-  graph YAML only supplies the `source:` (which upstream topic feeds
-  this port).
-- `self.scan.ranges()` is the typed read accessor: it returns a
-  borrowed `&[f32]` directly over the loaned SHM payload. No
-  deserialization, no copy, no allocation.
+- `#[input(trigger)] scan: LaserScan` makes `scan` both the data port and the
+  trigger, so `tick()` fires when a scan arrives and never polls. The graph YAML
+  supplies only the `source:` that feeds the port.
+- `self.scan.ranges()` is the typed read accessor: a borrowed `&[f32]` directly
+  over the loaned shared-memory payload. No deserialization, no copy, no
+  allocation.
 - **The controller cruises only on evidence.** A beam counts as a measurement
   only when it is finite and strictly positive, and a scan with no such beam
   (empty, all NaN, all zeros) stops the robot instead of reading as a clear
   path. Write every safety condition this way round: state what must be true to
   keep moving, rather than what must be true to stop.
-- The output is a `Vector3` (the linear velocity component) rather than a
-  full `geometry_msgs/Twist`, only to keep the example small. A `Twist`
-  works the same way: its two nested `Vector3`s are written by leaf
-  assignment, `self.cmd_vel.linear.x = speed`.
-- Because this node is **data-triggered** (declared via
-  `#[input(trigger)]`), `tick()` only fires when new data arrives on
-  the `scan` topic, with no wasted CPU cycles.
+- The output is a `Vector3` rather than a full `geometry_msgs/Twist` only to keep
+  the example small. A `Twist` works the same way:
+  `self.cmd_vel.linear.x = speed`.
 
 ### 3c. `drive_base` -- the sink node
 
@@ -531,88 +511,22 @@ impl DriveBaseNode {
 ```
 
 **Key points:**
-- This is a **sink node**: it only consumes data, never publishes
-  (the struct has no `#[output]` fields).
-- `#[input(trigger)]` makes `tick` data-triggered on the `cmd_vel` topic;
-  the graph YAML wires it to `safety_controller/cmd_vel`.
-- Direct fixed-field reads (`self.cmd_vel.x`) work via Deref: `Vector3Shm`
-  is the SHM overlay, exposing `pub x/y/z: f64` for zero-cost access.
-- **Hoist port reads out of macro invocations.** The `#[cerulion_node_impl]`
-  rewriter lowers `self.<port>.<field>` accesses in ordinary expressions, but
-  it cannot see inside another macro's body, so writing `self.cmd_vel.x`
-  directly inside `tracing::debug!(...)` fails to compile (E0609). Read the
-  port into a local first, then log the local (as the code above does).
-- Uses `tracing::debug!` with structured fields for observable logging. A node
-  logs through `tracing`, never `println!`. These are `debug` lines, and a
-  `--release` build compiles `debug` and `trace` out (release logging is capped
-  at `info`). To see them, build this one node without `--release`
-  (`cerulion node build drive_base`), run the graph without `--release` too (it
-  then loads the freshest build of each node, so the debug `drive_base` wins),
-  and set `RUST_LOG=debug` on the run. The `safety_controller`'s `emergency stop`
-  line is `info`, so it always shows.
+- A **sink node** has no `#[output]` fields: it consumes and never publishes.
+  Fixed-field reads (`self.cmd_vel.x`) go through the shared-memory overlay at
+  zero cost.
+- **Hoist port reads out of macro invocations.** The rewriter lowers
+  `self.<port>.<field>` in ordinary expressions but cannot see inside another
+  macro's body, so `self.cmd_vel.x` written directly inside
+  `tracing::debug!(...)` fails to compile (E0609). Read the port into a local
+  first, as the code above does.
+- A node logs through `tracing`, never `println!`. A `--release` build compiles
+  `debug` and `trace` out, so to see these lines build this node and run the
+  graph without `--release` and set `RUST_LOG=debug`. The `safety_controller`'s
+  `emergency stop` line is `info`, so it always shows.
 
 ---
 
-## Step 4: Verify Cargo.toml Dependencies
-
-The generated `Cargo.toml` for each node already has the right dependencies.
-The `cerulion_macros` crate is re-exported via `cerulion_core::prelude::*`,
-so no extra dependency is needed.
-
-Verify each node's `Cargo.toml` looks like this (the CLI generated it):
-
-```toml
-[package]
-name = "lidar_sensor"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[features]
-cdylib = []
-default = ["cdylib"]
-
-[dependencies]
-cerulion_core = { workspace = true }
-native_ros2_messages = { workspace = true }
-```
-
-The workspace root `Cargo.toml` defines the dependencies selected by the CLI:
-
-```toml
-[workspace]
-members = ["nodes/*"]
-resolver = "2"
-
-[workspace.dependencies]
-cerulion_core = "=X.Y.Z"
-native_ros2_messages = "=X.Y.Z"
-```
-
-An installed CLI writes exact published-version pins matching its own version
-(`cerulion --version`). When the CLI was built inside a `cerulion` source checkout, the same table
-instead holds normalized absolute paths into that checkout, for example
-`cerulion_core = { path = "/home/you/cerulion/crates/cerulion_core" }`.
-
-> **Why `cdylib`?** The graph runtime loads nodes as dynamic libraries at
-> startup, so each node is compiled into a `.dylib` (macOS) or a `.so` (Linux).
-> The `#[cerulion_node]` macro generates the entry points the runtime calls;
-> you never write or call them yourself.
->
-> **Why `{ workspace = true }`?** Using workspace-level dependency declarations
-> keeps all nodes using the same version of `cerulion_core` and
-> `native_ros2_messages`. The actual paths are defined once in the workspace
-> root `Cargo.toml`.
->
-> **Why the `cdylib` feature?** The `cdylib` feature flag controls whether the
-> `#[cerulion_node]` macro generates those entry points. It's
-> enabled by default so the node compiles as a loadable dynamic library.
-
----
-
-## Step 5: Create the Graph
+## Step 4: Create the Graph
 
 A **graph** is a YAML file that defines which node instances run and how
 they're wired together: topology only. (Trigger policy lives on each node
@@ -699,30 +613,30 @@ struct (written in Step 3); the graph YAML carries no `policy:` block. This file
 is yours to hand-edit from here on: add comments, rewire a `source:`, or set a
 per-output knob. `docs/user-api.md` ("Graph YAML reference") lists every key.
 
-> **No buffer sizes to set.** `LaserScan` carries variable-length arrays, and its
-> shared-memory budget comes from the schema itself, so the scan publishes without
-> any `max_slice_len:` here. The key exists for the day you need to override it
-> for one output.
+**No buffer sizes to set.** `LaserScan` carries variable-length arrays and its
+shared-memory budget comes from the schema itself, so the scan publishes without
+any `max_slice_len:` here. The key exists for the day you need to override it for
+one output.
 
-> **Trigger policies explained** (all declared on the macro side; the
-> graph YAML carries topology only):
->
-> | Policy | Macro attribute | Behavior |
-> |--------|-----------------|----------|
-> | **Period** | `#[cerulion_node(period_ms = N)]` | Fire every N ms regardless of data |
-> | **Data** | `#[input(trigger)]` on a field | Fire when that input port has new data |
-> | **Sync (bounded)** | `#[cerulion_node(sync_window_ms = N)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete aligned set**: one message from each trigger port, all within an N-ms window of each other. Each message is used by at most one set, so a burst holding three complete sets fires three times, each tick reading its own set. |
-> | **Sync (unbounded)** | `#[cerulion_node(unbounded_sync)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete set, as soon as every trigger port has an unconsumed message**. No timing bound; not recommended for control loops because worst-case fire latency is the slowest publisher's inter-arrival interval, unbounded if it stops. |
-> | **Data + deadline watchdog** | `#[input(trigger, expect_within_ms = N)]` | Fire on data arrival AND record a miss if no fresh data lands within N ms (the timeout records a miss, it does **not** fire the node). Replaces the removed `deadline_ms` trigger. |
-> | **External** | `#[cerulion_node(external)]` + an `external_source()` method | A **driver** node: it watches something outside Cerulion (a device file descriptor, a blocking SDK call) and fires itself when that signals. See "External nodes" in `docs/user-api.md`. |
->
-> The **data trigger** is the most common for reactive pipelines: it creates a
-> chain where each node fires exactly when its upstream publishes, giving
-> minimal latency without polling.
+### Trigger policies
+
+Every policy is declared on the macro side; the graph YAML carries topology only.
+
+| Policy | Macro attribute | Behavior |
+|--------|-----------------|----------|
+| **Period** | `#[cerulion_node(period_ms = N)]` | Fire every N ms regardless of data |
+| **Data** | `#[input(trigger)]` on a field | Fire when that input port has new data |
+| **Sync (bounded)** | `#[cerulion_node(sync_window_ms = N)]` + `#[input(trigger)]` on two or more ports | Fire once per complete aligned set: one message from each trigger port, all within an N-ms window of each other. Each message joins at most one set, so a burst holding three complete sets fires three times. |
+| **Sync (unbounded)** | `#[cerulion_node(unbounded_sync)]` + `#[input(trigger)]` on two or more ports | Fire once per complete set, as soon as every trigger port has an unconsumed message. No timing bound, so worst-case fire latency is the slowest publisher's inter-arrival interval, unbounded if it stops: not for control loops. |
+| **Data + deadline watchdog** | `#[input(trigger, expect_within_ms = N)]` | Fire on data arrival, and record a miss if no fresh data lands within N ms. The timeout records the miss; it does not fire the node. |
+| **External** | `#[cerulion_node(external)]` + an `external_source()` method | A driver node: it watches something outside Cerulion (a device file descriptor, a blocking SDK call) and fires itself when that signals. See "External nodes" in `docs/user-api.md`. |
+
+The data trigger is the most common for reactive pipelines: each node fires
+exactly when its upstream publishes, with minimal latency and no polling.
 
 ---
 
-## Step 6: Build and Run
+## Step 5: Build and Run
 
 ### Build all nodes
 
@@ -742,11 +656,13 @@ Built 'lidar_sensor'
 The first build also compiles the Cerulion runtime, so it takes a few minutes on
 a laptop; later builds take seconds.
 
-> **What happens during build:** `cerulion node build` runs your `cargo` on the
-> node crate and produces a node library, `target/release/lib<node_type>.dylib`
-> on macOS or `.so` on Linux (`target/debug/` without `--release`). `graph run`
-> loads the libraries from there. Use `--release` for anything you will measure
-> or record; a debug build is far slower.
+`cerulion node build` runs your `cargo` on the node crate and produces
+`target/release/lib<node_type>.dylib` on macOS or `.so` on Linux
+(`target/debug/` without `--release`); `graph run` loads the libraries from
+there. The runtime loads nodes as dynamic libraries, which is why each generated
+crate is a `cdylib` with the `cdylib` feature on by default: that feature is what
+makes the macro emit the entry points the runtime calls. Use `--release` for
+anything you will measure or record; a debug build is far slower.
 
 ### Check the graph
 
@@ -754,9 +670,10 @@ a laptop; later builds take seconds.
 cerulion graph validate obstacle_avoidance
 ```
 
-Every check should read `[ok]`, ending in `16/16 checks passed.` Run before the
-builds, the same command fails with three `cdylib ... not found` lines that tell
-you to run `cerulion node build` first: the verb names the next verb.
+Every check should read `[ok]`, ending in an `N/N checks passed.` line. Run
+before the builds, the same command fails with three `cdylib ... not found`
+lines that tell you to run `cerulion node build` first: the verb names the next
+verb.
 
 ### Run the graph, with recording on
 
@@ -766,7 +683,7 @@ cerulion graph run obstacle_avoidance --release --record
 
 This runs the graph **live**: an event-driven loop that wakes within microseconds
 of each publish. `--record` also writes the run to a bag under `recordings/`,
-which Step 8 uses.
+which Step 7 uses.
 
 **Multi-process by default:** the graph declares no `process_groups:` block, so
 on Linux and macOS `graph run` first derives a **process-per-node partition**
@@ -839,7 +756,7 @@ Leave it running and open a second terminal.
 
 ---
 
-## Step 7: Inspect Topics (in a second terminal)
+## Step 6: Inspect Topics (in a second terminal)
 
 While the graph is running, open another terminal, `cd` into `safety_demo`,
 and use the topic introspection commands.
@@ -977,7 +894,7 @@ Last timestamp: 18300000000ns
 
 ---
 
-## Step 8: Stop, Verify, Change, Verify Again
+## Step 7: Stop, Verify, Change, Verify Again
 
 Let the graph run for at least five seconds, then go back to the first terminal
 and press **Ctrl+C**. The workers drain, the recorder finalizes the bag, and the
@@ -1065,10 +982,9 @@ before it reaches the robot again. In CI the nonzero exit is the gate.
 
 ---
 
-## Step 9: Understand the Architecture
+## How it works underneath
 
-Now that you have a working system, let's review what's happening under the
-hood.
+You have a working system. This is what the runtime did to make it work.
 
 ### Message flow
 
@@ -1207,15 +1123,25 @@ contributes name-only, and a layout change inside such a target is not caught.
   in the user API.
 
 - **Capture the moment:** every serving `graph run` holds a rolling window of
-  the last ~30 seconds, recorded or not. `cerulion flashback` writes that window
-  to a bag; `cerulion bag info` reports whether the capture carries the
-  scheduler trace that re-execution needs, which depends on the run's shape. See
-  [docs/flashback.md](../flashback.md); [docs/bag.md](../bag.md) covers
-  recording and playback in full.
+  the last 30 seconds in memory, recorded or not. A capture writes that window
+  plus the 15 seconds after the trigger to a bag. The runtime captures on its own
+  when it sees a fault, and you can ask for one by hand from another shell:
 
-- **Visualize it:** `cerulion viz` attaches the live topics to the viz daemon and
-  [Cerulion Studio](../../README.md#studio-for-your-computer) connects to that
-  same daemon and renders them. Nothing is added to the graph for either.
+  ```bash
+  cerulion flashback --note "controller stopped late"
+  ```
+
+  `cerulion bag info` reports whether the capture carries the scheduler trace
+  that re-execution needs. See [docs/flashback.md](../flashback.md);
+  [docs/bag.md](../bag.md) covers recording and playback in full.
+
+- **Visualize it:** name the topics you want, and
+  [Cerulion Studio](../../README.md#studio-for-your-computer) renders them from
+  the same daemon. Nothing is added to the graph.
+
+  ```bash
+  cerulion viz /demo/lidar_sensor/scan /demo/safety_controller/cmd_vel
+  ```
 
 ---
 
@@ -1224,7 +1150,7 @@ contributes name-only, and a layout change inside such a target is not caught.
 | Command | Description |
 |---------|-------------|
 | `cerulion workspace create <name>` | Create a new workspace |
-| `cerulion node create <type> [--policy period_ms=N\|external] [-o SCHEMA NAME] [-T SCHEMA NAME] [-i SCHEMA NAME]` | Create node with ports (`-T` = trigger input; source-only nodes require `--policy`) |
+| `cerulion node create <type> [--policy period_ms=N\|sync_window_ms=N\|data_trigger=NAME\|external] [-o SCHEMA NAME] [-T SCHEMA NAME] [-i SCHEMA NAME]` | Create node with ports (`-T` = trigger input, equivalent to `--policy data_trigger=NAME`; source-only nodes require `--policy`) |
 | `cerulion node list` | List all node types |
 | `cerulion node info <type>` | Show node details |
 | `cerulion node build <type> [--release]` | Build node cdylib |

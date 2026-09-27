@@ -1,147 +1,106 @@
-# The Remote Plane: Deadman, WAN Latency, and Offline Safety
+# Remote access safety: the deadman, degraded links, and offline
 
-This document covers the SAFETY posture of the iroh remote plane
-(`cerulion_remoted` + `cerud`): the control-lease deadman window, how it
-interacts with WAN round-trip latency, why remote teleop is allowed over relayed
-paths, and why the e-stop channel is not serialized behind other sessions and
-never bricks offline.
+When you drive a robot from another network, three things decide whether a bad
+link is safe: what happens when your control link goes quiet, what happens when
+it is merely slow, and what still works when the internet does not. This page
+answers those three for the remote plane, the internet path to a robot: one
+iroh endpoint per robot, dial-by-key, reachable from boot, gated by the offline
+pairing access list.
 
-It is distinct from `docs/networking.md`, which covers the LAN **zenoh gateway**
-(`network:` block, `topic list`, mDNS). The remote plane is the internet path:
-one iroh endpoint per robot, dial-by-key, the `cerulion/ops/1` (cerud) and
-`cerulion/wire/1` planes, reachable 24/7 from boot by design, auth-gated
-by the offline pairing access list.
+It is separate from [`docs/networking.md`](networking.md), which covers the LAN
+zenoh gateway (`network:` blocks, `topic list`, mDNS).
 
-## The control-lease deadman
+## The deadman: a quiet operator stops the robot
 
-The `cerud` control lease (`crates/cerud/src/lease.rs`) is the single actuation-lease /
-deadman / e-stop state machine. A lease holder must **renew within the deadman
-window** or the deadman fires and the robot enters the safe frame (a live
-operator that goes silent must not leave the robot actuating).
+Actuation is held by a control lease, and the holder must renew it inside the
+deadman window. Miss the window and the robot enters its safe frame. An operator
+who goes silent, for any reason, does not leave a robot moving.
 
-The deadman window is a constant:
+The window ships at **500 ms**
+(`LEASE_DEADMAN_WINDOW_MS_ROBOT_CONFIRM`, `crates/cerud/src/constants.rs`).
 
-| Constant | Value | Where |
-|---|---|---|
-| `LEASE_DEADMAN_WINDOW_MS_ROBOT_CONFIRM` | **500 ms** | `crates/cerud/src/constants.rs` |
+**Size it from the actuator, not from the network.** The right window is decided
+by the actuator's control-loop rate and its physical stopping distance, so a
+deployment sets it on the robot and confirms it there. The same applies to what
+the safe frame does: which actuators to zero, which brakes to engage, the ramp
+profile. The lease layer owns the permission floor only, who may stop; it emits
+no actuation of its own. Do not treat 500 ms as an actuation contract until it
+has been confirmed against your own hardware.
 
-**ROBOT_CONFIRM.** 500 ms is a **placeholder**. The final window is confirmed
-on-robot at integration time: it depends on the actuator control-loop rate and
-the physical stopping distance, not on the network. `cerud` owns the *permission*
-floor only (who may stop); it does not emit any actuation, and the safe-frame
-CONTENTS (which actuators to zero, which brakes to engage, the ramp profile) are
-themselves ROBOT_CONFIRM. Do not bake 500 ms into any actuation contract without
-the on-robot confirmation. (The 500 ms figure this doc cites is pinned against the
-constant by `crates/cerud/tests/constants_test.rs`, so re-tuning the constant fails that
-test, forcing this doc to be updated in the same change.)
+## A slow link eats the window
 
-## Deadman vs WAN round-trip latency
-
-The deadman measures wall time between renewals **on the robot** (it takes an
-explicit `now_ns`, so it is deterministic and replay-safe). A remote operator's
-renewals travel the control path, so the effective renewal cadence the robot sees
-is the operator's send cadence **plus the one-way network latency and its
-jitter**. On a path with round-trip time `R` and jitter `J`, an operator sending
-renewals every `T` must satisfy, at the robot:
+The deadman measures wall time between renewals **on the robot**. A remote
+operator's renewals travel the control path, so the cadence the robot sees is
+your send cadence plus the one-way latency and its jitter. On a path with
+round-trip time `R` and jitter `J`, renewing every `T` keeps actuation live only
+while:
 
 ```
 T + (R/2) + J  <  deadman_window
 ```
 
-for actuation to stay live. Concretely:
-
-| Path | Typical RTT | Headroom against a 500 ms window |
+| Path | Typical round trip | Against a 500 ms window |
 |---|---|---|
-| LAN / direct holepunch | < 1 to 5 ms | Ample: renew every ~100 ms and the deadman never fires under normal jitter. |
-| Relayed WAN (off-LAN) | 100 to 300 ms + jitter | **Tight.** A single stall or a burst of jitter can push a renewal past the window and fire the safe frame. |
+| LAN or direct hole punch | under 1 to 5 ms | Ample. Renew every 100 ms and normal jitter never fires the deadman. |
+| Relayed wide-area | 100 to 300 ms plus jitter | Tight. One stall or a jitter burst can push a renewal past the window and fire the safe frame. |
 
-This is by design: on a relayed WAN path, one stalled renewal is close to one safe
-frame away, which is the SAFE failure (an operator whose control link degraded
-gets a stop, not a runaway). The window must be sized for the **worst admissible
-control-path latency** of the paths teleop is allowed over.
+That is the intended failure: a degraded control link produces a stop, not a
+runaway. Size the window for the worst latency the paths you allow teleop over
+can produce.
 
-## Teleop over relayed paths is allowed
+**Teleop is allowed over relayed paths**, including relay fallback, rather than
+refused. There is no relayed-path refusal: degraded latency drives a safe frame
+through the deadman, never a silent runaway, and the operator is shown the live
+control-path round trip and warned as it approaches the window rather than being
+quietly downgraded.
 
-**`CAP_TELEOP` is allowed over relayed paths**, with deadman tuning. Teleop works everywhere, including
-relay-fallback connections. Safety rides:
+## E-stop does not wait behind another session
 
-1. the cerud deadman (tuned / widened for WAN as needed, sized for the worst
-   admissible control-path latency), and
-2. **loud latency indicators**: the operator sees the live control-path RTT and
-   is warned as it approaches the deadman window.
+E-stop is the permission floor. Any paired session may engage it, it is never
+lease-gated, and nothing actuates while it is engaged. That has to hold at the
+transport layer too, so ops sessions are served **concurrently**: one shared ops
+server handles every session at once, with the receipt log behind a brief append
+lock. A stalled or hostile session parks on a blocking read holding no lock, so
+it cannot delay anyone else, and a reconnect loop cannot hold a permit to keep a
+legitimate e-stop waiting. The safety effect runs before its audit receipt, and
+the only contention inside the daemon is that brief append. Hash-chain integrity
+survives: each append is one atomic critical section, so concurrent appends form
+one valid tamper-evident chain.
 
-There is **no relayed-path teleop refusal arm**. The remote plane does NOT reject
-`CAP_TELEOP` on a relayed connection; degraded relay latency drives a safe frame
-via the deadman, never a silent runaway, and the operator is shown the degraded
-latency rather than being silently downgraded.
+**What this rules out is serialization, not unavailability.** Resource
+exhaustion and network delivery still decide whether a remote engage-estop
+arrives. Each session is bounded by a 120 s deadline that closes an
+authenticated-then-stalled connection, which is a per-session resource guard
+rather than a serialization point. Two caps that would bound the total footprint
+under a distributed flood, a global concurrency cap with a reserved safety-floor
+slot and the daemon's accept-loop cap, are **not implemented**.
 
-## E-stop is not serialized behind other sessions
+## A dropped connection does not drop the lease
 
-E-stop is the **permission floor**: any paired session may engage it, it is never
-lease-gated, and it always wins (no actuation while engaged). That guarantee must
-hold at the transport layer too: a legitimate remote `engage-estop` must not
-**queue behind other sessions, hostile or not, that are in flight**.
+The lease holder is the TLS-authenticated device key, stable per pairing, not
+the connection id. A link that drops and reopens inside the deadman window
+re-presents the same identity and renews the same lease: no fresh grant, no
+re-arbitration, no gap in actuation. An engaged e-stop is robot state that
+persists across reconnects until it is explicitly cleared, and a different paired
+device cannot take the floor from the one that engaged it. A drop **longer** than
+the window fires the safe frame, which is correct: the operator is gone.
 
-Serving ops sessions SERIALLY behind one permit (the receipt log as a
-single hash-chained sink) would let a reconnect-loop attacker hold the permit up
-to the per-session deadline and delay a legitimate e-stop. **So ops
-serving is concurrent**: `cerud`'s `OpsServer` is `Send + Sync` with the receipt log
-behind a brief-append `Mutex`, so one `Arc<OpsServer>` serves every session
-CONCURRENTLY. A stalled/hostile session is parked on a blocking read holding no
-lock, so it never delays another session. A paired `engage-estop` runs on its own
-concurrent session and reaches the lease without waiting for another session: the
-safety EFFECT runs BEFORE its audit receipt (e-stop is non-mutating, so no intent
-receipt precedes it), and its only contention inside `cerud` is the brief receipt
-append.
+## It never bricks offline
 
-Serialization is what this section rules out, not unavailability. Resource
-exhaustion and network delivery still affect whether a remote `engage-estop`
-arrives, and the caps that would bound the first of those are listed below as
-not implemented.
+On the LAN, an established pairing reaches the robot with no cloud anywhere in
+the connect path: mDNS or a direct dial for discovery, a direct iroh dial with
+the relay disabled for transport, and offline verification against the local
+root set and the durable access list. Established pairings never expire and
+never re-run the certificate chain per connect; the access row is the truth.
 
-Hash-chain integrity is preserved: the receipt sink's `Mutex` serializes each
-append as one atomic critical section, so concurrent appends still form one valid
-tamper-evident chain.
+The issuer, which mints certificates for **new** pairings, and the relay, which
+provides reach from off the LAN, are conveniences rather than dependencies. A
+robot with the issuer down and the relay unreachable still serves an established
+pairing on the LAN.
 
-Each session is still bounded by a per-session deadline (`OPS_SESSION_DEADLINE`,
-120 s) that closes an authed-then-stalled connection so its blocking task ends
-(a per-session resource guard, not a serialization point). A global
-concurrency cap with a reserved safety-floor slot (to bound the total blocking-
-task footprint under a distributed flood while keeping `engage-estop` always
-admissible) is not implemented, and neither is the daemon's accept-loop concurrency cap.
+## See also
 
-Pinned by `crates/cerulion_remoted/tests/estop_starvation_test.rs`.
-
-## Lease over reconnects
-
-The lease holder / engager is a **stable per-pairing session token**, the
-TLS-authenticated device key (`caller.id`), which is stable per pairing, **NOT
-the ephemeral QUIC connection id**. So a WAN drop + reopen within the deadman
-window re-presents the SAME token and RENEWS the same lease (no fresh grant, no
-re-arbitration, no gap in actuation). E-stop is robot state (`EstopState::Engaged`)
-that persists across reconnects until explicitly cleared: a transient reconnect
-never drops the floor, and a different paired token cannot take the floor from the
-first engager. A WAN drop LONGER than the deadman fires the safe frame: correct,
-the operator is gone.
-
-Pinned by `crates/cerud/tests/lease_test.rs` (pure state machine) +
-`crates/cerulion_remoted/tests/estop_starvation_test.rs` (e2e over iroh).
-
-## Never bricks offline
-
-On the LAN, an ESTABLISHED pairing reaches the robot with **zero cloud in the
-connect path**:
-
-1. **discovery**: mDNS multicast / direct-dial (no cloud);
-2. **transport**: iroh DIRECT dial via `direct_addr` + `RelayConfig::Disabled`
-   (no relay);
-3. **verify**: the offline `cerulion_pairing` `TrustStore` against the local root
-   set + the durable access list (I/O-free; established pairings never expire and
-   never re-run the chain per connect: the access row is truth).
-
-The issuer (which mints fresh certs for NEW pairings) and the relay (off-LAN
-reach) are conveniences, not dependencies: a robot with the issuer down and the
-relay unreachable still serves an established pairing on the LAN. Pinned by
-`crates/cerulion_remoted/tests/offline_connect_test.rs` (an established pairing connects
-and runs a verb with an UNREACHABLE relay and no issuer in the path, proving the
-connect path opened no cloud/issuer I/O).
+- [`docs/revocation.md`](revocation.md): taking an account's or one device's
+  access back.
+- [`docs/networking.md`](networking.md): the LAN plane, discovery and what a run
+  exposes by default.
