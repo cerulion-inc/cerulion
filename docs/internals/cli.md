@@ -949,10 +949,14 @@ cdylib must match the host's full compiler fingerprint, checked at load before i
 ## 12. The login gate
 
 Every command runs under a logged-in-ever identity. `command_needs_identity` in
-`crates/cerulion_cli/src/main.rs` exempts `login`, `completions` and the two
-internal `graph run-worker` / `run-gateway` subprocess verbs; clap's `--help` and
-`--version` and the usage refusals `main` performs before the gate call answer
-above it and need no exemption. `ensure_login_gate` in
+`crates/cerulion_cli/src/main.rs` exempts `login`, `completions`, `clean` and the
+two internal `graph run-worker` / `run-gateway` subprocess verbs; clap's `--help`
+and `--version` and the usage refusals `main` performs before the gate call answer
+above it and need no exemption. The `clean` exemption is scoped to what the verb
+is: a sweep of this machine's own iceoryx2 bookkeeping that reads no account and
+opens no socket, and the remedy a machine that has never signed in needs most.
+It exempts the VERB, both flag forms, and it is not a precedent for a verb that
+reaches an account or a robot. `ensure_login_gate` in
 `crates/cerulion_cli_engine/src/login_cmd.rs` reads local state only: a machine
 that signed in once proceeds with zero network, offline and on an expired
 session. A machine that never signed in runs the device-code flow inline when
@@ -973,7 +977,10 @@ and points `CERULION_ACCOUNT_SERVICE` at a closed loopback port, so it meets the
 gate the way a user's machine does and reaches no network:
 `crates/cerulion_cli/tests/login_gate_e2e_test.rs` is the whole contract over the
 real binary, and `a_malformed_resim_is_refused_before_the_login_gate` in
-`replay_cli_test.rs` pins the one ordering property. A test that needs an
+`replay_cli_test.rs` pins the one ordering property. The `clean` exemption is
+pinned there in both directions: `cerulion clean --report-only` under an empty
+home exits 0 and prints its report, and `cerulion topic list` under the same home
+prints the whole refusal and exits 7. A test that needs an
 identity rather than an absent one provisions it:
 `cerulion_cli_engine::auth::seed_logged_in_at` from Rust, or
 `tools/ci/seed_test_login.sh <dir>` from a shell, both writing the `auth.json`
