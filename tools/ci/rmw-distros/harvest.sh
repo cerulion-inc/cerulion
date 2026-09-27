@@ -41,3 +41,61 @@ suite_counts() {
 crashed() {
     grep -qE "process didn't exit successfully|\(signal: |^error: could not compile" "$1"
 }
+
+# The positive control every rmw library defines: without it an empty, truncated or unreadable
+# symbol table would satisfy a "none of these are present" check for free.
+NM_CONTROL_SYMBOL="rmw_init"
+
+# defined_symbols <nm output>: the defined symbol NAMES, one per line, sorted and unique.
+# `nm -D --defined-only` prints "<address> <type> <name>" and has already dropped the undefined
+# entries, so the name is the last field; a "@VERSION" suffix is stripped so a versioned library
+# reads the same as an unversioned one.
+defined_symbols() {
+    awk '{ print $NF }' "$1" | sed -E 's/@.*$//; /^$/d' | sort -u
+}
+
+# symbol_audit <nm output> <absent symbols, space separated>: exit 0 when the library defines the
+# control symbol and NONE of the named ones. An rmw whose headers do not declare a symbol must not
+# export it: rcl resolves by name, so a defined symbol is a claim the distro cannot back. The
+# control is what makes a zero finding mean something.
+symbol_audit() {
+    local nm_out="$1" absent_list="$2"
+    local defined bad=0 s
+    defined="$(defined_symbols "$nm_out")"
+    if ! printf '%s\n' "$defined" | grep -qx -- "$NM_CONTROL_SYMBOL"; then
+        echo "SYMBOL AUDIT FAIL: the control symbol $NM_CONTROL_SYMBOL is NOT defined, so an empty or unreadable symbol table cannot pass by default"
+        return 1
+    fi
+    # shellcheck disable=SC2086  # the list is deliberately word-split into symbol names
+    for s in $absent_list; do
+        if printf '%s\n' "$defined" | grep -qx -- "$s"; then
+            echo "SYMBOL AUDIT FAIL: $s is defined, but this distro's headers do not declare it"
+            bad=1
+        fi
+    done
+    return "$bad"
+}
+
+# refuse_row_pinned <errors> <marker>: exit 0 only when a `refuse` row pins BOTH inputs for real.
+# Both of gate.sh's inert defaults pass vacuously otherwise: `grep -F ""` matches every line, so an
+# empty marker accepts any failure at all, and an absent "due to N previous errors" line reads back
+# as 0, so an errors=0 row accepts a build that printed no count. A row that stops pinning its
+# refusal must fail the gate, not sail through it.
+refuse_row_pinned() {
+    local errors="$1" marker="$2"
+    case "$errors" in
+        '' | *[!0-9]*)
+            echo "GATE FAIL: a refuse row must pin a decimal error count, got '$errors'"
+            return 1
+            ;;
+        0)
+            echo "GATE FAIL: a refuse row must pin a NONZERO error count; 0 is the inert default and a build printing no error count at all reads back as 0"
+            return 1
+            ;;
+    esac
+    if [ -z "$marker" ]; then
+        echo "GATE FAIL: a refuse row must pin a NON-EMPTY marker; grep -F '' matches every line, so an empty marker accepts any failure"
+        return 1
+    fi
+    return 0
+}

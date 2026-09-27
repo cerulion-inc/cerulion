@@ -2602,6 +2602,27 @@ unsafe fn take_impl(
                 &data.topic,
             );
         }
+        // A member this build's C++ typesupport gives no way to WRITE
+        // (a `bool[]` before Humble: the generator emits no `assign` for
+        // `std::vector<bool>`) makes every frame of this type undeliverable.
+        // Decided at registration, so this is one `Option` read per frame,
+        // and taken BEFORE `unflatten` so the caller's message is untouched.
+        // The frame is consumed and dropped through the SAME latch and
+        // regime as every other decode refusal, with the member named,
+        // never as a generic malformed-entry warning, which would blame the
+        // wire for a limit of this build.
+        if let Some((var_idx, member)) = data.bridge.unwritable_bool_seq() {
+            crate::decode_failure_latch::report_decode_entry_refused(
+                &data.decode_failures,
+                crate::decode_failure_latch::DecodeSite::Subscription,
+                &data.topic,
+                &data.type_name,
+                msg.payload().len(),
+                var_idx,
+                &crate::type_bridge_cpp::bool_seq_no_assign_detail(member),
+            );
+            return;
+        }
         if data.bridge.unflatten(msg.payload(), ros_message) {
             took = true;
             info_out = Some((header.timestamp_ns, header.sequence as u64));
@@ -2643,8 +2664,7 @@ unsafe fn take_impl(
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
                     Err(_) => 0,
                 };
-                info.publication_sequence_number = seq;
-                info.reception_sequence_number = u64::MAX;
+                super::stamp_sequence_numbers(&mut info, seq);
             }
             info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
             info.from_intra_process = false;
@@ -3026,6 +3046,24 @@ unsafe fn take_adopted(
     // allocation failure in a copy arm, a malformed body inside a NESTED
     // member, and an unaligned forged entry) still fail mid-decode — exactly
     // as the plain copying take does.
+    // The type-level blocker first (see the copying take's arm): a member
+    // this build cannot write refuses the frame here, before the entry walk
+    // and before any write, with the member named. Read off the bridge, so it
+    // borrows nothing from the held sample.
+    if let Some((var_idx, member)) = data.bridge.unwritable_bool_seq() {
+        let body_len = owned.payload().len() - WireHeader::SIZE;
+        drop(owned);
+        crate::decode_failure_latch::report_decode_entry_refused(
+            &data.decode_failures,
+            crate::decode_failure_latch::DecodeSite::Subscription,
+            &data.topic,
+            &data.type_name,
+            body_len,
+            var_idx,
+            &crate::type_bridge_cpp::bool_seq_no_assign_detail(member),
+        );
+        return RMW_RET_OK;
+    }
     {
         let body = &owned.payload()[WireHeader::SIZE..];
         if let Err((var_idx, verdict)) = data.bridge.frame_entries_readable(body) {
@@ -3483,8 +3521,7 @@ unsafe fn take_adopted(
             Ok(rt) => rt.transport.clock().now_ns() as i64,
             Err(_) => 0,
         };
-        info.publication_sequence_number = seq;
-        info.reception_sequence_number = u64::MAX;
+        super::stamp_sequence_numbers(&mut info, seq);
         info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
         info.from_intra_process = false;
         *message_info = info;
@@ -3927,8 +3964,7 @@ unsafe fn take_loaned_impl(
             Ok(rt) => rt.transport.clock().now_ns() as i64,
             Err(_) => 0,
         };
-        info.publication_sequence_number = seq;
-        info.reception_sequence_number = u64::MAX;
+        super::stamp_sequence_numbers(&mut info, seq);
         info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
         info.from_intra_process = false;
         *message_info = info;
@@ -4072,8 +4108,15 @@ pub unsafe extern "C" fn rmw_subscription_get_actual_qos(
     RMW_RET_OK
 }
 
+// Content-filtered topics arrived with Humble: on an older distro
+// `rmw_subscription_content_filter_options_t` does not exist, so both
+// exports are compiled away WHOLE rather than stubbed (the distro gate
+// reads the built library with `nm` and fails if either is defined where
+// the headers lack the type).
+
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_content_filter_options)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_set_content_filter(
     _subscription: *mut ffi::rmw_subscription_t,
@@ -4084,6 +4127,7 @@ pub unsafe extern "C" fn rmw_subscription_set_content_filter(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_content_filter_options)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_get_content_filter(
     _subscription: *const ffi::rmw_subscription_t,
@@ -4283,7 +4327,9 @@ mod slice_ceiling_tests {
             size_function: None,
             get_const_function: None,
             get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             assign_function: None,
             resize_function: None,
             #[cfg(cerulion_has_is_rosidl_buffer)]

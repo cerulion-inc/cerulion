@@ -781,7 +781,9 @@ fn cpp_typesupport_untouched_loan_serves_defaults() {
             size_function: None,
             get_const_function: None,
             get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             assign_function: None,
             resize_function: None,
             #[cfg(cerulion_has_is_rosidl_buffer)]
@@ -1406,7 +1408,13 @@ fn c_abi_serialized_take_fills_message_info() {
         serialized.allocator = malloc_allocator();
         let mut taken = false;
         let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-        info.publication_sequence_number = 12345; // poison: must be overwritten
+        // `rmw_message_info_t` carries the two sequence numbers from Humble
+        // on; the poison and its assertion ride the same capability, and the
+        // frame's own sequence is asserted through the wire header below.
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
+        {
+            info.publication_sequence_number = 12345; // poison: must be overwritten
+        }
         assert_eq!(
             rmw_take_serialized_message_with_info(
                 subscription,
@@ -1418,6 +1426,7 @@ fn c_abi_serialized_take_fills_message_info() {
             RMW_RET_OK
         );
         assert!(taken, "published frame must be taken");
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
         assert_eq!(info.publication_sequence_number, 0, "first publish = seq 0");
         assert!(
             info.source_timestamp > 0,
@@ -2196,7 +2205,11 @@ fn c_abi_loaned_take_round_trip_and_return() {
         let mut taken = false;
         let mut out: *mut c_void = std::ptr::null_mut();
         let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-        info.publication_sequence_number = 12345; // poison: must be overwritten
+        // Humble and later, like the serialized arm above.
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
+        {
+            info.publication_sequence_number = 12345; // poison: must be overwritten
+        }
         assert_eq!(
             rmw_take_loaned_message_with_info(
                 subscription,
@@ -2232,9 +2245,12 @@ fn c_abi_loaned_take_round_trip_and_return() {
         let header = cerulion_core::wire::WireHeader::read_from_buf(header_bytes)
             .expect("wire header before the loaned payload");
         assert_eq!(info.source_timestamp, header.timestamp_ns as i64);
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
         assert_eq!(info.publication_sequence_number, 0, "first publish = seq 0");
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
         assert_eq!(info.publication_sequence_number, u64::from(header.sequence));
         assert!(info.received_timestamp > 0, "received timestamp stamped");
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
         assert_eq!(info.reception_sequence_number, u64::MAX);
 
         // rmw.h contract: a take into an out-slot that is NOT NULL is
@@ -2408,6 +2424,7 @@ fn c_abi_loaned_take_hold_across_publish_pins_the_slot() {
             );
             assert!(t, "frame {i} must still be queued");
             assert_eq!((*(p as *const CPoint)).x, 10.0 + f64::from(i), "FIFO order");
+            #[cfg(cerulion_has_message_info_sequence_numbers)]
             assert_eq!(info.publication_sequence_number, 1 + u64::from(i));
             assert_eq!(
                 rmw_return_loaned_message_from_subscription(subscription, p),

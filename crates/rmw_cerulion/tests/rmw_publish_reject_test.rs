@@ -278,11 +278,28 @@ unsafe fn serialize(msg: &CPoint, ts: *const ffi::rosidl_message_type_support_t)
     out
 }
 
-/// Take one message, returning `(taken, value, publication_sequence_number)`.
+/// What `take_one` must report for wire sequence `n`: the sequence itself
+/// where `rmw_message_info_t` carries one (Humble and later), `None` before
+/// that, where the struct has no such field and the datum rides the wire
+/// header alone.
+fn expected_publication_sequence(n: u64) -> Option<u64> {
+    #[cfg(cerulion_has_message_info_sequence_numbers)]
+    let want = Some(n);
+    #[cfg(not(cerulion_has_message_info_sequence_numbers))]
+    let want = {
+        let _ = n;
+        None
+    };
+    want
+}
+
+/// Take one message, returning `(taken, value, publication_sequence_number)`;
+/// the sequence is `None` where the rmw of this build has no field for it
+/// (see [`expected_publication_sequence`]).
 ///
 /// # Safety
 /// `subscription` must be a live subscription created by this implementation.
-unsafe fn take_one(subscription: *const ffi::rmw_subscription_t) -> (bool, CPoint, u64) {
+unsafe fn take_one(subscription: *const ffi::rmw_subscription_t) -> (bool, CPoint, Option<u64>) {
     let mut out = CPoint::default();
     let mut taken = true;
     let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
@@ -296,7 +313,14 @@ unsafe fn take_one(subscription: *const ffi::rmw_subscription_t) -> (bool, CPoin
         ),
         RMW_RET_OK
     );
-    (taken, out, info.publication_sequence_number)
+    #[cfg(cerulion_has_message_info_sequence_numbers)]
+    let sequence = Some(info.publication_sequence_number);
+    #[cfg(not(cerulion_has_message_info_sequence_numbers))]
+    let sequence = {
+        let _ = &info;
+        None
+    };
+    (taken, out, sequence)
 }
 
 // =====================================================================
@@ -447,7 +471,8 @@ fn serialized_publish_round_trips_and_restamps_the_sequence() {
             assert!(taken, "a well-formed frame must be delivered");
             assert_eq!(got, *expected, "the payload must survive the round trip");
             assert_eq!(
-                seq, i as u64,
+                seq,
+                expected_publication_sequence(i as u64),
                 "the publish site must RE-STAMP the wire sequence — a bag \
                  replayed through here would otherwise publish seq 0 forever"
             );
@@ -509,7 +534,8 @@ fn a_malformed_header_is_rejected_and_nothing_is_published() {
         assert!(taken);
         assert_eq!(got, healthy);
         assert_eq!(
-            seq, 0,
+            seq,
+            expected_publication_sequence(0),
             "a REJECTED frame must not burn a wire sequence number"
         );
 
