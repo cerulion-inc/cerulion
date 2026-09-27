@@ -783,6 +783,8 @@ fn cpp_typesupport_untouched_loan_serves_defaults() {
             fetch_function: None,
             assign_function: None,
             resize_function: None,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer_: false,
         };
         let members = Box::leak(
             vec![
@@ -1723,6 +1725,19 @@ fn c_abi_1mb_uint8_multi_array_publish_take_byte_identical() {
         size: usize,
         capacity: usize,
     }
+    /// Primitive and string sequences carry the two Lyrical Buffer flags after
+    /// the header (message sequences do not); the flags exist on the era the
+    /// crate is built for, so this fixture is exactly the distro's struct.
+    #[repr(C)]
+    struct CPrimSeq {
+        data: *mut c_void,
+        size: usize,
+        capacity: usize,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: bool,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: bool,
+    }
     /// std_msgs/MultiArrayDimension: { label: string, size: u32, stride: u32 }
     #[repr(C)]
     struct CDim {
@@ -1740,7 +1755,7 @@ fn c_abi_1mb_uint8_multi_array_publish_take_byte_identical() {
     #[repr(C)]
     struct CU8Ma {
         layout: CLayout,
-        data: CSeq,
+        data: CPrimSeq,
     }
 
     fn full_member(
@@ -1889,10 +1904,14 @@ fn c_abi_1mb_uint8_multi_array_publish_take_byte_identical() {
                 },
                 data_offset: 0,
             },
-            data: CSeq {
+            data: CPrimSeq {
                 data: payload.as_mut_ptr() as *mut c_void,
                 size: payload.len(),
                 capacity: payload.len(),
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                is_rosidl_buffer: false,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                owns_rosidl_buffer: false,
             },
         };
 
@@ -1914,10 +1933,14 @@ fn c_abi_1mb_uint8_multi_array_publish_take_byte_identical() {
                 },
                 data_offset: 0,
             },
-            data: CSeq {
+            data: CPrimSeq {
                 data: std::ptr::null_mut(),
                 size: 0,
                 capacity: 0,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                is_rosidl_buffer: false,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                owns_rosidl_buffer: false,
             },
         };
         let mut taken = false;

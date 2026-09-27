@@ -19,38 +19,21 @@ set -u
 # Expected-state table. Pinned from the 2026-09-23 pre-flight and the first lane run in these exact
 # images (jazzy is the validated distro: it must build and pass its whole suite, the regression guard
 # for every other row):
-#   lyrical: builds from generated bindings (43 s); FOURTEEN known failures, every one the C++
-#            typesupport arm refused on the post-Jazzy era (no Lyrical-shaped mirror yet), pinned as
-#            <binary>::<test> from cargo's own per-binary failures lists (three of them print their
-#            FAILED token on a line of its own after unterminated test stdout, which a grep for
-#            "^test .* FAILED$" never sees). One waiver is wider than its rationale: the slice-ceiling
-#            e2e test is a single #[test] whose first six arms use the plain C introspection path, so
-#            those C arms go unverified on Lyrical until the row flips;
+#   lyrical: builds from generated bindings and its whole suite is green (the C++ mirror carries the
+#            Lyrical tail field under cfg(cerulion_has_is_rosidl_buffer)); first run at this state:
+#            33 targets, 479 tests run, 0 failed;
 #   humble:  the compile stops at rmw's 24-byte GID storage against the 16-byte one the crate writes
 #            (4 errors);
 #   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 24 more missing symbols,
 #            25 errors).
 # A `build` row also pins floors the suite must clear before "green" means anything: at least
 # min_targets target summaries and min_tests tests run (ok, failed or ignored), pinned PER ROW from
-# that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run) with margin for
+# that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run; 33 and 479
+# with the two vendored-gate binaries) with margin for
 # targets that come and go; a lane that silently loses half its binaries lands below the floor.
 case "$distro" in
     jazzy)   expect=build; min_targets=25; min_tests=400; known_failures="" ;;
-    lyrical) expect=build; min_targets=25; min_tests=400
-             known_failures="rmw_adopt_take_test::cpp_twin_adopts_the_vector_in_place_and_the_free_releases
-rmw_adopt_take_test::cpp_twin_releases_a_caller_filled_vector_before_the_first_adopted_take
-rmw_cerulion::api::dispatch_tests::bridge_for_builds_cpp_anybridge_and_flattens_like_native
-rmw_cerulion::api::dispatch_tests::direct_leaf_resolves_without_a_dispatcher
-rmw_cerulion::api::dispatch_tests::resolves_cpp_arm_for_a_cpp_dispatcher
-rmw_e2e_test::cpp_typesupport_untouched_loan_serves_defaults
-rmw_shadow_take_test::a_write_through_the_forged_payload_faults_loudly
-rmw_shadow_take_test::cpp_image_loaned_take_aims_data_into_the_held_sample_and_recycles_the_shadow
-rmw_shadow_take_test::cpp_shadow_pool_exhaustion_is_refused_before_consuming_a_frame_and_recovers
-rmw_shadow_take_test::cpp_string_only_type_is_not_take_loanable_through_the_c_abi
-rmw_shadow_take_test::destroying_a_subscription_with_a_forged_loan_outstanding_unforges_then_finis
-rmw_shadow_take_test::the_resolver_calls_the_seams_bypass_warn_on_every_cpp_typesupport_resolve
-rmw_shadow_take_test::two_runs_of_the_forged_take_match_the_hand_oracle
-rmw_slice_ceiling_e2e_test::the_resolved_ceiling_governs_real_negotiated_buffers_end_to_end" ;;
+    lyrical) expect=build; min_targets=25; min_tests=400; known_failures="" ;;
     humble)  expect=refuse; errors=4;  marker="expected an array with a size of 24, found one with a size of 16" ;;
     foxy)    expect=refuse; errors=25; marker="cannot find type \`rmw_feature_t\` in module \`ffi\`" ;;
     *) echo "FATAL: no expected state for distro '$distro'"; exit 1 ;;

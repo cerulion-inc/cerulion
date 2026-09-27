@@ -136,4 +136,85 @@ void rmw_cerulion_vector_pod_release(void *begin) noexcept {
   ::operator delete(begin);
 }
 
+
+// The three introspection accessors that can THROW: on Lyrical and Rolling a
+// rosidl::Buffer member's get/get_const/resize call throw_if_not_cpu_backend()
+// first, and a C++ exception crossing the accessor pointer into Rust would be
+// a foreign unwind (undefined behaviour). Each wrapper calls the accessor
+// inside try/catch and returns 0 on success, 1 when it threw; the Rust side
+// treats 1 as a refused frame. size_function is documented as non-throwing
+// on every backend and is called directly.
+int rmw_cerulion_member_get_const(const void *(*f)(const void *, size_t), const void *m, size_t index,
+                                  const void **out) noexcept {
+  try {
+    *out = f(m, index);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+int rmw_cerulion_member_get(void *(*f)(void *, size_t), void *m, size_t index, void **out) noexcept {
+  try {
+    *out = f(m, index);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+int rmw_cerulion_member_resize(void (*f)(void *, size_t), void *m, size_t size) noexcept {
+  try {
+    f(m, size);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+// fetch and assign (the vector<bool> element copies) are wrapped as well, so
+// that no introspection accessor pointer is ever called directly from Rust.
+int rmw_cerulion_member_fetch(void (*f)(const void *, size_t, void *), const void *m, size_t index,
+                              void *out) noexcept {
+  try {
+    f(m, index, out);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+int rmw_cerulion_member_assign(void (*f)(void *, size_t, const void *), void *m, size_t index,
+                               const void *value) noexcept {
+  try {
+    f(m, index, value);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+// Test fixture for the Rust unit test of the wrappers: an accessor that
+// always throws, so the catch is proven rather than assumed.
+const void *rmw_cerulion_throwing_get_const(const void *, size_t) { throw 1; }
+
 }  // extern "C"
+
+// The hand-mirrored C++ MessageMember (src/ffi/introspection_cpp.rs) is pinned
+// against the C++ header itself wherever that header is on the include path
+// (the distro jobs): 120 bytes with is_rosidl_buffer_ at 112 on Lyrical and
+// Rolling, 112 bytes before. The Rust pins check the mirror against its C
+// twin; this one checks it against the C++ truth.
+#if __has_include(<rosidl_typesupport_introspection_cpp/message_introspection.hpp>)
+#include <rosidl_typesupport_introspection_cpp/message_introspection.hpp>
+#if defined(RMW_CERULION_HAS_IS_ROSIDL_BUFFER)
+static_assert(sizeof(rosidl_typesupport_introspection_cpp::MessageMember) == 120,
+              "C++ MessageMember is 120 bytes on Lyrical and Rolling");
+static_assert(offsetof(rosidl_typesupport_introspection_cpp::MessageMember, is_rosidl_buffer_) == 112,
+              "is_rosidl_buffer_ sits at 112");
+#endif
+// Era-independent twin of the asserts above, read by a Rust test: the C++
+// header's own sizeof, or 0 where the header is not on the include path
+// (a vendored build), so the Rust mirror is compared with the C++ truth on
+// every real-header build whatever the era.
+extern "C" size_t rmw_cerulion_cpp_message_member_sizeof() noexcept {
+  return sizeof(rosidl_typesupport_introspection_cpp::MessageMember);
+}
+#else
+extern "C" size_t rmw_cerulion_cpp_message_member_sizeof() noexcept { return 0; }
+#endif

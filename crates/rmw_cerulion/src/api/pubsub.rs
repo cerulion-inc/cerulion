@@ -4285,6 +4285,8 @@ mod slice_ceiling_tests {
             fetch_function: None,
             assign_function: None,
             resize_function: None,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer_: false,
         }]));
         let mm = Box::leak(Box::new(CppMessageMembers {
             message_namespace_: leaked_cstr(namespace),
