@@ -66,6 +66,9 @@
 - name: security
   color: ee0701
   description: Security-relevant, never auto-closed; see .github/SECURITY.md for private disclosure
+- name: leak
+  color: ee0701
+  description: Set by the leak guard on an issue or comment whose text points somewhere a stranger cannot open; cleared when the text is edited
 - name: duplicate
   color: cfd3d7
   description: Already tracked in another issue or pull request

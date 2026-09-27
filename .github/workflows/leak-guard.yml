@@ -36,6 +36,12 @@ name: Leak guard
 # `edited` is in the pull request trigger because a title or body edit does not
 # re-run the default trigger, and a re-run replays the original payload. No
 # `paths:` filter: every diff, title, body and message is in scope.
+#
+# Issues, issue comments and review comments are public the moment they are
+# written and no check runs before they are: the incident that added the
+# reference classes was an internal ticket quoted as a `#` shorthand in an issue
+# on this repository. The conversation job cannot stop that text from existing,
+# so it labels, asks once, and goes red.
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
@@ -43,9 +49,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created, edited]
 
 # The title and body come from the event payload, so no pull-requests scope is
-# needed; nothing here writes.
+# needed; the three code jobs write nothing. The conversation job raises its own
+# scope to the two it needs and nothing wider.
 permissions:
   contents: read
 
@@ -59,6 +72,11 @@ concurrency:
 jobs:
   tree:
     name: Leak guard (tree and names)
+    # The code events only: a comment carries no diff, no name and no
+    # container, and this job would report success on an empty scan.
+    if: >-
+      github.event_name == 'pull_request' || github.event_name == 'merge_group'
+      || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     # A whole-tree scan takes seconds on a warm file cache; the budget only
     # guards a hang.
@@ -133,6 +151,11 @@ jobs:
 
   messages:
     name: Leak guard (messages)
+    # The code events only: a comment carries no diff, no name and no
+    # container, and this job would report success on an empty scan.
+    if: >-
+      github.event_name == 'pull_request' || github.event_name == 'merge_group'
+      || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -203,6 +226,11 @@ jobs:
 
   media:
     name: Leak guard (media)
+    # The code events only: a comment carries no diff, no name and no
+    # container, and this job would report success on an empty scan.
+    if: >-
+      github.event_name == 'pull_request' || github.event_name == 'merge_group'
+      || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -259,3 +287,87 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B tools/scripts/leak_scan.py media --require-private --format github
+
+  conversation:
+    name: Leak guard (issue and comment bodies)
+    # Issues, issue comments and pull request review comments. These events run
+    # in the context of this repository, so the private tier is always here and
+    # is always required. The guard's own ask is skipped: it is a comment like
+    # any other and would otherwise clear the label it just set.
+    if: >-
+      (github.event_name == 'issues' || github.event_name == 'issue_comment'
+      || github.event_name == 'pull_request_review_comment')
+      && github.event.comment.user.login != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Scanner self-test
+        run: python3 -B tools/scripts/leak_scan.py --self-test
+
+      # The body reaches the scanner through an environment variable NAME, never
+      # interpolated into a shell line, and is neither echoed nor written to
+      # disk. What the scanner prints is a masked shape and a class, which is
+      # what every other job here prints.
+      - name: Scan the body
+        id: scan
+        env:
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+          EVENT_NAME: ${{ github.event_name }}
+          LG_BODY: ${{ github.event.comment.body || github.event.issue.body }}
+        run: |
+          set -uo pipefail
+          case "$EVENT_NAME" in
+            issues) label=issue-body ;;
+            *) label=comment-body ;;
+          esac
+          rc=0
+          python3 -B tools/scripts/leak_scan.py messages --require-private --format github \
+            --body-env LG_BODY --body-label "$label" || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      # The job cannot stop the text from existing, so this is the whole
+      # remedy: a label the triage list can see, one ask addressed to the
+      # author, and a red run.
+      - name: Label, ask once, and fail
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC: ${{ steps.scan.outputs.rc }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          LG_BODY: ${{ github.event.comment.body || github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          if [ "$RC" = 3 ]; then
+            echo "::error ::the leak guard could not run on this body"
+            exit 1
+          fi
+          if [ "$RC" = 0 ]; then
+            gh api "repos/$REPO/issues/$NUMBER/labels/leak" -X DELETE >/dev/null 2>&1 || true
+            echo "clean"
+            exit 0
+          fi
+          gh api "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=leak" >/dev/null
+          # One ask per body. The marker carries the surface and a digest of the
+          # text that was refused, so a second run over the same body never asks
+          # twice, and an edit that leaves the reference in place is a new ask.
+          scope=${COMMENT_ID:-body}
+          digest=$(printf '%s' "$LG_BODY" | sha256sum | cut -c1-16)
+          marker="<!-- leak-guard:$EVENT_NAME:$scope:$digest -->"
+          if gh api --paginate "repos/$REPO/issues/$NUMBER/comments" --jq '.[].body' \
+               | grep -qF "$marker"; then
+            echo "already asked"
+          else
+            printf '%s\n\n%s\n' \
+              "This text points at a repository or a tracker that people outside this project cannot open. Please edit the reference out, or replace it with a link anyone can follow. The reference itself is not printed anywhere by this check." \
+              "$marker" | gh api "repos/$REPO/issues/$NUMBER/comments" -F body=@- >/dev/null
+          fi
+          echo "::error ::a reference in this body is not openable by a stranger"
+          exit 1

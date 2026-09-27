@@ -22,6 +22,7 @@ Usage:
   leak_scan.py diff      (--range A..B | --staged) [common]
   leak_scan.py messages  [--range A..B] [--message-file F] [--pr-title-env VAR]
                          [--pr-body-env VAR] [--pr-title-file F] [--pr-body-file F]
+                         [--body-env VAR] [--body-label NAME]
                          [--allow-email-file F] [--ident-from-git] [--require-commits] [common]
   leak_scan.py names     [--ref REV | --staged | --range A..B]
                          [--branch NAME | --branch-env VAR] [--untracked] [common]
@@ -32,6 +33,9 @@ Usage:
   leak_scan.py --list-lan-values
   common: --require-private  --no-private  --hard CLASS (repeatable)
           --format text|github  --allow FILE  --no-allow  --allow-empty  --quiet
+          --offline (resolve no reference, report every candidate unverified)
+          --self-repo OWNER/REPO (the repository being scanned; else the forge
+          environment, else the origin remote)
 
 Private pattern sources, first one that yields a pattern wins (never merged):
   1. env LEAK_PATTERNS (newline separated)
@@ -42,11 +46,24 @@ Entry forms, one per line, '#' comments:
                    separator at every letter/digit transition (fast path)
   text:<literal>   case-insensitive substring, no boundaries (fast path)
   <regex>          any other line is a Python regex (slow path)
+  tracker-host:<host>   a tracker whose links a stranger cannot open
+  repo-slug:<slug>      a repository name that must not appear even as text
   An entry may end in a category tag from a fixed public vocabulary
   (@host @device @person @login @lan @nickname @slug @hygiene). A tagged
   hit reports as private#<index>@<tag>. A machine spoken about by a
   NICKNAME rather than by its host name is @nickname: no generic class can
-  see that shape, so the list is the only place it is refused.
+  see that shape, so the list is the only place it is refused. The two KEY
+  forms carry their own category and take no tag; they behave in every other
+  way like the entries above, and `tracker-host:` also tells the reference
+  classes that a link to that host is a defect.
+
+References a stranger cannot open are their own pair of classes. The scanner
+holds no list of repositories: it resolves what a link or a `#` shorthand
+points at and asks the forge, anonymously and once per distinct repository per
+run, whether a stranger is served a page. 404 is a defect whether the target is
+private or absent; a tracker link is a defect with no question asked; anything
+else is unverified, which is HARD under --require-private and a warning
+otherwise, so CI fails closed and a laptop with no network still runs.
 
 Exit codes:
   0  ran, controls passed, zero HARD hits
@@ -73,6 +90,9 @@ import sys
 import tempfile
 import time
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 import zlib
 
 EXIT_OK, EXIT_HIT, EXIT_USAGE, EXIT_NORUN = 0, 1, 2, 3
@@ -126,9 +146,13 @@ TAGS = ('host', 'device', 'person', 'login', 'lan', 'nickname', 'slug', 'hygiene
 # value is not a name the tier would have withheld, and a CI log (github
 # format) outlives the force-push that scrubs a branch, so both get a masked
 # shape. style-dash and overlay-word are not here: their text names nothing.
+# The reference classes are here too: when a reference is unopenable BECAUSE the
+# repository is closed, the slug it names is itself the secret, and a CI log
+# outlives the force-push that scrubs the branch.
 IDENTITY_CLASSES = frozenset((
     'lan-addr', 'cgnat-addr', 'home-mac', 'home-linux', 'home-win', 'home-tilde', 'temp-root',
-    'login-at-host', 'mdns-local', 'host-field', 'overlay-dns', 'email-personal', 'acl-tag'))
+    'login-at-host', 'mdns-local', 'host-field', 'overlay-dns', 'email-personal', 'acl-tag',
+    'ref-unopenable', 'ref-unverified'))
 MASK_RX = re.compile(r'[^\W_]')
 
 # Published placeholder vocabularies. Explicit sets, never a length rule.
@@ -574,13 +598,234 @@ CLASS_FLOOR = 15
 
 
 # ---------------------------------------------------------------------------
+# References a stranger cannot open.
+#
+# A repository or a tracker reference is a leak surface of its own. The shape
+# carries no address, no host and no login, so no other class can see it, and
+# the harm runs both ways: a reader outside this project cannot open what the
+# text points at, and when the target is closed its NAME is itself the secret
+# the text just published.
+#
+# Nothing here names a repository. The classes resolve what the text points at
+# and then ASK, anonymously and with no token, whether a stranger is served a
+# page: 200 is public, 404 is private or absent and a defect either way, and
+# anything else is unverified. One question per distinct repository per run,
+# cached, to the host the reference names and to no other host. A tracker link
+# needs no question: a tracker is closed to a stranger by construction.
+# ---------------------------------------------------------------------------
+REF_DEFECT = 'ref-unopenable'
+REF_UNVERIFIED = 'ref-unverified'
+REF_CLASSES = (
+    (REF_DEFECT, 'HARD', 'a repository or tracker reference a stranger cannot open'),
+    (REF_UNVERIFIED, 'scoped',
+     'a reference whose target the forge would not confirm (HARD with --require-private)'),
+)
+FORGE_HOST = 'github' + '.com'
+# A tracker is unreadable to a stranger whoever they are, so a link to one is a
+# defect on its face. This tuple is a PRODUCT host, not a private name; a
+# project's own tracker host goes in the private tier under `tracker-host:`.
+TRACKER_HOSTS = ('linear' + '.app',)
+# The first path segment of a forge URL is an owner only when it is not one of
+# the forge's own reserved words. This is the forge NAMESPACE, which changes
+# about never, not a list of repositories, which changes every week.
+FORGE_RESERVED = frozenset((
+    'about', 'account', 'apps', 'blog', 'codespaces', 'collections', 'contact',
+    'customer-stories', 'dashboard', 'edu', 'enterprise', 'events', 'explore', 'features',
+    'git-lfs', 'issues', 'join', 'login', 'logout', 'marketplace', 'new', 'nonprofit',
+    'notifications', 'organizations', 'orgs', 'pricing', 'pulls', 'readme', 'search',
+    'security', 'sessions', 'settings', 'signup', 'site', 'sitemap', 'sponsors', 'stars',
+    'topics', 'trending', 'users', 'watching'))
+REF_NAME = r'[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?'
+# A number sign, one to six digits, and then nothing that continues a token: a
+# commit hash after the number sign (`#4f18a0`) is a URL fragment, and `#3@host`
+# is this scanner's own report vocabulary, not a reference.
+REF_NUM = r'#[0-9]{1,6}(?![0-9A-Za-z_@])'
+REF_EDGE = r'(?<![A-Za-z0-9._/#@-])'
+# A bare `<repo>#<n>` is a repository reference only when the token is SLUG
+# shaped, that is when it carries a separator between alphanumerics. An English
+# word before a number sign is prose (`issue#5`, `demand#1`, `Alive#2`), and a
+# guard that reds on prose is a guard nobody keeps. A ONE WORD repository name
+# written bare is the shape this cannot see, which is exactly what the private
+# tier's `repo-slug:` key is for.
+REF_SLUGGY = r'[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)+'
+REF_LINK_RX = re.compile(r'(?<![A-Za-z0-9._-])https?://(?:www\.)?' + re.escape(FORGE_HOST)
+                         + r'/(' + REF_NAME + r')/(' + REF_NAME + r')(?![A-Za-z0-9_-])', re.I)
+REF_SLUG_RX = re.compile(REF_EDGE + r'(' + REF_NAME + r')/(' + REF_NAME + r')' + REF_NUM)
+REF_BARE_RX = re.compile(REF_EDGE + r'(' + REF_SLUGGY + r')' + REF_NUM)
+REF_SELF_RX = re.compile(r'(?:' + re.escape(FORGE_HOST) + r'[:/])([A-Za-z0-9._-]+)/'
+                         r'([A-Za-z0-9._-]+?)(?:\.git)?/?$', re.I)
+REF_TIMEOUT = 6.0
+REF_BACKOFF = 1.5
+# A ceiling on the questions one run may ask. Past it every further repository
+# is unverified, which is a finding under --require-private and a warning
+# otherwise: the run slows down and says so, it never quietly scans less.
+REF_BUDGET = 300
+REF_AGENT = 'leak-scan (repository reachability check)'
+
+
+def tracker_rx(hosts):
+    """A link to any of `hosts`, subdomains included. Group 1 is the registered
+    host, which is all a finding ever prints: the path of a tracker link can
+    carry a ticket title."""
+    return re.compile(r'https?://(?:[A-Za-z0-9-]+\.)*('
+                      + '|'.join(re.escape(h) for h in hosts) + r')(?![A-Za-z0-9.-])', re.I)
+
+
+def forge_status(owner, repo):
+    """Ask the forge, as nobody in particular, whether a stranger gets a page.
+    A HEAD for the repository's own page: no token, no credentials, no body, and
+    to the host the reference names and to no other host. Returns the status
+    code, or None when the network did not answer. A throttle or a server error
+    is retried once; the caller reads both as unverified."""
+    url = ('https' + '://' + FORGE_HOST + '/' + urllib.parse.quote(owner, safe='')
+           + '/' + urllib.parse.quote(repo, safe=''))
+    req = urllib.request.Request(url, method='HEAD',
+                                 headers={'User-Agent': REF_AGENT, 'Accept': '*/*'})
+    for attempt in (0, 1):
+        try:
+            with urllib.request.urlopen(req, timeout=REF_TIMEOUT) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            if attempt == 0 and (e.code == 429 or 500 <= e.code < 600):
+                time.sleep(REF_BACKOFF)
+                continue
+            return e.code
+        except Exception:
+            return None
+    return None
+
+
+class RefResolver(object):
+    """Is a repository openable by a stranger? One question per distinct
+    repository per run, answered by the forge itself and cached in memory, so no
+    list of repositories lives in the tree and none can go stale.
+
+      public      the forge served the page (200)
+      closed      the forge answered 404: private, renamed away or never there,
+                  and a stranger is given nothing in every one of those cases
+      unverified  the forge would not say (a throttle, a server error, no
+                  network), or the scanner was told not to ask
+    """
+
+    def __init__(self, fetch=None, offline=False, budget=REF_BUDGET):
+        self.fetch = forge_status if fetch is None else fetch
+        self.offline = offline
+        self.budget = budget
+        self.cache = {}
+        self.asked = 0
+
+    def verdict(self, owner, repo):
+        key = (owner.lower(), repo.lower())
+        if key in self.cache:
+            return self.cache[key]
+        if self.offline or self.asked >= self.budget:
+            return 'unverified'
+        self.asked += 1
+        try:
+            code = self.fetch(owner, repo)
+        except Exception:
+            code = None
+        verdict = 'public' if code == 200 else 'closed' if code == 404 else 'unverified'
+        self.cache[key] = verdict
+        return verdict
+
+
+class RefScan(object):
+    """The reference pass over one line. Finds the shapes, resolves each to a
+    repository or a tracker host, asks the resolver, and yields (class, token).
+    The token is the reference stripped to what a reader needs to find it on the
+    line: an owner and a repository, or a tracker host. Never a full link."""
+
+    def __init__(self, resolver, self_owner=None, self_repo=None, tracker_hosts=(),
+                 require=False):
+        self.res = resolver
+        self.self_owner = (self_owner or '').lower()
+        self.self_repo = (self_repo or '').lower()
+        self.hosts = tuple(TRACKER_HOSTS) + tuple(h for h in tracker_hosts if h)
+        self.tracker_rx = tracker_rx(self.hosts)
+        self.require = require
+
+    def _repo(self, owner, repo):
+        """(class, token) for one resolved repository, or None when a stranger
+        can open it, when it is the repository being scanned, or when the first
+        segment is a forge word and names no owner at all."""
+        if repo.lower().endswith('.git'):
+            repo = repo[:-4]
+        if not owner or not repo or owner.lower() in FORGE_RESERVED:
+            return None
+        if (owner.lower(), repo.lower()) == (self.self_owner, self.self_repo):
+            return None
+        verdict = self.res.verdict(owner, repo)
+        if verdict == 'public':
+            return None
+        return (REF_DEFECT if verdict == 'closed' else REF_UNVERIFIED, owner + '/' + repo)
+
+    def findings(self, line):
+        out, seen = [], set()
+
+        def take(cid, token):
+            if token.lower() not in seen:
+                seen.add(token.lower())
+                out.append((cid, token))
+
+        for m in self.tracker_rx.finditer(line):
+            take(REF_DEFECT, m.group(1))
+        for m in REF_LINK_RX.finditer(line):
+            got = self._repo(m.group(1), m.group(2))
+            if got:
+                take(got[0], got[1])
+        for m in REF_SLUG_RX.finditer(line):
+            got = self._repo(m.group(1), m.group(2))
+            if got:
+                take(got[0], m.group(0))
+        for m in REF_BARE_RX.finditer(line):
+            # The forge reads a bare shorthand in the owner's own namespace, so
+            # that is where it is resolved. With no owner known (no remote, no
+            # forge environment) the reference cannot be resolved at all, which
+            # is unverified, never clean.
+            repo = m.group(1)
+            if repo.lower() == self.self_repo:
+                continue
+            if not self.self_owner:
+                take(REF_UNVERIFIED, m.group(0))
+                continue
+            got = self._repo(self.self_owner, repo)
+            if got:
+                take(got[0], m.group(0))
+        return out
+
+
+def self_slug(args, env, git):
+    """The repository being scanned, as (owner, repo): the flag, then the forge's
+    own environment, then the origin remote. (None, None) when nothing says, in
+    which case a bare shorthand resolves to nothing and reads unverified."""
+    raw = (getattr(args, 'self_repo', None) or env.get('GITHUB_REPOSITORY', '') or '').strip()
+    if not raw and git is not None:
+        try:
+            raw = git.run(['remote', 'get-url', 'origin'],
+                          ok_codes=(0, 1, 2, 128)).decode('utf-8', 'replace').strip()
+        except NoRun:
+            raw = ''
+    m = REF_SELF_RX.search(raw)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.fullmatch(r'([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)', raw)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # Private patterns.
 # ---------------------------------------------------------------------------
 class PrivatePattern(object):
-    __slots__ = ('index', 'tag', 'rx', 'anchor')
+    __slots__ = ('index', 'tag', 'rx', 'anchor', 'host')
 
-    def __init__(self, index, tag, rx, anchor):
+    def __init__(self, index, tag, rx, anchor, host=None):
         self.index, self.tag, self.rx, self.anchor = index, tag, rx, anchor
+        # Set only by a `tracker-host:` key: the reference class needs the host
+        # to judge a link to it. It is never printed.
+        self.host = host
 
     def label(self):
         return 'private#%d%s' % (self.index, ('@' + self.tag) if self.tag else '')
@@ -626,10 +871,20 @@ INLINE_COMMENT_RX = re.compile(r'\s+#(?:\s|$).*')
 TRAILING_TAG_RX = re.compile(r'\s+@(\S+)$')
 PREFIX_RX = re.compile(r'(word|text):', re.I)
 GLUED_TAG_RX = re.compile(r'@(?:' + '|'.join(TAGS) + r')$', re.I)
+# The two KEYS. A key is an entry like any other: it counts in the index, it
+# compiles to a pattern that is HARD in every mode, and its value never prints.
+# `tracker-host:` additionally tells the reference class that a link to that
+# host is a defect, the way `linear.app` already is. `repo-slug:` is the one
+# shape the generic reference class cannot see: a repository named by a single
+# word, with no separator and no link around it, which reads as prose.
+KEYS = {'tracker-host': 'host', 'repo-slug': 'slug'}
+KEY_PREFIX_RX = re.compile(r'(?:' + '|'.join(KEYS) + r'):', re.I)
+KEY_RX = re.compile(r'(' + '|'.join(KEYS) + r'):(\S+)$')
 ACCEPTED_FORMS = ('accepted forms: a blank line; a line starting with #; word:<literal>, '
-                  'text:<literal> or <regex>, then optionally whitespace and @<tag> (%s), then '
-                  'optionally whitespace, # and a comment; LF line endings'
-                  % ' '.join('@' + t for t in TAGS))
+                  'text:<literal>, <key>:<value> (%s, no tag) or <regex>, then optionally '
+                  'whitespace and @<tag> (%s), then optionally whitespace, # and a comment; '
+                  'LF line endings'
+                  % (' '.join(k + ':' for k in sorted(KEYS)), ' '.join('@' + t for t in TAGS)))
 
 
 def _entry_fault(body):
@@ -685,6 +940,7 @@ def parse_private(text):
             raise NoRun('private pattern #%d is malformed (a carriage return; Windows line '
                         'endings); list line %d; %s' % (index, lineno, ACCEPTED_FORMS))
         line = INLINE_COMMENT_RX.sub('', line).rstrip()
+        is_key = KEY_PREFIX_RX.match(line) is not None
         tag = None
         m = TRAILING_TAG_RX.search(line)
         if m:
@@ -693,6 +949,22 @@ def parse_private(text):
                             'list line %d' % (index, ' '.join('@' + t for t in TAGS), lineno))
             tag = m.group(1).lower()
             line = line[:m.start()].rstrip()
+        if is_key:
+            if tag is not None:
+                raise NoRun('private pattern #%d is malformed (a key line carries its own '
+                            'category and takes no tag); list line %d; %s'
+                            % (index, lineno, ACCEPTED_FORMS))
+            km = KEY_RX.match(line)
+            src, anchor = _expand_word(km.group(2)) if km else (None, None)
+            if src is None:
+                raise NoRun('private pattern #%d is malformed (a key is <key>:<value>, the '
+                            'key lowercase, no whitespace, and a value that carries a letter '
+                            'or a digit); list line %d; %s'
+                            % (index, lineno, ACCEPTED_FORMS))
+            key, value = km.group(1).lower(), km.group(2)
+            out.append(PrivatePattern(index, KEYS[key], re.compile(src, re.I), anchor,
+                                      host=value.lower() if key == 'tracker-host' else None))
+            continue
         fault = _entry_fault(line)
         if fault:
             raise NoRun('private pattern #%d is malformed (%s); list line %d; %s'
@@ -757,6 +1029,9 @@ class PrivateSet(object):
         self.patterns = list(patterns)
         self.fast = [p for p in self.patterns if p.anchor]
         self.slow = [p for p in self.patterns if not p.anchor]
+        # The hosts the `tracker-host:` keys named, for the reference class. The
+        # values are never printed; only the judgement they produce is.
+        self.tracker_hosts = tuple(p.host for p in self.patterns if p.host)
         self.combined = None
         if self.slow:
             try:
@@ -1012,10 +1287,12 @@ def gh_escape(s, prop=False):
 class Scanner(object):
     """One scan. The sweep and the self-test both go through this class."""
 
-    def __init__(self, mode, classes, private, allow, out, fmt='text', hard=(), quiet=False):
+    def __init__(self, mode, classes, private, allow, out, fmt='text', hard=(), quiet=False,
+                 refs=None):
         self.mode = mode
         self.classes = classes
         self.private = private
+        self.refs = refs
         self.allow = allow
         self.out = out
         self.fmt = fmt
@@ -1118,6 +1395,35 @@ class Scanner(object):
                         self.add(c.id, sev, path, line_base + li, m.group(0), where,
                                  raw_line=raw_line, ctx=(raw_line, line))
                         break
+            if self.refs is not None:
+                cand = None
+                # Two anchors carry every shape: the number sign of a shorthand
+                # and the scheme separator of a link.
+                for a in ('#', '://'):
+                    i = low.find(a)
+                    while i != -1:
+                        if starts is None:
+                            starts = _line_starts(low)
+                        li = bisect.bisect_right(starts, i) - 1
+                        if cand is None:
+                            cand = set()
+                        cand.add(li)
+                        if li + 1 >= len(starts):
+                            break
+                        i = low.find(a, starts[li + 1])
+                if cand:
+                    if lines is None:
+                        lines = v.split('\n')
+                    for li in sorted(cand):
+                        line = lines[li]
+                        for cid, token in self.refs.findings(line):
+                            sev = 'HARD' if (cid == REF_DEFECT or self.refs.require) \
+                                else 'REPORT'
+                            if raw_lines is None:
+                                raw_lines = text.split('\n')
+                            raw_line = raw_lines[li] if li < len(raw_lines) else ''
+                            self.add(cid, sev, path, line_base + li, token, where,
+                                     raw_line=raw_line, ctx=(raw_line, line))
             if self.private is None:
                 continue
             for p in self.private.fast:
@@ -1898,8 +2204,10 @@ def run_messages(sc, git, args, env):
             if m:
                 sources += 1
                 ident(label, m.group(1), m.group(2))
+    body_label = getattr(args, 'body_label', 'body') or 'body'
     for what, envname, fname in (('pr-title', args.pr_title_env, args.pr_title_file),
-                                 ('pr-body', args.pr_body_env, args.pr_body_file)):
+                                 ('pr-body', args.pr_body_env, args.pr_body_file),
+                                 (body_label, getattr(args, 'body_env', None), None)):
         body = None
         if envname:
             body = env.get(envname, '')
@@ -2251,8 +2559,22 @@ def run_media(sc, git, args):
 # ---------------------------------------------------------------------------
 # Controls, driver, CLI.
 # ---------------------------------------------------------------------------
-def run_controls(classes, private_patterns, out, neuter=None):
-    """Every generic class must hit its own sample; the private tier must find a canary."""
+REF_SAMPLE_OWNER = 'qz' + 'rkv-labs'
+REF_SAMPLE_REPO = 'qz' + 'rkv-closed'
+REF_SAMPLES = (
+    ('link', 'see https' + '://' + FORGE_HOST + '/' + REF_SAMPLE_OWNER + '/'
+     + REF_SAMPLE_REPO + '/issues/945 for the rest'),
+    ('slug', 'filed as ' + REF_SAMPLE_OWNER + '/' + REF_SAMPLE_REPO + '#945 last week'),
+    ('bare', 'filed as ' + REF_SAMPLE_REPO + '#945 last week'),
+    ('tracker', 'tracked at https' + '://' + TRACKER_HOSTS[0] + '/team/ENG/issue/ENG-1'),
+)
+
+
+def run_controls(classes, private_patterns, out, neuter=None, fetch=None):
+    """Every generic class must hit its own sample; the private tier must find a
+    canary; every reference SHAPE must still produce a candidate. The reference
+    control runs offline, so it proves the shapes and never the network: a shape
+    that stopped matching would otherwise look exactly like a clean tree."""
     dead = []
     sc = Scanner('tree', classes, None, [], lambda s: None)
     for c in classes:
@@ -2260,6 +2582,12 @@ def run_controls(classes, private_patterns, out, neuter=None):
         sc.scan_unit('control', c.sample, 1, '', sevpath='results/control')
         if not any(h.cls == c.id for h in sc.hits[before:]):
             dead.append(c.id)
+    off = RefScan(RefResolver(offline=True), 'nobody', 'nothing')
+    for shape, sample in REF_SAMPLES:
+        found = off.findings(sample)
+        want = REF_DEFECT if shape == 'tracker' else REF_UNVERIFIED
+        if not any(cid == want for cid, _ in found):
+            dead.append('ref-' + shape)
     canary = 'zq' + binascii.hexlify(os.urandom(6)).decode()
     idx = len(private_patterns) + 1
     canary_pat = parse_private('word:' + canary)[0]
@@ -2291,10 +2619,12 @@ def load_allow(args, root, classes):
         if getattr(args, 'allow', None):
             raise NoRun('the allowlist file is unreadable')
         return []
-    ids = set(c.id for c in classes) | set(s[0] for s in STRUCT_CLASSES)
+    ids = set(c.id for c in classes) | set(s[0] for s in STRUCT_CLASSES + REF_CLASSES)
     hard = set(c.id for c in classes if any(c.sev(m, 'x') == 'HARD' for m in
                                            ('tree', 'diff', 'messages', 'names')))
-    hard |= set(s[0] for s in STRUCT_CLASSES if s[1] == 'HARD')
+    hard |= set(s[0] for s in STRUCT_CLASSES + REF_CLASSES if s[1] == 'HARD')
+    # ref-unverified is HARD only under --require-private, so it is waivable
+    # like a report class and is deliberately not in `hard`.
     return parse_allow(text, ids, hard)
 
 
@@ -2355,6 +2685,8 @@ def build_parser():
         p.add_argument('--no-allow', action='store_true')
         p.add_argument('--allow-empty', action='store_true')
         p.add_argument('--quiet', action='store_true')
+        p.add_argument('--offline', action='store_true')
+        p.add_argument('--self-repo')
 
     t = sub.add_parser('tree', allow_abbrev=False)
     t.add_argument('--ref')
@@ -2373,6 +2705,8 @@ def build_parser():
     m.add_argument('--pr-body-env')
     m.add_argument('--pr-title-file')
     m.add_argument('--pr-body-file')
+    m.add_argument('--body-env')
+    m.add_argument('--body-label', default='body')
     m.add_argument('--allow-email-file')
     m.add_argument('--ident-from-git', action='store_true')
     m.add_argument('--require-commits', action='store_true')
@@ -2420,7 +2754,7 @@ def parse_args(argv):
     return args
 
 
-def run_mode(args, root, env, out, neuter=None, home=None):
+def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
     """Runs one mode. Returns the exit code. `out` receives every printed line."""
     classes = build_classes(neuter)
     if args.no_private and args.require_private:
@@ -2434,13 +2768,22 @@ def run_mode(args, root, env, out, neuter=None, home=None):
     if args.require_private and not private_patterns:
         out('PRIVATE PATTERNS NOT LOADED and --require-private was given')
         return EXIT_NORUN
-    run_controls(classes, private_patterns, out, neuter)
     private = PrivateSet(private_patterns) if private_patterns else None
-    if args.mode == 'hook':
-        return run_hook(args, root, env, out, classes, private, kind)
-    allow = load_allow(args, root, classes)
     git = Git(root, env)
-    sc = Scanner(args.mode, classes, private, allow, out, args.format, args.hard, args.quiet)
+    # A hook runs on a laptop, often with no network and always on a keystroke
+    # budget, so it never asks: every candidate reads unverified, which is a
+    # warning there and a finding in CI.
+    offline = bool(getattr(args, 'offline', False)) or args.mode == 'hook'
+    owner, repo = self_slug(args, env, git)
+    refs = RefScan(RefResolver(fetch=fetch, offline=offline), owner, repo,
+                   private.tracker_hosts if private is not None else (),
+                   require=bool(args.require_private))
+    run_controls(classes, private_patterns, out, neuter, fetch=fetch)
+    if args.mode == 'hook':
+        return run_hook(args, root, env, out, classes, private, kind, refs)
+    allow = load_allow(args, root, classes)
+    sc = Scanner(args.mode, classes, private, allow, out, args.format, args.hard, args.quiet,
+                 refs=refs)
     t0 = time.time()
     if args.mode == 'messages':
         full_mode = run_messages(sc, git, args, env)
@@ -2511,7 +2854,7 @@ def _extras(sc):
     return (' ' + ' '.join(bits)) if bits else ''
 
 
-def run_hook(args, root, env, out, classes, private, kind):
+def run_hook(args, root, env, out, classes, private, kind, refs=None):
     """The pre-commit and commit-msg hooks, in one process: three scans, one note."""
     git = Git(root, env)
     allow = load_allow(args, root, classes)
@@ -2535,11 +2878,13 @@ def run_hook(args, root, env, out, classes, private, kind):
         plan = (('messages', {'range': None, 'message_file': args.message_file,
                               'pr_title_env': None, 'pr_body_env': None, 'pr_title_file': None,
                               'pr_body_file': None, 'allow_email_file': None,
+                              'body_env': None, 'body_label': 'body',
                               'ident_from_git': True, 'require_commits': False,
                               'editor_used': env.get('GIT_EDITOR') != ':',
                               'cleanup': cleanup}),)
     for mode, extra in plan:
-        sc = Scanner(mode, classes, private, allow, out, args.format, args.hard, quiet=True)
+        sc = Scanner(mode, classes, private, allow, out, args.format, args.hard, quiet=True,
+                     refs=refs)
         ns = argparse.Namespace(**extra)
         if mode == 'messages':
             run_messages(sc, git, ns, env)
@@ -2565,7 +2910,7 @@ def list_classes(out):
         sevs = ' '.join('%s=%s' % (m, _sev_name(c, m)) for m in
                         ('tree', 'diff', 'messages', 'names'))
         out('%-16s %s  [%s]' % (c.id, sevs, c.what))
-    for cid, sev, what in STRUCT_CLASSES:
+    for cid, sev, what in STRUCT_CLASSES + REF_CLASSES:
         out('%-16s %s  [%s]' % (cid, sev, what))
     out('placeholder users: ' + ' '.join(sorted(PH_USER)))
     out('placeholder hosts: ' + ' '.join(sorted(PH_HOST)))
@@ -2612,7 +2957,19 @@ SH = STANDIN_HOST            # a host stand-in
 PERSON = 'Orvald' + ' ' + 'Pentwistle'
 PLAIN_USER = 'thorn' + 'wick'   # a login NO tier in the self-test knows
 RED1 = '<private#1@host>'
-EXPECTED_ARMS = 175
+# The reference arms drive a CANNED forge through the resolver seam, so the
+# self-test asks the network nothing and every verdict is an oracle written
+# here rather than a page that can change under it.
+RO = REF_SAMPLE_OWNER                    # the stand-in owner
+R_SELF = 'qz' + 'rkv-here'               # the repository being scanned
+R_PUB = 'qz' + 'rkv-open'                # 200: a stranger gets a page
+R_PRIV = REF_SAMPLE_REPO                 # 404: private
+R_GONE = 'qz' + 'rkv-absent'             # 404: never there
+R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
+R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
+CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
+                (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
+EXPECTED_ARMS = 206
 
 
 def _png(chunks):
@@ -2776,6 +3133,14 @@ def self_test(out, base_env, argv0):
         if not ok:
             failures.append('%s %s' % (name, detail))
 
+    asked = []
+
+    def canned(owner, repo):
+        """The injected forge. Records every question so an arm can prove which
+        references were resolved and which were never asked about at all."""
+        asked.append(owner.lower() + '/' + repo.lower())
+        return CANNED_FORGE.get((owner.lower(), repo.lower()))
+
     private_env = ('word:' + PW + ' @host\nword:' + SU + ' @login\nword:' + PERSON
                    + ' @person\n')
     with tempfile.TemporaryDirectory() as tmp:
@@ -2799,9 +3164,10 @@ def self_test(out, base_env, argv0):
         git.run(['add', '-A'])
         git.run(['commit', '-q', '-m', 'fixture'])
 
-        def run(argv, e=None, cwd=None):
+        def run(argv, e=None, cwd=None, **kwargs):
             lines = []
-            rc = main_inner(argv, cwd or repo, e or env, lines.append, argv0)
+            rc = main_inner(argv, cwd or repo, e or env, lines.append, argv0,
+                            fetch=kwargs.get('fetch', canned))
             return rc, lines
 
         def hits(lines, word='HIT'):
@@ -3024,12 +3390,12 @@ def self_test(out, base_env, argv0):
         # contract 7: a dead control exits 3
         lines = []
         rc = main_inner(['tree', '--no-allow'], repo, env, lines.append, argv0,
-                        neuter='home-mac')
+                        neuter='home-mac', fetch=canned)
         arm('dead-control-norun', rc == EXIT_NORUN and any('CONTROL FAILED' in ln and
                                                           'home-mac' in ln for ln in lines))
         lines = []
         rc = main_inner(['tree', '--no-allow'], repo, penv, lines.append, argv0,
-                        neuter='private-canary')
+                        neuter='private-canary', fetch=canned)
         arm('dead-private-canary-norun', rc == EXIT_NORUN and any(
             'CONTROL FAILED' in ln and 'private-canary' in ln for ln in lines))
         # --- untracked -------------------------------------------------------------
@@ -3802,6 +4168,190 @@ def self_test(out, base_env, argv0):
                  sc_nt.redact_path(twice), sc_nt.redact_path(double),
                  sc_gh.redact_path(login_name),
                  sc_tx.redact_path(login_name)]))
+        # --- references a stranger cannot open ------------------------------------------
+        # Every verdict here comes from CANNED_FORGE through the injected
+        # resolver, never from the network, and every arm reads a line number
+        # planted below, so the oracle is this table and not another run of the
+        # scanner. `canned` records each question, which is how the arms that
+        # assert nothing was asked are decided.
+        HTTPS = 'https' + '://'
+        FORGE = HTTPS + FORGE_HOST + '/'
+        repo_ref = os.path.join(tmp, 'repo-ref')
+        os.makedirs(repo_ref)
+        ref_lines = [
+            FORGE + RO + '/' + R_PUB + '/issues/7 is open to anyone',          # 1 public
+            'see ' + FORGE + RO + '/' + R_PRIV + '/issues/945 for the rest',   # 2 private
+            'see ' + FORGE + RO + '/' + R_GONE,                                # 3 never there
+            'tracked at ' + HTTPS + TRACKER_HOSTS[0] + '/team/ENG/issue/E-1',  # 4 tracker
+            'this repository: ' + FORGE + RO + '/' + R_SELF + '/pull/12',      # 5 own repo
+            'fixed in #945 last week',                                         # 6 bare number
+            'filed as ' + RO + '/' + R_PRIV + '#945 upstream',                 # 7 slug shorthand
+            'filed as ' + R_PRIV + '#945 upstream',                            # 8 bare shorthand
+            'filed as ' + R_SELF + '#945 here',                                # 9 own repo bare
+            'sign in at ' + FORGE + 'login/oauth/authorize now',               # 10 forge word
+            'clone ' + FORGE + RO + '/' + R_PUB + '.git today',                # 11 .git suffix
+            'see ' + FORGE + RO + '/' + R_SLOW + '/issues/1',                  # 12 throttled
+            'issue#5 and demand#1 and Alive#2 and rclcpp#2335 are prose',      # 13 prose
+            'filed as ' + R_ONEWORD + '#945 upstream',                         # 14 one word
+        ]
+        _write_files(repo_ref, {'refs.md': ('\n'.join(ref_lines) + '\n').encode('utf-8')})
+        # the tier is loaded for these arms so a terminal run prints the
+        # reference in clear and the arms can read it; the CI-log arm below
+        # proves the same run masks it in a log.
+        refenv = dict(env, LEAK_PATTERNS='word:' + PW + ' @host\n')
+        gitr = Git(repo_ref, env)
+        gitr.run(['init', '-q'])
+        gitr.run(['symbolic-ref', 'HEAD', 'refs/heads/main'])
+        gitr.run(['add', '-A'])
+        gitr.run(['commit', '-q', '-m', 'refs'])
+        mine = ['--self-repo', RO + '/' + R_SELF]
+        del asked[:]
+        rc, lines = run(['tree', '--no-allow'] + mine, refenv, repo_ref)
+        got = hits(lines)
+        rep = hits(lines, 'REPORT')
+        hard_lines = set(n for c, p, n in got if c == REF_DEFECT and p == 'refs.md')
+        soft_lines = set(n for c, p, n in rep if c == REF_UNVERIFIED and p == 'refs.md')
+        every = hard_lines | soft_lines
+        arm('ref-public-link-passes', rc == EXIT_HIT and 1 not in every, str(sorted(every)))
+        arm('ref-private-link-fails', 2 in hard_lines)
+        arm('ref-nonexistent-link-fails', 3 in hard_lines)
+        arm('ref-tracker-link-fails', 4 in hard_lines and any(
+            ln.startswith('HIT ' + REF_DEFECT + ' refs.md:4: ' + TRACKER_HOSTS[0])
+            for ln in lines), str([ln for ln in lines if 'refs.md:4' in ln]))
+        arm('ref-own-repository-link-passes',
+            5 not in every and (RO + '/' + R_SELF.lower()) not in asked, str(asked))
+        arm('ref-bare-number-passes', 6 not in every)
+        arm('ref-owner-repo-shorthand-fails', 7 in hard_lines)
+        arm('ref-bare-shorthand-resolves-in-the-owner-namespace', 8 in hard_lines and any(
+            ln.startswith('HIT ' + REF_DEFECT + ' refs.md:8: ' + R_PRIV + '#945')
+            for ln in lines), str([ln for ln in lines if 'refs.md:8' in ln]))
+        arm('ref-bare-shorthand-of-this-repository-passes', 9 not in every)
+        arm('ref-forge-reserved-first-segment-passes',
+            10 not in every and not any(a.startswith('login/') for a in asked))
+        arm('ref-dot-git-suffix-is-not-part-of-the-name',
+            11 not in every and (RO + '/' + R_PUB.lower() + '.git') not in asked, str(asked))
+        arm('ref-unverified-without-require-is-a-warning',
+            12 in soft_lines and 12 not in hard_lines)
+        arm('ref-prose-before-a-number-sign-is-not-a-reference', 13 not in every)
+        arm('ref-a-one-word-repository-name-is-invisible-to-the-shape', 14 not in every)
+        arm('ref-one-question-per-repository-per-run',
+            asked.count(RO + '/' + R_PRIV.lower()) == 1, str(asked))
+        del asked[:]
+        rc, lines = run(['tree', '--no-allow', '--require-private'] + mine, refenv, repo_ref)
+        got = hits(lines)
+        arm('ref-unverified-with-require-is-a-finding', rc == EXIT_HIT and any(
+            c == REF_UNVERIFIED and n == 12 for c, p, n in got),
+            str([ln for ln in lines if 'refs.md:12' in ln]))
+        del asked[:]
+        rc, lines = run(['tree', '--no-allow', '--offline'] + mine, refenv, repo_ref)
+        rep = hits(lines, 'REPORT')
+        arm('ref-offline-asks-nothing-and-reports-every-candidate',
+            rc == EXIT_HIT and not asked and set(
+                n for c, p, n in rep if c == REF_UNVERIFIED and p == 'refs.md')
+            >= {1, 2, 3, 7, 8, 11, 12}, 'asked=%s rc=%d' % (asked, rc))
+        arm('ref-offline-still-refuses-a-tracker-link', any(
+            ln.startswith('HIT ' + REF_DEFECT + ' refs.md:4') for ln in lines))
+        rc, lines = run(['tree', '--no-allow', '--format', 'github'] + mine, refenv, repo_ref)
+        arm('ref-a-ci-log-carries-a-masked-shape-not-the-slug',
+            not any(R_PRIV in ln or R_GONE in ln for ln in lines)
+            and any(ln == '::error file=refs.md,line=2::' + REF_DEFECT + ': '
+                    + gh_escape(mask_shape(RO + '/' + R_PRIV)) for ln in lines),
+            str([ln for ln in lines if 'refs.md,line=2' in ln]))
+        # the MUTANT: a forge that answers 200 for everything. The private-link
+        # arm must go green, or the arm is not testing the forge at all.
+        rc, lines = run(['tree', '--no-allow'] + mine, refenv, repo_ref,
+                        fetch=lambda o, r: 200)
+        arm('ref-mutant-a-forge-that-answers-200-for-everything-passes-the-private-link',
+            not any(ln.startswith('HIT ' + REF_DEFECT + ' refs.md:2') for ln in lines)
+            and any(ln.startswith('HIT ' + REF_DEFECT + ' refs.md:4') for ln in lines),
+            str([ln for ln in lines if ln.startswith('HIT')][:3]))
+        # the private tier keys: a tracker host and a repository slug the shape
+        # cannot see. Neither value is in the tree and neither ever prints.
+        tracker = 'tickets.' + SH + '.example'
+        keyenv = dict(env, LEAK_PATTERNS='tracker-host:' + tracker + '\nrepo-slug:'
+                      + R_ONEWORD + '\n')
+        _write_files(repo_ref, {'keys.md': ('a ' + HTTPS + tracker + '/issue/9\n'
+                                            'b ' + R_ONEWORD + '#945\n').encode('utf-8')})
+        gitr.run(['add', '-A'])
+        gitr.run(['commit', '-q', '-m', 'keys'])
+        rc, lines = run(['tree', '--no-allow', '--require-private'] + mine, keyenv, repo_ref)
+        got = hits(lines)
+        arm('ref-private-tier-tracker-host-key-refuses-a-link-to-it',
+            rc == EXIT_HIT and any(c == REF_DEFECT and p == 'keys.md' and n == 1
+                                   for c, p, n in got)
+            and not any(tracker in ln for ln in lines),
+            str([ln for ln in lines if 'keys.md' in ln]))
+        arm('ref-private-tier-repo-slug-key-refuses-the-bare-name',
+            any(c == 'private#2@slug' and p == 'keys.md' and n == 2 for c, p, n in got)
+            and not any(R_ONEWORD in ln for ln in lines),
+            str([ln for ln in lines if 'keys.md' in ln]))
+        arm('ref-key-lines-carry-their-own-category',
+            len(parse_private('tracker-host:' + tracker + '\n')) == 1
+            and parse_private('tracker-host:' + tracker + '\n')[0].tag == 'host'
+            and parse_private('repo-slug:' + R_ONEWORD + '\n')[0].tag == 'slug'
+            and PrivateSet(parse_private('tracker-host:' + tracker
+                                         + '\n')).tracker_hosts == (tracker,))
+        rc, lines = run(['tree', '--no-allow'], dict(env, LEAK_PATTERNS='repo-slug:x @slug\n'),
+                        repo_ref)
+        arm('ref-a-key-line-with-a-tag-refuses-the-run', rc == EXIT_NORUN and any(
+            'takes no tag' in ln for ln in lines), str(lines[:2]))
+        rc, lines = run(['tree', '--no-allow'], dict(env, LEAK_PATTERNS='repo-slug: x\n'),
+                        repo_ref)
+        arm('ref-a-key-line-with-whitespace-refuses-the-run', rc == EXIT_NORUN)
+        # the NAME surface, in a scratch repository of its own so no other arm
+        # has to read a path that carries a slug
+        repo_refname = os.path.join(tmp, 'repo-refname')
+        os.makedirs(repo_refname)
+        _write_files(repo_refname, {RO + '/' + R_PRIV + '#945.md': b'clean body\n'})
+        gitn = Git(repo_refname, env)
+        gitn.run(['init', '-q'])
+        gitn.run(['add', '-A'])
+        gitn.run(['commit', '-q', '-m', 'name'])
+        rc, lines = run(['names', '--no-allow'] + mine, refenv, repo_refname)
+        arm('ref-a-shorthand-in-a-file-name-is-a-finding', rc == EXIT_HIT and any(
+            c == REF_DEFECT and p.endswith('#945.md') and n == 0
+            for c, p, n in hits(lines)), str([ln for ln in lines if 'HIT' in ln][:3]))
+        # the message surfaces: a commit body, and the issue or comment body the
+        # conversation job feeds through --body-env
+        gitr.run(['commit', '-q', '--allow-empty', '-m',
+                  'fix: rolled up\n\n* see ' + RO + '/' + R_PRIV + '#945\n'])
+        rc, lines = run(['messages', '--range', 'HEAD~1..HEAD', '--no-allow'] + mine,
+                        refenv, repo_ref)
+        arm('ref-a-commit-message-is-a-surface', any(
+            c == REF_DEFECT and p.startswith('commit:') and n == 3
+            for c, p, n in hits(lines)), str([ln for ln in lines if 'HIT' in ln][:3]))
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--no-allow'] + mine,
+                        dict(env, LG_BODY='hi\nthis is ' + RO + '/' + R_PRIV + '#945\n'),
+                        repo_ref)
+        arm('ref-an-issue-body-is-a-surface', rc == EXIT_HIT and any(
+            c == REF_DEFECT and p == 'issue-body' and n == 2 for c, p, n in hits(lines))
+            and not any(R_PRIV in ln for ln in lines),
+            str([ln for ln in lines if 'HIT' in ln][:3]))
+        surfaces.update(('issue-body', 'forge-link', 'shorthand', 'tracker-link'))
+        # the resolver and the shape finder as pure oracles
+        res = RefResolver(fetch=lambda o, r: {R_PUB: 200, R_PRIV: 404, R_SLOW: 429}.get(r))
+        arm('ref-resolver-oracles',
+            res.verdict(RO, R_PUB) == 'public' and res.verdict(RO, R_PRIV) == 'closed'
+            and res.verdict(RO, R_SLOW) == 'unverified'
+            and res.verdict(RO, 'nothing-known') == 'unverified' and res.asked == 4
+            and res.verdict(RO, R_PUB.upper()) == 'public' and res.asked == 4)
+        off = RefScan(RefResolver(offline=True), RO, R_SELF)
+        arm('ref-shape-oracles',
+            [t for _, t in off.findings(FORGE + RO + '/' + R_PUB + '/tree/main/x.rs')]
+            == [RO + '/' + R_PUB]
+            and off.findings(FORGE + RO + '/' + R_SELF) == []
+            and off.findings('see #12 and issue#12 and a.b/c') == []
+            and [t for _, t in off.findings('a-b' + '#12')] == ['a-b' + '#12']
+            and [c for c, _ in off.findings(HTTPS + 'sub.' + TRACKER_HOSTS[0] + '/x')]
+            == [REF_DEFECT],
+            str(off.findings('see #12 and issue#12 and a.b/c')))
+        arm('ref-self-slug-oracles',
+            self_slug(argparse.Namespace(self_repo=None), {'GITHUB_REPOSITORY': RO + '/'
+                                                           + R_SELF}, None) == (RO, R_SELF)
+            and self_slug(argparse.Namespace(self_repo=RO + '/' + R_PUB), {}, None)
+            == (RO, R_PUB)
+            and self_slug(argparse.Namespace(self_repo=None), {}, None) == (None, None))
         # --- contract 9: the guard's own files scan clean; the control does not ----------
         guard_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(argv0)),
                                                    '..', '..'))
@@ -3820,7 +4370,7 @@ def self_test(out, base_env, argv0):
         lines = []
         rc = main_inner(['tree', '--files-from', os.path.join(tmp, 'own'), '--no-allow',
                          '--hard', 'style-dash', '--hard', 'overlay-word'], own_root, penv,
-                        lines.append, argv0, root_override=own_root)
+                        lines.append, argv0, root_override=own_root, fetch=canned)
         own_hits = [ln for ln in lines if ln.startswith('HIT')]
         arm('self-scan-clean', rc == EXIT_OK and not own_hits,
             'rc=%d files=%s hits=%s' % (rc, own, own_hits[:5]))
@@ -3835,7 +4385,8 @@ def self_test(out, base_env, argv0):
             fh.write('joined.py\n')
         lines = []
         rc = main_inner(['tree', '--files-from', os.path.join(tmp, 'ctrl-list'), '--no-allow'],
-                        ctrl_dir, penv, lines.append, argv0, root_override=ctrl_dir)
+                        ctrl_dir, penv, lines.append, argv0, root_override=ctrl_dir,
+                        fetch=canned)
         arm('self-scan-control-hits', rc == EXIT_HIT and sum(
             1 for ln in lines if ln.startswith('HIT')) >= CLASS_FLOOR - 2)
         # --- contract 10 and 11 -------------------------------------------------------------
@@ -3873,7 +4424,7 @@ def self_test(out, base_env, argv0):
 # ---------------------------------------------------------------------------
 # Entry.
 # ---------------------------------------------------------------------------
-def main_inner(argv, cwd, env, raw_out, argv0, neuter=None, root_override=None):
+def main_inner(argv, cwd, env, raw_out, argv0, neuter=None, root_override=None, fetch=None):
     def out(line):
         raw_out(safe_line(line))
 
@@ -3888,7 +4439,7 @@ def main_inner(argv, cwd, env, raw_out, argv0, neuter=None, root_override=None):
         if args.list_lan_values:
             list_lan_values(root, env, out)
             return EXIT_OK
-        return run_mode(args, root, env, out, neuter=neuter, home=env.get('HOME'))
+        return run_mode(args, root, env, out, neuter=neuter, home=env.get('HOME'), fetch=fetch)
     except Usage as e:
         out('leak_scan: usage error: %s' % e)
         return EXIT_USAGE
