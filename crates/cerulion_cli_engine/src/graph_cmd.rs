@@ -1969,6 +1969,7 @@ pub fn build_node_def(
         .collect();
 
     NodeDef {
+        fuse: None,
         ros2: None,
         id,
         node_type: node_type.to_string(),
@@ -23078,6 +23079,7 @@ nodes:
             prefix: "rr".to_string(),
             nodes: vec![
                 NodeDef {
+                    fuse: None,
                     ros2: None,
                     id: "cam".to_string(),
                     node_type: "cam".to_string(),
@@ -23107,6 +23109,7 @@ nodes:
                     ],
                 },
                 NodeDef {
+                    fuse: None,
                     ros2: None,
                     id: "cam2".to_string(),
                     node_type: "cam2".to_string(),
@@ -23419,6 +23422,7 @@ nodes:
             identity: "rec_cfg_pin".to_string(),
             prefix: "rcp".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -23492,6 +23496,7 @@ nodes:
             identity: "rec_cfg_mp_pin".to_string(),
             prefix: "rcmp".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -23570,6 +23575,7 @@ nodes:
             identity: "rec_cfg_fr_pin".to_string(),
             prefix: "rcfr".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -26274,6 +26280,7 @@ nodes:
             identity: "vext".to_string(),
             prefix: "vext_test".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "driver".to_string(),
                 node_type: "driver".to_string(),
@@ -26341,6 +26348,7 @@ nodes:
             identity: "vok".to_string(),
             prefix: "vok_test".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -30153,6 +30161,7 @@ network:
             prefix: "p".to_string(),
             nodes: (0..n)
                 .map(|i| NodeDef {
+                    fuse: None,
                     ros2: None,
                     id: format!("{}_{}", node_type, i),
                     node_type: node_type.to_string(),
@@ -34332,6 +34341,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             identity: "period".to_string(),
             prefix: "period_test".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -34389,6 +34399,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             prefix: "period_multi_test".to_string(),
             nodes: vec![
                 NodeDef {
+                    fuse: None,
                     ros2: None,
                     id: "fast".to_string(),
                     node_type: "fast".to_string(),
@@ -34402,6 +34413,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
                     }],
                 },
                 NodeDef {
+                    fuse: None,
                     ros2: None,
                     id: "slow".to_string(),
                     node_type: "slow".to_string(),
@@ -37054,6 +37066,7 @@ mod worker_tests {
         }
         fn nd(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: id.to_string(),
                 node_type: id.to_string(),
@@ -38710,6 +38723,7 @@ mod supervisor_tests {
         cfg.nodes = ids
             .iter()
             .map(|id| cerulion_core::graph::config::NodeDef {
+                fuse: None,
                 ros2: None,
                 id: (*id).to_string(),
                 node_type: "t".to_string(),

@@ -2156,6 +2156,7 @@ mod tests {
 
     fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
         NodeDef {
+            fuse: None,
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),

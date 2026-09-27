@@ -151,6 +151,7 @@ fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
         prefix: "usw".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "stale_wake_producer".to_string(),
@@ -164,6 +165,7 @@ fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "stale_wake_consumer".to_string(),
