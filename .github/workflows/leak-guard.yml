@@ -439,14 +439,19 @@ jobs:
               [ -n "${id:-}" ] || continue
               case "$found" in
                 "$prefix"*)
-                  if ! gh api "repos/$REPO/issues/comments/$id" -X DELETE >/dev/null 2>&1; then
-                    # A delete that failed because the comment is already gone is
-                    # the outcome asked for. Anything else leaves an ask standing,
-                    # and an ask standing must never end with the label coming off.
-                    if gh api "repos/$REPO/issues/comments/$id" >/dev/null 2>&1; then
-                      stuck=1
-                    fi
-                  fi
+                  # -i prints the status line, so the outcome is read from the
+                  # forge's own answer rather than from whether the client exited
+                  # nonzero. 204 is deleted, 404 is already gone, and both are the
+                  # outcome asked for. EVERYTHING else, a throttle, a network
+                  # error, an authorization failure, a reply that cannot be
+                  # parsed, leaves the ask standing, and an ask standing must
+                  # never end with the label coming off. Unknown is stuck.
+                  status=$(gh api "repos/$REPO/issues/comments/$id" -X DELETE -i 2>/dev/null \
+                           | head -n 1 || true)
+                  case "$status" in
+                    HTTP/*\ 204\ *|HTTP/*\ 204|HTTP/*\ 404\ *|HTTP/*\ 404) ;;
+                    *) stuck=1; echo "the ask on comment $id could not be taken back" ;;
+                  esac
                   ;;
               esac
             done < "$asks"
