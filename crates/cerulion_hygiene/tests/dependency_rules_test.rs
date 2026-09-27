@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The tree's dependency-architecture rules, as tests over `cargo metadata`.
 //!
-//! WHY THIS FILE EXISTS. Every rule asserted here was already written down: two
-//! of them as jobs in `.github/workflows/ci.yml`, the rest as sentences in the
-//! root `Cargo.toml`, in a crate manifest header, in a crate `AGENTS.md`, or in
-//! `docs/internals/`. A sentence does not fail a build, and a CI job fails one
+//! WHY THIS FILE EXISTS. Every rule asserted here was already written down, as
+//! sentences in the root `Cargo.toml`, in a crate manifest header, in a crate
+//! `AGENTS.md`, or in `docs/internals/`, and five of them also as two retired
+//! `cargo tree` CI jobs. A sentence does not fail a build, and a CI job fails one
 //! on another machine minutes after the edge was typed. Each rule below names
 //! the sentence it is the machine half of, so the two cannot drift apart
-//! silently.
+//! silently. The quoted RETIRED GUARD text below is the failure message each of
+//! those jobs printed, kept because it states the rule in the words its author
+//! chose; the jobs themselves left once these rules were green on main, every one
+//! of them strictly stronger than the probe it replaced.
 //!
 //! WHY `cargo metadata` AND NOT A MANIFEST GREP. The edges that break these
 //! rules are the ones a grep cannot see: an OPTIONAL dependency behind a
@@ -82,16 +85,15 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
-// The forbidden families, derived the way the CI jobs derive theirs.
+// The forbidden families, each a name shape rather than a single name.
 // ---------------------------------------------------------------------------
 
 /// Packages whose name marks them as part of the iroh tree.
 ///
 /// A FAMILY, not a name: dependency direction runs umbrella -> subcrate, so a
 /// crate depending directly on `iroh-base` pulls the tree while `iroh` itself
-/// never enters the graph and a name-exact probe stays green. The same
-/// reasoning is written out in the `iroh-leanness` job, whose pattern
-/// (`^iroh($|-|_)`) this mirrors.
+/// never enters the graph and a name-exact probe stays green. Mirrors the
+/// `^iroh($|-|_)` lockfile pattern of the retired `cargo tree` guard.
 fn is_iroh_family(name: &str) -> bool {
     is_family(name, "iroh")
 }
@@ -99,8 +101,8 @@ fn is_iroh_family(name: &str) -> bool {
 /// Packages whose name marks them as part of the Rerun SDK.
 ///
 /// `cerulion_vizd` names seven `re_*` crates directly, so the subcrate spelling
-/// is the norm rather than the exotic case. Mirrors the `rerun-leanness` job's
-/// `^(rerun|re_)`.
+/// is the norm rather than the exotic case. Mirrors the `^(rerun|re_)` lockfile
+/// pattern of the retired `cargo tree` guard.
 fn is_rerun_family(name: &str) -> bool {
     name.starts_with("rerun") || name.starts_with("re_")
 }
@@ -170,7 +172,7 @@ fn is_desk_viz(name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// The rules that have no CI job, each beside the sentence it enforces.
+// The rules no guard ever covered, each beside the sentence it enforces.
 // ---------------------------------------------------------------------------
 
 /// A crate whose direct dependency list is pinned to an exact set, with the
@@ -781,9 +783,9 @@ fn refuse_a_collapsed_closure(resolved: &Resolved<'_>, g: &Graph<'_>) {
 /// A family predicate that matches nothing in the whole workspace would let
 /// every rule using it pass while proving nothing.
 ///
-/// This is the `INVARIANT UNVERIFIABLE` arm both CI leanness jobs open with,
-/// moved next to the rules it protects: they derive their family from
-/// `Cargo.lock` and refuse to run on an empty one.
+/// This is the `INVARIANT UNVERIFIABLE` arm both retired `cargo tree` guards
+/// opened with, moved next to the rules it protects: each derived its family
+/// from `Cargo.lock` and refused to run on an empty one.
 #[test]
 fn the_forbidden_families_exist_in_this_workspace() {
     let g = Graph::new(metadata());
@@ -889,8 +891,7 @@ fn the_resolver_covers_every_package_cargo_tree_reports() {
 // Rule: the default build stays iroh-free; the shipped netd still pulls iroh.
 // ---------------------------------------------------------------------------
 
-/// SOURCE SENTENCE. `.github/workflows/ci.yml`, job
-/// `Iroh leanness (default build stays iroh-free)`, probe (a): "INVARIANT
+/// SOURCE SENTENCE. The retired iroh `cargo tree` guard, probe (a): "INVARIANT
 /// VIOLATED: $pkg is in the default-members dependency graph. / The CLI + vizd
 /// default build must stay iroh-free: keep cerulion_netd OUT of
 /// default-members."
@@ -917,7 +918,7 @@ fn default_member_build_is_iroh_free() {
     );
 }
 
-/// SOURCE SENTENCE. `.github/workflows/ci.yml`, same job, probe (b):
+/// SOURCE SENTENCE. The same retired guard, probe (b):
 /// "INVARIANT VIOLATED: cerulion_netd (per-package) no longer pulls iroh. / The
 /// shipped netd daemon must include the iroh WAN plane (wan default-on)."
 /// `crates/cerulion_netd/AGENTS.md`: "`wan` is DEFAULT-ON and netd is
@@ -982,13 +983,12 @@ fn a_plain_cargo_test_compiles_no_iroh_and_no_rerun() {
 // Rule: the default build stays rerun-free; the desk viz lib still pulls rerun.
 // ---------------------------------------------------------------------------
 
-/// SOURCE SENTENCE. `.github/workflows/ci.yml`, job
-/// `Rerun leanness (robot + default build stay rerun-free)`, probe (a): "A
+/// SOURCE SENTENCE. The retired rerun `cargo tree` guard, probe (a): "A
 /// plain 'cargo build' must stay rerun-free: keep the cerulion_viz/* crates OUT
 /// of default-members."
 /// `crates/cerulion_viz/AGENTS.md`: "NOT default-members: a plain `cargo build`
-/// must stay rerun-free (CI's rerun-leanness job enforces it); build with
-/// `-p <crate>`."
+/// must stay rerun-free (pinned by `default_member_build_is_rerun_free` in
+/// cerulion_hygiene); build with `-p <crate>`."
 #[test]
 fn default_member_build_is_rerun_free() {
     let meta = metadata();
@@ -1005,7 +1005,7 @@ fn default_member_build_is_rerun_free() {
     );
 }
 
-/// SOURCE SENTENCE. `.github/workflows/ci.yml`, same job, control (c1): "PROBE
+/// SOURCE SENTENCE. The same retired guard, control (c1): "PROBE
 /// BROKEN: cerulion_viz (per-package) no longer pulls rerun. / Either the desk
 /// viz stack lost its rerun edge, or this job's probe is no longer probing
 /// anything."
@@ -1027,14 +1027,13 @@ fn desk_viz_still_pulls_rerun() {
 // Rule: the robot stays rerun-free, dev edges included.
 // ---------------------------------------------------------------------------
 
-/// SOURCE SENTENCE. `.github/workflows/ci.yml`, job
-/// `Rerun leanness (robot + default build stay rerun-free)`, probe (b):
+/// SOURCE SENTENCE. The retired rerun `cargo tree` guard, probe (b):
 /// "INVARIANT VIOLATED: a examples/go2 crate pulls $pkg (project rule: no viz
 /// or rerun on the robot). / Robot crates ship RAW frames; rasterization is
-/// desk-side." The job probes `-e normal,dev` because a DEV edge is exactly how
+/// desk-side." It probed `-e normal,dev` because a DEV edge is exactly how
 /// the Rerun SDK reached the robot the one time it did.
 ///
-/// STRICTER THAN THE JOB, AND HERMETIC. `examples/go2` is a separate workspace
+/// STRICTER THAN THAT PROBE, AND HERMETIC. `examples/go2` is a separate workspace
 /// that patches a DDS fork in by git, so resolving it wants a warm git cache; a
 /// test that reaches the network to prove an invariant goes red for the wrong
 /// reason. Both halves are read from the committed artifacts instead, and
@@ -1090,7 +1089,7 @@ fn the_robot_demo_workspace_is_rerun_free() {
     }
 }
 
-/// SOURCE SENTENCE. `.github/workflows/ci.yml`, same job, controls (c2) and
+/// SOURCE SENTENCE. The same retired guard, controls (c2) and
 /// (c3): "PROBE BROKEN: the examples/go2 reverse-tree probe found no go2_tf
 /// edge" and "PROBE BROKEN: probe (b) no longer traverses DEV dependencies. /
 /// tempfile is a dev-only dependency of examples/go2's dds_bridge and MUST be
@@ -1100,10 +1099,10 @@ fn the_robot_demo_workspace_is_rerun_free() {
 ///
 ///   * the LOCKFILE half is checked with `go2_tf`, a normal dependency of the
 ///     demo's producer nodes: it proves the reader is on the robot workspace
-///     and not the root one (CI's (c2));
+///     and not the root one (the retired guard's (c2));
 ///   * the MANIFEST half is checked with `tempfile`, which `dds_bridge`
 ///     declares ONLY under `[dev-dependencies]`: it proves
-///     [`collect_dependency_names`] descends into that table (CI's (c3)).
+///     [`collect_dependency_names`] descends into that table (the retired guard's (c3)).
 ///
 /// The second control has to be the manifest one. A lockfile lists every
 /// package in the resolve whatever edge brought it in, so finding `tempfile`

@@ -205,8 +205,9 @@ tempfile = "3"
 # It used to run the other way (go2_tf_source dev-depended on cerulion_viz +
 # rerun to host that same e2e), which put the Rerun SDK and its MSRV floor on a
 # crate that ships to the robot. Inverting it keeps the oracles identical and
-# leaves `go2_tf_source` rerun-free even under `-e normal,dev` — pinned by the
-# `rerun-leanness` CI job. Cross-workspace path dep into the ISOLATED
+# leaves `go2_tf_source` rerun-free under every edge kind, pinned by
+# `the_robot_demo_workspace_is_rerun_free` in cerulion_hygiene. Cross-workspace
+# path dep into the ISOLATED
 # `examples/go2` workspace: because of THIS edge, go2_tf_source is loaded by two
 # workspaces, and cargo resolves `workspace = true` against whichever one is
 # doing the loading — NOT against the package's directory ancestor. The root's
