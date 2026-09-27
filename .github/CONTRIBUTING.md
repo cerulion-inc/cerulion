@@ -349,12 +349,6 @@ a verdict: expect questions and suggestions, and don't hesitate to push back or
 ask for clarification. Open early as a draft if you'd like feedback before things
 are final.
 
-Pull requests from maintainers also get an automated first-pass review: an
-AI-driven review workflow runs on those pull requests and flags likely issues
-shortly after they open or update. Its findings are advisory, not gates: a
-maintainer always makes the final call. Pull requests from forks are reviewed
-by a maintainer directly, because the workflow cannot run against a fork.
-
 ## Security issues
 
 **Please do not report security vulnerabilities in public Issues.** See

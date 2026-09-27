@@ -3,11 +3,11 @@
 file, render the pull request comment on stdout, and decide the job's exit.
 
 The model writes JSON and nothing else (see public-surface-review.md). This
-script is what the workflow ACTS on, so the outcome never depends on the
+script is what the review ACTS on, so the outcome never depends on the
 session choosing to call a tool, and the blocking rule is written down in one
 place rather than inferred from prose.
 
-EXIT CODES (the workflow maps them):
+EXIT CODES:
   0  no findings                      -> pass,  post nothing
   1  at least one LEAK or EMBARRASSING -> FAIL,  post the comment
   2  only CONFUSING or COSMETIC        -> pass,  post the comment

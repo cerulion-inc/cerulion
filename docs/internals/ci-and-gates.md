@@ -298,35 +298,77 @@ arm pinned both ways. "Found something" and "could not run" never share an exit 
 built-in control per class must hit before any scan, and an allowlist entry that matches no
 file or excused nothing fails a full-tree run. Contributor-facing detail: `docs/leak_guard.md`.
 
-## The public-surface review (`.github/workflows/public-surface-review.yml`)
+## The public-surface review (`tools/review/public-surface-review.md`)
 
 `tools/scripts/check_public_surface.sh` refuses the wording it can NAME. A regex cannot
 see narrative, a stale claim, or a sentence that contradicts another page, and an
-independent audit of this tree found all three in files every pattern passed. This job
-reads the pull request's DIFF for those.
+independent audit of this tree found all three in files every pattern passed. The
+semantic half reads a pull request's DIFF for those. It is run locally, over the diff
+rather than the tree, and no CI job runs it.
 
-It runs the Claude Code action on the same terms as the Claude Code Review workflow: the
-same pinned action, the same three gates (a maintainer author, a head branch in this
-repository so a fork never holds the token, and not a draft), `show_full_output: false`,
-and no transcript artifact. It is smaller in every other way. The prompt is fixed and in
-the tree at `tools/review/public-surface-review.md` (the eleven families of tell, the
-vocabulary that is legitimate and must be judged rather than reported, and the four
-severities LEAK, EMBARRASSING, CONFUSING, COSMETIC). The diff is computed by a step and
-handed over as a file, so the model is allowed `Read`, `Grep`, `Glob` and `Write` and no
-shell at all. It writes ONE JSON verdict and posts nothing.
+The prompt is fixed and in the tree at `tools/review/public-surface-review.md` (the
+eleven families of tell, the vocabulary that is legitimate and must be judged rather
+than reported, and the four severities LEAK, EMBARRASSING, CONFUSING, COSMETIC). The
+diff is handed over as a file, the reader needs `Read`, `Grep`, `Glob` and `Write` and
+no shell at all, and the output is ONE JSON verdict.
 
 `tools/review/render_public_surface_verdict.py` reads that verdict, renders the one pull
 request comment, and decides the exit, so the outcome never depends on the session
 choosing to call a tool: clean is a silent pass, a LEAK or EMBARRASSING finding FAILS,
 advisory findings pass with the comment, and a missing or unparseable verdict FAILS,
 because a semantic review that did not happen looks exactly like a clean one. Its
-`--self-test` drives every arm, including a quoted pipe that must not add a table column
-and a blocking finding past the table's row cap.
+`--self-test` runs in `lint` on every push and drives every arm, including a quoted pipe
+that must not add a table column and a blocking finding past the table's row cap.
 
-ADVISORY until the maintainers add it to the required checks on `main`: a red here is a
-review to read, not a block. COST: one ubuntu job and one model session per push, over
-the diff rather than the tree, capped at 20 minutes, billed to the same OAuth account as
-the Claude Code Review workflow, and cancelled when a new push supersedes it.
+RUNNING IT, on the branch, before the pull request is opened, by whoever opened it:
+
+```bash
+# 1. Prepare the diff. The stale working files go FIRST, so a preparation that fails
+#    cannot leave an earlier diff or an earlier verdict standing in for this one.
+#    The steps are CHAINED, not run under errexit: a shell suspends `set -e` inside a
+#    command whose status is tested, an inner `set -e` included, so a guard written
+#    that way never fires.
+prepared=0
+rm -f pr.diff public-surface-review.json \
+  && git fetch -q https://github.com/cerulion-inc/cerulion.git main \
+  && base=$(git merge-base FETCH_HEAD HEAD) \
+  && git diff "$base..HEAD" > pr.diff \
+  && test -s pr.diff \
+  || prepared=$?
+echo "prepared: $prepared"
+
+# 2. With prepared 0, hand pr.diff and tools/review/public-surface-review.md to a local
+#    agent session holding Read, Grep, Glob and Write and no shell; it writes
+#    public-surface-review.json. Anything else and there is no diff to read.
+
+# 3. Read the verdict. A preparation that did not finish means there was nothing to
+#    review, which is 3 and never a clean pass, whatever file is lying around. A script
+#    that must FAIL on a blocking verdict ends `exit "$verdict"`.
+verdict=3
+if [ "$prepared" -eq 0 ]; then
+  verdict=0
+  python3 -B tools/review/render_public_surface_verdict.py public-surface-review.json || verdict=$?
+fi
+echo "verdict: $verdict"
+```
+
+The three steps fail CLOSED, the same way the renderer does: a fetch that does not land,
+a merge base that does not resolve, or an empty `pr.diff` leaves `prepared` non-zero and
+no file for step 2 to read, and step 3 over an absent verdict reports 3 rather than
+clean. Deleting both working files inside the chain is what makes that true a second
+time, because a verdict left over from the previous branch reads exactly like this one,
+and step 3 refuses to read any verdict at all unless `prepared` is 0, so a delete that
+does not happen cannot pass an old file off as this branch's result.
+Every status is captured rather than trapped, and no step relies on errexit, so none of
+the three can close a shell that already has it on.
+Neither working file is committed. The
+renderer's own status is the verdict, and `$verdict` is where the block keeps it, because
+a trailing `echo` would otherwise become the status a caller reads: 0 clean, 1 a LEAK or
+EMBARRASSING finding to fix before the branch lands, 2 advisory findings, 3 no verdict
+to read. The rendered comment is what goes on the pull request when it is 1 or 2.
+
+Its findings are ADVISORY: no required check on `main` carries them, so a finding is a
+review to read, not a block.
 
 ## The docs gate
 
