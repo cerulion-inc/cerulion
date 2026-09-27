@@ -2851,6 +2851,9 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
     if private is None and not args.quiet:
         out('PRIVATE PATTERNS NOT LOADED: names, devices, people and real LAN addresses were '
             'NOT checked.')
+    if refs.res.spent and not args.quiet:
+        out('REFERENCE BUDGET SPENT: this run stopped asking the forge and every reference '
+            'after that point is reported unverified, NOT clean.')
     by_class = {}
     for h in sc.hits:
         by_class[h.cls] = by_class.get(h.cls, 0) + 1
@@ -2886,6 +2889,10 @@ def _extras(sc):
         bits.append('commits=%d' % st.commits)
     if sc.suppressed:
         bits.append('suppressed=%d' % sc.suppressed)
+    if sc.refs is not None and sc.refs.res.asked:
+        bits.append('refs=%d' % sc.refs.res.asked)
+    if sc.refs is not None and sc.refs.res.spent:
+        bits.append('refs_budget_spent')
     if sc.media_kinds is not None:
         bits.append('media=%d' % st.media)
         for k in sorted(sc.media_kinds):
@@ -4391,6 +4398,12 @@ def self_test(out, base_env, argv0):
             and slow.asked == 1 and slow.spent
             and slow.verdict(RO, R_PRIV) == 'closed',
             'asked=%d spent=%s' % (slow.asked, slow.spent))
+        sc_b = Scanner('tree', build_classes(), None, [], lambda s: None,
+                       refs=RefScan(RefResolver(fetch=lambda o, r: 200, budget=0), RO, R_SELF))
+        sc_b.refs.findings(FORGE + RO + '/' + R_PUB)
+        arm('ref-a-spent-budget-is-reported-not-hidden',
+            sc_b.refs.res.spent and 'refs_budget_spent' in _extras(sc_b),
+            _extras(sc_b))
         res = RefResolver(fetch=lambda o, r: {R_PUB: 200, R_PRIV: 404, R_SLOW: 429}.get(r))
         arm('ref-resolver-oracles',
             res.verdict(RO, R_PUB) == 'public' and res.verdict(RO, R_PRIV) == 'closed'
