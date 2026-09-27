@@ -92,7 +92,7 @@ fn iceoryx2_family_resolves_to_single_version() {
     // In-workspace builds MUST have a resolvable workspace lock; an out-of-repo
     // (vendored/published-crate) build legitimately has none — there, the
     // manifest `=` pins (test 1) still govern downstream resolution.
-    let in_workspace = std::fs::read_to_string(manifest.join("../Cargo.toml"))
+    let in_workspace = std::fs::read_to_string(manifest.join("../../Cargo.toml"))
         .map(|t| t.contains("[workspace]"))
         .unwrap_or(false);
     let lock = manifest.join("../../Cargo.lock");
