@@ -749,8 +749,13 @@ jobs:
       - name: Leak guard (self-test)
         run: python3 -B tools/scripts/leak_scan.py --self-test
 
+      # `--offline` keeps this step off the network: it scans the WHOLE tree, so
+      # resolving every reference in it would spend half a minute asking the
+      # forge about files this pull request did not touch. The changed files are
+      # resolved for real in leak-guard.yml on the same event, and the whole
+      # tree is resolved there on every push to main.
       - name: Leak guard (tree, generic classes)
-        run: python3 -B tools/scripts/leak_scan.py tree --no-private
+        run: python3 -B tools/scripts/leak_scan.py tree --no-private --offline
 
       # The public-surface gate. The week before the public cut, seven classes
       # of mistake in the shipped tree were found and fixed BY HAND, one page

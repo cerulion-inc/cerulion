@@ -7,7 +7,17 @@ bodies, and the images and clips under `docs/media`. The leak guard is one scann
 names, addresses, home paths, logins, people and location metadata out of all of it.
 It runs in three places: the git hooks on your machine, the `lint` job of the main CI
 workflow, and the `Leak guard` workflow on every pull request, merge queue batch and
-push to `main`.
+push to `main`, and on every issue and comment body as it is written or edited.
+
+A body is public the moment it is written and no check runs before it is, so that last
+job cannot block anything. It reads what people write and skips what bots write: a review
+bot quotes example references in its findings, an example has the shape of the thing it is
+an example of, and its text is machine written from a diff the other three jobs already
+gate. On a finding it applies the `leak` label, asks the author once
+to edit the reference out (one ask per body, so an unchanged body is never asked twice),
+and goes red. The label tracks the THREAD: a clean body takes back the ask left for it,
+and the label comes off when the last outstanding ask on that thread is gone, so a clean
+comment cannot clear a label another body still deserves.
 
 ## What it checks
 
@@ -22,17 +32,80 @@ in the tree (new text reuses one of those or a documentation range such as
 `192.0.2.0/24`); a login at a host after `ssh`, `scp` or `rsync`; a multicast DNS host
 name; a personal mail address, or a non-role address at the project domain; a host
 identity field (`uname`, `hostname`, `nodename` and friends) carrying a value; an
-overlay access control tag; the overlay product words in CI files; and, as a
-report-only style class, en and em dashes. Placeholders such as `/Users/someone/`,
-`/home/ubuntu/` and `robot-a.local` are published vocabularies, never
-length rules.
+overlay access control tag; the overlay product words in CI files; a reference nobody
+outside this project can open (below); and, as a report-only style class, en and em
+dashes. Placeholders such as `/Users/someone/`, `/home/ubuntu/` and `robot-a.local` are
+published vocabularies, never length rules.
 
 **Private patterns** never ship. They hold the real names: machine hostnames and short
 names, overlay device names, real LAN addresses, logins, people, the private
-repository slug, the internal tracker prefix. They load from, in order, the
+repository slug, the internal tracker prefix, the tracker host. They load from, in order, the
 `LEAK_PATTERNS` environment variable (what CI passes from a secret), the file named by
 `LEAK_PATTERNS_FILE`, or `~/.config/cerulion/leak-patterns.txt`. The first source that
 yields a pattern wins. Private classes are HARD in every mode and honour no pragma.
+
+### References a stranger cannot open
+
+A reference is a leak surface of its own. The shape carries no address, no host and no
+login, so no other class can see it, and the harm runs both ways: a reader outside this
+project cannot open what the text points at, and when the target is closed its NAME is
+the secret the text just published. An internal ticket quoted in a public issue as a
+`#` shorthand is how this class came to exist.
+
+Nothing in the tree lists a repository. The scanner RESOLVES what the text points at and
+asks the forge, anonymously and with no token, whether a stranger is served a page.
+
+One forge is resolved, the one this repository lives on (`github.com`). A link to any other
+forge is not a candidate and is not checked; a reference there is a reviewer's job.
+
+| shape | example | resolved as |
+| --- | --- | --- |
+| a forge link | `https://github.com/<owner>/<repo>/...` | that owner and repository |
+| a qualified shorthand | `<owner>/<repo>#<n>` | that owner and repository |
+| a bare shorthand | `<repo>#<n>` | `<repo>` under this repository's own owner |
+| a tracker link | a link to `linear.app` or to a private-tier `tracker-host:` | nothing: a tracker is closed to a stranger already |
+
+`200` means public and is clean. `404` means private, renamed away or never there, and a
+stranger is given nothing in every one of those cases, so all three are one finding,
+`ref-unopenable`. A throttle, a server error or no network at all is `ref-unverified`,
+which is HARD under `--require-private` and a warning without it, so a laptop on a train
+still runs. Every `Leak guard` job escalates it by name as well (`--hard ref-unverified`),
+because a fork run holds no secret and so cannot be gated on `--require-private`, and a
+reference the forge would not confirm must stop a fork pull request too. `--offline` asks
+nothing and reports every candidate as unverified; the hooks always run that way.
+
+The asking is bounded twice over: at most 300 distinct repositories per run, and at most
+two minutes of asking in total from the first question. Past either bound every further
+repository is unverified with no request, so a scan behind a dead network still finishes
+and still says what it could not check.
+
+One question per distinct repository per run, cached in memory, to the host the link
+names and to no other host. That question carries the owner and repository the text
+already wrote, and it goes to the forge that owns the name; no text reaches anywhere
+else, and a tracker link is judged with no request at all. A reference to THIS repository
+is never a finding, and neither is a bare `#<n>`, which the forge already reads as this
+repository.
+
+Two shapes are deliberately out of reach. The first path segment of a forge URL is
+treated as an owner only when it is not one of the forge's own reserved words, and a bare
+`<repo>#<n>` counts only when the token is SLUG shaped, that is when it carries a `-`,
+`_` or `.` between alphanumerics: `issue#5` and `demand#1` are prose, and a guard that
+reds on prose is a guard nobody keeps. A repository whose name is a single word with no
+separator is therefore invisible to the shape, which is exactly what the private tier's
+`repo-slug:` key is for.
+
+What the slug shape cannot tell apart is a closed repository from a name that was never a
+repository: the forge answers 404 to both. A slug shaped token that is not a reference at
+all, an `api_v2` written straight against a `#8`, therefore reads as one. Across the
+tracked tree that shape occurs zero times, and the fix where it does occur is one
+character: a space before the number sign (`api_v2 #8`) is prose, and the ask the
+conversation job posts says so. In a file, the line pragma says it once and for good.
+
+A finding prints the reference stripped to what a reader needs to find it on the line, an
+owner and a repository or a tracker host, never the full link, and both classes are
+identity bearing: the value prints only on a terminal with the private tier loaded, and
+everywhere else a masked shape takes its place, in the LOCATION as well as the value, so a
+slug that is itself a file or directory name cannot ride out in the place that says where.
 
 Surfaces in `tree` mode: every text file in full (comments, strings, help text, YAML,
 Markdown, lock files), path names, symlink targets, binary files through their
@@ -50,7 +123,9 @@ percent-encoded path has the boundary it has on screen. `diff` mode scans added 
 only (the hooks use it). `messages` mode scans commit messages, author and committer
 names and emails (the identity policy accepts the forge noreply address, the forge
 web-flow address, project role addresses, or an address listed in
-`--allow-email-file`), and pull request title and body. `names` mode scans paths and
+`--allow-email-file`), pull request title and body, and any further body handed to it by
+name (`--body-env VAR --body-label issue-body`), which is how the workflow reaches an
+issue body, an issue comment and a pull request review comment. `names` mode scans paths and
 the branch name. `media` mode parses PNG, JPEG, GIF, WebP and the MP4 and MOV family
 for comments, EXIF, XMP, location boxes and trailing bytes; a document, archive or
 container no walker can read is a hit until an allowlist entry names it.
@@ -120,6 +195,25 @@ version after the at sign, so an address after the at sign still matches:
 The scanner self-test drives this exact recipe, the `text:` form and a regex entry in
 an author name, so all three forms are pinned, not only `word:`.
 
+**Two keys, for what no shape can see.** A key is an entry like any other: it counts in
+the index, it is HARD in every mode, and its value never prints. It carries its own
+category and takes no tag.
+
+```
+tracker-host:tickets.example.invalid    # a tracker whose links a stranger cannot open
+repo-slug:exampleoldname                # a repository name that must not appear at all
+```
+
+`tracker-host:` names a tracker host beside the one that ships (`linear.app`): a link to
+it becomes a `ref-unopenable` finding, and the host itself is refused anywhere in the
+tree. `repo-slug:` names a repository whose NAME is the secret, in the spelling the forge
+uses (`<repo>`, or `<owner>/<repo>`): the reference classes see a slug-shaped reference
+generically, but a repository named by a single word with no separator reads as prose,
+and this is the only place that can be refused. Both values are matched the way `word:`
+entries are, so a separator at any letter or digit seam still matches, and both are
+reported as `private#<index>@host` and `private#<index>@slug`. Neither value ships in the
+tree.
+
 The trailing tag is optional and comes from a fixed vocabulary (`@host` `@device`
 `@person` `@login` `@lan` `@nickname` `@slug` `@hygiene`, in any letter case); it
 labels a hit's category without naming anything. The grammar is strict and there is exactly one
@@ -140,6 +234,7 @@ canonical list; ask them for it rather than reconstructing it.
 ## Read a hit
 
 ```
+HIT ref-unopenable docs/notes.md:4: (value masked, 17 chars: xxxxxxxx-xxxx#xxx)
 HIT home-mac docs/setup.md:12: /Users/<a real login>/
 HIT home-mac docs/setup.md:12: (value masked, 21 chars: /xxxxx/xxxxxxxxxxxxx/)
 HIT home-mac docs/setup.md:13: (text withheld: a private pattern touches this line)
@@ -192,7 +287,10 @@ above it says what was not checked.
 
 Two mechanisms, both reviewed like code. A line pragma inside that language's comment:
 `leak-scan: allow <class> <reason of at least 12 characters>` on the hit line; it never
-accepts a private class and is ignored in `messages` mode. A path entry in
+accepts a private class and is ignored in `messages` mode. `ref-unopenable` and
+`ref-unverified` are one name for this purpose: they are two verdicts on the same
+reference, and a pragma judges the reference, so a line excused as one is excused as the
+other the first time the forge is slow. A path entry in
 `tools/scripts/leak_scan_allow.txt`: `glob | class | reason`, where the class is a
 generic class or a private CATEGORY such as `private@person` (a bare private waiver is
 refused, so a waiver for a person's name can never excuse a machine name in the same
@@ -213,6 +311,8 @@ check still runs, since that depends on the tree alone). Every summary line prin
 python3 -B tools/scripts/leak_scan.py --self-test        # every class and surface, planted
 python3 -B tools/scripts/leak_scan.py tree               # the whole worktree
 python3 -B tools/scripts/leak_scan.py tree --require-private   # refuse to run without the private tier
+python3 -B tools/scripts/leak_scan.py tree --offline           # resolve no reference; every candidate reads unverified
+python3 -B tools/scripts/leak_scan.py tree --self-repo OWNER/REPO   # name this repository yourself
 python3 -B tools/scripts/leak_scan.py tree --ref HEAD --files-from changed.zlist   # a NUL separated list, taken verbatim; a listed path the ref lacks is a NO RUN
 python3 -B tools/scripts/leak_scan.py messages --range origin/main..HEAD
 python3 -B tools/scripts/leak_scan.py names --branch "$(git rev-parse --abbrev-ref HEAD)"
@@ -221,6 +321,7 @@ python3 -B tools/scripts/leak_scan.py media
 
 What the guard does not see: a name on no list is invisible until it is
 listed; pixels are not read (look at every frame of a changed image or clip, both
-sides); compressed payloads inside bags and video streams are not opened; forge
-surfaces that no check sees before they are public (review comments, CI logs of other
-jobs) stay a habit.
+sides); compressed payloads inside bags and video streams are not opened; a repository
+named by a single word with no separator, written bare before a `#`, is invisible to the
+reference shape until a `repo-slug:` entry names it; a reference on a host the classes do
+not know is not resolved at all; and CI logs of other jobs stay a habit.
