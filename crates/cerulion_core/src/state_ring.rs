@@ -2721,6 +2721,21 @@ mod tests {
             }
             other => panic!("expected Malformed, got {other:?}"),
         }
+        // The ABSENCE, which the `Malformed` event does not prove on its own: a
+        // refused record must leave NOTHING behind. An assembler that reported the
+        // event and still opened an anchor on the record would go on to report that
+        // anchor `Torn` at `finish`, so the same bag would read as one refusal AND
+        // one torn node, and the torn report is about a node whose bytes were never
+        // admitted.
+        assert_eq!(
+            asm.open_anchors(),
+            0,
+            "a refused record must not open an anchor"
+        );
+        assert!(
+            asm.finish().is_empty(),
+            "and nothing is left to report at finish"
+        );
         // The control: the SAME record at this build's version assembles.
         let ok = encode_record(
             &StateRecordHeader {

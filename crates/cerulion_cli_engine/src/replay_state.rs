@@ -157,6 +157,31 @@ pub enum AnchorReadRefusal {
         /// The version this build reads.
         known: u32,
     },
+
+    /// The bag's records were written under a LATER state record format than
+    /// this build reads.
+    ///
+    /// Its own arm rather than a reuse of
+    /// [`StateRecordFormatTooOld`](Self::StateRecordFormatTooOld), because the
+    /// REMEDY is the opposite one: a bag from an earlier format has to be
+    /// re-recorded, and a bag from a later format has to be read by a later
+    /// build. An operator handed the wrong one of those two sentences throws
+    /// away a recording that was never damaged.
+    #[error(
+        "this recording's state records were written under state record format version {carried} \
+         and this build reads state record format version {known}. A later format is free to lay \
+         the record out differently, and a state record carries no checksum for a reader to catch \
+         a decode from the wrong offset on, so assembling these bytes could restore a node from \
+         data that is not its state and report a confident divergence about an execution that \
+         never happened. The recording is not damaged and does not need re-recording. Fix: read \
+         it with a build that reads state record format version {carried} or later"
+    )]
+    StateRecordFormatTooNew {
+        /// The version the bag's manifest carries, above this build's.
+        carried: u32,
+        /// The version this build reads.
+        known: u32,
+    },
 }
 
 /// Read the OPTIONAL `__cerulion/state_coverage.json` manifest.
@@ -392,11 +417,11 @@ pub fn read_bag_anchors(reader: &BagReader) -> Result<BagAnchors, AnchorReadRefu
             rings: coverage.rings_declared,
         });
     }
-    // The BACKWARD version gate, and it lives HERE rather than in the parse.
+    // The version gate, BOTH WAYS, and it lives HERE rather than in the parse.
     //
     // A state record carries no version of its own before format version 1 and
     // no checksum at any version, so nothing at the RECORD level can catch a bag
-    // written under the earlier layout: `StateRecordHeader::from_bytes` takes a
+    // written under a different layout: `StateRecordHeader::from_bytes` takes a
     // fixed-width array and would simply read a different field out of each
     // offset. The only discriminator is the BAG's, which is why the manifest
     // carries the writer's record format and why an absent key is refused rather
@@ -404,13 +429,28 @@ pub fn read_bag_anchors(reader: &BagReader) -> Result<BagAnchors, AnchorReadRefu
     // whose writer forgot it are the same bytes, and the safe reading of both is
     // a refusal.
     //
+    // EXACT EQUALITY, and the too-new half is the half worth arguing for. This
+    // gate read `v >= known`, which admitted a manifest naming format 2 or later
+    // into a version 1 assembler. Every record then failed `validate` and landed
+    // as `Malformed`, which is counted into `malformed_records` and logged at
+    // `debug`, so the reader answered "this bag records no anchor" and sent the
+    // operator to re-record a bag that is perfectly good and simply newer than
+    // this build. That is the same misdiagnosis the too-old arm exists to
+    // prevent, arriving from the other side, so it gets the same treatment: a
+    // refusal that NAMES both versions and says which build to reach for. It
+    // fires before the index table is built and before the assembler exists, so
+    // no record of a future format is ever assembled or counted.
+    //
     // It is in `read_bag_anchors` and NOT in `read_state_coverage`, which
     // `read_state_arm` shares: a refusal at the parse would take the catch-up
-    // clamp away from every bag recorded before this format, on the from-start
-    // path, which this gate has no business touching.
+    // clamp away from every bag whose records this build cannot read, on the
+    // from-start path, which this gate has no business touching.
     let known = cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION;
     match coverage.state_record_format_version {
-        Some(v) if v >= known => {}
+        Some(v) if v == known => {}
+        Some(v) if v > known => {
+            return Err(AnchorReadRefusal::StateRecordFormatTooNew { carried: v, known })
+        }
         carried => return Err(AnchorReadRefusal::StateRecordFormatTooOld { carried, known }),
     }
     let table = index_table(&coverage);
@@ -923,6 +963,77 @@ mod tests {
         let anchors = craft_and_read(&manifest_json(Some("1"), 1), &[this_format_record(9)])
             .expect("not refused");
         assert_eq!(anchors.unattributable_records, 1);
+    }
+
+    /// A bag recorded under a LATER state record format is refused BY NAME, with
+    /// both versions in the sentence, and nothing in it is ever assembled.
+    ///
+    /// The gate this pins read `v >= known`, which let a manifest naming format 2
+    /// into a version 1 assembler. The records then failed `validate` one by one
+    /// and were counted as malformed behind a `debug` line, so the reader's answer
+    /// was "this bag records no anchor" and the operator was sent to re-record a
+    /// recording that was not damaged at all. Naming BOTH versions is what turns
+    /// that into the one diagnosis an operator can act on, and the remedy has to
+    /// be the opposite of the too-old arm's: reach for a newer build, do not
+    /// re-record.
+    ///
+    /// Every expected value below is TYPED OUT rather than computed from the
+    /// constant. A test that writes `STATE_RECORD_FORMAT_VERSION + 1` into the
+    /// manifest and then asserts the message mentions `STATE_RECORD_FORMAT_VERSION
+    /// + 1` passes whatever the gate does with the two numbers.
+    #[test]
+    fn a_bag_recorded_after_this_state_record_format_is_refused_by_name() {
+        // The records are VALID at this build's format, so the only thing wrong
+        // with this bag is the version its manifest names. That is what makes the
+        // absence assertion below mean something: these records would assemble.
+        let records = vec![this_format_record(0)];
+        let refusal = craft_and_read(&manifest_json(Some("2"), 1), &records)
+            .expect_err("a manifest naming a later record format must be refused");
+        assert_eq!(
+            refusal,
+            AnchorReadRefusal::StateRecordFormatTooNew {
+                carried: 2,
+                known: 1
+            },
+            "refused by name, not swallowed: {refusal:?}"
+        );
+        let text = refusal.to_string();
+        assert!(
+            text.contains("state record format version 2"),
+            "the BAG's version, literally: {text}"
+        );
+        assert!(
+            text.contains("state record format version 1"),
+            "and THIS BUILD's version, literally: {text}"
+        );
+        assert!(
+            text.contains("read it with a build that reads state record format version 2 or later"),
+            "the remedy names the build to reach for: {text}"
+        );
+        assert!(
+            text.contains("does not need re-recording"),
+            "and says the recording is not the thing at fault: {text}"
+        );
+
+        // THE ABSENCE. `read_bag_anchors` returns before the index table and
+        // before the assembler is built, so there is no `BagAnchors` on this path
+        // at all: no anchor was served, no record was fed, and no malformed count
+        // exists to be read. `Err` is the whole of what the caller gets.
+        assert!(
+            craft_and_read(&manifest_json(Some("2"), 1), &records).is_err(),
+            "the reader hands back a refusal and no anchors, so `finish` is never reached"
+        );
+
+        // THE CONTROL, and it is the point of pairing it with these exact
+        // records: the SAME records under a manifest at this build's version
+        // assemble into one anchor with nothing malformed. So the refusal above
+        // withheld a readable anchor on the strength of the version alone, which
+        // is the behaviour, and it is not a reader that refuses everything.
+        let ok = craft_and_read(&manifest_json(Some("1"), 1), &records)
+            .expect("the same records at this build's version are read");
+        assert_eq!(ok.facts.len(), 1, "one anchor: {:?}", ok.facts);
+        assert_eq!(ok.facts[0].node, "alpha");
+        assert_eq!(ok.malformed_records, 0, "and nothing malformed about them");
     }
 
     /// The AMBIGUITY refusal still comes FIRST, so a k>1 bag reads the sentence

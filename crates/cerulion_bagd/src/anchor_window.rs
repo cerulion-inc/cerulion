@@ -205,18 +205,6 @@ impl RetainedAnchor {
     }
 }
 
-/// PURE: the STATE bytes a whole anchor's records carry — the sum of each
-/// record's declared `len`, never the record footprint.
-///
-/// The distinction matters for coverage: `byte_len` is what the anchor
-/// costs the RETENTION (footprint, which is what a byte ceiling must bound),
-/// while a coverage manifest's `bytes` is how much STATE the node's anchor
-/// accounts for. A 4-byte blob rides one 512-byte record, and reporting 512
-/// would describe the framing rather than the state.
-///
-/// A record whose header will not parse contributes nothing rather than a
-/// guess; every record here came through the assembler, so that is unreachable
-/// and the arm exists only so a malformed one cannot inflate the count.
 /// The producer RANK this anchor's records carry, read off the first one.
 ///
 /// Read rather than carried, on exactly the rule
@@ -237,6 +225,18 @@ pub(crate) fn producer_rank(records: &[StateRecord]) -> Option<u32> {
     )
 }
 
+/// PURE: the STATE bytes a whole anchor's records carry, which is the sum of
+/// each record's declared `len` and never the record footprint.
+///
+/// The distinction matters for coverage: `byte_len` is what the anchor
+/// costs the RETENTION (footprint, which is what a byte ceiling must bound),
+/// while a coverage manifest's `bytes` is how much STATE the node's anchor
+/// accounts for. A 4-byte blob rides one 512-byte record, and reporting 512
+/// would describe the framing rather than the state.
+///
+/// A record whose header will not parse contributes nothing rather than a
+/// guess; every record here came through the assembler, so that is unreachable
+/// and the arm exists only so a malformed one cannot inflate the count.
 pub(crate) fn anchor_payload_bytes(records: &[StateRecord]) -> u64 {
     records
         .iter()

@@ -330,19 +330,44 @@ fn ranks_armed_before_and_after_bag_creation_are_all_discovered_by_name() {
     // The ring-to-rank JOIN: a record names its rank and a node entry names its
     // ring, and this is what ties the two. Its keys are the DECLARED names, the
     // same names `StateNodeCoverage::ring` carries.
-    // SORTED before the comparison, and that is the assertion rather than a
-    // convenience: the map is keyed by ring NAME, the names are minted from a
-    // hash, so their order carries no rank order at all. Comparing the values in
-    // key order would pass or fail on the hash. What the join owes is that every
-    // rank this recording drained is named, once each.
-    let mut ranks_named: Vec<u32> = cov.ring_ranks.values().copied().collect();
-    ranks_named.sort_unstable();
+    //
+    // The WHOLE MAP, not the sorted values. A sorted value list says only that
+    // the three ranks appear once each, so it passes on a join that gives rank
+    // 0's ring rank 2 and rank 2's ring rank 0, which is the one wrong answer
+    // this map exists to prevent, since the reader uses it to decide whose
+    // records a ring's anchors are. The pairing is hand written off the arming
+    // above: `Rank::arm(&tag, 0, "n0")` put node n0 on rank 0's ring, so the
+    // ring n0's coverage names is rank 0's ring, and the same for n1 and n2.
+    let expected_ring_ranks: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::from([
+            (cov.nodes["n0"].ring.clone(), 0u32),
+            (cov.nodes["n1"].ring.clone(), 1u32),
+            (cov.nodes["n2"].ring.clone(), 2u32),
+        ]);
     assert_eq!(
-        ranks_named,
-        vec![0, 1, 2],
-        "every drained ring's rank is named: {:?}",
+        expected_ring_ranks.len(),
+        3,
+        "three distinct rings, or the hand map collapsed and asserts nothing: {:?}",
+        cov.nodes
+    );
+    assert_eq!(
+        cov.ring_ranks, expected_ring_ranks,
+        "WHICH ring is WHICH rank, not merely that all three ranks appear: {:?}",
         cov.ring_ranks
     );
+    // And the names themselves, so the map is pinned to the rank each ring was
+    // armed under rather than only to the node that happened to live on it.
+    for (rank, id) in [(0u32, "n0"), (1, "n1"), (2, "n2")] {
+        let named = state_ring_tag(&tag, rank).expect("an ordinary rank names a ring");
+        assert_eq!(
+            cov.nodes[id].ring, named,
+            "rank {rank}'s ring is the one this test armed under that rank"
+        );
+        assert_eq!(
+            cov.ring_ranks[&named], rank,
+            "and the join reads that ring back as rank {rank}"
+        );
+    }
     assert_eq!(
         cov.state_record_format_version,
         Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION)

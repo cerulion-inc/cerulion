@@ -42,6 +42,12 @@ fn repo_root() -> PathBuf {
 /// turns every added sentence into a failing gate, which is how a control gets
 /// deleted. A minimum still fails the case it exists for, a file that left the
 /// region or lost its framing prose entirely, because that reads zero.
+///
+/// Each minimum below is the count MEASURED at this tree once `512-byte` left
+/// the marker set, so a file that loses one of its framing sentences fails while
+/// one that gains a sentence still passes. The previous numbers were floors set
+/// well under the counts a `512-byte` marker inflated, which is how a file could
+/// have lost most of its framing prose and still cleared them.
 struct Scanned {
     path: &'static str,
     min_markers: usize,
@@ -58,7 +64,7 @@ struct Scanned {
 const REGION: &[Scanned] = &[
     Scanned {
         path: "crates/cerulion_core/src/state_ring.rs",
-        min_markers: 8,
+        min_markers: 33,
     },
     Scanned {
         path: "crates/cerulion_core/src/state_carrier/fork.rs",
@@ -70,11 +76,11 @@ const REGION: &[Scanned] = &[
     },
     Scanned {
         path: "crates/cerulion_bagd/src/anchor_window.rs",
-        min_markers: 4,
+        min_markers: 5,
     },
     Scanned {
         path: "crates/cerulion_bagd/src/lib.rs",
-        min_markers: 1,
+        min_markers: 4,
     },
     Scanned {
         path: "crates/cerulion_bagd/src/state_coverage.rs",
@@ -82,7 +88,7 @@ const REGION: &[Scanned] = &[
     },
     Scanned {
         path: "crates/cerulion_core/tests/state_ring_test.rs",
-        min_markers: 3,
+        min_markers: 4,
     },
     // The SHM ring is a GENERIC primitive, but two of its sentences state the
     // record count a 500 MB state anchor takes, which is derived from the state
@@ -90,11 +96,11 @@ const REGION: &[Scanned] = &[
     // states the same count a third time.
     Scanned {
         path: "crates/cerulion_core/src/shm_ring.rs",
-        min_markers: 2,
+        min_markers: 4,
     },
     Scanned {
         path: "crates/cerulion_core/tests/shm_ring_backpressure_test.rs",
-        min_markers: 1,
+        min_markers: 2,
     },
     // The ring room precheck's hand oracle writes the arena's record count down
     // (64 KiB of arena is 139 records). That number is DERIVED from the payload
@@ -102,7 +108,7 @@ const REGION: &[Scanned] = &[
     // a file that carries no other state record prose at all.
     Scanned {
         path: "crates/cerulion_core/src/graph/runtime.rs",
-        min_markers: 1,
+        min_markers: 2,
     },
 ];
 
@@ -212,9 +218,47 @@ fn carries_an_unexcused_stale_framing_literal(line: &str) -> bool {
         || carries_a_retired_derived_count(line)
 }
 
+/// The DERIVED record counts this format states, the mirror of
+/// [`RETIRED_DERIVED_COUNTS`].
+///
+/// These are the control half's only reach into two files. `graph/runtime.rs`
+/// writes the arena term down as a record count and nothing else about the state
+/// framing, and the SHM ring's 500 MB sentences state the count rather than the
+/// payload region. Without them those files hold no current marker at all and
+/// their control reads zero, which is the vacuity the control exists to catch.
+const CURRENT_DERIVED_COUNTS: &[&str] = &["1.11 M", "1_110_780", "139"];
+
+/// Does this line RESERVE the kind range this build mints out of?
+///
+/// The claim is made of TWO parts, the range and the word, and this asks for both
+/// rather than for one spelling of the sentence that joins them. `4+` is token
+/// bound on a number boundary so `14+` and `24+`, which reserve a range nothing
+/// here mints, are not swept up with it.
+fn reserves_the_range_this_build_mints(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    contains_token(&lower, "4+", is_number_char) && lower.contains("reserv")
+}
+
 /// Does this line carry a CURRENT framing marker, for the control half?
+///
+/// `512-byte` is NOT in this set, and leaving it in was the defect. The record
+/// SIZE did not move at format version 1: only the header width and the payload
+/// region did. So a file that lost every one of its `40-byte` and `472`
+/// sentences, which are the ones this format actually rewrote, still cleared its
+/// minimum on the strength of a number that was already there before the format
+/// existed. The set now holds only numbers this format MINTED, so a file that
+/// drops its framing prose reads zero and fails its control.
+///
+/// `472` is TOKEN BOUND on a number boundary for the same reason the stale arm
+/// is: as a plain substring it matched `1472` and `4720`, so an unrelated number
+/// could stand in for the payload region and keep a stripped file's control
+/// green.
 fn carries_a_current_framing_marker(line: &str) -> bool {
-    line.contains("40-byte") || line.contains("472") || line.contains("512-byte")
+    line.contains("40-byte")
+        || contains_token(line, "472", is_number_char)
+        || CURRENT_DERIVED_COUNTS
+            .iter()
+            .any(|n| contains_token(line, n, is_number_char))
 }
 
 /// No file in the framing region carries a state record number that moved, and
@@ -317,6 +361,45 @@ fn the_stale_literal_detector_fires_on_every_number_this_format_retired() {
     );
 }
 
+/// The CURRENT marker set holds only numbers this format minted, and it reads
+/// each of them as a number rather than as a substring.
+///
+/// The control half is the one that decides whether the sweep proved anything, so
+/// a marker that fires on the wrong thing is worse than a missing one: it keeps a
+/// stripped file green. Both halves are here. `512-byte` must NOT count, because
+/// the record size did not move at format version 1 and a file may state it
+/// without carrying one current framing sentence. `1472` and `4720` must not
+/// count either, which is what the number boundary on `472` is for.
+#[test]
+fn the_current_marker_set_holds_only_numbers_this_format_minted() {
+    for marker in [
+        "/// the header is 40-byte wide",
+        "/// the payload region is 472 bytes",
+        "/// a 500 MB anchor is ~1.11 M records",
+        "const PARTS: u64 = 1_110_780;",
+        "// 64 KiB of arena is 139 records",
+    ] {
+        assert!(
+            carries_a_current_framing_marker(marker),
+            "a number this format minted must count toward a file's control: {marker}"
+        );
+    }
+    for not_a_marker in [
+        "// every message on it is exactly one 512-byte record",
+        "/// the slot is 1472 bytes wide",
+        "/// 4720 records fit",
+        "/// a 500 MB anchor is ~1.09 M records",
+        "/// the header is 32-byte and the payload region is 480",
+        "/// 1390 records, which is a different number",
+    ] {
+        assert!(
+            !carries_a_current_framing_marker(not_a_marker),
+            "a number this format did NOT mint must not stand in for one, or a file \
+             that lost its framing prose keeps a green control: {not_a_marker}"
+        );
+    }
+}
+
 /// The frame carve-out exempts the wire frame plane, nothing that merely starts
 /// with the same five letters, and NO arm but the 32-byte header arm it argues
 /// for.
@@ -376,7 +459,7 @@ fn the_reserved_kind_range_doc_names_the_range_that_is_actually_reserved() {
         .expect("state_ring.rs");
     let offenders: Vec<&str> = text
         .lines()
-        .filter(|l| l.contains("4+ reserved") || l.contains("Values 4+ are RESERVED"))
+        .filter(|l| reserves_the_range_this_build_mints(l))
         .collect();
     assert!(
         offenders.is_empty(),
@@ -388,4 +471,41 @@ fn the_reserved_kind_range_doc_names_the_range_that_is_actually_reserved() {
         text.contains("7+ are RESERVED") || text.contains("values 7+ are RESERVED"),
         "the doc must still reserve the range above the kinds this build mints"
     );
+}
+
+/// The reserved-range detector reads the CLAIM rather than one wording of it.
+///
+/// It was two literal phrases, `4+ reserved` and `Values 4+ are RESERVED`, and a
+/// doc saying `4+ is reserved` means exactly the same thing and walked through
+/// both. A phrase list is the wrong shape for a sentence a human writes freely,
+/// so the detector now asks for the two things the claim is made of, the range
+/// and the word, and the control below is the pair: every wording that makes the
+/// claim fires, and the sentence the doc is SUPPOSED to carry does not.
+#[test]
+fn the_reserved_range_detector_reads_the_claim_and_not_one_wording_of_it() {
+    for offender in [
+        "/// Values 4+ are RESERVED.",
+        "/// 4+ reserved.",
+        "/// 4+ is reserved.",
+        "/// 4+ are reserved for a later format.",
+        "// kind 4+ remains reserved",
+    ] {
+        assert!(
+            reserves_the_range_this_build_mints(offender),
+            "a doc that reserves the range this build mints out of must be caught, \
+             however it is worded: {offender}"
+        );
+    }
+    for allowed in [
+        "// version 1 record this build mints; values 7+ are RESERVED.",
+        "/// 7+ is reserved.",
+        "/// kind 4 is the rank-bearing final record",
+        "/// 14+ is reserved, a range nothing here mints",
+    ] {
+        assert!(
+            !reserves_the_range_this_build_mints(allowed),
+            "the detector must not fire on the reservation the doc is supposed to \
+             carry, or the gate reads red on a correct tree: {allowed}"
+        );
+    }
 }
