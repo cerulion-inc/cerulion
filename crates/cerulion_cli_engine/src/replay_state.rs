@@ -467,7 +467,7 @@ fn index_table(coverage: &StateCoverage) -> BTreeMap<u32, String> {
 const FLASHBACK_MANIFEST_ATTACHMENT: &str = "__cerulion/flashback.json";
 
 /// The capture numbers this bag's restore points name, when there is more than
-/// one of them — `None` when the set is whole.
+/// one of them. `None` when the set is whole.
 ///
 /// # Read tolerantly, and every degradation means "not mixed"
 ///
@@ -1205,6 +1205,107 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    /// ORACLE 14, arm (b): the refusal is RESUME SCOPED. A bag whose restore
+    /// points name two captures still RENDERS under `bag info` and still PLAYS
+    /// its frames; only the resume refuses.
+    ///
+    /// The commit's own claim, and the one the arm above cannot make: a reader
+    /// that refused such a bag outright would take an operator's evidence away
+    /// at exactly the moment they need it, so the refusal belongs to
+    /// [`read_bag_anchors`] and to nothing else. This drives the three paths
+    /// apart on ONE bag.
+    ///
+    /// The frame is written with a hand-built wire header and read back BYTE FOR
+    /// BYTE, because "plays" is a claim about the bytes rather than about a count.
+    #[test]
+    fn a_bag_whose_restore_points_name_two_captures_still_renders_and_still_plays() {
+        use cerulion_bag::{BagWriterConfig, TopicSchema};
+
+        const TOPIC: &str = "/imu";
+        const HASH: u64 = 0x1417_1417_1417_1417;
+        let payload = [7u8; 24];
+        let mut frame = vec![0u8; cerulion_core::WireHeader::SIZE + payload.len()];
+        cerulion_core::WireHeader {
+            schema_hash: HASH,
+            total_size: (cerulion_core::WireHeader::SIZE + payload.len()) as u32,
+            offset_table_offset: 0,
+            offset_table_count: 0,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000,
+        }
+        .write_to_buf(&mut frame[..cerulion_core::WireHeader::SIZE]);
+        frame[cerulion_core::WireHeader::SIZE..].copy_from_slice(&payload);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mixed.mcap");
+        {
+            let mut w = cerulion_bag::BagWriter::create(
+                &path,
+                BagWriterConfig::default(),
+                &[TopicSchema {
+                    topic: TOPIC.to_string(),
+                    schema_name: "geometry_msgs/Vector3".to_string(),
+                    schema_hash: HASH,
+                    wire_fixed_size: 24,
+                }],
+            )
+            .expect("create bag");
+            w.write_attachment(
+                STATE_COVERAGE_ATTACHMENT,
+                "application/json",
+                0,
+                0,
+                manifest_json(Some("1"), 1).as_bytes(),
+            )
+            .expect("write the manifest");
+            // The MIXED set: rank 0 selected by capture 7, rank 1 by capture 9.
+            w.write_attachment(
+                FLASHBACK_MANIFEST_ATTACHMENT,
+                "application/json",
+                0,
+                0,
+                flashback_json(&[(0, 7), (1, 9)]).as_bytes(),
+            )
+            .expect("write the flashback manifest");
+            let state_id = w.state_channel_id();
+            let record = this_format_record(0);
+            w.write_chunk(|c| {
+                c.write_message(state_id, 0, 1_000, 1_000, &[&record[..]])?;
+                c.write_message(TOPIC, 0, 1_000_000_000, 1_000_000_000, &[&frame[..]])
+            })
+            .expect("write the records and the frame");
+            w.finalize().expect("finalize");
+        }
+
+        // (1) THE RESUME refuses, by name. The precondition for the other two
+        // halves meaning anything: a bag that was not refused would render and
+        // play for uninteresting reasons.
+        let reader = BagReader::open(&path).expect("open");
+        assert_eq!(
+            read_bag_anchors(&reader).expect_err("a mixed set must refuse the resume"),
+            AnchorReadRefusal::MixedCaptureIdentity {
+                captures: vec![(7, vec![0]), (9, vec![1])],
+            }
+        );
+
+        // (2) `bag info` RENDERS it, and names the topic it holds.
+        let info = crate::bag_cmd::bag_info(&path, None).expect("bag info must still render");
+        assert!(
+            info.contains(TOPIC),
+            "bag info must still name the bag's topic: {info}"
+        );
+
+        // (3) THE FRAMES still play, byte for byte.
+        let index = reader.user_message_index().expect("the user message index");
+        let spans = index.get(TOPIC).expect("the topic's frames");
+        assert_eq!(spans.len(), 1, "one frame was written and one is readable");
+        assert_eq!(
+            reader.frame(&spans[0]),
+            &frame[..],
+            "the carried frame must come back byte for byte"
+        );
     }
 
     /// ORACLE 14, arm (c), ANTI-VACUITY: the SAME bag with both entries at one

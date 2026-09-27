@@ -70,7 +70,7 @@
 //! here is the ceiling currently in force rather than the one the operator set.
 //! And a capture that loses EVERY rank's anchor to it is not written at all, so
 //! the `RetentionCeilingExhausted` reason below is what the REFUSAL is keyed on
-//! when it applies to every rank — there it decides whether a bag exists, not
+//! when it applies to every rank: there it decides whether a bag exists, not
 //! merely what a manifest says.
 //!
 //! # …and STRICTLY NEVER SILENTLY PARTIAL
@@ -266,7 +266,7 @@ pub(crate) fn anchor_payload_bytes(records: &[StateRecord]) -> u64 {
         .sum()
 }
 
-/// Every anchor seen for one `(run_id, ring, step)` — one RANK's half of the
+/// Every anchor seen for one `(run_id, ring, step)`: one RANK's half of the
 /// unit a resim resumes from.
 ///
 /// A resume needs EVERY executed node's state at ONE step (`plan_restore`), so
@@ -278,11 +278,11 @@ pub(crate) fn anchor_payload_bytes(records: &[StateRecord]) -> u64 {
 /// A k-worker run drains k state rings and each rank reaches a step on its own
 /// schedule, so two ranks at step 41 are two independent facts. Folded into one
 /// entry they became "whichever rank admitted first", and that one rank's
-/// checkpoint was then served as the whole graph's state — a set with a hole
+/// checkpoint was then served as the whole graph's state, a set with a hole
 /// and nothing able to say so. Keying by the ring keeps each rank's checkpoint
 /// whole.
 ///
-/// The CROSS-RANK unit — every ring's entry for one `(run_id, step)` — is still
+/// The CROSS-RANK unit (every ring's entry for one `(run_id, step)`) is still
 /// the thing eviction takes and the thing a capture selects a SET from; it is
 /// derived from the key rather than stored, so there is one place the key is
 /// written down.
@@ -296,7 +296,7 @@ pub(crate) fn anchor_payload_bytes(records: &[StateRecord]) -> u64 {
 pub(crate) struct Checkpoint {
     /// The run these anchors belong to.
     pub run_id: u64,
-    /// The SHM name of the ring every anchor here came off — the second
+    /// The SHM name of the ring every anchor here came off, and the second
     /// component of the key.
     pub ring: String,
     /// The anchor step.
@@ -420,7 +420,7 @@ pub(crate) enum NoAnchorReason {
     /// no-anchor reason a capture is REFUSED for: the plane could not hold a
     /// whole generation for anybody, so any bag would be a dashcam clip wearing
     /// the Flashback name, which the never-frames-only rule forbids. The other
-    /// two total absences are still written with an accurate non-resim verdict —
+    /// two total absences are still written with an accurate non-resim verdict:
     /// `NothingRetained` covers a run younger than its first cadence, where the
     /// remedy is to wait rather than to change a knob.
     ///
@@ -520,6 +520,77 @@ pub(crate) struct SelectedAnchor {
     pub capture_seq: u64,
 }
 
+/// The records the production chunker emits for one node's blob, with the
+/// producer RANK stamped into every one of them.
+///
+/// TEST-ONLY, and it lives here rather than in a test module because the arms
+/// that need it are in SIBLING modules: the manifest block a member becomes is
+/// built in `flashback_plane`, and its arms have to hand that builder members
+/// whose rank is a hand-chosen number. Built through the production chunker
+/// rather than hand-framed, so a change to the record format fails in the arm
+/// rather than producing records no reader accepts.
+#[cfg(test)]
+pub(crate) fn ranked_records_for_test(
+    run_id: u64,
+    step: u64,
+    node_idx: u32,
+    rank: u32,
+    blob: &[u8],
+) -> Vec<StateRecord> {
+    let mut out = Vec::new();
+    let mut chunker = cerulion_core::state_ring::StateChunker::new(run_id, step, node_idx, rank);
+    chunker.append(blob, &mut |r| out.push(*r));
+    chunker.finish(&mut |r| out.push(*r));
+    out
+}
+
+/// A hand-built selection member, for the arms in SIBLING modules that judge
+/// what a member BECOMES rather than how one is chosen.
+///
+/// TEST-ONLY. `Checkpoint::bytes` is private to this module because the
+/// retention is the only thing entitled to say what a checkpoint costs, so a
+/// sibling module's arm cannot build one and the alternative to this
+/// constructor is publishing that field to the whole crate.
+///
+/// `anchor_records` is one record vector PER NODE, so an arm can hand over a
+/// member with two nodes, or one whose only anchor carries NO record at all,
+/// which is the shape [`Checkpoint::producer_rank`] answers `None` for.
+#[cfg(test)]
+pub(crate) fn selected_anchor_for_test(
+    ring: &str,
+    run_id: u64,
+    step: u64,
+    taken_at_ns: u64,
+    capture_seq: u64,
+    fit: AnchorFit,
+    anchor_records: Vec<Vec<StateRecord>>,
+) -> SelectedAnchor {
+    let anchors: Vec<RetainedAnchor> = anchor_records
+        .into_iter()
+        .enumerate()
+        .map(|(i, records)| RetainedAnchor {
+            ring: ring.to_string(),
+            node_idx: i as u32,
+            node: Some(format!("n{i}")),
+            kind: AnchorKind::Complete,
+            records: Arc::new(records),
+        })
+        .collect();
+    let bytes = anchors.iter().map(RetainedAnchor::byte_len).sum();
+    SelectedAnchor {
+        checkpoint: Checkpoint {
+            run_id,
+            ring: ring.to_string(),
+            step,
+            taken_at_ns,
+            anchors,
+            bytes,
+        },
+        fit,
+        capture_seq,
+    }
+}
+
 /// What one capture's selection returned: the SET, and the ranks it could not
 /// fill.
 ///
@@ -567,8 +638,8 @@ impl AnchorSelection {
     ///
     /// TEST-ONLY. Production folds the whole set (a k-rank capture has no "the"
     /// checkpoint), so a production caller reaching for one member would be
-    /// publishing one rank's numbers as the capture's — the exact defect the set
-    /// exists to remove.
+    /// publishing one rank's numbers as the capture's, which is the exact defect
+    /// the set exists to remove.
     #[cfg(test)]
     pub(crate) fn sole(&self) -> (&Checkpoint, AnchorFit) {
         assert_eq!(
@@ -624,6 +695,24 @@ pub(crate) struct AnchorWindow {
     /// REFUSED capture must answer to distinguish a ceiling that took everything from a run
     /// that simply never anchored.
     ceiling_refusals: u64,
+    /// The same fact PER RING: how many times the ceiling took or refused
+    /// something belonging to each ring, keyed by the ring's SHM name.
+    ///
+    /// Apart from the window-wide counter because the two answer different
+    /// questions and only one of them can stamp a RANK.
+    /// [`select_one_ring`](Self::select_one_ring) has to tell a rank that never
+    /// anchored from a rank the ceiling emptied, and the window-wide counter
+    /// answers "did the ceiling bite anywhere", so reading it per rank stamped
+    /// the byte ceiling's reason and remedy onto a rank that never anchored
+    /// whenever the ceiling bit for some OTHER rank. That is the shape a k-rank
+    /// run makes ordinary: one big-state rank exhausts the plane while a second
+    /// rank has simply not reached its first cadence.
+    ///
+    /// The two counters are deliberately NOT a sum of one another. This one
+    /// counts a RING's entries, and the window-wide one counts whole
+    /// CHECKPOINTS, so one cross-rank eviction adds 1 there and 1 to each of the
+    /// k rings here. Both readings are true of what they name.
+    ceiling_refusals_by_ring: BTreeMap<String, u64>,
     /// The largest anchor-shaped thing the CEILING has
     /// taken, in bytes. See [`note_refused_bytes`](Self::note_refused_bytes).
     max_refused_bytes: usize,
@@ -662,6 +751,7 @@ impl AnchorWindow {
             declared_nodes: BTreeMap::new(),
             declared_ranks: BTreeMap::new(),
             ceiling_refusals: 0,
+            ceiling_refusals_by_ring: BTreeMap::new(),
             max_refused_bytes: 0,
             max_generation_bytes: 0,
         }
@@ -732,15 +822,6 @@ impl AnchorWindow {
         self.ceiling_refusals
     }
 
-    /// Record that a HARVESTER refused an anchor in flight for exceeding its
-    /// buffer ceiling.
-    ///
-    /// The other half of the same fact: such an anchor never becomes a checkpoint,
-    /// so the window's own eviction can never see it, and a capture would report
-    /// "nothing retained" for a run whose state was captured and refused on cost.
-    /// The harvest reports it here, so ONE counter answers the question wherever
-    /// the ceiling bit.
-    ///
     /// The largest complete generation ever held.
     ///
     /// `None` until one has been measured — the caller must not read a zero as
@@ -770,8 +851,42 @@ impl AnchorWindow {
         self.max_bytes as u64
     }
 
-    pub(crate) fn note_ceiling_refusal(&mut self, refusals: u64) {
+    /// Record that a HARVESTER refused an anchor in flight for exceeding its
+    /// buffer ceiling.
+    ///
+    /// The other half of the same fact: such an anchor never becomes a
+    /// checkpoint, so the window's own eviction can never see it, and a capture
+    /// would report "nothing retained" for a run whose state was captured and
+    /// refused on cost. The harvest reports it here, so the counters answer the
+    /// question wherever the ceiling bit.
+    ///
+    /// `ring` is the SHM name the refused anchor would have been filed under, so
+    /// the rank whose state was refused carries the cause and no other rank
+    /// inherits it. The harvester knows it: the refusal is reported from the
+    /// drain of one ring, and the same name stamps every anchor that drain
+    /// admitted.
+    pub(crate) fn note_ceiling_refusal(&mut self, ring: &str, refusals: u64) {
         self.ceiling_refusals = self.ceiling_refusals.saturating_add(refusals);
+        if refusals > 0 {
+            let seen = self
+                .ceiling_refusals_by_ring
+                .entry(ring.to_string())
+                .or_insert(0);
+            *seen = seen.saturating_add(refusals);
+        }
+    }
+
+    /// Times the ceiling took or refused something belonging to ONE ring.
+    ///
+    /// `0` for a ring the ceiling never touched, which is the reading
+    /// [`select_one_ring`](Self::select_one_ring) needs: a ring holding nothing
+    /// and reading 0 here never anchored, and a ring holding nothing and reading
+    /// more than 0 was emptied.
+    fn ring_ceiling_refusals(&self, ring: &str) -> u64 {
+        self.ceiling_refusals_by_ring
+            .get(ring)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The largest anchor-shaped thing the CEILING has
@@ -800,7 +915,7 @@ impl AnchorWindow {
         self.truncated
     }
 
-    /// The oldest held checkpoint's stamp, or `None` when empty — the MINIMUM
+    /// The oldest held checkpoint's stamp, or `None` when empty. The MINIMUM
     /// over rings.
     ///
     /// Stated as a minimum rather than read off the front, even though the
@@ -892,8 +1007,8 @@ impl AnchorWindow {
         self.note_generation(generation);
     }
 
-    /// The COMPLETE bytes of the whole cross-rank checkpoint at `(run_id, step)`
-    /// — the sum over every ring's entry for that step.
+    /// The COMPLETE bytes of the whole cross-rank checkpoint at `(run_id, step)`,
+    /// which is the sum over every ring's entry for that step.
     ///
     /// Not the sum over every RETAINED step: the reserve has to hold one
     /// generation at a time, and summing the retention would size it for the
@@ -925,7 +1040,7 @@ impl AnchorWindow {
     /// unusable: a resume needs a member per rank, so a step missing one rank
     /// restores nothing while still costing the retention the other k-1 ranks'
     /// bytes. Whole-step eviction also keeps the two counters meaning what they
-    /// say — `aged` and `truncated` count CHECKPOINTS, and a per-entry count
+    /// say: `aged` and `truncated` count CHECKPOINTS, and a per-entry count
     /// would multiply both by k on the same run.
     ///
     /// # The CARRY
@@ -954,13 +1069,28 @@ impl AnchorWindow {
             None => now_ns.saturating_sub(self.span_ns),
         };
         // Every cross-rank checkpoint strictly older than the horizon is a
-        // candidate; the NEWEST of those is the carry and stays. So drop while at
-        // least TWO are below the horizon.
-        while self.aged_below(horizon) >= 2 {
-            if !self.pop_front_counting() {
-                break;
+        // candidate; the NEWEST of those is the carry and stays. The candidates
+        // are evicted BY GENERATION IDENTITY, and that is not a refactor: this
+        // arm used to ask HOW MANY generations had aged and then drop whatever
+        // sat at the FRONT of the deque, which are answers to two different
+        // questions. A generation is judged aged by its NEWEST entry
+        // ([`generations_to_age`](Self::generations_to_age)); the front of the
+        // deque is the globally OLDEST ENTRY, and under free run that entry
+        // belongs to a generation that STRADDLES the horizon. A slow rank's
+        // step-41 anchor is stamped after a fast rank's step-42 one and lands
+        // behind it, so step 41's own oldest entry can be the oldest entry in
+        // the whole queue while step 41's newest is still inside the window. The
+        // count then said "two generations have aged" and the pop took the
+        // straddling one, so a slow rank's ONLY checkpoint went while the window
+        // still covered it, and the generation the horizon really named stayed.
+        //
+        // Popping by identity closes that: exactly the generations the horizon
+        // test named go, whole, and the carry rule is unchanged because
+        // `generations_to_age` withholds the newest aged-out generation itself.
+        for (run_id, step) in self.generations_to_age(horizon) {
+            if !self.pop_generation(run_id, step).is_empty() {
+                report.aged += 1;
             }
-            report.aged += 1;
         }
 
         // (2) BYTES. The backstop; the carry has no exemption here either.
@@ -985,10 +1115,23 @@ impl AnchorWindow {
             // one ring's entry is the figure divided by k.
             let refused_bytes = self.generation_complete_bytes(oldest.0, oldest.1) as u64;
             self.note_refused_bytes(refused_bytes);
-            if !self.pop_front_counting() {
-                // Nothing went, and the loop would otherwise spin — breaking is
+            let dropped = self.pop_generation(oldest.0, oldest.1);
+            if dropped.is_empty() {
+                // Nothing went, and the loop would otherwise spin. Breaking is
                 // what stops this being an infinite loop.
                 break;
+            }
+            // PER RING as well as window-wide. A rank that never anchored holds
+            // nothing and a rank the ceiling emptied holds nothing, and
+            // `select_one_ring` has to tell those two apart to stamp the right
+            // reason and the right remedy onto the rank. The window-wide counter
+            // cannot: it answers "did the ceiling bite ANYWHERE", so reading it
+            // per rank stamped every silent rank with the byte ceiling's sentence
+            // the moment the ceiling bit for one OTHER rank. Each ring whose
+            // entry actually went is counted here instead, so the reason a rank
+            // is given is a fact about THAT rank.
+            for ring in dropped {
+                *self.ceiling_refusals_by_ring.entry(ring).or_insert(0) += 1;
             }
             // ONE refusal for the whole cross-rank checkpoint, not k. The counter
             // answers "how many CHECKPOINTS did the ceiling take", which is the
@@ -1024,45 +1167,81 @@ impl AnchorWindow {
         report
     }
 
-    /// How many whole CROSS-RANK checkpoints sit strictly below `horizon`.
+    /// The NEWEST instant each whole CROSS-RANK checkpoint carries, keyed by
+    /// `(run_id, step)`.
     ///
-    /// Distinct `(run_id, step)` pairs, not deque entries: with k rings a
-    /// per-entry count reads k times the real number, so the age arm would drop
-    /// k-1 generations too many and the carry would be gone.
+    /// Distinct `(run_id, step)` pairs, never deque entries: with k rings a
+    /// per-entry reading counts k times, so the age arm would drop k-1
+    /// generations too many and the carry would be gone.
     ///
-    /// A generation counts as below the horizon only when its NEWEST entry is.
-    /// The entries of one step are not contiguous in the queue — a slow rank's
-    /// step-41 anchor is stamped after a fast rank's step-42 one and lands
-    /// behind it — so a step can straddle the horizon, and taking the whole step
-    /// off the strength of its OLDEST entry would evict an entry the window
-    /// still covers.
-    fn aged_below(&self, horizon: u64) -> usize {
+    /// The NEWEST entry is what decides a generation's age, and that is the
+    /// conservative direction. The entries of one step are not contiguous in the
+    /// queue: a slow rank's step-41 anchor is stamped after a fast rank's
+    /// step-42 one and lands behind it, so a step can STRADDLE the horizon, and
+    /// judging the whole step by its OLDEST entry would evict an entry the
+    /// window still covers.
+    fn newest_per_generation(&self) -> BTreeMap<(u64, u64), u64> {
         let mut newest: BTreeMap<(u64, u64), u64> = BTreeMap::new();
         for c in &self.checkpoints {
             let seen = newest.entry((c.run_id, c.step)).or_insert(0);
             *seen = (*seen).max(c.taken_at_ns);
         }
-        newest.values().filter(|ns| **ns < horizon).count()
+        newest
     }
 
-    /// Drop the OLDEST whole cross-rank checkpoint — every ring's entry for the
-    /// front entry's `(run_id, step)`. `false` when there was none.
+    /// The generations the AGE arm must take, OLDEST FIRST, with the carry
+    /// already withheld.
+    ///
+    /// IDENTITIES rather than a count, and that is the point of the function. A
+    /// count can only be spent by popping something, and the only thing an
+    /// eviction loop can pop without an identity is the front of the deque,
+    /// which is the globally oldest ENTRY rather than an entry of a generation
+    /// this test named. Returning the identities makes the horizon test and the
+    /// drop the same decision.
+    ///
+    /// THE CARRY is the last element removed here, not a special case at the
+    /// call site: the candidates are ordered by their own newest instant, so the
+    /// last of them IS the newest generation that has aged out, and dropping it
+    /// from the list is what keeps it retained. That is the `+1` in
+    /// `⌈W/C⌉ + 1`, for the reason [`evict`](Self::evict) states.
+    fn generations_to_age(&self, horizon: u64) -> Vec<(u64, u64)> {
+        let mut below: Vec<((u64, u64), u64)> = self
+            .newest_per_generation()
+            .into_iter()
+            .filter(|(_, ns)| *ns < horizon)
+            .collect();
+        // Ascending by the generation's OWN newest instant, with the identity as
+        // the tie-break so the order is total and two generations stamped at one
+        // instant cannot swap between passes.
+        below.sort_by_key(|(key, ns)| (*ns, *key));
+        // The newest aged-out generation is the CARRY and stays.
+        below.pop();
+        below.into_iter().map(|(key, _)| key).collect()
+    }
+
+    /// Drop the whole cross-rank checkpoint at `(run_id, step)`, every ring's
+    /// entry for it, and answer with the RINGS whose entries went.
+    ///
+    /// Empty means nothing went, which is what stops the byte arm spinning.
     ///
     /// The whole queue is walked rather than only its head, because the entries
-    /// of one step are not contiguous (see [`aged_below`](Self::aged_below)).
-    /// Order is preserved for the survivors, which is what keeps the queue
-    /// ascending for eviction and selection.
-    fn pop_front_counting(&mut self) -> bool {
-        let Some(front) = self.checkpoints.front() else {
-            return false;
-        };
-        let key = (front.run_id, front.step);
+    /// of one step are not contiguous (see
+    /// [`newest_per_generation`](Self::newest_per_generation)). Order is
+    /// preserved for the survivors, which is what keeps the queue ascending for
+    /// eviction and selection.
+    ///
+    /// The ring names are returned rather than counted, because the BYTE arm
+    /// owes each ring a refusal record of its own: a ring that lost an entry
+    /// here is a ring whose emptiness has the ceiling as its cause, and a ring
+    /// that lost nothing must not inherit that cause.
+    fn pop_generation(&mut self, run_id: u64, step: u64) -> Vec<String> {
+        let key = (run_id, step);
         let mut kept = VecDeque::with_capacity(self.checkpoints.len());
-        let mut dropped = false;
+        let mut dropped: Vec<String> = Vec::new();
         while let Some(c) = self.checkpoints.pop_front() {
             if (c.run_id, c.step) == key {
                 self.bytes -= c.bytes;
-                dropped = true;
+                dropped.push(c.ring);
             } else {
                 kept.push_back(c);
             }
@@ -1071,7 +1250,7 @@ impl AnchorWindow {
         dropped
     }
 
-    /// Choose the SET of checkpoints a capture should carry — one per rank.
+    /// Choose the SET of checkpoints a capture should carry, one per rank.
     ///
     /// `floor_ns` is the capture's own frame floor and `deadline_ns` is the
     /// instant its CLAIMED pre-window starts (`capture_start − post_window`).
@@ -1087,12 +1266,12 @@ impl AnchorWindow {
     ///    the result would be a divergence caused by the recording rather than
     ///    by the code under test.
     /// 2. A candidate must be one
-    ///    ([`checkpoint_is_complete`](Self::checkpoint_is_complete)) — see that
+    ///    ([`checkpoint_is_complete`](Self::checkpoint_is_complete)). See that
     ///    doc for why a partial checkpoint and an all-declined one both are.
     ///    A rank with no candidate contributes NOTHING and is named in
     ///    `shortfall` with its reason, rather than being silently omitted and
     ///    leaving the set with a hole nothing accounts for.
-    /// 3. Among candidates, the NEWEST at or before `deadline_ns` — so a resume
+    /// 3. Among candidates, the NEWEST at or before `deadline_ns`, so a resume
     ///    covers the whole window the capture claims, and re-executes no more
     ///    than it has to.
     /// 4. If none reaches the deadline, the OLDEST candidate: the most coverage
@@ -1106,8 +1285,8 @@ impl AnchorWindow {
     /// other, so a set whose members sit at steps 41 and 44 is a correct set
     /// rather than a refusal. A graph-wide simultaneous cut is not something the
     /// recorder can produce without stopping every rank, and the downstream
-    /// repair — positioning each CONSUMING rank's read log, with the clock as
-    /// the fallback — is what makes the non-simultaneous cut resumable.
+    /// repair (positioning each CONSUMING rank's read log, with the clock as the
+    /// fallback) is what makes the non-simultaneous cut resumable.
     ///
     /// # The ring UNIVERSE, and why it is not read off the held checkpoints
     ///
@@ -1193,7 +1372,7 @@ impl AnchorWindow {
     /// Because a rank whose every node VOIDED is exactly the rank an operator
     /// most needs named. Its checkpoint restores no state, but it carries the
     /// skip markers that say WHY, and dropping it from the set drops that ring
-    /// from the capture's ring-to-rank map — so the declining rank disappears
+    /// from the capture's ring-to-rank map, so the declining rank disappears
     /// from the manifest instead of being reported in it, which is the evidence
     /// the retention keeps skips for.
     /// [`a_rank_whose_every_node_declined_is_still_selected_so_the_skip_is_reported`]
@@ -1245,7 +1424,17 @@ impl AnchorWindow {
             // apply, or one whose anchors the ceiling took. Different facts,
             // different remedies, and the Q8 stamp prints them as two different
             // sentences.
-            return Err(if self.ceiling_refusals > 0 && held == 0 {
+            //
+            // Read off THIS RING's own refusal record, never the window-wide
+            // counter. Plan section 2.1's Q8 row requires the reason to be
+            // carried from that ring's own `select` outcome, and the window-wide
+            // counter cannot carry it: it answers "did the ceiling bite
+            // anywhere", so a rank that had simply not reached its first cadence
+            // was stamped with the byte ceiling's reason and its remedy the
+            // moment the ceiling bit for any OTHER rank. An operator was then
+            // sent to `CERULION_FLASHBACK_ANCHOR_MAX_MB` for a rank whose answer
+            // was to wait.
+            return Err(if self.ring_ceiling_refusals(ring) > 0 && held == 0 {
                 NoAnchorReason::RetentionCeilingExhausted
             } else {
                 NoAnchorReason::NothingRetained
@@ -2439,7 +2628,7 @@ mod tests {
             Some(NoAnchorReason::NothingRetained),
             "precondition: nothing has been refused yet"
         );
-        w.note_ceiling_refusal(1);
+        w.note_ceiling_refusal("rank0", 1);
         assert_eq!(
             w.select(0, u64::MAX, CAPTURE).err(),
             Some(NoAnchorReason::RetentionCeilingExhausted),
@@ -3113,8 +3302,185 @@ mod tests {
         assert_eq!(w.refused_bytes_floor(), Some(1024));
     }
 
+    /// The AGE arm evicts exactly the generations the HORIZON named, whole, and
+    /// a generation that STRADDLES the horizon is NOT one of them.
+    ///
+    /// The fixture is the free-run shape the module doc describes. Step 41's
+    /// fast rank is stamped at 500 ms and its SLOW rank at 12,000 ms, so step
+    /// 41's own OLDEST entry is the oldest entry in the whole queue while step
+    /// 41's NEWEST entry is still inside the window. Steps 42 and 43 are wholly
+    /// below the horizon, and step 44 is wholly above it. Every instant is
+    /// written out.
+    ///
+    /// The expected answer is computed BY HAND from the horizon rather than from
+    /// the code: 40,000 ms minus the 30,000 ms span is 10,000 ms, steps 42
+    /// (newest 1,100 ms) and 43 (newest 2,100 ms) are the two generations below
+    /// it, 43 is the newer of the two and is the CARRY, so exactly step 42 goes
+    /// and `aged` reads 1.
+    ///
+    /// # The arm that fails if the loop pops the FRONT of the deque
+    ///
+    /// The front is step 41's fast-rank entry, so a front pop takes step 41
+    /// WHOLE, including the slow rank's 12,000 ms checkpoint that the window
+    /// still covers. The count then still reads two generations below the
+    /// horizon, so the loop goes round again and takes step 42 as well: `aged`
+    /// reads 2, and rank 1's only step-41 checkpoint is gone from a retention
+    /// whose span still promises it.
+    #[test]
+    fn the_age_arm_takes_the_generations_the_horizon_named_and_not_a_straddler() {
+        let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
+        // The straddler's FAST rank, and the oldest entry in the queue.
+        w.admit(500 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
+        // Two generations wholly below the horizon.
+        w.admit(1_000 * MS, rank_anchor(0, 7, 42, 0, &[1; 64]));
+        w.admit(1_100 * MS, rank_anchor(1, 7, 42, 0, &[2; 64]));
+        w.admit(2_000 * MS, rank_anchor(0, 7, 43, 0, &[1; 64]));
+        w.admit(2_100 * MS, rank_anchor(1, 7, 43, 0, &[2; 64]));
+        // The straddler's SLOW rank, stamped after step 43's entries and landing
+        // behind them, which is what makes step 41 straddle the horizon.
+        w.admit(12_000 * MS, rank_anchor(1, 7, 41, 0, &[2; 64]));
+        // One generation wholly above it.
+        w.admit(13_000 * MS, rank_anchor(0, 7, 44, 0, &[1; 64]));
+        w.admit(14_000 * MS, rank_anchor(1, 7, 44, 0, &[2; 64]));
+        assert_eq!(w.bytes(), 4096, "precondition: eight 512-byte entries");
+
+        // The BYTE arm cannot fire: the ceiling is a gibibyte.
+        let report = w.evict(40_000 * MS, None);
+
+        assert_eq!(
+            report.aged, 1,
+            "step 42 aged; step 43 is the carry and step 41 straddles the horizon"
+        );
+        assert_eq!(report.truncated, 0);
+        let held: Vec<(u64, &str, u64)> = w
+            .checkpoints
+            .iter()
+            .map(|c| (c.step, c.ring.as_str(), c.taken_at_ns / MS))
+            .collect();
+        assert_eq!(
+            held,
+            vec![
+                (41, "rank0", 500),
+                (43, "rank0", 2_000),
+                (43, "rank1", 2_100),
+                (41, "rank1", 12_000),
+                (44, "rank0", 13_000),
+                (44, "rank1", 14_000),
+            ],
+            "only step 42's two entries went, and the survivors kept their order"
+        );
+        // Stated apart, because it is the defect rather than a consequence of it:
+        // the slow rank's ONLY checkpoint for step 41 is still held.
+        assert!(
+            w.checkpoints
+                .iter()
+                .any(|c| c.step == 41 && c.ring == "rank1" && c.taken_at_ns == 12_000 * MS),
+            "a checkpoint the window still covers must never be evicted by the AGE arm"
+        );
+        assert_eq!(w.bytes(), 3072, "bytes fell by step 42's two entries only");
+        assert_eq!(w.aged(), 1);
+        assert_eq!(w.ceiling_refusals(), 0, "the byte arm never fired");
+    }
+
+    /// The per-rank shortfall reason is carried from THAT RING's OWN select
+    /// outcome, so a ceiling that bit one ring never stamps another ring's
+    /// absence.
+    ///
+    /// Plan section 2.1's Q8 row requires exactly this: the reason a rank is
+    /// stamped with is carried from that ring's own outcome, so the three
+    /// reasons reach a reader as three sentences with three remedies.
+    ///
+    /// Three rings, all hand built. `rank0` anchored twice and the byte ceiling
+    /// took both generations; `rank1` never anchored at all; `rank2` holds a live
+    /// checkpoint, which is what keeps the selection NON-EMPTY so the shortfall
+    /// is readable at all (a selection with no member returns the worst reason as
+    /// an `Err` and no per-rank stamp ever reaches a manifest).
+    ///
+    /// # The arm that fails if the reason is read off the WINDOW-WIDE counter
+    ///
+    /// `ceiling_refusals()` reads 2 here, and it is asserted so that the arm
+    /// cannot pass by the ceiling having failed to bite. Read per rank, that
+    /// counter stamps rank 1 with `RetentionCeilingExhausted` and sends an
+    /// operator to the memory knob for a rank whose whole answer is to wait.
+    /// The REMEDIES are asserted whole and required distinct, because two causes
+    /// rendering one sentence is the defect the stamp exists to prevent.
+    #[test]
+    fn the_ceiling_biting_one_ring_never_stamps_another_rings_absence() {
+        let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
+        w.declare_ring_nodes("rank0", 0, &["r0n0".to_string()]);
+        w.declare_ring_nodes("rank1", 1, &["r1n0".to_string()]);
+        w.declare_ring_nodes("rank2", 2, &["r2n0".to_string()]);
+        w.admit(1_000 * MS, rank_anchor(0, 7, 40, 0, &[1; 64]));
+        w.admit(2_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
+        w.admit(3_000 * MS, rank_anchor(2, 7, 42, 0, &[3; 64]));
+        assert_eq!(w.bytes(), 1536, "precondition: three 512-byte entries");
+
+        // Room for ONE entry. The clock is younger than the span, so the horizon
+        // is 0 and only the BYTE arm can fire.
+        w.set_max_bytes(512);
+        w.evict(4_000 * MS, None);
+        assert_eq!(w.bytes(), 512, "both of rank 0's generations went");
+        assert_eq!(
+            w.ceiling_refusals(),
+            2,
+            "precondition: the WINDOW-WIDE counter has bitten twice, which is what a \
+             window-wide reading would spread onto rank 1"
+        );
+
+        let selection = w.select(0, 4_000 * MS, CAPTURE).expect("rank 2 answers");
+        assert_eq!(
+            selection.selected.keys().collect::<Vec<_>>(),
+            vec!["rank2"],
+            "only the ring holding a checkpoint contributes a member"
+        );
+        assert_eq!(
+            selection.shortfall.get("rank0"),
+            Some(&MissingRank {
+                rank: Some(0),
+                reason: NoAnchorReason::RetentionCeilingExhausted,
+            }),
+            "the ring the ceiling emptied says the CEILING"
+        );
+        assert_eq!(
+            selection.shortfall.get("rank1"),
+            Some(&MissingRank {
+                rank: Some(1),
+                reason: NoAnchorReason::NothingRetained,
+            }),
+            "the ring that never anchored says it never anchored, whatever the ceiling did \
+             to another ring"
+        );
+        // The two REMEDIES, written out whole and required distinct: a stamp that
+        // named the right reason and rendered one sentence would still send an
+        // operator to the wrong knob.
+        assert_eq!(
+            NoAnchorReason::RetentionCeilingExhausted.rank_remedy(),
+            "the retention's byte ceiling took this rank's checkpoints: raise the anchor \
+             ceiling so the plane can hold one whole checkpoint generation"
+        );
+        assert_eq!(
+            NoAnchorReason::NothingRetained.rank_remedy(),
+            "this rank retained no checkpoint: it published no state ring, its plane was \
+             refused at arm time, or it had not reached its first anchor cadence when the \
+             capture was triggered"
+        );
+    }
+
     /// ORACLE 6, the RETENTION half: a lockstep (one ring) retention answers
     /// exactly what it answered before the set existed.
+    ///
+    /// The retention's half of oracle 6 IS byte identical and is asserted as
+    /// such: one member, the same checkpoint, the same step, instant, counts,
+    /// bytes and fit the parent returned, and every lifetime counter at 0.
+    ///
+    /// The MANIFEST's half is weaker and is stated where it lives, in
+    /// `flashback_plane`'s
+    /// `a_k1_manifest_is_the_parents_plus_exactly_the_two_additive_keys`: a k=1
+    /// manifest is the parent's plus EXACTLY the two additive keys, because
+    /// `per_rank` and `missing_ranks` are emitted unconditionally so that a
+    /// reader never has to guess why a block is absent. The plan's "byte
+    /// identical" is therefore true of the selection and of the trim, and true
+    /// of the manifest apart from those two keys.
     #[test]
     fn a_lockstep_retention_selects_one_member_with_the_parents_numbers() {
         let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
@@ -3146,7 +3512,11 @@ mod tests {
         w.declare_ring_nodes("rank0", 0, &["r0n0".to_string()]);
         w.declare_ring_nodes("rank1", 1, &["r1n0".to_string()]);
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
-        w.note_ceiling_refusal(1);
+        // The refusal is attributed to the RING it happened on, which is what
+        // lets rank 1 be stamped with the ceiling rather than with silence. See
+        // `the_ceiling_biting_one_ring_never_stamps_another_rings_absence` for
+        // the arm that fails if this reason is read off a window-wide counter.
+        w.note_ceiling_refusal("rank1", 1);
 
         let selection = w.select(0, 20_000 * MS, CAPTURE).expect("rank 0 answers");
         assert_eq!(selection.selected.keys().collect::<Vec<_>>(), vec!["rank0"]);

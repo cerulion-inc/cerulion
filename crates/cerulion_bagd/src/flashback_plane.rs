@@ -2094,6 +2094,150 @@ pub(crate) struct CaptureManifest<'a> {
 /// `embedded` says what state is IN the bag, and `resimmable` says whether this
 /// bag can be resumed from it. A reader is never left to infer the second from
 /// the first.
+/// Build the manifest's PER-RANK block from the selected set, EXHAUSTIVELY, or
+/// name the reason it cannot be built.
+///
+/// # Why exhaustiveness is a refusal rather than a repair
+///
+/// [`AnchorReport::Embedded::per_rank`]'s own doc says the block is exhaustive
+/// with `missing_ranks` over every ring the retention knows about, and the
+/// recorder's rule is STRICTLY NEVER SILENTLY PARTIAL. A member that reached
+/// neither map is a hole in a written capture with no sentence beside it, which
+/// is the one outcome the anchor plane exists to make impossible. So each of the
+/// two ways the keying can fail refuses the whole capture BY NAME.
+///
+/// The keying is by the rank read off the member's OWN records rather than by a
+/// counter or by the ring's position, because the rank is a fact the producer
+/// stamped into every record and the ring-to-rank join the rest of the bag is
+/// keyed by is read the same way. The manifest's per-rank block and
+/// `state_coverage.json`'s therefore cannot name different ranks for one ring.
+///
+/// * A member whose records carry NO READABLE RANK cannot be filed at all.
+///   Filing it under a guessed rank 0 would put two rings in one entry and lose
+///   one of them; dropping it would publish a set SMALLER than the one the
+///   retention selected, and since the trim reads its per-rank cuts off this
+///   map, the dropped rank's records would then be cut at another rank's step.
+/// * TWO RINGS resolving to ONE RANK would collapse into a single entry, because
+///   the map is keyed by rank. One ring's numbers would be published as the
+///   other's and the second member would vanish with nothing said.
+///
+/// Neither is a shape the harvester produces, which is why each is a refusal
+/// rather than a repair: there is no correct capture to write, and the run is
+/// misconfigured or its records are damaged in a way an operator has to be told
+/// about.
+pub(crate) fn build_per_rank_block(
+    members: &[&crate::anchor_window::SelectedAnchor],
+    achieved_from_ns: Option<u64>,
+) -> Result<std::collections::BTreeMap<u32, RankAnchor>, String> {
+    let mut per_rank: std::collections::BTreeMap<u32, RankAnchor> =
+        std::collections::BTreeMap::new();
+    let mut ring_of_rank: std::collections::BTreeMap<u32, String> =
+        std::collections::BTreeMap::new();
+    for m in members {
+        let ring = m.checkpoint.ring.clone();
+        let Some(rank) = m.checkpoint.producer_rank() else {
+            return Err(format!(
+                "the checkpoint selected for state ring {ring} carries no readable producer \
+                 rank, so this capture could not name every rank it holds and was NOT written. \
+                 Fix: check that this ring's records are undamaged and that every worker writes \
+                 the current state record format"
+            ));
+        };
+        if let Some(first) = ring_of_rank.insert(rank, ring.clone()) {
+            return Err(format!(
+                "state rings {first} and {ring} both report rank {rank}, so this capture's \
+                 per-rank restore points would collapse into one and it was NOT written. Fix: \
+                 give every worker of a run its own rank"
+            ));
+        }
+        // Measured from the SAME achieved reach the folded scalars are, against
+        // THIS rank's own instant: a rank whose member sits before the reach and
+        // one whose member sits after it are the two sides the pair exists to
+        // tell apart, and a fold cannot show both at once.
+        let (before_ms, missing_ms) = rank_anchor_spans(achieved_from_ns, m.checkpoint.taken_at_ns);
+        per_rank.insert(
+            rank,
+            RankAnchor {
+                capture_seq: m.capture_seq,
+                step: m.checkpoint.step,
+                taken_at_ns: m.checkpoint.taken_at_ns,
+                nodes: m.checkpoint.anchors.len(),
+                complete: m.checkpoint.complete_anchors(),
+                records: m.checkpoint.record_count(),
+                fit: m.fit,
+                frames_before_anchor_ms: before_ms,
+                frames_missing_after_anchor_ms: missing_ms,
+            },
+        );
+    }
+    Ok(per_rank)
+}
+
+/// ONE rank's pair of frame-span figures, measured against the capture's
+/// ACHIEVED reach.
+///
+/// `(frames_before_anchor_ms, frames_missing_after_anchor_ms)`. For a single
+/// rank at most one of the two can be nonzero, because the rank's instant is
+/// either at or after the reach or before it and cannot be both.
+///
+/// Its own function because the same arithmetic serves three callers (the
+/// folded scalars, each per-rank entry, and this module's arms), and three
+/// copies of a saturating subtraction is how a rank ends up reporting a span
+/// measured from a different origin than the capture's.
+pub(crate) fn rank_anchor_spans(achieved_from_ns: Option<u64>, taken_at_ns: u64) -> (u64, u64) {
+    // No frames at all: there is no reach to measure from, so both figures are
+    // 0 and the manifest's `achieved_from_ns: null` beside them is what says
+    // why. Inventing a span here would be a claim about a bag with nothing in
+    // it.
+    let Some(from) = achieved_from_ns else {
+        return (0, 0);
+    };
+    (
+        taken_at_ns.saturating_sub(from) / 1_000_000,
+        from.saturating_sub(taken_at_ns) / 1_000_000,
+    )
+}
+
+/// The two SPAN scalars a capture publishes, folded over the whole SET.
+///
+/// # The rule: each scalar is the LARGEST over the ranks, INDEPENDENTLY
+///
+/// Plan section 2.1 assigns these two the CONSERVATIVE EXTREME, which is the
+/// largest missing span over the ranks, on the same reasoning that made the
+/// scalar covered range the earliest rank's. A resume is only as good as its
+/// worst-served rank: if one rank needs 6 seconds of frames the bag does not
+/// carry, the CAPTURE needs them, whatever the other ranks' members sit at.
+///
+/// The two are folded APART rather than both read off one chosen member. Read
+/// off the LATEST member, `frames_missing_after_anchor_ms` takes that member's
+/// figure, which is the SMALLEST of them: a capture whose slowest rank needs 6
+/// seconds of absent frames would publish 0 and claim a completeness no rank
+/// has. Read off the earliest, `frames_before_anchor_ms` understates by the
+/// same mechanism in the other direction.
+///
+/// # What that costs, stated rather than hidden
+///
+/// For k=1 the two rules are the same number and the field docs' "at most one
+/// of the two is nonzero" holds exactly as it did. For k>1 BOTH may read
+/// nonzero, and that is the honest report of a set that STRADDLES the achieved
+/// reach: one rank's member sits inside the frames the bag carries and
+/// another's sits before them. A reader that needs to know which side a
+/// particular rank is on reads that rank's own entry in `per_rank`, which is
+/// what the per-rank block is for.
+pub(crate) fn fold_anchor_spans(achieved_from_ns: Option<u64>, taken_at_ns: &[u64]) -> (u64, u64) {
+    let before = taken_at_ns
+        .iter()
+        .map(|at| rank_anchor_spans(achieved_from_ns, *at).0)
+        .max()
+        .unwrap_or(0);
+    let missing = taken_at_ns
+        .iter()
+        .map(|at| rank_anchor_spans(achieved_from_ns, *at).1)
+        .max()
+        .unwrap_or(0);
+    (before, missing)
+}
+
 /// ONE rank's member of the anchor set, as the manifest reports it.
 ///
 /// # Why every scalar is repeated here
@@ -2241,8 +2385,12 @@ pub(crate) enum AnchorReport {
         /// Measured from the ACHIEVED reach, not from the claimed
         /// floor. Under a biting byte ceiling the floor is frozen where the
         /// trigger put it while the frames behind it have been evicted, so a
-        /// floor-relative figure OVERSTATES — it counts a stretch of recording
+        /// floor-relative figure OVERSTATES: it counts a stretch of recording
         /// the bag does not carry as recording a resume will skip.
+        ///
+        /// Over a k-rank set this is the LARGEST of the ranks' own figures, the
+        /// conservative extreme the plan assigns both span scalars. See
+        /// [`fold_anchor_spans`] for the rule and for what it costs.
         frames_before_anchor_ms: u64,
         /// How much of the anchor's FORWARD span the bag is
         /// MISSING, in ms — `max(0, achieved_from − anchor_stamp)`.
@@ -2250,10 +2398,16 @@ pub(crate) enum AnchorReport {
         /// The complement of the field above, and the one the anchor accuracy rule
         /// exists for: a resume re-executes from the anchor
         /// onward, so frames between the anchor and the bag's achieved reach are
-        /// frames the resume needs and the bag does not have. At most one of the
-        /// two is nonzero — the anchor is either inside the achieved range or
-        /// before it — so a reader sees which side the gap is on without
-        /// arithmetic.
+        /// frames the resume needs and the bag does not have.
+        ///
+        /// Over a k-rank set this is the LARGEST of the ranks' own figures, the
+        /// conservative extreme: a capture needs the frames its worst-served
+        /// rank needs. For a lockstep or k=1 capture at most one of the two is
+        /// nonzero, since one instant is either inside the achieved range or
+        /// before it, and a reader sees which side the gap is on without
+        /// arithmetic. For k>1 BOTH may read nonzero, because the set can
+        /// straddle the reach, and the rank that is on each side is named in
+        /// `per_rank`. See [`fold_anchor_spans`].
         ///
         /// Both are 0 for a capture carrying NO frames: there is no reach to
         /// measure from, nothing in the bag predates the anchor, and nothing
@@ -2994,6 +3148,289 @@ mod tests {
         );
     }
 
+    /// The folded SPAN scalars are the LARGEST over the ranks, each folded on its
+    /// own, and NOT the latest member's pair.
+    ///
+    /// Two ranks with different spans, every number written out. The achieved
+    /// reach is 10,000 ms. Rank A's member sits at 4,000 ms, so it is 6,000 ms
+    /// BEFORE the reach and needs 6,000 ms of frames the bag does not carry.
+    /// Rank B's sits at 13,000 ms, so 3,000 ms of the bag's frames sit before it
+    /// and none are missing. The conservative extreme the plan assigns is
+    /// therefore `(3_000, 6_000)`: the capture needs what its worst-served rank
+    /// needs.
+    ///
+    /// # The arm that fails on the latest member's pair
+    ///
+    /// The latest member is rank B at 13,000 ms and its pair is `(3_000, 0)`, so
+    /// `frames_missing_after_anchor_ms` would read 0 and the manifest would claim
+    /// a completeness NO rank has. `frames_before_anchor_ms` agrees between the
+    /// two rules here by construction, which is why the arm asserts the pair
+    /// rather than one figure: a rule that is right about one half is not the
+    /// rule.
+    ///
+    /// The k=1 IDENTITY is asserted beside it, because the whole additive claim
+    /// rests on it: over a one-member set the fold is that member's own pair, so
+    /// a lockstep capture's two scalars are unchanged.
+    #[test]
+    fn the_folded_spans_are_the_largest_over_the_ranks_not_the_latest_members() {
+        const REACH: u64 = 10_000_000_000;
+        const RANK_A: u64 = 4_000_000_000;
+        const RANK_B: u64 = 13_000_000_000;
+
+        // The two per-rank pairs, by hand.
+        assert_eq!(rank_anchor_spans(Some(REACH), RANK_A), (0, 6_000));
+        assert_eq!(rank_anchor_spans(Some(REACH), RANK_B), (3_000, 0));
+
+        assert_eq!(
+            fold_anchor_spans(Some(REACH), &[RANK_A, RANK_B]),
+            (3_000, 6_000),
+            "each scalar is the LARGEST over the ranks, folded apart"
+        );
+        // Order cannot matter: the set is a map and its walk order is the ring
+        // order, which is not the instant order.
+        assert_eq!(
+            fold_anchor_spans(Some(REACH), &[RANK_B, RANK_A]),
+            (3_000, 6_000)
+        );
+
+        // THE k=1 IDENTITY, both ways round.
+        assert_eq!(
+            fold_anchor_spans(Some(REACH), &[RANK_A]),
+            rank_anchor_spans(Some(REACH), RANK_A)
+        );
+        assert_eq!(
+            fold_anchor_spans(Some(REACH), &[RANK_B]),
+            rank_anchor_spans(Some(REACH), RANK_B)
+        );
+        // NO FRAMES: there is no reach to measure from, so both are 0 whatever
+        // the set holds, and `achieved_from_ns: null` is what says why.
+        assert_eq!(fold_anchor_spans(None, &[RANK_A, RANK_B]), (0, 0));
+    }
+
+    /// A member whose records carry NO READABLE RANK refuses the capture BY NAME.
+    ///
+    /// The refusal sentence is asserted as literal substrings rather than against
+    /// a second `format!`: a message tested against its own formatter passes for
+    /// any wording, including one that never names the ring.
+    ///
+    /// The arm that fails if such a member is silently dropped from the block.
+    /// Dropped, the block would publish ONE entry for a TWO-member set, the
+    /// trim would cut the dropped rank's records at the surviving rank's step,
+    /// and the bag would carry a rank in neither `per_rank` nor `missing_ranks`.
+    #[test]
+    fn a_member_with_no_readable_rank_refuses_the_capture_by_name() {
+        // A member whose sole anchor carries NO record at all, which is the one
+        // shape `Checkpoint::producer_rank` answers `None` for.
+        let unrankable = crate::anchor_window::selected_anchor_for_test(
+            "worker-b",
+            7,
+            44,
+            13_000_000_000,
+            CAPTURE_SEQ,
+            AnchorFit::CoversTheClaimedWindow,
+            vec![Vec::new()],
+        );
+        let good = crate::anchor_window::selected_anchor_for_test(
+            "worker-a",
+            7,
+            41,
+            10_000_000_000,
+            CAPTURE_SEQ,
+            AnchorFit::CoversTheClaimedWindow,
+            vec![crate::anchor_window::ranked_records_for_test(
+                7, 41, 0, 0, &[1; 64],
+            )],
+        );
+
+        // THE CONTROL first: the rankable member alone builds a block of one.
+        let ok = build_per_rank_block(&[&good], Some(0)).expect("a rankable member builds");
+        assert_eq!(ok.keys().copied().collect::<Vec<u32>>(), vec![0]);
+
+        let err = build_per_rank_block(&[&good, &unrankable], Some(0))
+            .expect_err("an unrankable member must refuse the capture");
+        for needle in [
+            "state ring worker-b",
+            "no readable producer rank",
+            "was NOT written",
+            "Fix:",
+        ] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+    }
+
+    /// TWO RINGS reporting ONE RANK refuse the capture BY NAME.
+    ///
+    /// The arm that fails if the two collapse. The block is keyed by rank, so a
+    /// plain insert publishes whichever member is walked last and loses the
+    /// other: one ring's step, instant, counts and fit would be published as the
+    /// other ring's, and the trim would cut the lost ring's records at the
+    /// surviving one's step.
+    #[test]
+    fn two_rings_reporting_one_rank_refuse_the_capture_by_name() {
+        let first = crate::anchor_window::selected_anchor_for_test(
+            "worker-a",
+            7,
+            41,
+            10_000_000_000,
+            CAPTURE_SEQ,
+            AnchorFit::CoversTheClaimedWindow,
+            vec![crate::anchor_window::ranked_records_for_test(
+                7, 41, 0, 2, &[1; 64],
+            )],
+        );
+        let second = crate::anchor_window::selected_anchor_for_test(
+            "worker-b",
+            7,
+            44,
+            13_000_000_000,
+            CAPTURE_SEQ,
+            AnchorFit::CoversTheClaimedWindow,
+            vec![crate::anchor_window::ranked_records_for_test(
+                7, 44, 0, 2, &[2; 64],
+            )],
+        );
+
+        // THE CONTROL: the SAME two members with DISTINCT ranks build a block of
+        // two, so the refusal reads the collision and not the pair.
+        let apart = crate::anchor_window::selected_anchor_for_test(
+            "worker-b",
+            7,
+            44,
+            13_000_000_000,
+            CAPTURE_SEQ,
+            AnchorFit::CoversTheClaimedWindow,
+            vec![crate::anchor_window::ranked_records_for_test(
+                7, 44, 0, 3, &[2; 64],
+            )],
+        );
+        let ok = build_per_rank_block(&[&first, &apart], Some(0)).expect("two ranks build");
+        assert_eq!(ok.keys().copied().collect::<Vec<u32>>(), vec![2, 3]);
+        assert_eq!(ok[&2].step, 41, "rank 2 keeps ITS step");
+        assert_eq!(ok[&3].step, 44, "rank 3 keeps ITS step");
+
+        let err = build_per_rank_block(&[&first, &second], Some(0))
+            .expect_err("two rings at one rank must refuse the capture");
+        for needle in [
+            "worker-a",
+            "worker-b",
+            "both report rank 2",
+            "was NOT written",
+            "Fix:",
+        ] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+    }
+
+    /// ORACLE 6, the MANIFEST half, RESTATED HONESTLY: a k=1 capture's manifest
+    /// is the parent's plus EXACTLY the two additive keys, `per_rank` and
+    /// `missing_ranks`, and nothing else moves.
+    ///
+    /// # Why the claim is "plus two keys" rather than "byte identical"
+    ///
+    /// The plan's oracle 6 says a lockstep capture's manifest is BYTE IDENTICAL
+    /// to the parent's, and after this change it is not: the two blocks are
+    /// emitted unconditionally, so a k=1 manifest carries two keys the parent's
+    /// lacked. Making them conditional was the alternative and was REFUSED: the
+    /// blocks are what makes a manifest self-describing, a reader that has to
+    /// tell "no per-rank block because k=1" from "no per-rank block because this
+    /// bag predates them" has to guess, and the readers of this bag consume them
+    /// unconditionally. Every typed reader tolerates the addition by construction
+    /// (`FlashbackManifest` names no `anchor` field and sets no
+    /// `deny_unknown_fields`), which
+    /// [`a_two_rank_manifest_joins_the_per_rank_block_to_the_untouched_scalars`]
+    /// asserts.
+    ///
+    /// So the k=1 claim is stated as what it IS and ASSERTED as such: the
+    /// retention's selection and the trim's output are byte identical to the
+    /// parent's ([`a_lockstep_retention_selects_one_member_with_the_parents_numbers`]
+    /// and the k=1 controls in `trace_window`), and the manifest is byte
+    /// identical APART FROM the two additive keys, which is this arm.
+    ///
+    /// # How that is asserted without asserting a tautology
+    ///
+    /// The additive span is written out BY HAND, required to appear exactly once,
+    /// and removed. What is left must then account for every remaining byte
+    /// (`stripped.len()` plus the span's length is the whole document), must carry
+    /// no trace of either key, and must match the parent's document BYTE FOR BYTE
+    /// up to the first verdict field. The verdict fields after it carry the
+    /// judge's own prose, which this change does not touch and which the byte
+    /// accounting above already pins.
+    #[test]
+    fn a_k1_manifest_is_the_parents_plus_exactly_the_two_additive_keys() {
+        let text = manifest(
+            with_sole_rank(
+                AnchorReport::Embedded {
+                    run_id: 7,
+                    step: 41,
+                    nodes: 2,
+                    complete: 2,
+                    records: 3,
+                    fit: AnchorFit::CoversTheClaimedWindow,
+                    taken_at_ns: 10_000,
+                    frames_before_anchor_ms: 10,
+                    frames_missing_after_anchor_ms: 0,
+                    per_rank: Default::default(),
+                    missing_ranks: Vec::new(),
+                },
+                CAPTURE_SEQ,
+            ),
+            12,
+        );
+
+        // THE ADDITIVE SPAN, by hand: the two keys, consecutive, the per-rank
+        // entry carrying the k=1 identity of the scalars beside it.
+        let additive = concat!(
+            r#""per_rank":{"0":{"capture_seq":12,"step":41,"taken_at_ns":10000,"#,
+            r#""nodes":2,"complete":2,"records":3,"fit":"covers_the_claimed_window","#,
+            r#""frames_before_anchor_ms":10,"frames_missing_after_anchor_ms":0}},"#,
+            r#""missing_ranks":[],"#,
+        );
+        assert_eq!(
+            text.matches(additive).count(),
+            1,
+            "the two additive keys appear ONCE and consecutively in: {text}"
+        );
+
+        let stripped = text.replacen(additive, "", 1);
+        assert_eq!(
+            stripped.len(),
+            text.len() - additive.len(),
+            "the span is the ONLY thing removed"
+        );
+        assert!(
+            !stripped.contains("per_rank"),
+            "no residue of the first key: {stripped}"
+        );
+        assert!(
+            !stripped.contains("missing_ranks"),
+            "no residue of the second key: {stripped}"
+        );
+
+        // THE PARENT'S DOCUMENT, by hand, byte for byte up to the first verdict
+        // field. Every key and every value is written out rather than derived, so
+        // a field that moved, was renamed, or changed value fails here.
+        let parent_head = concat!(
+            r#"{"version":1,"seq":1,"pinned":false,"recorder":"demo","frames":10,"#,
+            r#""span_ms":0,"achieved_span_ms":0,"coverage_shortfall_ms":0,"floor_ns":0,"#,
+            r#""achieved_from_ns":0,"ended_ns":1,"topics_with_no_frames":0,"#,
+            r#""window_span_ms":30000,"window_cap_bytes":335544320,"truncated_frames":0,"#,
+            r#""headerless_frames":0,"causes":[],"causes_dropped":0,"#,
+            r#""causes_dropped_exact":true,"truncated_trace_records":0,"#,
+            r#""anchor_target_ns":4321,"anchor":{"embedded":true,"run_id":7,"step":41,"#,
+            r#""nodes":2,"complete":2,"records":3,"fit":"covers_the_claimed_window","#,
+            r#""taken_at_ns":10000,"frames_before_anchor_ms":10,"#,
+            r#""frames_missing_after_anchor_ms":0,"#,
+        );
+        let verdict = stripped
+            .find(r#""resimmable":"#)
+            .expect("the verdict field ends the parent's anchor scalars");
+        assert_eq!(
+            &stripped[..verdict],
+            parent_head,
+            "every byte before the verdict is the parent's"
+        );
+    }
+
     /// ORACLE 5: the per-rank block JOINS the scalars, it does not replace them,
     /// and a reader written before it existed is unmoved.
     ///
@@ -3502,7 +3939,7 @@ mod tests {
                 fit: AnchorFit::CoversTheClaimedWindow,
                 // These arms do not exercise the anchor instant.
                 taken_at_ns: 0,
-                // Not what this arm is about — the neutral value.
+                // Not what this arm is about: the neutral value.
                 frames_before_anchor_ms: 0,
                 frames_missing_after_anchor_ms: 0,
                 per_rank: std::collections::BTreeMap::new(),

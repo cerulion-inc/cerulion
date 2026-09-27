@@ -9888,7 +9888,7 @@ fn admit_harvested_anchors(
     // see it — without this a capture on a big-state robot reports "no anchor
     // retained", pointing its operator at the arm gate when the answer is the
     // byte ceiling.
-    retention.note_ceiling_refusal(ceiling_refusals);
+    retention.note_ceiling_refusal(ring.name(), ceiling_refusals);
     // And the size evidence that goes with them. An
     // in-flight anchor that had buffered N bytes before the ceiling took it is at
     // least N bytes, which is the floor the remedy sentence falls back to when
@@ -16595,6 +16595,10 @@ impl Recorder {
         // rings declared, which is what tells an absent sibling from a graph that
         // never had one (see `build_capture_state_coverage`).
         let declared_nodes = plane.declared_ring_nodes();
+        // Assigned inside the `Ok` arm below rather than returned beside the
+        // report, so the destructuring this match feeds stays exactly the shape
+        // it had. See `flashback_plane::build_per_rank_block` for what sets it.
+        let mut rank_identity_refusal: Option<String> = None;
         let (anchor, state_coverage, anchor_report, anchor_summary, (anchor_facts, rings_seen)) =
             match plane.select_anchor(floor_ns, started_ns, finished.seq) {
                 Ok(selection) => {
@@ -16703,6 +16707,39 @@ impl Recorder {
                     } else {
                         anchor_window::AnchorFit::CoversTheClaimedWindow
                     };
+                    // THE SET, un-folded, beside the folded scalars above, and
+                    // EXHAUSTIVE over the members by construction. The rule, the
+                    // keying and the two ways it can fail are all in
+                    // `build_per_rank_block`; a failure REFUSES this capture
+                    // rather than publishing a block with a rank in neither map.
+                    let per_rank =
+                        match flashback_plane::build_per_rank_block(&members, achieved_from_ns) {
+                            Ok(block) => block,
+                            // EMPTY on the refusal path, and nothing reads it: the
+                            // report is still built so the refusal can name the
+                            // capture it is refusing, and the finalize gate below
+                            // returns before any bag is written.
+                            Err(reason) => {
+                                rank_identity_refusal = Some(reason);
+                                BTreeMap::new()
+                            }
+                        };
+                    // The two SPAN scalars, folded over the SET by the rule
+                    // `fold_anchor_spans` states and plan section 2.1 assigns:
+                    // each is the LARGEST of the ranks' own figures, and the two
+                    // are folded APART. Read off the latest member instead,
+                    // `frames_missing_after_anchor_ms` takes the SMALLEST of
+                    // them, so a capture whose slowest rank needs frames the bag
+                    // does not carry publishes 0 and claims a completeness no
+                    // rank has.
+                    let (frames_before_anchor_ms, frames_missing_after_anchor_ms) =
+                        flashback_plane::fold_anchor_spans(
+                            achieved_from_ns,
+                            &members
+                                .iter()
+                                .map(|m| m.checkpoint.taken_at_ns)
+                                .collect::<Vec<u64>>(),
+                        );
                     let summary = format!(
                         "step {}: {}/{} node(s) complete, {} record(s), {} byte(s)",
                         step, complete, nodes, record_count, byte_len,
@@ -16720,77 +16757,16 @@ impl Recorder {
                         // field's own doc for why one cannot serve for the other.
                         taken_at_ns,
                         // How much of the bag's FRAME span a resume will not
-                        // re-execute.
-                        //
-                        // Against the ACHIEVED reach, not the claimed
-                        // floor. Floor-relative it OVERSTATES under truncation,
-                        // counting a stretch the bag does not carry as one the
-                        // resume will skip. With no frames at all there is no
-                        // reach to measure from and the correct answer is 0 — the
-                        // manifest's `achieved_from_ns: null` beside it is what
-                        // says why.
-                        frames_before_anchor_ms: achieved_from_ns
-                            .map(|from| taken_at_ns.saturating_sub(from) / 1_000_000)
-                            .unwrap_or(0),
-                        // The other side of the same gap: frames the resume NEEDS
-                        // and the bag does not have. At most one of the two is
-                        // nonzero.
-                        frames_missing_after_anchor_ms: achieved_from_ns
-                            .map(|from| from.saturating_sub(taken_at_ns) / 1_000_000)
-                            .unwrap_or(0),
-                        // The SET, un-folded, beside the folded scalars above.
-                        //
-                        // Keyed by the rank read off the member's OWN records
-                        // rather than by a counter or by the ring's position:
-                        // the rank is a fact the producer stamped into every
-                        // record (the C1 header), and the ring-to-rank join the
-                        // rest of the bag is keyed by is read the same way, so
-                        // the manifest's per-rank block and
-                        // `state_coverage.json`'s cannot name different ranks
-                        // for one ring.
-                        //
-                        // A member whose records carry no readable rank is
-                        // SKIPPED rather than filed under a guessed one. It is a
-                        // shape the harvester does not produce (an anchor with
-                        // no record), and inventing rank 0 for it would put two
-                        // rings in one entry and silently lose one.
-                        per_rank: members
-                            .iter()
-                            .filter_map(|m| {
-                                let rank = m.checkpoint.producer_rank()?;
-                                Some((
-                                    rank,
-                                    flashback_plane::RankAnchor {
-                                        capture_seq: m.capture_seq,
-                                        step: m.checkpoint.step,
-                                        taken_at_ns: m.checkpoint.taken_at_ns,
-                                        nodes: m.checkpoint.anchors.len(),
-                                        complete: m.checkpoint.complete_anchors(),
-                                        records: m.checkpoint.record_count(),
-                                        fit: m.fit,
-                                        // Measured from the SAME achieved reach
-                                        // the scalars are, against THIS rank's
-                                        // own instant: a rank whose member sits
-                                        // before the reach and one whose member
-                                        // sits after it are the two sides the
-                                        // pair exists to tell apart, and a fold
-                                        // cannot show both at once.
-                                        frames_before_anchor_ms: achieved_from_ns
-                                            .map(|from| {
-                                                m.checkpoint.taken_at_ns.saturating_sub(from)
-                                                    / 1_000_000
-                                            })
-                                            .unwrap_or(0),
-                                        frames_missing_after_anchor_ms: achieved_from_ns
-                                            .map(|from| {
-                                                from.saturating_sub(m.checkpoint.taken_at_ns)
-                                                    / 1_000_000
-                                            })
-                                            .unwrap_or(0),
-                                    },
-                                ))
-                            })
-                            .collect(),
+                        // re-execute, and the frames the resume NEEDS that the
+                        // bag does not have. Both folded above, both the largest
+                        // over the ranks.
+                        frames_before_anchor_ms,
+                        frames_missing_after_anchor_ms,
+                        // The SET, un-folded, beside the folded scalars
+                        // above. Built exhaustively over the members a few lines
+                        // up, where the two ways that keying can fail are named
+                        // refusals of the whole capture.
+                        per_rank,
                         // THE Q8 STAMP. Exhaustive with the map above over every
                         // ring the retention knows about, so a capture written
                         // with a hole always names the hole. Empty whenever
@@ -16811,11 +16787,14 @@ impl Recorder {
                             })
                             .collect(),
                     };
-                    // Both spans are measured from the SAME folded instant, which
-                    // is what keeps the field docs' "at most one of the two is
-                    // nonzero" true for a k-rank capture: computing each as its
-                    // own per-rank extreme would let both read nonzero and leave
-                    // a reader unable to say which side the gap is on.
+                    // The two spans are folded APART, each the largest over the
+                    // ranks, so for k>1 both may read nonzero. That is the honest
+                    // report of a set that STRADDLES the achieved reach: one
+                    // rank's member sits inside the frames the bag carries and
+                    // another's sits before them, and which rank is on which side
+                    // is in `per_rank`. For k=1 the pair is unchanged, so the
+                    // field docs' "at most one of the two is nonzero" still holds
+                    // exactly where it always did.
                     let (coverage, rings) =
                         build_capture_state_coverage(&checkpoints, observed_arm, &declared_nodes);
                     (
@@ -16891,17 +16870,28 @@ impl Recorder {
         // not-resimmable and are still written. That used to be the plain
         // `graph run` shape; it now applies to the wall-gated shapes only,
         // which is where PR-delta will close it.
-        if matches!(
+        // TWO causes reach this ONE cleanup, and they share it deliberately: a
+        // refusal has exactly one shape (release the reserved filename, log
+        // loudly, count it, tell every requester), and a second copy of that
+        // shape is how one of them ends up leaving a zero-byte bag behind.
+        let capture_refusal: Option<String> = if matches!(
             anchor_report,
             flashback_plane::AnchorReport::Absent(
                 anchor_window::NoAnchorReason::RetentionCeilingExhausted
             )
         ) {
             let remedy = generation_remedy_text(plane);
-            let reason = format!(
+            Some(format!(
                 "the capture plane cannot hold one whole checkpoint generation, so this \
                  capture could not resim and was NOT written. {remedy}"
-            );
+            ))
+        } else {
+            // The second cause: the per-rank block could not be built
+            // exhaustively over the selected set. Named rather than repaired,
+            // for the two reasons the builder states.
+            rank_identity_refusal
+        };
+        if let Some(reason) = capture_refusal {
             // The reserved filename is an EMPTY file `reserve_capture_path`
             // created to claim the name (`create_new`). A refusal that left it
             // behind would put a zero-byte `.mcap` in the retention directory —

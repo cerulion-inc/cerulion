@@ -902,7 +902,7 @@ fn a_capture_carries_the_newest_checkpoints_records_verbatim() {
     );
 
     // THE PER-RANK BLOCK, over the production path. This run has one rank, so
-    // the block has exactly one entry and its numbers are the scalars above —
+    // the block has exactly one entry and its numbers are the scalars above,
     // the k=1 identity the fold has by construction, asserted here against a
     // manifest a real recorder wrote rather than a hand-built report.
     let per_rank = m["anchor"]["per_rank"]
@@ -999,7 +999,7 @@ struct MultiRankRun {
 ///   `(taken_at_ns, step)`, and a rank whose records reach the recorder after its
 ///   predecessor's have all left the ring is harvested on a later drive pass and
 ///   therefore stamped later. So "the last plan in the vector is the latest
-///   member" is a fact the driver establishes rather than a race it hopes for —
+///   member" is a fact the driver establishes rather than a race it hopes for,
 ///   and where the arms also give the later rank the higher STEP, the tie-break
 ///   agrees, so the two keys cannot disagree.
 /// * The pre-window ranks are then left alone for two post windows before the
@@ -1081,7 +1081,7 @@ fn multi_rank_captures(tag: &str, plans: Vec<RankPlan>, captures_wanted: usize) 
             await_condition(DEADLINE, || {
                 producers[i].free_records() == Some(u64::from(RING_RECORDS))
             }),
-            "the recorder must drain rank {rank}'s state ring — nothing else in this process \
+            "the recorder must drain rank {rank}'s state ring: nothing else in this process \
              consumes it"
         );
     }
@@ -1095,7 +1095,7 @@ fn multi_rank_captures(tag: &str, plans: Vec<RankPlan>, captures_wanted: usize) 
 
     // Opened BEFORE the post-window pushes below. `open_on_manager` CREATES
     // iceoryx2 services and ports, and anything variable between a post-window
-    // push and the trigger is competing with the post window's own budget — the
+    // push and the trigger is competing with the post window's own budget, the
     // load inversion this file has already paid for once.
     let requester = FlashbackRequester::open_on_manager(&mgr).expect("requester");
 
@@ -1124,7 +1124,7 @@ fn multi_rank_captures(tag: &str, plans: Vec<RankPlan>, captures_wanted: usize) 
         );
     }
 
-    // Every rank's records really did leave its ring — asserted AFTER the
+    // Every rank's records really did leave its ring, asserted AFTER the
     // captures, so the wait cannot widen the gap the post-window ranks depend on.
     for (i, plan) in plans.iter().enumerate() {
         let rank = plan.rank;
@@ -1163,17 +1163,25 @@ fn multi_rank_captures(tag: &str, plans: Vec<RankPlan>, captures_wanted: usize) 
 /// step and the instant are the LATEST rank's, and each rank keeps its own
 /// numbers beside them.
 ///
-/// # Why this cannot be asserted at the unit level, and why k=1 cannot assert it
+/// # Why k=1 cannot assert it, and what the unit level does and does not reach
 ///
-/// The fold is built in the recorder's capture close and nowhere else: no
-/// function takes a set of members and returns the folded block, so there is
-/// nothing a unit arm could call. And under k=1 every fold in it is the
-/// IDENTITY — the sum over a one-member set is that member's number, the latest
-/// of one member is that member, the worst of one fit is that fit — so a k=1
-/// arm asserts each rule at the one input where every wrong rule agrees with the
-/// right one. That is measured rather than argued: mutations replacing the sum
-/// with the first member's count, and the latest member with the earliest,
-/// survived this whole binary while it drove one rank only.
+/// Under k=1 every fold is the IDENTITY: the sum over a one-member set is that
+/// member's number, the latest of one member is that member, and the worst of
+/// one fit is that fit. So a k=1 arm asserts each rule at the one input where
+/// every wrong rule agrees with the right one. That is measured rather than
+/// argued: mutations replacing the sum with the first member's count, and the
+/// latest member with the earliest, survived this whole binary while it drove
+/// one rank only.
+///
+/// Two PARTS of the fold were since extracted and now have unit arms of their
+/// own, and this arm is deliberately kept beside them rather than replaced by
+/// them: `flashback_plane::fold_anchor_spans` folds the two span scalars and
+/// `flashback_plane::build_per_rank_block` builds the map, each with its own
+/// hand oracle. What no unit arm reaches is the rest of the fold (the three
+/// count sums, the step, the instant and the worst fit) and, more importantly,
+/// the claim that the PRODUCTION capture close really composes these pieces over
+/// a set a real recorder selected. That claim needs two ranks on the production
+/// path, which is this binary.
 ///
 /// Every expected number here is HAND WRITTEN from the two ranks' inputs: rank 0
 /// publishes two nodes at step 20 and rank 1 publishes one node at step 24, so
@@ -1292,7 +1300,7 @@ fn a_two_rank_capture_folds_the_counts_and_takes_the_latest_ranks_step() {
 /// its member sits at or before the anchor deadline and COVERS; rank 1 is pushed
 /// immediately before the trigger, so its member is stamped inside the post
 /// window and is NEWER than the claimed window. Both wall arguments push the
-/// safe way — load lengthens the sleep before the trigger (rank 0 further from
+/// safe way: load lengthens the sleep before the trigger (rank 0 further from
 /// the boundary) and delays rank 1's drain (further into the band).
 #[test]
 fn a_two_rank_capture_reports_the_worst_fit_and_each_ranks_own() {

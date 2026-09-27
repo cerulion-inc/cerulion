@@ -308,8 +308,8 @@ impl TraceWindow {
     /// and the answer a caller wants is the one belonging to the rank whose
     /// anchor it is recovering. An unscoped read answers the first boundary at
     /// that step in retained order, which under free run is whichever rank
-    /// happened to be banked first — a different rank's clock reported as this
-    /// rank's floor.
+    /// happened to be banked first, so a different rank's clock is reported as
+    /// this rank's floor.
     pub(crate) fn boundary_target_ns_for(&self, rank: u32, step: u64) -> Option<u64> {
         self.batches
             .iter()
@@ -348,13 +348,13 @@ pub(crate) struct TrimmedTrace {
     /// compute it does not trim rather than guessing one.
     pub anchor_target_ns: Option<u64>,
     /// The gating-clock target of the EARLIEST rank's last kept step-boundary
-    /// record — the instant a resume of this capture can cover TO.
+    /// record: the instant a resume of this capture can cover TO.
     ///
     /// The MINIMUM over the ranks that kept a boundary, because a resume covers
     /// the graph only as far as its SLOWEST rank: past that instant one rank has
     /// no recorded boundary for a frame to be matched against. The rule used to
     /// be the AUTHORITATIVE rank's own last boundary, justified by "a peer
-    /// rank's boundary is pinned to rank 0's on every shared step" — a LOCKSTEP
+    /// rank's boundary is pinned to rank 0's on every shared step", a LOCKSTEP
     /// fact, true only while every rank advances together, which is precisely
     /// the assumption free run removes. For lockstep and k=1 the minimum is over
     /// one value and the number is unchanged.
@@ -409,8 +409,8 @@ pub(crate) struct TrimmedTrace {
     /// WITHIN one rank it is LAST-WINS rather than a maximum, deliberately: the
     /// replayer's own `BoundaryCursor` walks the trace in FILE order and ends on
     /// the last boundary it meets, and these records are written to the bag in
-    /// exactly this order. On a well-formed trace (targets non-decreasing —
-    /// enforced by `validate_step_boundaries`) the two are the same number;
+    /// exactly this order. On a well-formed trace (targets non-decreasing, as
+    /// `validate_step_boundaries` enforces) the two are the same number;
     /// where they could differ, matching the reader is what matters. ACROSS
     /// ranks it is the minimum, for the reason above: last-wins across ranks
     /// would answer whichever rank the writer banked last, which is a race.
@@ -596,7 +596,7 @@ fn walk(
                 out.first_recorded_step = Some(rec.step);
             }
             // The covered range's upper endpoint is measured PER RANK here and
-            // folded into the scalar after the walk — see the fold at the end of
+            // folded into the scalar after the walk. See the fold at the end of
             // this function for why the scalar is the earliest rank's.
             //
             // The old rule read it off the AUTHORITATIVE rank alone, on the
@@ -617,7 +617,7 @@ fn walk(
         if rec.record_type == RECORD_TYPE_FIRE {
             // Resolved through THIS rank's own manifest. A `node_idx` names a
             // different node in each ring, so resolving a peer rank's index
-            // through rank 0's table would name the wrong node — which is why
+            // through rank 0's table would name the wrong node, which is why
             // the recorder used to decline to resolve any of them for k>1 and
             // reported an empty executed set.
             if let Some(name) = node_ids
@@ -1132,7 +1132,7 @@ mod tests {
         r
     }
 
-    /// The two ranks' own manifests, DIFFERENT lists at the same indices — which
+    /// The two ranks' own manifests, DIFFERENT lists at the same indices, which
     /// is the whole reason a shared table names the wrong node.
     fn ranked_nodes() -> BTreeMap<u32, Vec<String>> {
         BTreeMap::from([
