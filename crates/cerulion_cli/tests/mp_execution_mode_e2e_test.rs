@@ -196,7 +196,11 @@ fn run_and_stop(
     }
     std::thread::sleep(Duration::from_secs(3));
 
-    send_signal(guard.id(), libc::SIGINT);
+    // ALIVE, not merely signalled. A run that exited on its own before this
+    // point satisfies `wait_bounded`, `status.success()` and every log assert
+    // below without ever receiving the SIGINT, so the arm would be reporting a
+    // graceful shutdown it never exercised.
+    signal_live_process(guard.id(), libc::SIGINT);
     let status = guard
         .wait_bounded(Duration::from_secs(90))
         .expect("graph run did not exit after SIGINT");

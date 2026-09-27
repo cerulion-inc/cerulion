@@ -198,8 +198,14 @@ node declaration order elsewhere in the graph file.
    producer created it.
 4. **GO gate**: no worker enters its live loop until EVERY worker is
    built + READY. This kills the startup first-sample race: all
-   subscribers are connected before the first publish, so the run is
-   deterministic **from step 0**.
+   subscribers are connected before the first publish, so no step's inputs
+   depend on which worker started first. What that buys depends on the
+   execution mode below. Under the `CERULION_EXECUTION_MODE=lockstep`
+   opt-out the run is deterministic **from step 0**. Under the DEFAULT
+   free run each rank advances on its own wall clock, so two live runs of
+   one graph can pair different frames on a split same-level edge; a
+   default run reproduces **from its recorded bag** instead, which is what
+   `bag play --resim` re-executes byte for byte.
 5. **Execution**: every worker runs the deterministic-live loop. By DEFAULT
    the run free-runs: no barrier is created, no rank maps one, and each
    worker's gating clock follows the wall from the shared GO epoch, so the
