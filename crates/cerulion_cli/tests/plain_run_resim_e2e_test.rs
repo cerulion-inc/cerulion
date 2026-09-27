@@ -2487,11 +2487,50 @@ const CLEAN_CAPTURE_ATTEMPTS: usize = 3;
 /// ~2 s of a healthy run.
 const FREE_RUN_MID_RUN_FRAMES: usize = 40;
 
-/// The capture's RECORDER health (`CAPTURE_RECORDER_HEALTH_ATTACHMENT`, the
-/// run-cumulative document, so an UPPER bound on what this window lost), summed
-/// over this run's two graph topics. `None` means the attachment is absent,
-/// which on a finalized capture is a harness failure rather than health.
-fn capture_graph_topic_loss(bag: &Path, prefix: &str) -> Option<u64> {
+/// Every RECORDER LOSS the capture's own health document
+/// (`CAPTURE_RECORDER_HEALTH_ATTACHMENT`, the run-cumulative document, so an
+/// UPPER bound on what this window lost) reports for this run's two graph
+/// topics, as the sentences the retry gate prints. An EMPTY vector is the
+/// loss-free claim; `None` means the attachment is absent, which on a
+/// finalized capture is a harness failure rather than health.
+///
+/// # `frames_lost` alone is not a loss-free claim
+///
+/// It counts one producer, tap-queue overflow against an established
+/// sequence baseline. The SAME document states two more, and both are
+/// run-level rather than per-topic, which is the same upper-bound direction
+/// the per-topic counts already carry:
+///
+///  * `dropped_unwritten` frames left their tap's queue and never reached the
+///    bag at all (a latched writer error, or a full hand-off channel), so no
+///    per-topic counter can see them;
+///  * a `prefix_invisible` loss-counting basis says a contiguous prefix was
+///    dropped before a tap's FIRST drain and TAKEN AS the baseline, so a zero
+///    `frames_lost` beneath it means "nothing was counted", not "nothing was
+///    lost".
+///
+/// # The basis is ASSERTED, not gated, and the difference is measured
+///
+/// The always-on window plane discovers LIVE producers, so its taps attach to
+/// nodes that are already publishing and the document reads
+/// `prefix_invisible` on EVERY attempt of this arm (measured: three of three,
+/// every run). Retrying on it therefore refuses every capture this fixture can
+/// produce, which is why it is stated here and asserted below rather than
+/// added to the retry gate: it is a permanent property of the recorder this
+/// arm uses, not an attempt that went badly.
+///
+/// What the arm can still claim under that basis comes from its own shape:
+/// the comparison begins at the capture's ANCHOR, not at the topic's first
+/// frame, so a contiguous prefix dropped before the first drain sits outside
+/// the compared suffix by construction. What the gate below cannot rule out
+/// is a prefix loss INSIDE that suffix, and no counter in this document can:
+/// the coverage manifest's per-topic `prefix_lost` would, and a Flashback
+/// capture carries this health document and no coverage manifest.
+///
+/// Sequence GAPS stay admitted for the same reason: the rolling window trims
+/// this capture's head, so its first recorded frame is ordinarily not the
+/// topic's first.
+fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
     let reader = cerulion_bag::BagReader::open(bag).expect("open the capture");
     let att = reader
         .attachment(CAPTURE_RECORDER_HEALTH_ATTACHMENT)
@@ -2507,29 +2546,51 @@ fn capture_graph_topic_loss(bag: &Path, prefix: &str) -> Option<u64> {
              looked for:\n{raw}"
         )
     });
-    Some(
-        ["ticker/cmd", "relay/cmd"]
-            .iter()
-            .map(|suffix| {
-                let topic = format!("/{prefix}/{suffix}");
-                // PRESENT, not merely non-lossy. A topic the health document
-                // does not carry contributes 0 to the gate this feeds, so a
-                // recorder that tapped ONE of the two graph topics would read
-                // as a loss-free capture of both — the gate's whole job is to
-                // refuse a capture the re-execution will out-produce.
-                let health = topics.get(&topic).unwrap_or_else(|| {
-                    panic!(
-                        "the capture's recorder health carries no entry for `{topic}`, so the \
-                         loss gate would pass it by DEFAULT. It accounts for {:?}:\n{raw}",
-                        topics.keys().collect::<Vec<_>>()
-                    )
-                });
-                health["frames_lost"].as_u64().unwrap_or_else(|| {
-                    panic!("`{topic}` carries no readable `frames_lost`: {health}")
-                })
-            })
-            .sum(),
-    )
+    let mut reported = Vec::new();
+    for suffix in ["ticker/cmd", "relay/cmd"] {
+        let topic = format!("/{prefix}/{suffix}");
+        // PRESENT, not merely non-lossy. A topic the health document
+        // does not carry contributes nothing to the gate this feeds, so a
+        // recorder that tapped ONE of the two graph topics would read
+        // as a loss-free capture of both. The gate's whole job is to
+        // refuse a capture the re-execution will out-produce.
+        let health = topics.get(&topic).unwrap_or_else(|| {
+            panic!(
+                "the capture's recorder health carries no entry for `{topic}`, so the \
+                 loss gate would pass it by DEFAULT. It accounts for {:?}:\n{raw}",
+                topics.keys().collect::<Vec<_>>()
+            )
+        });
+        let lost = health["frames_lost"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("`{topic}` carries no readable `frames_lost`: {health}"));
+        if lost > 0 {
+            reported.push(format!(
+                "`{topic}` lost {lost} frame(s) to tap-queue overflow"
+            ));
+        }
+    }
+    // Run-level, so it is charged once rather than per topic.
+    let unwritten = v["dropped_unwritten"].as_u64().unwrap_or_else(|| {
+        panic!("the capture's recorder health carries no readable `dropped_unwritten`:\n{raw}")
+    });
+    if unwritten > 0 {
+        reported.push(format!(
+            "{unwritten} frame(s) were drained from a tap and never written to the bag"
+        ));
+    }
+    // The basis is the SCOPE of every count above, so the gate states it
+    // rather than retries on it (see this function's own doc for the
+    // measurement). A THIRD token, or an absent one on a document this test
+    // suite writes, would mean the scope moved under the gate, and the gate
+    // would be claiming a reach nobody established.
+    assert!(
+        v["loss_counting_basis"] == serde_json::json!("prefix_invisible")
+            || v["loss_counting_basis"] == serde_json::json!("prefix_proven"),
+        "the capture's recorder health must state which loss-counting basis its counts \
+         were taken under; without it a zero `frames_lost` is not a claim:\n{raw}"
+    );
+    Some(reported)
 }
 
 /// **ARM 6: THE ONE-RANK FREE-RUN LOOP (the mid-run resume).**
@@ -2661,14 +2722,15 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         stop_run(&mut run, &stderr_path);
 
         // ----------------------------------------------- the loss-free gate
-        let loss = capture_graph_topic_loss(&capture, &prefix).unwrap_or_else(|| {
+        let loss = capture_loss_indicators(&capture, &prefix).unwrap_or_else(|| {
             panic!("a finalized capture carries `{CAPTURE_RECORDER_HEALTH_ATTACHMENT}`")
         });
-        if loss > 0 {
+        if !loss.is_empty() {
             last_retry = format!(
-                "attempt {attempt}: the recorder reports {loss} lost frame(s) on this run's \
-                 topics: a window tap overflowed (loaded desk?), so the re-execution would \
-                 reproduce frames the capture does not hold"
+                "attempt {attempt}: the recorder does not report a LOSS-FREE capture of this \
+                 run's topics ({}), so the re-execution could reproduce frames the capture \
+                 does not hold",
+                loss.join("; ")
             );
             eprintln!("{last_retry}");
             continue;
@@ -2775,10 +2837,18 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         assert_eq!(report["passed"], serde_json::json!(true), "{report}");
         // `passed` is a claim about the comparisons that RAN. A report that
         // compared nothing passes too, so exit 0 says nothing until this does.
-        assert!(
-            report["topics_checked"].as_u64().unwrap_or(0) > 0,
-            "the verify must have COMPARED a topic; `passed` over zero comparisons is the \
-             tautology this arm exists to avoid: {report}"
+        //
+        // EXACTLY the fixture's two graph outputs, not "at least one": the
+        // graph publishes `ticker/cmd` and `relay/cmd` on every step, so a
+        // verify that silently left one of them out would still report a
+        // positive count and still pass. The perturbed leg below only
+        // exercises the ticker, so nothing else in this arm would notice a
+        // relay comparison that never happened.
+        assert_eq!(
+            report["topics_checked"],
+            serde_json::json!(2),
+            "the verify must have COMPARED both graph topics; `passed` over a partial \
+             comparison is the tautology this arm exists to avoid: {report}"
         );
         assert_eq!(
             report["coordination"]["mode"],
