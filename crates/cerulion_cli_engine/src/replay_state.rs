@@ -221,6 +221,35 @@ pub enum AnchorReadRefusal {
         /// The version this build reads.
         known: u32,
     },
+
+    /// The restore points in this bag were selected by more than one capture.
+    #[error(
+        "this capture's restore points name {} different capture events ({}), so the ranks were \
+         cut at two unrelated instants and a resume from them would start the graph from two \
+         different moments at once: every cross-rank edge between them would be replayed against \
+         state that never coexisted, and the divergence report would be about an execution that \
+         never happened. Fix: resume from a bag whose ranks were all selected by one capture, or \
+         re-record",
+        captures.len(),
+        captures
+            .iter()
+            .map(|(seq, ranks)| format!(
+                "capture {seq} carries rank(s) {}",
+                ranks.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )]
+    MixedCaptureIdentity {
+        /// Every capture number the restore points name, each with the ranks
+        /// that carry it, in capture order.
+        ///
+        /// BOTH halves are quoted in the message. The numbers alone say the set
+        /// is mixed; the ranks are what tells an operator which half of their
+        /// graph came from where, which is the difference between a message they
+        /// can act on and one they can only believe.
+        captures: Vec<(u64, Vec<u32>)>,
+    },
 }
 
 /// Read the OPTIONAL `__cerulion/state_coverage.json` manifest.
@@ -431,6 +460,64 @@ fn index_table(coverage: &StateCoverage) -> BTreeMap<u32, String> {
     table
 }
 
+/// The `__cerulion/flashback.json` attachment a Flashback CAPTURE carries.
+///
+/// A `--record` bag has none, and that absence is the gate on the identity
+/// refusal below: nothing about an ordinary recording's resume changes.
+const FLASHBACK_MANIFEST_ATTACHMENT: &str = "__cerulion/flashback.json";
+
+/// The capture numbers this bag's restore points name, when there is more than
+/// one of them — `None` when the set is whole.
+///
+/// # Read tolerantly, and every degradation means "not mixed"
+///
+/// The same rule `replay_engine`'s `capture_anchor_target_ns` is read under, and
+/// for the same reason: this attachment describes what a capture was ABOUT, and
+/// a resume that refused because a prose field would not parse would be refusing
+/// over metadata it does not otherwise read. So a bag with no attachment, an
+/// attachment that is not JSON, a manifest with no `anchor.per_rank` block, an
+/// entry with no `capture_seq`, and a set whose entries agree all reach the same
+/// answer: `None`, not mixed, carry on. That covers every bag written before the
+/// per-rank block existed and every ordinary capture written after it.
+///
+/// The refusal therefore fires on exactly one shape: a manifest that DOES carry
+/// per-rank restore points and whose points name two or more DIFFERENT captures.
+/// A bag cannot reach that shape by being old or by being damaged; it reaches it
+/// by having been assembled from two captures.
+///
+/// # Why the manifest and not the records
+///
+/// The identity is stamped at SELECTION, and a state record is written at
+/// harvest, long before any capture exists. There is nowhere on the record for
+/// it to be, which is the same reason the recorder puts it on the manifest.
+fn mixed_capture_identities(reader: &BagReader) -> Option<Vec<(u64, Vec<u32>)>> {
+    let attachment = reader.attachment(FLASHBACK_MANIFEST_ATTACHMENT).ok()??;
+    let parsed: serde_json::Value = serde_json::from_slice(&attachment.data).ok()?;
+    let per_rank = parsed.get("anchor")?.get("per_rank")?.as_object()?;
+    // Keyed by capture, valued by the ranks that name it, so the message can
+    // state which half of the graph came from where. `BTreeMap` for both, so two
+    // reads of one bag render the same sentence.
+    let mut by_capture: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+    for (rank, entry) in per_rank {
+        let Some(seq) = entry.get("capture_seq").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        // A rank key that is not a number is a manifest this reader does not
+        // understand, and the tolerant rule says carry on rather than refuse.
+        let Ok(rank) = rank.parse::<u32>() else {
+            continue;
+        };
+        by_capture.entry(seq).or_default().push(rank);
+    }
+    if by_capture.len() < 2 {
+        return None;
+    }
+    for ranks in by_capture.values_mut() {
+        ranks.sort_unstable();
+    }
+    Some(by_capture.into_iter().collect())
+}
+
 /// Read every anchor a bag carries.
 ///
 /// The record stream is the bag's `__cerulion/state` channel in file order —
@@ -492,6 +579,14 @@ pub fn read_bag_anchors(reader: &BagReader) -> Result<BagAnchors, AnchorReadRefu
             return Err(AnchorReadRefusal::StateRecordFormatTooNew { carried: v, known })
         }
         carried => return Err(AnchorReadRefusal::StateRecordFormatTooOld { carried, known }),
+    }
+    // THE MIXED IDENTITY REFUSAL, third and last, so the two refusals above keep
+    // their precedence exactly. A bag that is multi-ring ambiguous or written
+    // under an older record format is still refused for THAT, which is the
+    // stronger fact: those two say the records cannot be read at all, while this
+    // one says they can be read and must not be combined.
+    if let Some(captures) = mixed_capture_identities(reader) {
+        return Err(AnchorReadRefusal::MixedCaptureIdentity { captures });
     }
     let table = index_table(&coverage);
 
@@ -1008,6 +1103,198 @@ mod tests {
         r[36..40]
             .copy_from_slice(&cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION.to_le_bytes());
         r
+    }
+
+    // =======================================================================
+    // ORACLE 14: the MIXED CAPTURE IDENTITY refusal
+    // =======================================================================
+
+    /// A flashback capture manifest whose per-rank block names `entries` as
+    /// `(rank, capture_seq)` pairs.
+    ///
+    /// Only the keys the identity reader looks at are written out: the reader
+    /// must work on a manifest it does not otherwise understand, and a fixture
+    /// carrying the whole block would hide a reader that had quietly started
+    /// depending on a neighbour field.
+    fn flashback_json(entries: &[(u32, u64)]) -> String {
+        let per_rank: Vec<String> = entries
+            .iter()
+            .map(|(rank, seq)| format!(r#""{rank}": {{ "capture_seq": {seq}, "step": 41 }}"#))
+            .collect();
+        format!(
+            r#"{{ "version": 1, "seq": 7, "anchor": {{ "embedded": true,
+                 "per_rank": {{ {} }} }} }}"#,
+            per_rank.join(", ")
+        )
+    }
+
+    /// [`craft_and_read`] with a flashback capture manifest attached too.
+    fn craft_with_flashback(
+        manifest: &str,
+        flashback: Option<&str>,
+        records: &[Vec<u8>],
+    ) -> Result<BagAnchors, AnchorReadRefusal> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crafted.mcap");
+        {
+            let mut w = cerulion_bag::BagWriter::create(
+                &path,
+                cerulion_bag::BagWriterConfig::default(),
+                &[],
+            )
+            .expect("create bag");
+            w.write_attachment(
+                STATE_COVERAGE_ATTACHMENT,
+                "application/json",
+                0,
+                0,
+                manifest.as_bytes(),
+            )
+            .expect("write the manifest");
+            if let Some(fb) = flashback {
+                w.write_attachment(
+                    FLASHBACK_MANIFEST_ATTACHMENT,
+                    "application/json",
+                    0,
+                    0,
+                    fb.as_bytes(),
+                )
+                .expect("write the flashback manifest");
+            }
+            let state_id = w.state_channel_id();
+            w.write_chunk(|c| {
+                for (i, r) in records.iter().enumerate() {
+                    c.write_message(state_id, i as u32, 1_000 + i as u64, 1_000 + i as u64, &[r])?;
+                }
+                Ok(())
+            })
+            .expect("write the records");
+            w.finalize().expect("finalize");
+        }
+        let reader = BagReader::open(&path).expect("open the crafted bag");
+        read_bag_anchors(&reader)
+    }
+
+    /// ORACLE 14, arm (a): a bag whose restore points name two captures refuses
+    /// the RESUME, and the sentence names both numbers, both ranks and a remedy.
+    ///
+    /// Asserted as literal substrings rather than against a second call of the
+    /// formatter: a message tested against its own `format!` passes for any
+    /// wording, including one that never states the second capture.
+    #[test]
+    fn restore_points_naming_two_captures_refuse_the_resume_by_name() {
+        let err = craft_with_flashback(
+            &manifest_json(Some("1"), 1),
+            Some(&flashback_json(&[(0, 7), (1, 9)])),
+            &[this_format_record(0)],
+        )
+        .expect_err("a mixed set must refuse");
+
+        assert_eq!(
+            err,
+            AnchorReadRefusal::MixedCaptureIdentity {
+                captures: vec![(7, vec![0]), (9, vec![1])],
+            }
+        );
+        let text = err.to_string();
+        for needle in [
+            "name 2 different capture events",
+            "capture 7 carries rank(s) 0",
+            "capture 9 carries rank(s) 1",
+            "Fix: resume from a bag whose ranks were all selected by one capture",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+    }
+
+    /// ORACLE 14, arm (c), ANTI-VACUITY: the SAME bag with both entries at one
+    /// capture passes the gate.
+    ///
+    /// One character apart from the arm above, so what the refusal reads is the
+    /// disagreement and not the presence of the block.
+    #[test]
+    fn restore_points_naming_one_capture_pass_the_gate() {
+        let read = craft_with_flashback(
+            &manifest_json(Some("1"), 1),
+            Some(&flashback_json(&[(0, 7), (1, 7)])),
+            &[this_format_record(0)],
+        )
+        .expect("one capture, one answer");
+        assert!(read.coverage_present);
+    }
+
+    /// Every bag in existence today: no flashback manifest at all, so nothing
+    /// about its resume changes.
+    ///
+    /// The degradation arms are folded in beside it, because they must all reach
+    /// the SAME answer and asserting them apart would let one drift into a
+    /// refusal unnoticed: an attachment that is not JSON, a manifest with no
+    /// `anchor` block, one whose `per_rank` entries carry no `capture_seq`, and
+    /// one with a single entry.
+    #[test]
+    fn a_bag_without_per_rank_capture_identities_is_never_refused_for_them() {
+        for (label, flashback) in [
+            ("no attachment at all", None),
+            ("not JSON", Some("this is not a manifest".to_string())),
+            (
+                "no anchor block",
+                Some(r#"{ "version": 1, "seq": 7 }"#.to_string()),
+            ),
+            (
+                "per_rank entries carrying no capture number",
+                Some(
+                    r#"{ "anchor": { "per_rank": { "0": { "step": 41 },
+                         "1": { "step": 44 } } } }"#
+                        .to_string(),
+                ),
+            ),
+            ("one rank", Some(flashback_json(&[(0, 7)]))),
+        ] {
+            let read = craft_with_flashback(
+                &manifest_json(Some("1"), 1),
+                flashback.as_deref(),
+                &[this_format_record(0)],
+            )
+            .unwrap_or_else(|e| panic!("{label} must not be refused: {e}"));
+            assert!(read.coverage_present, "{label}");
+        }
+    }
+
+    /// The PRECEDENCE: a bag that is refused for a stronger reason keeps that
+    /// reason even when its restore points are also mixed.
+    ///
+    /// The two refusals above say the records cannot be read AT ALL; this one
+    /// says they can be read and must not be combined. Reporting the weaker one
+    /// would send an operator after the wrong problem, and the ordering in
+    /// `read_bag_anchors` is the only thing that decides it.
+    #[test]
+    fn a_stronger_refusal_outranks_the_mixed_identity_one() {
+        let multi_ring = craft_with_flashback(
+            &manifest_json(Some("1"), 2),
+            Some(&flashback_json(&[(0, 7), (1, 9)])),
+            &[this_format_record(0)],
+        )
+        .expect_err("two rings is still two rings");
+        // The refusal carries the manifest's own state record format key, which
+        // this fixture names as version 1, so the expected value names it too.
+        assert_eq!(
+            multi_ring,
+            AnchorReadRefusal::MultiRingAmbiguous {
+                rings: 2,
+                state_record_format: Some(1)
+            }
+        );
+
+        let too_old = craft_with_flashback(
+            &manifest_json(None, 1),
+            Some(&flashback_json(&[(0, 7), (1, 9)])),
+            &[previous_format_record(0)],
+        )
+        .expect_err("an unreadable record layout is still unreadable");
+        assert!(matches!(
+            too_old,
+            AnchorReadRefusal::StateRecordFormatTooOld { carried: None, .. }
+        ));
     }
 
     /// A manifest with the two keys this build writes, or without them.
