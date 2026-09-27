@@ -34,6 +34,8 @@ Usage:
   common: --require-private  --no-private  --hard CLASS (repeatable)
           --format text|github  --allow FILE  --no-allow  --allow-empty  --quiet
           --offline (resolve no reference, report every candidate unverified)
+          --skip-code (blank fenced blocks and inline code spans first; the
+          conversation surfaces only, where a quoted example is not a link)
           --self-repo OWNER/REPO (the repository being scanned; else the forge
           environment, else the origin remote)
 
@@ -669,6 +671,25 @@ REF_DEADLINE = 120.0
 REF_AGENT = 'leak-scan (repository reachability check)'
 
 
+# A fenced block, and an inline code span of any backtick run length. Markdown
+# closes a span with a run of exactly the same length, and the forge does not
+# autolink anything inside either, so a reference there is a quotation of a
+# reference and not one a reader can follow.
+FENCE_RX = re.compile(r'^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)',
+                      re.S | re.M)
+SPAN_RX = re.compile(r'(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)', re.S)
+
+
+def blank_code(text):
+    """`text` with every fenced block and inline code span replaced, character
+    for character, by spaces. Length, line count and every offset are preserved,
+    so a line number and a column still point where they did. Only the
+    conversation surfaces use this: in a source file a code span is just text."""
+    def spaces(m):
+        return re.sub(r'[^\n]', ' ', m.group(0))
+    return SPAN_RX.sub(spaces, FENCE_RX.sub(spaces, text))
+
+
 def tracker_rx(hosts):
     """A link to any of `hosts`, subdomains included. Group 1 is the registered
     host, which is all a finding ever prints: the path of a tracker link can
@@ -677,22 +698,29 @@ def tracker_rx(hosts):
                       + '|'.join(re.escape(h) for h in hosts) + r')(?![A-Za-z0-9.-])', re.I)
 
 
-def forge_status(owner, repo):
+def forge_status(owner, repo, remaining=None):
     """Ask the forge, as nobody in particular, whether a stranger gets a page.
     A HEAD for the repository's own page: no token, no credentials, no body, and
     to the host the reference names and to no other host. Returns the status
     code, or None when the network did not answer. A throttle or a server error
-    is retried once; the caller reads both as unverified."""
+    is retried once; the caller reads both as unverified.
+
+    `remaining` is what is left of the run's whole time budget. It caps this
+    request's own timeout and it cancels the retry, so the budget binds the
+    request IN FLIGHT and not only the decision to start the next one."""
     url = ('https' + '://' + FORGE_HOST + '/' + urllib.parse.quote(owner, safe='')
            + '/' + urllib.parse.quote(repo, safe=''))
     req = urllib.request.Request(url, method='HEAD',
                                  headers={'User-Agent': REF_AGENT, 'Accept': '*/*'})
+    left = REF_TIMEOUT if remaining is None else max(0.1, min(REF_TIMEOUT, remaining))
     for attempt in (0, 1):
         try:
-            with urllib.request.urlopen(req, timeout=REF_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=left) as resp:
                 return resp.status
         except urllib.error.HTTPError as e:
-            if attempt == 0 and (e.code == 429 or 500 <= e.code < 600):
+            retryable = e.code == 429 or 500 <= e.code < 600
+            room = remaining is None or remaining > left + REF_BACKOFF
+            if attempt == 0 and retryable and room:
                 time.sleep(REF_BACKOFF)
                 continue
             return e.code
@@ -745,8 +773,9 @@ class RefResolver(object):
         if self.started is None:
             self.started = self.clock()
         self.asked += 1
+        remaining = max(0.0, self.deadline - (self.clock() - self.started))
         try:
-            code = self.fetch(owner, repo)
+            code = self.fetch(owner, repo, remaining)
         except Exception:
             code = None
         verdict = 'public' if code == 200 else 'closed' if code == 404 else 'unverified'
@@ -1327,8 +1356,11 @@ class Scanner(object):
     """One scan. The sweep and the self-test both go through this class."""
 
     def __init__(self, mode, classes, private, allow, out, fmt='text', hard=(), quiet=False,
-                 refs=None):
+                 refs=None, skip_code=False):
         self.mode = mode
+        # Conversation surfaces only: a fenced block or an inline code span is
+        # blanked before any class reads the unit. See blank_code.
+        self.skip_code = skip_code
         self.classes = classes
         self.private = private
         self.refs = refs
@@ -1395,6 +1427,8 @@ class Scanner(object):
                   skip_private_tags=()):
         """Scan one multi-line unit. Line numbers are line_base + index."""
         sevpath = sevpath if sevpath is not None else path
+        if self.skip_code:
+            text = blank_code(text)
         raw_lines = None
         self.stats.units += text.count('\n') + 1
         views = text_views(text) if deep else [text]
@@ -2725,6 +2759,7 @@ def build_parser():
         p.add_argument('--allow-empty', action='store_true')
         p.add_argument('--quiet', action='store_true')
         p.add_argument('--offline', action='store_true')
+        p.add_argument('--skip-code', action='store_true')
         p.add_argument('--self-repo')
 
     t = sub.add_parser('tree', allow_abbrev=False)
@@ -2822,7 +2857,7 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
         return run_hook(args, root, env, out, classes, private, kind, refs)
     allow = load_allow(args, root, classes)
     sc = Scanner(args.mode, classes, private, allow, out, args.format, args.hard, args.quiet,
-                 refs=refs)
+                 refs=refs, skip_code=bool(getattr(args, 'skip_code', False)))
     t0 = time.time()
     if args.mode == 'messages':
         full_mode = run_messages(sc, git, args, env)
@@ -3015,7 +3050,7 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 209
+EXPECTED_ARMS = 214
 
 
 def _png(chunks):
@@ -3180,11 +3215,15 @@ def self_test(out, base_env, argv0):
             failures.append('%s %s' % (name, detail))
 
     asked = []
+    budgets = []
 
-    def canned(owner, repo):
-        """The injected forge. Records every question so an arm can prove which
-        references were resolved and which were never asked about at all."""
+    def canned(owner, repo, remaining=None):
+        """The injected forge. Records every question, and the budget it was
+        handed, so an arm can prove which references were resolved, which were
+        never asked about at all, and that the time budget reaches the request
+        rather than only the decision to start one."""
         asked.append(owner.lower() + '/' + repo.lower())
+        budgets.append(remaining)
         return CANNED_FORGE.get((owner.lower(), repo.lower()))
 
     private_env = ('word:' + PW + ' @host\nword:' + SU + ' @login\nword:' + PERSON
@@ -4306,7 +4345,7 @@ def self_test(out, base_env, argv0):
         # the MUTANT: a forge that answers 200 for everything. The private-link
         # arm must go green, or the arm is not testing the forge at all.
         rc, lines = run(['tree', '--no-allow'] + mine, refenv, repo_ref,
-                        fetch=lambda o, r: 200)
+                        fetch=lambda o, r, *_: 200)
         arm('ref-mutant-a-forge-that-answers-200-for-everything-passes-the-private-link',
             not any(ln.startswith('HIT ' + REF_DEFECT + ' refs.md:2') for ln in lines)
             and any(ln.startswith('HIT ' + REF_DEFECT + ' refs.md:4') for ln in lines),
@@ -4387,10 +4426,86 @@ def self_test(out, base_env, argv0):
             str([ln for ln in lines if 'HIT' in ln][:3]))
         surfaces.update(('issue-body', 'forge-link', 'shorthand', 'tracker-link'))
         # the resolver and the shape finder as pure oracles
+        # --skip-code: a reference a reader can follow is a finding; the same
+        # text inside a fenced block or a code span is a quotation of one, which
+        # the forge does not autolink either. Both are planted on their own line
+        # so the arm reads line numbers, and the blanker is pinned as a pure
+        # function beside it because length and line count must not move.
+        tick = chr(96)
+        code_body = ('plain ' + RO + '/' + R_PRIV + '#945 here\n'
+                     + tick + RO + '/' + R_GONE + '#12' + tick + ' quoted\n'
+                     + tick * 3 + '\n' + RO + '/' + R_GONE + '#13\n' + tick * 3 + '\n')
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--no-allow'] + mine, dict(env, LG_BODY=code_body), repo_ref)
+        every = set((c, n) for c, p, n in hits(lines) if p == 'issue-body')
+        rc2, lines2 = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                           '--skip-code', '--no-allow'] + mine,
+                          dict(env, LG_BODY=code_body), repo_ref)
+        kept = set((c, n) for c, p, n in hits(lines2) if p == 'issue-body')
+        arm('ref-without-skip-code-a-quoted-example-is-a-finding',
+            rc == EXIT_HIT and {(REF_DEFECT, 1), (REF_DEFECT, 2), (REF_DEFECT, 4)} <= every,
+            str(sorted(every)))
+        arm('ref-with-skip-code-only-the-followable-reference-is-a-finding',
+            rc2 == EXIT_HIT and kept == {(REF_DEFECT, 1)}, str(sorted(kept)))
+        arm('ref-blank-code-oracles',
+            blank_code('a ' + tick + 'x' + tick + ' b') == 'a     b'
+            and blank_code(tick * 3 + '\nq\n' + tick * 3 + '\nz\n')
+            == '   \n \n   \nz\n'
+            and blank_code(tick * 2 + 'a' + tick + 'b' + tick * 2) == ' ' * 7
+            and blank_code('no code here') == 'no code here'
+            and len(blank_code(code_body)) == len(code_body)
+            and blank_code(code_body).count('\n') == code_body.count('\n'),
+            repr(blank_code(tick * 2 + 'a' + tick + 'b' + tick * 2)))
+        # the deadline reaches the request in flight, not only the decision to
+        # start the next one: the budget handed to the fetch shrinks as the run
+        # spends its clock
+        ticks2 = [0.0]
+        seen = []
+
+        def spend(owner, repo, remaining=None):
+            seen.append(remaining)
+            ticks2[0] += 40.0
+            return 404
+
+        rr = RefResolver(fetch=spend, deadline=100.0, clock=lambda: ticks2[0])
+        rr.verdict(RO, R_PRIV)
+        rr.verdict(RO, R_GONE)
+        rr.verdict(RO, R_PUB)
+        spent_now = rr.verdict(RO, R_SLOW)
+        arm('ref-the-fetch-is-handed-what-is-left-of-the-budget',
+            seen == [100.0, 60.0, 20.0] and rr.asked == 3
+            and spent_now == 'unverified' and rr.spent and len(seen) == 3,
+            'seen=%s asked=%d spent=%s' % (seen, rr.asked, rr.spent))
+        # What the budget does to a request is observed AT THE BOUNDARY: the
+        # timeout the socket was actually handed, and whether a retry was
+        # attempted at all. Restating the clamp would test nothing. The opener
+        # and the sleep are replaced for the length of this arm only.
+        seen_timeouts, slept = [], []
+
+        def fake_open(req, timeout=None):
+            seen_timeouts.append(timeout)
+            raise urllib.error.HTTPError(req.full_url, 503, 'busy', {}, None)
+
+        real_open, real_sleep = urllib.request.urlopen, time.sleep
+        urllib.request.urlopen = fake_open
+        time.sleep = lambda s: slept.append(s)
+        try:
+            plain = forge_status(RO, R_PRIV)
+            full = list(seen_timeouts), list(slept)
+            del seen_timeouts[:]
+            del slept[:]
+            starved = forge_status(RO, R_PRIV, 0.05)
+            tight = list(seen_timeouts), list(slept)
+        finally:
+            urllib.request.urlopen, time.sleep = real_open, real_sleep
+        arm('ref-an-exhausted-budget-caps-the-request-timeout-and-kills-the-retry',
+            plain == 503 and full == ([REF_TIMEOUT, REF_TIMEOUT], [REF_BACKOFF])
+            and starved == 503 and tight == ([0.1], []),
+            'full=%s tight=%s' % (full, tight))
         # the deadline: a count alone is not a bound, so an injected clock proves
         # the run stops asking and reports unverified instead of running long
         ticks = [0.0]
-        slow = RefResolver(fetch=lambda o, r: 404, deadline=5.0, clock=lambda: ticks[0])
+        slow = RefResolver(fetch=lambda o, r, *_: 404, deadline=5.0, clock=lambda: ticks[0])
         first = slow.verdict(RO, R_PRIV)
         ticks[0] = 9.0
         arm('ref-probing-stops-at-the-deadline',
@@ -4399,12 +4514,13 @@ def self_test(out, base_env, argv0):
             and slow.verdict(RO, R_PRIV) == 'closed',
             'asked=%d spent=%s' % (slow.asked, slow.spent))
         sc_b = Scanner('tree', build_classes(), None, [], lambda s: None,
-                       refs=RefScan(RefResolver(fetch=lambda o, r: 200, budget=0), RO, R_SELF))
+                       refs=RefScan(RefResolver(fetch=lambda o, r, *_: 200, budget=0),
+                                    RO, R_SELF))
         sc_b.refs.findings(FORGE + RO + '/' + R_PUB)
         arm('ref-a-spent-budget-is-reported-not-hidden',
             sc_b.refs.res.spent and 'refs_budget_spent' in _extras(sc_b),
             _extras(sc_b))
-        res = RefResolver(fetch=lambda o, r: {R_PUB: 200, R_PRIV: 404, R_SLOW: 429}.get(r))
+        res = RefResolver(fetch=lambda o, r, *_: {R_PUB: 200, R_PRIV: 404, R_SLOW: 429}.get(r))
         arm('ref-resolver-oracles',
             res.verdict(RO, R_PUB) == 'public' and res.verdict(RO, R_PRIV) == 'closed'
             and res.verdict(RO, R_SLOW) == 'unverified'
