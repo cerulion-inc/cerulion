@@ -83,8 +83,11 @@ recording's per-edge read log offline).
   `shm_open` `MAP_SHARED` primitive. The wake shape is per-OS (Linux: a
   process-shared futex; macOS: a bounded boundary spin then chunked
   ~100µs sleep-rechecks, never a busy-spin). On non-Unix hosts the SAME
-  graph runs single-process (monolith fallback) with a loud notice:
-  identical results, no process isolation.
+  graph runs single-process (monolith fallback) with a loud notice: you lose
+  process isolation. Under the `lockstep` opt-out the fallback's results match
+  the split's. Under the free-run default they need not: a split's cross-rank
+  pairings are decided by OS scheduling, and what reproduces such a run is its
+  recorded bag, not a second live run.
 
 ## When does a run go multi-process? (the auto-partition default)
 
@@ -808,7 +811,7 @@ process model in each row applies to it.
 |---|---|
 | Linux | Multi-process (supervisor + workers); under the `lockstep` opt-out, futex-woken barrier + CPU-park primitives |
 | macOS | Multi-process (supervisor + workers). Under the `lockstep` opt-out, the same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then chunked ~100µs sleep-rechecks (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
-| other (non-Unix) | **Monolith fallback**: the graph runs single-process with a loud notice. Results are identical (determinism firewall); you lose only process isolation. |
+| other (non-Unix) | **Monolith fallback**: the graph runs single-process with a loud notice; you lose process isolation. Under the `lockstep` opt-out its results match the split's (determinism firewall). Under the free-run default a split's cross-rank pairings are decided by OS scheduling, so what reproduces such a run is its recorded bag, not a second live run. |
 
 `--single-process` forces the monolith path on ANY host (useful for
 debugging a multi-process graph in one process, or for an

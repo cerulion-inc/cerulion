@@ -20,8 +20,13 @@ command it emits is computed from a new measurement rather than from whichever
 scan happened to be in the slot when a timer fired. A `#[input(trigger)]` edge
 is also a DAG edge, so the scanner levelizes strictly above the controller.
 Polling the same scan on a `period_ms` timer leaves the edge out of the DAG:
-both nodes share one level, which scan a tick pairs with becomes OS-scheduled,
-and the recording does not replay.
+both nodes share one level. Split across processes under the free-run default,
+nothing then orders that edge: which scan a tick pairs with is decided by OS
+scheduling, and two live runs of the graph can pair differently. The
+`CERULION_EXECUTION_MODE=lockstep` opt-out orders the live pairing instead. A
+`--record` bag re-executes under either mode: every cross-rank edge is served
+from the recorded frames, so a replay reproduces the pairing its run took
+rather than re-deriving it.
 
 When `cerulion graph run` splits the two nodes into one process per node (the
 default partition), the two ranks FREE-RUN: no cross-process barrier is
