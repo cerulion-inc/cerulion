@@ -241,7 +241,7 @@ is `crates/cerulion_hygiene/tests/dependency_rules_test.rs`, so an optional, ren
 transitive edge that breaks one fails `cargo test`. Each test quotes the sentence it
 enforces.
 
-| Test | The rule |
+| Test | What fails it |
 |---|---|
 | `default_member_build_is_iroh_free` | A `cargo build` with no `-p` reaches the iroh tree. `cerulion_netd`, `cerulion_link`, `cerulion_wireclient`, `cerulion_remoted`, `cerulion_connectd` and `cerulion_accountd` are workspace members and not default members for this reason, and lean consumers of netd depend with `default-features = false`. |
 | `netd_per_package_build_pulls_the_iroh_wan_plane` | `cargo build -p cerulion_netd` stops reaching iroh, which means the shipped daemon lost the WAN plane that its `wan` feature carries by default. Also the positive control for the rule above: the two differ only in the root set. |

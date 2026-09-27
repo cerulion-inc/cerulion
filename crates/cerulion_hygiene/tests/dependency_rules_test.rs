@@ -1093,7 +1093,11 @@ fn the_lean_crates_declare_exactly_their_allowed_dependencies() {
         let declared: BTreeSet<&str> = pkg
             .dependencies
             .iter()
-            .filter(|d| d.kind.is_none())
+            // Everything but `[dev-dependencies]`, which is what the rule
+            // says: a BUILD dependency compiles during a plain `cargo build`
+            // as surely as a normal one, so excluding it here would leave a
+            // lean crate able to take one and stay green.
+            .filter(|d| d.kind.as_deref() != Some("dev"))
             .map(|d| d.name.as_str())
             .collect();
         let allowed: BTreeSet<&str> = rule.allowed.iter().copied().collect();
