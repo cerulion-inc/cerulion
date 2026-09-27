@@ -546,7 +546,6 @@ mod runtime_corners {
         F: FnMut(&mut NodeContext) -> cerulion_core::error::TransportResult<()> + Send + 'static,
     {
         let config = GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),

@@ -1248,7 +1248,6 @@ pub fn graph_create(graphs_dir: &Path, name: &str, prefix: Option<&str>) -> CliR
 /// [`is_pristine_scaffold`].
 fn render_graph_scaffold(prefix: &str) -> CliResult<String> {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -23070,7 +23069,6 @@ nodes:
     #[cfg(unix)]
     fn recorded_topics_config() -> GraphConfig {
         GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -23415,7 +23413,6 @@ nodes:
         use indexmap::IndexMap;
 
         let config = GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -23490,7 +23487,6 @@ nodes:
         use indexmap::IndexMap;
 
         let config = GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -23570,7 +23566,6 @@ nodes:
         use indexmap::IndexMap;
 
         let config = GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -26276,7 +26271,6 @@ nodes:
 
         // --- External node → refused before stepping. ---
         let ext_config = GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -26345,7 +26339,6 @@ nodes:
 
         // --- Non-external (Period) node → NO refusal (Ok, run proceeds). ---
         let ok_config = GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -30159,7 +30152,6 @@ network:
     /// `node_type` (ids `<type>_0..n`), no ports.
     fn config_with_n_instances(node_type: &str, n: usize) -> GraphConfig {
         GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -34340,7 +34332,6 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         use indexmap::IndexMap;
 
         let config = GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -34398,7 +34389,6 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         use indexmap::IndexMap;
 
         let config = GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -36808,7 +36798,6 @@ mod worker_tests {
             go_path: "unused.go".to_string(),
             go_deadline_ms: 120_000,
             subgraph: GraphConfig {
-                execution: None,
                 level_assignments: None,
                 network: None,
                 name: None,
@@ -37064,7 +37053,6 @@ mod worker_tests {
         }
         fn cfg(nodes: Vec<NodeDef>) -> GraphConfig {
             GraphConfig {
-                execution: None,
                 level_assignments: None,
                 network: None,
                 name: None,
@@ -37946,7 +37934,6 @@ mod supervisor_tests {
     /// A minimal empty-subgraph config for plan literals.
     fn empty_subgraph(name: &str) -> GraphConfig {
         GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             name: None,

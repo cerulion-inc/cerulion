@@ -94,7 +94,6 @@ fn build_rig(prefix: &str) -> Rig {
     let key_topic = format!("/teleop/{prefix}/key");
 
     let config = GraphConfig {
-        execution: None,
         network: None,
         level_assignments: None,
         process_groups: Default::default(),

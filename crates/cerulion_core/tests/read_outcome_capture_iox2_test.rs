@@ -553,7 +553,6 @@ fn two_node_graph(
     consumer: Box<dyn NodeEntry>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -803,7 +802,6 @@ fn sink_def(id: &str, inputs: &[(&str, &str)]) -> NodeDef {
 /// A bare `GraphConfig` around `nodes` under `prefix`.
 fn graph_of(prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2153,7 +2151,6 @@ fn run_relay_capture(tag: &str, record: bool, steps: u64) -> RelayCapture {
         topic: None,
     };
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -6183,7 +6180,6 @@ fn wave_graph(
         (None, "producer/out".to_string())
     };
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

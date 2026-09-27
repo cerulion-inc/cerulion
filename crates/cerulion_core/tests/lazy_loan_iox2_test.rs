@@ -386,7 +386,6 @@ fn build_sparse_graph(prefix: &str) -> (GraphRuntime, SparseHandles) {
     let s_delivered = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -578,7 +577,6 @@ fn alternating_write_empty_ticks_never_flood_discard_errors() {
     let delivered = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -676,7 +674,6 @@ fn partial_write_still_discards_loudly() {
     const N: u32 = 6;
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -837,7 +834,6 @@ fn zero_field_emit_publishes_every_tick_unemitted_is_silent() {
     let q_hash = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -985,7 +981,6 @@ fn read_back_after_write_sees_just_written_value() {
     let last_y = Arc::new(AtomicU64::new(u64::MAX));
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

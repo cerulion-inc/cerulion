@@ -85,7 +85,6 @@ impl BsConsumer {
 /// isolated per-test transport.
 fn build() -> GraphRuntime {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -142,7 +142,6 @@ fn build_graph(
     .with_label("sync_nontrigger_sink");
 
     let config = GraphConfig {
-        execution: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),
@@ -524,7 +523,6 @@ fn build_seq_graph(
     .with_label("sync_nontrigger_sink");
 
     let config = GraphConfig {
-        execution: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),

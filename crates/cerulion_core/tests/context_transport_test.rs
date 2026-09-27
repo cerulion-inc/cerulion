@@ -59,7 +59,6 @@ fn test_runtime_built_context_carries_the_build_manager() {
     );
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

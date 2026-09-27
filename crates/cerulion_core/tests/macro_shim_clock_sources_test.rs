@@ -123,7 +123,6 @@ fn shim_now_ns_tracks_active_clock_and_dispatches_once() {
     let _ = NOW_CLOCK.set(clock.clone());
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -248,7 +247,6 @@ fn shim_now_ns_is_virtual_while_real_ns_is_wall() {
     let _ = REAL_NOW_OBS.set(obs.clone());
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -357,7 +355,6 @@ impl ExtSink {
 
 fn ext_sink_config() -> GraphConfig {
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

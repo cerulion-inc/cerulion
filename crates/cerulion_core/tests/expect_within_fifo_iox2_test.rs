@@ -151,7 +151,6 @@ fn reading_consumer(
 
 fn consumer_only_graph(prefix: &str) -> GraphConfig {
     GraphConfig {
-        execution: None,
         name: None,
         identity: "ewf".to_string(),
         prefix: prefix.to_string(),
@@ -176,7 +175,6 @@ fn consumer_only_graph(prefix: &str) -> GraphConfig {
 
 fn producer_consumer_graph(prefix: &str, producer_type: &str) -> GraphConfig {
     GraphConfig {
-        execution: None,
         name: None,
         identity: "ewf".to_string(),
         prefix: prefix.to_string(),
@@ -803,7 +801,6 @@ fn a_non_trigger_input_on_a_data_node_is_not_suppressed() {
     .with_label("ewf_two_input_consumer");
 
     let config = GraphConfig {
-        execution: None,
         name: None,
         identity: "ewf".to_string(),
         prefix: "ewfe".to_string(),

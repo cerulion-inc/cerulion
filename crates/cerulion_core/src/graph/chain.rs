@@ -970,7 +970,8 @@ fn late_context_bar(
 // The resolved decision: does this graph ask for fused chains?
 // ==========================================================================
 
-/// The development A/B seam for chain fusion.
+/// The A/B seam for chain fusion: `0` refuses fusion, `1` asks for it, and
+/// anything else leaves the built-in behaviour in force.
 ///
 /// A HIDDEN seam, deliberately NOT in `docs/user-api.md`, following the
 /// `CERULION_DRAIN_DISCIPLINE` and `CERULION_NOTIFY_ELISION` precedents: it
@@ -985,12 +986,12 @@ pub const FUSE_CHAINS_ENV: &str = "CERULION_FUSE_CHAINS";
 /// first question anybody asks of a graph that did not fuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FusionSource {
-    /// Neither the graph nor the environment said anything.
+    /// The environment said nothing, so the built-in behaviour applies.
     BuiltInDefault,
-    /// The graph's `execution:` block carries `fuse_chains:`.
-    GraphKey,
-    /// The environment refused it, whatever the graph asked for.
+    /// The environment refused fusion.
     EnvironmentOff,
+    /// The environment asked for fusion.
+    EnvironmentOn,
 }
 
 impl FusionSource {
@@ -998,8 +999,8 @@ impl FusionSource {
     pub fn label(self) -> &'static str {
         match self {
             Self::BuiltInDefault => "built-in default",
-            Self::GraphKey => "execution: fuse_chains:",
             Self::EnvironmentOff => "CERULION_FUSE_CHAINS=0",
+            Self::EnvironmentOn => "CERULION_FUSE_CHAINS=1",
         }
     }
 }
@@ -1050,50 +1051,44 @@ impl FusionDecision {
 
 /// Resolve the fusion decision for one graph build.
 ///
-/// Precedence, highest first:
+/// Whether chains fuse AT ALL is not a graph's choice: a graph declares its
+/// topology, and how that topology executes is the platform's business. So
+/// only two things decide it, in this order:
 ///
-/// 1. `CERULION_FUSE_CHAINS=0` refuses fusion whatever the graph says. It is
-///    the bisect switch, so it has to win.
-/// 2. `execution: fuse_chains:` in the graph, when the graph declares one.
-/// 3. The built-in default.
+/// 1. [`FUSE_CHAINS_ENV`], which selects the arm explicitly: `0` refuses
+///    fusion, `1` asks for it.
+/// 2. The built-in behaviour, for an unset or empty variable and for any value
+///    that is neither, which also warns once so a typo cannot quietly select
+///    an arm nobody chose.
 ///
-/// `CERULION_FUSE_CHAINS=1`, an empty value and an unset variable all keep the
-/// graph's decision rather than forcing one: a switch whose "on" position
-/// overrode a graph that asked for no fusion would be a second source of
-/// truth, and the graph is the source of truth for its own execution shape.
-/// Any other value is garbage that keeps the graph's decision and warns once,
-/// so a typo can never silently change what a graph does.
+/// What a GRAPH declares is narrower and per node: `fuse: false` on a node
+/// entry ends a chain there, whatever arm is in force. That is a statement
+/// about one node's role in one deployment, which is a topology fact and
+/// belongs in the graph; a graph-wide fusion switch would not be.
 ///
 /// Read FRESH once per build, with no static cache, matching the
 /// drain-discipline and notify-elision seams: one read, one value, threaded to
 /// every consumer, and a test may A/B the two paths under an environment
 /// guard. It costs nothing after the build, because nothing reads it again.
 pub fn resolve_fusion(config: &GraphConfig) -> FusionDecision {
-    let asked = config
-        .execution
-        .as_ref()
-        .and_then(|e| e.fuse_chains)
-        .map(|v| (v, FusionSource::GraphKey))
-        .unwrap_or((FUSE_CHAINS_DEFAULT, FusionSource::BuiltInDefault));
-
     let (enabled, source) = match std::env::var(FUSE_CHAINS_ENV).as_deref() {
         Ok("0") => (false, FusionSource::EnvironmentOff),
-        Ok("1") | Ok("") | Err(_) => asked,
+        Ok("1") => (true, FusionSource::EnvironmentOn),
+        Ok("") | Err(_) => (FUSE_CHAINS_DEFAULT, FusionSource::BuiltInDefault),
         Ok(other) => {
             tracing::warn!(
                 value = %other,
-                "{FUSE_CHAINS_ENV} set to an unrecognized value; expected \"0\" to refuse \
-                 fusion or \"1\" to keep the graph's decision, so the graph's decision \
-                 stands"
+                "{FUSE_CHAINS_ENV} set to an unrecognized value; expected \"0\" or \"1\", \
+                 so the built-in behaviour stands"
             );
-            asked
+            (FUSE_CHAINS_DEFAULT, FusionSource::BuiltInDefault)
         }
     };
 
     // Collected whatever the decision is, so the build log can name a node
-    // that opted out of something the graph was not asking for anyway: an
-    // opt-out that reads as having no effect is how a graph ends up with one
-    // nobody notices when the default flips.
+    // that opted out of something nothing was asking for anyway: an opt-out
+    // that reads as having no effect is how a graph ends up with one nobody
+    // notices when the default changes.
     let opted_out: IndexSet<String> = config
         .native_nodes()
         .filter(|n| n.fuse == Some(false))
@@ -1107,10 +1102,10 @@ pub fn resolve_fusion(config: &GraphConfig) -> FusionDecision {
     }
 }
 
-/// The decision a graph that says nothing gets.
+/// The behaviour an unset seam gets.
 ///
-/// `false` while no execution path fuses anything: a graph that declares
-/// nothing must behave byte-identically to one built before the key existed.
+/// `false` while no execution path fuses anything: a build with the seam
+/// unset must behave byte-identically to one made before the seam existed.
 /// It becomes `true` once a fused run and a queued run of one graph are proved
 /// to produce identical traces, which is what earns fusion the right to be the
 /// default.
@@ -1133,7 +1128,7 @@ pub fn log_fusion_decision(decision: &FusionDecision, census: &ChainCensus) {
         enabled = decision.enabled(),
         decided_by = decision.source().label(),
         opted_out = decision.opted_out().len(),
-        "chain fusion: the graph's decision is resolved; no execution path consumes it yet"
+        "chain fusion: the decision is resolved; no execution path consumes it yet"
     );
     tracing::info!(
         chains = census.chains().len(),
@@ -1176,104 +1171,80 @@ mod fusion_resolution_tests {
         }
     }
 
-    /// A two-node graph whose `execution:` block and node keys the arms vary.
-    fn graph(execution: &str, node_keys: &str) -> GraphConfig {
+    /// A two-node graph whose node keys the arms vary.
+    fn graph(node_keys: &str) -> GraphConfig {
         let yaml = format!(
-            "prefix: t\n{execution}nodes:\n  - id: src\n    type: src\n    outputs:\n      \
+            "prefix: t\nnodes:\n  - id: src\n    type: src\n    outputs:\n      \
              - name: out\n        schema: std_msgs/Int32\n  - id: sink\n    type: sink\n\
              {node_keys}    inputs:\n      - name: inp\n        source: src/out\n"
         );
         parse_graph_raw(&yaml).expect("the fixture graph must parse")
     }
 
-    /// The graph's own key decides when the environment says nothing, and an
-    /// absent key is the built-in default.
+    /// The seam selects the arm, and an unset variable is the built-in
+    /// behaviour.
     #[test]
     #[serial]
-    fn the_graph_key_decides_when_the_environment_is_silent() {
+    fn the_seam_selects_the_arm_and_unset_is_the_built_in_behaviour() {
         let _g = FuseEnvGuard;
+        let g = graph("");
+
         std::env::remove_var(FUSE_CHAINS_ENV);
+        let unset = resolve_fusion(&g);
+        assert_eq!(unset.enabled(), FUSE_CHAINS_DEFAULT);
+        assert_eq!(unset.source(), FusionSource::BuiltInDefault);
 
-        let absent = resolve_fusion(&graph("", ""));
-        assert_eq!(absent.enabled(), FUSE_CHAINS_DEFAULT);
-        assert_eq!(absent.source(), FusionSource::BuiltInDefault);
+        std::env::set_var(FUSE_CHAINS_ENV, "1");
+        let on = resolve_fusion(&g);
+        assert!(on.enabled(), "\"1\" asks for fusion");
+        assert_eq!(on.source(), FusionSource::EnvironmentOn);
 
-        let on = resolve_fusion(&graph("execution:\n  fuse_chains: true\n", ""));
-        assert!(on.enabled(), "the graph asked for fusion");
-        assert_eq!(on.source(), FusionSource::GraphKey);
-
-        // ANTI-TAUTOLOGY: the same key with the other value, so the arm above
-        // cannot pass against a resolver that always answers true.
-        let off = resolve_fusion(&graph("execution:\n  fuse_chains: false\n", ""));
-        assert!(!off.enabled(), "the graph refused fusion");
-        assert_eq!(off.source(), FusionSource::GraphKey);
-    }
-
-    /// `0` refuses fusion whatever the graph asked for: it is the bisect
-    /// switch, so it has to win.
-    #[test]
-    #[serial]
-    fn the_environment_can_refuse_what_the_graph_asked_for() {
-        let _g = FuseEnvGuard;
+        // ANTI-TAUTOLOGY: the other arm, so the one above cannot pass against
+        // a resolver that always answers true.
         std::env::set_var(FUSE_CHAINS_ENV, "0");
-
-        let asked = resolve_fusion(&graph("execution:\n  fuse_chains: true\n", ""));
-        assert!(!asked.enabled(), "\"0\" must refuse a graph that asked");
-        assert_eq!(asked.source(), FusionSource::EnvironmentOff);
-
-        let silent = resolve_fusion(&graph("", ""));
-        assert!(!silent.enabled());
-        assert_eq!(silent.source(), FusionSource::EnvironmentOff);
+        let off = resolve_fusion(&g);
+        assert!(!off.enabled(), "\"0\" refuses fusion");
+        assert_eq!(off.source(), FusionSource::EnvironmentOff);
     }
 
-    /// `1`, an empty value and an unset variable all KEEP the graph's
-    /// decision rather than forcing one, and garbage keeps it too.
+    /// An empty value and anything unrecognized leave the built-in behaviour
+    /// in force rather than selecting an arm.
     ///
-    /// The direction matters: a switch whose "on" position overrode a graph
-    /// that asked for no fusion would be a second source of truth for the
-    /// graph's own execution shape, and a typo that silently turned fusion on
-    /// would be the same mistake with no one watching.
+    /// The direction matters: a typo that silently turned fusion on would
+    /// change how a deployment executes with nobody watching, and a near-miss
+    /// of `0` that read as `0` would do the same in reverse.
     #[test]
     #[serial]
-    fn every_value_but_zero_keeps_the_graphs_decision() {
+    fn an_unrecognized_value_leaves_the_built_in_behaviour_in_force() {
         let _g = FuseEnvGuard;
-        let refused = graph("execution:\n  fuse_chains: false\n", "");
-        let asked = graph("execution:\n  fuse_chains: true\n", "");
-
-        for value in ["1", "", "yes", "true", "0 ", "00", "off", "O"] {
+        let g = graph("");
+        for value in [
+            "", "yes", "true", "on", "off", "0 ", " 0", "00", "01", "O", "2", "-1",
+        ] {
             std::env::set_var(FUSE_CHAINS_ENV, value);
-            let d = resolve_fusion(&refused);
-            assert!(
-                !d.enabled(),
-                "{value:?} must not turn fusion on for a graph that refused it"
-            );
-            assert_eq!(d.source(), FusionSource::GraphKey, "value {value:?}");
-
-            let d = resolve_fusion(&asked);
-            assert!(
+            let d = resolve_fusion(&g);
+            assert_eq!(
                 d.enabled(),
-                "{value:?} must not turn fusion off for a graph that asked for it"
+                FUSE_CHAINS_DEFAULT,
+                "{value:?} must not select an arm"
             );
-            assert_eq!(d.source(), FusionSource::GraphKey, "value {value:?}");
+            assert_eq!(d.source(), FusionSource::BuiltInDefault, "value {value:?}");
         }
     }
 
-    /// `fuse: false` names the node in the decision, whatever the graph and
-    /// the environment decided, and `may_fuse` refuses it.
+    /// `fuse: false` names the node in the decision whatever arm is in force,
+    /// and `may_fuse` refuses it.
     ///
     /// Collected even when fusion is off so a build log can name an opt-out
-    /// that currently changes nothing: an opt-out nobody can see is one
-    /// nobody notices when the default flips.
+    /// that currently changes nothing: an opt-out nobody can see is one nobody
+    /// notices when the behaviour changes.
     #[test]
     #[serial]
-    fn a_node_opt_out_is_recorded_whatever_the_graph_decided() {
+    fn a_node_opt_out_is_recorded_whatever_arm_is_in_force() {
         let _g = FuseEnvGuard;
-        std::env::remove_var(FUSE_CHAINS_ENV);
 
-        let on = resolve_fusion(&graph(
-            "execution:\n  fuse_chains: true\n",
-            "    fuse: false\n",
-        ));
+        std::env::set_var(FUSE_CHAINS_ENV, "1");
+        let on = resolve_fusion(&graph("    fuse: false\n"));
         assert!(on.enabled());
         assert_eq!(
             on.opted_out().iter().cloned().collect::<Vec<_>>(),
@@ -1284,19 +1255,14 @@ mod fusion_resolution_tests {
 
         // `true` means the same as absent: a graph may state the default
         // without that reading as a request for something different.
-        let stated = resolve_fusion(&graph(
-            "execution:\n  fuse_chains: true\n",
-            "    fuse: true\n",
-        ));
+        let stated = resolve_fusion(&graph("    fuse: true\n"));
         assert!(stated.opted_out().is_empty());
         assert!(stated.may_fuse("sink"));
 
         // With fusion off, the opt-out is still RECORDED and `may_fuse` is
         // false for every node, including ones that never opted out.
-        let off = resolve_fusion(&graph(
-            "execution:\n  fuse_chains: false\n",
-            "    fuse: false\n",
-        ));
+        std::env::set_var(FUSE_CHAINS_ENV, "0");
+        let off = resolve_fusion(&graph("    fuse: false\n"));
         assert!(!off.enabled());
         assert_eq!(
             off.opted_out().iter().cloned().collect::<Vec<_>>(),
@@ -1306,15 +1272,25 @@ mod fusion_resolution_tests {
         assert!(!off.may_fuse("src"));
     }
 
-    /// A misspelled key inside `execution:` is a loud parse error, never a
-    /// silently dropped setting.
+    /// A misspelled node key is a loud parse error, never a silently dropped
+    /// setting, and a graph-wide fusion key is not a thing a graph may declare.
     #[test]
-    fn a_misspelled_execution_key_is_refused() {
-        let yaml = "prefix: t\nexecution:\n  fuse_chain: true\nnodes:\n  - id: src\n    \
-                    type: src\n";
-        let err = parse_graph_raw(yaml).expect_err("a typo inside the block must be refused");
+    fn a_misspelled_node_key_and_a_graph_wide_key_are_both_refused() {
+        let typo = "prefix: t\nnodes:\n  - id: src\n    type: src\n    fuze: false\n";
+        let err = parse_graph_raw(typo).expect_err("a misspelled node key must be refused");
         assert!(
-            err.to_string().contains("fuse_chain"),
+            err.to_string().contains("fuze"),
+            "the refusal must name the key; got: {err}"
+        );
+
+        // How a graph EXECUTES is not a graph's declaration, so there is no
+        // top-level block to write it in. This pins that the key cannot be
+        // reintroduced by accident.
+        let block = "prefix: t\nexecution:\n  fuse_chains: true\nnodes:\n  - id: src\n    \
+                     type: src\n";
+        let err = parse_graph_raw(block).expect_err("a graph-wide fusion key must be refused");
+        assert!(
+            err.to_string().contains("execution"),
             "the refusal must name the key; got: {err}"
         );
     }

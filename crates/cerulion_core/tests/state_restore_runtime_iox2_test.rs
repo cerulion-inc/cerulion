@@ -242,7 +242,6 @@ impl NodeEntry for HalfDeclaredEntry {
 
 fn counter_graph(prefix: &str) -> GraphConfig {
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

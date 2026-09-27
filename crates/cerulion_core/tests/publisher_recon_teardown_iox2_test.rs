@@ -135,7 +135,6 @@ const CONSUMER_ID: &str = "consumer";
 /// declare a replay sequence seed on it).
 fn recon_graph(prefix: &str) -> GraphConfig {
     GraphConfig {
-        execution: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),

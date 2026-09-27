@@ -213,7 +213,6 @@ fn chain_graph(
     fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -910,7 +909,6 @@ impl Periodic {
 /// same Arc), so `clock.set(t)` directly drives `spin_budget`'s `now_ns` read.
 fn build_period_graph() -> (GraphRuntime, Arc<VirtualClock>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

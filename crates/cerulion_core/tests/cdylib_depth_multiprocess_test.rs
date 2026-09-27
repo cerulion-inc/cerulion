@@ -103,7 +103,6 @@ fn dylib_declared_depth_survives_into_multiprocess_provisioning_harvest() {
     process_groups.insert("perception".to_string(), vec!["consumer".to_string()]);
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups,

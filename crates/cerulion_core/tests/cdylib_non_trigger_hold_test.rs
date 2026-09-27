@@ -218,7 +218,6 @@ fn vec3_out(name: &str) -> OutputDef {
 fn build_cdylib_hold_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>) {
     let rec = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

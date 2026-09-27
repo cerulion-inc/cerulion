@@ -180,7 +180,6 @@ fn run_cdylib_chain(prefix: &str) -> (bool, usize, Vec<u64>) {
     .with_label("cdylib_drain_sink");
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -404,7 +403,6 @@ fn run_drain_fail_graph(prefix: &str) -> (bool, usize, u64, u64) {
     let capability = entry.unifies_trigger_drain();
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -64,7 +64,6 @@ fn unique_tag(what: &str) -> String {
 
 fn ticker_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -72,7 +72,6 @@ fn producer_graph(
     multi: Vec<String>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -501,7 +500,6 @@ impl DiscardingProducer {
 /// the surface bagd's gap detector reads.
 fn discard_arm(prefix: &str, steps: usize) -> Vec<(u32, f64)> {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

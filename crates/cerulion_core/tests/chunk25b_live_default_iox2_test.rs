@@ -127,7 +127,6 @@ fn build_live(
 /// A lone 100ms-period-producer graph (no data inputs).
 fn period_only_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -159,7 +158,6 @@ fn period_only_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
 /// A lone data-trigger consumer of the absolute external topic (NO Period node).
 fn data_only_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

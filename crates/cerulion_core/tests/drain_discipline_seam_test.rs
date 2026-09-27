@@ -187,7 +187,6 @@ impl DrainConsumer {
 fn run_chain(prefix: &str) -> (usize, Vec<u64>) {
     let last_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -302,7 +301,6 @@ fn run_fanout(prefix: &str) -> (usize, Vec<Vec<u64>>) {
         });
     }
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -697,7 +695,6 @@ fn run_closure_chain(prefix: &str, unified_capability: bool) -> (usize, Vec<u64>
     .with_unified_drain(unified_capability);
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -909,7 +906,6 @@ fn run_closure_receive_chain(prefix: &str, unified_capability: bool) -> (usize, 
     .with_unified_drain(unified_capability);
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1158,7 +1154,6 @@ fn unified_try_receive_one_warns_once_and_latch_is_shared_across_methods() {
     .with_unified_drain(true);
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1329,7 +1324,6 @@ fn unified_wait_for_message_warns_once_named_and_latch_covers_try_receive() {
     .with_unified_drain(true);
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

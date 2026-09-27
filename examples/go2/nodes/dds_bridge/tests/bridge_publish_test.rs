@@ -205,7 +205,6 @@ fn build_rig_capped(prefix: &str, cloud_max_slice_len: Option<usize>) -> Rig {
     .collect();
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -67,7 +67,6 @@ fn build_rig(prefix: &str) -> Rig {
     let inbox: Arc<Mutex<Vec<KeyOp>>> = Arc::new(Mutex::new(Vec::new()));
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

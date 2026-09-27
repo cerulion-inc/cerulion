@@ -273,7 +273,6 @@ fn producer_consumer_graph(
     seq: Arc<Mutex<Vec<u64>>>,
 ) -> GraphRuntime {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -443,7 +442,6 @@ fn run_live_refuses_single_host_driven_node() {
         .with_fires(Arc::clone(&fires))
         .with_queries(Arc::clone(&queries));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -552,7 +550,6 @@ fn run_live_refuses_multi_host_driven_nodes_in_one_error() {
     imu.src = None; // external_source() → None
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -612,7 +609,6 @@ fn run_live_refuses_mixed_reason_nodes_in_one_error_with_distinct_reasons() {
         .with_fires(Arc::clone(&lidar_fires));
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -773,7 +769,6 @@ fn refused_live_run_tears_down_sibling_blocking_helper() {
     );
     let hd = ExtProducer::new(ExternalSource::HostDriven, PublishMode::Counter);
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

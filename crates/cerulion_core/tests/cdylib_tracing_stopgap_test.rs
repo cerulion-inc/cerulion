@@ -207,7 +207,6 @@ fn build_probe_graph(instances: usize) -> TransportResult<GraphRuntime> {
         factories.insert(id, Box::new(DylibNodeEntry::load(&path)?));
     }
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

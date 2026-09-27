@@ -196,7 +196,6 @@ fn build_ticker_workspace() -> (tempfile::TempDir, PathBuf) {
 /// READY path + minted iceoryx2 Config JSON, returning the plan file path.
 fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String) -> PathBuf {
     let subgraph = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         name: None,
@@ -730,7 +729,6 @@ fn box_supervisor_directed_sigint_fans_out_and_drains_all_workers() {
     // ── (1) Scaffold: ticker workspace + a 2-group split graph. ─────────
     let (ws_tmp, ws_root) = build_ticker_workspace();
     let split = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         name: None,

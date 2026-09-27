@@ -181,7 +181,6 @@ impl Consumer {
 /// keys by node ID).
 fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -223,7 +222,6 @@ fn consumer_graph(
     fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1607,7 +1605,6 @@ mod box_same_core {
         // that isolates slice cadence + yield (a doorbell would add a second
         // wake mechanism without changing what a missing yield starves).
         let config = GraphConfig {
-            execution: None,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),

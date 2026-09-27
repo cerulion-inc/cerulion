@@ -151,7 +151,6 @@ impl WsSampleConsumer {
 /// topic `EXT_TOPIC`.
 fn ws_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -376,7 +375,6 @@ const EXT_TOPIC_ALPHA: &str = "/wsm/ext/alpha";
 /// regression.
 fn ws_multi_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -517,7 +515,6 @@ fn reactor_multiplexing_is_deterministic_across_runs() {
 /// Build a producer-ONLY graph (a lone period producer, no consumer).
 fn ws_producer_only_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -606,7 +603,6 @@ const EXT_TOPIC_MIXED: &str = "/wsx/ext/cam";
 /// `.map`-over-both dispatch under test.
 fn ws_mixed_variant_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

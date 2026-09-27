@@ -131,7 +131,6 @@ fn graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let path = cerulion_core::testing::find_fixture_cdylib("test_node_sync_op_fail_cdylib");
     let entry = DylibNodeEntry::load(&path).expect("load the sync-op-fail fixture");
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -43,7 +43,6 @@ impl ExtConsumer {
 
 fn ext_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -223,7 +222,6 @@ fn topic_override_publishes_under_absolute_name_with_single_writer() {
     // with External topics, which admit out-of-graph writers freely.
     let fires = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

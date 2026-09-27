@@ -261,7 +261,6 @@ fn prefix_for(tag: &str) -> String {
 /// One `probe` (the cdylib under test) publishing into one recording `sink`.
 fn probe_graph(prefix: &str) -> GraphConfig {
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1532,7 +1531,6 @@ fn a_panicking_state_decoder_fails_its_own_restore_without_poisoning_the_cdylibs
 /// One port-less node, so a symbol-less cdylib can be wired into a real graph.
 fn uncovered_graph(prefix: &str) -> GraphConfig {
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

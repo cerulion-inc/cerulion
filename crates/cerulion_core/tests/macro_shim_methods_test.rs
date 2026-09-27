@@ -96,7 +96,6 @@ fn shim_methods_reach_runtime_clock_and_shutdown_signal() {
         .expect("OBSERVED set exactly once");
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

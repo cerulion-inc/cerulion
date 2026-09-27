@@ -83,7 +83,6 @@ fn make_entry(info: NodeInfo) -> Box<dyn NodeEntry> {
 /// actually used.
 fn graph_config(node_id: &str) -> GraphConfig {
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

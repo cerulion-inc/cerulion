@@ -141,7 +141,6 @@ fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
     };
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

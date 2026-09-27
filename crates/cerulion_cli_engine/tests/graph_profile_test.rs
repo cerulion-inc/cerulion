@@ -644,7 +644,6 @@ fn thawed_artifact_feeds_auto_partition() {
 
     // ticker -> sink (trigger edge), laggard disconnected + isolated.
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         name: None,

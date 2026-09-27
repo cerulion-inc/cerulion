@@ -62,7 +62,6 @@ fn one_node_graph(
     body: impl FnMut() + Send + 'static,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

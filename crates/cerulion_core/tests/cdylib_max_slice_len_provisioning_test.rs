@@ -140,7 +140,6 @@ fn build_graph(
     String,
 ) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

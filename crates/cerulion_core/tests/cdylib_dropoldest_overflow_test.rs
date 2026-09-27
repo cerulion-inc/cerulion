@@ -127,7 +127,6 @@ struct SweepResult {
 fn run_sweep() -> SweepResult {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

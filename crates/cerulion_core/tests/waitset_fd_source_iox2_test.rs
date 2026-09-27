@@ -131,7 +131,6 @@ impl Drop for Pipe {
 /// `EXT_TOPIC` — one listener wake source, ready to co-exist with fd sources.
 fn fd_ws_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

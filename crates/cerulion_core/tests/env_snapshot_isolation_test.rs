@@ -65,7 +65,6 @@ fn build_runtime_recording_env_var(
 
     let node_id = unique_id("env_iso");
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

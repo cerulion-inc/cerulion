@@ -130,7 +130,6 @@ impl Drain {
 fn build_graph(val: f64) -> (GraphRuntime, Arc<AtomicU64>) {
     let last_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

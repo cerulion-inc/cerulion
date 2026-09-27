@@ -176,7 +176,6 @@ fn unique(tag: &str) -> String {
 
 fn graph(prefix: &str, ids: &[&str]) -> GraphConfig {
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -709,7 +708,6 @@ fn a_served_fifo_input_writes_its_service_cursor_into_the_anchor() {
     factories.insert("tally".to_string(), Box::new(TallyEntry::new()));
     let ids = vec!["tally".to_string()];
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -850,7 +848,6 @@ fn a_frame_the_tick_never_saw_does_not_advance_the_cursor() {
     factories.insert("tally".to_string(), Box::new(TallyEntry::new()));
     let ids = vec!["tally".to_string()];
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -973,7 +970,6 @@ fn a_per_set_sync_nodes_anchor_states_a_cursor_for_every_trigger_input() {
     factories.insert("fusion".to_string(), Box::new(SyncTallyEntry::new()));
     let ids = vec!["fusion".to_string()];
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1124,7 +1120,6 @@ fn a_skipped_member_leaves_the_two_trigger_cursors_holding_different_frames() {
     factories.insert("fusion".to_string(), Box::new(SyncTallyEntry::new()));
     let ids = vec!["fusion".to_string()];
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1434,7 +1429,6 @@ fn a_caught_tick_panic_stops_anchoring_so_no_anchor_observes_a_post_panic_cursor
     factories.insert("tally".to_string(), Box::new(PanicTallyEntry::new()));
     let ids = vec!["tally".to_string()];
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

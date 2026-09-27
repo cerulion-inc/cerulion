@@ -45,7 +45,6 @@ impl Drop for EnvGuard {
 /// One-node graph carrying the given `network:` block.
 fn graph_with(network: Option<NetworkBlock>) -> GraphConfig {
     GraphConfig {
-        execution: None,
         name: None,
         identity: "netgate".to_string(),
         prefix: "ng".to_string(),
@@ -382,7 +381,6 @@ fn enabled_network_plus_process_groups_is_strict_not_refused() {
 fn node_run_temp_graph_shape_is_permissive() {
     let _lock = env_lock();
     let config = GraphConfig {
-        execution: None,
         name: None,
         identity: "__temp_talker".to_string(),
         prefix: "standalone".to_string(),

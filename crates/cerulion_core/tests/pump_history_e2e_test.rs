@@ -100,7 +100,6 @@ fn producer_graph(
     factory: Box<dyn NodeEntry>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

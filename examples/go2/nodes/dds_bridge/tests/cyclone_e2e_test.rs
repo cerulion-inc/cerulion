@@ -129,7 +129,6 @@ fn cyclone_peer_cloud_reaches_cerulion_subscriber_byte_exact() {
 
     let queue: Arc<Mutex<SampleQueue>> = Arc::new(Mutex::new(SampleQueue::default()));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

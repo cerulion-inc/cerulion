@@ -153,7 +153,6 @@ impl QuantumNode {
 /// (`build_for_test_barrier` keys by node ID).
 fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -206,7 +205,6 @@ fn humanoid_graph(
         topic: None,
     };
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -259,7 +257,6 @@ fn humanoid_graph(
 /// `Period` cadence (50ms) or the 1ms fallback. `id` == factory-map key.
 fn quantum_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -620,7 +617,6 @@ impl LiveConsumer {
 /// publishers to drive real liveliness transitions.
 fn liveliness_graph(obs: Arc<LiveObs>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

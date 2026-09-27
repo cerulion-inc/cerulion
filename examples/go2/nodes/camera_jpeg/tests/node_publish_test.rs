@@ -187,7 +187,6 @@ struct Rig {
 /// one `CompressedImage` output).
 fn graph_config(prefix: &str, h264_topic: &str, max_slice_len: usize) -> GraphConfig {
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

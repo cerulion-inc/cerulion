@@ -164,7 +164,6 @@ fn mixed_graph(
         factories.insert("sink".to_string(), Box::new(NwSinkEntry::new()));
     }
     let config = GraphConfig {
-        execution: None,
         name: None,
         identity: "nw_wiring".to_string(),
         prefix: prefix.to_string(),

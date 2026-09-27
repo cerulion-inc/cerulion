@@ -246,7 +246,6 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
         outputs: vec![],
     });
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

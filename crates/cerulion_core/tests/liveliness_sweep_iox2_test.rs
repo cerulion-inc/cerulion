@@ -128,7 +128,6 @@ impl LiveConsumer {
 /// publishers to drive real liveliness transitions.
 fn live_graph(obs: Arc<LiveObs>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -399,7 +398,6 @@ fn internal_edge_consumer_first_no_spurious_alive() {
     let obs = Arc::new(LiveObs::default());
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -526,7 +524,6 @@ fn data_trigger_lost_handler_silent_but_counter_fires() {
     let obs = Arc::new(LiveObs::default());
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -666,7 +663,6 @@ fn multi_publisher_lost_only_on_last_leave() {
     let obs = Arc::new(LiveObs::default());
 
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

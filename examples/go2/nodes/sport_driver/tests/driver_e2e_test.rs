@@ -62,7 +62,6 @@ fn build_rig(prefix: &str) -> Rig {
 
     let cmd_topic = format!("/e_sd/{prefix}/cmd_vel");
     let config = GraphConfig {
-        execution: None,
         network: None,
         level_assignments: None,
         process_groups: Default::default(),

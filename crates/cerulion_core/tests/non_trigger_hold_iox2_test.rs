@@ -279,7 +279,6 @@ fn build_graph(
 ) -> (GraphRuntime, Arc<AtomicU64>) {
     let last_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -820,7 +819,6 @@ fn build_one_input_graph(
     buffer: usize,
 ) -> GraphRuntime {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -874,7 +872,6 @@ fn data_trigger_consumer_holds_silent_context() {
 
     let last_ctx = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1373,7 +1370,6 @@ fn two_non_trigger_inputs_hold_independently() {
     let last_a = Arc::new(AtomicU64::new(MISSING));
     let last_b = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1635,7 +1631,6 @@ fn build_external_snapshot_graph(
     last_read: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1841,7 +1836,6 @@ fn build_producer_via_worker_path(
     overrides: Option<&std::collections::BTreeMap<String, cerulion_core::TopicRequirements>>,
 ) -> GraphRuntime {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2179,7 +2173,6 @@ fn external_topic_excluded_from_union_and_harvest() {
     // roots (the consumer's trigger source has no in-graph producer) → ONE
     // global level.
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2328,7 +2321,6 @@ fn override_applies_only_to_its_topic_not_siblings() {
 
     // Two independent owned producer topics (both roots → ONE global level).
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2478,7 +2470,6 @@ fn build_producer_override_graph(
     val: f64,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

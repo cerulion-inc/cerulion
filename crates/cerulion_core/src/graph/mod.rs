@@ -50,8 +50,7 @@ pub use chain::{
     FUSE_CHAINS_ENV, MAX_FUSED_CHAIN_NODES,
 };
 pub use config::{
-    ExecutionBlock, GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef,
-    UNNAMED_GRAPH,
+    GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef, UNNAMED_GRAPH,
 };
 #[cfg(feature = "fuzz-helpers")]
 pub use node::fuzz_parse_info_json;

@@ -138,7 +138,6 @@ fn build_cdylib_collapse_graph(
     let delivered = Arc::new(AtomicU64::new(0));
     let last_value = Arc::new(AtomicU64::new(u64::MAX));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

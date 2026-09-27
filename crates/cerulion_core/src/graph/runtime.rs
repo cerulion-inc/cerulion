@@ -4835,14 +4835,13 @@ impl GraphRuntime {
         let levels = super::topology::resolve_levels(&config, &topology, &trigger_edges)?;
 
         // CHAIN FUSION, resolved once and logged once. The decision combines
-        // the graph's `execution: fuse_chains:` key, the per-node `fuse:
-        // false` opt-out and the `CERULION_FUSE_CHAINS` bisect switch; the
-        // census beside it says which edges the graph's declarations would
-        // allow and, for every other consumer edge, the reason it keeps the
-        // queued path.
+        // the `CERULION_FUSE_CHAINS` seam with the per-node `fuse: false`
+        // opt-out; the census beside it says which edges the graph's
+        // declarations would allow and, for every other consumer edge, the
+        // reason it keeps the queued path.
         //
         // NOTHING BELOW READS EITHER. The pair is logged and dropped, so this
-        // build is byte-identical to one made before the keys existed. It is
+        // build is byte-identical to one made before either existed. It is
         // resolved HERE, beside the other build-time seams, because a decision
         // read twice in one build could disagree with itself and a fusion set
         // that varied within a build would make a replay a different program.
@@ -17281,7 +17280,6 @@ mod tests {
     fn ingress_resolver_config(nodes: Vec<(&str, Vec<(&str, &str)>)>) -> GraphConfig {
         use crate::graph::config::{InputDef, NodeDef};
         GraphConfig {
-            execution: None,
             name: None,
             identity: "ingress_hash_test".to_string(),
             prefix: "nw".to_string(),

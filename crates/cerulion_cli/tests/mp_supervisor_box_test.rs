@@ -166,7 +166,6 @@ fn build_graph_config() -> GraphConfig {
         source: source.to_string(),
     };
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         name: None,

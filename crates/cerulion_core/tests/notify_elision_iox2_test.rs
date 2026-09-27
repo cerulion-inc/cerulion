@@ -139,7 +139,6 @@ impl ElideConsumer {
 fn build_chain(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
     let last_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -79,7 +79,6 @@ fn out_def(name: &str) -> OutputDef {
 /// `fuse`, whose YAML `inputs:` list is supplied by the caller.
 fn two_node_config(fuse_inputs: Vec<InputDef>) -> GraphConfig {
     GraphConfig {
-        execution: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),

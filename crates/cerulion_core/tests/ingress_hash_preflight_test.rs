@@ -58,7 +58,6 @@ fn ingress_graph() -> GraphConfig {
 /// metadata for it and fail for an incidental reason.
 fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
     GraphConfig {
-        execution: None,
         name: None,
         identity: "ingress_preflight".to_string(),
         prefix: "ingress_preflight".to_string(),

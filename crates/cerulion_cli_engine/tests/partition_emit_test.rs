@@ -306,7 +306,6 @@ fn crlf_line_endings_are_preserved_outside_the_block() {
 /// use.
 fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
     let config = GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         name: None,
@@ -1511,7 +1510,6 @@ fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
 
 fn config_of(nodes: Vec<NodeDef>, multi: Vec<String>) -> GraphConfig {
     GraphConfig {
-        execution: None,
         level_assignments: None,
         network: None,
         name: None,
