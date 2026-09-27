@@ -169,7 +169,7 @@ fn main() -> ExitCode {
     // here, ABOVE the login gate, for the same reason the removed `replay` verb
     // is — you do not have to prove who you are to be told your command line is
     // wrong. `bag play` is identity-gated (`command_needs_identity` exempts only
-    // `login`, `completions` and the two internal `graph run-worker` /
+    // `login`, `completions`, `clean` and the two internal `graph run-worker` /
     // `run-gateway` subprocess verbs), and on a never-signed-in machine
     // `ensure_login_gate` runs the DEVICE-CODE FLOW inline, so `cerulion bag
     // play b.mcap --verify` would open a browser prompt and exit 7 (auth)
@@ -3670,6 +3670,13 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 ///   auth cache — auto-trigger an interactive device-code login MID-SPAWN,
 ///   wedging the whole run. (`bagd` is also internal but is dispatched away in
 ///   `main` BEFORE this hook, so it never reaches here.)
+/// - **`clean`** — it sweeps the iceoryx2 bookkeeping that provably dead
+///   processes left behind on THIS machine: it reads no account, sends nothing
+///   anywhere and reaches no network. The desks that need it most have never
+///   signed in — a CI runner, a fresh install a `kill -9` left wedged — and a
+///   machine must be able to clear its own state. Gating it would also make the
+///   remedy for a wedged desk depend on a device-code flow that the wedge is
+///   perfectly capable of outliving.
 ///
 /// The enforcement boundary: `run-worker` and `run-gateway` are hidden from
 /// help but still reachable as standalone `cerulion graph run-worker`
@@ -3685,6 +3692,7 @@ fn command_needs_identity(command: &Commands) -> bool {
             // completions zsh` in a shell rc file block startup on a device
             // -code prompt nobody is watching.
             | Commands::Completions { .. }
+            | Commands::Clean { .. }
             | Commands::Graph {
                 action: GraphAction::RunWorker { .. } | GraphAction::RunGateway { .. },
             }
@@ -3865,8 +3873,9 @@ mod login_gate_exemption_tests {
 
     // Pin the load-bearing exemption surface so a
     // future edit that drops/reorders the match — un-exempting `login` (a doubled
-    // login) or the worker/gateway subprocess verbs (a mid-spawn wedge) — fails
-    // CI instead of shipping green.
+    // login), the worker/gateway subprocess verbs (a mid-spawn wedge) or `clean`
+    // (a wedged desk with no way to clear its own state) — fails CI instead of
+    // shipping green.
 
     #[test]
     fn login_verb_is_exempt() {
@@ -3888,10 +3897,33 @@ mod login_gate_exemption_tests {
     }
 
     #[test]
-    fn ordinary_verbs_are_gated() {
-        // A representative spread of user-facing verbs must gate.
-        assert!(command_needs_identity(&Commands::Clean {
+    fn the_clean_verb_is_exempt() {
+        // `clean` sweeps provably dead local shared-memory bookkeeping: no
+        // account is read and nothing leaves the machine. The exemption is the
+        // VERB, so both forms of the flag carry it — a desk wedged badly enough
+        // to need the destructive form is exactly the desk that cannot sign in.
+        assert!(!command_needs_identity(&Commands::Clean {
+            report_only: true
+        }));
+        assert!(!command_needs_identity(&Commands::Clean {
             report_only: false
+        }));
+    }
+
+    #[test]
+    fn ordinary_verbs_are_gated() {
+        // A representative spread of user-facing verbs must gate. Without this
+        // arm every assertion above would still hold for a build that exempted
+        // everything. `topic list` is the twin of the behavioural control in
+        // `tests/login_gate_e2e_test.rs`.
+        assert!(command_needs_identity(&Commands::Topic {
+            action: TopicAction::List {
+                all: false,
+                no_network: true,
+                connect: Vec::new(),
+                listen: Vec::new(),
+                scan: false,
+            },
         }));
         assert!(command_needs_identity(&Commands::Graph {
             action: GraphAction::List,

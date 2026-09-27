@@ -397,8 +397,8 @@ fn the_removed_replay_verb_is_an_unrecognized_subcommand() {
 /// BEFORE the login gate.
 ///
 /// `bag play` is identity-gated: `command_needs_identity` exempts only `login`,
-/// `completions` and the two internal `graph run-worker` / `run-gateway`
-/// subprocess verbs. On a machine that has never signed in the gate answers
+/// `completions`, `clean` and the two internal `graph run-worker` /
+/// `run-gateway` subprocess verbs. On a machine that has never signed in the gate answers
 /// first, so this exact argv would exit 7 (auth) rather than 2 (usage), never
 /// reaching the refusal that names `--resim`.
 ///

@@ -9,8 +9,8 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   statement of `main()` - it owns stdout for a completion invocation. Nothing may print
   before it, and completion output must stay bare candidates with zero stderr bytes
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
-- Keep `Completions` excluded from `command_needs_identity` - `cerulion completions zsh`
-  runs from shell rc files and must never block shell startup on an auth prompt.
+- Never gate `Completions` or `Clean` behind `command_needs_identity` - a shell rc file
+  and a desk that never signed in must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
 - Multi-value flags use exact `num_args = N`, never a range - clap's default Append
   action flattens repeated invocations into one Vec, making two partial invocations
   indistinguishable from one full one. Length guards run BEFORE any positional access.

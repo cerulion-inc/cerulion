@@ -10,6 +10,15 @@
 //! reads the real `~/.cerulion`) and runs from a non-workspace cwd, so it needs
 //! no fixtures and touches no shared state (parallel-safe, no `#[serial]`).
 //!
+//! ONE arm is not purely local, and cannot be. `clean` is exempt precisely
+//! because it sweeps THIS machine's iceoryx2 bookkeeping, so the only way to
+//! prove the exemption at the boundary a user feels is to let that sweep run.
+//! It runs in the `--report-only` form, which removes no state file and no
+//! orphan port tag; the dead-node sweep it still performs is the same one
+//! `graph run` performs at its own startup and reaches provably dead nodes
+//! only, so nothing a concurrent test owns is reachable by it and the file
+//! stays parallel-safe.
+//!
 //! ## Which arm runs here, and why
 //!
 //! A spawned process gets pipes for stdin and stderr, so every test in this file
@@ -23,6 +32,7 @@
 //! (`ensure_login_gate_with`) and the device flow runs against a real local
 //! account service.
 
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -49,12 +59,28 @@ fn run_cerulion(seeded: bool, extra_env: &[(&str, &str)], args: &[&str]) -> (Opt
     if seeded {
         auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
     }
+    let (code, _stdout, stderr) = run_cerulion_at(home.path(), extra_env, args);
+    (code, stderr)
+}
+
+/// The same spawn against a home the CALLER owns, handing back stdout as well.
+///
+/// Two arms need more than the refusal on stderr: one has to read the report an
+/// exempt verb prints, and both have to look at the home afterwards to show the
+/// run left no local identity behind. Everything else about the spawn — the
+/// non-workspace cwd, the removed `CERULION_LOGIN_GATE`, the dead account
+/// service — is [`run_cerulion`]'s, because this is that function's body.
+fn run_cerulion_at(
+    home: &Path,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> (Option<i32>, String, String) {
     let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
     cmd.args(args)
         .current_dir(cwd.path())
         .env_remove("CERULION_LOGIN_GATE")
-        .env("CERULION_HOME", home.path())
+        .env("CERULION_HOME", home)
         .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1");
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -62,6 +88,7 @@ fn run_cerulion(seeded: bool, extra_env: &[(&str, &str)], args: &[&str]) -> (Opt
     let out = cmd.output().expect("spawn cerulion");
     (
         out.status.code(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
 }
@@ -81,6 +108,28 @@ fn assert_is_the_refusal(stderr: &str) {
     assert!(
         stderr.contains("CERULION_HOME"),
         "the refusal must name the fix for automation; stderr={stderr}"
+    );
+}
+
+/// The refusal a user reads, WHOLE, transcribed by hand from the two lines the
+/// binary prints (the `Error: ` frame `main` puts in front of every `CliError`
+/// included). Written out here rather than composed from the constant the code
+/// holds: a comparison against that constant would agree with any wording,
+/// which is the failure this oracle exists to catch. Whoever rewords the
+/// refusal reworded what a user reads, and retypes it here.
+const REFUSAL_A_USER_READS: &str = "Error: This machine has never signed in to a Cerulion account, and every command needs one.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did.";
+
+/// The file a real sign-in writes into `CERULION_HOME`. A run that neither
+/// signed in nor was asked to leaves the home exactly as it found it, and an
+/// exemption that worked by quietly minting one would be a different change
+/// than the one under test.
+fn assert_no_identity_was_written(home: &Path) {
+    let auth = home.join("auth.json");
+    assert!(
+        !auth.exists(),
+        "the run wrote {} — neither an exempt verb nor a refused one may leave \
+         this machine signed in",
+        auth.display()
     );
 }
 
@@ -182,7 +231,9 @@ fn this_repositorys_own_runs_proceed_without_an_account() {
 fn the_exempt_verbs_run_without_an_identity() {
     // `completions` renders local text and is read by a shell rc file at
     // startup, where a device-code prompt nobody is watching would block the
-    // shell. `login` is the login itself. Neither may be gated.
+    // shell. `login` is the login itself. Neither may be gated. (`clean` is
+    // exempt too and has its own arm below, because proving it means reading
+    // the report it prints rather than only its exit code.)
     for args in [
         vec!["completions", "zsh"],
         vec!["--help"],
@@ -200,6 +251,65 @@ fn the_exempt_verbs_run_without_an_identity() {
             "{args:?} must succeed on a machine that never signed in; stderr={stderr}"
         );
     }
+}
+
+#[test]
+fn clean_runs_on_a_machine_that_has_never_signed_in() {
+    // `clean` sweeps the shared-memory bookkeeping that dead processes left on
+    // THIS machine. It reads no account, sends nothing anywhere and reaches no
+    // network, and the desks that need it most have never signed in: a CI
+    // runner, a fresh install a `kill -9` left wedged. Gating it would leave
+    // such a machine no way to clear its own state.
+    let home = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_cerulion_at(home.path(), &[], &["clean", "--report-only"]);
+    assert!(
+        !stderr.contains(REFUSAL_A_USER_READS),
+        "`clean` must not meet the login gate; stderr={stderr}"
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "`clean --report-only` must succeed on a machine that never signed in; \
+         stdout={stdout} stderr={stderr}"
+    );
+    // It RAN, rather than exiting 0 having printed nothing. The report names
+    // the node registry on every path it can take (a population, an absence,
+    // or a directory it could not read), so this one line is present whatever
+    // the machine's state is; the literal is transcribed from the renderer, not
+    // read back off it.
+    assert!(
+        stdout.contains("iceoryx2 node registry:"),
+        "`clean --report-only` must print its report; stdout={stdout}"
+    );
+    assert_no_identity_was_written(home.path());
+}
+
+#[test]
+fn a_gated_verb_under_the_same_never_signed_in_home_still_refuses() {
+    // The anti-tautology control for the arm above: the same empty home, a verb
+    // that is NOT exempt, and the whole message a user reads. Without it the
+    // arm above would pass just as well on a build that had switched the gate
+    // off altogether. `--no-network` bounds the blast radius if it ever does:
+    // a `topic list` that reached its own body would otherwise go scouting.
+    let home = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) =
+        run_cerulion_at(home.path(), &[], &["topic", "list", "--no-network"]);
+    assert!(
+        stderr.contains(REFUSAL_A_USER_READS),
+        "a gated verb must print the whole refusal a user reads; stderr={stderr}"
+    );
+    assert_eq!(
+        code,
+        Some(i32::from(EXIT_AUTH_REQUIRED)),
+        "a gated verb exits 7 on a machine that never signed in; stderr={stderr}"
+    );
+    // The command did not run: `topic list` prints a LOCAL section on every
+    // path of its own, and the refusal came instead of all of it.
+    assert!(
+        stdout.is_empty(),
+        "the gate must short-circuit before the verb writes anything; stdout={stdout}"
+    );
+    assert_no_identity_was_written(home.path());
 }
 
 #[test]
