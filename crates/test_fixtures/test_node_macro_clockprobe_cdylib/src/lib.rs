@@ -16,7 +16,8 @@
 //! # The shared memory address probe
 //!
 //! Under `CER_ZC_ADDR_PROBE` this fixture ALSO records the raw virtual address
-//! of the output slot it writes through, and stamps `PROBE_MARKER_BITS` into
+//! of the output slot the FIRST probed tick writes through, and stamps
+//! `PROBE_MARKER_BITS` into
 //! `angular.z`. `cerulion_core/tests/cdylib_shm_write_address_test.rs` reads the
 //! address back through [`cerulion_test_get_shm_write_addr`] and asks the OS
 //! which mapping contains it: a zero copy plugin write lands in the publisher's
@@ -45,7 +46,11 @@ use native_ros2_messages::geometry_msgs::Twist;
 /// is an oracle for the delivered bytes rather than a self compare.
 const PROBE_MARKER_BITS: u64 = 0x5A5A_C0FF_EE00_1234;
 
-/// Virtual address of the `angular.z` slot the last probed tick wrote through.
+/// Virtual address of the `angular.z` slot the FIRST probed tick wrote through,
+/// counting from the last reset. Later ticks leave it alone, so the address names
+/// one identifiable frame: the first one published after the reset. That is what
+/// lets the host compare this write position against the position the SAME frame
+/// is read at, rather than against whichever frame happened to be delivered last.
 ///
 /// Process global, so every `dlopen` of this object shares it: the host reads it
 /// through its own `libloading` handle of the same path while the graph that
@@ -84,10 +89,11 @@ impl ClockProbe {
             // derefs to the `#[repr(C)]` `TwistShm` overlaid on the iceoryx2
             // payload, so this is the address of the payload slot the line above
             // wrote. Taken LAST in the tick: the borrow ends with the statement.
-            SHM_WRITE_ADDR.store(
-                std::ptr::from_ref(&self.out.angular.z) as usize,
-                Ordering::Relaxed,
-            );
+            // `compare_exchange` from 0 keeps the FIRST probed tick's address and
+            // discards every later one, so the recorded position belongs to the
+            // first frame published after the host's reset.
+            let slot = std::ptr::from_ref(&self.out.angular.z) as usize;
+            let _ = SHM_WRITE_ADDR.compare_exchange(0, slot, Ordering::Relaxed, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -97,8 +103,9 @@ impl ClockProbe {
 // Probe accessors (read/reset the process global address slot).
 // ===========================================================================
 
-/// Read the address the last probed tick wrote its output payload through, or 0
-/// when no probed tick has run. `handle` is accepted for ABI shape but ignored:
+/// Read the address the FIRST probed tick since the last reset wrote its output
+/// payload through, or 0 when no probed tick has run. `handle` is accepted for
+/// ABI shape but ignored:
 /// the slot is process global, shared across every `dlopen` of this object, so
 /// the host reads it through its own `libloading` handle of the same path.
 #[no_mangle]
@@ -107,7 +114,8 @@ pub extern "C" fn cerulion_test_get_shm_write_addr(_handle: u64) -> u64 {
 }
 
 /// Clear the address slot, so an arm that must observe a FRESH write cannot pass
-/// on the address a previous arm in the same process left behind.
+/// on the address a previous arm in the same process left behind, and so the next
+/// probed tick becomes the FIRST one again.
 #[no_mangle]
 pub extern "C" fn cerulion_test_reset_shm_write_addr() {
     SHM_WRITE_ADDR.store(0, Ordering::Relaxed);

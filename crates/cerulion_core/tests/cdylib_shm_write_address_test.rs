@@ -29,14 +29,19 @@
 //! makes them mean something:
 //!
 //! 1. **plugin arm**: the address the plugin wrote through is inside a shared
-//!    memory mapping, and inside the SAME OS memory object the host reads the
-//!    delivered frame out of.
+//!    memory mapping, inside the SAME OS memory object the host reads the
+//!    delivered frame out of, and at the SAME position inside that object. The
+//!    position matters because object identity alone would admit a producer that
+//!    wrote one slot and moved the bytes to another slot of the same segment
+//!    before publishing, which is still a copy. Both sides therefore name the
+//!    FIRST frame of the run, so the comparison is exact.
 //! 2. **in process twin**: a non cdylib node whose tick mirrors the fixture's
 //!    probe branch passes the SAME checker, so the checker is not accidentally
 //!    passing on something specific to the FFI path.
-//! 3. **positive control**: the payload copied into a heap buffer FAILS the same
-//!    checker, with the checker's own panic captured, so a checker that had
-//!    degraded into an unconditional pass cannot go unnoticed.
+//! 3. **positive controls**: the payload copied into a heap buffer FAILS the same
+//!    checker, and a frame read from a NEIGHBOURING slot of the same segment fails
+//!    the position arm, both with the checker's own panic captured, so neither
+//!    check can degrade into an unconditional pass unnoticed.
 //!
 //! The delivered bytes carry a hand oracle as well: `angular.z` must arrive as
 //! the exact bit pattern the fixture stamps (`PROBE_MARKER_BITS`, written here
@@ -116,6 +121,19 @@ struct MappedRegion {
     /// anonymous mapping). macOS: the share mode and allocation tag, since a
     /// POSIX shared memory object has no vnode path.
     os_label: String,
+    /// Offset INTO the backing object at which this mapping starts. Linux: the
+    /// `offset` column of `/proc/self/maps`. macOS: `pri_offset`. Added to an
+    /// address's distance from `base` it gives that address's position inside the
+    /// object, which is comparable across two mappings of one object even when
+    /// the kernel has split a mapping into several regions.
+    object_offset: usize,
+}
+
+impl MappedRegion {
+    /// Position of `addr` inside the backing OBJECT, not inside this mapping.
+    fn offset_of(&self, addr: usize) -> usize {
+        (addr - self.base) + self.object_offset
+    }
 }
 
 /// Where an address lives, as far as the OS is concerned.
@@ -140,13 +158,16 @@ fn region_of(addr: usize) -> Option<MappedRegion> {
         .expect("Linux: /proc/self/maps must be readable to locate a mapping");
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
-        let (Some(range), Some(perms), Some(_offset), Some(dev), Some(inode)) = (
+        let (Some(range), Some(perms), Some(offset), Some(dev), Some(inode)) = (
             fields.next(),
             fields.next(),
             fields.next(),
             fields.next(),
             fields.next(),
         ) else {
+            continue;
+        };
+        let Ok(object_offset) = usize::from_str_radix(offset, 16) else {
             continue;
         };
         let Some((lo, hi)) = range.split_once('-') else {
@@ -168,6 +189,7 @@ fn region_of(addr: usize) -> Option<MappedRegion> {
             shared: perms.ends_with('s'),
             object: format!("{dev}:{inode}"),
             os_label: path.join(" "),
+            object_offset,
         });
     }
     None
@@ -264,6 +286,7 @@ fn region_of(addr: usize) -> Option<MappedRegion> {
             "share_mode={} user_tag=0x{:x} ref_count={}",
             info.share_mode, info.user_tag, info.ref_count
         ),
+        object_offset: info.offset as usize,
     })
 }
 
@@ -337,6 +360,40 @@ fn assert_same_os_object(writer: &MappedRegion, reader: &MappedRegion, who: &str
     );
 }
 
+/// Both addresses sit at the SAME position inside that one object.
+///
+/// Object identity alone cannot see a copy that stays INSIDE the segment: a
+/// producer that wrote slot A and then moved the bytes to slot B before
+/// publishing would satisfy it, because both slots belong to the same object.
+/// The position is what excludes that. It is compared as an offset into the
+/// OBJECT rather than as a raw address, because a publisher and a consumer map
+/// the same segment at different base addresses.
+///
+/// Both sides name the FIRST frame of the run, which is what makes an exact
+/// comparison meaningful: the producer records only its first probed tick and the
+/// consumer keeps only its first delivered frame, so the two describe one frame
+/// rather than whichever frame each happened to see last.
+fn assert_same_object_offset(
+    writer_addr: usize,
+    writer: &MappedRegion,
+    reader_addr: usize,
+    reader: &MappedRegion,
+    who: &str,
+) {
+    let w = writer.offset_of(writer_addr);
+    let r = reader.offset_of(reader_addr);
+    assert_eq!(
+        w, r,
+        "{who}: the producer wrote at offset 0x{w:x} into the shared memory \
+         object, and the consumer read the delivered frame at offset 0x{r:x} \
+         into that same object, so the payload was moved between two slots of \
+         one segment, which is a copy that object identity alone cannot see \
+         (writer base=0x{:x} addr=0x{writer_addr:x}, reader base=0x{:x} \
+         addr=0x{reader_addr:x})",
+        writer.base, reader.base,
+    );
+}
+
 // ===========================================================================
 // Graph: a Twist producer feeding an in process capture consumer.
 // ===========================================================================
@@ -367,7 +424,13 @@ impl TwistCapture {
             angular_x_bits: self.probe.angular.x.to_bits(),
             read_addr: std::ptr::from_ref(&self.probe.angular.z) as usize,
         };
-        *self.captured.lock().unwrap() = Some(cap);
+        // Keep the FIRST delivered frame only: the producer records the position
+        // of its first write, so the offset comparison has to be against the same
+        // frame, not against whichever frame arrived last.
+        let mut slot = self.captured.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(cap);
+        }
         Ok(())
     }
 }
@@ -388,7 +451,12 @@ impl TwistProbeTwin {
     fn tick(&mut self) -> Result<(), NodeError> {
         self.out.angular.x = 0.0;
         self.out.angular.z = f64::from_bits(PROBE_MARKER_BITS);
-        *self.write_addr.lock().unwrap() = std::ptr::from_ref(&self.out.angular.z) as usize;
+        let slot = std::ptr::from_ref(&self.out.angular.z) as usize;
+        // First tick only, mirroring the fixture's `compare_exchange` from 0.
+        let mut recorded = self.write_addr.lock().unwrap();
+        if *recorded == 0 {
+            *recorded = slot;
+        }
         Ok(())
     }
 }
@@ -573,6 +641,35 @@ fn cdylib_tick_writes_through_an_address_inside_the_publisher_shm_segment() {
         &run.data_suffix,
     );
     assert_same_os_object(&writer, &reader, "cdylib plugin write vs host read");
+    assert_same_object_offset(
+        write_addr,
+        &writer,
+        got.read_addr,
+        &reader,
+        "cdylib plugin write vs host read",
+    );
+
+    // Control for the offset arm itself: a DIFFERENT slot in the SAME object must
+    // be rejected. Without this, an offset check that had collapsed into a
+    // tautology would keep the arm above green while admitting an intra segment
+    // copy, which object identity alone cannot see.
+    let other_slot = got.read_addr + std::mem::size_of::<f64>();
+    assert!(
+        reader.offset_of(other_slot) != reader.offset_of(got.read_addr),
+        "the neighbouring slot must sit at a different object offset"
+    );
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let moved = std::panic::catch_unwind({
+        let (w, r) = (writer.clone(), reader.clone());
+        move || assert_same_object_offset(write_addr, &w, other_slot, &r, "intra segment copy")
+    });
+    std::panic::set_hook(previous);
+    assert!(
+        moved.is_err(),
+        "the offset arm must REJECT a frame read from a different slot of the \
+         same shared memory object: that is an intra segment copy"
+    );
 }
 
 // ===========================================================================
@@ -613,6 +710,13 @@ fn in_process_twin_writes_through_an_address_inside_the_publisher_shm_segment() 
         &run.data_suffix,
     );
     assert_same_os_object(&writer, &reader, "in process write vs host read");
+    assert_same_object_offset(
+        addr,
+        &writer,
+        got.read_addr,
+        &reader,
+        "in process write vs host read",
+    );
 }
 
 // ===========================================================================
