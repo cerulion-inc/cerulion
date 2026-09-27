@@ -1122,7 +1122,28 @@ fn the_robot_workspace_reader_sees_normal_and_dev_packages() {
          lockfile that no longer covers this workspace"
     );
 
+    // The fixture first: `tempfile` has to be dev-ONLY in that manifest, or
+    // the reader below could find it through `[dependencies]` while the dev
+    // table went unread. A control that a fixture change can satisfy is not a
+    // control.
     let dds_bridge = go2.join("nodes/dds_bridge/Cargo.toml");
+    let manifest: toml::Table = std::fs::read_to_string(&dds_bridge)
+        .unwrap_or_else(|e| panic!("could not read {} ({e})", dds_bridge.display()))
+        .parse()
+        .unwrap_or_else(|e| panic!("{} is not valid TOML ({e})", dds_bridge.display()));
+    let in_table = |name: &str, table: &str| {
+        manifest
+            .get(table)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|t| t.contains_key(name))
+    };
+    assert!(
+        in_table("tempfile", "dev-dependencies") && !in_table("tempfile", "dependencies"),
+        "{} no longer declares `tempfile` under [dev-dependencies] and nowhere else, so it \
+         cannot serve as the dev-table control below. Pick another dev-only dependency of a \
+         robot crate and name it here, or the control proves nothing.",
+        dds_bridge.display(),
+    );
     assert!(
         declared_dependencies(&dds_bridge).contains("tempfile"),
         "{} declares `tempfile` under [dev-dependencies] and the manifest reader did not see \
@@ -1164,16 +1185,22 @@ fn lockfile_packages(path: &Path) -> Vec<String> {
 /// library it links do not, and following those would drag in most of the
 /// repository and red this rule for something that never reaches a robot.
 fn robot_manifests(root: &Path) -> Vec<PathBuf> {
-    let mut queue: Vec<(PathBuf, bool)> = workspace_manifests(root)
+    let members: BTreeSet<PathBuf> = workspace_manifests(root)
         .into_iter()
-        .map(|m| (lexically_normal(m), true))
+        .map(lexically_normal)
         .collect();
+    let mut queue: Vec<(PathBuf, bool)> = members.iter().cloned().map(|m| (m, true)).collect();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     let mut out: Vec<PathBuf> = Vec::new();
-    while let Some((manifest, is_member)) = queue.pop() {
+    while let Some((manifest, reached_as_member)) = queue.pop() {
         if !manifest.is_file() || !seen.insert(manifest.clone()) {
             continue;
         }
+        // Membership is a property of the MANIFEST, not of the route taken to
+        // it. Two demo nodes path-depend on a third, so a member can be popped
+        // as a followed path before its own queue entry comes up; keying only
+        // on the route would drop that member's dev edges on the floor.
+        let is_member = reached_as_member || members.contains(&manifest);
         out.push(manifest.clone());
         let dir = manifest.parent().expect("a manifest has a directory");
         for path in path_dependencies(&manifest, is_member) {
