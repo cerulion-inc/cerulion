@@ -22615,10 +22615,13 @@ fn a_one_rank_free_run_resume_with_restored_sync_heads_is_not_mis_judged() {
     // recorded fusion fire, and convicts a healthy resume on its first step
     // (exit 6). With the restored heads seeded it is CLEAN.
     //
-    // Two anti-vacuity claims ride along: the verifier RAN (no rank-level
+    // Three anti-vacuity claims ride along: the verifier RAN (no rank-level
     // decline and no stand-down on the fusion node: a declined verifier
-    // finds nothing for the wrong reason), and the recorded frames are read
-    // against the same hand oracle the lockstep arms use.
+    // finds nothing for the wrong reason), the recorded frames are read
+    // against the same hand oracle the lockstep arms use, and the CONTROL
+    // below proves the clean report is a judgement rather than a silence
+    // (the same bag with the heads un-restored is convicted, by the verifier,
+    // on this same node).
     let dir = tempfile::tempdir().unwrap();
     let rec = cp3_reference_with_read_log();
     assert_cp3_reference_shape(&rec);
@@ -22684,6 +22687,89 @@ fn a_one_rank_free_run_resume_with_restored_sync_heads_is_not_mis_judged() {
         "{:?}",
         outcome.violations
     );
+}
+
+#[test]
+#[serial]
+fn a_one_rank_free_run_resume_without_restored_sync_heads_is_convicted() {
+    // The ANTI-VACUITY CONTROL for the arm above, and its mutation oracle: the
+    // SAME free-run bag with an EMPTY sync section. Nothing else differs (same
+    // frames, same anchors, same deadlines, same coordination stamp), so the
+    // one thing that can move the verdict is whether the alignment was
+    // restored.
+    //
+    // This is what makes the arm above a POSITIVE claim rather than a silence.
+    // A verifier that never judged this node would report an empty
+    // `trace_divergence` there AND here; what the pair shows is that the
+    // verifier is live on this exact fixture and this exact node, because
+    // taking the restored heads away makes it CONVICT. Dropping
+    // `restore_sync_input_timestamps` collapses the arm above onto this one.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = cp3_reference_with_read_log();
+    assert_cp3_reference_shape(&rec);
+    let bag = write_stamped_cp3_bag(
+        &dir,
+        "cp3_sync_free_run_unrestored.mcap",
+        &rec,
+        BTreeMap::new(),
+        replay_engine::CoordinationMode::FreeRun,
+    );
+
+    let outcome = replay(&bag, cp3_factories, None, None).expect("mid-run replay runs");
+    // Same contract as the arm above, so the two differ in ONE input.
+    assert_eq!(
+        outcome.coordination,
+        replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::FreeRun,
+            inferred: false,
+        }
+    );
+    assert_eq!(outcome.ticks_replayed, CP3_STEPS - CP3_FIRST_STEP as usize);
+    // And the verifier judged: a rank it had declined, or a node it had stood
+    // down on, would convict nobody, so the conviction below is a judgement
+    // this rank actually reached.
+    let declined: Vec<&cerulion_cli_engine::replay_engine::RederivationNote> = outcome
+        .rederivation_notes
+        .iter()
+        .filter(|n| {
+            n.kind == cerulion_cli_engine::replay_engine::RederivationNoteKind::StandDown
+                && (n.subject == "rank 0" || n.subject == CP3_FUSION)
+        })
+        .collect();
+    assert!(
+        declined.is_empty(),
+        "the verifier must JUDGE the fusion node rather than decline it: {declined:?}"
+    );
+    let divergence = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("an un-restored alignment loses the recorded fire entirely");
+    // The conviction is the VERIFIER's own: the fire-schedule class is what
+    // the arm above does NOT carry, and the sentence names the node, the step,
+    // the decider and the two fire counts it re-derived against. The frame
+    // class beside it is the SAME residual the arm above already pins (the
+    // fired node has no `/a` data to publish from), so the one thing this
+    // control adds is the re-derived conviction.
+    assert_eq!(
+        outcome.divergence_classes,
+        vec![
+            replay_engine::DivergenceClass::FireSchedule,
+            replay_engine::DivergenceClass::FrameContent,
+        ],
+        "{:?}",
+        outcome.divergence_classes
+    );
+    for token in [
+        CP3_FUSION,
+        "sync alignment",
+        "re-derived 0 fire(s), recorded 1 fire(s)",
+    ] {
+        assert!(
+            divergence.detail.contains(token),
+            "the verifier's sentence must carry '{token}': {divergence:?}"
+        );
+    }
+    assert!(!outcome.passed);
 }
 
 /// [`backlog_reference`]'s relay run WITH the read log captured.
