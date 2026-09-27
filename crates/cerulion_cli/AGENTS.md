@@ -38,7 +38,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
     test_node_macro_period_perturbed_cdylib -p test_node_macro_period_panic_cdylib -p test_node_nondeterministic_cdylib`
   - `mp_record_e2e_test`, `mp_auto_partition_e2e_test`, `network_gateway{,_mp}_e2e_test`:
     `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`
-  - `signal_matrix_e2e_test`: `period`. `credit_death_e2e_test`: + `..._trigger_block_cdylib`.
+  - `signal_matrix_e2e_test`: `cargo build -p test_node_macro_period_cdylib`. `credit_death_e2e_test`: + `..._trigger_block_cdylib`.
     `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`
 
 ## Gotchas

@@ -150,15 +150,29 @@ const REFUSAL_A_USER_READS: &str = "Error: This machine has never signed in to a
 /// the root, so a file in the child's cwd is the only way to reach the child's
 /// singleton without adding a production seam.
 ///
+/// `root` is written as a TOML basic string with `\` and `"` escaped. A
+/// temporary directory is unlikely to carry either, and a path that broke the
+/// file would be caught rather than silently ignored (see below), but the cost
+/// of getting it right is two `replace` calls and the cost of getting it wrong
+/// is the arm's whole point: a child reading no config falls back to the
+/// machine's registry. The residual is a control character in a path, which no
+/// escaping of these two characters covers and which the loud failure below
+/// still catches.
+///
 /// Nothing asserts here. A config that failed to load would leave the child on
 /// `/tmp/iceoryx2`, which the caller catches by requiring the report to name
 /// `root` back.
 fn write_isolated_iceoryx2_config(cwd: &Path, root: &Path) {
     let dir = cwd.join("config");
     std::fs::create_dir_all(&dir).expect("create the project-local config dir");
+    let escaped = root
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     std::fs::write(
         dir.join("iceoryx2.toml"),
-        format!("[global]\nroot-path = \"{}\"\n", root.display()),
+        format!("[global]\nroot-path = \"{escaped}\"\n"),
     )
     .expect("write the project-local iceoryx2 config");
 }

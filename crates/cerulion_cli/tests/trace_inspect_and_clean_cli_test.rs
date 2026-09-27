@@ -60,7 +60,7 @@
 //! mirroring `iceoryx2_pal_configuration::TEMP_DIRECTORY`, iceoryx2 honours no
 //! `TMPDIR`, and the binary reads no environment variable for it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -104,15 +104,29 @@ fn run_cerulion(args: &[&str], cwd: &Path) -> (bool, String, String) {
 /// an environment variable for the root, so a file in the child's cwd is the
 /// only way to reach the child's singleton without adding a production seam.
 ///
+/// `root` is written as a TOML basic string with `\` and `"` escaped. A
+/// temporary directory is unlikely to carry either, and a path that broke the
+/// file would be caught rather than silently ignored (see below), but the cost
+/// of getting it right is two `replace` calls and the cost of getting it wrong
+/// is the whole point of this file: a child reading no config falls back to the
+/// machine's registry. The residual is a control character in a path, which no
+/// escaping of these two characters covers and which the loud failure below
+/// still catches.
+///
 /// Nothing asserts here. A config that failed to load would leave the child on
 /// `/tmp/iceoryx2`, which every caller catches: the `cerulion` arms require
 /// the report to name `root` back, and the fixture child refuses outright.
 fn write_isolated_iceoryx2_config(cwd: &Path, root: &Path) {
     let dir = cwd.join("config");
     std::fs::create_dir_all(&dir).expect("create the project-local config dir");
+    let escaped = root
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     std::fs::write(
         dir.join("iceoryx2.toml"),
-        format!("[global]\nroot-path = \"{}\"\n", root.display()),
+        format!("[global]\nroot-path = \"{escaped}\"\n"),
     )
     .expect("write the project-local iceoryx2 config");
 }
@@ -180,12 +194,21 @@ impl PrivateRegistry {
         out
     }
 
-    /// Every path under the node-registry directory, relative to it, sorted:
-    /// the whole value an "untouched" assertion compares, so a run that
-    /// removed a node's details while leaving its directory standing is still
-    /// a difference.
-    fn registry_contents(&self) -> BTreeSet<PathBuf> {
-        let mut out = BTreeSet::new();
+    /// Every path under the node-registry directory, relative to it, sorted,
+    /// each carrying its CONTENT: the bytes of a file, or `None` for a
+    /// directory. That whole value is what an "untouched" assertion compares.
+    ///
+    /// Paths alone would not be enough. A sweep that truncated or rewrote a
+    /// node's `iox2_node.details` in place, leaving every name where it was,
+    /// would compare equal to an untouched registry and the assertion would
+    /// pass on a registry that had in fact been reached. These files are a few
+    /// hundred bytes each and there is one node per root here, so reading them
+    /// costs nothing worth trading a hole in the proof for.
+    ///
+    /// A file that cannot be read is recorded as its error rather than skipped,
+    /// so a permission change is a difference too.
+    fn registry_contents(&self) -> BTreeMap<PathBuf, Option<Result<Vec<u8>, String>>> {
+        let mut out = BTreeMap::new();
         let dir = self.nodes_dir();
         let mut stack = vec![dir.clone()];
         while let Some(next) = stack.pop() {
@@ -194,13 +217,17 @@ impl PrivateRegistry {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() {
+                let content = if path.is_dir() {
                     stack.push(path.clone());
-                }
+                    None
+                } else {
+                    Some(std::fs::read(&path).map_err(|e| e.to_string()))
+                };
                 out.insert(
                     path.strip_prefix(&dir)
                         .expect("a walked path is under the directory walked")
                         .to_path_buf(),
+                    content,
                 );
             }
         }
@@ -529,7 +556,7 @@ fn clean_sweeps_its_own_registry_and_leaves_another_root_untouched() {
     assert_never_names_the_machines_registry(&stdout);
     assert_eq!(
         swept.registry_contents(),
-        BTreeSet::new(),
+        BTreeMap::new(),
         "the swept registry must hold nothing afterwards"
     );
     assert_eq!(
@@ -568,7 +595,7 @@ fn clean_sweeps_its_own_registry_and_leaves_another_root_untouched() {
     assert_never_names_the_machines_registry(&stdout);
     assert_eq!(
         spared.registry_contents(),
-        BTreeSet::new(),
+        BTreeMap::new(),
         "the second registry must hold nothing once its own cwd is swept"
     );
 }
