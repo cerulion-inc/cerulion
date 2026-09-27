@@ -589,12 +589,12 @@ impl FlashbackPlane {
     pub(crate) fn select_trace(
         &self,
         snapshot: &[cerulion_core::trace_ring::TraceRingRecord],
-        anchor_step: u64,
-        node_ids: &[String],
+        anchor_steps: &std::collections::BTreeMap<u32, u64>,
+        node_ids: &std::collections::BTreeMap<u32, Vec<String>>,
     ) -> crate::trace_window::TrimmedTrace {
         let held = lock_trace(&self.trace);
         let mut trimmed =
-            crate::trace_window::trim_to_anchor(snapshot.iter().copied(), anchor_step, node_ids);
+            crate::trace_window::trim_to_anchor(snapshot.iter().copied(), anchor_steps, node_ids);
         // The trim reads `target(S-1)` off the anchor step's own
         // boundary record ON ITS WAY PAST — which only works while that record
         // is among the ones the FRAME floor offers it. A boundary drained a pass
@@ -607,8 +607,31 @@ impl FlashbackPlane {
         // Still `None` when the retention genuinely does not hold that boundary
         // (the ceiling took it, or the capture predates it), which is the correct
         // answer the manifest and the replay both already handle.
+        //
+        // Recovered PER RANK, against that rank's own anchor step: the boundary
+        // one rank straddled the floor on says nothing about where another
+        // rank's anchor sits, so one recovery against one step would fill k
+        // slots with one rank's answer.
+        for (rank, anchor_step) in anchor_steps {
+            let per = trimmed.per_rank.entry(*rank).or_default();
+            if per.anchor_target_ns.is_none() {
+                per.anchor_target_ns = held.boundary_target_ns_for(*rank, *anchor_step);
+            }
+        }
         if trimmed.anchor_target_ns.is_none() {
-            trimmed.anchor_target_ns = held.boundary_target_ns(anchor_step);
+            trimmed.anchor_target_ns = anchor_steps
+                .get(&cerulion_core::trace_ring::AUTHORITATIVE_TRACE_RANK)
+                .and_then(|step| {
+                    held.boundary_target_ns_for(
+                        cerulion_core::trace_ring::AUTHORITATIVE_TRACE_RANK,
+                        *step,
+                    )
+                })
+                .or_else(|| {
+                    anchor_steps
+                        .iter()
+                        .find_map(|(rank, step)| held.boundary_target_ns_for(*rank, *step))
+                });
         }
         trimmed
     }
@@ -627,7 +650,7 @@ impl FlashbackPlane {
     pub(crate) fn select_trace_untrimmed(
         &self,
         snapshot: &[cerulion_core::trace_ring::TraceRingRecord],
-        node_ids: &[String],
+        node_ids: &std::collections::BTreeMap<u32, Vec<String>>,
     ) -> crate::trace_window::TrimmedTrace {
         crate::trace_window::keep_all(snapshot.iter().copied(), node_ids)
     }
@@ -4187,7 +4210,11 @@ mod tests {
         }
 
         let snapshot = plane.snapshot_trace_from(20 * MS);
-        let trimmed = plane.select_trace(&snapshot, 3, &["ticker".to_string()]);
+        let trimmed = plane.select_trace(
+            &snapshot,
+            &std::collections::BTreeMap::from([(0, 3)]),
+            &std::collections::BTreeMap::from([(0, vec!["ticker".to_string()])]),
+        );
         // PRECONDITION: the floor really did hide the anchor's boundary, so the
         // trim could not have read it on its way past.
         assert_eq!(

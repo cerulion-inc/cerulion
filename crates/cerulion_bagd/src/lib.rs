@@ -16373,13 +16373,17 @@ impl Recorder {
         // through, read BEFORE the plane is borrowed (and cloned, because the
         // trim outlives this borrow).
         //
-        // EXACTLY ONE trace ring or NOTHING. With several rings a `node_idx`
-        // names a different node in each and resolving it needs the record's own
-        // rank, which this recorder does not demux — so it declines rather than
-        // naming the wrong node, and the resulting empty executed-set costs
-        // nothing: a multi-ring deployment declares multiple STATE rings too and
-        // is refused by the verdict's `MultiRing` arm before any anchor question
-        // is asked.
+        // ONE TABLE PER RANK, keyed by the rank the trace record carries.
+        //
+        // This used to be EXACTLY ONE ring's list or NOTHING, on the reasoning
+        // that "with several rings a `node_idx` names a different node in each
+        // and resolving it needs the record's own rank, which this recorder does
+        // not demux". The first half is still true and is exactly why the table
+        // is keyed by rank; the second half stopped being true here: a trace
+        // record carries its rank (`TraceRingRecord::rank`), and the trim now
+        // resolves each rank's index through that rank's own manifest. The
+        // decline cost a k>1 capture its whole executed-node set, which is the
+        // set the anchor-completeness question is asked against.
         //
         // **The DEPARTURE ring does not count.** It carries an EMPTY
         // node manifest by construction (a departure record's `node_idx` is a
@@ -16391,18 +16395,20 @@ impl Recorder {
         // on the smallest shape there is.
         //
         // Built from ONE filtered vector, and `required_nodes_known` below is
-        // derived from the SAME one. The lockstep is the whole safety argument:
-        // relaxing the count while leaving `trim_node_ids` empty turns a
-        // conservative refusal into a VACUOUS acceptance.
+        // derived from the SAME one. `required_nodes_known` is deliberately NOT
+        // relaxed here: it gates the anchor-completeness REFUSAL, that refusal
+        // belongs to the reader work, and relaxing it in the same commit that
+        // fills the table would turn a conservative refusal into an acceptance
+        // whose reader is not ready for it.
         let worker_rings: Vec<&RingIdentity> = self
             .ring_identities
             .iter()
             .filter(|r| r.rank != DEPARTURE_RING_RANK)
             .collect();
-        let trim_node_ids: Vec<String> = match worker_rings.as_slice() {
-            [only] => only.node_ids.clone(),
-            _ => Vec::new(),
-        };
+        let trim_node_ids: BTreeMap<u32, Vec<String>> = worker_rings
+            .iter()
+            .map(|r| (r.rank, r.node_ids.clone()))
+            .collect();
         let required_nodes_known = worker_rings.len() == 1;
 
         let Some(closed) = self.flashback.as_mut().and_then(|p| p.finish_capture()) else {
@@ -16944,9 +16950,18 @@ impl Recorder {
         // Over the SNAPSHOT taken at the top of this close, never a
         // fresh read of the retention: the frames above were harvested AFTER
         // that snapshot, which is what makes them at least as new as the trace.
+        //
+        // ONE CUT PER RANK. Each rank's cut is its OWN member's step, read off
+        // the per-rank block the selection built, so a rank that reached step 41
+        // is trimmed at 41 while its peer at 44 is trimmed at 44. A single
+        // global cut would discard the faster rank's records for not having
+        // reached the slower rank's step, or keep records the slower rank's
+        // anchor does not describe.
         let trimmed = match &anchor_report {
-            flashback_plane::AnchorReport::Embedded { step, .. } => {
-                plane.select_trace(&trace_snapshot, *step, &trim_node_ids)
+            flashback_plane::AnchorReport::Embedded { per_rank, .. } => {
+                let cuts: BTreeMap<u32, u64> =
+                    per_rank.iter().map(|(rank, m)| (*rank, m.step)).collect();
+                plane.select_trace(&trace_snapshot, &cuts, &trim_node_ids)
             }
             flashback_plane::AnchorReport::Absent(_) => {
                 plane.select_trace_untrimmed(&trace_snapshot, &trim_node_ids)
