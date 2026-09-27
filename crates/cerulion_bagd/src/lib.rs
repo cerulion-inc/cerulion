@@ -12655,7 +12655,7 @@ impl Recorder {
             return;
         };
         for r in &self.state_rings {
-            plane.declare_ring_nodes(r.ring.name(), r.ring.node_ids());
+            plane.declare_ring_nodes(r.ring.name(), r.ring.rank(), r.ring.node_ids());
         }
     }
 
@@ -12778,7 +12778,7 @@ impl Recorder {
             // once the writer thread owns it, the drive loop that closes a
             // capture can no longer read its manifest.
             if let Some(plane) = self.flashback.as_ref() {
-                plane.declare_ring_nodes(consumer.name(), consumer.node_ids());
+                plane.declare_ring_nodes(consumer.name(), consumer.rank(), consumer.node_ids());
             }
             let ring = SendStateRing {
                 ring: consumer,
@@ -16781,6 +16781,25 @@ impl Recorder {
                                             .unwrap_or(0),
                                     },
                                 ))
+                            })
+                            .collect(),
+                        // THE Q8 STAMP. Exhaustive with the map above over every
+                        // ring the retention knows about, so a capture written
+                        // with a hole always names the hole. Empty whenever
+                        // every rank contributed, which is the ordinary answer.
+                        //
+                        // Built from the SELECTION's own shortfall rather than
+                        // from a second walk of the ring list: the reason a rank
+                        // contributed nothing is a fact only its own retention
+                        // has, and re-deriving it here would be a second opinion
+                        // that can disagree with the first.
+                        missing_ranks: selection
+                            .shortfall
+                            .values()
+                            .map(|m| flashback_plane::MissingRankStamp {
+                                rank: m.rank,
+                                reason: m.reason.as_wire(),
+                                remedy: m.reason.rank_remedy(),
                             })
                             .collect(),
                     };

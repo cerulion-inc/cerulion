@@ -68,9 +68,24 @@
 //! `FlashbackPlane` re-splits its budget ANCHOR-FIRST as the demand becomes
 //! known and re-points it through [`AnchorWindow::set_max_bytes`], so what is
 //! here is the ceiling currently in force rather than the one the operator set.
-//! And a capture that loses its anchor to it is not written at all, so the
-//! `RetentionCeilingExhausted` reason below is what the REFUSAL is keyed on — it
-//! decides whether a bag exists, not merely what a manifest says.
+//! And a capture that loses EVERY rank's anchor to it is not written at all, so
+//! the `RetentionCeilingExhausted` reason below is what the REFUSAL is keyed on
+//! when it applies to every rank — there it decides whether a bag exists, not
+//! merely what a manifest says.
+//!
+//! # …and STRICTLY NEVER SILENTLY PARTIAL
+//!
+//! The rule above is about the WHOLE capture and it is unchanged. A k-rank run
+//! adds a second shape it never had to answer for: a capture that has one
+//! rank's state and not another's. Throwing that away would discard the state
+//! of every healthy rank because one rank was unlucky, and the run an operator
+//! is trying to understand is exactly the run where one rank went wrong. So
+//! such a capture IS written, and the rule that carries the weight instead is
+//! that it is never written SILENTLY: [`AnchorSelection`] returns the set and
+//! the SHORTFALL together, exhaustive over every ring the retention knows
+//! about, and the manifest stamps each absent rank with its number and the
+//! reason its own retention gave. A capture with a hole nothing can account for
+//! is the one outcome this module exists to make impossible.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -398,19 +413,63 @@ pub(crate) enum NoAnchorReason {
     /// giving the plane more room. Reporting both as "no anchor retained" told an
     /// operator to look in exactly the wrong place.
     ///
-    /// **Under the never-frames-only rule this reason decides whether a bag exists.** It
-    /// is the one no-anchor reason a capture is REFUSED for: the plane could not
-    /// hold a whole generation, so any bag would be a dashcam clip wearing the
-    /// Flashback name, which that rule forbids. The other two are still written
-    /// with an accurate non-resim verdict — `NothingRetained` covers a run younger
-    /// than its first cadence, where the remedy is to wait rather than to change
-    /// a knob. Misclassifying one as the other is therefore no longer a wrong
-    /// word in a manifest; it either refuses a capture that should have been
-    /// written or writes one that should have been refused.
+    /// **This reason does two different jobs, and which one depends on HOW MANY
+    /// RANKS it applies to.**
+    ///
+    /// Applied to EVERY rank it decides whether a bag exists. It is then the one
+    /// no-anchor reason a capture is REFUSED for: the plane could not hold a
+    /// whole generation for anybody, so any bag would be a dashcam clip wearing
+    /// the Flashback name, which the never-frames-only rule forbids. The other
+    /// two total absences are still written with an accurate non-resim verdict —
+    /// `NothingRetained` covers a run younger than its first cadence, where the
+    /// remedy is to wait rather than to change a knob.
+    ///
+    /// Applied to ONE RANK OF SEVERAL it decides what a manifest SAYS. The
+    /// capture is written, because discarding every healthy rank's state over
+    /// one unlucky rank would throw away the recording of exactly the run an
+    /// operator is trying to understand, and that rank is STAMPED with this
+    /// reason in the manifest's missing-rank block. The remedy is the same
+    /// sentence in both jobs (give the plane more room); what differs is whether
+    /// a bag exists to read it in.
+    ///
+    /// Misclassifying one reason as another is therefore never merely a wrong
+    /// word: at the whole-capture level it refuses a capture that should have
+    /// been written or writes one that should have been refused, and at the
+    /// per-rank level it sends an operator after the wrong problem for a rank
+    /// whose state they no longer have.
     RetentionCeilingExhausted,
 }
 
 impl NoAnchorReason {
+    /// What an operator should DO about this rank, as one sentence.
+    ///
+    /// Three reasons, three remedies, and they point in three different
+    /// directions: wait, re-cut the window, or give the plane more room. A
+    /// missing-rank stamp carrying only the wire word would make a reader look
+    /// all three up, and a stamp carrying one remedy for all three would send
+    /// two thirds of them to the wrong place.
+    ///
+    /// Written for a MISSING RANK rather than for a refused capture: the subject
+    /// of each sentence is the rank, because that is what the stamp names.
+    pub(crate) fn rank_remedy(self) -> &'static str {
+        match self {
+            Self::NothingRetained => {
+                "this rank retained no checkpoint: it published no state ring, its plane was \
+                 refused at arm time, or it had not reached its first anchor cadence when the \
+                 capture was triggered"
+            }
+            Self::AllOlderThanTheFrames => {
+                "this rank's checkpoints all predate the frames this capture carries, so \
+                 resuming from one would execute steps whose inputs are not in the bag: \
+                 widen the window span or shorten the anchor cadence"
+            }
+            Self::RetentionCeilingExhausted => {
+                "the retention's byte ceiling took this rank's checkpoints: raise the anchor \
+                 ceiling so the plane can hold one whole checkpoint generation"
+            }
+        }
+    }
+
     /// The wire spelling, and the one an operator reads.
     pub(crate) fn as_wire(self) -> &'static str {
         match self {
@@ -480,7 +539,27 @@ pub(crate) struct AnchorSelection {
     /// The chosen checkpoint per ring, keyed by the ring's SHM name.
     pub selected: std::collections::BTreeMap<String, SelectedAnchor>,
     /// Why each ring that contributed NOTHING contributed nothing.
-    pub shortfall: std::collections::BTreeMap<String, NoAnchorReason>,
+    pub shortfall: std::collections::BTreeMap<String, MissingRank>,
+}
+
+/// One ring that contributed nothing to a capture's anchor set: WHICH rank, and
+/// WHY.
+///
+/// Both halves are required for the stamp to be worth anything. The reason
+/// alone tells an operator what went wrong without saying to whom, and on a
+/// twenty-rank robot that is not actionable; the rank alone tells them who
+/// without saying what to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MissingRank {
+    /// The rank, when it can be known.
+    ///
+    /// `None` only for a ring the retention was never TOLD the rank of and
+    /// which holds no record to read one off. Answered rather than defaulted to
+    /// 0: a stamp that named rank 0 for an unknown ring would accuse a rank that
+    /// may be perfectly healthy, which is worse than saying the rank is unknown.
+    pub rank: Option<u32>,
+    /// The reason that ring's own retention gave.
+    pub reason: NoAnchorReason,
 }
 
 impl AnchorSelection {
@@ -529,6 +608,13 @@ pub(crate) struct AnchorWindow {
     /// a sibling whose records are still in flight, or a rank that died, simply
     /// is not there, and a manifest built only from what arrived can never say so.
     declared_nodes: BTreeMap<String, Vec<String>>,
+    /// The RANK of every ring the retention has been told about.
+    ///
+    /// Apart from `declared_nodes` because the two answer different questions
+    /// and one of them survives an empty node table: a ring is declared with its
+    /// rank even when its node list is empty, and the missing-rank stamp needs
+    /// the rank whether or not the nodes are known.
+    declared_ranks: BTreeMap<String, u32>,
     /// Times the BYTE CEILING refused or dropped a checkpoint — from this
     /// window's own eviction AND from a harvester abandoning an anchor in flight
     /// (see [`note_ceiling_refusal`](Self::note_ceiling_refusal)).
@@ -574,6 +660,7 @@ impl AnchorWindow {
             aged: 0,
             truncated: 0,
             declared_nodes: BTreeMap::new(),
+            declared_ranks: BTreeMap::new(),
             ceiling_refusals: 0,
             max_refused_bytes: 0,
             max_generation_bytes: 0,
@@ -590,8 +677,25 @@ impl AnchorWindow {
     ///
     /// Idempotent by overwrite: a ring name is unique and its manifest is fixed
     /// for the life of the ring, so a re-declaration is the same list.
-    pub(crate) fn declare_ring_nodes(&mut self, ring: &str, nodes: &[String]) {
+    pub(crate) fn declare_ring_nodes(&mut self, ring: &str, rank: u32, nodes: &[String]) {
         self.declared_nodes.insert(ring.to_string(), nodes.to_vec());
+        self.declared_ranks.insert(ring.to_string(), rank);
+    }
+
+    /// The RANK of a ring, from the declaration or from what it is holding.
+    ///
+    /// Two sources because a ring can be known through either: the drive loop
+    /// and the discovery sweep DECLARE a ring when they open it, and a ring the
+    /// retention only ever saw records from is known through the rank its own
+    /// producer stamped into them. The declaration wins when both answer, since
+    /// it is the rank the opener was handed rather than one read back out.
+    fn ring_rank(&self, ring: &str) -> Option<u32> {
+        self.declared_ranks.get(ring).copied().or_else(|| {
+            self.checkpoints
+                .iter()
+                .filter(|c| c.ring == ring)
+                .find_map(Checkpoint::producer_rank)
+        })
     }
 
     /// The declared node table, cloned for a capture to judge against.
@@ -1045,7 +1149,13 @@ impl AnchorWindow {
                     out.selected.insert(ring.to_string(), picked);
                 }
                 Err(reason) => {
-                    out.shortfall.insert(ring.to_string(), reason);
+                    out.shortfall.insert(
+                        ring.to_string(),
+                        MissingRank {
+                            rank: self.ring_rank(ring),
+                            reason,
+                        },
+                    );
                 }
             }
         }
@@ -1163,7 +1273,7 @@ impl AnchorWindow {
     /// `NothingRetained`. The order is not cosmetic: the ceiling reason is the
     /// one a capture is REFUSED for, so reporting a milder reason for a run the
     /// ceiling emptied would write a bag the never-frames-only rule forbids.
-    fn no_anchor_reason(&self, shortfall: &BTreeMap<String, NoAnchorReason>) -> NoAnchorReason {
+    fn no_anchor_reason(&self, shortfall: &BTreeMap<String, MissingRank>) -> NoAnchorReason {
         if shortfall.is_empty() {
             return if self.ceiling_refusals > 0 {
                 NoAnchorReason::RetentionCeilingExhausted
@@ -1173,12 +1283,12 @@ impl AnchorWindow {
         }
         if shortfall
             .values()
-            .any(|r| *r == NoAnchorReason::RetentionCeilingExhausted)
+            .any(|m| m.reason == NoAnchorReason::RetentionCeilingExhausted)
         {
             NoAnchorReason::RetentionCeilingExhausted
         } else if shortfall
             .values()
-            .any(|r| *r == NoAnchorReason::AllOlderThanTheFrames)
+            .any(|m| m.reason == NoAnchorReason::AllOlderThanTheFrames)
         {
             NoAnchorReason::AllOlderThanTheFrames
         } else {
@@ -2556,8 +2666,8 @@ mod tests {
     #[test]
     fn an_incomplete_rank_is_named_in_the_shortfall_rather_than_leaving_a_hole() {
         let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
-        w.declare_ring_nodes("rank0", &["r0n0".to_string(), "r0n1".to_string()]);
-        w.declare_ring_nodes("rank1", &["r1n0".to_string(), "r1n1".to_string()]);
+        w.declare_ring_nodes("rank0", 0, &["r0n0".to_string(), "r0n1".to_string()]);
+        w.declare_ring_nodes("rank1", 1, &["r1n0".to_string(), "r1n1".to_string()]);
         // Rank 0 drained both its nodes at step 41. Rank 1 drained nothing.
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
         w.admit(10_010 * MS, rank_anchor(0, 7, 41, 1, &[1; 64]));
@@ -2572,8 +2682,11 @@ mod tests {
         );
         assert_eq!(
             selection.shortfall.get("rank1"),
-            Some(&NoAnchorReason::NothingRetained),
-            "…and the rank that did not is NAMED, with the reason — the ring \
+            Some(&MissingRank {
+                rank: Some(1),
+                reason: NoAnchorReason::NothingRetained,
+            }),
+            "…and the rank that did not is NAMED, BY RANK, with the reason — the ring \
              universe is the DECLARED table, so a rank holding nothing is still known"
         );
 
@@ -2599,7 +2712,7 @@ mod tests {
     #[test]
     fn a_checkpoint_missing_a_declared_node_is_still_selected_and_never_refused() {
         let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
-        w.declare_ring_nodes("rank0", &["r0n0".to_string(), "r0n1".to_string()]);
+        w.declare_ring_nodes("rank0", 0, &["r0n0".to_string(), "r0n1".to_string()]);
         // Only node 0 of the two the ring declared.
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
 
@@ -2628,8 +2741,8 @@ mod tests {
     #[test]
     fn a_rank_whose_every_node_declined_is_still_selected_so_the_skip_is_reported() {
         let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
-        w.declare_ring_nodes("rank0", &["r0n0".to_string()]);
-        w.declare_ring_nodes("rank1", &["r1n0".to_string()]);
+        w.declare_ring_nodes("rank0", 0, &["r0n0".to_string()]);
+        w.declare_ring_nodes("rank1", 1, &["r1n0".to_string()]);
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
         w.admit(10_010 * MS, rank_skip(1, 7, 41, 0));
 
@@ -2649,6 +2762,100 @@ mod tests {
             selection.selected["rank1"].checkpoint.complete_anchors(),
             0,
             "…and the set member is honest about restoring nothing"
+        );
+    }
+
+    /// ORACLE 11: after an eviction the set is either WHOLE or STAMPED, never
+    /// silently short.
+    ///
+    /// The exhaustiveness property in one line: the ring universe the retention
+    /// knows about is EXACTLY the union of the ranks that contributed and the
+    /// ranks that were stamped. A rank in neither map is a hole nothing can
+    /// account for, which is the outcome the missing-rank stamp exists to make
+    /// impossible, and an eviction is the easiest way to produce one by
+    /// accident.
+    #[test]
+    fn an_eviction_leaves_the_set_whole_or_stamped_and_never_silently_short() {
+        let mut w = AnchorWindow::new(5_000 * MS, 1 << 30);
+        w.declare_ring_nodes("rank0", 0, &["r0n0".to_string()]);
+        w.declare_ring_nodes("rank1", 1, &["r1n0".to_string()]);
+        // Step 40 is the ONLY generation rank 1 ever reached: it stopped
+        // anchoring after it, which is the shape a rank that died produces.
+        w.admit(9_000 * MS, rank_anchor(0, 7, 40, 0, &[1; 64]));
+        w.admit(9_010 * MS, rank_anchor(1, 7, 40, 0, &[2; 64]));
+        w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
+        w.admit(20_000 * MS, rank_anchor(0, 7, 42, 0, &[1; 64]));
+
+        // The horizon (24 s minus the 5 s span) is 19 s, so generations 40 and
+        // 41 are both below it; the AGE arm drops whole generations while at
+        // least two are below, so 40 goes and 41 is the CARRY. Rank 1's only
+        // entry was in 40.
+        w.evict(24_000 * MS, None);
+        assert_eq!(
+            w.checkpoints(),
+            2,
+            "precondition: generation 40 went whole and rank 0 still holds 41 and 42"
+        );
+
+        let selection = w.select(0, 25_000 * MS, CAPTURE).expect("rank 0 answers");
+        assert_eq!(selection.selected.keys().collect::<Vec<_>>(), vec!["rank0"]);
+        assert_eq!(
+            selection.shortfall.get("rank1"),
+            Some(&MissingRank {
+                rank: Some(1),
+                reason: NoAnchorReason::NothingRetained,
+            }),
+            "the evicted rank is STAMPED, by rank and with a reason"
+        );
+
+        // THE EXHAUSTIVENESS ASSERT, written as the union rather than as two
+        // separate counts: a rank that fell out of both maps would pass a pair
+        // of "at least one" checks and fail this one.
+        let mut accounted: Vec<&str> = selection
+            .selected
+            .keys()
+            .chain(selection.shortfall.keys())
+            .map(String::as_str)
+            .collect();
+        accounted.sort_unstable();
+        assert_eq!(
+            accounted,
+            vec!["rank0", "rank1"],
+            "every ring the retention knows about is in exactly one of the two maps"
+        );
+    }
+
+    /// ORACLE 10, THE CONTROL: a k=2 capture whose BOTH ranks lose everything to
+    /// the ceiling still answers the whole-capture refusal reason.
+    ///
+    /// The partial shape is written and stamped; this shape is not written at
+    /// all, and the recorder keys that refusal on exactly this `Err`. An
+    /// implementation that reported the milder `NothingRetained` here would turn
+    /// the never-frames-only refusal into a bag.
+    #[test]
+    fn both_ranks_taken_by_the_ceiling_still_answers_the_refusal_reason() {
+        let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
+        w.declare_ring_nodes("rank0", 0, &["r0n0".to_string()]);
+        w.declare_ring_nodes("rank1", 1, &["r1n0".to_string()]);
+        w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
+        w.admit(10_010 * MS, rank_anchor(1, 7, 41, 0, &[2; 64]));
+        // The ceiling drops to below one entry, so both go and both are counted.
+        w.set_max_bytes(0);
+        w.evict(11_000 * MS, None);
+        assert_eq!(w.checkpoints(), 0, "precondition: the ceiling took both");
+
+        assert_eq!(
+            w.select(0, 12_000 * MS, CAPTURE).err(),
+            Some(NoAnchorReason::RetentionCeilingExhausted),
+            "the reason the whole-capture refusal is keyed on, not the milder one"
+        );
+
+        // ANTI-VACUITY: a retention that never held anything answers the MILDER
+        // reason, so the arm above is reading the ceiling and not a constant.
+        let never = AnchorWindow::new(30_000 * MS, 1 << 30);
+        assert_eq!(
+            never.select(0, 12_000 * MS, CAPTURE).err(),
+            Some(NoAnchorReason::NothingRetained)
         );
     }
 
@@ -2856,7 +3063,7 @@ mod tests {
     #[test]
     fn a_lockstep_retention_selects_one_member_with_the_parents_numbers() {
         let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
-        w.declare_ring_nodes("rank0", &["r0n0".to_string()]);
+        w.declare_ring_nodes("rank0", 0, &["r0n0".to_string()]);
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
         w.admit(25_000 * MS, rank_anchor(0, 7, 42, 0, &[1; 64]));
 
@@ -2881,8 +3088,8 @@ mod tests {
     #[test]
     fn a_rank_whose_ring_holds_nothing_is_still_named_in_the_shortfall() {
         let mut w = AnchorWindow::new(30_000 * MS, 1 << 30);
-        w.declare_ring_nodes("rank0", &["r0n0".to_string()]);
-        w.declare_ring_nodes("rank1", &["r1n0".to_string()]);
+        w.declare_ring_nodes("rank0", 0, &["r0n0".to_string()]);
+        w.declare_ring_nodes("rank1", 1, &["r1n0".to_string()]);
         w.admit(10_000 * MS, rank_anchor(0, 7, 41, 0, &[1; 64]));
         w.note_ceiling_refusal(1);
 
@@ -2890,7 +3097,10 @@ mod tests {
         assert_eq!(selection.selected.keys().collect::<Vec<_>>(), vec!["rank0"]);
         assert_eq!(
             selection.shortfall.get("rank1"),
-            Some(&NoAnchorReason::RetentionCeilingExhausted),
+            Some(&MissingRank {
+                rank: Some(1),
+                reason: NoAnchorReason::RetentionCeilingExhausted,
+            }),
             "the rank that holds nothing while the ceiling has bitten says WHICH absence"
         );
     }

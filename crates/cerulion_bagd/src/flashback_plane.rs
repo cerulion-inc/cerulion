@@ -697,8 +697,8 @@ impl FlashbackPlane {
     ///
     /// Called when the ring is OPENED, so a rank that never closes an anchor is
     /// still known to have been expected — see `AnchorWindow::declared_nodes`.
-    pub(crate) fn declare_ring_nodes(&self, ring: &str, nodes: &[String]) {
-        lock_anchors(&self.anchors).declare_ring_nodes(ring, nodes);
+    pub(crate) fn declare_ring_nodes(&self, ring: &str, rank: u32, nodes: &[String]) {
+        lock_anchors(&self.anchors).declare_ring_nodes(ring, rank, nodes);
     }
 
     /// The declared node table, for a capture to judge its checkpoint against.
@@ -2143,6 +2143,43 @@ impl RankAnchor {
     }
 }
 
+/// One rank the capture was WRITTEN without, as the manifest stamps it.
+///
+/// # Why a capture with a hole is written at all
+///
+/// A k-rank run can lose one rank's state to its own retention while every
+/// other rank is healthy, and discarding the capture would discard the healthy
+/// ranks' state too. The run an operator is trying to understand is exactly the
+/// run where one rank went wrong, so throwing that recording away is the worst
+/// possible moment to be strict. What the strictness moves to instead is this
+/// stamp: a capture written with a hole always names the hole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingRankStamp {
+    /// The rank, or `None` for a ring whose rank nothing could answer.
+    pub rank: Option<u32>,
+    /// The wire word, so a machine reader can branch on the cause.
+    pub reason: &'static str,
+    /// What to DO about it, so a human reader does not have to look the word up.
+    pub remedy: &'static str,
+}
+
+impl MissingRankStamp {
+    /// The JSON object one stamp renders to.
+    fn render(&self) -> String {
+        let rank = match self.rank {
+            Some(r) => r.to_string(),
+            // JSON `null` for "nothing could answer", never 0: 0 is a REAL rank,
+            // and a reader handed it would be told a healthy rank is missing.
+            None => "null".to_string(),
+        };
+        format!(
+            "{{\"rank\":{rank},\"reason\":\"{}\",\"remedy\":\"{}\"}}",
+            self.reason,
+            esc(self.remedy)
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AnchorReport {
     /// A checkpoint is embedded.
@@ -2213,6 +2250,18 @@ pub(crate) enum AnchorReport {
         /// selection returned a non-empty set, and every member of that set
         /// becomes an entry here.
         per_rank: std::collections::BTreeMap<u32, RankAnchor>,
+        /// The ranks this capture was written WITHOUT, each named with why.
+        ///
+        /// Exhaustive with `per_rank` over every ring the retention knows about,
+        /// which is the property the whole stamp rests on: a rank is in one map
+        /// or the other, so a capture cannot be written with a rank that is in
+        /// neither.
+        ///
+        /// EMPTY is the ordinary answer and is a statement rather than a
+        /// placeholder: every rank the retention knew about contributed. It is
+        /// also the anti-vacuity half of the arm that reads this block, since a
+        /// stamp that was always populated would prove nothing.
+        missing_ranks: Vec<MissingRankStamp>,
     },
     /// None is embedded, and why.
     Absent(NoAnchorReason),
@@ -2286,6 +2335,7 @@ impl AnchorReport {
                 frames_before_anchor_ms,
                 frames_missing_after_anchor_ms,
                 per_rank,
+                missing_ranks,
             } => {
                 // A JSON OBJECT keyed by the rank as a decimal string, in rank
                 // order. An ARRAY would make the rank a position a reader has to
@@ -2294,6 +2344,14 @@ impl AnchorReport {
                 let per_rank: String = per_rank
                     .iter()
                     .map(|(rank, entry)| format!("\"{rank}\":{}", entry.render()))
+                    .collect::<Vec<String>>()
+                    .join(",");
+                // An ARRAY, in the order `select` walked the rings, because
+                // this block has no key a reader could index by: the rank is the
+                // natural one and it is exactly the value that may be absent.
+                let missing_ranks: String = missing_ranks
+                    .iter()
+                    .map(MissingRankStamp::render)
                     .collect::<Vec<String>>()
                     .join(",");
                 let fit = match fit {
@@ -2312,6 +2370,7 @@ impl AnchorReport {
                      \"frames_before_anchor_ms\":{frames_before_anchor_ms},\
                      \"frames_missing_after_anchor_ms\":{frames_missing_after_anchor_ms},\
                      \"per_rank\":{{{per_rank}}},\
+                     \"missing_ranks\":[{missing_ranks}],\
                      \"resimmable\":{resimmable},\
                      \"resim_covered_through_ns\":{covered},\
                      \"resimmable_reason\":\"{reason}\"}}"
@@ -2538,8 +2597,10 @@ mod tests {
                 taken_at_ns,
                 frames_before_anchor_ms,
                 frames_missing_after_anchor_ms,
+                ref missing_ranks,
                 ..
             } => AnchorReport::Embedded {
+                missing_ranks: missing_ranks.clone(),
                 run_id,
                 step,
                 nodes,
@@ -2792,6 +2853,124 @@ mod tests {
         assert!(text.contains("\"pinned\":false"));
     }
 
+    /// ORACLE 10: a capture missing ONE rank is WRITTEN, and the manifest names
+    /// that rank, the cause and the remedy.
+    ///
+    /// Two arms over the two causes the ruling separates, each asserted as a
+    /// literal sentence rather than by re-calling the function that produces it:
+    /// arm (a) a rank that never harvested anything, arm (b) a rank the byte
+    /// ceiling emptied. Three reasons reaching a reader as one sentence is the
+    /// defect the stamp exists to remove, so the two sentences are asserted to
+    /// DIFFER as well as to be right.
+    #[test]
+    fn a_capture_missing_one_rank_names_the_rank_the_cause_and_the_remedy() {
+        let stamped = |reason: NoAnchorReason| {
+            let text = manifest(
+                AnchorReport::Embedded {
+                    run_id: 7,
+                    step: 41,
+                    nodes: 1,
+                    complete: 1,
+                    records: 1,
+                    fit: AnchorFit::CoversTheClaimedWindow,
+                    taken_at_ns: 10_000,
+                    frames_before_anchor_ms: 0,
+                    frames_missing_after_anchor_ms: 0,
+                    per_rank: std::collections::BTreeMap::from([(
+                        0,
+                        RankAnchor {
+                            capture_seq: 1,
+                            step: 41,
+                            taken_at_ns: 10_000,
+                            nodes: 1,
+                            complete: 1,
+                            records: 1,
+                            fit: AnchorFit::CoversTheClaimedWindow,
+                            frames_before_anchor_ms: 0,
+                            frames_missing_after_anchor_ms: 0,
+                        },
+                    )]),
+                    missing_ranks: vec![MissingRankStamp {
+                        rank: Some(1),
+                        reason: reason.as_wire(),
+                        remedy: reason.rank_remedy(),
+                    }],
+                },
+                12,
+            );
+            serde_json::from_str::<serde_json::Value>(&text).expect("valid JSON")
+        };
+
+        // ARM (a): the rank never harvested anything.
+        let never = stamped(NoAnchorReason::NothingRetained);
+        assert_eq!(
+            never["anchor"]["embedded"],
+            serde_json::json!(true),
+            "the capture is WRITTEN: one rank's absence does not discard the others' state"
+        );
+        let a = &never["anchor"]["missing_ranks"][0];
+        assert_eq!(a["rank"], serde_json::json!(1));
+        assert_eq!(a["reason"], serde_json::json!("no_anchor_retained"));
+        assert_eq!(
+            a["remedy"],
+            serde_json::json!(
+                "this rank retained no checkpoint: it published no state ring, its plane was \
+                 refused at arm time, or it had not reached its first anchor cadence when the \
+                 capture was triggered"
+            )
+        );
+
+        // ARM (b): the byte ceiling emptied it. A DIFFERENT sentence pointing at
+        // a DIFFERENT knob, which is the whole reason the reason is carried.
+        let ceiling = stamped(NoAnchorReason::RetentionCeilingExhausted);
+        let b = &ceiling["anchor"]["missing_ranks"][0];
+        assert_eq!(b["rank"], serde_json::json!(1));
+        assert_eq!(
+            b["reason"],
+            serde_json::json!("anchors_dropped_by_the_byte_ceiling")
+        );
+        assert_eq!(
+            b["remedy"],
+            serde_json::json!(
+                "the retention's byte ceiling took this rank's checkpoints: raise the anchor \
+                 ceiling so the plane can hold one whole checkpoint generation"
+            )
+        );
+        assert_ne!(
+            a["remedy"], b["remedy"],
+            "two causes, two remedies: one sentence for both is the defect this replaces"
+        );
+
+        // ANTI-VACUITY: a capture whose ranks are all present carries an EMPTY
+        // block, so the arms above are reading the stamp and not a field that is
+        // always populated.
+        let whole = manifest(
+            with_sole_rank(
+                AnchorReport::Embedded {
+                    run_id: 7,
+                    step: 41,
+                    nodes: 1,
+                    complete: 1,
+                    records: 1,
+                    fit: AnchorFit::CoversTheClaimedWindow,
+                    taken_at_ns: 10_000,
+                    frames_before_anchor_ms: 0,
+                    frames_missing_after_anchor_ms: 0,
+                    per_rank: std::collections::BTreeMap::new(),
+                    missing_ranks: Vec::new(),
+                },
+                CAPTURE_SEQ,
+            ),
+            12,
+        );
+        let doc: serde_json::Value = serde_json::from_str(&whole).expect("valid JSON");
+        assert_eq!(
+            doc["anchor"]["missing_ranks"],
+            serde_json::json!([]),
+            "every rank contributed, and the block SAYS so rather than being absent"
+        );
+    }
+
     /// ORACLE 5: the per-rank block JOINS the scalars, it does not replace them,
     /// and a reader written before it existed is unmoved.
     ///
@@ -2848,6 +3027,7 @@ mod tests {
                     },
                 ),
             ]),
+            missing_ranks: Vec::new(),
         };
         let text = manifest(two, 12);
 
@@ -2939,6 +3119,7 @@ mod tests {
                     frames_before_anchor_ms: 0,
                     frames_missing_after_anchor_ms: 0,
                     per_rank: std::collections::BTreeMap::new(),
+                    missing_ranks: Vec::new(),
                 },
                 CAPTURE_SEQ,
             ),
@@ -3103,6 +3284,7 @@ mod tests {
                         frames_before_anchor_ms: 100,
                         frames_missing_after_anchor_ms: 0,
                         per_rank: std::collections::BTreeMap::new(),
+                        missing_ranks: Vec::new(),
                     },
                     CAPTURE_SEQ,
                 ),
@@ -3210,6 +3392,7 @@ mod tests {
                 frames_before_anchor_ms: 15_000,
                 frames_missing_after_anchor_ms: 0,
                 per_rank: std::collections::BTreeMap::new(),
+                missing_ranks: Vec::new(),
             },
             CAPTURE_SEQ,
         );
@@ -3300,6 +3483,7 @@ mod tests {
                 frames_before_anchor_ms: 0,
                 frames_missing_after_anchor_ms: 0,
                 per_rank: std::collections::BTreeMap::new(),
+                missing_ranks: Vec::new(),
             },
             CAPTURE_SEQ,
         );
@@ -3724,6 +3908,7 @@ mod tests {
                     frames_before_anchor_ms: 3_000,
                     frames_missing_after_anchor_ms: 0,
                     per_rank: std::collections::BTreeMap::new(),
+                    missing_ranks: Vec::new(),
                 },
                 CAPTURE_SEQ,
             ),
@@ -3748,6 +3933,7 @@ mod tests {
                     frames_before_anchor_ms: 0,
                     frames_missing_after_anchor_ms: 8_000,
                     per_rank: std::collections::BTreeMap::new(),
+                    missing_ranks: Vec::new(),
                 },
                 CAPTURE_SEQ,
             ),
@@ -3837,6 +4023,7 @@ mod tests {
                     frames_before_anchor_ms: 29_000,
                     frames_missing_after_anchor_ms: 0,
                     per_rank: std::collections::BTreeMap::new(),
+                    missing_ranks: Vec::new(),
                 },
                 CAPTURE_SEQ,
             ),
@@ -4753,6 +4940,7 @@ mod tests {
                     frames_before_anchor_ms: 14_500,
                     frames_missing_after_anchor_ms: 0,
                     per_rank: std::collections::BTreeMap::new(),
+                    missing_ranks: Vec::new(),
                 },
                 CAPTURE_SEQ,
             ),

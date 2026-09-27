@@ -847,6 +847,15 @@ fn a_capture_carries_the_newest_checkpoints_records_verbatim() {
         rank0["capture_seq"], m["seq"],
         "the restore point names the capture event that selected it"
     );
+    // …and the Q8 stamp's ANTI-VACUITY half over the production path: every
+    // rank this run had contributed, so the block is present and EMPTY. Absent
+    // would mean a reader cannot tell "no rank is missing" from "this recorder
+    // does not say".
+    assert_eq!(
+        m["anchor"]["missing_ranks"],
+        serde_json::json!([]),
+        "a capture with every rank present says so"
+    );
 
     std::fs::remove_dir_all(&h.dir).ok();
 }
