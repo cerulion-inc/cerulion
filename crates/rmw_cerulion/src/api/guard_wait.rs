@@ -398,6 +398,31 @@ pub fn resolve_park(
     }
 }
 
+/// PURE: does THIS block of a call take the park tier, and what is the
+/// call's park allowance afterwards? The whole per-block rule, split out
+/// so it is pinnable by a hand oracle rather than only observable through
+/// a timing test.
+///
+/// `allowance` enters a call `true` only when the wait set mapped at least
+/// one topic doorbell; a wait set with none never parks, whatever the
+/// horizon. [`ParkHorizon::FirstRungOnce`] then SPENDS the allowance on
+/// the call's FIRST block by design (the x86 hatch's bounded shape), so
+/// every LATER block of that same call takes the kernel fd block: on that
+/// horizon a nonzero `fd_blocks` is the designed outcome of a call that
+/// blocked more than once, never evidence that the park tier disengaged.
+/// [`ParkHorizon::ThroughRung`] keeps the allowance, so every block of the
+/// call parks and `fd_blocks` stays 0.
+pub fn block_parks(horizon: ParkHorizon, allowance: bool) -> (bool, bool) {
+    if !allowance {
+        return (false, false);
+    }
+    match horizon {
+        ParkHorizon::NoPark => (false, false),
+        ParkHorizon::FirstRungOnce => (true, false),
+        ParkHorizon::ThroughRung => (true, true),
+    }
+}
+
 /// The park horizon in µs under [`ParkHorizon::FirstRungOnce`] — the
 /// ladder's first rung, so a call's one park is exactly as long as its
 /// first kernel block would have been.
@@ -2319,11 +2344,10 @@ pub unsafe extern "C" fn rmw_wait(
             match strategy {
                 BlockStrategy::Fd => {
                     let budget = remaining.min(ws.ladder_rung(&ladder));
-                    let this_block_parks = park_allowance;
+                    let (this_block_parks, next_allowance) =
+                        block_parks(park_policy, park_allowance);
+                    park_allowance = next_allowance;
                     let outcome = if this_block_parks {
-                        if park_policy == ParkHorizon::FirstRungOnce {
-                            park_allowance = false;
-                        }
                         let park_budget = match park_policy {
                             ParkHorizon::FirstRungOnce => {
                                 budget.min(Duration::from_micros(PARK_HORIZON_US))
@@ -2577,6 +2601,53 @@ mod tests {
             }
         );
         assert_eq!(BLOCK_LADDER.reset_rung_us(), 200);
+    }
+
+    /// The per-block park rule, every input of it, against a HAND table
+    /// written from the horizon definitions rather than from the function:
+    /// no allowance never parks; `NoPark` never parks; `FirstRungOnce`
+    /// parks the first block and SPENDS the allowance, so the second block
+    /// of the same call takes the fd tier; `ThroughRung` parks every block
+    /// and keeps the allowance. The second row of the `FirstRungOnce` pair
+    /// is the one a timing test cannot state: it is why `fd_blocks` is
+    /// nonzero on x86 for a call that blocked twice, and why an oracle must
+    /// not read that as the park tier disengaging.
+    #[test]
+    fn a_calls_first_block_parks_and_only_through_rung_keeps_the_allowance() {
+        use ParkHorizon::{FirstRungOnce, NoPark, ThroughRung};
+        // (horizon, allowance in) -> (this block parks, allowance out)
+        let cases: &[(ParkHorizon, bool, bool, bool)] = &[
+            (NoPark, false, false, false),
+            (NoPark, true, false, false),
+            (FirstRungOnce, false, false, false),
+            (FirstRungOnce, true, true, false),
+            (ThroughRung, false, false, false),
+            (ThroughRung, true, true, true),
+        ];
+        for (horizon, allowance, parks, after) in cases {
+            assert_eq!(
+                block_parks(*horizon, *allowance),
+                (*parks, *after),
+                "horizon={horizon:?} allowance={allowance}"
+            );
+        }
+        // Walk a whole call the way `rmw_wait` does: three blocks, one
+        // allowance. FirstRungOnce parks exactly the first; ThroughRung
+        // parks all three.
+        for (horizon, want) in [
+            (FirstRungOnce, [true, false, false]),
+            (ThroughRung, [true, true, true]),
+            (NoPark, [false, false, false]),
+        ] {
+            let mut allowance = horizon != NoPark;
+            let mut got = [false; 3];
+            for slot in got.iter_mut() {
+                let (parks, next) = block_parks(horizon, allowance);
+                *slot = parks;
+                allowance = next;
+            }
+            assert_eq!(got, want, "a three-block call under {horizon:?}");
+        }
     }
 
     /// The platform policy table, pinned per target (the ARM-meaningful
