@@ -56,25 +56,26 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`). Detail: `docs/i
 
 ## Conventions
 
-- Logging: `tracing` with structured fields (`topic = %name`); levels error=unrecoverable,
-  warn=recoverable, info=lifecycle, debug=operational, trace=hot path. Standard fields:
+- Logging: `tracing` structured fields (`topic = %name`); levels error=unrecoverable,
+  warn=recoverable, info=lifecycle, debug=operational, trace=hot path. Fields:
   `topic`, `schema`, `node_id`, `graph`, `size_bytes`, `seq`, `latency_us`, `error`,
-  `total_failures`. GATED, not advice: library crates deny `clippy::print_stdout`/`print_stderr`
-  outside tests (escape = a targeted `#[allow]` + reason), `clippy.toml` bans `dbg!` and
-  `process::exit`, and a walk fails any message interpolating a runtime value.
+  `total_failures`. GATED: library crates deny `clippy::print_stdout`/`print_stderr`
+  outside tests (escape = `#[allow]` + reason), `clippy.toml` bans `dbg!` and
+  `process::exit`; a walk fails any message interpolating a runtime value.
 - High-frequency failure paths flood-suppress (loud first-of-regime, counted repeats,
-  recovery line): reuse `FailureRegimeLatch`, never a new hand-rolled one.
+  recovery line): reuse `FailureRegimeLatch`, never hand-roll one.
 - Errors: one `thiserror` enum per crate; propagate with `?`; exit codes only at the CLI.
-- Tests: descriptive behavior names; a fire-count proves scheduling, not delivery - strong pins
-  assert downstream DELIVERY. Five categories per new path: happy, edge, adversarial,
-  determinism (two runs bit-identical), every error arm.
-- Mutation checks: mutate PURE decision functions only (never live syscall/transport paths),
+- Tests: behavior names; a fire-count proves scheduling, not delivery; strong pins assert
+  downstream DELIVERY. Five categories per new path: happy, edge, adversarial, determinism
+  (two runs bit-identical), every error arm.
+- Six rules for tests and review threads: `docs/internals/testing-rules.md`.
+- Mutation checks: PURE decision functions only (never live syscall/transport paths),
   against a COMMITTED baseline; each variant must fail a test.
-- Some docs are pinned by oracle tests (tutorial YAML, completion hints): a doc edit that
-  fails a test is the gate working - update both together. A regression test per finding.
+- Docs pinned by oracle tests (tutorial YAML, completion hints): a doc edit that fails a
+  test is the gate working: update both. A regression test per finding.
 - Prefer compile-time prevention (types, exhaustive matches, `compile_error!`) over runtime
-  checks; a loud `warn!` at the inference site over a silent "smart" default; killing a
-  misleading name over documenting one.
+  checks; a loud `warn!` at the inference site over a silent "smart" default; kill a
+  misleading name, never document one.
 
 ## Git & PRs
 

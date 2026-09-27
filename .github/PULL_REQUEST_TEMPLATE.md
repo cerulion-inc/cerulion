@@ -26,6 +26,7 @@
 # workspace has no `cargo test --workspace` step (it deadlocks on iceoryx2's
 # SHM singleton), so ci.yml's root-workspace test steps enumerate their
 # packages, and `cerulion_core` goes through the shard runner.
+# New tests and review replies follow docs/internals/testing-rules.md.
 cargo test -p <crate>
 ./tools/scripts/ci_test_shard.sh cerulion_core <shard> 4   # a cerulion_core shard
 cargo clippy --workspace --all-targets -- -D warnings
