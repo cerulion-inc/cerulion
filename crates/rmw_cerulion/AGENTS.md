@@ -25,7 +25,7 @@ stage `RMW_IMPLEMENTATION` for the user.
   (destroy/poisoned then LEAKS the slot AND its `PublisherData`: freeing it wedges the dead-node
   sweep); quarantine retires at slot REUSE, never at publish. Every degrade = the copy path,
   never a failed publish.
-- NEVER export an entry point a distro's headers do not declare: cfg the `extern "C"` fn out
+- NEVER export an entry point whose types a distro's headers lack: cfg the `extern "C"` fn out
   WHOLE, never stub it (`nm` audit: `tools/ci/rmw-distros/gate.sh`).
 
 ## Testing
