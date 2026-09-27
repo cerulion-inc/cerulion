@@ -314,12 +314,17 @@ build.rs layers three era probes on top of the source selection:
   proxies for the C++ mirror's era; a compile-time pin holds the mirror's size equal to the
   bindgen-generated C member's on every era, and the compiled shim adds a `static_assert`
   of all three sizes against the distro's own C++ header on EVERY real-header build. Reaching
-  that header takes its own include directories: from Galactic on, ament installs each package
-  under `include/<package>/<package>/`, so the shim is given the C++ packages'
-  per-package directories (`rosidl_typesupport_introspection_cpp`, `rosidl_runtime_cpp`)
-  beside the C ones bindgen needs, and the flat pre-Galactic layout resolves through the
-  include root as before. Only the vendored build has no distro header to compare with, and
-  the test that reads the shim's probe says so rather than passing silently. The service
+  that header takes its own include directories, and WHERE a package keeps them differs by
+  layout, so build.rs looks for the header rather than assuming the nesting: it accepts an
+  include root when the header sits one level under it (the flat pre-Galactic layout) and the
+  package directory when it sits two (`include/<package>/<package>/`, what ament installs from
+  Galactic on). A colcon isolated install, whose C++ packages sit in prefixes of their own
+  carrying no core C namespace, is searched too, for both of the shapes it produces; those
+  prefixes reach the shim probe alone and never bindgen. A generated build that cannot find
+  the header FAILS rather than compiling the checks away, because it would otherwise ship a
+  library whose C++ layout was never cross-checked. Only the vendored build has no distro
+  header to compare with, and the test that reads the shim's probe skips the comparison there
+  rather than asserting agreement. The service
   mirror's trailing `event_members_` is keyed on
   `cfg(cerulion_has_event_members)`, present from Iron on and absent before it.
   SUPPORTED SUBSET: every era resolves the C++ arm, and the ONE member kind no era before

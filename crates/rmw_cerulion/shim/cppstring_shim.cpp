@@ -196,11 +196,14 @@ const void *rmw_cerulion_throwing_get_const(const void *, size_t) { throw 1; }
 }  // extern "C"
 
 // The hand-mirrored C++ MessageMember (src/ffi/introspection_cpp.rs) is pinned
-// against the C++ header itself on every real-header build: build.rs gives this
-// translation unit the C++ packages' per-package include directories as well as
-// the C ones bindgen needs, so the include below resolves on the flat
-// pre-Galactic layout AND on the per-package one every later distro installs.
-// Only a build with no ROS headers at all takes the #else. All three shapes are
+// against the C++ header itself on every real-header build: build.rs looks for
+// this header under every include root it knows and hands this translation unit
+// the directory that resolves it, so the include below works on the flat
+// pre-Galactic layout, on the per-package one every later distro installs, and
+// on a colcon isolated install, where each C++ package has a prefix of its own.
+// Only a build with no ROS headers at all takes the #else, and a generated build
+// that cannot find this header fails in build.rs rather than compiling the
+// checks away. All three member shapes are
 // pinned, keyed on the same defines
 // build.rs derives from the bindings: 120 bytes with is_rosidl_buffer_ at 112
 // on Lyrical and Rolling, 112 bytes from Humble to Kilted, and 96 bytes with
