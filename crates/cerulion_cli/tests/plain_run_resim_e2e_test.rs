@@ -59,6 +59,13 @@
 //!    other's positive control: both read the stamp and the label, and the two
 //!    answers differ.
 //!
+//! Arms 1, 3 and 5 drive the DEFAULT execution mode and SAY SO
+//! (`DEFAULT_MODE_ENV`) rather than leaving it to whatever a plain run happens
+//! to resolve to, and each derives its frame-stamp rule from the `gating`
+//! label that mode implies. A multi-process run free-runs, so a capture off
+//! any of them may legitimately carry a bounded catch-up burst, which the
+//! strict lockstep rule forbids.
+//!
 //! # What each arm alone catches
 //!
 //! Each fails EXACTLY the arm that is named for it, with the others green — which
@@ -547,9 +554,9 @@ const MAX_CATCH_UP_BURST_FRAMES: usize = 8;
 /// blind to a fault the stricter one catches. See [`gating_stamp_violation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gating {
-    /// A plain `graph run`: the quantum is the TIGHTEST period in the graph, so
-    /// a step never owes a `period_ms` node a second fire and every frame
-    /// carries its own boundary target.
+    /// `CERULION_EXECUTION_MODE=lockstep`, the OPT-OUT: the quantum is the
+    /// TIGHTEST period in the graph, so a step never owes a `period_ms` node a
+    /// second fire and every frame carries its own boundary target.
     Lockstep,
     /// `CERULION_EXECUTION_MODE=free_run`: the rank's controlled clock advances
     /// ONCE per step by the measured wall elapsed and is CONSTANT within the
@@ -584,6 +591,24 @@ fn stamp_rule_for(want_gating: &str) -> Gating {
         ),
     }
 }
+
+/// **THE DEFAULT EXECUTION MODE, SPELLED OUT**, and the `gating` label
+/// `run.json` reads under it.
+///
+/// A multi-process `graph run` FREE-RUNS unless the operator opts out, so this
+/// pair is what a plain run resolves to. An arm whose subject is the recorder
+/// plane rather than the coordination contract hands `spawn_run` this env
+/// instead of an empty one, so it STATES the mode it executes under, and it
+/// derives its frame-stamp rule from [`DEFAULT_MODE_GATING`] through
+/// [`stamp_rule_for`] rather than naming a [`Gating`] variant by hand. The two
+/// halves therefore move together, which is the property a hand-written
+/// `Gating::Lockstep` on a plain run did not have: the mode flipped to free
+/// run under it, the strict rule stayed, and the first machine slow enough to
+/// produce a catch-up burst failed an arm about recording.
+const DEFAULT_MODE_ENV: &[(&str, &str)] = &[("CERULION_EXECUTION_MODE", "free_run")];
+
+/// The `gating` label [`DEFAULT_MODE_ENV`] implies; see its doc.
+const DEFAULT_MODE_GATING: &str = "recorded_wall";
 
 /// **THE GATING-CLOCK STAMP RULE**, as a pure function over one topic's stamps
 /// so that BOTH of its sides can be pinned by hand oracles rather than by a run
@@ -731,9 +756,12 @@ fn gating_stamp_violation(stamps: &[u64], gating: Gating) -> Option<String> {
 /// `gating` is the coordination contract the run under test executed under, and
 /// it decides the STAMP rule: strictly increasing under lockstep, strictly
 /// increasing except a bounded catch-up burst under free run. The caller states
-/// it rather than the bag, so an arm that drives a lockstep run keeps the strict
-/// rule even though this helper is shared with the free-run arm; see
-/// [`gating_stamp_violation`] for what the loose rule cannot catch.
+/// it rather than the bag, and every caller driving a real run derives it from
+/// the `gating` label that run's execution mode implies (see
+/// [`stamp_rule_for`]), so the arm that opts out to lockstep keeps the strict
+/// rule while the arms on the default are judged under the rule their clock
+/// actually obeys. See [`gating_stamp_violation`] for what the loose rule
+/// cannot catch.
 fn assert_frames_match_the_fixture_oracle(
     bag: &Path,
     prefix: &str,
@@ -950,7 +978,7 @@ fn the_stamp_rule_refuses_a_decreasing_pair_under_both_modes() {
 
 /// **THE MODE IS LOAD-BEARING.** The very burst the free-run rule admits is a
 /// FAILURE under lockstep, which is what makes passing the mode in worth doing:
-/// the three lockstep callers keep the strict rule the free-run arm cannot.
+/// the opt-out arm keeps a strict rule the default arms cannot be held to.
 #[test]
 #[serial]
 fn the_stamp_rule_refuses_under_lockstep_the_burst_it_admits_under_free_run() {
@@ -1626,8 +1654,10 @@ fn a_capture_taken_off_a_plain_run_is_a_bag_bag_play_resim_accepts() {
     std::fs::create_dir_all(&flashbacks).unwrap();
 
     // ------------------------------------------------------------------ leg 1
-    // A PLAIN run. No `--record`, no `--single-process`, no `--no-rings`.
-    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], &[]);
+    // A PLAIN run. No `--record`, no `--single-process`, no `--no-rings`. The
+    // execution mode is STATED, not inherited: this arm's subject is the
+    // recorder plane, so it runs the DEFAULT and says which one that is.
+    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], DEFAULT_MODE_ENV);
     wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
 
     // Let the window fill: the ticker is `period_ms = 50`, so a second of run
@@ -1681,8 +1711,12 @@ fn a_capture_taken_off_a_plain_run_is_a_bag_bag_play_resim_accepts() {
 
     // ------------------------------------------------- the oracle, then the CLAIM
     let foreign = assert_the_capture_accounts_for_every_topic_it_holds(&capture, &prefix);
-    let frames =
-        assert_frames_match_the_fixture_oracle(&capture, &prefix, "the capture", Gating::Lockstep);
+    let frames = assert_frames_match_the_fixture_oracle(
+        &capture,
+        &prefix,
+        "the capture",
+        stamp_rule_for(DEFAULT_MODE_GATING),
+    );
     assert!(
         frames > 0,
         "a capture over a live window carries frames from both graph topics"
@@ -1950,7 +1984,10 @@ fn a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts() {
     let stranger_topic = format!("/{}/stranger", unique_prefix("cotenant"));
     let stranger = CoTenant::spawn(&stranger_topic);
 
-    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], &[]);
+    // The DEFAULT execution mode, stated (see `DEFAULT_MODE_ENV`): this arm's
+    // subject is a co-tenant's topic inside the window, not the coordination
+    // contract, so it runs the mode a plain run resolves to and names it.
+    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], DEFAULT_MODE_ENV);
     wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
 
     // RENDEZVOUS on the tap, then fill. The arm's verdict needs the stranger's
@@ -2030,8 +2067,12 @@ fn a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts() {
 
     // The run's OWN frames still match the fixtures' hand oracle, so exit 0
     // below is a claim about real data.
-    let frames =
-        assert_frames_match_the_fixture_oracle(&capture, &prefix, "the capture", Gating::Lockstep);
+    let frames = assert_frames_match_the_fixture_oracle(
+        &capture,
+        &prefix,
+        "the capture",
+        stamp_rule_for(DEFAULT_MODE_GATING),
+    );
     assert!(frames > 0, "a capture over a live window carries frames");
 
     let (code, resim_err) = resim(root, &capture, &[], "resim");
@@ -2235,7 +2276,10 @@ fn a_bag_record_run_attach_to_a_plain_run_carries_its_trace() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&flashbacks).unwrap();
 
-    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], &[]);
+    // The DEFAULT execution mode, stated (see `DEFAULT_MODE_ENV`): this arm's
+    // subject is the LATE consumer of the run's trace rings, not the
+    // coordination contract, so it runs the mode a plain run resolves to.
+    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], DEFAULT_MODE_ENV);
     wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
     // THE MID-RUN RENDEZVOUS. `WINDOW_HELD` is the SUPERVISOR's landmark and says
     // nothing about the worker, so without this the recorder can open the trace
@@ -2314,7 +2358,12 @@ fn a_bag_record_run_attach_to_a_plain_run_carries_its_trace() {
     );
 
     // …and the frames it did capture are the ones these fixtures produce.
-    assert_frames_match_the_fixture_oracle(&out, &prefix, "the attach bag", Gating::Lockstep);
+    assert_frames_match_the_fixture_oracle(
+        &out,
+        &prefix,
+        "the attach bag",
+        stamp_rule_for(DEFAULT_MODE_GATING),
+    );
 
     // The declined-plane refusal — THE CONSEQUENCE, measured rather than
     // assumed.
