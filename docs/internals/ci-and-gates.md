@@ -341,13 +341,11 @@ and no stub job standing in for a skipped required check.
 
 `lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
 `viz-tests`, and the push-only `fuzz`, `miri` and latency jobs), so a red `lint` still
-saves their runner minutes. It does NOT gate the three that do: `test-archive`,
-`test-linux` and `test-macos`. All three start at t=0. `test-linux` has no `needs:` at all:
-each shard builds the `cerulion_core` test binaries it runs, so `test-archive` is no longer a
-data dependency; that job still runs and uploads its artifact because `Test archive (Linux,
-build once)` is a required check on `main`. A `lint` verdict was never a data dependency for
-any of the three, and while it gated them the wall was `lint` plus the longest test job
-instead of the longest test job.
+saves their runner minutes. It does NOT gate the two that do: `test-linux` and
+`test-macos`. Both start at t=0. `test-linux` has no `needs:` at all: each shard builds the
+`cerulion_core` test binaries it runs, so nothing in front of it is a data dependency. A
+`lint` verdict was never a data dependency for either, and while it gated them the wall was
+`lint` plus the longest test job instead of the longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
 3-way (`[0,1,2]`); both `fail-fast: false`. The macOS count is set from per-step
@@ -381,10 +379,7 @@ reason. Each sharded job's `shard:` matrix is held to the count its shard step p
 
 Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the shard step
 compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
-what it built. `test-archive` still builds the whole set once with `cargo nextest archive`
-and uploads it as a run-scoped artifact with its `sha256` as a job output, but no job
-downloads it; the job stays only because `Test archive (Linux, build once)` is a required
-check on `main`.
+what it built. There is no shared archive of test binaries and no job that builds one.
 
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`

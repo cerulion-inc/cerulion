@@ -1180,197 +1180,13 @@ jobs:
   # has its own /dev/shm, which is what makes splitting ACROSS runners legal;
   # within one runner it is the fence, not a flag, that keeps the namespace
   # binaries apart.
-  # ==========================================================================
-  # BUILD ONCE, RUN MANY — the test binaries the four Linux shards execute.
-  #
-  # MEASURED (box-ci, 2026-09-14, cgroup sample of 909 rows): a heavy shard is busy
-  # 99.7 % of its wall at a mean 0.50 of 4 threads — ~48 % of busy time at <=2
-  # threads (serial test EXECUTION) and ~38 % above 3 threads (COMPILE). That
-  # compile is the same work four times: every shard linked the same ~180
-  # `cerulion_core` test binaries and then ran a quarter of them. ~135 of the
-  # ~290 thread-min a PR spends here was duplicate.
-  #
-  # This job builds them ONCE with `cargo nextest archive`; the shards RUN the
-  # archive (`--archive-file`) and build nothing.
-  #
-  # HOW THE ARCHIVE REACHES THE SHARDS: as a run-scoped ARTIFACT, uploaded once
-  # here and downloaded by each shard. It is VERIFIED rather than trusted:
-  # this job exports the archive's `sha256` as a job OUTPUT and every shard
-  # checks the file it downloaded against
-  # `needs.test-archive.outputs.archive_sha256` BEFORE extracting it, which
-  # also catches a torn or short download for free.
-  # MEASUREMENT IN FLIGHT: the shards below no longer consume this archive.
-  #
-  # The job stays because `Test archive (Linux, build once)` is a required
-  # status context on `main`, and a required context that stops reporting
-  # blocks every pull request. Removing it is a branch-protection change and is
-  # deliberately not made here.
-  #
-  # WHAT IS BEING MEASURED. This job costs 9.6 to 13.4 min and sits IN FRONT of
-  # the four shards, which cannot start until it has uploaded. Its own steps
-  # say what it saves them: `Archive the test binaries` builds EVERY
-  # `cerulion_core` test binary in 5.63 min on top of a workspace build, so one
-  # shard's quarter is worth roughly 1.4 to 2.5 min, against the 0.7 to 3.5 min
-  # each shard currently spends downloading and verifying the artifact.
-  #
-  # If that reading is right, the archive costs the run about 11 to 12 min of
-  # wall and about 7 min of runner time, and the shard durations in this run
-  # against the same shards in a run that used the archive are what decides it.
-  #
-  # The reading it replaces was taken on 4 CPU containers with a shared archive
-  # directory on local disk, where a shard was CPU starved and the archive
-  # never crossed a network. On hosted runners every shard is its own VM and
-  # the archive travels as an artifact, which is a different trade.
-  test-archive:
-    name: Test archive (Linux, build once)
-    runs-on: ubuntu-latest
-    # NO `needs: [lint]`, and the omission is the point. `lint` takes 7.6 min on
-    # a quiet runner and 12 min on a contended one, and it used to gate every
-    # test job in this file, so the wall was `lint` PLUS the longest test job
-    # rather than the longest test job. Measured on the last green push run:
-    # `lint` 7.6, macOS shard 1 46.1, wall 54.0.
-    #
-    # It was never a DATA dependency. This job compiles test binaries; a
-    # formatting or clippy verdict changes nothing about what it compiles, and
-    # nothing it produces is derived from `lint`'s output. What the gate bought
-    # was runner minutes on a run whose `lint` fails. What it cost was the same
-    # minutes of WALL on every run whose `lint` passes, which is almost all of
-    # them.
-    #
-    # The cheap jobs keep `needs: [lint]` deliberately (`docs`, `netd-wan`,
-    # `crate-tests`, `viz-tests`, and the push-only `fuzz` / `miri` /
-    # latency jobs): none of them sets the wall, so gating them still saves
-    # minutes on a red-lint run and costs nothing on a green one. The three
-    # jobs that DO set the wall are this one, `test-linux` (which keeps its real
-    # dependency on this job) and `test-macos`.
-    # The build half of a shard's work, without the test execution.
-    timeout-minutes: 60
-    # SAME value as `test-linux` below, and the shards ASSERT it rather than
-    # trusting this comment: `ci_test_shard.sh` compares the archive job's
-    # recorded `CARGO_PROFILE_DEV_DEBUG` and `rustc -V` against its own and dies
-    # on drift. GitHub Actions has no YAML anchors, so an asserted contract is
-    # the closest thing to one shared block.
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-    outputs:
-      archive_sha256: ${{ steps.publish.outputs.sha256 }}
-      rustc: ${{ steps.publish.outputs.rustc }}
-      profile_debug: ${{ steps.publish.outputs.profile_debug }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      # Preinstalled-image bloat: same reclaim, same reason as `test-linux`.
-      - name: Free disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-                      /usr/local/.ghcup /usr/local/share/powershell \
-                      /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
-          df -h /
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: stable
-
-      # RESTORE ONLY. `test-linux` shard 0 remains the saver for this key; two
-      # savers on one key race, and this job has no better cache to offer than
-      # the one the shards already maintain.
-      - name: Restore cargo (no save)
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
-
-      # The fixture cdylibs the `DylibNodeEntry` tests dlopen and the binaries
-      # the e2e tests spawn are NOT test targets, so `nextest archive` does not
-      # build them — this step does, and `.config/nextest.toml`'s
-      # `archive.include` then puts them into the archive at `target/debug/…`,
-      # which is exactly where `find_fixture_cdylib` looks (it resolves from the
-      # TEST BINARY's own location, so under an extracted archive that is the
-      # extracted tree).
-      - name: Build test cdylibs and binaries
-        run: cargo build --workspace
-
-      - name: Install cargo-nextest
-        run: ./tools/scripts/install_nextest.sh
-
-      # `--profile ci` so the archive is built under the same profile the shards
-      # run with (the serial fences live there too, but those are read from the
-      # repo at RUN time, not baked in).
-      - name: Archive the test binaries
-        run: |
-          set -euo pipefail
-          cargo nextest archive --profile ci -p cerulion_core \
-            --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
-          ls -l "$RUNNER_TEMP/nextest-archive.tar.zst"
-          # THE NUMBER THE SHARDS ARE SIZED AGAINST, measured rather than assumed.
-          #
-          # What a shard has to find room for is the UNCOMPRESSED tree, and the
-          # compressed figure above understates it several-fold — which is how
-          # four shards came to be pointed at a filesystem that could not hold
-          # it. Printing it here costs one decompress in a job that already runs
-          # ~22 minutes, and it keeps being true as the tree grows: the day this
-          # crosses the work volume's free space, the log says so.
-          if command -v zstd >/dev/null 2>&1; then
-            zstd -dc "$RUNNER_TEMP/nextest-archive.tar.zst" | tar -tvf - \
-              | awk '{ n++; b += $3 } END {
-                  printf "archive contents: %d entries, %d bytes uncompressed (%.2f GiB)\n", n, b, b/1073741824 }'
-          else
-            echo "::warning::no zstd CLI on this runner: the uncompressed size was not measured"
-          fi
-
-      # The PROVENANCE the shards check what they downloaded against. `sha256`
-      # is per-run and not forgeable from another run; `rustc` and
-      # `profile_debug` let `ci_test_shard.sh` refuse an archive built by a
-      # different compiler or under a different profile rather than silently
-      # rebuilding it.
-      - name: Publish the archive provenance
-        id: publish
-        run: |
-          set -euo pipefail
-          A="$RUNNER_TEMP/nextest-archive.tar.zst"
-          sha=$(sha256sum "$A" | awk '{print $1}')
-          {
-            echo "sha256=$sha"
-            echo "rustc=$(rustc -V)"
-            echo "profile_debug=${CARGO_PROFILE_DEV_DEBUG:-}"
-          } >> "$GITHUB_OUTPUT"
-          echo "archive sha256: $sha"
-
-      # The artifact is how these bytes reach a shard, so this job uploads THE
-      # FILE IT JUST BUILT.
-      #
-      # Delegating that to a second job which builds its own copy and refuses
-      # to upload unless the sha256 matches could only ever fail: a nextest
-      # archive is a tar, a tar records mtimes, and two independent builds do
-      # not produce the same bytes, so such a fallback would refuse on every run
-      # and the shards would have nothing. The remedy is to not rebuild rather
-      # than to loosen the check: the check is right and a second build is the
-      # mistake.
-      #
-      # `compression-level: 0` because the file is already zstd-compressed.
-      - name: Upload the archive
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: nextest-archive-linux
-          path: ${{ runner.temp }}/nextest-archive.tar.zst
-          retention-days: 1
-          compression-level: 0
 
   test-linux:
     name: Test (Linux) shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # NO `needs:` AT ALL, for this measurement. These shards BUILD the
-    # `cerulion_core` test binaries they run instead of downloading the
-    # archive, so `test-archive` stops being a data dependency and the shards
-    # start at t=0 with everything else. See the block above `test-archive` for
-    # what this is measuring and what decides it.
+    # No `needs:`. Each shard builds the `cerulion_core` test binaries it runs,
+    # so nothing in front of it is a data dependency and the four shards start
+    # at t=0 with every other job.
     strategy:
       # One shard's failure must not cancel the other three: the whole point of
       # the split is that the shards report independently, and a red shard 2
@@ -1567,28 +1383,6 @@ jobs:
       # builds every fixture — drift-proof, unlike the prior enumerated `-p`
       # list (which had gone stale: a deleted crate + two missing ones). Same
       # spirit as the default-cover test model below.
-      # The archived test binaries are RUN in this job, never built, so nothing
-      # here puts a DEV-dependency source into the cargo registry: the workspace
-      # build below compiles no test target, and the archive arrives as finished
-      # binaries. One of those binaries needs dev-dependency sources at RUN time.
-      # `macro_compile_fail_test` is a trybuild harness, and trybuild folds the
-      # crate's dev-dependencies into the project it generates and then builds
-      # that project with `--offline`. So `proptest`, and `bit-set` underneath
-      # it, must already be on disk, or the harness dies with "attempting to
-      # make an HTTP request, but --offline was specified" and the shard is red.
-      #
-      # Without this step, whether they are on disk is LUCK: it depends on what
-      # the cargo restore above happened to carry and, on a runner whose cargo
-      # home outlives the job, on what an earlier job on that same machine
-      # fetched. `cargo fetch` downloads the whole lockfile closure,
-      # dev-dependencies included, and costs seconds once the registry is warm.
-      #
-      # The macOS shards need no such step: they have no archive, so nextest
-      # BUILDS the test binaries there and cargo fetches the dev-dependencies as
-      # part of that build.
-      - name: Fetch the lockfile closure (the archived trybuild test builds offline)
-        run: cargo fetch --locked
-
       - name: Build test cdylibs
         run: cargo build --workspace
 
@@ -1630,53 +1424,10 @@ jobs:
       # Fence membership is gated by
       # `cerulion_core/tests/serial_discipline_test.rs`, so it cannot silently
       # lose a binary.
-      # ---------------------------------------------------------------
-      # THE ARCHIVE THE SHARD RUNS INSTEAD OF BUILDING.
-      #
-      # Note what did NOT move: `cargo build --workspace` above stays, because
-      # this job is not only the `cerulion_core` shard — the rmw / CLI / bagd /
-      # netd steps below need the workspace's binaries and the cdylib fixtures
-      # they dlopen. What the archive removes is the ~180 `cerulion_core` TEST
-      # BINARY links each shard would otherwise pay to run a quarter of them, which is
-      # the duplicated half the cgroup sample measured.
-      #
-      # One transport, verified rather than trusted: the artifact this run's
-      # archive job uploaded, checked against the sha256 it exported before a
-      # byte is extracted. Hashing the file AFTER it lands in `$RUNNER_TEMP`
-      # also catches a torn or short download for free.
-      # WHERE THE ARCHIVE LANDS, and it was not a detail: an early run of this
-      # died on ALL FOUR shards with `No space left on device (os error 28)` on
-      # a machine with hundreds of GB free, because the extract went to a
-      # RAM-backed `/tmp` rather than to the work volume. The archive was fine
-      # (each shard had logged that it verified the download by sha256), so
-      # this step makes the DESTINATION as legible as the source, on every run,
-      # before anything is written.
-      #
-      # Two consequences a free-space figure alone would miss, and both argue
-      # the same way:
-      #
-      #   * a tmpfs is RAM, so a bigger one would trade ENOSPC for an OOM kill.
-      #     The extract must not be memory at all.
-      #   * `/tmp` is also where iceoryx2 puts its SHM state, so an extract
-      #     filling it would starve the tests it exists to run.
-      - name: Space for the extract (evidence, not a guess)
-        run: |
-          set -euo pipefail
-          echo "== free space where the archive will be unpacked =="
-          df -h /tmp "$RUNNER_TEMP" || true
-          echo "== filesystem type of each =="
-          # `stat -f -c %T` is the one that says "tmpfs" rather than a device
-          # name, which is the whole distinction this step exists to surface.
-          for d in /tmp "$RUNNER_TEMP"; do
-            printf '%s: fstype=%s\n' "$d" "$(stat -f -c '%T' "$d" 2>/dev/null || echo unknown)"
-          done
 
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
-        # BUILD MODE for this measurement: no `CI_TEST_SHARD_ARCHIVE`, so the
-        # script passes `-p cerulion_core --test <member> ...` and cargo builds
-        # exactly this shard's quarter of the test binaries before running them.
-        # The archive-mode provenance assertions are unreachable here by
-        # construction, because there is no archive to assert about.
+        # Each shard compiles the quarter of the `cerulion_core` test binaries
+        # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
@@ -1760,23 +1511,15 @@ jobs:
       # next firing attributable.
       # ======================================================================
       #
-      # ARCHIVE MODE MOVED THE LARGEST PRODUCER, so this step follows it. The
-      # `cerulion_core` binaries the shard just ran no longer live in the
-      # checkout's `target/debug/deps` at all — `--extract-to` unpacks them under
-      # `$RUNNER_TEMP`, together with a 3.60 GiB compressed archive this shard is
-      # finished with. Left behind, that pair is the largest single claim on the
-      # work volume at the point the later linking steps need it, and the `find`
-      # below cannot see either of them (the archive half and the extracted
-      # tree are the same defect one directory over).
-      # Both are removed by name, still with `|| true`.
+      # The `cerulion_core` test binaries the shard just ran live in the
+      # checkout's `target/debug/deps`; the `find` below removes them so the
+      # later linking steps get the disk back.
       - name: Reclaim disk from already-run test binaries
         run: |
           df -h / || true
           find target/debug/deps -maxdepth 1 -type f -executable \
                ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' \
                ! -name 'build_script_build*' -delete || true
-          rm -rf "$RUNNER_TEMP/nextest-extract" || true
-          rm -f  "$RUNNER_TEMP/nextest-archive.tar.zst" || true
           df -h / || true
 
       # ---------------------------------------------------------------
@@ -2087,8 +1830,8 @@ jobs:
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
-    # NO `needs: [lint]`: see the note on `test-archive` for why the gate was
-    # never a data dependency. This is the job the omission is aimed at. It is
+    # NO `needs: [lint]`: a `lint` verdict was never a data dependency for a
+    # test job. This is the job the omission is aimed at. It is
     # the longest in the workflow (46.1 min of the 54.0 min wall on the last
     # green push run), so every minute `lint` spent in front of it was a minute
     # on the wall of every green run.
