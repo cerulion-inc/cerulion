@@ -258,11 +258,13 @@ fn the_walk_reads_the_code_it_claims_to_read() {
 //
 // Behavioural where it can be: `render_refused_nodes` is PURE, so the whole
 // listing is pinned against hand-written line vectors with no dead node in
-// the global iceoryx2 namespace. A subprocess test in
-// `tests/trace_inspect_and_clean_cli_test.rs` could only exercise this arm by
-// PLANTING a dead node in the shared `iox2_` namespace, which is exactly the
-// contamination that file's convergence test detects — so the CLI file is
-// deliberately untouched and the wiring is pinned by the source walk below.
+// the global iceoryx2 namespace. The subprocess arms in
+// `tests/trace_inspect_and_clean_cli_test.rs` plant their dead nodes under a
+// PRIVATE registry root rather than the shared `iox2_` namespace, and they
+// pin the converged shape (one node swept, nothing refused); minting a
+// REFUSED node needs the leaked-loan shape, which
+// `cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs` owns, so the
+// listing's own wiring is pinned by the source walk below.
 // ---------------------------------------------------------------------------
 
 use cerulion_cli_engine::ipc_cleanup::{classify_cleanup_failures, FailedNodeCleanup};
