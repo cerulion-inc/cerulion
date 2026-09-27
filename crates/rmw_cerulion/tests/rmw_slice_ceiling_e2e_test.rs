@@ -224,7 +224,9 @@ fn cpp_seq_ts(namespace: &str, name: &str) -> *const ffi::rosidl_message_type_su
         size_function: Some(vecf64_size),
         get_const_function: Some(vecf64_get_const),
         get_function: Some(vecf64_get),
+        #[cfg(cerulion_has_fetch_function)]
         fetch_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         assign_function: None,
         resize_function: Some(vecf64_resize),
         #[cfg(cerulion_has_is_rosidl_buffer)]

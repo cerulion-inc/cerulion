@@ -134,10 +134,12 @@ pub(crate) unsafe fn resolve_introspection(
                     data as *const ffi::rosidl_typesupport_introspection_c__MessageMembers,
                 ));
             }
-            // C++ bridge gate, bounded on BOTH edges (the
-            // Jazzy/Kilted hand-mirror exactly), with the
-            // bypass composite — see cpp_typesupport_gate. The C
-            // arm above stays fully functional on every era.
+            // C++ bridge gate: the hand-mirror is shaped per era by the
+            // same capability cfgs that name the era, so every era is
+            // admitted and the only refusing verdict left is a vendored
+            // build under a runtime the snapshot does not admit; see
+            // cpp_typesupport_gate. The C arm above stays fully functional
+            // on every era.
             if cpp_typesupport_gate().emit_refusal() {
                 return None;
             }
@@ -200,7 +202,8 @@ pub(crate) unsafe fn resolve_service_introspection(
                 ));
             }
             // Same gate as the message resolver: CppServiceMembers is
-            // hand-mirrored to the Jazzy/Kilted-era shape too.
+            // hand-mirrored per era too, its trailing `event_members_`
+            // under its own capability cfg.
             if cpp_typesupport_gate().emit_refusal() {
                 return None;
             }
@@ -491,7 +494,9 @@ mod dispatch_tests {
             size_function: None,
             get_const_function: None,
             get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             assign_function: None,
             resize_function: None,
             #[cfg(cerulion_has_is_rosidl_buffer)]

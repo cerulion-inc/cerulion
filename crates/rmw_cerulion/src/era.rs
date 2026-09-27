@@ -99,10 +99,6 @@ pub enum CppBridgeGate {
     /// The build's era matches the hand-mirrored C++ layout — resolve
     /// the C++ arm as always.
     Supported,
-    /// A pre-Galactic build (Foxy, Galactic): the C++ typesupport arm
-    /// REFUSES at registration with [`CPP_BRIDGE_PRE_GALACTIC_REFUSAL`]
-    /// instead of misreading every rclcpp publisher's 96-byte members.
-    RefusePreGalactic,
     /// A VENDORED (development) build whose running process names no
     /// distro the snapshot admits: the era of the C++ typesupport it would
     /// be handed is unknown, so the C++ arm REFUSES with
@@ -121,7 +117,6 @@ impl CppBridgeGate {
     pub fn refusal_message(self) -> Option<&'static str> {
         match self {
             CppBridgeGate::Supported => None,
-            CppBridgeGate::RefusePreGalactic => Some(CPP_BRIDGE_PRE_GALACTIC_REFUSAL),
             CppBridgeGate::RefuseVendoredUnnamedRuntime => {
                 Some(CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL)
             }
@@ -224,29 +219,6 @@ impl CppBridgeGate {
         match self {
             // Unreachable: `refusal_message()` returned above.
             CppBridgeGate::Supported => {}
-            CppBridgeGate::RefusePreGalactic => match decision {
-                RegimeDecision::Loud => tracing::error!(
-                    built_for = %built_for(),
-                    verdict = ?self,
-                    rcl_error_channel = %rcl,
-                    "{CPP_BRIDGE_PRE_GALACTIC_REFUSAL}"
-                ),
-                RegimeDecision::StillFailing { total, suppressed } => tracing::error!(
-                    built_for = %built_for(),
-                    verdict = ?self,
-                    rcl_error_channel = %rcl,
-                    total_failures = total,
-                    suppressed_count = suppressed,
-                    "{CPP_BRIDGE_PRE_GALACTIC_REFUSAL}"
-                ),
-                RegimeDecision::Suppressed { suppressed } => tracing::debug!(
-                    built_for = %built_for(),
-                    verdict = ?self,
-                    rcl_error_channel = %rcl,
-                    suppressed_count = suppressed,
-                    "{CPP_BRIDGE_PRE_GALACTIC_REFUSAL}"
-                ),
-            },
             CppBridgeGate::RefuseVendoredUnnamedRuntime => match decision {
                 RegimeDecision::Loud => tracing::error!(
                     built_for = %built_for(),
@@ -372,12 +344,14 @@ pub fn test_surface() -> TestSurface {
 /// from three capability cfgs (`fetch_function` is absent before Humble,
 /// `is_key_` arrived at Jazzy, `is_rosidl_buffer_` at Lyrical), so the bridge
 /// classifier cannot receive them swapped. The hand-mirrored C++ bridge is
-/// shaped by the SAME cfgs, so every era from Humble onward is admitted;
-/// only the pre-Galactic shape (96-byte member, no fetch/assign) has no
-/// mirror yet.
+/// shaped by the SAME cfgs, so every era is admitted; the pre-Galactic
+/// shape (96-byte member, no fetch/assign) costs only its
+/// `std::vector<bool>` members, refused per message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CIntrospectionEra {
-    /// Before `fetch_function` (Foxy, Galactic): 96-byte members.
+    /// Before `fetch_function` (Foxy, Galactic): 96-byte members, and no
+    /// accessor for a `std::vector<bool>` member, which the C++ bridge
+    /// refuses per message.
     PreGalactic,
     /// `fetch_function` without `is_key_` (Humble, Iron): 112-byte members,
     /// 56-byte `MessageMembers`, 32-byte `ServiceMembers`.
@@ -405,12 +379,11 @@ pub fn c_introspection_era() -> CIntrospectionEra {
 /// The C++ bridge verdict for THIS build under a given bypass mode — the
 /// call-site seam the resolvers use (`classify_cpp_bridge` over the
 /// build's own [`c_introspection_era`]), split out so the wiring is
-/// pinnable: every build from Humble onward classifies `Supported` under
-/// either bypass, since the mirror is shaped by the same cfgs that classify
-/// the era; with the bypass `Off` a vendored build also needs the runtime to
-/// name a distro the snapshot admits ([`gate_vendored_cpp_arm`]); a
-/// pre-Galactic build classifies `RefusePreGalactic` with the bypass `Off`
-/// and `Supported` under either bypass.
+/// pinnable: every build classifies `Supported` under either bypass, since
+/// the mirror is shaped by the same cfgs that classify the era; with the
+/// bypass `Off` a vendored build also needs the runtime to name a distro
+/// the snapshot admits ([`gate_vendored_cpp_arm`]), which is the only
+/// refusing verdict left.
 pub fn cpp_bridge_gate_for(bypass: CppBypassMode) -> CppBridgeGate {
     gate_vendored_cpp_arm(
         classify_cpp_bridge(bypass, c_introspection_era()),
@@ -583,21 +556,6 @@ pub fn cpp_bypass_warns_fired() -> u64 {
     CPP_BYPASS_WARNS_FIRED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The registration-time refusal the C++ typesupport arm emits on a
-/// pre-Galactic build (Foxy, Galactic): the generated path builds, but the
-/// C++ `MessageMember` there predates `fetch_function` and `assign_function`
-/// (96 bytes) and `ffi/introspection_cpp.rs` mirrors no such shape yet, so
-/// the arm refuses at registration instead of misreading member arrays.
-pub const CPP_BRIDGE_PRE_GALACTIC_REFUSAL: &str = concat!(
-    "rmw_cerulion: this build targets a pre-Galactic distro (Foxy or Galactic), whose ",
-    "C++ introspection MessageMember predates fetch_function and assign_function ",
-    "(96 bytes against the 112 the C++ bridge mirrors from Humble onward); ",
-    "refusing the rclcpp (C++ typesupport) path at registration rather than misreading ",
-    "its member arrays. The pre-Galactic C++ mirror is not implemented yet; rclpy and ",
-    "C-typesupport consumers are unaffected (the C introspection path is ",
-    "bindgen-generated against this distro's real headers and correct on every era)."
-);
-
 /// The registration-time refusal a VENDORED (development) build emits
 /// when the running process names no distro the snapshot admits. Shipped
 /// text: no typographic dash.
@@ -612,22 +570,22 @@ pub const CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL: &str = concat!(
     "consumers are unaffected."
 );
 
-/// Gate the hand-mirrored C++ introspection bridge on the
-/// build's era, BOUNDED BELOW ONLY. `ffi/introspection_cpp.rs` takes
-/// its shape from the same capability cfgs that select the era:
-/// `fetch_function` / `assign_function` arrived at Galactic (the lower
-/// bound; before it the C++ `MessageMember` is 96 bytes and has no
-/// mirror), `is_key_` / `has_any_key_member_` at Jazzy and
-/// `is_rosidl_buffer_` at Lyrical, each widening the mirror under its
-/// own cfg. Every one of those fields was added to the C AND C++
-/// introspection structs by the same rosidl release, so the C
-/// capability tokens (`cerulion_has_fetch_function`,
+/// Gate the hand-mirrored C++ introspection bridge on the build's era.
+/// UNBOUNDED NOW, because every era has a mirror.
+/// `ffi/introspection_cpp.rs` takes its shape from the same capability
+/// cfgs that select the era: `fetch_function` / `assign_function` arrived
+/// at Humble (before them the C++ `MessageMember` is 96 bytes and
+/// `std::vector<bool>` members are unreachable, which the bridge refuses
+/// per MESSAGE rather than per build), `is_key_` /
+/// `has_any_key_member_` at Jazzy and `is_rosidl_buffer_` at Lyrical,
+/// each widening the mirror under its own cfg. Every one of those fields
+/// was added to the C AND C++ introspection structs by the same rosidl
+/// release, so the C capability tokens (`cerulion_has_fetch_function`,
 /// `cerulion_has_is_key`, `cerulion_has_is_rosidl_buffer`) are the
 /// build-time proxies for the C++ mirror's era, folded ONCE into
-/// [`c_introspection_era`], a compile-time constant, so the gated arm
-/// compiles to the right verdict per build (never a runtime sniff);
-/// [`cpp_bridge_gate_for`] is the resolver's seam over it. The mirror
-/// and the classifier read the same cfgs, so they cannot disagree.
+/// [`c_introspection_era`], a compile-time constant; [`cpp_bridge_gate_for`]
+/// is the resolver's seam over it. The mirror and the classifier read the
+/// same cfgs, so they cannot disagree.
 ///
 /// The VENDORED-TEST BYPASS (see [`classify_cpp_bypass`] — by design
 /// the bypass rides `cfg(test)` silently or `test-seams` LOUDLY, with
@@ -646,20 +604,24 @@ pub const CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL: &str = concat!(
 /// compiled with the Lyrical tail field under the same capability cfg,
 /// and a vendored `.so` under any OTHER named runtime is already refused
 /// at init by the era guard. SELECTION of the correct gate, nothing
-/// more: the pre-Galactic C++ variant is not implemented; the Jazzy,
-/// Lyrical and Humble container lanes execute the
-/// `Supported` arm, a lane for another era would execute its own, and this
-/// classifier's oracle covers every input because one build can only
+/// more: the Foxy, Humble, Jazzy and Lyrical container lanes each
+/// compile their own mirror shape and execute the `Supported` arm, and
+/// this classifier's oracle covers every input because one build can only
 /// ever exercise one.
 pub fn classify_cpp_bridge(bypass: CppBypassMode, era: CIntrospectionEra) -> CppBridgeGate {
     if bypass != CppBypassMode::Off {
         return CppBridgeGate::Supported;
     }
     match era {
-        CIntrospectionEra::PreGalactic => CppBridgeGate::RefusePreGalactic,
-        CIntrospectionEra::PreJazzy => CppBridgeGate::Supported,
-        CIntrospectionEra::Jazzy => CppBridgeGate::Supported,
-        CIntrospectionEra::PostJazzy => CppBridgeGate::Supported,
+        // Every era the bindings can carry has a mirror, and the mirror is
+        // shaped by the same capability cfgs that name the era, so no era
+        // refuses on layout grounds. The match stays exhaustive so a NEW
+        // era variant is a deliberate decision rather than a silent
+        // `Supported`.
+        CIntrospectionEra::PreGalactic
+        | CIntrospectionEra::PreJazzy
+        | CIntrospectionEra::Jazzy
+        | CIntrospectionEra::PostJazzy => CppBridgeGate::Supported,
     }
 }
 
@@ -884,14 +846,14 @@ mod tests {
     use tracing_test::traced_test;
 
     #[test]
-    fn the_refusal_rcl_text_is_built_once_and_is_per_verdict() {
+    fn the_refusal_rcl_text_is_built_once_per_verdict() {
         // A real-time allocation hazard: the C++ gate sits
         // on the per-MESSAGE resolve path, so its rcl text must be
         // rendered ONCE, not formatted per refusal. Pointer identity is
         // the oracle a `format!`-per-call cannot satisfy — it could not
         // even return `&'static`.
-        let a = CppBridgeGate::RefusePreGalactic.rcl_error_text();
-        let b = CppBridgeGate::RefusePreGalactic.rcl_error_text();
+        let a = CppBridgeGate::RefuseVendoredUnnamedRuntime.rcl_error_text();
+        let b = CppBridgeGate::RefuseVendoredUnnamedRuntime.rcl_error_text();
         assert!(
             std::ptr::eq(a, b),
             "the cached rcl text must be the SAME object on every refusal"
@@ -901,10 +863,11 @@ mod tests {
         assert_eq!(
             a.as_ref(),
             format!(
-                "{CPP_BRIDGE_PRE_GALACTIC_REFUSAL} built_for={} verdict=RefusePreGalactic",
+                "{CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL} built_for={} \
+                 verdict=RefuseVendoredUnnamedRuntime",
                 built_for()
             ),
-            "the cached rcl text for RefusePreGalactic is wrong"
+            "the cached rcl text for RefuseVendoredUnnamedRuntime is wrong"
         );
     }
 
@@ -913,15 +876,29 @@ mod tests {
         // Hand oracle over every input of the pure gate: a vendored build
         // with the bypass off admits the C++ arm only when the runtime
         // admits; everything else passes through.
-        use CppBridgeGate::{RefusePreGalactic, RefuseVendoredUnnamedRuntime, Supported};
+        use CppBridgeGate::{RefuseVendoredUnnamedRuntime, Supported};
         use CppBypassMode::{Off, TestSilent};
         let cases: &[(CppBridgeGate, CppBypassMode, bool, bool, CppBridgeGate)] = &[
             (Supported, Off, true, false, RefuseVendoredUnnamedRuntime),
             (Supported, Off, true, true, Supported),
             (Supported, Off, false, false, Supported),
             (Supported, TestSilent, true, false, Supported),
-            (RefusePreGalactic, Off, true, false, RefusePreGalactic),
-            (RefusePreGalactic, Off, true, true, RefusePreGalactic),
+            // An ALREADY-refusing verdict passes through unchanged, whatever
+            // the vendored bits say.
+            (
+                RefuseVendoredUnnamedRuntime,
+                Off,
+                true,
+                false,
+                RefuseVendoredUnnamedRuntime,
+            ),
+            (
+                RefuseVendoredUnnamedRuntime,
+                Off,
+                true,
+                true,
+                RefuseVendoredUnnamedRuntime,
+            ),
         ];
         for (gate, bypass, vendored, admits, want) in cases {
             assert_eq!(
@@ -965,11 +942,6 @@ mod tests {
                 "{CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL} built_for={} verdict=RefuseVendoredUnnamedRuntime",
                 built_for()
             )
-        );
-        // Each refusing verdict owns its own cell: the two texts differ.
-        assert_ne!(
-            a.to_bytes(),
-            CppBridgeGate::RefusePreGalactic.rcl_error_text().to_bytes()
         );
         // Every refusal paragraph carries the one marker the refusal tests
         // key on.
@@ -1165,13 +1137,13 @@ mod tests {
     }
 
     #[test]
-    fn the_cpp_bridge_gate_is_bounded_on_both_edges() {
+    fn the_cpp_bridge_gate_admits_every_era_the_mirror_is_shaped_for() {
         // One build can only exercise one input combination (the cfgs
         // are fixed at compile time), so the classifier is pinned on
         // ALL of them — the Jazzy container lane executes the Supported
-        // arm; a lane for another era would execute its own. Args:
-        // (CppBypassMode, CIntrospectionEra).
-        // The mirror is the Jazzy/Kilted shape EXACTLY:
+        // arm; a lane for another era executes the same arm with its own
+        // mirror shape. Args: (CppBypassMode, CIntrospectionEra).
+        // Jazzy and Kilted, the shape the mirror was first written for:
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::Jazzy),
             CppBridgeGate::Supported
@@ -1185,11 +1157,15 @@ mod tests {
             CppBridgeGate::Supported,
             "a Humble/Iron build compiles the pre-Iron-shaped C++ mirror"
         );
-        // Lower bound: no pre-Galactic mirror exists (96-byte members).
+        // Foxy/Galactic: the mirror drops `fetch_function` and
+        // `assign_function` under the same cfg that classifies this era and
+        // closes at 96 bytes, so the build is admitted; the one member kind
+        // it cannot reach, a `std::vector<bool>`, is refused per MESSAGE by
+        // the bridge, not per build by this gate.
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreGalactic),
-            CppBridgeGate::RefusePreGalactic,
-            "a pre-Galactic build must refuse the hand-mirrored C++ bridge"
+            CppBridgeGate::Supported,
+            "a Foxy/Galactic build compiles the 96-byte C++ mirror"
         );
         // Post-Jazzy (Lyrical/Rolling): the mirror carries the appended
         // `is_rosidl_buffer_` under the same capability cfg that classifies
@@ -1229,9 +1205,6 @@ mod tests {
             CppBridgeGate::Supported,
             "a vendored-dev .so admits the C++ arm on its own era"
         );
-        // Each refusal names the layout boundary, the missing per-era support, and
-        // the unaffected consumers — the three things an operator
-        // needs — and the verdict-to-message seam agrees.
         // The call-site seam over THIS build (the resolver's wiring needs
         // executing coverage): a vendored build carries the
         // rolling-era C introspection shape, so it classifies PostJazzy; with
@@ -1260,23 +1233,22 @@ mod tests {
             cpp_bridge_gate_for(CppBypassMode::SeamsLoud),
             CppBridgeGate::Supported
         );
+        // The ONE refusing verdict names the build posture, what it would
+        // have misread, the remedy and the unaffected consumers, the four
+        // things an operator needs, and the verdict-to-message seam agrees.
         for phrase in [
-            "pre-Galactic distro",
-            "predates fetch_function and assign_function",
+            "vendored bindings snapshot",
+            "names no ROS distro the snapshot admits",
             "refusing the rclcpp (C++ typesupport) path at registration",
-            "is not implemented yet",
+            "Set ROS_DISTRO to the running distro",
             "C-typesupport consumers are unaffected",
         ] {
             assert!(
-                CPP_BRIDGE_PRE_GALACTIC_REFUSAL.contains(phrase),
-                "pre-Galactic refusal must contain {phrase:?}"
+                CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL.contains(phrase),
+                "the vendored-runtime refusal must contain {phrase:?}"
             );
         }
         assert_eq!(CppBridgeGate::Supported.refusal_message(), None);
-        assert_eq!(
-            CppBridgeGate::RefusePreGalactic.refusal_message(),
-            Some(CPP_BRIDGE_PRE_GALACTIC_REFUSAL)
-        );
         assert_eq!(
             CppBridgeGate::RefuseVendoredUnnamedRuntime.refusal_message(),
             Some(CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL)

@@ -4288,7 +4288,9 @@ mod slice_ceiling_tests {
             size_function: None,
             get_const_function: None,
             get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             assign_function: None,
             resize_function: None,
             #[cfg(cerulion_has_is_rosidl_buffer)]

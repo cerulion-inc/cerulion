@@ -43,8 +43,8 @@ use cerulion_core::wire::WireHeader;
 use crate::ffi;
 use crate::ffi::introspection_cpp::{
     assign_u8_vector, cppstring_bytes, debug_assert_vector_u8_layout, is_unbounded_u8_vector,
-    rmw_cerulion_cppstring_assign, vector_triplet_layout_verified, CppMessageMember,
-    CppMessageMembers, VecTriplet,
+    member_assign, member_fetch, rmw_cerulion_cppstring_assign, vector_triplet_layout_verified,
+    CppMessageMember, CppMessageMembers, VecTriplet,
 };
 use crate::type_bridge::{
     add_var_size, adopted_offset, align_up, check_out_cap, check_seq_bound, cursor_align_var,
@@ -54,6 +54,43 @@ use crate::type_bridge::{
     ForgeOutcome, ForgePlacement, FrameCursor, NestedLayouts, SealItem, SealRefusal, SealScratch,
     WindowExtent, BORROW_TAIL_ALIGN, MAX_FRAME_BYTES,
 };
+
+/// Why a `bool` sequence is unreachable when its member carries no `fetch`
+/// accessor: before Humble the C++ typesupport generator emits no `fetch`
+/// or `assign` function for `std::vector<bool>` and leaves its `get` and
+/// `get_const` null, so no element of it can be read or written. One
+/// literal, rendered by [`bool_seq_no_fetch_detail`] where the member can
+/// be named and by [`BOOL_SEQ_NO_FETCH_NESTED`] where it cannot.
+macro_rules! bool_seq_no_fetch_reason {
+    () => {
+        "this build's C++ typesupport has no fetch accessor for \
+         std::vector<bool>: its generator emits no fetch or assign function \
+         and leaves get and get_const null, so no element is reachable"
+    };
+}
+
+/// [`bool_seq_no_fetch_reason`] for a member inside a NESTED message,
+/// whose encode path carries a `&'static str` and so cannot format the
+/// member's name; the enclosing message is named by the `Encode` error the
+/// top-level caller wraps this in.
+pub(crate) const BOOL_SEQ_NO_FETCH_NESTED: &str = concat!(
+    "a bool sequence in a nested message cannot be encoded: ",
+    bool_seq_no_fetch_reason!()
+);
+
+/// [`bool_seq_no_fetch_reason`] naming the member the reader must go and
+/// look at. The enclosing message is the `Encode` error's own `message`
+/// field, so the two together locate the field exactly.
+///
+/// # Safety
+/// `member.name_` must be the member's own NUL-terminated name.
+pub(crate) unsafe fn bool_seq_no_fetch_detail(member: &CppMessageMember) -> String {
+    let field = ffi::cstr(member.name_).unwrap_or("<field>");
+    format!(
+        "bool sequence member '{field}' cannot be encoded: {}",
+        bool_seq_no_fetch_reason!()
+    )
+}
 
 /// One flatten/unflatten operation for a top-level C++ field.
 #[derive(Debug)]
@@ -1015,9 +1052,8 @@ impl CppBridgedMessage {
                         // vector<bool>: bit-packed, fetch element-wise —
                         // straight into the cursor's zeroed span (no
                         // intermediate buffer).
-                        let fetch = member.fetch_function.ok_or_else(|| {
-                            self.encode_err("bool sequence missing fetch_function")
-                        })?;
+                        let fetch = member_fetch(member)
+                            .ok_or_else(|| self.encode_err(&bool_seq_no_fetch_detail(member)))?;
                         let offset =
                             cursor_align_var(&mut cur, 1).map_err(|d| self.encode_err(d))?;
                         cursor_write_var_entry(&mut cur, table_base, *var_idx, offset, count)
@@ -1741,7 +1777,7 @@ unsafe fn write_prim_seq_cpp(
         return true;
     }
     if is_bool {
-        let Some(assign) = member.assign_function else {
+        let Some(assign) = member_assign(member) else {
             return false;
         };
         for (i, &b) in bytes.iter().enumerate() {
@@ -1948,7 +1984,7 @@ unsafe fn encode_message_payload_cpp(
             let elem = primitive_size(member.type_id_);
             check_seq_bound(count, elem)?;
             if member.type_id_ == ros_type::BOOLEAN {
-                let fetch = member.fetch_function.ok_or("bool seq missing fetch")?;
+                let fetch = member_fetch(member).ok_or(BOOL_SEQ_NO_FETCH_NESTED)?;
                 buf.resize(count, 0);
                 for (i, b) in buf.iter_mut().enumerate() {
                     let mut v: bool = false;
@@ -2296,10 +2332,8 @@ impl CppBridgedMessage {
                         // Bit-packed: fetch into the reused owned arena (the
                         // same element walk the flatten path runs). Never
                         // forgeable, never adopted.
-                        let fetch = member.fetch_function.ok_or_else(|| {
-                            SealRefusal::Encode(
-                                self.encode_err("bool sequence missing fetch_function"),
-                            )
+                        let fetch = member_fetch(member).ok_or_else(|| {
+                            SealRefusal::Encode(self.encode_err(&bool_seq_no_fetch_detail(member)))
                         })?;
                         if count == 0 {
                             // `vector<bool>` is never forgeable.
@@ -2537,7 +2571,9 @@ mod cpp_package_tests {
             size_function: None,
             get_const_function: None,
             get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             assign_function: None,
             resize_function: None,
             is_rosidl_buffer_: is_rosidl_buffer,
