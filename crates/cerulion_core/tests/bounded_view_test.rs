@@ -192,6 +192,16 @@ fn a_frame_that_is_not_one_is_refused_and_serves_no_view() {
     header.write_to_buf(&mut too_short[..WireHeader::SIZE]);
     cases.push(("total_size below the header", too_short));
 
+    // A header-only frame: well-formed as a header, but with no room for the
+    // fields the schema names. The generated reader ASSERTS on a buffer this
+    // short, and an assert in a reader is a panic in a node body, so this must
+    // be a refusal and not a crash.
+    let mut header_only = good.clone();
+    let mut header = WireHeader::read_from_buf(&header_only).expect("header");
+    header.total_size = WireHeader::SIZE as u32;
+    header.write_to_buf(&mut header_only[..WireHeader::SIZE]);
+    cases.push(("header-only frame", header_only));
+
     for (label, bytes) in cases {
         let mut closure_ran = false;
         let outcome = with_committed_frame("/t/producer/out", &bytes, |committed| {
@@ -227,14 +237,69 @@ fn a_frame_that_is_not_one_is_refused_and_serves_no_view() {
     assert_eq!(served.expect("the good frame serves"), X);
 }
 
-/// A frame that carries MORE bytes than its header claims serves only the
-/// claimed ones.
+/// The reader's window is the FRAME, not the slot, and a frame whose header
+/// claims less than its schema needs is refused even when the slot has the
+/// bytes to spare.
 ///
-/// A slot is sized for the largest frame a topic can carry, so trailing bytes
-/// from a previous, longer frame are the normal case rather than a strange one.
-/// The reader must be bounded by `total_size`, not by the slot.
+/// This is the arm that can tell the two apart. A slot is sized for the largest
+/// frame a topic can carry, so trailing bytes from a previous, longer frame are
+/// the normal case; but for a FIXED schema, serving `raw[32..]` and serving
+/// `raw[32..total_size]` read the same three fields, so a tail alone proves
+/// nothing. A header claiming a payload too short for the schema does prove it:
+/// bounded by the frame the serve is refused, bounded by the slot it would read
+/// the tail and answer.
 #[test]
-fn trailing_slot_bytes_past_total_size_are_not_served() {
+fn the_readers_window_is_the_frame_and_not_the_slot() {
+    let good = commit_vector3_frame();
+
+    // The same frame in a slot with room to spare, its header claiming a
+    // payload of 8 bytes where `Vector3` needs 24. Bounded by `total_size`
+    // this is refused; bounded by the slot it would serve the tail.
+    let mut short_claim = good.clone();
+    short_claim.extend(std::iter::repeat_n(0xAB, good.len()));
+    let mut header = WireHeader::read_from_buf(&short_claim).expect("header");
+    header.total_size = (WireHeader::SIZE + 8) as u32;
+    header.write_to_buf(&mut short_claim[..WireHeader::SIZE]);
+
+    let mut closure_ran = false;
+    let outcome = with_committed_frame("/t/producer/out", &short_claim, |committed| {
+        assert!(
+            committed.len() > WireHeader::SIZE + 24,
+            "the slot really does hold enough bytes to serve a Vector3"
+        );
+        committed.serve_as::<Vector3, _>(|_view| {
+            closure_ran = true;
+        })
+    });
+    assert!(
+        outcome.is_err(),
+        "a header claiming less than the schema needs must be refused"
+    );
+    assert!(!closure_ran, "and must serve no view");
+
+    // ANTI-TAUTOLOGY: the same oversized slot with a header that MATCHES its
+    // frame serves, and serves the committed values rather than the tail.
+    let (x, y, z) = with_committed_frame(
+        "/t/producer/out",
+        &{
+            let mut padded = good.clone();
+            padded.extend(std::iter::repeat_n(0xAB, good.len()));
+            padded
+        },
+        |committed| {
+            committed
+                .serve_as::<Vector3, _>(|view| (view.x, view.y, view.z))
+                .expect("a matching header in an oversized slot serves")
+        },
+    );
+    assert_eq!(x, X, "the payload is the committed one, not the tail");
+    assert_eq!(y, Y);
+    assert_eq!(z, Z);
+}
+
+/// A frame in an oversized slot reports its OWN length, not the slot's.
+#[test]
+fn a_frame_in_an_oversized_slot_reports_its_own_length() {
     let good = commit_vector3_frame();
 
     // The same frame in a slot twice its size, the tail filled with a byte
@@ -297,4 +362,50 @@ fn the_bounded_serve_takes_only_bytes_and_a_topic() {
         &frame,
         reads_the_committed_x
     ));
+}
+
+/// A frame the wire format would never place at that address is refused, not
+/// read.
+///
+/// The generated reader reinterprets the payload bytes in place, so it ASSERTS
+/// on a misaligned start. An assert in a reader is a panic in a node body, and
+/// a node body must never panic through an accessor, so a misaligned frame is a
+/// refusal with a reason.
+///
+/// A publisher's slot is always aligned, which is why this shape only arises
+/// from a caller handing over a slice of its own; the check is what makes that
+/// a typed error rather than a crash.
+#[test]
+fn a_misaligned_frame_is_refused_rather_than_read() {
+    let good = commit_vector3_frame();
+
+    // One byte of lead-in, then the frame, so the frame starts at an odd
+    // address inside an allocation whose own start is aligned.
+    let mut shifted = vec![0u8; 1];
+    shifted.extend_from_slice(&good);
+    let frame = &shifted[1..];
+    assert_eq!(frame.len(), good.len(), "the same frame, one byte over");
+
+    if frame.as_ptr().align_offset(8) == 0 {
+        // The allocator happened to hand back a base that leaves the shifted
+        // slice aligned anyway. Refusing to assert on an accident is better
+        // than asserting on one.
+        return;
+    }
+
+    let mut closure_ran = false;
+    let outcome = with_committed_frame("/t/producer/out", frame, |committed| {
+        committed.serve_as::<Vector3, _>(|_view| {
+            closure_ran = true;
+        })
+    });
+    assert!(outcome.is_err(), "a misaligned frame must be refused");
+    assert!(!closure_ran, "and must serve no view");
+
+    // ANTI-TAUTOLOGY: the SAME bytes at an aligned start serve, so the arm
+    // above is about the address and not about the frame.
+    let served = with_committed_frame("/t/producer/out", &good, |committed| {
+        committed.serve_as::<Vector3, _>(|view| view.x)
+    });
+    assert_eq!(served.expect("the aligned frame serves"), X);
 }

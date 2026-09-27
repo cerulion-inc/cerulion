@@ -13,8 +13,13 @@
 //! publish time of the frame being read (for a held latest-value input, the
 //! held frame's original stamp, which is its freshness).
 //!
-//! The view holds the iceoryx2 sample for its entire lifetime; once the
-//! view drops, the SHM slot is released back to the publisher pool.
+//! A view built by the receive path holds the iceoryx2 sample for its entire
+//! lifetime; once the view drops, the SHM slot is released back to the
+//! publisher pool. A view built by [`super::bounded_view`] instead borrows
+//! bytes its caller already holds and owns no sample, so it releases nothing:
+//! the caller's own borrow is what keeps the slot alive. Which one a view is
+//! shows in its `SampleHandle` variant and nowhere else,
+//! which is the point, because a node reads both the same way.
 
 use std::marker::PhantomData;
 
@@ -25,9 +30,10 @@ use super::shm_sample::SampleHandle;
 
 /// Zero-copy SHM-backed receive handle.
 ///
-/// `'sample` is the lifetime of the held iceoryx2 inbound sample; the
-/// SHM slot stays alive as long as the view is alive. `T: ShmMessage`
-/// is the schema being read.
+/// `'sample` is the lifetime of whatever keeps the bytes alive: the held
+/// iceoryx2 inbound sample on the receive path, or the caller's borrow of an
+/// already-committed slot on the bounded path. Either way the bytes outlive the
+/// view. `T: ShmMessage` is the schema being read.
 ///
 /// # Send / Sync
 ///
@@ -60,8 +66,10 @@ impl<'sample, T: ShmMessage + 'sample> InputView<'sample, T> {
     /// Construct an `InputView` from an inbound sample and a reader over
     /// its payload.
     ///
-    /// Crate-private: only `CerulionSubscriber::try_view` may call this. A
-    /// node reaches the view only as `self.<input>` inside `tick`.
+    /// Crate-private, with exactly two callers: `CerulionSubscriber::try_view`
+    /// on the receive path and [`super::bounded_view::BoundedFrame::serve_as`]
+    /// on the scheduler-bounded one. A node reaches the view only as
+    /// `self.<input>` inside `tick`, and cannot tell which caller built it.
     ///
     /// The caller is responsible for validating that the sample's
     /// WireHeader's `schema_hash` matches `T::SCHEMA_HASH`. Mismatch
@@ -97,9 +105,10 @@ impl<'sample, T: ShmMessage + 'sample> InputView<'sample, T> {
     ///
     /// # Infallibility (why the impossible arm does not panic)
     ///
-    /// A view is constructed ONLY by `CerulionSubscriber::try_view`'s
-    /// `build_inbound_view`, which validates the header (and its 32-byte
-    /// length) BEFORE the view exists; the held-replay path serves that same
+    /// Every view is constructed behind `validate_wire_frame`, which parses
+    /// the header and bounds the payload BEFORE the view exists: on the receive
+    /// path through `build_inbound_view`, on the scheduler-bounded path through
+    /// `BoundedFrame::serve_as`, and the held-replay path serves that same
     /// already-validated frame. So `read_from_buf` cannot return `None` in
     /// practice. On the by-construction-impossible short-frame arm we do NOT
     /// silently fabricate a header: a `debug_assert!` fires loudly in dev and
@@ -211,6 +220,50 @@ pub(crate) fn validate_wire_frame<T: ShmMessage>(
                 total_size,
                 raw.len(),
                 WireHeader::SIZE,
+            ),
+        });
+    }
+    // The reader `T::build_reader` returns REINTERPRETS the payload bytes, so
+    // it ASSERTS on a buffer too small for the fixed section and on one whose
+    // start is misaligned. An assert in a reader is a panic in a node body,
+    // and a node body must never panic through an accessor, so both conditions
+    // are refused HERE with a reason instead.
+    //
+    // A frame a publisher wrote always satisfies both, which is why the frames
+    // in front of these checks are the malformed ones: a header claiming a
+    // `total_size` with no room for the fields it names, and a slice a caller
+    // handed over at an address the wire format does not put frames at.
+    let required = crate::wire::frame_prefix_size(T::WIRE_FIXED_SIZE, T::VARIABLE_FIELD_COUNT)
+        .ok_or_else(|| TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "schema fixed size {} with {} variable field(s) overflows a wire frame",
+                T::WIRE_FIXED_SIZE,
+                T::VARIABLE_FIELD_COUNT,
+            ),
+        })?;
+    if total_size < required {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "wire header total_size {total_size} leaves no room for the schema: a {} \
+                 byte fixed section plus {} offset table entry/entries needs {required}",
+                T::WIRE_FIXED_SIZE,
+                T::VARIABLE_FIELD_COUNT,
+            ),
+        });
+    }
+    // 8 is the wire format's own alignment: [`WireHeader`] is
+    // `#[repr(C, align(8))]`, the header is exactly 32 bytes so a payload
+    // starts 8-aligned whenever the frame does, and 8 bytes is the widest
+    // primitive a generated fixed section holds.
+    const WIRE_ALIGN: usize = 8;
+    if raw.as_ptr().align_offset(WIRE_ALIGN) != 0 {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "frame is not {WIRE_ALIGN}-byte aligned, which the wire format requires \
+                 and a zero-copy reader cannot work around"
             ),
         });
     }
