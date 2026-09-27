@@ -1383,8 +1383,11 @@ jobs:
       # builds every fixture — drift-proof, unlike the prior enumerated `-p`
       # list (which had gone stale: a deleted crate + two missing ones). Same
       # spirit as the default-cover test model below.
+      # `--locked` keeps the lockfile check the removed `cargo fetch --locked` step
+      # used to provide: a dependency edit committed without a regenerated
+      # `Cargo.lock` fails here instead of being repaired silently in the job.
       - name: Build test cdylibs
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
 
       # The whole-workspace build is the job's single biggest disk
       # consumer and was the one point between the reclaim and the wan step with
