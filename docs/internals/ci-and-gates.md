@@ -379,10 +379,12 @@ shards 1-3 restore only; the macOS job's shard 0 saves and shards 1-2 restore, f
 reason. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
 
-`test-linux` does not build the `cerulion_core` test binaries four times: `test-archive`
-builds them once with `cargo nextest archive`, uploads the archive as a run-scoped
-artifact with its `sha256` as a job output, and each shard downloads it, verifies the hash
-before extracting, and RUNS the archive rather than compiling one.
+Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the shard step
+compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
+what it built. `test-archive` still builds the whole set once with `cargo nextest archive`
+and uploads it as a run-scoped artifact with its `sha256` as a job output, but no job
+downloads it; the job stays only because `Test archive (Linux, build once)` is a required
+check on `main`.
 
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`

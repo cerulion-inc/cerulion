@@ -1366,13 +1366,6 @@ jobs:
   test-linux:
     name: Test (Linux) shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # `test-archive` builds the `cerulion_core` test binaries this job RUNS — see
-    # the block above it for the measurement that motivated it.
-    #
-    # There is no third job to wait on: `test-archive` uploads the artifact
-    # itself, in that same job, so by the time it reports success the archive is
-    # ready and these shards start immediately.
-    #
     # NO `needs:` AT ALL, for this measurement. These shards BUILD the
     # `cerulion_core` test binaries they run instead of downloading the
     # archive, so `test-archive` stops being a data dependency and the shards
