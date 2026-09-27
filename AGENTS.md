@@ -83,9 +83,9 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`). Detail: `docs/i
   id in the name (it goes in the PR body); gated by `tools/scripts/check_pr_title.sh`.
 - PR titles: `<type>(<scope>)!: <description>`. PRs are SQUASH-merged, so the title becomes
   the commit message. Commit bodies carry the WHY.
-- PR bodies are self-contained: summary, what changed, how to test (copy-pasteable
-  commands), actual test output. Keep diffs reviewable (~800 lines; split above).
-  Self-review first; call out breaking changes with migration steps.
+- PR bodies follow the PR template: outsiders read them, <=40 lines, no pasted output,
+  no checkpoint tables, no questions. Keep diffs reviewable (~800 lines; split above).
+  Self-review first; breaking changes get migration steps.
 - Stacked PRs (B depends on unmerged A): base B on A's branch; merge in dependency
   order. GitHub retargets dependents when a merged base is deleted; a rename closes them.
 - Plan gate: read the issue in full, check dependencies (an unlanded one => confirm the
