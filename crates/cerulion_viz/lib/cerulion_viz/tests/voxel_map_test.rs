@@ -2,7 +2,9 @@
 //! The live voxel map codec (`cerulion_viz::voxel_map`): the field-layout
 //! probe, the frame decoder over both `fields` framings, the seven ops, the
 //! epoch rules, determinism, the static entity tree the viewer receives, the
-//! wall geometry, the colour ramp and the trail. Every oracle is hand-written.
+//! wall geometry, the colour ramp and the trail; then the sink's side of it:
+//! the classification rung, the no-coalesce rule, and the PNG `CompressedImage`
+//! path a floor plan rides on. Every oracle is hand-written.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,13 +15,17 @@ use cerulion_core::shm_runtime::write_offset_entry;
 use cerulion_core::wire::WireHeader;
 use cerulion_viz::pointcloud::PointFieldDesc;
 use cerulion_viz::schema_registry::builtin_walker;
+use cerulion_viz::sink::{
+    classify_frame, coalesces, dispatch_frame, dispatch_or_stage, route_for_input, ArchetypeKind,
+    SinkState,
+};
 use cerulion_viz::voxel_map::{
     decode_ops, decode_voxel_message, execute, height_rgb, tile_of, tile_segment,
     voxel_delta_layout, voxel_layout_of, wall_cells, wall_geometry, LogAction, VoxelDeltaLayout,
     VoxelMapState, VoxelMessage, VoxelOp, BLUE_RGB, CERULEAN_RGB, EMBER_RGB, FLOOR_RGB, OP_CLEAR,
     OP_END_TILE, OP_FLOOR, OP_RESET, OP_ROBOT, OP_SET, OP_TILE, TRAIL_MAX_POINTS,
 };
-use native_ros2_messages::sensor_msgs::PointCloud2;
+use native_ros2_messages::sensor_msgs::{CompressedImage, PointCloud2};
 
 // ---- Frame builders ---------------------------------------------------------
 
@@ -210,6 +216,7 @@ fn message(ops: &[[u8; 8]]) -> VoxelMessage {
     }
 }
 
+const TOPIC: &str = "/go2/map_view/voxels";
 const ROOT: &str = "world/go2/map_view/voxels";
 const SECOND: u64 = 1_000_000_000;
 
@@ -426,7 +433,7 @@ fn the_probe_accepts_exactly_the_voxel_layout() {
 }
 
 #[test]
-fn a_voxel_frame_decodes_in_either_field_framing() {
+fn a_voxel_frame_classifies_as_voxel_map_in_either_field_framing() {
     let walker = builtin_walker();
     let ops = [floor(1, 0), set(1, 2, 3), robot(1, 2)];
     for (framing, blob) in [
@@ -447,6 +454,7 @@ fn a_voxel_frame_decodes_in_either_field_framing() {
             Some(VoxelDeltaLayout { edge_mm: 50 }),
             "{framing}"
         );
+        assert_eq!(classify_frame(&fv), ArchetypeKind::VoxelMap, "{framing}");
         let msg = decode_voxel_message(&fv).expect("decodes");
         assert_eq!(msg.edge_mm, 50, "{framing}");
         assert_eq!(msg.trailing_bytes, 0, "{framing}");
@@ -473,17 +481,64 @@ fn a_voxel_frame_decodes_in_either_field_framing() {
             "{framing}"
         );
     }
-    // A near miss is not a voxel stream: the NAME row answers.
+    // A near miss stays a point cloud: the NAME row answers.
     let mut near = voxel_fields(50);
     near[2].0 = "vz_40mm".to_string();
     let frame = cloud_frame(&canonical_fields(&near), 8, &ops, "odom", 1_000);
     let fv = walker.walk_by_hash(&frame).expect("walk");
     assert_eq!(voxel_layout_of(&fv), None);
     assert_eq!(decode_voxel_message(&fv), None);
+    assert_eq!(classify_frame(&fv), ArchetypeKind::Points3D);
     // Nor is any other schema, whatever its fields say.
     let mut other = walker.walk_by_hash(&frame).expect("walk");
     other.schema_name = "sensor_msgs/PointCloud".to_string();
     assert_eq!(voxel_layout_of(&other), None);
+}
+
+#[test]
+fn voxel_map_is_not_coalesced_so_a_clear_in_a_batch_survives() {
+    assert!(!coalesces(ArchetypeKind::VoxelMap));
+    // Behaviour: two frames drained in ONE tick both apply. Coalescing would
+    // keep only the second, and the first frame's CLEAR would be lost.
+    let walker = builtin_walker();
+    let mut state = SinkState::new();
+    let (rec, _storage) = memory();
+    dispatch_frame(
+        &rec,
+        &walker,
+        TOPIC,
+        &voxel_frame(
+            &[floor(1, 0), set(1, 1, 5), set(2, 2, 5), robot(0, 0)],
+            SECOND,
+        ),
+        &mut state,
+    );
+    let batch = vec![
+        voxel_frame(
+            &[floor(1, 0), op(1, 1, 5, 0, OP_CLEAR), robot(0, 0)],
+            2 * SECOND,
+        ),
+        voxel_frame(&[floor(1, 0), set(3, 3, 5), robot(0, 0)], 2 * SECOND + 1),
+    ];
+    let mut staged = None;
+    let mut coalesced = 0;
+    for f in batch {
+        dispatch_or_stage(
+            &rec,
+            &walker,
+            TOPIC,
+            f,
+            &mut state,
+            &mut staged,
+            &mut coalesced,
+        );
+    }
+    assert!(staged.is_none(), "a voxel frame is never staged");
+    assert_eq!(coalesced, 0);
+    let map = state.voxel_map(TOPIC).expect("state");
+    assert!(!map.contains(1, 1, 5), "the first frame's CLEAR applied");
+    assert!(map.contains(2, 2, 5) && map.contains(3, 3, 5));
+    assert_eq!(map.visible_count(), 2);
 }
 
 // ---- 2. Ops, epochs, determinism --------------------------------------------
@@ -996,4 +1051,60 @@ fn the_trail_steps_every_10_cm_and_keeps_the_newest_5000_points() {
         panic!("no trail drawn: {a:?}");
     };
     assert!((points[0][2] - 0.07).abs() < 1e-6);
+}
+
+// ---- 5. PNG floor plan on the existing EncodedImage path --------------------
+
+/// A valid 1 x 1 RGBA PNG.
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+/// The map node's floor plan is a PNG `sensor_msgs/CompressedImage`; it rides
+/// the existing `EncodedImage` path and must never fall to a text dump.
+#[test]
+fn a_png_compressed_image_is_logged_as_an_encoded_image() {
+    let layout = layout_of("sensor_msgs/CompressedImage");
+    let fixed = layout.fixed_size;
+    let table = layout.offset_table_bytes();
+    let format = b"png";
+    let mut payload = vec![0u8; fixed + table];
+    let format_off = (fixed + table) as u32;
+    let data_off = format_off + format.len() as u32;
+    write_offset_entry(&mut payload, fixed, 0, 0, 0);
+    write_offset_entry(&mut payload, fixed, 1, format_off, format.len() as u32);
+    write_offset_entry(&mut payload, fixed, 2, data_off, PNG_1X1.len() as u32);
+    payload.extend_from_slice(format);
+    payload.extend_from_slice(PNG_1X1);
+    let mut frame = vec![0u8; WireHeader::SIZE];
+    WireHeader {
+        schema_hash: <CompressedImage as ShmMessage>::SCHEMA_HASH,
+        total_size: (WireHeader::SIZE + payload.len()) as u32,
+        offset_table_offset: (WireHeader::SIZE + fixed) as u32,
+        offset_table_count: 3,
+        sequence: 0,
+        timestamp_ns: 5_000,
+    }
+    .write_to_buf(&mut frame);
+    frame.extend_from_slice(&payload);
+
+    let walker = builtin_walker();
+    let fv = walker.walk_by_hash(&frame).expect("walk");
+    assert_eq!(classify_frame(&fv), ArchetypeKind::Image);
+    let mut state = SinkState::new();
+    let (rec, storage) = memory();
+    let topic = "/go2/map_view/plan";
+    dispatch_frame(&rec, &walker, topic, &frame, &mut state);
+    let r = rendered(&chunks(&rec, &storage));
+    let entity = route_for_input(topic).entity;
+    let (families, _) = &r[&entity];
+    assert!(families.contains("EncodedImage"), "{families:?}");
+    assert!(
+        !r.values().any(|(f, _)| f.contains("TextDocument")),
+        "a PNG plan must never become a text dump: {r:?}"
+    );
 }

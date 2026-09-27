@@ -242,6 +242,58 @@ lockstep with the rest of the `re_*` graph).
   objects, so the sink renders what decodes and reports the rest, unlike the
   all-or-nothing rule for a single message's fields.
 
+### Voxel map (live map delta stream)
+
+A `sensor_msgs/PointCloud2` whose fields are exactly `vx_<N>mm`, `vy_<N>mm`,
+`vz_<N>mm` (`int16` at 0/2/4, one `N` from 1 to 1000), `hits` (`uint8` at 6)
+and `op` (`uint8` at 7), with `point_step` 8, is a VOXEL-DELTA stream, not a
+cloud: `ArchetypeKind::VoxelMap` (wire name `VoxelMap`). The Go2 demo's map
+node, which lives outside this repository, sends one; the desk builds the
+whole 3D world from it, so only voxel indices cross the robot link.
+
+- **Classification** (`voxel_map::voxel_layout_of`, over
+  `voxel_map::voxel_delta_layout`) is a CONTENT rung ahead of the H.264 rung
+  and the name table, so it outranks `PointCloud2 -> Points3D`. It reads the
+  declared descriptors from either `fields` framing (the walker's decoded
+  canonical elements, or the packed records), never the point_step inference.
+  Evaluated per frame outside the memo, like the video rung; one producer's
+  layout is fixed, so a topic cannot flip kinds. The daemon reports the kind
+  wherever it reports one (`attach`, `status`, `list`; pinned by
+  `vizd_e2e_test.rs`'s `a_voxel_delta_topic_reports_the_voxel_map_archetype_e2e`).
+- **Ops** (`voxel_map` module docs have the table): `SET`, `CLEAR`, `TILE` (empty a
+  32 x 32-column tile; its `SET`s follow), `RESET` (new epoch), `ROBOT` (trail),
+  `FLOOR` (epoch + floor layer; an epoch the state does not hold is a lost
+  `RESET` and is healed as one), `END_TILE`. Every op is idempotent. NOT
+  coalesced (`coalesces_exact_set_oracle`,
+  `voxel_map_is_not_coalesced_so_a_clear_in_a_batch_survives`): a dropped
+  frame may carry the only `CLEAR`.
+- **State** (`VoxelMapState`, per input in `SinkState`): the visible set by tile,
+  epoch, floor layer, trail, and which entities the viewer holds. `apply` is
+  pure and returns the log calls (`LogAction`); render cadence gates read WIRE
+  stamps only (cubes at most every 450 ms, surfaces every 950 ms: the producer
+  ticks at 500 ms and the slack absorbs its jitter), so two replays of a recording
+  make identical calls (`two_replays_of_the_same_frames_give_identical_log_calls`).
+- **Drawing**, all `log_static` under the topic entity `E`:
+  `E/viz-cubes/t_<tx+32768>_<ty+32768>` (`VoxelGridMap`, tile origin in
+  `translation`, indices relative to it, height ramp in the Cerulion design
+  system colours), `E/viz-walls/t_*` (`Mesh3D`: cells of 2 x 2 voxel columns
+  with at least 3 voxels 0.10 to 1.80 m above the floor, extruded from the floor
+  top to the highest voxel up to 2.5 m, flat outward normals so the viewer
+  lights them), `E/viz-edges/t_*` (`LineStrips3D` top outlines of walls at least
+  1 m tall) and `E/viz-trail` (a point per 10 cm, the newest 5 000). A new
+  epoch is ONE recursive static `Clear` at `E`; an emptied entity gets a flat
+  static `Clear`. A static write replaces the older static chunk in the viewer's
+  store, so memory follows the map size, not the run time.
+- **Frames**: each drawn entity gets a STATIC `CoordinateFrame` from the
+  message's `frame_id` (resolved like any data topic), logged once per entity and
+  again after a `Clear` (a `Clear` shadows it too). A pose-bound model in the same
+  frame and the map therefore cannot separate.
+- **Reconnect**: `SinkState::clear_rebroadcast_dedup` re-arms every map, so the
+  next frame redraws every tile, the trail and their frames on the fresh server.
+- **Not drawn by rerun 0.34**: glow (line colour alpha is unused by the line
+  renderer; only the view's line grid honours alpha), so the look is bright,
+  thin lines on the dark stage.
+
 ### Entity paths
 
 - House rule: sanitize-then-plain-string. Entity strings are a contract with
@@ -416,6 +468,7 @@ reverse-dependency probes that fail loudly if the probe itself goes stale.
 | `video_decode_test.rs` | desk-side H.264 decode + latest-frame presentation | CI re-runs it serial | none |
 | `video_h264_test.rs` | H.264 classification, SPS-keyed rendition demux, keyframe gate, VideoStream arm | no | none |
 | `video_layout_test.rs` | an interleaved H.264 topic gets ONE spatial2d view (its default rendition) in both layout producers | no | none |
+| `voxel_map_test.rs` | voxel-delta classifier and sink rung, the seven ops, lost-RESET healing, deterministic replay, the static entity tree, wall mesh counts and normals, colour ramp, trail, the no-coalesce rule, PNG `CompressedImage` as `EncodedImage` | no | none |
 
 Roughly half the lane's tests live in the lib's own `#[cfg(test)]` modules
 (the same modules that DEFINE the crate's process-globals) and confine

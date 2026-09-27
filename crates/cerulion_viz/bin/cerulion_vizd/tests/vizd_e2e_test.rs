@@ -10660,6 +10660,151 @@ fn a_paced_stream_reports_exactly_zero_pre_decode_loss() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// The live voxel map: a voxel-delta PointCloud2 topic is classified by its
+// FIELD LAYOUT, so every reporter names it `VoxelMap`, never `Points3D`.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A `sensor_msgs/PointCloud2` voxel-delta frame (5 cm, packed `fields`, frame
+/// `odom`) carrying `FLOOR`, one `SET` and `ROBOT`.
+fn voxel_delta_frame() -> Vec<u8> {
+    use cerulion_core::codegen::layout::LayoutResolver;
+    use native_ros2_messages::sensor_msgs::PointCloud2;
+    let schemas: Vec<MessageSchema> = native_ros2_messages::BUILTIN_MSGS
+        .iter()
+        .filter_map(|(pkg, name, text)| parse_rosmsg(text, name, Some(pkg)).ok())
+        .collect();
+    let (mut resolver, _) = LayoutResolver::new(schemas);
+    let layout = resolver
+        .layout_of("sensor_msgs/PointCloud2")
+        .expect("PointCloud2 layout");
+    let header = resolver
+        .layout_of("std_msgs/Header")
+        .expect("Header layout");
+    let fixed_off = |name: &str| {
+        layout
+            .fixed_fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("PointCloud2 has no fixed field '{name}'"))
+            .offset
+    };
+    // Packed `fields`: name_len, name, offset, datatype, count.
+    let mut fields = Vec::new();
+    for (name, offset, datatype) in [
+        ("vx_50mm", 0u32, 3u8),
+        ("vy_50mm", 2, 3),
+        ("vz_50mm", 4, 3),
+        ("hits", 6, 2),
+        ("op", 7, 2),
+    ] {
+        fields.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        fields.extend_from_slice(name.as_bytes());
+        fields.extend_from_slice(&offset.to_le_bytes());
+        fields.push(datatype);
+        fields.extend_from_slice(&1u32.to_le_bytes());
+    }
+    // `header.frame_id` = "odom".
+    let head = header.fixed_size + header.offset_table_bytes();
+    let mut header_blob = vec![0u8; head];
+    write_offset_entry(&mut header_blob, header.fixed_size, 0, head as u32, 4);
+    header_blob.extend_from_slice(b"odom");
+    // FLOOR (epoch 1, layer 0), SET (3, 4, 5), ROBOT (0, 0, 6).
+    let mut data = Vec::new();
+    for (x, y, z, op) in [(1i16, 0i16, 0i16, 5u8), (3, 4, 5, 0), (0, 0, 6, 4)] {
+        data.extend_from_slice(&x.to_le_bytes());
+        data.extend_from_slice(&y.to_le_bytes());
+        data.extend_from_slice(&z.to_le_bytes());
+        data.push(1);
+        data.push(op);
+    }
+    let fixed = layout.fixed_size;
+    let table = layout.offset_table_bytes();
+    let mut payload = vec![0u8; fixed + table];
+    for (name, v) in [
+        ("height", 1u32),
+        ("width", 3),
+        ("point_step", 8),
+        ("row_step", 24),
+    ] {
+        payload[fixed_off(name)..fixed_off(name) + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let header_off = (fixed + table) as u32;
+    let fields_off = header_off + header_blob.len() as u32;
+    let data_off = fields_off + fields.len() as u32;
+    write_offset_entry(&mut payload, fixed, 0, header_off, header_blob.len() as u32);
+    write_offset_entry(&mut payload, fixed, 1, fields_off, fields.len() as u32);
+    write_offset_entry(&mut payload, fixed, 2, data_off, data.len() as u32);
+    payload.extend_from_slice(&header_blob);
+    payload.extend_from_slice(&fields);
+    payload.extend_from_slice(&data);
+    let mut frame = vec![0u8; WireHeader::SIZE];
+    WireHeader {
+        schema_hash: <PointCloud2 as ShmMessage>::SCHEMA_HASH,
+        total_size: (WireHeader::SIZE + payload.len()) as u32,
+        offset_table_offset: (WireHeader::SIZE + fixed) as u32,
+        offset_table_count: 3,
+        sequence: 0,
+        timestamp_ns: 42_000,
+    }
+    .write_to_buf(&mut frame);
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+#[test]
+fn a_voxel_delta_topic_reports_the_voxel_map_archetype_e2e() {
+    let _statics = blueprint_statics_guard();
+    let mgr = isolated_transport("voxelmap");
+    let topic = "/vizd/voxels";
+    let _publisher = Publisher::spawn_fixed_frame(Arc::clone(&mgr), topic, voxel_delta_frame());
+    let (worker, _flush, _storage) = memory_worker("voxelmap");
+    let (socket, dir) = temp_socket("voxelmap");
+    let mut daemon: RunningDaemon = start_hermetic(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        Arc::clone(&mgr),
+        worker,
+        builtin_walker(),
+        None,
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+
+    let att = client.request(&format!(
+        r#"{{"id":1,"method":"attach","topic":"{topic}"}}"#
+    ));
+    assert_eq!(att["ok"].as_bool(), Some(true), "attach: {att}");
+    assert_eq!(
+        att["archetype"].as_str(),
+        Some("VoxelMap"),
+        "the field layout outranks the PointCloud2 name row: {att}"
+    );
+    let entity = att["entity"].as_str().expect("entity").to_string();
+    assert_eq!(entity, "world/vizd/voxels");
+
+    let status_row = |client: &mut Client, id: u64| -> Option<Value> {
+        let st = client.request(&format!(r#"{{"id":{id},"method":"status"}}"#));
+        entry_for(&st["topics"], "topic", topic).cloned()
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            status_row(&mut client, 2).is_some_and(|r| r["archetype"].as_str() == Some("VoxelMap"))
+        }),
+        "the status row names the archetype: {:?}",
+        status_row(&mut client, 3)
+    );
+    let row = status_row(&mut client, 4).expect("row");
+    assert_eq!(row["entity"].as_str(), Some(entity.as_str()), "{row}");
+    assert_eq!(
+        row["view_kinds"],
+        serde_json::json!(["spatial3d"]),
+        "a voxel map renders in ONE 3D view and never dumps: {row}"
+    );
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // The dump companion is refused on a LIVE signal, and COMES BACK when
 // a degradation fires — over the real daemon, the real worker and real frames.
 //
