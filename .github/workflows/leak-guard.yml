@@ -352,6 +352,12 @@ jobs:
             issues) label=issue-body ;;
             *) label=comment-body ;;
           esac
+          # Which KINDS of finding fired, so the ask describes the defect the
+          # author actually has. The scan catches every class on this surface,
+          # not only references, and a home path told to mind its number signs
+          # is a guard nobody listens to. Class ids only: no values.
+          classes="${RUNNER_TEMP:-/tmp}/leak-guard-classes.txt"
+          : > "$classes"
           rc=0
           if [ "${ACTION:-}" = deleted ]; then
             # The text is gone, so there is nothing to scan and nothing to ask
@@ -361,7 +367,8 @@ jobs:
             echo "the body was deleted; treating it as clean"
           else
             python3 -B tools/scripts/leak_scan.py messages --require-private --format github \
-              --skip-code --body-env LG_BODY --body-label "$label" || rc=$?
+              --skip-code --body-env LG_BODY --body-label "$label" \
+              --hard-classes-file "$classes" || rc=$?
           fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
 
@@ -400,6 +407,12 @@ jobs:
           # so one body is asked once however often it is rescanned, and an edit
           # that leaves the reference in place is a new ask.
           asks="${RUNNER_TEMP:-/tmp}/leak-guard-asks.txt"
+          # Written by the scan step above, which runs in its own shell, so the
+          # path is spelled again here rather than inherited. A missing file means
+          # no class was recorded, and the ask falls back to saying only that
+          # something was found.
+          classes="${RUNNER_TEMP:-/tmp}/leak-guard-classes.txt"
+          [ -f "$classes" ] || : > "$classes"
           scope=${COMMENT_ID:-body}
           digest=$(printf '%s' "$LG_BODY" | sha256sum | cut -c1-16)
           prefix="<!--leak-guard:$EVENT_NAME:$scope:"
@@ -460,6 +473,19 @@ jobs:
               exit 1
             fi
             read_asks
+            # A status line says what the forge REPLIED, not what is true. The
+            # asks for this surface are read back, and if one is still listed the
+            # delete did not take effect whatever it answered, so the label stays
+            # and the run goes red. Absence is confirmed, never inferred.
+            while read -r id found; do
+              case "${found:-}" in
+                "$prefix"*) stuck=1 ;;
+              esac
+            done < "$asks"
+            if [ "$stuck" = 1 ]; then
+              echo "::error ::an ask is still listed after being deleted; the leak label is left as it is"
+              exit 1
+            fi
             if [ "$(others_outstanding)" = 1 ]; then
               echo "clean here, but another body on this thread still has an outstanding ask"
               exit 0
@@ -491,8 +517,29 @@ jobs:
           if [ "$asked" = 1 ]; then
             echo "already asked about this body"
           else
-            printf '%s\n\n%s\n' \
-              "This text points at a repository or a tracker that people outside this project cannot open. Please edit the reference out, or replace it with a link anyone can follow, so that everyone reading can get to what it names. If it is not a repository reference at all, a space before the number sign is enough: \`name #8\` reads as prose, \`name#8\` reads as a repository. The reference itself is not printed anywhere by this check." \
+            # The ask is assembled from the classes that fired. A body can carry
+            # both kinds at once, and then it gets both sentences.
+            refs=no; others=no
+            while read -r c; do
+              case "$c" in
+                ref-unopenable|ref-unverified) refs=yes ;;
+                '') ;;
+                *) others=yes ;;
+              esac
+            done < "$classes"
+            msg=""
+            if [ "$others" = yes ]; then
+              msg="This text carries a value that should not be public, such as a machine name, an address, a home path or a personal detail. Please edit it out."
+            fi
+            if [ "$refs" = yes ]; then
+              ref_msg="This text points at a repository or a tracker that people outside this project cannot open. Please edit the reference out, or replace it with a link anyone can follow, so that everyone reading can get to what it names. If it is not a repository reference at all, a space before the number sign is enough: \`name #8\` reads as prose, \`name#8\` reads as a repository."
+              if [ -n "$msg" ]; then msg="$msg"$'\n\n'"$ref_msg"; else msg="$ref_msg"; fi
+            fi
+            if [ -z "$msg" ]; then
+              msg="This text carries something that should not be public. Please edit it out."
+            fi
+            printf '%s\n\n%s\n\n%s\n' "$msg" \
+              "Nothing that was found is printed anywhere by this check." \
               "$marker" | gh api "repos/$REPO/issues/$NUMBER/comments" -F body=@- >/dev/null
           fi
           gh api "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=leak" >/dev/null

@@ -846,11 +846,13 @@ class RefScan(object):
         self.require = require
 
     def matches(self, text):
-        """Every finding as (start, end, class id) over `text`, for masking a
+        """EVERY occurrence as (start, end, class id) over `text`, for masking a
         reference that sits inside a file or directory NAME. The span covers the
         whole matched reference, so nothing of a closed slug survives in a
-        printed location."""
-        return [(s, e, cid) for cid, _, s, e in self._scan(text)]
+        printed location. Deliberately not deduplicated: one finding per token is
+        right for a report, and wrong for masking, because a name that carries
+        the same slug twice would have kept the second copy in clear."""
+        return [(s, e, cid) for cid, _, s, e in self._scan(text, dedupe=False)]
 
     def _repo(self, owner, repo):
         """(class, token) for one resolved repository, or None when a stranger
@@ -872,13 +874,14 @@ class RefScan(object):
         distinct token."""
         return [(cid, token) for cid, token, _, _ in self._scan(line)]
 
-    def _scan(self, line):
+    def _scan(self, line, dedupe=True):
         out, seen = [], set()
 
         def take(cid, token, m):
-            if token.lower() not in seen:
-                seen.add(token.lower())
-                out.append((cid, token, m.start(), m.end()))
+            if dedupe and token.lower() in seen:
+                return
+            seen.add(token.lower())
+            out.append((cid, token, m.start(), m.end()))
 
         for m in self.tracker_rx.finditer(line):
             take(REF_DEFECT, m.group(1), m)
@@ -2816,7 +2819,6 @@ def build_parser():
         p.add_argument('--allow-empty', action='store_true')
         p.add_argument('--quiet', action='store_true')
         p.add_argument('--offline', action='store_true')
-        p.add_argument('--skip-code', action='store_true')
         p.add_argument('--self-repo')
 
     t = sub.add_parser('tree', allow_abbrev=False)
@@ -2838,6 +2840,12 @@ def build_parser():
     m.add_argument('--pr-body-file')
     m.add_argument('--body-env')
     m.add_argument('--body-label', default='body')
+    # Conversation surfaces only, and so on the messages parser only: a tree,
+    # diff, names or hook run that accepted this flag would quietly stop reading
+    # references inside code, which is the opposite of what those modes are for.
+    # Spelling it anywhere else is a usage error rather than a silent no-op.
+    m.add_argument('--skip-code', action='store_true')
+    m.add_argument('--hard-classes-file')
     m.add_argument('--allow-email-file')
     m.add_argument('--ident-from-git', action='store_true')
     m.add_argument('--require-commits', action='store_true')
@@ -2933,6 +2941,18 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
         out('leak_scan %s: NO RUN, zero units scanned' % args.mode)
         return EXIT_NORUN
     hard, report = sc.emit_hits()
+    if getattr(args, 'hard_classes_file', None):
+        # The distinct HARD class IDS, nothing else: no values, no locations, no
+        # counts. A caller that has to choose what to say to an author needs to
+        # know WHICH kind of finding fired, and reading that off a summary line
+        # meant for a human is how a remediation message ends up describing the
+        # wrong defect.
+        try:
+            with open(args.hard_classes_file, 'w', encoding='utf-8') as fh:
+                fh.write(''.join(c + '\n' for c in sorted(
+                    set(h.cls for h in sc.hits if h.sev == 'HARD'))))
+        except OSError:
+            raise NoRun('the hard-classes file could not be written')
     problems = []
     if full_mode:
         problems, notes = check_allow_usage(sc, sc.all_paths, private is not None)
@@ -3107,7 +3127,7 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 222
+EXPECTED_ARMS = 226
 
 
 def _png(chunks):
@@ -4534,6 +4554,47 @@ def self_test(out, base_env, argv0):
             str(sorted(every)))
         arm('ref-with-skip-code-only-the-followable-reference-is-a-finding',
             rc2 == EXIT_HIT and kept == {(REF_DEFECT, 1)}, str(sorted(kept)))
+        # Masking needs EVERY occurrence. A name carrying the same slug twice
+        # would otherwise keep the second copy in clear, right beside a masked
+        # first one, which is the worst possible half measure.
+        # Comma separated: a hyphen before the second one would put it inside the
+        # left boundary of the first and there would be nothing to find twice.
+        twice = RO + '/' + R_GONE + '#1,' + RO + '/' + R_GONE + '#1.md'
+        off2 = RefScan(RefResolver(offline=True), RO, R_SELF)
+        sc_tw = Scanner('names', build_classes(), None, [], lambda s: None, fmt='github',
+                        refs=RefScan(RefResolver(fetch=canned), RO, R_SELF))
+        arm('ref-every-occurrence-is-masked-not-only-the-first',
+            len(off2.matches(twice)) == 2 and len(off2.findings(twice)) == 1
+            and R_GONE not in sc_tw.redact_path(twice)
+            and sc_tw.redact_path(twice).endswith('.md'),
+            '%d matches, path=%s' % (len(off2.matches(twice)), sc_tw.redact_path(twice)))
+        # ... and one finding per distinct token stays one finding
+        same = RO + '/' + R_GONE + '#1 and ' + RO + '/' + R_GONE + '#1 again'
+        distinct = RO + '/' + R_GONE + '#1,' + RO + '/' + R_GONE + '#2'
+        arm('ref-a-repeated-token-is-still-one-finding-and-two-spans',
+            len(off2.findings(same)) == 1 and len(off2.matches(same)) == 2
+            and len(off2.findings(distinct)) == 2 and len(off2.matches(distinct)) == 2,
+            '%d findings %d spans' % (len(off2.findings(same)), len(off2.matches(same))))
+        arm('ref-skip-code-is-a-usage-error-outside-the-conversation-surface',
+            run(['tree', '--skip-code', '--no-allow'], refenv, repo_ref)[0] == EXIT_USAGE
+            and run(['names', '--skip-code', '--no-allow'], refenv, repo_ref)[0] == EXIT_USAGE
+            and run(['diff', '--staged', '--skip-code', '--no-allow'],
+                    refenv, repo_ref)[0] == EXIT_USAGE)
+        hcf = os.path.join(tmp, 'hard-classes')
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--skip-code', '--hard-classes-file', hcf, '--no-allow'] + mine,
+                        dict(refenv, LG_BODY='a ' + P_MAC + PLAIN_USER + '/x\nb '
+                             + RO + '/' + R_GONE + '#9\n'), repo_ref)
+        try:
+            with open(hcf) as fh:
+                body = fh.read()
+        except OSError:
+            body = None
+        fired = set(l.strip() for l in (body or '').split('\n') if l.strip())
+        arm('ref-the-hard-classes-file-names-the-kinds-that-fired-and-no-values',
+            rc == EXIT_HIT and body is not None and fired == {'home-mac', REF_DEFECT}
+            and PLAIN_USER not in body and R_GONE not in body,
+            'written=%s fired=%s' % (body is not None, sorted(fired)))
         # The code-span exemption is the REFERENCE classes' alone. A host, a
         # login, an address or a private-tier name is as visible to a reader in
         # backticks as in prose, so every other class still reads the body whole.
