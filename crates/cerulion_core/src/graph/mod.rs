@@ -24,6 +24,7 @@
 //! 2. Bridge received data to `scheduler.signal_data()`
 //! 3. Call `scheduler.step(delta)` to evaluate triggers and fire nodes
 
+pub mod chain;
 pub mod config;
 pub mod drain_latch;
 pub mod node;
@@ -43,6 +44,10 @@ pub mod validation;
 // seam stays gated (the firewall-proof harness); the reactor itself ships.
 pub(crate) mod waitset;
 
+pub use chain::{
+    census_chains, ChainBar, ChainCensus, Colocation, ConsumerEdgeVerdict, ConsumerFireClass,
+    FusedChain, MAX_FUSED_CHAIN_NODES,
+};
 pub use config::{
     GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef, UNNAMED_GRAPH,
 };

@@ -95,13 +95,86 @@ env:
   PINNED_NIGHTLY: nightly-2026-04-07
 
 jobs:
+  # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
+  # that care. Two runner-seconds of work plus a checkout.
+  #
+  # Only `deb-smoke` reads it today, and only to RUN ITSELF on a pull request it
+  # would otherwise skip. Nothing in this file uses a class to SKIP a job that
+  # would otherwise run, which is the direction that could weaken a gate: the
+  # rules live in `tools/scripts/ci_changed_paths.sh` with the reasoning and a
+  # `--self-test` table, and `lint` runs that table.
+  #
+  # On `push`, `merge_group` and `workflow_dispatch` there is no pull request to
+  # diff, so every class is `false` and the jobs that consult it fall back to the
+  # event test they had before.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      packaging: ${{ steps.classify.outputs.packaging }}
+    steps:
+      # `fetch-depth: 0` because the diff is against the pull request's BASE
+      # commit, which a shallow checkout does not have. It is the whole cost of
+      # this job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Classify the changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "not a pull request: every class is false"
+            echo "packaging=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # On a `pull_request` event the checkout is the MERGE commit, so
+          # `diff <base> HEAD` is exactly what the pull request changes.
+          # `--no-renames` so a rename arrives as its DELETE plus its ADD.
+          # With rename detection left on, `--name-only` prints the DESTINATION
+          # path alone, so renaming a listed packaging input to an unlisted path
+          # would classify as `packaging=false` and skip the job that reads it.
+          git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+          echo "== changed paths =="
+          cat "$RUNNER_TEMP/changed.txt"
+          ./tools/scripts/ci_changed_paths.sh < "$RUNNER_TEMP/changed.txt" \
+            | tee -a "$GITHUB_OUTPUT"
+
   deb-smoke:
     name: Debian and APT package smoke
     runs-on: ubuntu-22.04
+    needs: [changes]
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
-    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+    #
+    # EXCEPT on a pull request that touches the packaging inputs themselves. The
+    # cost policy holds because almost no pull request can break this job; the
+    # ones that can are the ones that edit the scripts it drives, the license
+    # inventory it assembles or the packaging docs that describe its output, and
+    # for those "breakage is caught on the merge to main" means a revert instead
+    # of a red check. `tools/scripts/ci_changed_paths.sh` holds the list and
+    # derives it from this job's own steps.
+    #
+    # `merge_group` stays excluded either way: the queue would pay for the same
+    # work a second time over the same commits, and `main`'s push run is still
+    # the control.
+    #
+    # `!cancelled()` is load bearing. `needs: [changes]` makes the classifier a
+    # prerequisite on EVERY event, and GitHub skips a dependent when its
+    # dependency fails, so without the guard a checkout or classification
+    # failure would silently skip this job on `push`, where it runs
+    # unconditionally today. With it, a push runs the smoke whatever the
+    # classifier did, and a pull request whose classifier failed reads an empty
+    # `packaging` and skips, which is exactly the behaviour it has today.
+    if: >-
+      !cancelled()
+      && ((github.event_name != 'pull_request' && github.event_name != 'merge_group')
+      || (github.event_name == 'pull_request' && needs.changes.outputs.packaging == 'true'))
     # Measured 22 min on the PR head (the debug-binary tar + dpkg-deb step
     # alone is ~12 min); 30 left eight minutes of headroom on a
     # compression-bound job.
@@ -456,6 +529,12 @@ jobs:
       - name: Crates.io publish retry self-test
         run: ./tools/scripts/test_publish_crates.sh
 
+      # The path classifier the `changes` job runs. Its table is what decides
+      # whether a pull request pays for the 22-minute packaging smoke, so it is
+      # executed here rather than only read by shellcheck below.
+      - name: Changed-path classifier self-test
+        run: ./tools/scripts/ci_changed_paths.sh --self-test
+
       # A static linter is the only automated reader most of these scripts
       # get: CI executes only a few of them (the two gates this workflow runs,
       # `check_agents_md.sh` and `check_pr_title.sh`, and the shard runner that
@@ -481,10 +560,16 @@ jobs:
           # `tools/hooks` carries the leak guard's git hooks, which have no
           # extension (git looks them up by bare name), so that tree is matched
           # by path rather than by suffix.
-          files=$(find tools/scripts tools/hooks -type f \( -name '*.sh' -o -path 'tools/hooks/*' \) | sort)
+          # `tools/ci` carries the CI-only gates (the rmw distro lanes).
+          files=$(find tools/scripts tools/hooks tools/ci -type f \( -name '*.sh' -o -path 'tools/hooks/*' \) | sort)
           count=$(printf '%s\n' "$files" | grep -c . || true)
-          if [ "$count" -lt 19 ]; then
-            echo "::error::shellcheck swept only ${count} script(s): the find is not reaching the trees"
+          # The find must reach every tracked regular-file script in those trees: the expected
+          # count is derived from git (symlinks excluded, as the find excludes them), never a
+          # hand-kept floor that the real count leaves behind.
+          expected=0
+          while IFS= read -r f; do [ -f "$f" ] && [ ! -L "$f" ] && expected=$((expected + 1)); done < <(git ls-files 'tools/scripts/*.sh' 'tools/hooks/*' 'tools/ci/*.sh' | sort -u)
+          if [ "$count" -ne "$expected" ] || [ "$count" -eq 0 ]; then
+            echo "::error::shellcheck swept ${count} script(s) but git tracks ${expected}: the find is not reaching the trees"
             exit 1
           fi
           # shellcheck disable=SC2086  # $files is a newline list of paths, split on purpose
@@ -1335,6 +1420,16 @@ jobs:
     # reported as a cancellation. Same rule as every number above: the ceiling
     # guards a HUNG job, not a budget. Tighten it once three or four green runs
     # have put a real wall on a leg — that is an OPEN ITEM, not an oversight.
+    #
+    # THE RUNS ARE IN, and the answer is that it STAYS at 60. Sixteen green
+    # legs across four runs: 16.4, 18.0, 18.3, 18.8, 19.7, 20.4, 20.7, 21.2,
+    # 24.4, 26.8, 26.9 min — and one at 40.7. The outlier is the number that
+    # decides this. It was not a slow suite: that leg's own `Free disk space`
+    # step, which normally runs 1.2 to 4.3 min, took 21.4 min on a stalled
+    # runner, and the rest of the job was ordinary. A ceiling has to survive
+    # the runner having a bad day, because a cancelled green suite costs a
+    # rerun of the whole workflow. 60 is 1.5x the worst observed leg; the
+    # ~26 min a healthy leg takes is not the number to size against.
     timeout-minutes: 60
     # Even with the SDK-bloat reclaim below, the union of the
     # external-source feature + the multi-process spawner overflowed the runner
@@ -1964,16 +2059,38 @@ jobs:
   # comment). Mirrored so macOS-specific failures (path handling,
   # case-sensitivity, dlopen differences) are caught.
   #
-  # TWO SHARDS, not `test-linux`'s four. The macOS map does NOT mirror the
-  # Linux 4-way one: every shard pays a fixed cost (`cargo build --workspace`,
-  # toolchain setup, the nextest install, the shared dev-dep test-compile), so
-  # the macOS side runs fewer, fuller shards. The 2-way package tilt below is
-  # balanced BY HAND (see the shard-step comment): shard 0 takes the
-  # `cerulion_core` half that carries the pinned `macro_compile_fail_test`
-  # trybuild tail (~6-9 min) plus the lighter package set; shard 1 takes the
-  # other half, the CLI binary/TUI, the iroh tree (wireclient / connectd /
-  # netd-wan) and the folded viz suites. Re-tilt if a run shows the two legs
-  # more than 5 min apart.
+  # THREE SHARDS, and the count is a MEASUREMENT rather than a mirror of
+  # `test-linux`'s four. Every shard pays a fixed cost (`cargo build
+  # --workspace`, toolchain setup, the nextest install), so more shards is not
+  # automatically faster; the question is whether the variable work divides
+  # further than the fixed cost grows, and on this job it does.
+  #
+  # WHAT THE 2-WAY SPLIT MEASURED, per step, on two runs a week apart:
+  #
+  #   leg      cache hit    cache miss
+  #   shard 0    28.3 min     57.4 min
+  #   shard 1    46.0 min     55.1 min
+  #
+  # Two facts out of that table, and they point the same way. The legs were
+  # skewed 1.6 to 1 with a warm cache, so one of them set the wall of the whole
+  # workflow while the other idled for 18 minutes. And the skew INVERTS when
+  # the cache misses, because shard 0 carried the pinned `macro_compile_fail_test`
+  # trybuild tail, which compiles 91 fixture projects and costs 6 min warm
+  # against 18 min cold. A hand tilt tuned on either column is wrong in the
+  # other one; a third shard is better in BOTH, because it divides the variable
+  # work by 3 while the fixed cost is paid once more.
+  #
+  # PREDICTED from the same per-step numbers: longest leg 26.6 min warm (from
+  # 46.0) and 42.7 min cold (from 57.4).
+  #
+  # The package map below is balanced by hand against those numbers, under
+  # three constraints: the iroh-tree packages (wireclient, connectd, netd-wan)
+  # stay together so that ~390-crate tree compiles once; `--lib` and the
+  # doctests ride shard 0 because the shard script puts the lib unit tests
+  # there; and the trybuild tail lands on `PINNED_SHARD % 3` = shard 2, so
+  # shard 2 gets the lightest package set. Re-tilt if a run shows the legs
+  # more than 5 min apart WITH THE SAME CACHE STATE (comparing a warm leg
+  # against a cold one measures the cache, not the map).
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
@@ -1983,12 +2100,12 @@ jobs:
     # green push run), so every minute `lint` spent in front of it was a minute
     # on the wall of every green run.
     strategy:
-      # 2 shards, NOT `test-linux`'s 4: see the note above.
+      # 3 shards, NOT `test-linux`'s 4: see the note above for the measurement.
       # `fail-fast: false` for the same reason as `test-linux`: one red shard
-      # must not cancel the other's report.
+      # must not cancel the others' report.
       fail-fast: false
       matrix:
-        shard: [0, 1]
+        shard: [0, 1, 2]
     # 30 → 45 with the Linux job: same suite-growth pressure —
     # headroom over the observed ~20m so the ceiling isn't the next flake.
     # 45 → 55: first job here to cold-compile the iroh tree for the
@@ -2005,7 +2122,20 @@ jobs:
     # 60 → 75 (the 2-way split): two fuller shards each carry more of the
     # suite, so the ceiling is raised with them. It guards a HUNG job, not a
     # runtime budget.
-    timeout-minutes: 75
+    # 75 → 60 (the 3-way split), and DOWN for the first time in this file's
+    # history, because for the first time there are per-step MEASUREMENTS to
+    # derive it from rather than a guess. The per-step costs are measured, on
+    # the 2-way runs tabulated above; the longest 3-way leg is PROJECTED from
+    # them at 26.6 min warm and 42.7 min cold, and no three-shard run has put
+    # an observed wall on it yet. 60 leaves 40 percent headroom over the WORSE
+    # of those two projections. Re-set it from the first three green 3-way
+    # runs, which replace the projection with a measurement. A ceiling that tracks the measured wall
+    # turns a hang into a fast red instead of a 75-minute one, which is the
+    # point of having one. Every raise above is a run that was CANCELLED with
+    # every suite green, so the rule those raises teach still holds: tighten
+    # only against green runs, and only downward from a number the runs have
+    # already cleared.
+    timeout-minutes: 60
     env:
       # `line-tables-only`, matching every other TEST job (`test-linux`,
       # `crate-tests`, `viz-tests`): backtraces keep file:line while rustc emits
@@ -2017,7 +2147,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Release installer self-test
-        if: matrix.shard == 0
+        if: matrix.shard == 1
         run: ./tools/scripts/install.sh --self-test
 
       # This job has NO reclaim step and, until now, no `df` anywhere —
@@ -2060,7 +2190,7 @@ jobs:
       # multi-gigabyte archive that is then rejected ("another job may be
       # creating this cache"), and the archive that lands is whichever leg's
       # `target/` happened to be newest — arbitrary, and different run to run.
-      # Shard 0 saves; shard 1 restores only. (This job runs two shards; the
+      # Shard 0 saves; shards 1-2 restore only. (This job runs three shards; the
       # Linux twin above runs four, and its copy of this block says "four".)
       #
       # NOT a per-shard key, deliberately: `target/` for this workspace runs to
@@ -2074,16 +2204,15 @@ jobs:
       # also needs — its `target/` is never a strict subset of a bare leg's.
       # That is the whole claim.
       #
-      # It is explicitly NOT the deepest tree, and a maintainer weighing the
-      # "move the cache save off shard 0" lever named in the package-map table
-      # should not read it as one. MEASURED against the map below: shard 1's
-      # package tree is a strict SUPERSET of shard 0's (`cerulion_cli` depends
-      # on `cli_engine`, `bagd`, `bag`, `cli_tui` and `dds`), and shard 3's
-      # union is the largest of the four because it alone compiles the ~390-crate
-      # iroh tree. If cache CONTENT ever becomes the deciding factor, shard 3
-      # is the leg to measure — but note it would then also be paying the save
-      # tail on top of the wan step's disk pressure. (`rmw_cerulion` rides shard 2;
-      # if the package map moves again, re-derive this rather than trusting it.)
+      # RE-DERIVED against the 3-way map below rather than carried over: shard 0
+      # now runs `cerulion_cli`, whose tree covers `cli_engine`, `bagd`, `bag`,
+      # `cli_tui` and `dds`, so its `target/` is the broadest of the three on
+      # everything except the two specialist trees (the ~390-crate iroh tree on
+      # shard 1, the rerun tree on shard 2, both of which `cargo build
+      # --workspace` builds on every leg anyway). That makes shard 0 a better
+      # saver under this map than under the 2-way one, not merely a defensible
+      # one. If the package map moves again, re-derive this rather than
+      # trusting it.
       # (On Linux `lint` normally reserves this key first and every save here is
       # skipped as an exact hit; there is no `lint` leg on macOS, which is where
       # the race actually bit.)
@@ -2099,7 +2228,7 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      - name: Restore cargo (shard 1, no save)
+      - name: Restore cargo (shards 1-2, no save)
         if: matrix.shard != 0
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -2137,17 +2266,17 @@ jobs:
       # NOT SERIAL ANY MORE — see the twin step in `test-linux` for why, and
       # `.config/nextest.toml` for the fence that replaces `--test-threads=1`.
       #
-      # TWO shards here, not `test-linux`'s four. The macOS count is pinned to
+      # THREE shards here, not `test-linux`'s four. The macOS count is pinned to
       # the `shard:` matrix above by
       # the_ci_shard_matrix_agrees_with_the_shard_count_argument in
       # `cerulion_cli_engine/tests/ci_test_coverage_test.rs`, which walks every
       # job a pull request can fail and this job is one of them.
-      # `--check cerulion_core 2` proves the partition
-      # (131 + 130 files, `PINNED_SHARD % 2 == 0` so the trybuild tail lands
-      # on shard 0, which is why shard 0 gets the lighter package set below).
+      # `--check cerulion_core 3` proves the partition
+      # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
+      # on shard 2, which is why shard 2 gets the lightest package set below).
       # ---------------------------------------------------------------
-      - name: cerulion_core tests (shard ${{ matrix.shard }} of 2, nextest)
-        run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 2
+      - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
+        run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
@@ -2163,13 +2292,19 @@ jobs:
         if: matrix.shard == 0
         run: cargo test -p cerulion_core --doc
 
-      # Shard assignment is macOS's OWN 2-way tilt (it no longer mirrors
-      # `test-linux`'s 4-way table): shard 0 = installer self-test, `--lib` +
-      # doctests, rmw, native_ros2_messages, bag, bagd (serial), macros,
-      # discovery, CLI engine; shard 1 = CLI binary, CLI TUI, wireclient,
-      # connectd, netd-wan, the folded viz suites. Every `run:` line is
-      # byte-identical to before, so both nightly mirrors still cover the job.
-      # Touches the iceoryx2 singleton — serial.
+      # Shard assignment is macOS's OWN 3-way tilt (it does not mirror
+      # `test-linux`'s 4-way table), balanced against the per-step numbers in
+      # the note above the job:
+      #
+      #   shard 0  `--lib` + doctests, rmw, bagd (serial), CLI binary
+      #   shard 1  installer self-test, bag, CLI engine, CLI TUI, and the iroh
+      #            tree kept together (wireclient, connectd, netd-wan)
+      #   shard 2  the pinned trybuild tail, native_ros2_messages, macros,
+      #            discovery, and the folded viz suites
+      #
+      # Every `run:` line is byte-identical to the 2-way map, so nothing about
+      # WHAT runs changed and both nightly mirrors still cover the job; only
+      # which leg runs it did. Touches the iceoryx2 singleton — serial.
       - name: rmw_cerulion tests (serial)
         if: matrix.shard == 0
         # The runner has no ROS: a build that silently fell back to (or
@@ -2180,14 +2315,14 @@ jobs:
         run: cargo test -p rmw_cerulion -- --test-threads=1
 
       - name: native_ros2_messages tests
-        if: matrix.shard == 0
+        if: matrix.shard == 2
         run: cargo test -p native_ros2_messages
 
       # See the Linux job's note — neither bag crate was in ANY job's
       # `-p` list, so both suites compiled and never ran. bagd is serial for the
       # process-global panic hook, not for iceoryx2.
       - name: cerulion_bag tests
-        if: matrix.shard == 0
+        if: matrix.shard == 1
         run: cargo test -p cerulion_bag
       - name: cerulion_bagd tests (serial, process-global panic hook)
         if: matrix.shard == 0
@@ -2197,17 +2332,18 @@ jobs:
       # toolchain — its own unit tests (parse + determinism) are NOT
       # exercised transitively by `-p cerulion_core`, so name it explicitly.
       - name: cerulion_macros tests
-        if: matrix.shard == 0
+        if: matrix.shard == 2
         run: cargo test -p cerulion_macros
 
-      # `cli_engine` and `cli` are split (as on `test-linux`); here
-      # the engine rides shard 0 and the binary + TUI ride shard 1, offsetting
-      # bagd staying serial on shard 0.
+      # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
+      # rides shard 1 and the binary rides shard 0, because the binary's suite
+      # is the single most expensive package step on this job (10.4 min warm)
+      # and the engine's is the third (6.2 min).
       - name: CLI engine tests
-        if: matrix.shard == 0
+        if: matrix.shard == 1
         run: cargo test -p cerulion_cli_engine
       - name: CLI binary tests
-        if: matrix.shard == 1
+        if: matrix.shard == 0
         run: cargo test -p cerulion_cli
       - name: CLI TUI tests
         if: matrix.shard == 1
@@ -2222,7 +2358,7 @@ jobs:
       # is named here. Same reason as the wireclient/connectd
       # steps below. Leaf crate (std + serde + dirs + tracing) — ~3 s, no transport.
       - name: cerulion_discovery tests
-        if: matrix.shard == 0
+        if: matrix.shard == 2
         run: cargo test -p cerulion_discovery
 
       # The test jobs enumerate packages explicitly: there is NO blanket
@@ -2276,22 +2412,22 @@ jobs:
       # for a REQUIRED check on the slower runner is the riskier error. The job
       # ceiling still bounds it.
       - name: cerulion_viz tests (whole suite, parallel)
-        if: matrix.shard == 1
+        if: matrix.shard == 2
         run: cargo test -p cerulion_viz --no-fail-fast
       - name: cerulion_vizd tests (whole suite, serial)
-        if: matrix.shard == 1
+        if: matrix.shard == 2
         run: cargo test -p cerulion_vizd --no-fail-fast -- --test-threads=1
       - name: go2_tf tests
-        if: matrix.shard == 1
+        if: matrix.shard == 2
         run: cargo test -p go2_tf
       - name: cargo test -p cerulion_viz --lib openh264_fetch
-        if: matrix.shard == 1
+        if: matrix.shard == 2
         run: cargo test -p cerulion_viz --lib openh264_fetch
       - name: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
-        if: matrix.shard == 1
+        if: matrix.shard == 2
         run: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
       - name: cargo test -p cerulion_viz --test video_decode_test
-        if: matrix.shard == 1
+        if: matrix.shard == 2
         run: cargo test -p cerulion_viz --test video_decode_test -- --test-threads=1
 
   # ==========================================================================
@@ -2349,13 +2485,20 @@ jobs:
   # (it needs a live CycloneDDS peer), so what runs here is the pure decision
   # engine. The `humble` variant stays CHECK-only, as the project docs say.
   #
-  # TIMEOUT 60: not measured on a runner, and deliberately generous rather than
-  # tight. `cerulion_link` / `cerulion_remoted` cold-compile the ~390-crate
-  # iroh tree and `cerulion_accountd` a web stack (axum/hyper/rusqlite), none of
-  # which any other job in this file caches for them. A cold-cache timeout is
-  # self-sustaining (the job dies before `actions/cache` can save), so the
-  # headroom is taken BEFORE the first red run. Recorded as an open item: tune
-  # it down once two or three green runs have put a real number on it.
+  # TIMEOUT 60 -> 40, and the open item that asked for this is now closed.
+  # 60 was taken BEFORE the first run of this job, deliberately generous: its
+  # packages cold-compile the ~390-crate iroh tree (`cerulion_link`,
+  # `cerulion_remoted`) and a web stack (`cerulion_accountd`: axum, hyper,
+  # rusqlite), nothing else in this file caches those for them, and a
+  # cold-cache timeout is self-sustaining because the job dies before
+  # `actions/cache` can save. The note asked for two or three green runs to put
+  # a real number on it.
+  #
+  # SIX green legs now have, across four runs and both runners, cache hit and
+  # cache miss: 7.8, 9.4, 11.6, 11.8, 13.8, 16.6 min. The worst of those is the
+  # macOS leg of a run with no cache at all, which is the cold case the 60 was
+  # bought for. 40 is 2.4x it, and it still guards a HUNG job rather than
+  # rationing a healthy one, which is the rule this file applies everywhere.
   # ==========================================================================
   crate-tests:
     name: Crate tests (${{ matrix.os }})
@@ -2367,7 +2510,7 @@ jobs:
         # so each leg renders its own required check name.
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 40
     env:
       # `line-tables-only`, matching the other TEST jobs: backtraces keep
       # file:line (what makes a red run diagnosable) while the target dir stays

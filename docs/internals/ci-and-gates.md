@@ -342,30 +342,40 @@ and no stub job standing in for a skipped required check.
 `lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
 `viz-tests`, and the push-only `fuzz`, `miri` and latency jobs), so a red `lint` still
 saves their runner minutes. It does NOT gate the three that do: `test-archive`,
-`test-linux` and `test-macos` start at t=0. A `lint` verdict was never a data dependency
-for them, and while it gated them the wall was `lint` plus the longest test job instead of
-the longest test job. `test-linux` keeps `needs: [test-archive]`, which IS a data
-dependency: it runs the binaries that job builds.
+`test-linux` and `test-macos`. All three start at t=0. `test-linux` has no `needs:` at all:
+each shard builds the `cerulion_core` test binaries it runs, so `test-archive` is no longer a
+data dependency; that job still runs and uploads its artifact because `Test archive (Linux,
+build once)` is a required check on `main`. A `lint` verdict was never a data dependency for
+any of the three, and while it gated them the wall was `lint` plus the longest test job
+instead of the longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
-2-way (`[0,1]`: every macOS shard pays a fixed build and setup cost, so the macOS side
-runs fewer, fuller shards); both `fail-fast: false`. Each leg
+3-way (`[0,1,2]`); both `fail-fast: false`. The macOS count is set from per-step
+measurement: under the earlier 2-way split the legs ran 28.3 and 46.0 min with a warm
+cargo cache and 57.4 and 55.1 with none, so one leg set the wall of the whole workflow
+while the other idled, and the skew INVERTED with the cache state (the pinned trybuild
+tail costs 6 min warm against 18 cold, so a hand tilt tuned on either column is wrong in
+the other). A third leg divides the variable work by 3 while the fixed per-leg cost
+(`cargo build --workspace`, toolchain, nextest install) is paid once more, which is
+better in both cache states: a longest leg PROJECTED from those per-step costs at 26.6
+min warm and 42.7 cold, not yet an observed three-shard wall. Each leg
 runs `./tools/scripts/ci_test_shard.sh cerulion_core <shard> <count>`, which ENUMERATES
 `crates/cerulion_core/tests/*.rs` at depth 1 and takes every file whose position is
 `index mod count`, GENERATED, never hand-listed, save for ONE pinned name
 (`macro_compile_fail_test`, the serial trybuild tail (see `PINNED_TEST` in that script for the
 per-run measurement), which must not relocate every time a test
-file is added; it lands on `PINNED_SHARD % count`, shard 2 of 4 on Linux, shard 0 of 2 on
+file is added; it lands on `PINNED_SHARD % count`, shard 2 of 4 on Linux, shard 2 of 3 on
 macOS, and `--check` proves the pin), and execs `cargo nextest run --profile ci`
 (install via `tools/scripts/install_nextest.sh`). It does NOT pass `--test-threads=1`; see the
 serialisation fence below. The split across runners is legal because each VM has its own
 `/dev/shm`.
 `--lib` and the doctests ride shard 0; the non-core packages are distributed across the
-shards (one per shard on Linux; a hand-balanced 2-way tilt on macOS), with the iroh-tree
-packages kept together so that large tree compiles once. On macOS, shard 1 also carries the
+shards (one per shard on Linux; a hand-balanced 3-way tilt on macOS), with the iroh-tree
+packages kept together so that large tree compiles once. On macOS, shard 2 also carries the
 six viz steps (`cerulion_viz`, `go2_tf`, the serial `cerulion-vizd` suite and the three
-OpenH264 steps); there is NO macOS `viz-tests` leg. Linux shard 0 is the cache SAVER and
-shards 1-3 restore only; the macOS job's shard 0 saves and shard 1 restores, for the same
+OpenH264 steps) beside the trybuild tail, which is why it takes the lightest package set;
+there is NO macOS `viz-tests` leg. Linux shard 0 is the cache SAVER and
+shards 1-3 restore only; the macOS job's shard 0 saves and shards 1-2 restore, for the same
 reason. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
 
@@ -388,7 +398,7 @@ on PRs).
 Six Linux jobs run on push / `workflow_dispatch` only and never
 on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `msrv`, `fuzz`, `miri` and
 `machete` each carry a job-level `if: github.event_name != 'pull_request' && github.event_name
-!= 'merge_group'`; the second
+!= 'merge_group'`; `deb-smoke` carries one exception, below; the second
 conjunct is required because a bare `!= 'pull_request'` ADMITS a merge-queue batch,
 which would run the same work a second time over the same commits (`main`'s push run is the
 control), with their `needs: [lint]` (`fuzz`, `miri`) and
@@ -398,6 +408,18 @@ They run on every merge to `main` (the push run is where their breakage
 surfaces, revert-on-red), and the coverage walk drops any job behind a job-level `if:`
 from its PR-blocking view, so none of the six can credit pull-request coverage it does not
 provide.
+
+The `changes` job classifies a pull request's changed paths (rules and a
+`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) and
+`deb-smoke` reads one class: a pull request that touches the packaging inputs
+themselves runs the 22-minute Debian and APT smoke instead of skipping it, because
+those are the only pull requests that can break it and "caught on the merge to main"
+means a revert rather than a red check. The direction is the safe one: a class only
+ever makes a job RUN that would otherwise skip, so no rule in that script can weaken a
+gate a pull request has today, and every class is `false` on `push`, `merge_group` and
+`workflow_dispatch`, where there is no pull request to diff. `deb-smoke` keeps its
+`push` run whatever the classifier did: the job is guarded with `!cancelled()`, because
+`needs:` alone would let a failed classifier skip a job that runs unconditionally today.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.

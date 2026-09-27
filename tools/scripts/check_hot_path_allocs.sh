@@ -152,6 +152,10 @@ reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs"
 
 # cerulion_core/src/graph — the level executor lives here (runtime.rs).
 #
+#   chain.rs       the STATIC chain-fusion census; `census_chains` walks the
+#                  topology, the trigger edges and the levels once at graph
+#                  build and no execution path reads its result. Same class as
+#                  topology.rs below, which it is built on top of.
 #   config.rs      serde YAML types; parsed once at graph LOAD.
 #   node.rs        NodeEntry loading + the cdylib FFI shim. Its per-step half is
 #                  a thin dispatch, but the file is dominated by dlopen/info-JSON
@@ -163,7 +167,7 @@ reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs"
 #   topology.rs    the STATIC build-time dataflow model; `build()`/`validate()`
 #                  run once at graph build.
 #   validation.rs  build-time graph validation.
-GRAPH_EXCLUDE="config.rs node.rs partition.rs topology.rs validation.rs"
+GRAPH_EXCLUDE="chain.rs config.rs node.rs partition.rs topology.rs validation.rs"
 
 # cerulion_core/src/scheduler — the fire/decide engine.
 #

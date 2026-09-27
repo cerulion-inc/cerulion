@@ -273,6 +273,7 @@ fn the_scaffolding_templates_emit_the_print_ban() {
     // probe carries a real policy — the scaffold `cerulion node create --policy
     // period_ms=100` produces.
     let macro_metadata = NodeMetadata {
+        throttle_ms: None,
         node_type: "print_ban_probe".to_string(),
         policy: Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
         inputs: vec![],
@@ -281,6 +282,7 @@ fn the_scaffolding_templates_emit_the_print_ban() {
     // The raw-FFI generator has no such gate; keep its input the same shape the
     // frozen oracle fixture uses.
     let raw_metadata = NodeMetadata {
+        throttle_ms: None,
         node_type: "print_ban_probe".to_string(),
         policy: None,
         inputs: vec![],
