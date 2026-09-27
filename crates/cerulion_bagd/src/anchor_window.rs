@@ -2523,6 +2523,61 @@ mod tests {
         assert_eq!(unique.len(), wires.len(), "{wires:?}");
     }
 
+    /// Each no-anchor reason's REMEDY is its own sentence, written out here
+    /// rather than read back off the function.
+    ///
+    /// The wire arm above proves the three IDENTIFIERS distinct and says nothing
+    /// about the three sentences an operator actually reads, so two causes could
+    /// render one remedy and the suite would be green. Measured: a mutant that
+    /// gave `AllOlderThanTheFrames` the `NothingRetained` text survived the whole
+    /// suite, and the sentence it substituted sends an operator to check whether
+    /// a rank published a ring when what happened is that the window was too
+    /// short for the checkpoints the rank did publish.
+    ///
+    /// Each expectation is the WHOLE sentence, by hand. A fragment would pass for
+    /// a remedy that kept one clause and lost the rest, and the remedies exist to
+    /// be read end to end.
+    #[test]
+    fn the_no_anchor_reasons_remedies_are_spelled_apart() {
+        assert_eq!(
+            NoAnchorReason::NothingRetained.rank_remedy(),
+            "this rank retained no checkpoint: it published no state ring, its plane was \
+             refused at arm time, or it had not reached its first anchor cadence when the \
+             capture was triggered"
+        );
+        assert_eq!(
+            NoAnchorReason::AllOlderThanTheFrames.rank_remedy(),
+            "this rank's checkpoints all predate the frames this capture carries, so \
+             resuming from one would execute steps whose inputs are not in the bag: \
+             widen the window span or shorten the anchor cadence"
+        );
+        assert_eq!(
+            NoAnchorReason::RetentionCeilingExhausted.rank_remedy(),
+            "the retention's byte ceiling took this rank's checkpoints: raise the anchor \
+             ceiling so the plane can hold one whole checkpoint generation"
+        );
+        // All three DISTINCT, which is the property the substitution above broke
+        // and the one no single equality can state.
+        let remedies = [
+            NoAnchorReason::NothingRetained.rank_remedy(),
+            NoAnchorReason::AllOlderThanTheFrames.rank_remedy(),
+            NoAnchorReason::RetentionCeilingExhausted.rank_remedy(),
+        ];
+        let unique: std::collections::BTreeSet<&str> = remedies.iter().copied().collect();
+        assert_eq!(unique.len(), remedies.len(), "{remedies:?}");
+        // …and each remedy names a DIFFERENT lever, so the three are actionable
+        // apart rather than merely different strings.
+        assert!(NoAnchorReason::NothingRetained
+            .rank_remedy()
+            .contains("published no state ring"));
+        assert!(NoAnchorReason::AllOlderThanTheFrames
+            .rank_remedy()
+            .contains("widen the window span"));
+        assert!(NoAnchorReason::RetentionCeilingExhausted
+            .rank_remedy()
+            .contains("raise the anchor"));
+    }
+
     trait ExpectNone {
         fn expect_none_or_panic(self);
     }

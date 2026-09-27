@@ -1252,6 +1252,56 @@ mod tests {
         assert_eq!(lockstep.per_rank.len(), 1);
     }
 
+    /// The boundary recovery answers the NAMED rank's clock and never a peer's.
+    ///
+    /// `boundary_target_ns_for(rank, step)` exists so the trim can recover
+    /// `target(S)` for a step whose boundary record sits below the capture's
+    /// frame floor. Under free run two ranks reach one step at two instants, so
+    /// the lookup has to be keyed by both: a rank-blind `find` answers whichever
+    /// rank's record the retention happens to hold first, and the scalar then
+    /// carries another rank's clock as this rank's floor.
+    ///
+    /// Rank 1's record is pushed FIRST here deliberately. That is the order in
+    /// which a rank-blind lookup answers rank 1's clock for BOTH ranks, so the
+    /// arm reads the substitution rather than only an absence. Every expected
+    /// value is written out by hand.
+    ///
+    /// The three cases: each rank's own step, and a rank the retention holds
+    /// nothing for, so the lookup is a lookup rather than a fabrication.
+    #[test]
+    fn the_boundary_recovery_answers_the_named_ranks_clock_and_not_a_peers() {
+        let mut w = TraceWindow::new(30_000 * MS, 1 << 30);
+        w.push(
+            10 * MS,
+            vec![
+                ranked_boundary(1, 3, 31_000),
+                ranked_boundary(0, 3, 30_000),
+                ranked_boundary(0, 4, 40_000),
+            ],
+        );
+
+        assert_eq!(
+            w.boundary_target_ns_for(0, 3),
+            Some(30_000),
+            "rank 0's own clock at step 3, not rank 1's 31_000"
+        );
+        assert_eq!(
+            w.boundary_target_ns_for(1, 3),
+            Some(31_000),
+            "rank 1's own clock at the SAME step"
+        );
+        assert_eq!(
+            w.boundary_target_ns_for(0, 4),
+            Some(40_000),
+            "a step only rank 0 reached is still rank 0's"
+        );
+        // A step rank 1 never reached answers NOTHING, rather than borrowing the
+        // rank that did reach it.
+        assert_eq!(w.boundary_target_ns_for(1, 4), None);
+        // …and a rank the retention holds no record for at all.
+        assert_eq!(w.boundary_target_ns_for(2, 3), None);
+    }
+
     /// `keep_all` — the NO-ANCHOR capture — measures the same endpoint.
     ///
     /// Its own arm because the two entry points share `walk` but not their

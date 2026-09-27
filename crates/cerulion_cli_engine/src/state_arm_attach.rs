@@ -744,6 +744,82 @@ fn create_state_ring(
 mod tests {
     use super::*;
 
+    /// The WORKER scope sentence names the rank, and rank 7 is written here by
+    /// hand.
+    ///
+    /// A refusal on a twelve-rank deployment is unattributable without it: every
+    /// rank would log the same sentence and an operator reading one line could
+    /// not say which process lost its plane. The sentence is built inside
+    /// `report_arm_refusal` and reaches a reader only through `tracing`, so this
+    /// arm drives the refusal and reads the log.
+    ///
+    /// Measured before it existed: a mutant that dropped the rank from the
+    /// sentence survived the whole suite, because the literal appears at its
+    /// definition site and nowhere else in the tree.
+    ///
+    /// The MONOLITH sentence is the control. It carries no rank by design, so an
+    /// implementation that interpolated one everywhere would fail here too, and
+    /// the arm states a rule rather than a coincidence.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_workers_refusal_names_the_rank_that_lost_its_plane() {
+        use cerulion_core::flashback::{ArmProjection, ArmRefusal};
+
+        let projection = ArmProjection {
+            state_bytes: Some(64 * 1024 * 1024),
+            mem_available: Some(32 * 1024 * 1024 * 1024),
+            max_state_bytes: 8 * 1024 * 1024,
+            ring_bytes: 1024 * 1024,
+            cadence_steps: 100,
+            cadence_ms: 1_000,
+        };
+
+        report_arm_refusal(
+            PlaneRole::Worker { rank: 7 },
+            "cer_run_7",
+            &projection,
+            ArmRefusal::StateTooLarge,
+            8 * 1024 * 1024,
+        );
+        assert!(
+            logs_contain("rank 7 captures NOTHING while its peers carry on"),
+            "the worker scope sentence must name the rank"
+        );
+        assert!(
+            logs_contain("every anchor of this run LACKS rank 7's records"),
+            "and name it again where it states what every anchor of the run lacks"
+        );
+
+        // The same refusal on the other end of the same ceiling, so the sentence
+        // is carried by BOTH refusal arms rather than by one of them.
+        report_arm_refusal(
+            PlaneRole::Worker { rank: 3 },
+            "cer_run_3",
+            &projection,
+            ArmRefusal::NoHeadroom,
+            8 * 1024 * 1024,
+        );
+        assert!(
+            logs_contain("rank 3 captures NOTHING while its peers carry on"),
+            "the no-headroom refusal carries the same named sentence"
+        );
+
+        // THE CONTROL: a monolith has no rank, and its sentence says so without
+        // borrowing one.
+        report_arm_refusal(
+            PlaneRole::Monolith,
+            "cer_run_mono",
+            &projection,
+            ArmRefusal::StateTooLarge,
+            8 * 1024 * 1024,
+        );
+        assert!(
+            logs_contain("this run has NO capture plane at all"),
+            "the monolith sentence is the one with no rank in it"
+        );
+    }
+
     /// The normalisation table, hand-written. The three "nothing to attach"
     /// rows are the load-bearing ones: an env var that exists but says nothing
     /// is the shape a script leaves behind when it computed no tag, and reading
