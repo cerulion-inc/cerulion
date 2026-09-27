@@ -34,7 +34,6 @@ jobs:
       actions: write
       contents: read # the signatures live in the store repository, written with its own token
       pull-requests: write # posts/updates the CLA comment
-      statuses: write
     steps:
       - name: CLA Assistant Lite
         uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
@@ -51,7 +50,7 @@ jobs:
           remote-organization-name: cerulion-inc
           remote-repository-name: cla
           branch: main
-          allowlist: lakshay2010sharma,raveenk9696,dependabot[bot],renovate[bot],github-actions[bot]
+          allowlist: lakshay2010sharma,raveenk9696,dependabot[bot],renovate[bot],github-actions[bot],claude[bot]
           lock-pullrequest-aftermerge: false
           custom-notsigned-prcomment: >-
             Thank you for your contribution! Before we can merge your first
