@@ -490,7 +490,20 @@ jobs:
               echo "clean here, but another body on this thread still has an outstanding ask"
               exit 0
             fi
-            gh api "repos/$REPO/issues/$NUMBER/labels/leak" -X DELETE >/dev/null 2>&1 || true
+            # Read from the forge's own status line, like the ask delete above.
+            # 200 and 204 are removed, 404 is a label that was not there, and
+            # anything else means the label may still be on a thread this run has
+            # just called clean, which is a visible state nobody would question.
+            lstat=$(gh api "repos/$REPO/issues/$NUMBER/labels/leak" -X DELETE -i 2>/dev/null \
+                    | head -n 1 || true)
+            case "$lstat" in
+              HTTP/*\ 200*|HTTP/*\ 204*|HTTP/*\ 404*) ;;
+              *)
+                echo "::error ::the leak label could not be removed from a thread with no"\
+                     "outstanding ask"
+                exit 1
+                ;;
+            esac
             # A flagged run for another body can have posted its ask between the
             # read above and the delete just now, and it added the label before
             # this run took it off. Confirm, and put it back if so.
@@ -514,19 +527,21 @@ jobs:
           while read -r id found; do
             [ "${found:-}" = "$marker" ] && asked=1
           done < "$asks"
+          # Which kinds fired. Read BEFORE the branch below, because the error
+          # line at the end needs them whether or not an ask was posted this run.
+          refs=no; others=no
+          while read -r c; do
+            case "$c" in
+              ref-unopenable|ref-unverified) refs=yes ;;
+              '') ;;
+              *) others=yes ;;
+            esac
+          done < "$classes"
           if [ "$asked" = 1 ]; then
             echo "already asked about this body"
           else
             # The ask is assembled from the classes that fired. A body can carry
             # both kinds at once, and then it gets both sentences.
-            refs=no; others=no
-            while read -r c; do
-              case "$c" in
-                ref-unopenable|ref-unverified) refs=yes ;;
-                '') ;;
-                *) others=yes ;;
-              esac
-            done < "$classes"
             msg=""
             if [ "$others" = yes ]; then
               msg="This text carries a value that should not be public, such as a machine name, an address, a home path or a personal detail. Please edit it out."
@@ -543,5 +558,12 @@ jobs:
               "$marker" | gh api "repos/$REPO/issues/$NUMBER/comments" -F body=@- >/dev/null
           fi
           gh api "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=leak" >/dev/null
-          echo "::error ::a reference in this body is not openable by a stranger"
+          # The error names the kind that fired, for the same reason the ask does.
+          if [ "$refs" = yes ] && [ "$others" = no ]; then
+            echo "::error ::a reference in this body is not openable by a stranger"
+          elif [ "$refs" = no ] && [ "$others" = yes ]; then
+            echo "::error ::this body carries a value that should not be public"
+          else
+            echo "::error ::this body carries something that should not be public"
+          fi
           exit 1
