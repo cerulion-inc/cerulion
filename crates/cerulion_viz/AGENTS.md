@@ -2,8 +2,8 @@
 
 Three crates: `lib/cerulion_viz` (rerun render/sink library), `lib/go2_tf` (pure
 TFMessage codec - no transport, no rerun), `bin/cerulion_vizd` (the desk viz daemon).
-NOT default-members: a plain `cargo build` must stay rerun-free (CI's rerun-leanness
-job enforces it); build with `-p <crate>`.
+NOT default-members: a plain `cargo build` must stay rerun-free (pinned by
+`default_member_build_is_rerun_free` in cerulion_hygiene); build with `-p <crate>`.
 
 ## Invariants
 
