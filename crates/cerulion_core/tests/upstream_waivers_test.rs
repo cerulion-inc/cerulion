@@ -195,8 +195,8 @@ fn both_waivers_are_pinned_to_the_iceoryx2_release_they_describe() {
     );
 }
 
-/// The 2034 arms are marked, and marked the way the ruling said: a `cfg_attr`
-/// ignore, scoped to macOS, whose reason string names the defect.
+/// The 2034 arms are marked, and marked in one shape: a `cfg_attr` ignore,
+/// scoped to macOS, whose reason string names the defect.
 #[test]
 fn every_declared_2034_arm_carries_a_macos_scoped_ignore_that_names_the_defect() {
     for (binary, test) in WAIVED_2034 {
@@ -208,13 +208,24 @@ fn every_declared_2034_arm_carries_a_macos_scoped_ignore_that_names_the_defect()
              deleted, update this inventory in the same change"
         );
         let at = src.find(&needle).expect("checked above");
-        let head = &src[at.saturating_sub(1200)..at];
-        assert!(
-            head.contains("cfg_attr(target_os = \"macos\", ignore") && head.contains("2034"),
-            "{binary}::{test} is declared waived for upstream 2034 but the attribute above it is \
-             not a macOS scoped ignore naming 2034. A bare `#[ignore]` would hide the arm on \
-             Linux too, and an unnamed reason is a waiver nobody can retire"
-        );
+        // Collapse whitespace before matching, and match the parts separately
+        // rather than as one contiguous string. `cargo fmt` wraps a long
+        // `cfg_attr` across three lines, which broke an exact substring form of
+        // this check the first time it ran against a formatted tree. A guard
+        // that fails on a reformat is a guard somebody eventually deletes.
+        let head: String = src[at.saturating_sub(1500)..at]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for part in ["cfg_attr(", "target_os = \"macos\"", "ignore", "2034"] {
+            assert!(
+                head.contains(part),
+                "{binary}::{test} is declared waived for upstream 2034 but the attributes above \
+                 it do not contain `{part}`. The waiver must be a macOS scoped ignore whose \
+                 reason names the defect: a bare `#[ignore]` would hide the arm on Linux too, \
+                 and an unnamed reason is a waiver nobody can retire"
+            );
+        }
     }
 }
 
