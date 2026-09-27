@@ -287,7 +287,10 @@ above it says what was not checked.
 
 Two mechanisms, both reviewed like code. A line pragma inside that language's comment:
 `leak-scan: allow <class> <reason of at least 12 characters>` on the hit line; it never
-accepts a private class and is ignored in `messages` mode. A path entry in
+accepts a private class and is ignored in `messages` mode. `ref-unopenable` and
+`ref-unverified` are one name for this purpose: they are two verdicts on the same
+reference, and a pragma judges the reference, so a line excused as one is excused as the
+other the first time the forge is slow. A path entry in
 `tools/scripts/leak_scan_allow.txt`: `glob | class | reason`, where the class is a
 generic class or a private CATEGORY such as `private@person` (a bare private waiver is
 refused, so a waiver for a person's name can never excuse a machine name in the same

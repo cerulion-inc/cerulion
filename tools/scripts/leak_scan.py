@@ -617,6 +617,13 @@ CLASS_FLOOR = 15
 # ---------------------------------------------------------------------------
 REF_DEFECT = 'ref-unopenable'
 REF_UNVERIFIED = 'ref-unverified'
+# The two reference classes are two VERDICTS on the same reference, and a line
+# pragma judges the reference ("this token is not a repository name"), which no
+# verdict changes. So a pragma naming either one excuses the other on that line:
+# without this, a line reviewed and excused as a 404 goes hard the first time the
+# forge is slow and the same token reads unverified instead, with no exemption
+# the author could have written in advance.
+REF_PAIR = frozenset(('ref-unopenable', 'ref-unverified'))
 REF_CLASSES = (
     (REF_DEFECT, 'HARD', 'a repository or tracker reference a stranger cannot open'),
     (REF_UNVERIFIED, 'scoped',
@@ -1397,7 +1404,7 @@ class Scanner(object):
         m = PRAGMA_RX.search(raw_line)
         if not m or self.mode == 'messages':
             return False
-        if m.group(1) != cid:
+        if m.group(1) != cid and {m.group(1), cid} != REF_PAIR:
             return False
         if cid.startswith('private') or len(m.group(2).strip()) < 12:
             self.stats.pragmas_refused += 1
@@ -3050,7 +3057,7 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 214
+EXPECTED_ARMS = 216
 
 
 def _png(chunks):
@@ -4370,6 +4377,25 @@ def self_test(out, base_env, argv0):
             any(c == 'private#2@slug' and p == 'keys.md' and n == 2 for c, p, n in got)
             and not any(R_ONEWORD in ln for ln in lines),
             str([ln for ln in lines if 'keys.md' in ln]))
+        # a pragma judges the REFERENCE, so either verdict's name excuses the
+        # other on that line; a pragma for an unrelated class still does not
+        pragma_line = ('let bad = "' + RO + '/' + R_GONE + '#945"; // '
+                       + PRAGMA_WORD + ' allow %s a fixture value, not a reference')
+        _write_files(repo_ref, {
+            'p1.rs': (pragma_line % REF_DEFECT + '\n').encode('utf-8'),
+            'p2.rs': (pragma_line % REF_UNVERIFIED + '\n').encode('utf-8'),
+            'p3.rs': (pragma_line % 'style-dash' + '\n').encode('utf-8')})
+        gitr.run(['add', '-A'])
+        gitr.run(['commit', '-q', '-m', 'pragmas'])
+        pf = os.path.join(tmp, 'pragma-list')
+        with open(pf, 'w') as fh:
+            fh.write('p1.rs\np2.rs\np3.rs\n')
+        for label, extra in (('online-404', []), ('offline-unverified', ['--offline'])):
+            rc, lines = run(['tree', '--no-allow', '--files-from', pf, '--hard',
+                             REF_UNVERIFIED] + extra + mine, refenv, repo_ref)
+            got = set(p for c, p, n in hits(lines) if c in REF_PAIR)
+            arm('ref-either-verdict-pragma-excuses-the-other-' + label,
+                rc == EXIT_HIT and got == {'p3.rs'}, 'rc=%d got=%s' % (rc, sorted(got)))
         arm('ref-key-lines-carry-their-own-category',
             len(parse_private('tracker-host:' + tracker + '\n')) == 1
             and parse_private('tracker-host:' + tracker + '\n')[0].tag == 'host'
