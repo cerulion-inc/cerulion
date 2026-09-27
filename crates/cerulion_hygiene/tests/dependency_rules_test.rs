@@ -1131,17 +1131,17 @@ fn the_robot_workspace_reader_sees_normal_and_dev_packages() {
         .unwrap_or_else(|e| panic!("could not read {} ({e})", dds_bridge.display()))
         .parse()
         .unwrap_or_else(|e| panic!("{} is not valid TOML ({e})", dds_bridge.display()));
-    let in_table = |name: &str, table: &str| {
-        manifest
-            .get(table)
-            .and_then(toml::Value::as_table)
-            .is_some_and(|t| t.contains_key(name))
-    };
+    // Every table of each kind, `[target.'cfg(...)'.dependencies]` included.
+    // Checking the top-level tables alone would let a target-scoped normal
+    // entry satisfy the guard while the reader's dev traversal was dead, which
+    // is the whole failure this control exists to detect.
+    let dev = names_in_dependency_tables(&manifest, &["dev-dependencies"]);
+    let not_dev = names_in_dependency_tables(&manifest, &["dependencies", "build-dependencies"]);
     assert!(
-        in_table("tempfile", "dev-dependencies") && !in_table("tempfile", "dependencies"),
-        "{} no longer declares `tempfile` under [dev-dependencies] and nowhere else, so it \
-         cannot serve as the dev-table control below. Pick another dev-only dependency of a \
-         robot crate and name it here, or the control proves nothing.",
+        dev.contains("tempfile") && !not_dev.contains("tempfile"),
+        "{} no longer declares `tempfile` under a dev-dependency table and nowhere else, so \
+         it cannot serve as the dev-table control below. Pick another dev-only dependency of \
+         a robot crate and name it here, or the control proves nothing.",
         dds_bridge.display(),
     );
     assert!(
@@ -1335,6 +1335,31 @@ fn declared_dependencies(manifest: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     collect_dependency_names(&doc, &mut out);
     out
+}
+
+/// Every dependency name declared in a table whose own key is one of `kinds`,
+/// at any depth, so `[target.'cfg(unix)'.dependencies]` counts as
+/// `dependencies`.
+///
+/// Separate from [`collect_dependency_names`], which flattens all three kinds
+/// into one set: this one has to tell them apart, because the question it
+/// answers is which TABLE a name sits in.
+fn names_in_dependency_tables(table: &toml::Table, kinds: &[&str]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    collect_names_in_kinds(table, kinds, &mut out);
+    out
+}
+
+fn collect_names_in_kinds(table: &toml::Table, kinds: &[&str], out: &mut BTreeSet<String>) {
+    for (key, value) in table {
+        if kinds.contains(&key.as_str()) {
+            if let Some(deps) = value.as_table() {
+                out.extend(deps.keys().cloned());
+            }
+        } else if let Some(sub) = value.as_table() {
+            collect_names_in_kinds(sub, kinds, out);
+        }
+    }
 }
 
 /// Walk a manifest table for every `*dependencies` table, however nested.
