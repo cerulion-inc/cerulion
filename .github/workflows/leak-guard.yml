@@ -122,8 +122,11 @@ jobs:
           BRANCH_NAME: ${{ github.event.pull_request.head.ref || github.event.merge_group.head_ref }}
         run: |
           set -euo pipefail
-          flags=()
-          if [ "$REQUIRE" = yes ]; then flags=(--require-private); fi
+          # A fork run holds no secret, so --require-private cannot be its gate;
+          # ref-unverified is escalated by name instead, and every run here fails
+          # closed on a reference the forge would not confirm.
+          flags=(--hard ref-unverified)
+          if [ "$REQUIRE" = yes ]; then flags+=(--require-private); fi
           git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
           # The list names the files the head commit changed since the merge
           # base, and the content scanned is that commit's copy of each one
@@ -146,8 +149,10 @@ jobs:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
         run: |
           set -euo pipefail
-          python3 -B tools/scripts/leak_scan.py tree --require-private --format github
-          python3 -B tools/scripts/leak_scan.py names --require-private --format github
+          python3 -B tools/scripts/leak_scan.py tree --require-private --format github \
+            --hard ref-unverified
+          python3 -B tools/scripts/leak_scan.py names --require-private --format github \
+            --hard ref-unverified
 
   messages:
     name: Leak guard (messages)
@@ -199,8 +204,8 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-          flags=()
-          if [ "$REQUIRE" = yes ]; then flags=(--require-private); fi
+          flags=(--hard ref-unverified)
+          if [ "$REQUIRE" = yes ]; then flags+=(--require-private); fi
           case "$EVENT_NAME" in
             pull_request)
               git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
@@ -300,6 +305,16 @@ jobs:
       && github.event.comment.user.login != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # One run at a time per BODY, newest wins. The workflow level group keys on
+    # the run id for these events, so without this an edit could be overtaken by
+    # the scan of the text it replaced, and the label and the ask would describe
+    # a body that no longer exists. Two different bodies on one thread are
+    # independent and still run in parallel.
+    concurrency:
+      group: >-
+        leak-guard-body-${{ github.event.issue.number || github.event.pull_request.number }}-${{
+        github.event.comment.id || 'body' }}
+      cancel-in-progress: true
     permissions:
       contents: read
       issues: write
@@ -333,7 +348,9 @@ jobs:
 
       # The job cannot stop the text from existing, so this is the whole
       # remedy: a label the triage list can see, one ask addressed to the
-      # author, and a red run.
+      # author, and a red run. The label tracks the THREAD, not this body: an
+      # outstanding ask is a comment the guard left and has not taken back, so
+      # the label comes off only when the last one is gone.
       - name: Label, ask once, and fail
         env:
           GH_TOKEN: ${{ github.token }}
@@ -349,21 +366,47 @@ jobs:
             echo "::error ::the leak guard could not run on this body"
             exit 1
           fi
-          if [ "$RC" = 0 ]; then
-            gh api "repos/$REPO/issues/$NUMBER/labels/leak" -X DELETE >/dev/null 2>&1 || true
-            echo "clean"
-            exit 0
-          fi
-          gh api "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=leak" >/dev/null
-          # One ask per body. The marker carries the surface and a digest of the
-          # text that was refused, so a second run over the same body never asks
-          # twice, and an edit that leaves the reference in place is a new ask.
+          # The marker names the surface and digests the text that was refused,
+          # so one body is asked once however often it is rescanned, and an edit
+          # that leaves the reference in place is a new ask.
           scope=${COMMENT_ID:-body}
           digest=$(printf '%s' "$LG_BODY" | sha256sum | cut -c1-16)
-          marker="<!-- leak-guard:$EVENT_NAME:$scope:$digest -->"
-          if gh api --paginate "repos/$REPO/issues/$NUMBER/comments" --jq '.[].body' \
-               | grep -qF "$marker"; then
-            echo "already asked"
+          prefix="<!--leak-guard:$EVENT_NAME:$scope:"
+          marker="$prefix$digest-->"
+          # One read of the thread, into a file. Nothing is piped into a reader
+          # that may stop early: under pipefail that reads as a failed lookup and
+          # the ask would be posted twice.
+          gh api --paginate "repos/$REPO/issues/$NUMBER/comments" \
+            --jq '.[] | select(.body | test("<!--leak-guard:"))
+                  | "\(.id) \(.body | match("<!--leak-guard:[^>]*-->").string)"' \
+            > asks.txt || : > asks.txt
+
+          if [ "$RC" = 0 ]; then
+            others=0
+            while read -r id found; do
+              [ -n "${id:-}" ] || continue
+              case "$found" in
+                "$prefix"*) gh api "repos/$REPO/issues/comments/$id" -X DELETE \
+                              >/dev/null 2>&1 || true ;;
+                *) others=1 ;;
+              esac
+            done < asks.txt
+            if [ "$others" = 0 ]; then
+              gh api "repos/$REPO/issues/$NUMBER/labels/leak" -X DELETE >/dev/null 2>&1 || true
+              echo "clean, and no ask is outstanding on this thread"
+            else
+              echo "clean here, but another body on this thread still has an outstanding ask"
+            fi
+            exit 0
+          fi
+
+          gh api "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=leak" >/dev/null
+          asked=0
+          while read -r id found; do
+            [ "${found:-}" = "$marker" ] && asked=1
+          done < asks.txt
+          if [ "$asked" = 1 ]; then
+            echo "already asked about this body"
           else
             printf '%s\n\n%s\n' \
               "This text points at a repository or a tracker that people outside this project cannot open. Please edit the reference out, or replace it with a link anyone can follow. The reference itself is not printed anywhere by this check." \

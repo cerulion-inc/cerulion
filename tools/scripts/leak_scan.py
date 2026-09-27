@@ -660,6 +660,12 @@ REF_BACKOFF = 1.5
 # is unverified, which is a finding under --require-private and a warning
 # otherwise: the run slows down and says so, it never quietly scans less.
 REF_BUDGET = 300
+# ... and a ceiling on the TIME they may take together. A count alone is not a
+# bound: 300 repositories behind a black-holed network are 300 timeouts in a
+# row, which outlives the job that started the scan. Past the deadline every
+# further repository is unverified with no request, so a scan that cannot
+# finish asking still finishes, and says so.
+REF_DEADLINE = 120.0
 REF_AGENT = 'leak-scan (repository reachability check)'
 
 
@@ -707,19 +713,37 @@ class RefResolver(object):
                   network), or the scanner was told not to ask
     """
 
-    def __init__(self, fetch=None, offline=False, budget=REF_BUDGET):
+    def __init__(self, fetch=None, offline=False, budget=REF_BUDGET, deadline=REF_DEADLINE,
+                 clock=time.monotonic):
         self.fetch = forge_status if fetch is None else fetch
         self.offline = offline
         self.budget = budget
+        self.deadline = deadline
+        self.clock = clock
+        self.started = None
         self.cache = {}
         self.asked = 0
+        self.spent = False
+
+    def out_of_budget(self):
+        """True once this run has asked enough questions, or spent enough time
+        asking them. The clock starts at the FIRST question, so a run that
+        resolves nothing is never charged for a scan that took a while."""
+        if self.asked >= self.budget:
+            return True
+        if self.started is None:
+            return False
+        return self.clock() - self.started >= self.deadline
 
     def verdict(self, owner, repo):
         key = (owner.lower(), repo.lower())
         if key in self.cache:
             return self.cache[key]
-        if self.offline or self.asked >= self.budget:
+        if self.offline or self.out_of_budget():
+            self.spent = not self.offline
             return 'unverified'
+        if self.started is None:
+            self.started = self.clock()
         self.asked += 1
         try:
             code = self.fetch(owner, repo)
@@ -745,6 +769,13 @@ class RefScan(object):
         self.tracker_rx = tracker_rx(self.hosts)
         self.require = require
 
+    def matches(self, text):
+        """Every finding as (start, end, class id) over `text`, for masking a
+        reference that sits inside a file or directory NAME. The span covers the
+        whole matched reference, so nothing of a closed slug survives in a
+        printed location."""
+        return [(s, e, cid) for cid, _, s, e in self._scan(text)]
+
     def _repo(self, owner, repo):
         """(class, token) for one resolved repository, or None when a stranger
         can open it, when it is the repository being scanned, or when the first
@@ -761,23 +792,28 @@ class RefScan(object):
         return (REF_DEFECT if verdict == 'closed' else REF_UNVERIFIED, owner + '/' + repo)
 
     def findings(self, line):
+        """Every finding on one line as (class id, token), in order, one per
+        distinct token."""
+        return [(cid, token) for cid, token, _, _ in self._scan(line)]
+
+    def _scan(self, line):
         out, seen = [], set()
 
-        def take(cid, token):
+        def take(cid, token, m):
             if token.lower() not in seen:
                 seen.add(token.lower())
-                out.append((cid, token))
+                out.append((cid, token, m.start(), m.end()))
 
         for m in self.tracker_rx.finditer(line):
-            take(REF_DEFECT, m.group(1))
+            take(REF_DEFECT, m.group(1), m)
         for m in REF_LINK_RX.finditer(line):
             got = self._repo(m.group(1), m.group(2))
             if got:
-                take(got[0], got[1])
+                take(got[0], got[1], m)
         for m in REF_SLUG_RX.finditer(line):
             got = self._repo(m.group(1), m.group(2))
             if got:
-                take(got[0], m.group(0))
+                take(got[0], m.group(0), m)
         for m in REF_BARE_RX.finditer(line):
             # The forge reads a bare shorthand in the owner's own namespace, so
             # that is where it is resolved. With no owner known (no remote, no
@@ -787,11 +823,11 @@ class RefScan(object):
             if repo.lower() == self.self_repo:
                 continue
             if not self.self_owner:
-                take(REF_UNVERIFIED, m.group(0))
+                take(REF_UNVERIFIED, m.group(0), m)
                 continue
             got = self._repo(self.self_owner, repo)
             if got:
-                take(got[0], m.group(0))
+                take(got[0], m.group(0), m)
         return out
 
 
@@ -1147,13 +1183,15 @@ def identity_label(cid, text):
     return '<%s:%s>' % (cid, shape_of(text))
 
 
-def identity_spans(classes, text):
+def identity_spans(classes, text, refs=None):
     """Every identity-bearing generic match in `text` as (start, end, class id): the
     classes, regexes and filters the name scan runs, over the same text. Two
     adjacent matches can share their boundary character (two home paths share
     a slash), so the search resumes ON the last character of a match, not after
-    it; a sub-match found that way sits inside the match before it and merges."""
-    spans = []
+    it; a sub-match found that way sits inside the match before it and merges.
+    `refs` adds the reference classes, which have no regex in the class table and
+    whose text is a slug the tier may not know."""
+    spans = list(refs.matches(text)) if refs is not None else []
     low = text.lower()
     for c in classes:
         if c.id not in IDENTITY_CLASSES or not any(a in low for a in c.anchors):
@@ -1169,7 +1207,7 @@ def identity_spans(classes, text):
     return spans
 
 
-def identity_path_spans(classes, path):
+def identity_path_spans(classes, path, refs=None):
     """Returns (spans, withheld). `spans` are the (start, end, label) triples to mask
     in `path`: every match on the raw path, plus each whole component a normalised
     view of which matches (such a match has no span in the raw text), as
@@ -1177,21 +1215,22 @@ def identity_path_spans(classes, path):
     path when a normalised view of the path holds more matches of some class than
     the raw spans and the components account for (a home path whose separators
     are encoded, so no one component holds it), else None."""
-    raw = identity_spans(classes, path)
+    raw = identity_spans(classes, path, refs)
     spans = [(s, e, identity_label(cid, path[s:e])) for s, e, cid in merge_spans(raw)]
     seen = collections.Counter(cid for _, _, cid in raw)
     pos = 0
     for comp in path.split('/'):
         if comp:
             for v in text_views(comp)[1:]:
-                found = identity_spans(classes, v)
+                found = identity_spans(classes, v, refs)
                 if found:
                     spans.append((pos, pos + len(comp), identity_label(found[0][2], comp)))
                     seen.update(cid for _, _, cid in found)
                     break
         pos += len(comp) + 1
     for v in text_views(path)[1:]:
-        extra = collections.Counter(cid for _, _, cid in identity_spans(classes, v)) - seen
+        extra = collections.Counter(
+            cid for _, _, cid in identity_spans(classes, v, refs)) - seen
         if extra:
             return spans, identity_label(sorted(extra)[0], path)
     return spans, None
@@ -1502,7 +1541,7 @@ class Scanner(object):
         if self.private is not None:
             spans += self.private.path_spans(path)
         if self.masks_values():
-            generic, withheld = identity_path_spans(self.classes, path)
+            generic, withheld = identity_path_spans(self.classes, path, self.refs)
             if withheld is not None:
                 return withheld
             spans += generic
@@ -2969,7 +3008,7 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 206
+EXPECTED_ARMS = 208
 
 
 def _png(chunks):
@@ -4311,6 +4350,17 @@ def self_test(out, base_env, argv0):
         arm('ref-a-shorthand-in-a-file-name-is-a-finding', rc == EXIT_HIT and any(
             c == REF_DEFECT and p.endswith('#945.md') and n == 0
             for c, p, n in hits(lines)), str([ln for ln in lines if 'HIT' in ln][:3]))
+        # ... and in a CI log the location itself is masked, or the file property
+        # would publish the closed slug the value beside it was masked to hide.
+        slug_name = RO + '/' + R_PRIV + '#945'
+        rc, lines = run(['names', '--no-allow', '--format', 'github'] + mine, refenv,
+                        repo_refname)
+        arm('ref-a-slug-in-a-file-name-is-masked-in-a-ci-log', rc == EXIT_HIT
+            and not any(R_PRIV in ln for ln in lines)
+            and any(ln == '::error ::' + REF_DEFECT + ' <' + REF_DEFECT + ':'
+                    + shape_of(slug_name) + '>.md:0: '
+                    + mask_shape(slug_name) + ' [name]' for ln in lines),
+            str([ln for ln in lines if '::error' in ln][:3]))
         # the message surfaces: a commit body, and the issue or comment body the
         # conversation job feeds through --body-env
         gitr.run(['commit', '-q', '--allow-empty', '-m',
@@ -4330,6 +4380,17 @@ def self_test(out, base_env, argv0):
             str([ln for ln in lines if 'HIT' in ln][:3]))
         surfaces.update(('issue-body', 'forge-link', 'shorthand', 'tracker-link'))
         # the resolver and the shape finder as pure oracles
+        # the deadline: a count alone is not a bound, so an injected clock proves
+        # the run stops asking and reports unverified instead of running long
+        ticks = [0.0]
+        slow = RefResolver(fetch=lambda o, r: 404, deadline=5.0, clock=lambda: ticks[0])
+        first = slow.verdict(RO, R_PRIV)
+        ticks[0] = 9.0
+        arm('ref-probing-stops-at-the-deadline',
+            first == 'closed' and slow.verdict(RO, R_GONE) == 'unverified'
+            and slow.asked == 1 and slow.spent
+            and slow.verdict(RO, R_PRIV) == 'closed',
+            'asked=%d spent=%s' % (slow.asked, slow.spent))
         res = RefResolver(fetch=lambda o, r: {R_PUB: 200, R_PRIV: 404, R_SLOW: 429}.get(r))
         arm('ref-resolver-oracles',
             res.verdict(RO, R_PUB) == 'public' and res.verdict(RO, R_PRIV) == 'closed'

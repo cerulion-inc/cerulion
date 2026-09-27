@@ -12,7 +12,9 @@ push to `main`, and on every issue and comment body as it is written or edited.
 A body is public the moment it is written and no check runs before it is, so that last
 job cannot block anything. On a finding it applies the `leak` label, asks the author once
 to edit the reference out (one ask per body, so an unchanged body is never asked twice),
-and goes red; on a clean body it takes the label off again.
+and goes red. The label tracks the THREAD: a clean body takes back the ask left for it,
+and the label comes off when the last outstanding ask on that thread is gone, so a clean
+comment cannot clear a label another body still deserves.
 
 ## What it checks
 
@@ -50,9 +52,12 @@ the secret the text just published. An internal ticket quoted in a public issue 
 Nothing in the tree lists a repository. The scanner RESOLVES what the text points at and
 asks the forge, anonymously and with no token, whether a stranger is served a page.
 
+One forge is resolved, the one this repository lives on (`github.com`). A link to any other
+forge is not a candidate and is not checked; a reference there is a reviewer's job.
+
 | shape | example | resolved as |
 | --- | --- | --- |
-| a forge link | `https://<forge>/<owner>/<repo>/...` | that owner and repository |
+| a forge link | `https://github.com/<owner>/<repo>/...` | that owner and repository |
 | a qualified shorthand | `<owner>/<repo>#<n>` | that owner and repository |
 | a bare shorthand | `<repo>#<n>` | `<repo>` under this repository's own owner |
 | a tracker link | a link to `linear.app` or to a private-tier `tracker-host:` | nothing: a tracker is closed to a stranger already |
@@ -60,9 +65,16 @@ asks the forge, anonymously and with no token, whether a stranger is served a pa
 `200` means public and is clean. `404` means private, renamed away or never there, and a
 stranger is given nothing in every one of those cases, so all three are one finding,
 `ref-unopenable`. A throttle, a server error or no network at all is `ref-unverified`,
-which is a HARD finding under `--require-private` (CI, which must fail closed) and a
-warning without it (a laptop on a train, which must still run). `--offline` asks nothing
-and reports every candidate as unverified; the hooks always run that way.
+which is HARD under `--require-private` and a warning without it, so a laptop on a train
+still runs. Every `Leak guard` job escalates it by name as well (`--hard ref-unverified`),
+because a fork run holds no secret and so cannot be gated on `--require-private`, and a
+reference the forge would not confirm must stop a fork pull request too. `--offline` asks
+nothing and reports every candidate as unverified; the hooks always run that way.
+
+The asking is bounded twice over: at most 300 distinct repositories per run, and at most
+two minutes of asking in total from the first question. Past either bound every further
+repository is unverified with no request, so a scan behind a dead network still finishes
+and still says what it could not check.
 
 One question per distinct repository per run, cached in memory, to the host the link
 names and to no other host. That question carries the owner and repository the text
@@ -82,7 +94,8 @@ separator is therefore invisible to the shape, which is exactly what the private
 A finding prints the reference stripped to what a reader needs to find it on the line, an
 owner and a repository or a tracker host, never the full link, and both classes are
 identity bearing: the value prints only on a terminal with the private tier loaded, and
-everywhere else a masked shape takes its place.
+everywhere else a masked shape takes its place, in the LOCATION as well as the value, so a
+slug that is itself a file or directory name cannot ride out in the place that says where.
 
 Surfaces in `tree` mode: every text file in full (comments, strings, help text, YAML,
 Markdown, lock files), path names, symlink targets, binary files through their
