@@ -63,11 +63,16 @@
 //! the `cargo tree` probes in CI, which default to the host platform, and makes
 //! the verdict identical on every developer machine.
 //!
-//! COST. One `cargo metadata` invocation per test binary, shared through a
-//! `OnceLock`; no compilation and no network beyond what resolving the
-//! workspace already needs. The `examples/go2` rules read that workspace's
-//! committed manifests and lockfile directly, so they need no second resolve
-//! and no network at all.
+//! COST. Two cargo subprocesses per test binary: one `cargo metadata`, shared
+//! through a `OnceLock`, and one `cargo tree` for the oracle. Neither compiles
+//! anything, and neither needs the network beyond what resolving the workspace
+//! already did to build this binary. The `examples/go2` rules read that
+//! workspace's committed manifests and lockfile directly, so they need no
+//! second resolve and no network at all.
+//!
+//! EVERY COUNT in these comments is a measurement taken while the file was
+//! written, recorded so a reader knows the order of magnitude. No assertion
+//! depends on one, and nothing here needs re-measuring when the tree grows.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -88,7 +93,7 @@ use serde::Deserialize;
 /// reasoning is written out in the `iroh-leanness` job, whose pattern
 /// (`^iroh($|-|_)`) this mirrors.
 fn is_iroh_family(name: &str) -> bool {
-    name == "iroh" || name.starts_with("iroh-") || name.starts_with("iroh_")
+    is_family(name, "iroh")
 }
 
 /// Packages whose name marks them as part of the Rerun SDK.
@@ -105,21 +110,44 @@ fn is_rerun_family(name: &str) -> bool {
 /// The first two are the published Cerulion forks pinned in
 /// `docs/packaging/dds-forks.md`; the upstream spellings are named too, so that
 /// dropping a fork cannot silently drop the rule with it.
+///
+/// The four names are a FLOOR, not a ceiling: each is also matched as a family
+/// root, so a future `rustdds-security` or `cerulion-ros2-client-macros` is
+/// covered with no edit. A move to a different DDS implementation is not, and
+/// would need a name here.
 fn is_dds_stack(name: &str) -> bool {
-    matches!(
-        name,
-        "cerulion-ros2-client" | "cerulion-rustdds" | "ros2-client" | "rustdds"
-    )
+    [
+        "cerulion-ros2-client",
+        "cerulion-rustdds",
+        "ros2-client",
+        "rustdds",
+    ]
+    .iter()
+    .any(|root| is_family(name, root))
+}
+
+/// True when `name` is `root`, or a subcrate of it under either separator.
+///
+/// One helper for every transport family, because the separator is not a
+/// choice a crate's author makes consistently: the iroh tree spells subcrates
+/// with `-`, and published zenoh subcrates appear with both. A family that
+/// covered only one spelling would let a direct dependency on the other pull
+/// the whole tree while the probe stayed green.
+fn is_family(name: &str, root: &str) -> bool {
+    name == root
+        || (name.len() > root.len()
+            && name.starts_with(root)
+            && matches!(name.as_bytes()[root.len()], b'-' | b'_'))
 }
 
 /// The zenoh network transport.
 fn is_zenoh(name: &str) -> bool {
-    name == "zenoh" || name.starts_with("zenoh-")
+    is_family(name, "zenoh")
 }
 
 /// The iceoryx2 shared-memory transport.
 fn is_iceoryx2(name: &str) -> bool {
-    name == "iceoryx2" || name.starts_with("iceoryx2-")
+    is_family(name, "iceoryx2")
 }
 
 /// The workspace's own runtime crate.
@@ -130,11 +158,15 @@ fn is_cerulion_core(name: &str) -> bool {
 /// The desk render stack, which is what the robot rule actually names: the
 /// Rerun SDK family, and the `cerulion_viz` library that wraps it.
 ///
+/// Both viz crates, not just the library: `cerulion_vizd` pulls the SDK through
+/// `cerulion_viz`, so a robot crate depending on the daemon would carry the
+/// whole tree while a `cerulion_viz`-only check stayed green.
+///
 /// `go2_tf` is NOT in it. That crate sits in the `cerulion_viz` directory but
 /// is a pure TFMessage codec with no transport and no rerun, and the demo's
 /// producer nodes depend on it deliberately.
 fn is_desk_viz(name: &str) -> bool {
-    is_rerun_family(name) || name == "cerulion_viz"
+    is_rerun_family(name) || name == "cerulion_viz" || name == "cerulion_vizd"
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +236,11 @@ struct ConfinedCrate {
 const CONFINED_CRATES: &[ConfinedCrate] = &[
     ConfinedCrate {
         package: "cerulion_pairing",
-        forbidden: &[("iroh", is_iroh_family), ("rerun", is_rerun_family)],
+        forbidden: &[
+            ("iroh", is_iroh_family),
+            ("rerun", is_rerun_family),
+            ("the DDS stack", is_dds_stack),
+        ],
         source: "docs/internals/remote-access.md crate map: `cerulion_pairing` is \"formats + \
                  crypto + state machines ONLY; no network I/O, no iroh dep (embeds in \
                  firmware and in the closed Studio client)\". Root Cargo.toml: \"Desk-half \
@@ -231,6 +267,11 @@ const CONFINED_CRATES: &[ConfinedCrate] = &[
 /// The leanness rules assert the CONSEQUENCE; this one asserts the MECHANISM,
 /// so a failing run names the manifest line to restore instead of handing over
 /// a dependency path to work backwards from.
+/// EVERY member outside `default-members`, so the list can be checked in both
+/// directions: a member that quietly leaves the default set is as much a
+/// change to the build as one that joins it, and a row nobody removed
+/// pre-authorises the next departure. Two entries carry no heavy tree and say
+/// so; they are here because completeness is the property being asserted.
 const EXCLUDED_FROM_DEFAULT_MEMBERS: &[(&str, &str)] = &[
     ("cerulion_netd", "iroh (its `wan` feature is default-on)"),
     ("cerulion_link", "iroh"),
@@ -242,7 +283,22 @@ const EXCLUDED_FROM_DEFAULT_MEMBERS: &[(&str, &str)] = &[
     ("cerulion_connectd", "iroh"),
     ("cerulion_accountd", "iroh and the web stack"),
     ("cerulion_viz", "the Rerun SDK"),
-    ("cerulion_vizd", "the Rerun SDK"),
+    ("cerulion_vizd", "the Rerun SDK (through cerulion_viz)"),
+    (
+        "cerulion_heaphook",
+        "an allocator-interposing cdylib, which a plain build should not link \
+         into anything (root Cargo.toml: \"a PRELOAD PAYLOAD, not a workspace tool\")",
+    ),
+    (
+        "go2_tf",
+        "nothing heavy (std + thiserror). It sits under crates/cerulion_viz/ \
+         beside the crates that do, and stays out with them",
+    ),
+    (
+        "go2_tf_source",
+        "nothing heavy. It is a demo node under examples/go2/, built by that \
+         workspace rather than by a plain root build",
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -261,6 +317,7 @@ struct Metadata {
 struct Package {
     id: String,
     name: String,
+    version: String,
     manifest_path: String,
     #[serde(default)]
     features: BTreeMap<String, Vec<String>>,
@@ -336,7 +393,13 @@ fn metadata() -> &'static Metadata {
             out.status,
             String::from_utf8_lossy(&out.stderr),
         );
-        serde_json::from_slice(&out.stdout).expect("cargo metadata emits valid JSON")
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "`cargo metadata` output did not match the shape this file parses ({e}). A \
+                 cargo upgrade may have renamed or dropped a field, or `resolve` may be null \
+                 (it is, under --no-deps). The structs are at the top of this file."
+            )
+        })
     })
 }
 
@@ -370,6 +433,16 @@ const NORMAL: &[Option<&str>] = &[None];
 /// rules that turn on a dev edge read the manifests directly instead.
 const NORMAL_AND_BUILD: &[Option<&str>] = &[None, Some("build")];
 
+/// What a plain `cargo test` compiles: the above plus each ROOT's own
+/// `[dev-dependencies]`.
+///
+/// Dev edges are followed from the roots and nowhere else, which is cargo's
+/// own rule: a dependency's dev-dependencies are built only when that
+/// dependency is itself the package under test. [`Graph::resolve`] enforces
+/// that; a walk that followed dev edges everywhere would drag in most of
+/// crates.io and make every rule fire.
+const NORMAL_BUILD_AND_ROOT_DEV: &[Option<&str>] = &[None, Some("build"), Some("dev")];
+
 /// An indexed view of one `cargo metadata` document.
 struct Graph<'m> {
     by_id: BTreeMap<&'m str, &'m Package>,
@@ -402,6 +475,10 @@ impl<'m> Graph<'m> {
         &self.by_id[id].name
     }
 
+    fn version(&self, id: &str) -> &'m str {
+        &self.by_id[id].version
+    }
+
     /// The id of the workspace member called `name`.
     fn member(&self, name: &str) -> &'m str {
         self.meta
@@ -421,16 +498,27 @@ impl<'m> Graph<'m> {
     /// The package ids cargo resolved manifest dependency `dep` of `owner` to.
     ///
     /// Joined on the real package name plus the dependency kind. Two versions
-    /// of one package can sit behind a single name (four such edges exist in
-    /// this tree, all inside third-party crates), and the answer is then BOTH,
-    /// which is the fail-closed direction: an extra edge can only make a
-    /// "nothing forbidden is reachable" rule stricter, never weaker.
+    /// of one package can sit behind a single name (four such edges in this
+    /// tree, all inside third-party crates), and the answer is then BOTH.
+    ///
+    /// THAT IS FAIL-CLOSED FOR THE ABSENCE RULES AND FAIL-OPEN FOR THE
+    /// PRESENCE ONES, and the difference is worth stating rather than
+    /// glossing. An extra edge can only make "nothing forbidden is reachable"
+    /// stricter. It makes "something IS reachable" easier, which covers the
+    /// three positive controls and the oracle, whose whole job is to catch an
+    /// under-count. The oracle compensates by comparing NAME AND VERSION, so a
+    /// spurious second version cannot stand in for a missing package. Doing
+    /// better here means matching the version requirement, which needs a
+    /// semver matcher this file does not otherwise want.
     fn edge_targets(&self, owner: &str, dep: &ManifestDep) -> Vec<&'m str> {
         self.nodes[owner]
             .deps
             .iter()
             .filter(|e| self.name(&e.pkg) == dep.name)
             .filter(|e| e.dep_kinds.iter().any(|k| k.kind == dep.kind))
+            // Through `by_id` rather than straight off `e.pkg`: the lookup
+            // panics on an id no package declares, which would mean the two
+            // halves of one `cargo metadata` document disagree.
             .map(|e| self.by_id[e.pkg.as_str()].id.as_str())
             .collect()
     }
@@ -461,14 +549,20 @@ impl<'m> Graph<'m> {
     /// Run cargo's feature algorithm over `kinds` edges from `roots`, each root
     /// taken with its default features, and report the activated graph.
     fn resolve(&self, roots: &[&'m str], kinds: &[Option<&str>]) -> Resolved<'m> {
+        // An empty root set resolves to an empty graph, and an empty graph
+        // satisfies every "nothing forbidden is reachable" rule in this file.
+        // Whatever produced it is a bug here, not a clean tree.
+        assert!(
+            !roots.is_empty(),
+            "resolve() was asked for the closure of no packages at all, which would report \
+             every absence rule clean while proving nothing"
+        );
         let mut requested: BTreeMap<&'m str, BTreeSet<String>> = BTreeMap::new();
         let mut with_defaults: BTreeSet<&'m str> = BTreeSet::new();
         let mut edges: BTreeMap<&'m str, BTreeSet<&'m str>> = BTreeMap::new();
-        let mut reached: BTreeSet<&'m str> = BTreeSet::new();
         for root in roots {
             requested.entry(root).or_default();
             with_defaults.insert(root);
-            reached.insert(root);
         }
 
         loop {
@@ -482,9 +576,16 @@ impl<'m> Graph<'m> {
                 }
                 let (deps_on, dep_features) = close_features(&table, &want);
 
+                // Cargo builds a package's dev-dependencies only when that
+                // package is the one being tested, so a dev edge is followed
+                // out of a root and out of nothing else.
+                let is_root = roots.contains(&id);
                 let mut out: BTreeSet<&'m str> = BTreeSet::new();
                 for dep in &pkg.dependencies {
                     if !kinds.contains(&dep.kind.as_deref()) {
+                        continue;
+                    }
+                    if dep.kind.as_deref() == Some("dev") && !is_root {
                         continue;
                     }
                     if dep.optional && !deps_on.contains(dep.local_name()) {
@@ -492,6 +593,9 @@ impl<'m> Graph<'m> {
                     }
                     for target in self.edge_targets(id, dep) {
                         out.insert(target);
+                        // A package reached for the first time is processed on
+                        // the next sweep, so its arrival is itself a change.
+                        let first_sighting = !requested.contains_key(target);
                         let entry = requested.entry(target).or_default();
                         let before = entry.len();
                         entry.extend(dep.features.iter().cloned());
@@ -500,7 +604,7 @@ impl<'m> Graph<'m> {
                         }
                         changed |= entry.len() != before;
                         changed |= dep.uses_default_features && with_defaults.insert(target);
-                        changed |= reached.insert(target);
+                        changed |= first_sighting;
                     }
                 }
                 if edges.get(id) != Some(&out) {
@@ -576,8 +680,8 @@ fn close_features(
 }
 
 impl<'m> Resolved<'m> {
-    /// The names of every package reachable from the roots.
-    fn reachable(&self, g: &Graph<'m>) -> BTreeSet<&'m str> {
+    /// The package ids reachable from the roots.
+    fn ids(&self) -> BTreeSet<&'m str> {
         let mut seen: BTreeSet<&'m str> = self.roots.iter().copied().collect();
         let mut queue: VecDeque<&'m str> = self.roots.iter().copied().collect();
         while let Some(id) = queue.pop_front() {
@@ -587,7 +691,12 @@ impl<'m> Resolved<'m> {
                 }
             }
         }
-        seen.into_iter().map(|id| g.name(id)).collect()
+        seen
+    }
+
+    /// The names of every package reachable from the roots.
+    fn reachable(&self, g: &Graph<'m>) -> BTreeSet<&'m str> {
+        self.ids().into_iter().map(|id| g.name(id)).collect()
     }
 
     /// One shortest dependency path, as package names, from a root to each
@@ -643,6 +752,26 @@ fn default_member_ids(meta: &Metadata) -> Vec<&str> {
         .iter()
         .map(String::as_str)
         .collect()
+}
+
+/// The smallest default-build closure that is not a collapse.
+///
+/// Every absence rule over the default build reports clean on an empty graph,
+/// and a resolver that stopped following edges at all would produce one. The
+/// closure is around 470 packages as this is written, so a floor of 100 cannot
+/// be reached by anything but a genuine break; it is a collapse detector, not
+/// a budget, and nothing here asserts the measured figure.
+const DEFAULT_BUILD_FLOOR: usize = 100;
+
+/// Panic unless the closure is large enough to be real.
+fn refuse_a_collapsed_closure(resolved: &Resolved<'_>, g: &Graph<'_>) {
+    let reached = resolved.reachable(g).len();
+    assert!(
+        reached >= DEFAULT_BUILD_FLOOR,
+        "the default-build closure came to {reached} packages, under the floor of \
+         {DEFAULT_BUILD_FLOOR}. Every absence rule stated over this set would report clean, so \
+         this reads as a resolver that stopped following edges rather than as a lean tree."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -713,14 +842,21 @@ fn the_resolver_covers_every_package_cargo_tree_reports() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    // Each line is `<name> v<version>[ (<source>)][ (*)]`; the leading name is
-    // all this needs, and a duplicate line collapses into the set.
-    let reported: BTreeSet<&str> = std::str::from_utf8(&out.stdout)
+    // Each line is `<name> v<version>[ (<source>)][ (*)]`. Name AND version,
+    // because `edge_targets` answers an ambiguous join with every candidate:
+    // comparing names alone would let a spurious second version of a package
+    // stand in for the version cargo actually resolved.
+    let reported: BTreeSet<(&str, &str)> = std::str::from_utf8(&out.stdout)
         .expect("cargo tree emits UTF-8")
         .lines()
         .filter_map(|line| line.split_once(" v"))
-        .map(|(name, _)| name.trim())
-        .filter(|name| !name.is_empty())
+        .map(|(name, rest)| {
+            (
+                name.trim(),
+                rest.split_whitespace().next().unwrap_or("").trim(),
+            )
+        })
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
         .collect();
     assert!(
         reported.len() > 100,
@@ -732,13 +868,19 @@ fn the_resolver_covers_every_package_cargo_tree_reports() {
 
     let meta = metadata();
     let g = Graph::new(meta);
-    let computed = g.resolve(&default_member_ids(meta), NORMAL).reachable(&g);
-    let missing: Vec<&&str> = reported.difference(&computed).collect();
+    let resolved = g.resolve(&default_member_ids(meta), NORMAL);
+    let computed: BTreeSet<(&str, &str)> = resolved
+        .ids()
+        .into_iter()
+        .map(|id| (g.name(id), g.version(id)))
+        .collect();
+    let missing: Vec<&(&str, &str)> = reported.difference(&computed).collect();
     assert!(
         missing.is_empty(),
         "cargo resolves {} package(s) into the default build that this file's resolver does \
          not see: {missing:?}. Every rule here is stated over that set, so a package missing \
-         from it is a place a forbidden crate can sit unreported.",
+         from it is a place a forbidden crate can sit unreported. The fix is in this file's \
+         resolver, not in the tree: start at close_features and Graph::resolve.",
         missing.len(),
     );
 }
@@ -761,9 +903,9 @@ fn the_resolver_covers_every_package_cargo_tree_reports() {
 fn default_member_build_is_iroh_free() {
     let meta = metadata();
     let g = Graph::new(meta);
-    let paths = g
-        .resolve(&default_member_ids(meta), NORMAL_AND_BUILD)
-        .violations(&g, None, is_iroh_family);
+    let resolved = g.resolve(&default_member_ids(meta), NORMAL_AND_BUILD);
+    refuse_a_collapsed_closure(&resolved, &g);
+    let paths = resolved.violations(&g, None, is_iroh_family);
     assert!(
         paths.is_empty(),
         "the default build reaches the iroh tree. A `cargo build` with no `-p` must stay \
@@ -804,6 +946,38 @@ fn netd_per_package_build_pulls_the_iroh_wan_plane() {
     );
 }
 
+/// SOURCE SENTENCE. Root `Cargo.toml`, the `default-members` comment: "`cargo
+/// build` / `cargo test` with no `-p`/`--workspace` operate on THIS set, so
+/// NEITHER the rerun SDK NOR the iroh tree is compiled on a plain build."
+///
+/// The sentence names two commands and the rules above cover one of them.
+/// `cargo test` additionally compiles each default member's own
+/// `[dev-dependencies]`, and that is not a theoretical extra edge:
+/// `cerulion_cli_engine` dev-depends by path on `cerulion_accountd`, a member
+/// held out of `default-members` to keep the web stack out of a plain build.
+/// Nothing on that path reaches a forbidden family today, which is what makes
+/// this the right moment to pin it.
+#[test]
+fn a_plain_cargo_test_compiles_no_iroh_and_no_rerun() {
+    let meta = metadata();
+    let g = Graph::new(meta);
+    let resolved = g.resolve(&default_member_ids(meta), NORMAL_BUILD_AND_ROOT_DEV);
+    refuse_a_collapsed_closure(&resolved, &g);
+    for (label, pred) in [
+        ("the iroh tree", is_iroh_family as NamePredicate),
+        ("the Rerun SDK", is_rerun_family),
+    ] {
+        let paths = resolved.violations(&g, None, pred);
+        assert!(
+            paths.is_empty(),
+            "`cargo test` with no `-p` compiles {label}, through a DEV dependency of a default \
+             member. Dev-depend on the heavy crate from the heavy crate's own tests instead, so \
+             the edge points away from the default build.\nPaths:\n  {}",
+            paths.join("\n  "),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rule: the default build stays rerun-free; the desk viz lib still pulls rerun.
 // ---------------------------------------------------------------------------
@@ -819,9 +993,9 @@ fn netd_per_package_build_pulls_the_iroh_wan_plane() {
 fn default_member_build_is_rerun_free() {
     let meta = metadata();
     let g = Graph::new(meta);
-    let paths = g
-        .resolve(&default_member_ids(meta), NORMAL_AND_BUILD)
-        .violations(&g, None, is_rerun_family);
+    let resolved = g.resolve(&default_member_ids(meta), NORMAL_AND_BUILD);
+    refuse_a_collapsed_closure(&resolved, &g);
+    let paths = resolved.violations(&g, None, is_rerun_family);
     assert!(
         paths.is_empty(),
         "the default build reaches the Rerun SDK. Rasterization is desk-side: keep \
@@ -882,20 +1056,35 @@ fn the_robot_demo_workspace_is_rerun_free() {
          from there (see tf_source_e2e_test.rs), not the other way round."
     );
 
-    let manifests = workspace_manifests(&go2);
-    assert!(
-        manifests.len() >= 3,
-        "the examples/go2 manifest walk found {} manifests, so it is not walking the \
-         workspace it claims to walk",
-        manifests.len(),
-    );
+    // The walk refuses an empty glob expansion itself, so what is left to
+    // check here is that it reached the crates the controls name. A count
+    // floor would be a magic number; these two are the demo's producer nodes,
+    // and they are what the rerun incident was about.
+    let manifests = robot_manifests(&go2);
+    for required in [
+        go2.join("nodes/dds_bridge"),
+        go2.join("nodes/go2_tf_source"),
+        // Outside the workspace, and the reason the walk follows `path`:
+        // this crate lives in the viz directory and ships to the robot.
+        repo_root().join("crates/cerulion_viz/lib/go2_tf"),
+    ] {
+        let wanted = required.join("Cargo.toml");
+        assert!(
+            manifests.contains(&wanted),
+            "the robot manifest walk did not reach {}, so it is not reading what it claims \
+             to read. Check the `members` patterns in examples/go2/Cargo.toml and the `path` \
+             dependencies the demo's nodes declare.",
+            wanted.display(),
+        );
+    }
     for manifest in manifests {
         let declared = declared_dependencies(&manifest);
         let offending: Vec<&String> = declared.iter().filter(|n| is_desk_viz(n)).collect();
         assert!(
             offending.is_empty(),
-            "{} declares {offending:?}. No examples/go2 crate may take a viz or rerun dependency of \
-             any kind, dev-dependencies included.",
+            "{} declares {offending:?}. Nothing the robot builds may take a viz or rerun \
+             dependency of any kind, dev-dependencies included. That covers the demo's own \
+             crates and every crate they reach by `path`.",
             manifest.display(),
         );
     }
@@ -907,23 +1096,42 @@ fn the_robot_demo_workspace_is_rerun_free() {
 /// tempfile is a dev-only dependency of examples/go2's dds_bridge and MUST be
 /// reachable under '-e normal,dev'."
 ///
-/// The same two controls against the same two packages, for the reader above:
-/// `go2_tf` proves it is reading the robot workspace and not the root one, and
-/// `tempfile`, reachable in that workspace only through a dev edge, proves
-/// dev-only packages are visible to it at all.
+/// The rule above has two halves and each gets the control that fits it.
+///
+///   * the LOCKFILE half is checked with `go2_tf`, a normal dependency of the
+///     demo's producer nodes: it proves the reader is on the robot workspace
+///     and not the root one (CI's (c2));
+///   * the MANIFEST half is checked with `tempfile`, which `dds_bridge`
+///     declares ONLY under `[dev-dependencies]`: it proves
+///     [`collect_dependency_names`] descends into that table (CI's (c3)).
+///
+/// The second control has to be the manifest one. A lockfile lists every
+/// package in the resolve whatever edge brought it in, so finding `tempfile`
+/// there says nothing at all about whether anything in this file can see a dev
+/// edge. Narrowing `collect_dependency_names` to `key == "dependencies"` is the
+/// edit that reopens the hole L15 closed, and only this arm catches it.
 #[test]
 fn the_robot_workspace_reader_sees_normal_and_dev_packages() {
-    let locked = lockfile_packages(&repo_root().join("examples/go2/Cargo.lock"));
-    for (pkg, why) in [
-        ("go2_tf", "a normal dependency of the demo's producer nodes"),
-        ("tempfile", "a DEV-only dependency of the demo's dds_bridge"),
-    ] {
-        assert!(
-            locked.iter().any(|n| n == pkg),
-            "examples/go2/Cargo.lock does not list `{pkg}` ({why}), so the rerun rule above is \
-             reading the wrong file, or a lockfile that no longer covers this workspace"
-        );
-    }
+    let go2 = repo_root().join("examples/go2");
+
+    let locked = lockfile_packages(&go2.join("Cargo.lock"));
+    assert!(
+        locked.iter().any(|n| n == "go2_tf"),
+        "examples/go2/Cargo.lock does not list `go2_tf`, a normal dependency of the demo's \
+         producer nodes, so the lockfile half of the rule above is reading the wrong file or a \
+         lockfile that no longer covers this workspace"
+    );
+
+    let dds_bridge = go2.join("nodes/dds_bridge/Cargo.toml");
+    assert!(
+        declared_dependencies(&dds_bridge).contains("tempfile"),
+        "{} declares `tempfile` under [dev-dependencies] and the manifest reader did not see \
+         it, so the manifest half of the rule above no longer traverses dev dependencies. That \
+         is the one edge kind the robot rule exists for: check that \
+         `collect_dependency_names` still matches every table whose name ends in \
+         \"dependencies\", not just `[dependencies]`.",
+        dds_bridge.display(),
+    );
 }
 
 /// Every package name in a lockfile.
@@ -940,6 +1148,94 @@ fn lockfile_packages(path: &Path) -> Vec<String> {
         .filter_map(|line| line.strip_suffix('"'))
         .map(str::to_string)
         .collect()
+}
+
+/// Every manifest the robot workspace builds from: its own members, and the
+/// crates they reach by `path`, however far outside the workspace those sit.
+///
+/// The members alone are not the robot's code. `examples/go2`'s producer nodes
+/// path-depend on `crates/cerulion_viz/lib/go2_tf`, which lives inside the viz
+/// directory, and on `crates/cerulion_core`; a rerun dependency added to one of
+/// those ships to the robot exactly as one added to a node does, and a walk
+/// over members only would not read the manifest it was added to.
+///
+/// Dev edges are followed OUT OF A MEMBER and no further. A robot crate's own
+/// test dependencies ship to the robot's build; the test dependencies of a
+/// library it links do not, and following those would drag in most of the
+/// repository and red this rule for something that never reaches a robot.
+fn robot_manifests(root: &Path) -> Vec<PathBuf> {
+    let mut queue: Vec<(PathBuf, bool)> = workspace_manifests(root)
+        .into_iter()
+        .map(|m| (lexically_normal(m), true))
+        .collect();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    while let Some((manifest, is_member)) = queue.pop() {
+        if !manifest.is_file() || !seen.insert(manifest.clone()) {
+            continue;
+        }
+        out.push(manifest.clone());
+        let dir = manifest.parent().expect("a manifest has a directory");
+        for path in path_dependencies(&manifest, is_member) {
+            queue.push((lexically_normal(dir.join(path).join("Cargo.toml")), false));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `path` with `.` and `..` resolved textually, no filesystem access.
+///
+/// A manifest reached through `../../../../crates/...` is the same file as one
+/// named from the repository root, and only a normalized form says so. Without
+/// this the walk still READS the right manifests and still scans them, but the
+/// control that asserts it reached a named crate compares two spellings of one
+/// path and fails. Textual rather than `canonicalize`, because resolving
+/// symlinks would answer a different question than the manifests ask.
+fn lexically_normal(path: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Every `path = "..."` a manifest declares, with dev entries included only
+/// when `follow_dev` is set.
+fn path_dependencies(manifest: &Path, follow_dev: bool) -> Vec<String> {
+    let text = std::fs::read_to_string(manifest)
+        .unwrap_or_else(|e| panic!("could not read {} ({e})", manifest.display()));
+    let doc: toml::Table = text
+        .parse()
+        .unwrap_or_else(|e| panic!("{} is not valid TOML ({e})", manifest.display()));
+    let mut out = Vec::new();
+    collect_path_dependencies(&doc, follow_dev, &mut out);
+    out
+}
+
+fn collect_path_dependencies(table: &toml::Table, follow_dev: bool, out: &mut Vec<String>) {
+    for (key, value) in table {
+        if key.ends_with("dependencies") {
+            if key == "dev-dependencies" && !follow_dev {
+                continue;
+            }
+            if let Some(deps) = value.as_table() {
+                for spec in deps.values() {
+                    if let Some(path) = spec.get("path").and_then(toml::Value::as_str) {
+                        out.push(path.to_string());
+                    }
+                }
+            }
+        } else if let Some(sub) = value.as_table() {
+            collect_path_dependencies(sub, follow_dev, out);
+        }
+    }
 }
 
 /// Every `Cargo.toml` of a workspace: the root manifest and each member,
@@ -968,12 +1264,23 @@ fn workspace_manifests(root: &Path) -> Vec<PathBuf> {
                 let listing = std::fs::read_dir(root.join(dir)).unwrap_or_else(|e| {
                     panic!("`{pattern}` names {dir}, which cannot be listed ({e})")
                 });
+                let mut found = 0usize;
                 for entry in listing {
                     let path = entry.expect("a readable directory entry").path();
                     if path.join("Cargo.toml").is_file() {
                         out.push(path.join("Cargo.toml"));
+                        found += 1;
                     }
                 }
+                // A glob that expands to nothing is how this walk goes quiet:
+                // every rule stated over it would pass with no crate examined.
+                assert!(
+                    found > 0,
+                    "the member pattern `{pattern}` in {}/Cargo.toml expanded to no crate at \
+                     all. Either the directory moved, or every rule stated over this \
+                     workspace is examining nothing.",
+                    root.display(),
+                );
             }
             None => {
                 assert!(
@@ -1004,6 +1311,12 @@ fn declared_dependencies(manifest: &Path) -> BTreeSet<String> {
 }
 
 /// Walk a manifest table for every `*dependencies` table, however nested.
+///
+/// Two things it deliberately does not report. A `[patch]` or `[replace]`
+/// entry redirects an existing dependency rather than declaring one, so it is
+/// not a name this crate takes on; and a dependency is keyed by NAME, so a
+/// `path` or `git` source pointing at a forbidden crate under an innocuous key
+/// is invisible here. The lockfile arm of the same rule catches both.
 fn collect_dependency_names(table: &toml::Table, out: &mut BTreeSet<String>) {
     for (key, value) in table {
         if key.ends_with("dependencies") {
@@ -1063,14 +1376,21 @@ fn the_dds_stack_is_confined_to_cerulion_dds() {
         );
     }
 
-    let resolved = g.resolve(&default_member_ids(meta), NORMAL_AND_BUILD);
+    // Rooted at EVERY member, not only the default ones. A non-default member
+    // reaching the DDS stack through an intermediate crate declares no DDS
+    // dependency of its own, so the scan above cannot see it, and a walk that
+    // started at the default members would never visit it either.
+    let all_members: Vec<&str> = meta.workspace_members.iter().map(String::as_str).collect();
+    let resolved = g.resolve(&all_members, NORMAL_AND_BUILD);
+    refuse_a_collapsed_closure(&resolved, &g);
     let dds = g.member("cerulion_dds");
     let bypassing = resolved.violations(&g, Some(dds), is_dds_stack);
     assert!(
         bypassing.is_empty(),
-        "the default build reaches the DDS stack without going through cerulion_dds, so \
-         cerulion_dds is no longer the single flip point its AGENTS.md promises.\n\
-         Paths:\n  {}",
+        "a workspace member reaches the DDS stack without going through cerulion_dds, so \
+         cerulion_dds is no longer the single flip point its AGENTS.md promises. Route the \
+         edge through cerulion_dds, or move the consumer's DDS use into cerulion_dds and \
+         depend on the plain types it re-exports.\nPaths:\n  {}",
         bypassing.join("\n  "),
     );
 }
@@ -1121,7 +1441,11 @@ fn the_confined_crates_reach_nothing_they_forbid() {
     let g = Graph::new(metadata());
     for rule in CONFINED_CRATES {
         let root = g.member(rule.package);
-        let resolved = g.resolve(&[root], NORMAL_AND_BUILD);
+        // Dev edges out of the crate itself, because `cargo test -p <crate>`
+        // compiles them: a dev-dependency on an intermediate crate that pulls
+        // the forbidden family is a path the declaration scan below cannot
+        // see, since all it reads there is the intermediate crate's name.
+        let resolved = g.resolve(&[root], NORMAL_BUILD_AND_ROOT_DEV);
         let declared: BTreeSet<&str> = g.by_id[root]
             .dependencies
             .iter()
@@ -1131,7 +1455,7 @@ fn the_confined_crates_reach_nothing_they_forbid() {
             let paths = resolved.violations(&g, None, *pred);
             assert!(
                 paths.is_empty(),
-                "`cargo build -p {}` reaches {label}.\nRULE: {}\nPaths:\n  {}",
+                "`cargo test -p {}` reaches {label}.\nRULE: {}\nPaths:\n  {}",
                 rule.package,
                 rule.source,
                 paths.join("\n  "),
@@ -1167,6 +1491,23 @@ fn the_heavy_members_stay_out_of_default_members() {
         .map(|id| g.name(id))
         .collect();
     let members: BTreeSet<&str> = meta.workspace_members.iter().map(|id| g.name(id)).collect();
+
+    // Both directions, so neither half of the list can go stale on its own.
+    let declared: BTreeSet<&str> = EXCLUDED_FROM_DEFAULT_MEMBERS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    let unaccounted: Vec<&&str> = members
+        .difference(&default)
+        .filter(|name| !declared.contains(**name))
+        .collect();
+    assert!(
+        unaccounted.is_empty(),
+        "{unaccounted:?} left `default-members` and nothing here says why. A member drops out \
+         of the default build for a reason; write the reason into \
+         EXCLUDED_FROM_DEFAULT_MEMBERS, or put the member back."
+    );
+
     for (package, what_it_pulls) in EXCLUDED_FROM_DEFAULT_MEMBERS {
         assert!(
             members.contains(package),
@@ -1200,6 +1541,11 @@ fn the_heavy_members_stay_out_of_default_members() {
 ///     see;
 ///   * `cerulion_viz` reaches the Rerun SDK.
 ///
+/// The netd root repeats what [`netd_per_package_build_pulls_the_iroh_wan_plane`]
+/// already asserts, and that is deliberate: this test must keep proving the
+/// checker fires on an optional default-on edge even if the netd rule is ever
+/// retired, so it does not lean on it.
+///
 /// Each answer must also be a PATH from the named root, so the failure text the
 /// rules print is proven to carry the edge a reader has to delete.
 #[test]
@@ -1221,8 +1567,10 @@ fn the_checker_reports_a_forbidden_crate_when_one_is_present() {
              can find nothing anywhere, none of them proves a thing."
         );
         let first = &paths[0];
+        // The first SEGMENT, not a prefix: `cerulion_viz` is a prefix of
+        // `cerulion_vizd`, so a path rooted at the wrong crate would pass.
         assert!(
-            first.starts_with(package) && first.contains(" -> "),
+            first.split(" -> ").next() == Some(package) && first.contains(" -> "),
             "the checker reported `{first}` for {package}, which is not a path from that root: \
              a violation nobody can trace back to an edge is a red nobody can fix"
         );
