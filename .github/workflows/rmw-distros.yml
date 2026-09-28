@@ -87,6 +87,7 @@ jobs:
       - name: Self-test the gate's log harvester
         run: bash tools/ci/rmw-distros/gate_selftest.sh
       - name: Cache cargo (restore)
+        id: cache-restore-1
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -106,7 +107,7 @@ jobs:
       # restore what it saved, and the upload only adds eviction pressure on the
       # store.
       - name: Cache cargo (save)
-        if: github.event_name != 'merge_group'
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
