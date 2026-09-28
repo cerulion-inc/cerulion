@@ -623,9 +623,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -882,9 +883,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-cross-aarch64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-cross-aarch64-
+            cargo-cross-aarch64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-cross-aarch64-main-
 
       - name: cargo check (aarch64-unknown-linux-gnu)
         run: cargo check -p cerulion_core --target aarch64-unknown-linux-gnu
@@ -927,9 +929,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-msrv-1.93-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-msrv-1.93-
+            cargo-msrv-1.93-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-msrv-1.93-main-
 
       - name: cargo check (workspace, MSRV 1.93.0)
         run: cargo +1.93.0 check --workspace --all-targets
@@ -963,9 +966,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             examples/*/target
-          key: cargo-examples-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'examples/**/Cargo.toml') }}
+          key: cargo-examples-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/**/Cargo.toml') }}
           restore-keys: |
-            cargo-examples-${{ runner.os }}-
+            cargo-examples-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-examples-${{ runner.os }}-main-
 
       # Each example is its OWN workspace with its OWN lockfile + target dir
       # (isolated workspaces resolve fresh), so check them one at a time from
@@ -1074,9 +1078,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             examples/go2/target
-          key: cargo-examples-go2-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'examples/go2/**/Cargo.toml') }}
+          key: cargo-examples-go2-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/go2/**/Cargo.toml') }}
           restore-keys: |
-            cargo-examples-go2-${{ runner.os }}-
+            cargo-examples-go2-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-examples-go2-${{ runner.os }}-main-
 
       # COMPILE EVERYTHING FIRST — `--tests`, because a plain `cargo build`
       # builds no test target at all. A cerulion_core API change that breaks a
@@ -1325,7 +1330,7 @@ jobs:
           toolchain: stable
 
       # ONE SAVER, CHOSEN RATHER THAN RACED. All four legs of this matrix share
-      # `cargo-${{ runner.os }}-<lockhash>`, and `actions/cache` RESERVES a key
+      # `cargo-${{ runner.os }}-<main|pr>-<lockhash>`, and `actions/cache` RESERVES a key
       # at save time: whichever leg finishes first wins, the other three upload
       # a multi-gigabyte archive that is then rejected ("another job may be
       # creating this cache"), and the archive that lands is whichever leg's
@@ -1333,9 +1338,19 @@ jobs:
       # Shard 0 saves; shards 1-3 restore only.
       #
       # NOT a per-shard key, deliberately: `target/` for this workspace runs to
-      # several GB, GitHub evicts a repository's caches against a 10 GB total,
-      # and four archives per OS per lockfile would have the shards evicting
-      # each other AND every other job's namespace. One archive, one writer.
+      # several GB, the repository's cache store has a fixed total (40 GB), and
+      # four archives per OS per lockfile would have the shards evicting each
+      # other AND every other job's namespace. One archive, one writer.
+      #
+      # BRANCH-QUALIFIED, because the reservation is per KEY across every ref: a
+      # pull request that saved `cargo-<os>-<lockhash>` first made every later
+      # save of that key fail with the same "another job may be creating this
+      # cache", from any branch, while a run on `main` may restore only entries
+      # created on `main`. So `main` never restored anything and never saved
+      # anything (measured: no `main` entry existed two days after the store was
+      # emptied). `main` and pull requests now save under different keys, and
+      # `restore-keys` lists the `main` key second so a pull request or a
+      # merge-queue build restores `main`'s archive when its own is missing.
       #
       # WHICH leg writes is a FIXED PICK, not a measured optimum, and shard 0
       # is a defensible one rather than the best one. It carries `--lib` and
@@ -1368,9 +1383,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
 
       - name: Restore cargo (shards 1-3, no save)
         if: matrix.shard != 0
@@ -1380,9 +1396,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
       # cargo doesn't treat them as deps of the test crates). `--workspace`
@@ -1930,7 +1947,7 @@ jobs:
           toolchain: stable
 
       # ONE SAVER, CHOSEN RATHER THAN RACED. Both legs of this matrix share
-      # `cargo-${{ runner.os }}-<lockhash>`, and `actions/cache` RESERVES a key
+      # `cargo-${{ runner.os }}-<main|pr>-<lockhash>`, and `actions/cache` RESERVES a key
       # at save time: whichever leg finishes first wins, the other uploads a
       # multi-gigabyte archive that is then rejected ("another job may be
       # creating this cache"), and the archive that lands is whichever leg's
@@ -1939,9 +1956,19 @@ jobs:
       # Linux twin above runs four, and its copy of this block says "four".)
       #
       # NOT a per-shard key, deliberately: `target/` for this workspace runs to
-      # several GB, GitHub evicts a repository's caches against a 10 GB total,
-      # and four archives per OS per lockfile would have the shards evicting
-      # each other AND every other job's namespace. One archive, one writer.
+      # several GB, the repository's cache store has a fixed total (40 GB), and
+      # four archives per OS per lockfile would have the shards evicting each
+      # other AND every other job's namespace. One archive, one writer.
+      #
+      # BRANCH-QUALIFIED, because the reservation is per KEY across every ref: a
+      # pull request that saved `cargo-<os>-<lockhash>` first made every later
+      # save of that key fail with the same "another job may be creating this
+      # cache", from any branch, while a run on `main` may restore only entries
+      # created on `main`. So `main` never restored anything and never saved
+      # anything (measured: no `main` entry existed two days after the store was
+      # emptied). `main` and pull requests now save under different keys, and
+      # `restore-keys` lists the `main` key second so a pull request or a
+      # merge-queue build restores `main`'s archive when its own is missing.
       #
       # WHICH leg writes is a FIXED PICK, not a measured optimum, and shard 0
       # is a defensible one rather than the best one. It carries `--lib` and
@@ -1969,9 +1996,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
 
       - name: Restore cargo (shards 1-2, no save)
         if: matrix.shard != 0
@@ -1981,9 +2009,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
       # cargo doesn't treat them as deps of the test crates). `--workspace`
@@ -2306,9 +2335,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-crates-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-crates-${{ runner.os }}-
+            cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-crates-${{ runner.os }}-main-
 
       # One step per package, deliberately: a single multi-`-p` invocation
       # reports one red for nine packages and makes the log hard to attribute,
@@ -2408,9 +2438,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-release-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-release-${{ runner.os }}-
+            cargo-release-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-release-${{ runner.os }}-main-
 
       # `--nocapture` on both: these two tests PRINT their measurements
       # (`floor=… median=… p99=…`, `ratio=…x`, the per-payload user-POV table),
@@ -2546,9 +2577,10 @@ jobs:
           # test-latency) so it never shares a cache with the debug-profile
           # test-linux/test-macos jobs — a debug restore would force a full
           # release rebuild and risk tripping the 30-min timeout.
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-release-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-release-${{ runner.os }}-
+            cargo-release-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-release-${{ runner.os }}-main-
 
       # The test itself runs `cargo build -p cerulion_cli --release` + builds
       # the node cdylibs internally (also release), so NO separate build step
@@ -2588,9 +2620,10 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin/cargo-fuzz
             target
-          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-fuzz-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-fuzz-${{ runner.os }}-
+            cargo-fuzz-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-fuzz-${{ runner.os }}-main-
 
       - name: Install cargo-fuzz (skipped when cache-restored)
         run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
@@ -2668,9 +2701,10 @@ jobs:
             ~/.cargo/git
             ~/.cache/miri
             target
-          key: cargo-miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-miri-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-miri-${{ runner.os }}-
+            cargo-miri-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-miri-${{ runner.os }}-main-
 
       - name: Miri setup (download std sources)
         run: cargo miri setup
@@ -2732,9 +2766,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
 
       - name: Check documentation
         run: cargo doc --workspace --no-deps
@@ -2786,9 +2821,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
 
       - name: Clippy (cerulion_netd --features wan)
         run: cargo clippy -p cerulion_netd --features wan --all-targets -- -D warnings
@@ -2836,9 +2872,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-iroh-leanness-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-iroh-leanness-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-iroh-leanness-
+            cargo-iroh-leanness-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-iroh-leanness-main-
 
       - name: Assert default build is iroh-free and shipped netd includes wan
         run: |
@@ -2925,9 +2962,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-rerun-leanness-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-rerun-leanness-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-rerun-leanness-
+            cargo-rerun-leanness-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-rerun-leanness-main-
 
       - name: Assert the robot and the default build stay rerun-free
         run: |
@@ -3398,9 +3436,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-viz-${{ matrix.lane }}-${{ runner.os }}-
+            cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-viz-${{ matrix.lane }}-${{ runner.os }}-main-
             cargo-viz-${{ runner.os }}-
 
       # PARALLEL by design — see the classification in the job comment. Runs the
