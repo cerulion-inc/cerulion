@@ -41,24 +41,28 @@
 //! SAME cwd and so builds its node under the SAME private root, and it
 //! refuses to run unless its own global config proves that took.
 //!
-//! Every arm passes `--report-only`, and the boundary arm DEPENDS on a product
-//! defect while it stands: `clean_dead_nodes` calls
-//! `cleanup_dead_iceoryx2_nodes_with_diagnostics` before it reads the flag at
-//! all, so the destructive dead-node sweep runs whether or not
-//! `--report-only` was given, which is what lets the arm below watch a planted
-//! node be REMOVED under the flag. That is issue #116, filed rather than fixed
-//! here (a flag that promises to report and then deletes is a product change
-//! and gets its own pass). WHOEVER FIXES #116 must revisit the boundary arm:
-//! the sweep observation has to move to whatever path then performs the sweep,
-//! or the arm goes inert.
+//! ## Why every arm here passes `--report-only`
 //!
-//! The flag is still what every arm passes, because the one population no
-//! config can move is the `/tmp/*.shm_state` files, and `--report-only` keeps
-//! that half a bounded READ rather than a machine-wide reclamation a test has
-//! no business performing. Not confinable, and not for want of trying:
+//! NO ARM MAY RUN A BARE `cerulion clean`, and the private root does not make
+//! one safe. The node registry is confinable; the `/tmp/*.shm_state`
+//! population is not, and a bare run reclaims it MACHINE WIDE, unlinking
+//! every state file whose creator is provably gone whatever else on the host
+//! owns it. Not confinable, and not for want of trying:
 //! `shm_state::SHM_STATE_DIRECTORY` is the compile-time constant `"/tmp/"`
 //! mirroring `iceoryx2_pal_configuration::TEMP_DIRECTORY`, iceoryx2 honours no
-//! `TMPDIR`, and the binary reads no environment variable for it.
+//! `TMPDIR`, and the binary reads no environment variable for it. So a test
+//! that ran the verb bare would delete other workloads' shared memory state
+//! as a side effect of `cargo test`, which is why these arms drive only the
+//! flag that provably touches nothing.
+//!
+//! That leaves the destructive half to be proven somewhere it CAN be
+//! confined, and there is such a place: `ipc_cleanup::sweep_dead_nodes_with_config`
+//! takes the registry config explicitly and never reaches the state-file pass
+//! at all, which lives above it in the verb. The three arms that watch a real
+//! removal therefore live in
+//! `crates/cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs`, over that
+//! crate's isolated root. What stays here is what only the real binary can
+//! show: the LINES a user reads, and the registry unchanged beneath them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -175,6 +179,27 @@ impl PrivateRegistry {
             if entries == 1 { "y" } else { "ies" },
             self.nodes_dir().display()
         )
+    }
+
+    /// Hand oracle for the would-remove heading `cerulion clean --report-only`
+    /// prints over a registry holding `dead` dead nodes, transcribed from
+    /// `render_would_remove` rather than read back off it.
+    fn would_remove_heading(&self, dead: usize) -> String {
+        format!(
+            "Dead iceoryx2 node(s) `cerulion clean` would sweep: {dead} under {} (report only; \
+             none was removed)",
+            self.nodes_dir().display()
+        )
+    }
+
+    /// Every top-level entry of the node-registry directory: the population
+    /// `cerulion clean`'s registry line counts. Counted here by this file's
+    /// own `read_dir` rather than read back off the engine, so the count in
+    /// the oracle is independently derived.
+    fn registry_entries(&self) -> u64 {
+        std::fs::read_dir(self.nodes_dir())
+            .map(|entries| entries.flatten().count() as u64)
+            .unwrap_or(0)
     }
 
     /// The registered nodes: the top-level DIRECTORIES of the node-registry
@@ -361,6 +386,23 @@ const NOTHING_TO_CLEAN: &str = "No dead iceoryx2 nodes found — nothing to clea
 /// The whole summary line the same renderer prints for one reclaimed node and
 /// no refusals.
 const ONE_NODE_CLEANED: &str = "Cleaned 1 dead iceoryx2 node(s); 0 cleanup(s) failed.";
+/// The whole closing line every `--report-only` run prints, transcribed by
+/// hand from `clean_iceoryx2_state`.
+const NOTHING_WAS_REMOVED: &str =
+    "Report only: nothing was removed. Run `cerulion clean` without `--report-only` to act on \
+     everything listed above.";
+/// The whole line that keeps the would-sweep listing from over-promising,
+/// transcribed by hand from `REMOVAL_CAN_STILL_BE_REFUSED`.
+const REMOVAL_CAN_STILL_BE_REFUSED: &str =
+    "  (what the sweep would ATTEMPT, not a promise each one comes off: iceoryx2 reports \
+     insufficient permissions or a version mismatch only when it tries to remove a node, which \
+     a report does not do)";
+/// The whole line a report prints where a destructive run lists the orphan
+/// port tags it reclaimed, transcribed by hand from `ORPHAN_TAGS_NOT_LISTED`.
+const ORPHAN_TAGS_NOT_LISTED: &str =
+    "Orphan port tags: not listed by a report. iceoryx2 identifies one by the refusal it \
+     raises while removing the tag's node, and this run removed nothing. A run without \
+     `--report-only` lists and reclaims them.";
 
 /// Assert `stdout` carries `line` as a WHOLE line, not as a substring of a
 /// longer one: the counts and the paths in these reports are the content, and
@@ -516,86 +558,100 @@ fn clean_happy_path_reports_nothing_to_clean() {
         &registry.registry_line_when_absent(),
         "the registry the sweep looked in",
     );
+    // "nothing to clean" and "nothing was removed" are different claims, and
+    // the flag asked for the second one too.
+    assert_reports_line(&stdout, NOTHING_WAS_REMOVED, "the report's closing claim");
     assert_never_names_the_machines_registry(&stdout);
 }
 
-/// The boundary the isolation is worth anything at: a dead node planted under
-/// THIS arm's private root is swept, and a dead node planted under a SECOND
-/// private root is left exactly as it was.
+/// `cerulion clean --report-only` over a private root holding ONE planted dead
+/// node: the report NAMES that node as one it would remove, and the registry
+/// is byte for byte what it was before the run.
 ///
-/// The second root is the anti-tautology control, and it is a control in both
-/// directions. Its node is provably sweepable, because the last leg runs the
-/// same verb from the second cwd and watches it go, so "untouched" can only
-/// mean the first run never reached it, never that there was nothing there to
-/// reach. Without that leg a `clean` that swept nothing anywhere would pass.
+/// The second leg is what makes "unchanged" mean anything. The same root,
+/// swept BARE, removes the same node, so the report held back rather than
+/// there being nothing to hold back from. Without it a `clean` that had
+/// stopped sweeping entirely would pass.
 ///
-/// The convergence leg in the middle is what pins the reclaim ordering: a
-/// sweep that removed a node's name mapping before its details would leave the
-/// node permanently unreclaimable, and the second `clean` would find it still
-/// registered instead of finding nothing.
-///
-/// Reads under `--report-only` and still sees nodes REMOVED, because the sweep
-/// runs before the flag is read (issue #116, see the module doc). This arm is
-/// the one that has to move when that is fixed.
+/// The report-only run touches nothing anywhere, so it needs no isolation of
+/// its own; the private root is what keeps the BARE leg's node sweep inside
+/// this arm. That leg's `/tmp/*.shm_state` half is not confinable, so nothing
+/// here asserts anything about `/tmp` (see the module doc).
 #[test]
-fn clean_sweeps_its_own_registry_and_leaves_another_root_untouched() {
-    let swept = PrivateRegistry::new();
-    let spared = PrivateRegistry::new();
-    swept.plant_a_dead_node();
-    spared.plant_a_dead_node();
-    let spared_before = spared.registry_contents();
+fn clean_report_only_names_what_it_would_sweep_and_removes_nothing() {
+    let registry = PrivateRegistry::new();
+    registry.plant_a_dead_node();
+    let before = registry.registry_contents();
+    let entries = registry.registry_entries();
+    let planted: Vec<PathBuf> = registry.registered_nodes().into_iter().collect();
+    assert_eq!(planted.len(), 1, "one planted node: {planted:?}");
+    let name = planted[0].display().to_string();
 
-    let (ok, stdout, stderr) = run_cerulion(&["clean", "--report-only"], swept.cwd());
-    assert!(ok, "cerulion clean must exit 0; stderr:\n{stderr}");
-    assert_reports_line(&stdout, ONE_NODE_CLEANED, "the planted dead node");
-    assert_reports_line(
-        &stdout,
-        &swept.registry_line_with(0),
-        "the swept registry, now empty",
-    );
-    assert_never_names_the_machines_registry(&stdout);
-    assert_eq!(
-        swept.registry_contents(),
-        BTreeMap::new(),
-        "the swept registry must hold nothing afterwards"
-    );
-    assert_eq!(
-        spared.registry_contents(),
-        spared_before,
-        "a sweep of one private registry must leave every other root exactly as it was"
-    );
-
-    // Convergence: nothing is left, and the verb says so rather than
-    // re-finding a node whose mapping an out-of-order reclaim had stranded.
-    let (ok, stdout, stderr) = run_cerulion(&["clean", "--report-only"], swept.cwd());
+    let (ok, stdout, stderr) = run_cerulion(&["clean", "--report-only"], registry.cwd());
     assert!(
         ok,
-        "the second cerulion clean must exit 0; stderr:\n{stderr}"
+        "cerulion clean --report-only must exit 0; stderr:\n{stderr}"
     );
-    assert_reports_line(&stdout, NOTHING_TO_CLEAN, "the second sweep");
     assert_reports_line(
         &stdout,
-        &swept.registry_line_with(0),
-        "the swept registry on the second sweep",
+        &registry.would_remove_heading(1),
+        "the report names the registry and the count it would act on",
     );
-
-    // The other direction of the control: the spared node was sweepable all
-    // along, and the verb run from ITS cwd sweeps it.
-    let (ok, stdout, stderr) = run_cerulion(&["clean", "--report-only"], spared.cwd());
+    assert_reports_line(
+        &stdout,
+        &format!("  node {name}"),
+        "the report names the planted node by its registry entry name",
+    );
+    assert_reports_line(
+        &stdout,
+        REMOVAL_CAN_STILL_BE_REFUSED,
+        "the listing says it is what the sweep would attempt, never a promised removal",
+    );
+    assert_reports_line(
+        &stdout,
+        ORPHAN_TAGS_NOT_LISTED,
+        "the orphan-tag absence is stated, never an empty section",
+    );
+    assert_reports_line(
+        &stdout,
+        &registry.registry_line_with(entries),
+        "the registry the report looked in",
+    );
+    assert_reports_line(&stdout, NOTHING_WAS_REMOVED, "the report's closing claim");
     assert!(
-        ok,
-        "cerulion clean must exit 0 on the second root; stderr:\n{stderr}"
-    );
-    assert_reports_line(&stdout, ONE_NODE_CLEANED, "the spared node, once reached");
-    assert_reports_line(
-        &stdout,
-        &spared.registry_line_with(0),
-        "the second registry, now empty",
+        !stdout.lines().any(|printed| printed == ONE_NODE_CLEANED),
+        "a report must never render a removal; stdout:\n{stdout}"
     );
     assert_never_names_the_machines_registry(&stdout);
+
+    // The claim, proven on disk: every path under the registry, and the BYTES
+    // of every file, exactly as they were. A sweep that unlinked the node, or
+    // one that rewrote its details in place, fails here.
     assert_eq!(
-        spared.registry_contents(),
-        BTreeMap::new(),
-        "the second registry must hold nothing once its own cwd is swept"
+        registry.registry_contents(),
+        before,
+        "a `--report-only` run must leave the registry byte for byte as it found it"
     );
+
+    // A second report over the same root converges on the same answer, which
+    // is the cheap proof that the first one really did hold back rather than
+    // reporting from a registry it had already emptied.
+    let (ok, stdout, stderr) = run_cerulion(&["clean", "--report-only"], registry.cwd());
+    assert!(ok, "the second report must exit 0; stderr:\n{stderr}");
+    assert_reports_line(
+        &stdout,
+        &registry.would_remove_heading(1),
+        "the same node is still there to be swept",
+    );
+    assert_eq!(
+        registry.registry_contents(),
+        before,
+        "two reports in a row must still leave the registry byte for byte as it was"
+    );
+
+    // The OTHER direction of the control, that this node is really removable,
+    // is proven where a removal can be confined: `a_removing_sweep_takes_the_node_off_disk`
+    // in `cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs`. It cannot
+    // be proven here, because the only way to reach it through the real binary
+    // is a bare `clean`, which reclaims `/tmp` machine wide (see the module doc).
 }
