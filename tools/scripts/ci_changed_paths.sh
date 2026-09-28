@@ -428,6 +428,12 @@ classify() {
 
 self_test() {
     local fails=0
+    # EVERY CASE THIS SUITE JUDGES, counted in one place: the packaging rows,
+    # the class rows, the shared-tree loop, the live pipeline rows and the two
+    # emergency-stop rows. The count is the witness the last line carries, and
+    # it is what the nested run below is judged on, so a suite that stops
+    # judging rows reports a smaller number rather than the same `OK`.
+    local cases=0
 
     # ---- the packaging table, unchanged -----------------------------------
     # `<input paths>|<expected packaging>`; `;` separates paths.
@@ -454,6 +460,7 @@ crates/cerulion_core/src/wire.rs;README.md|false
     local line paths want got
     while IFS= read -r line; do
         [ -n "$line" ] || continue
+        cases=$((cases + 1))
         paths=${line%|*}
         want=${line##*|}
         got=$(printf '%s\n' "${paths//;/$'\n'}" \
@@ -530,6 +537,7 @@ pull_request;;|false|false||none
     local event switch head
     while IFS= read -r line; do
         [ -n "$line" ] || continue
+        cases=$((cases + 1))
         head=${line%%|*}
         event=${head%%;*}
         head=${head#*;}
@@ -556,6 +564,7 @@ pull_request;;|false|false||none
     # tree.
     local tree root markers
     for tree in docs benches examples; do
+        cases=$((cases + 1))
         got=$(printf '%s/guide.md\n' "$tree" \
               | GITHUB_EVENT_NAME=pull_request CI_SELECTION=on classify_touched \
               | sed -n 's/^touched=//p')
@@ -569,6 +578,7 @@ pull_request;;|false|false||none
         # and every package that DID match was reported as a miss.
         markers=$(marker_packages_for_root "$tree")
         for name in $got; do
+            cases=$((cases + 1))
             case "
 $markers
 " in
@@ -585,6 +595,7 @@ $name
     done
     # The other side: a tree with no marker at all touches nothing, so the rule
     # cannot be satisfied by a reader that returns every package for any input.
+    cases=$((cases + 1))
     got=$(marker_packages_for_root "no_such_tree" | tr '\n' ' ')
     if [ -n "${got// /}" ]; then
         printf 'ci_changed_paths self-test: a tree no marker names read back %s\n' "$got" >&2
@@ -592,6 +603,7 @@ $name
     fi
     # A root markdown file reaches the markers by its own name, and the four the
     # walk knows are the four `git ls-files` reports at the root.
+    cases=$((cases + 1))
     got=$(printf 'AGENTS.md\n' \
           | GITHUB_EVENT_NAME=pull_request CI_SELECTION=on classify_touched \
           | sed -n 's/^docs=//p')
@@ -605,6 +617,7 @@ $name
     # Everything above stops at `touched`. This arm proves the wiring: the
     # selector is invoked, the observation-edge table is read, and `pkgs` comes
     # back as a JSON array that holds the touched package itself.
+    cases=$((cases + 1))
     got=$(printf 'crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\n' \
           | GITHUB_EVENT_NAME=pull_request CI_SELECTION=on classify \
           | sed -n 's/^pkgs=//p')
@@ -618,6 +631,7 @@ $name
     esac
     # The other side of the same answer: a vizd-only change does NOT select a
     # package nothing connects it to, so the narrow answer is narrow.
+    cases=$((cases + 1))
     case "$got" in
         *'"cerulion_bagd"'*)
             printf 'ci_changed_paths self-test: a vizd-only change selected cerulion_bagd: %s\n' \
@@ -627,6 +641,7 @@ $name
     esac
     # A workspace-level input selects every member, spelled as the array, never
     # as the word `all`: `fromJSON` on that word is an expression error.
+    cases=$((cases + 1))
     got=$(printf '.github/workflows/ci.yml\n' \
           | GITHUB_EVENT_NAME=pull_request CI_SELECTION=on classify \
           | sed -n 's/^pkgs=//p')
@@ -647,28 +662,67 @@ $name
     #
     # Once, guarded by its own variable, because the nested run reaches this
     # line too.
+    #
+    # BOTH ARMS READ THE NESTED RUN'S CASE COUNT, never its exit status. A run
+    # that returns early on the guard variable exits 0 as well, so an arm that
+    # discards the output and keeps the status passes a process that judged no
+    # row. The nested run skips this block and nothing else, so it judges
+    # exactly the cases this run has judged on reaching here: that number is
+    # the witness, and a run that prints no count line, a different count, or
+    # `OK` with no count at all reds the arm.
     if [ -z "${CI_CHANGED_PATHS_NESTED_SELF_TEST:-}" ]; then
-        if ! CI_SELECTION=off CI_CHANGED_PATHS_NESTED_SELF_TEST=1 \
-                "$ROOT/tools/scripts/ci_changed_paths.sh" --self-test >/dev/null 2>&1; then
+        local nested_point=$cases nested_out
+        # `$1` names the run for the message, `$2` is its captured stdout.
+        judge_nested() {
+            local count
+            count=$(printf '%s\n' "$2" \
+                    | sed -n 's/^ci_changed_paths: self-test OK (\([0-9][0-9]*\) cases)$/\1/p')
+            if [ -z "$count" ]; then
+                printf 'ci_changed_paths self-test: the nested run %s printed no self-test OK (<n> cases) line, so nothing says it judged a row\n' \
+                    "$1" >&2
+                fails=$((fails + 1))
+                return 0
+            fi
+            if [ "$count" != "$nested_point" ]; then
+                printf 'ci_changed_paths self-test: the nested run %s judged %s case(s), and this run had judged %s on reaching it\n' \
+                    "$1" "$count" "$nested_point" >&2
+                fails=$((fails + 1))
+                return 0
+            fi
+            # The floor stands on its own, so a suite that loses most of its
+            # table in both processes at once still reds here.
+            if [ "$count" -lt 60 ]; then
+                printf 'ci_changed_paths self-test: the nested run %s judged %s case(s), under the floor of 60\n' \
+                    "$1" "$count" >&2
+                fails=$((fails + 1))
+            fi
+        }
+        if nested_out=$(CI_SELECTION=off CI_CHANGED_PATHS_NESTED_SELF_TEST=1 \
+                "$ROOT/tools/scripts/ci_changed_paths.sh" --self-test 2>/dev/null); then
+            judge_nested 'under CI_SELECTION=off' "$nested_out"
+        else
             printf 'ci_changed_paths self-test: the suite fails under CI_SELECTION=off, so the emergency stop reds the Lint job\n' >&2
             fails=$((fails + 1))
         fi
-        # The other side: the nested run must really be running the suite, not
-        # exiting early on the guard.
-        if CI_CHANGED_PATHS_NESTED_SELF_TEST=1 \
-                "$ROOT/tools/scripts/ci_changed_paths.sh" --self-test >/dev/null 2>&1; then
-            :
+        # The other side, with the switch REALLY unset: `env -u` removes it, so
+        # this arm differs from the one above on every event. Inheriting it made
+        # the two runs the same command under the repository variable
+        # `CI_SELECTION=off`, which is the one state the block exists for.
+        if nested_out=$(env -u CI_SELECTION CI_CHANGED_PATHS_NESTED_SELF_TEST=1 \
+                "$ROOT/tools/scripts/ci_changed_paths.sh" --self-test 2>/dev/null); then
+            judge_nested 'with the switch unset' "$nested_out"
         else
-            printf 'ci_changed_paths self-test: the nested run fails with the switch unset, so the arm above proves nothing\n' >&2
+            printf 'ci_changed_paths self-test: the suite fails with the switch unset, so the arm above tells nothing apart\n' >&2
             fails=$((fails + 1))
         fi
+        cases=$((cases + 2))
     fi
 
     if [ "$fails" -ne 0 ]; then
         printf 'ci_changed_paths: %d self-test case(s) failed\n' "$fails" >&2
         exit 1
     fi
-    printf 'ci_changed_paths: self-test OK\n'
+    printf 'ci_changed_paths: self-test OK (%d cases)\n' "$cases"
 }
 
 case "${1:-}" in
