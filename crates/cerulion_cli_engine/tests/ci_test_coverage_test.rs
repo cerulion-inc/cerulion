@@ -92,12 +92,18 @@
 //! GROUNDED, not merely well spelled. A condition is an expression over a value
 //! another job produced, so each of the three counts only where that value
 //! exists: the job carrying the step must `needs:` the `changes` job, `changes`
-//! must declare the output the condition reads, and that declaration must take
-//! its value from a STEP of that job (`steps.<id>.outputs.<name>` for an `id:`
-//! the job carries) or be a literal. Any one of the three missing means the
-//! expression evaluates to the empty string on every event — the step runs
-//! NOWHERE while reading as a selected step — so the walk fails closed and
-//! drops it. All three are asserted on synthetic workflows by
+//! must declare the output the condition reads, and that declaration must be
+//! EXACTLY `${{ steps.<id>.outputs.<name> }}` naming a step of that job that
+//! can SET an output — a `run:` step that appends to `$GITHUB_OUTPUT`, or a
+//! `uses:` step, whose action's outputs are not in this file to read. A LITERAL
+//! grounds nothing: `code: 'false'` is a value no classifier produced, and a
+//! step gated on `== 'true'` behind it runs on no event at all. Neither does an
+//! expression carrying another operand: `${{ github.event_name == 'push' &&
+//! steps.c.outputs.code }}` names a step that exists and is false on every pull
+//! request. Any one of these missing means the condition reads the empty string
+//! on every event — the step runs NOWHERE while reading as a selected step — so
+//! the walk fails closed and drops it. All of them are asserted on synthetic
+//! workflows by
 //! `a_selection_condition_credits_nothing_when_its_output_is_not_grounded`.
 //!
 //! TOTALITY UNDER SELECTION is the second thing the walk now decides, because
@@ -345,10 +351,10 @@ const OUTPUT_KEY_INDENT: &str = "      ";
 /// the file, and reading one as the end truncated the map at the first comment
 /// between two keys.
 ///
-/// Declaring the key is half of it. The VALUE has to come from somewhere that
-/// exists — a step of that job, or a literal — because an output wired to a
-/// step id the job does not carry is the empty string on every event, exactly
-/// like an output nobody declared at all.
+/// Declaring the key is half of it. The VALUE has to be a value a STEP of that
+/// job produced, because an output wired to anything else — a step id the job
+/// does not carry, a step that writes no output, a literal — is the empty
+/// string on every event, exactly like an output nobody declared at all.
 ///
 /// The value is READ with [`read_scalar_value`], the same reader the `if:`
 /// values go through, so an output written as a BLOCK scalar — `code: >-` with
@@ -361,7 +367,7 @@ fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
     let Some((_, block)) = jobs.iter().find(|(name, _)| name == SELECTION_JOB) else {
         return out;
     };
-    let ids = step_ids(block);
+    let producing = output_producing_step_ids(block);
     let lines: Vec<&str> = block.lines().collect();
     let Some(at) = lines.iter().position(|l| l.trim_end() == "    outputs:") else {
         return out;
@@ -402,55 +408,71 @@ fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
                      coverage from an output nobody produces."
                 )
             });
-        if output_is_produced(&value, &ids) {
+        if output_is_produced(&value, &producing) {
             out.insert(key.to_string());
         }
     }
     out
 }
 
-/// Does a declared output's VALUE come from somewhere that exists?
+/// The environment file a `run:` step appends to in order to set an output.
 ///
-/// A non-empty literal grounds itself. An expression has to read
-/// `steps.<id>.outputs.<name>`, and every step id it names has to be one this
-/// job's steps declare: an expression over anything else — a step renamed away,
-/// a `needs.` of a job that is not needed — is the empty string on every event.
+/// There is no other way for a run step to set one, so a run step whose block
+/// never names it produces NOTHING, whatever `id:` it carries.
+const GITHUB_OUTPUT: &str = "GITHUB_OUTPUT";
+
+/// Does a declared output's VALUE come from a step that PRODUCES it?
+///
+/// Three rules, each of them fail-closed, and a declaration has to satisfy all
+/// three. The value must be a PURE step-output reference
+/// ([`pure_step_output_reference`]); the step it names must be one this job
+/// carries; and that step must be able to SET an output
+/// ([`output_producing_step_ids`]).
+///
+/// A LITERAL grounds nothing. It reads like a value — `code: 'true'` — and it
+/// is not one a classifier produced: nothing about the pull request can change
+/// it, and its twin `code: 'false'` makes every step gated on `== 'true'` run
+/// on no event at all while reading as a selected step. Crediting either is the
+/// silent skip this walk exists to refuse.
 ///
 /// `value` is the FOLDED scalar [`read_scalar_value`] returned, never the raw
 /// text after the `:`: a block scalar's header carries no expression at all, so
 /// asking this about `>-` asked it about a literal.
-fn output_is_produced(value: &str, step_ids: &BTreeSet<String>) -> bool {
-    if !value.contains("${{") {
-        return !value.trim().is_empty();
-    }
-    let referenced = step_output_references(value);
-    !referenced.is_empty() && referenced.iter().all(|id| step_ids.contains(id))
+fn output_is_produced(value: &str, producing_step_ids: &BTreeSet<String>) -> bool {
+    pure_step_output_reference(value).is_some_and(|id| producing_step_ids.contains(&id))
 }
 
-/// Every step id an expression reads an output of.
-fn step_output_references(value: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let mut rest = value;
-    while let Some(at) = rest.find("steps.") {
-        rest = &rest[at + "steps.".len()..];
-        let id: String = rest.chars().take_while(|c| is_name_char(*c)).collect();
-        let Some(tail) = rest[id.len()..].strip_prefix(".outputs.") else {
-            continue;
-        };
-        if !id.is_empty() && tail.starts_with(is_name_char) {
-            out.insert(id);
-        }
-    }
-    out
-}
-
-/// The `id:` of every step of one job block.
+/// The step id a value names when it is EXACTLY one step-output reference.
 ///
-/// Read at the step's own indent — the item line's `- id:`, or a key two
-/// deeper — so a line inside a `run:` script cannot invent one.
-fn step_ids(block: &str) -> BTreeSet<String> {
-    let lines: Vec<&str> = block.lines().collect();
-    let mut out = BTreeSet::new();
+/// `${{ steps.<id>.outputs.<name> }}` and nothing else. The whitespace inside
+/// the braces is YAML's to ignore and the scalar reader has already folded it,
+/// but another OPERAND is not whitespace: `${{ github.event_name == 'push' &&
+/// steps.c.outputs.code }}` names a step this job carries and is the empty
+/// string on every pull request, so an output declared that way grounds a step
+/// that never runs. A prefix, a suffix, a `||` default and a second reference
+/// are the same shape and answer the same way.
+fn pure_step_output_reference(value: &str) -> Option<String> {
+    let inner = value.trim().strip_prefix("${{")?.strip_suffix("}}")?.trim();
+    let after_steps = inner.strip_prefix("steps.")?;
+    let id: String = after_steps
+        .chars()
+        .take_while(|c| is_name_char(*c))
+        .collect();
+    if id.is_empty() {
+        return None;
+    }
+    let name = after_steps[id.len()..].strip_prefix(".outputs.")?;
+    let is_output_name = !name.is_empty() && name.chars().all(is_name_char);
+    is_output_name.then_some(id)
+}
+
+/// The lines of each step of one job block, in file order.
+///
+/// A step starts at a list item at the FIRST item's indent, so a `- ` inside a
+/// `run:` script starts nothing, and it runs to the line before the next one.
+fn step_blocks(job: &str) -> Vec<Vec<&str>> {
+    let lines: Vec<&str> = job.lines().collect();
+    let mut out: Vec<Vec<&str>> = Vec::new();
     let Some(steps_at) = lines.iter().position(|l| l.trim() == "steps:") else {
         return out;
     };
@@ -463,6 +485,41 @@ fn step_ids(block: &str) -> BTreeSet<String> {
         return out;
     };
     for line in body {
+        if indent_of(line) == step_indent && line.trim_start().starts_with("- ") {
+            out.push(Vec::new());
+        }
+        if let Some(step) = out.last_mut() {
+            step.push(line);
+        }
+    }
+    out
+}
+
+/// Does this step block carry `key` at the step's OWN indent?
+///
+/// The item line's `- <key>`, or a key two deeper — so a line inside a `run:`
+/// script declares nothing.
+fn step_carries_key(block: &[&str], key: &str) -> bool {
+    let Some(first) = block.first() else {
+        return false;
+    };
+    let step_indent = indent_of(first);
+    block.iter().any(|line| {
+        let trimmed = line.trim_start();
+        match trimmed.strip_prefix("- ") {
+            Some(item) if indent_of(line) == step_indent => item.trim_start().starts_with(key),
+            _ => indent_of(line) == step_indent + 2 && trimmed.starts_with(key),
+        }
+    })
+}
+
+/// The `id:` one step block declares, or `None`.
+///
+/// Read at the step's own indent — the item line's `- id:`, or a key two
+/// deeper — so a line inside a `run:` script cannot invent one.
+fn step_id_of(block: &[&str]) -> Option<String> {
+    let step_indent = indent_of(block.first()?);
+    for line in block {
         let trimmed = line.trim_start();
         let value = if indent_of(line) == step_indent && trimmed.starts_with("- ") {
             trimmed
@@ -476,8 +533,32 @@ fn step_ids(block: &str) -> BTreeSet<String> {
         if let Some(id) = value {
             let id = id.trim().trim_matches(['\'', '"']);
             if !id.is_empty() {
-                out.insert(id.to_string());
+                return Some(id.to_string());
             }
+        }
+    }
+    None
+}
+
+/// The `id:` of every step of one job that can SET an output.
+///
+/// Two shapes, and no others. A `run:` step sets an output by appending to
+/// [`GITHUB_OUTPUT`], so a `run:` step whose block never names it produces
+/// nothing — `- id: c` with `run: true` under it declares an id and writes no
+/// output, and an output wired to it is the empty string on every event. A
+/// `uses:` step is credited on its declaration alone: the action's outputs are
+/// not in this file to read, and refusing them would red a workflow that works.
+fn output_producing_step_ids(job: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for block in step_blocks(job) {
+        let Some(id) = step_id_of(&block) else {
+            continue;
+        };
+        let produces = step_carries_key(&block, "uses:")
+            || (step_carries_key(&block, "run:")
+                && block.iter().any(|line| line.contains(GITHUB_OUTPUT)));
+        if produces {
+            out.insert(id);
         }
     }
     out
@@ -1982,7 +2063,8 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
                      code: ${{ steps.classify.outputs.code }}\n      \
                      docs: ${{ steps.classify.outputs.docs }}\n      \
                      pkgs: ${{ steps.classify.outputs.pkgs }}\n    steps:\n      \
-                     - id: classify\n        run: true\n";
+                     - id: classify\n        \
+                     run: echo \"code=true\" >> \"$GITHUB_OUTPUT\"\n";
     let candidates: BTreeSet<String> = [
         "code_pkg",
         "docs_pkg",
@@ -2046,7 +2128,7 @@ fn the_sanctioned_conditions_are_spelled_from_the_job_and_output_names() {
 /// workflow that does not.
 #[test]
 fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
-    let body = |needs: &str, outputs: &str| {
+    let body_with_steps = |needs: &str, outputs: &str, steps: &str| {
         format!(
             "on:\n  pull_request:\njobs:\n  \
              j:\n    runs-on: ubuntu-latest\n{needs}    steps:\n      \
@@ -2055,10 +2137,14 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
              - if: contains(fromJSON(needs.changes.outputs.pkgs), 'sel_pkg')\n        \
              run: cargo test -p sel_pkg\n      \
              - run: cargo test -p always_pkg\n  \
-             changes:\n    runs-on: ubuntu-latest\n{outputs}    steps:\n      \
-             - id: c\n        run: true\n"
+             changes:\n    runs-on: ubuntu-latest\n{outputs}    steps:\n{steps}"
         )
     };
+    // The classifier step every arm below wires its outputs to: a `run:` step
+    // that APPENDS to the output environment file, which is the only way a run
+    // step sets an output at all.
+    let producing_step = "      - id: c\n        run: echo \"code=true\" >> \"$GITHUB_OUTPUT\"\n";
+    let body = |needs: &str, outputs: &str| body_with_steps(needs, outputs, producing_step);
     let needs_changes = "    needs: [changes]\n";
     let all_outputs = "    outputs:\n      code: ${{ steps.c.outputs.code }}\n      \
                        pkgs: ${{ steps.c.outputs.pkgs }}\n";
@@ -2138,6 +2224,95 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
          grounds, and the step that reads it credits the package it names"
     );
 
+    // PRODUCED, not merely referenced. A `run:` step that never names the
+    // output environment file writes no output, whatever `id:` it carries, so
+    // an output wired to it is the empty string on every event. A `uses:` step
+    // is the other side: its action's outputs are not in this file to read, so
+    // the declaration is credited.
+    let silent_step = "      - id: c\n        run: true\n";
+    let uses_step = "      - id: c\n        uses: actions/github-script@v7\n";
+    assert_eq!(
+        credited(&body_with_steps(needs_changes, all_outputs, silent_step)),
+        set(&["always_pkg"]),
+        "a step that writes no output produces none, so an output wired to it \
+         grounds nothing"
+    );
+    assert_eq!(
+        credited(&body_with_steps(needs_changes, all_outputs, uses_step)),
+        set(&["always_pkg", "code_pkg", "sel_pkg"]),
+        "a `uses:` step may set an output, so an output wired to it grounds"
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body_with_steps(
+            needs_changes,
+            all_outputs,
+            silent_step
+        ))),
+        BTreeSet::<String>::new()
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body_with_steps(
+            needs_changes,
+            all_outputs,
+            uses_step
+        ))),
+        set(&["code", "pkgs"])
+    );
+
+    // A LITERAL grounds NOTHING, either way it is spelled. `code: 'true'` reads
+    // like a permanently selected class and `code: 'false'` is its twin, under
+    // which every step gated on `== 'true'` runs on no event at all — and
+    // neither is a value the classifier produced.
+    for literal in ["'true'", "'false'", "true", "false"] {
+        let outputs = format!("    outputs:\n      code: {literal}\n");
+        assert_eq!(
+            credited(&body(needs_changes, &outputs)),
+            set(&["always_pkg"]),
+            "the literal `code: {literal}` is not a produced value and grounds \
+             nothing"
+        );
+        assert_eq!(
+            declared_selection_outputs(&jobs_of(&body(needs_changes, &outputs))),
+            BTreeSet::<String>::new()
+        );
+    }
+
+    // PURE, not merely containing a reference. An expression carrying another
+    // operand names a step this job carries AND is the empty string on every
+    // pull request the operand rules out.
+    for impure in [
+        "${{ github.event_name == 'push' && steps.c.outputs.code }}",
+        "${{ steps.c.outputs.code || 'true' }}",
+        "prefix-${{ steps.c.outputs.code }}",
+        "${{ steps.c.outputs.code }}-suffix",
+        "${{ steps.c.outputs.code }}${{ steps.c.outputs.pkgs }}",
+        "${{ needs.other.outputs.code }}",
+    ] {
+        let outputs = format!("    outputs:\n      code: {impure}\n");
+        assert_eq!(
+            credited(&body(needs_changes, &outputs)),
+            set(&["always_pkg"]),
+            "`code: {impure}` is not one step output and grounds nothing"
+        );
+        assert_eq!(
+            declared_selection_outputs(&jobs_of(&body(needs_changes, &outputs))),
+            BTreeSet::<String>::new()
+        );
+    }
+    // And the pure form, with and without the whitespace YAML folds away.
+    for pure in ["${{ steps.c.outputs.code }}", "${{steps.c.outputs.code}}"] {
+        let outputs = format!("    outputs:\n      code: {pure}\n");
+        assert_eq!(
+            credited(&body(needs_changes, &outputs)),
+            set(&["always_pkg", "code_pkg"]),
+            "`code: {pure}` is one produced step output and grounds"
+        );
+        assert_eq!(
+            declared_selection_outputs(&jobs_of(&body(needs_changes, &outputs))),
+            set(&["code"])
+        );
+    }
+
     // And the declaration reader itself, every way.
     assert_eq!(
         declared_selection_outputs(&jobs_of(&body(needs_changes, all_outputs))),
@@ -2163,13 +2338,14 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
         declared_selection_outputs(&jobs_of(&body(needs_changes, literal_there))),
         set(&["code"])
     );
-    // A literal value grounds itself: nothing has to produce it.
+    // A literal value grounds NOTHING: a classifier did not produce it, and
+    // the walk cannot tell `'true'` from `'false'` by who wrote it.
     assert_eq!(
         declared_selection_outputs(&jobs_of(&body(
             needs_changes,
             "    outputs:\n      code: 'true'\n"
         ))),
-        set(&["code"])
+        BTreeSet::<String>::new()
     );
     // A comment between two output keys does not end the mapping. Comments are
     // blanked to empty strings before this walk reads a workflow, so a blank

@@ -58,11 +58,19 @@ Usage:
 
 `--metadata` defaults to `-`, standard input.
 
+THE DOCUMENT IS VALIDATED BEFORE ANY MODE, `--all` included. A document that is
+not an object carrying `packages` (a list), `workspace_members` (a list) and
+`version` is refused with exit 2 and one line naming the field, never read as a
+selection: `null` and a list used to reach `.get()` and die with a traceback,
+which is exit 1 and reads as "the self-test found a miss", and under `--all` a
+document missing either list printed `[]` with exit 0, which a caller reads as
+"nothing to test" — the silent empty selection this script exists to refuse.
+
 Exit codes:
   0  the selection is on stdout, or the self-test passed
   1  the self-test found a miss
-  2  malformed invocation, unreadable metadata, or a name that is not a
-     workspace member
+  2  malformed invocation, unreadable or malformed metadata, or a name that is
+     not a workspace member
 
 Stdlib only. Python 3.8 or newer.
 """
@@ -127,13 +135,65 @@ class UnsupportedMetadata(SelectionError):
         return hash((type(self).__name__, self.version))
 
 
+class MalformedMetadata(SelectionError):
+    """A document that is not the shape this script reads."""
+
+    def __init__(self, field, found):
+        self.field = field
+        self.found = found
+        super().__init__(str(self))
+
+    def __str__(self):
+        if self.found is None:
+            what = '`%s` is missing' % self.field
+        elif self.field == 'document':
+            what = 'the document is a %s, not an object' % self.found
+        else:
+            what = '`%s` is a %s, not a list' % (self.field, self.found)
+        return ('ci_selected_packages: malformed metadata: %s; expected a `cargo metadata '
+                '--format-version %d` object carrying `packages` (a list), `workspace_members` '
+                '(a list) and `version`' % (what, METADATA_FORMAT_VERSION))
+
+    def __eq__(self, other):
+        return type(other) is type(self) and (other.field, other.found) == (self.field, self.found)
+
+    def __hash__(self):
+        return hash((type(self).__name__, self.field, self.found))
+
+
+def validate_metadata(document):
+    """Refuse a document that is not the shape this walk reads.
+
+    Runs BEFORE any mode, `--all` included, which is the whole point: a
+    document that is `null` or a list reached `.get()` and died with an
+    AttributeError traceback — exit 1, the code that means "the self-test found
+    a miss" — and under `--all` a document missing either list printed `[]` with
+    exit 0, a silent empty selection a caller reads as "nothing to test".
+
+    The `version` FIELD is checked for presence here and its VALUE by
+    `workspace_members`; both answer with `UnsupportedMetadata`, so one fact has
+    one refusal.
+    """
+    if not isinstance(document, dict):
+        raise MalformedMetadata('document', type(document).__name__)
+    for field in ('packages', 'workspace_members'):
+        if field not in document:
+            raise MalformedMetadata(field, None)
+        if not isinstance(document[field], list):
+            raise MalformedMetadata(field, type(document[field]).__name__)
+    if 'version' not in document:
+        raise UnsupportedMetadata(None)
+    return document
+
+
 def workspace_members(document):
     """The names of the workspace members in a format-version 1 document."""
-    version = document.get('version')
+    validate_metadata(document)
+    version = document['version']
     if version != METADATA_FORMAT_VERSION:
         raise UnsupportedMetadata(version)
-    member_ids = set(document.get('workspace_members') or ())
-    return {package['name'] for package in document.get('packages') or () if package['id'] in member_ids}
+    member_ids = set(document['workspace_members'])
+    return {package['name'] for package in document['packages'] if package['id'] in member_ids}
 
 
 def dependents(document, include_dev=True):
@@ -144,9 +204,9 @@ def dependents(document, include_dev=True):
     closure without failing anything else. Callers leave it True.
     """
     members = workspace_members(document)
-    member_ids = set(document.get('workspace_members') or ())
+    member_ids = set(document['workspace_members'])
     table = {name: set() for name in members}
-    for package in document.get('packages') or ():
+    for package in document['packages']:
         if package['id'] not in member_ids:
             continue
         for dependency in package.get('dependencies') or ():
@@ -416,7 +476,8 @@ def self_test():
         got = _run(['--metadata', path, 'left'])
         arm('cli-reads-a-path', got == (0, '["left", "top"]\n', ''), '-> %r' % (got,))
         with open(path, 'w', encoding='utf-8') as handle:
-            handle.write('{"version": 1, "packages": [{"name": "base"}]}')
+            handle.write('{"version": 1, "workspace_members": [], '
+                         '"packages": [{"name": "base"}]}')
         # Pinned WHOLE, like its sibling below: the line a caller reads has to
         # name the document it could not read AND the field that was missing.
         expected_field = (2, '', 'ci_selected_packages: cannot read %s: %r\n'
@@ -432,6 +493,39 @@ def self_test():
         got = _run(['--metadata', absent, 'base'])
         arm('cli-absent-document-refused-in-full', got == expected_absent,
             '-> %r, wanted %r' % (got, expected_absent))
+
+    # A MALFORMED DOCUMENT IS REFUSED IN EVERY MODE, the whole triple pinned.
+    # `null` and a list used to reach `.get()` and die with a traceback (exit 1,
+    # the self-test's own code), and under `--all` a document missing either
+    # list printed `[]` with exit 0 — a silent empty selection.
+    for name, text, expected_error in (
+            ('null-document', 'null', MalformedMetadata('document', 'NoneType')),
+            ('list-document', '[]', MalformedMetadata('document', 'list')),
+            ('document-without-packages', '{"version": 1, "workspace_members": []}',
+             MalformedMetadata('packages', None)),
+            ('document-without-workspace-members', '{"version": 1, "packages": []}',
+             MalformedMetadata('workspace_members', None)),
+            ('document-with-packages-mistyped', '{"version": 1, "packages": {}, '
+             '"workspace_members": []}', MalformedMetadata('packages', 'dict')),
+            ('document-with-workspace-members-mistyped',
+             '{"version": 1, "packages": [], "workspace_members": "all"}',
+             MalformedMetadata('workspace_members', 'str'))):
+        expected = (2, '', str(expected_error) + '\n')
+        for mode, argv in (('named', ['base']), ('all-flag', ['--all']),
+                           ('all-sentinel', ['all'])):
+            got = _run(argv, text)
+            arm('cli-%s-refused-in-%s' % (name, mode), got == expected,
+                '-> %r, wanted %r' % (got, expected))
+
+    # The other side: the valid document still selects, in each of the same
+    # three modes, so the validation refuses malformed documents and nothing
+    # else.
+    for mode, argv, expected in (('named', ['base'], (0, every_member, '')),
+                                 ('all-flag', ['--all'], (0, every_member, '')),
+                                 ('all-sentinel', ['all'], (0, every_member, ''))):
+        got = _run(argv, document_text)
+        arm('cli-valid-document-still-selects-in-%s' % mode, got == expected,
+            '-> %r, wanted %r' % (got, expected))
 
     arm('live-oracle-measured', LIVE_ORACLE_MEASURED,
         'LIVE_ORACLE_MEASURED is False: measure the workspace, fill in '
@@ -493,6 +587,9 @@ def run(argv):
 
     try:
         document = read_metadata(args.metadata)
+        # BEFORE the mode split, so `--all` refuses a malformed document rather
+        # than printing the empty selection it reads out of one.
+        validate_metadata(document)
         if args.all or args.packages == ['all']:
             selected = sorted(workspace_members(document))
         else:
