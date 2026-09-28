@@ -310,23 +310,29 @@ const ALLOW_LIST_ENTRIES: usize = 87;
 /// each say something slightly different.
 ///
 /// It states the behaviour PER CASE, which is what the arm below exists to keep
-/// it doing. The wording it replaced said a resim of a capture from a run with
-/// a rank hole is "refused as not replay-grade and exits 2 with no verdict,
-/// unless that capture's window reaches step 0", and the code does not do that
-/// on every shape: nothing on the replay path reads `ranks_missing` at all, so
-/// a hole that leaves ONE surviving ring is not refused for being a hole, and
-/// a capture whose executed nodes are all covered by that ring reaches a
-/// verdict. The three cases are driven end to end by `cerulion_cli_engine`'s
-/// `a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case`, which
-/// reads the printed line and the exit code back off each of them. This arm is
-/// the half that keeps the SENTENCES equal to that.
+/// it doing, and the STEP 0 exception is stated FIRST because it governs both
+/// ring counts. Two earlier wordings each overclaimed a half of it. The first
+/// said such a capture is "refused as not replay-grade and exits 2 with no
+/// verdict, unless that capture's window reaches step 0", which denies the
+/// commonest shape of all: nothing on the replay path reads `ranks_missing`, so
+/// a hole leaving ONE surviving ring is not refused for being a hole, and a
+/// capture whose executed nodes are all covered by that ring reaches a verdict.
+/// The second put the step 0 exception inside the ONE ring branch alone, which
+/// reads as though more than one ring refuses whatever the window; it does not.
+/// `resolve_resume` returns before any anchor is read, so a window reaching
+/// step 0 reaches a verdict at TWO rings exactly as it does at one. Every case
+/// is driven end to end by `cerulion_cli_engine`'s
+/// `a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case`, whose
+/// step 0 leg drives BOTH ring counts, and which reads the printed line and the
+/// exit code back off each of them. This arm is the half that keeps the
+/// SENTENCES equal to that.
 const SHARED_CONSEQUENCE_CLAUSE: &str =
-    "A resim of a capture from this run exits 2 with no verdict in two ways: with more than one \
-     state ring left it refuses the recording outright as ambiguous, and with one ring left it \
-     resumes from that ring and refuses by name every node of the missing rank the replay \
-     executes, none of which has an anchor. It reaches a verdict of its own only when no node of \
-     that rank runs in the capture's window, or when that window reaches step 0 and needs no \
-     anchor";
+    "A resim of a capture from this run whose window reaches step 0 reads no anchor at all and \
+     reaches a verdict whatever the ring count. One whose window starts mid run exits 2 with no \
+     verdict in two ways: with more than one state ring left it refuses the recording outright as \
+     ambiguous, and with one ring left it resumes from that ring and refuses by name every node of \
+     the missing rank the replay executes, none of which has an anchor. It reaches a verdict of \
+     its own only when no node of that rank runs in that window";
 
 /// Reconstruct the string literals a source file's reader actually sees.
 ///
@@ -399,7 +405,7 @@ fn the_six_operator_sentences_name_the_rank_whose_records_are_lacking() {
                 "created, so this rank captures NOTHING, and because a graph-wide anchor is",
                 // Both ring sites promise the graph is not taken down with the
                 // plane, after the shared clause.
-                "step 0 and needs no anchor. The graph continues running",
+                "runs in that window. The graph continues running",
             ],
         ),
     ];
@@ -442,6 +448,13 @@ fn the_six_operator_sentences_name_the_rank_whose_records_are_lacking() {
             "reports PARTIAL",
             "exits 8",
             "is refused as not replay-grade and exits 2 with no verdict, unless",
+            // The UNQUALIFIED opening, which is the half the step 0 exception
+            // now governs: "from this run exits 2" asserted the two ways of
+            // exiting 2 of every capture, and a two-ring capture whose window
+            // reaches step 0 passes.
+            "from this run exits 2 with no verdict in two ways",
+            // Its tail, which sat the exception inside the ONE ring branch.
+            "or when that window reaches step 0 and needs no anchor",
         ] {
             assert!(
                 !text.contains(gone),

@@ -202,6 +202,27 @@ pub struct ResimFacts<'a> {
     pub trace_rings_unreadable: usize,
     /// State rings the bag's own coverage manifest declares.
     pub state_rings_declared: usize,
+    /// **Ranks that exist and published NO state ring at all**, ascending.
+    ///
+    /// A RECORDER-ONLY fact, on the same terms as
+    /// [`trace_gap`](Self::trace_gap) and
+    /// [`trace_rings_unreadable`](Self::trace_rings_unreadable): the replayer
+    /// re-measures every other field off the bag, and a rank that published
+    /// nothing leaves nothing in the bag to measure. A CAPTURE's own
+    /// `state_coverage.json` cannot carry it either, and deliberately does not
+    /// (`StateCoverage::for_capture` writes an empty `ranks_missing`, because a
+    /// capture walked no rank space and can witness neither density nor a
+    /// hole). The recorder DID walk it, so the recorder is the one party that
+    /// can state it, and stating it here is what lets a capture's stored
+    /// `resimmable_reason` answer the very warn that sent an operator to read
+    /// it.
+    ///
+    /// EMPTY is "no hole was observed", which is the ordinary answer and the
+    /// only one a recorder that swept no rank space can give. Read ONLY by the
+    /// [`ResimGap::MultiRing`] arm, which is where a rank hole and a multi-ring
+    /// recording turn out to be one event: on a run of three or more ranks the
+    /// gap publishes nothing and the ranks above it each publish a ring.
+    pub ranks_missing: &'a [u32],
     /// The run ids that have an anchor at the anchor step.
     ///
     /// More than one is `AmbiguousRun`: a bag holding two runs' anchors at one
@@ -360,6 +381,17 @@ pub enum ResimGap {
     MultiRing {
         /// How many rings the coverage manifest declares.
         rings: usize,
+        /// Ranks that exist and published no state ring at all, ascending.
+        ///
+        /// Carried so this sentence answers the WARN that sent the operator
+        /// to it, exactly as `replay_state`'s `MultiRingAmbiguous` does. Both
+        /// render the clause through [`render_ranks_missing`], so a capture's
+        /// stored `resimmable_reason` and the refusal a resim of that capture
+        /// prints cannot come to say different things about one hole.
+        ///
+        /// EMPTY on a multi-ring recording with no hole, where the clause
+        /// renders nothing and the sentence is the one it always was.
+        ranks_missing: Vec<u32>,
     },
     /// Two runs' anchors at the resume step — resim's `AmbiguousRun`.
     AmbiguousRun {
@@ -372,6 +404,34 @@ pub enum ResimGap {
         /// `plan_restore`'s own refusal, rendered.
         detail: String,
     },
+}
+
+/// The one clause that names the ranks that exist and published no state ring.
+///
+/// ONE renderer for TWO sentences: the stored `resimmable_reason` a capture
+/// carries (through [`ResimGap::MultiRing`]) and the refusal a resim of that
+/// capture prints (`cerulion_cli_engine`'s
+/// `AnchorReadRefusal::MultiRingAmbiguous`). They are the two halves of one
+/// operator journey, and a reader who meets a rank in the first and not in the
+/// second learns that the tool changed its mind. Keeping the words in one place
+/// is what stops that.
+///
+/// EMPTY when there is no hole, so a multi-ring recording without one reads
+/// exactly as it did before this clause existed. The ranks are rendered in the
+/// order they arrive rather than re-sorted here: the recorder already keeps
+/// them ascending, and a second sort would be a second rule about an order that
+/// has one owner.
+pub fn render_ranks_missing(ranks: &[u32]) -> String {
+    if ranks.is_empty() {
+        return String::new();
+    }
+    let list = ranks
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if ranks.len() == 1 { "rank" } else { "ranks" };
+    format!(" ({noun} {list} published none, which is the hole you were warned about)")
 }
 
 impl ResimGap {
@@ -459,11 +519,15 @@ impl ResimGap {
                                  says which step a resume would begin at. The frames and the \
                                  state are in the bag and readable"
                 .to_string(),
-            Self::MultiRing { rings } => format!(
-                "this capture drained {rings} state rings, and a state record carries a node \
+            Self::MultiRing {
+                rings,
+                ranks_missing,
+            } => format!(
+                "this capture drained {rings} state rings{}, and a state record carries a node \
                  index but no rank — every ring numbers its own nodes from 0, so nothing in the \
                  bag says which ring a record came from. Capture a single-process run \
-                 to get a resimmable bag"
+                 to get a resimmable bag",
+                render_ranks_missing(ranks_missing)
             ),
             Self::AmbiguousRun { runs } => format!(
                 "{runs} runs have an anchor at this capture's resume step, and nothing in the bag \
@@ -684,6 +748,7 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     if facts.state_rings_declared > 1 {
         return Err(ResimGap::MultiRing {
             rings: facts.state_rings_declared,
+            ranks_missing: facts.ranks_missing.to_vec(),
         });
     }
     // 5b. The node map, and it belongs BELOW the ring count — this is the
@@ -775,6 +840,7 @@ mod tests {
             trace_rings_declared: 1,
             trace_rings_unreadable: 0,
             state_rings_declared: 1,
+            ranks_missing: &[],
             anchor_run_ids_at_anchor_step: 1,
             anchor_run_id: RUN,
             required_nodes: nodes,
@@ -866,6 +932,7 @@ mod tests {
             trace_rings_declared: 2,
             trace_rings_unreadable: 1,
             state_rings_declared: 4,
+            ranks_missing: &[],
             anchor_run_ids_at_anchor_step: 2,
             anchor_run_id: RUN,
             required_nodes: &nodes,
@@ -921,6 +988,7 @@ mod tests {
             departure_records: 3,
             first_recorded_step: None,
             state_rings_declared: 4,
+            ranks_missing: &[],
             anchor_run_ids_at_anchor_step: 2,
             anchor_run_id: RUN,
             required_nodes: &nodes,
@@ -1542,6 +1610,7 @@ mod tests {
         let both = ResimFacts {
             required_nodes_known: false,
             state_rings_declared: 2,
+            ranks_missing: &[],
             first_recorded_step: Some(41),
             required_nodes: &[],
             anchor_facts: &anchors,
@@ -1549,16 +1618,87 @@ mod tests {
         };
         assert_eq!(
             judge_resimmable(&both),
-            Err(ResimGap::MultiRing { rings: 2 }),
+            Err(ResimGap::MultiRing {
+                rings: 2,
+                ranks_missing: Vec::new(),
+            }),
             "resim refuses the ring count at `read_bag_anchors` and has no node-map gate at all"
         );
         assert_eq!(
             judge_resimmable(&ResimFacts {
                 state_rings_declared: 1,
+                ranks_missing: &[],
                 ..both
             }),
             Err(ResimGap::AmbiguousNodeMap),
             "with ONE ring the node map is what remains, so this judge does still report it"
+        );
+    }
+
+    /// The STORED reason a multi-ring capture carries names the RANK that
+    /// published nothing, in the same words the resim refusal uses.
+    ///
+    /// `bag info` prints this string and a resim of the same capture prints
+    /// `AnchorReadRefusal::MultiRingAmbiguous`, and until now only the second
+    /// named the rank. An operator warned about a RANK, told by `bag info` about
+    /// RINGS, and then told by the resim about a rank again has to work out that
+    /// all three are one event. Both sentences render the clause through
+    /// [`render_ranks_missing`], so they cannot come to disagree.
+    ///
+    /// The roster is a RECORDER fact and reaches this judge no other way: a
+    /// capture's own `state_coverage.json` carries an empty `ranks_missing` by
+    /// design, because a capture walks no rank space.
+    #[test]
+    fn the_stored_multi_ring_reason_names_the_rank_that_published_no_ring() {
+        let nodes = vec!["a".to_string()];
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let reason_for = |missing: &[u32]| {
+            judge_resimmable(&ResimFacts {
+                state_rings_declared: 2,
+                ranks_missing: missing,
+                ..healthy(&nodes, &anchors)
+            })
+            .expect_err("several state rings are never resimmable")
+            .reason()
+        };
+
+        let one = reason_for(&[1]);
+        assert!(
+            one.contains("(rank 1 published none, which is the hole you were warned about)"),
+            "the stored reason answers the warn by NAME: {one}"
+        );
+        let two = reason_for(&[1, 3]);
+        assert!(
+            two.contains("(ranks 1, 3 published none, which is the hole you were warned about)"),
+            "two holes read as a list and the noun agrees: {two}"
+        );
+
+        // THE CONTROL, and the half that fails if the clause were unconditional:
+        // a multi-ring recording with NO hole renders the sentence it always
+        // rendered, with no rank clause and no dangling parenthesis.
+        let clean = reason_for(&[]);
+        assert!(
+            !clean.contains("published none"),
+            "no hole, no clause: {clean}"
+        );
+        assert!(
+            clean.contains("drained 2 state rings, and a state record"),
+            "and the sentence is otherwise the one it always was: {clean}"
+        );
+
+        // THE SECOND CONTROL: the clause is reached only through the RING arm.
+        // A capture whose window reaches step 0 is resimmable whatever the ring
+        // count and whatever the hole, so it carries no reason to name a rank
+        // in. This is the same fact the six operator sentences state first.
+        assert_eq!(
+            judge_resimmable(&ResimFacts {
+                state_rings_declared: 2,
+                ranks_missing: &[1],
+                first_recorded_step: Some(0),
+                ..healthy(&nodes, &anchors)
+            }),
+            Ok(()),
+            "step 0 needs no anchor, so neither the ring count nor the hole is consulted"
         );
     }
 
@@ -1621,7 +1761,13 @@ mod tests {
         let mut facts = healthy(&nodes, &anchors);
         facts.state_rings_declared = 3;
         let gap = judge_resimmable(&facts).expect_err("multi-ring is not resimmable");
-        assert_eq!(gap, ResimGap::MultiRing { rings: 3 });
+        assert_eq!(
+            gap,
+            ResimGap::MultiRing {
+                rings: 3,
+                ranks_missing: Vec::new(),
+            }
+        );
         assert!(gap.reason().contains("state rings"), "{}", gap.reason());
     }
 
@@ -1730,7 +1876,10 @@ mod tests {
             },
             ResimGap::FaultReplay { departures: 1 },
             ResimGap::NoBoundary,
-            ResimGap::MultiRing { rings: 2 },
+            ResimGap::MultiRing {
+                rings: 2,
+                ranks_missing: Vec::new(),
+            },
             ResimGap::AmbiguousRun { runs: 2 },
             ResimGap::AnchorIncomplete {
                 detail: "node `a` has no state".to_string(),

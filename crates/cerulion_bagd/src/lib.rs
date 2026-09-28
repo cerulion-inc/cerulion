@@ -9793,6 +9793,7 @@ fn judge_capture_resimmable(
     first_record_refusal: Option<cerulion_core::trace_ring::TraceRecordRefusal>,
     trace_gap: Option<cerulion_core::flashback::resim::TraceGap>,
     trace_rings: TraceRingCoverage,
+    ranks_missing: &[u32],
 ) -> Result<(), cerulion_core::flashback::resim::ResimGap> {
     let (anchor_run_id, runs_at_step) = match anchor {
         flashback_plane::AnchorReport::Embedded { run_id, .. } => (*run_id, 1),
@@ -9846,6 +9847,13 @@ fn judge_capture_resimmable(
             state_rings_declared,
             anchor_run_ids_at_anchor_step: runs_at_step,
             anchor_run_id,
+            // The rank holes the DISCOVERY SWEEP saw, which nothing in this
+            // capture's own manifest can state: `StateCoverage::for_capture`
+            // writes an empty `ranks_missing` on purpose, because a capture
+            // walked no rank space. The recorder walked it, so the recorder is
+            // what carries the answer here and the stored reason can name the
+            // same rank the warn named.
+            ranks_missing,
             required_nodes: &trimmed.executed_nodes,
             anchor_facts,
         },
@@ -12818,13 +12826,13 @@ impl Recorder {
                     "bagd found node-state rings for HIGHER ranks than {gap} but none for {gap} \
                      itself: that rank exists and published no ring, and a graph-wide anchor is \
                      all-or-nothing across ranks, so every anchor of this run LACKS rank {gap}'s \
-                     records. A resim of a capture from this run exits 2 with no verdict in \
-                     two ways: with more than one state ring left it refuses the recording \
-                     outright as ambiguous, and with one ring left it resumes from that ring \
-                     and refuses by name every node of the missing rank the replay executes, \
-                     none of which has an anchor. It reaches a verdict of its own only when no \
-                     node of that rank runs in the capture's window, or when that window \
-                     reaches step 0 and needs no anchor"
+                     records. A resim of a capture from this run whose window reaches step 0 reads \
+                     no anchor at all and reaches a verdict whatever the ring count. One whose \
+                     window starts mid run exits 2 with no verdict in two ways: with more than one \
+                     state ring left it refuses the recording outright as ambiguous, and with one \
+                     ring left it resumes from that ring and refuses by name every node of the \
+                     missing rank the replay executes, none of which has an anchor. It reaches a \
+                     verdict of its own only when no node of that rank runs in that window"
                 );
             }
         }
@@ -17041,6 +17049,20 @@ impl Recorder {
                 // costs is the HOLE above.
                 unreadable: self.rings_unavailable.len() + drain.rings_retired.len(),
             },
+            // The rank holes, by the SAME call the warn above makes over the
+            // SAME two sets, so the sentence a capture stores and the sentence
+            // the operator was warned with name the same ranks. Recomputed
+            // rather than read off `state_rank_gaps_reported`, which is a
+            // report-once ledger and would go EMPTY on the second capture of a
+            // run whose hole is still open.
+            &cerulion_core::state_ring::missing_state_ring_ranks_within(
+                &self
+                    .state_ring_swept_ranks
+                    .iter()
+                    .copied()
+                    .collect::<Vec<u32>>(),
+                &self.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
+            ),
         );
         // The earlier handoff, with the seam it left OPEN now CLOSED.
         //

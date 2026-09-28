@@ -528,14 +528,14 @@ fn report_arm_refusal(
              it carries NO node-state anchors and is NOT resimmable"
             .to_string(),
         PlaneRole::Worker { rank } => format!(
-            "rank {rank} captures NOTHING while its peers carry on, so every anchor of this \
-             run LACKS rank {rank}'s records. A resim of a capture from this run exits 2 \
-             with no verdict in two ways: with more than one state ring left it refuses the \
-             recording outright as ambiguous, and with one ring left it resumes from that ring \
-             and refuses by name every node of the missing rank the replay executes, none of \
-             which has an anchor. It reaches a verdict of its own only when no node of that \
-             rank runs in the capture's window, or when that window reaches step 0 and needs \
-             no anchor"
+            "rank {rank} captures NOTHING while its peers carry on, so every anchor of this run \
+             LACKS rank {rank}'s records. A resim of a capture from this run whose window reaches \
+             step 0 reads no anchor at all and reaches a verdict whatever the ring count. One \
+             whose window starts mid run exits 2 with no verdict in two ways: with more than one \
+             state ring left it refuses the recording outright as ambiguous, and with one ring \
+             left it resumes from that ring and refuses by name every node of the missing rank the \
+             replay executes, none of which has an anchor. It reaches a verdict of its own only \
+             when no node of that rank runs in that window"
         ),
         // UNREACHABLE today: a supervisor never reaches the memory gate
         // (`pays_the_fork_cost` is false for it), so nothing calls this with that
@@ -674,16 +674,16 @@ fn create_state_ring(
                 tag = %tag,
                 rank,
                 error = %e,
-                "this run is ARMED for checkpoints but its state-ring name cannot be \
-                 derived, so this rank captures NOTHING, and because a graph-wide anchor is \
-                 all-or-nothing across ranks, every anchor of this run LACKS the records of \
-                 the rank this event names. A resim of a capture from this run exits 2 with \
-                 no verdict in two ways: with more than one state ring left it refuses the \
-                 recording outright as ambiguous, and with one ring left it resumes from that \
-                 ring and refuses by name every node of the missing rank the replay executes, \
-                 none of which has an anchor. It reaches a verdict of its own only when no \
-                 node of that rank runs in the capture's window, or when that window reaches \
-                 step 0 and needs no anchor. The graph continues running"
+                "this run is ARMED for checkpoints but its state-ring name cannot be derived, so \
+                 this rank captures NOTHING, and because a graph-wide anchor is all-or-nothing \
+                 across ranks, every anchor of this run LACKS the records of the rank this event \
+                 names. A resim of a capture from this run whose window reaches step 0 reads no \
+                 anchor at all and reaches a verdict whatever the ring count. One whose window \
+                 starts mid run exits 2 with no verdict in two ways: with more than one state ring \
+                 left it refuses the recording outright as ambiguous, and with one ring left it \
+                 resumes from that ring and refuses by name every node of the missing rank the \
+                 replay executes, none of which has an anchor. It reaches a verdict of its own \
+                 only when no node of that rank runs in that window. The graph continues running"
             );
             return None;
         }
@@ -715,16 +715,16 @@ fn create_state_ring(
                 rank,
                 ring_tag = %ring_tag,
                 error = %e,
-                "this run is ARMED for checkpoints but its state ring could not be \
-                 created, so this rank captures NOTHING, and because a graph-wide anchor is \
-                 all-or-nothing across ranks, every anchor of this run LACKS the records of \
-                 the rank this event names. A resim of a capture from this run exits 2 with \
-                 no verdict in two ways: with more than one state ring left it refuses the \
-                 recording outright as ambiguous, and with one ring left it resumes from that \
-                 ring and refuses by name every node of the missing rank the replay executes, \
-                 none of which has an anchor. It reaches a verdict of its own only when no \
-                 node of that rank runs in the capture's window, or when that window reaches \
-                 step 0 and needs no anchor. The graph continues running"
+                "this run is ARMED for checkpoints but its state ring could not be created, so \
+                 this rank captures NOTHING, and because a graph-wide anchor is all-or-nothing \
+                 across ranks, every anchor of this run LACKS the records of the rank this event \
+                 names. A resim of a capture from this run whose window reaches step 0 reads no \
+                 anchor at all and reaches a verdict whatever the ring count. One whose window \
+                 starts mid run exits 2 with no verdict in two ways: with more than one state ring \
+                 left it refuses the recording outright as ambiguous, and with one ring left it \
+                 resumes from that ring and refuses by name every node of the missing rank the \
+                 replay executes, none of which has an anchor. It reaches a verdict of its own \
+                 only when no node of that rank runs in that window. The graph continues running"
             );
             return None;
         }

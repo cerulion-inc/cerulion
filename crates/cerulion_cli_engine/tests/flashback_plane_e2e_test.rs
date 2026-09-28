@@ -530,6 +530,15 @@ fn a_worker_over_the_ceiling_declines_for_itself_and_says_which_rank() {
          resim really returns and split by the case it lands in"
     );
     assert!(
+        logs_contain(
+            "whose window reaches step 0 reads no anchor at all and reaches a verdict whatever \
+             the ring count"
+        ),
+        "…with the STEP 0 exception stated FIRST, because it governs BOTH ring counts: a \
+         two-ring capture that reaches step 0 resims and passes, so the ambiguity half is \
+         true only of a window that starts mid run"
+    );
+    assert!(
         logs_contain("refuses by name every node of the missing rank the replay executes"),
         "…including what the operator SEES on the one-surviving-ring case, which is the \
          common one and the one a blanket refusal claim got wrong"

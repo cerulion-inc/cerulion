@@ -107,26 +107,15 @@ impl BagAnchors {
     }
 }
 
-/// The one clause that names the ranks a recording's manifest stamps as having
-/// published no state ring at all.
-///
-/// EMPTY when the manifest stamps none, so a multi-ring recording without a
-/// hole reads exactly as it did before this clause existed. The ranks are
-/// rendered in the manifest's own ascending order rather than re-sorted here:
-/// the writer already keeps them ascending, and a second sort would be a
-/// second rule about an order that has one owner.
-fn render_ranks_missing(ranks: &[u32]) -> String {
-    if ranks.is_empty() {
-        return String::new();
-    }
-    let list = ranks
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let noun = if ranks.len() == 1 { "rank" } else { "ranks" };
-    format!(" ({noun} {list} published none, which is the hole you were warned about)")
-}
+// The clause naming the ranks that published no state ring, taken from
+// `cerulion_core::flashback::resim` rather than written again here.
+//
+// The SAME hole is described twice on one operator journey: `bag info` prints
+// it as the stored `resimmable_reason` a capture carries, and a resim of that
+// capture prints it as the refusal below. Two renderers would let those two
+// sentences drift, and a reader who met a rank in one and not the other would
+// learn that the tool had changed its mind about the recording.
+use cerulion_core::flashback::resim::render_ranks_missing;
 
 /// Why a bag's anchors cannot be read.
 ///

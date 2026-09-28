@@ -4265,7 +4265,13 @@ mod tests {
                 ResimGap::FaultReplay { departures: 3 },
                 "fault-degraded recording is not supported yet",
             ),
-            (ResimGap::MultiRing { rings: 4 }, "no rank"),
+            (
+                ResimGap::MultiRing {
+                    rings: 4,
+                    ranks_missing: Vec::new(),
+                },
+                "no rank",
+            ),
             (ResimGap::NoBoundary, "no step-boundary record"),
             (
                 ResimGap::AnchorIncomplete {

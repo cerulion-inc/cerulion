@@ -13256,11 +13256,16 @@ fn a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case() {
     //      Leg (A2) drives exactly that and reads the printed line back.
     //      When no such node runs in the window, the resim reaches a verdict of
     //      its own instead, which is leg (A1).
-    //  (B) SEVERAL rings survive (three or more ranks). The recording is
-    //      refused outright as ambiguous before any node is judged, exit 2,
-    //      and that refusal now names the holed rank beside the ring count.
-    //  (C) The capture's window reaches step 0. No anchor is read at all, so
-    //      the hole costs nothing and the resim runs.
+    //  (B) SEVERAL rings survive (three or more ranks) and the capture's window
+    //      starts MID RUN. The recording is refused outright as ambiguous
+    //      before any node is judged, exit 2, and that refusal names the holed
+    //      rank beside the ring count.
+    //  (C) The capture's window reaches step 0, at EITHER ring count.
+    //      `resolve_resume` returns before any anchor is read, so neither the
+    //      rank stamp nor the ring count is ever consulted and the resim
+    //      reaches its own verdict. Driven at one ring AND at two, because the
+    //      two-ring half is what makes (B) a statement about the WINDOW rather
+    //      than about the ring count, and the six sentences are worded on it.
     //
     // Every leg asserts the PRINTED line, because `resim_cmd::run_resim`
     // renders a typed error as `Error: {e}` on stderr and returns
@@ -13270,6 +13275,9 @@ fn a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case() {
     let rec = checkpoint_reference();
     let mid = make_mid_run(&rec, CP_FIRST_STEP);
     let one_ring = coverage_with_a_rank_hole(1, vec![1], vec![0]);
+    // The SAME manifest legs (B) and (C2) both drive, bound once so the pair
+    // differs in the WINDOW and in nothing else.
+    let two_rings = coverage_with_a_rank_hole(2, vec![0, 2], vec![1]);
 
     // (A1) ONE surviving ring, and every node the replay executes is covered by
     // it. The stamp refuses NOTHING, so the resim resumes and reaches its own
@@ -13352,7 +13360,7 @@ fn a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case() {
             CHECKPOINT_NODE_IDX,
             &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
         ),
-        Some(&coverage_with_a_rank_hole(2, vec![0, 2], vec![1])),
+        Some(&two_rings),
         None,
     );
     let ambiguous = replay(&b, checkpoint_factories, None, None)
@@ -13370,29 +13378,43 @@ fn a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case() {
         "names the fix: {printed}"
     );
 
-    // (C) The window reaches step 0. Nothing reads the coverage, so the hole
-    // costs nothing whatever the ring count.
-    let c = dir.path().join("hole_from_start.mcap");
-    write_checkpoint_bag(
-        &rec,
-        &c,
-        &state_records(
-            CHECKPOINT_RUN,
-            CP_FIRST_STEP - 1,
-            CHECKPOINT_NODE_IDX,
-            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
-        ),
-        Some(&one_ring),
-        None,
-    );
-    let whole = replay(&c, checkpoint_factories, None, None)
-        .expect("a recording that reaches step 0 needs no anchor, hole or not");
-    assert!(whole.passed, "{whole:?}");
-    assert!(
-        whole.resume.is_none(),
-        "nothing resumed, which is why the hole cost nothing: {:?}",
-        whole.resume
-    );
+    // (C) The window reaches step 0, at BOTH ring counts. `resolve_resume`
+    // returns before any anchor is read, so nothing reaches the ring-count gate
+    // and the hole costs nothing either way.
+    //
+    // DRIVEN AT TWO RINGS as well as one, because that is the leg that decides
+    // how the six sentences may be worded. With only the one-ring bag here, the
+    // sentences could say "more than one ring refuses outright" unqualified and
+    // this arm would stay green while leg (B)'s bag, which differs from the
+    // two-ring bag here ONLY in starting mid run, is the one that refuses. The
+    // (B)/(C2) PAIR is what pins the refusal to the WINDOW rather than to the
+    // ring count.
+    for (label, rings) in [("one ring", &one_ring), ("two rings", &two_rings)] {
+        let c = dir
+            .path()
+            .join(format!("hole_from_start_{}.mcap", label.replace(' ', "_")));
+        write_checkpoint_bag(
+            &rec,
+            &c,
+            &state_records(
+                CHECKPOINT_RUN,
+                CP_FIRST_STEP - 1,
+                CHECKPOINT_NODE_IDX,
+                &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+            ),
+            Some(rings),
+            None,
+        );
+        let whole = replay(&c, checkpoint_factories, None, None).unwrap_or_else(|e| {
+            panic!("a recording that reaches step 0 needs no anchor, hole or not ({label}): {e}")
+        });
+        assert!(whole.passed, "{label}: {whole:?}");
+        assert!(
+            whole.resume.is_none(),
+            "{label}: nothing resumed, which is why the hole cost nothing: {:?}",
+            whole.resume
+        );
+    }
 
     // THE ANTI-CLAIM half, over every line an operator can be handed here: a
     // verdict word and an exit code the 0 to 6 contract does not have.
