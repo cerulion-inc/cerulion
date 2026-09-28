@@ -2004,6 +2004,12 @@ jobs:
         env:
           CERULION_RMW_EXPECT_BINDINGS: vendored
         run: cargo test -p rmw_cerulion -- --test-threads=1
+      - name: selection marker, rmw_cerulion
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped rmw_cerulion (selected: $SELECTED)"
 
       # The borrow-window heap hook (`cerulion_heaphook`). LINUX ONLY (this
       # step is only on `test-linux`; the interposition `.so` cannot build on
@@ -2018,11 +2024,23 @@ jobs:
       - name: cerulion_heaphook tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_heaphook')
         run: cargo test -p cerulion_heaphook
+      - name: selection marker, cerulion_heaphook
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_heaphook') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_heaphook (selected: $SELECTED)"
 
       # doc-pin: native_ros2_messages::upstream_drift_test reads tools
       - name: native_ros2_messages tests
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
         run: cargo test -p native_ros2_messages
+      - name: selection marker, native_ros2_messages
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped native_ros2_messages (selected: $SELECTED)"
 
       # BOTH bag crates are named explicitly — every job here names its
       # `-p` packages and there is no blanket `cargo test --workspace`
@@ -2044,9 +2062,21 @@ jobs:
       - name: cerulion_bag tests
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')
         run: cargo test -p cerulion_bag
+      - name: selection marker, cerulion_bag
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_bag (selected: $SELECTED)"
       - name: cerulion_bagd tests (serial, process-global panic hook)
         if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
         run: cargo test -p cerulion_bagd -- --test-threads=1
+      - name: selection marker, cerulion_bagd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_bagd (selected: $SELECTED)"
 
       # cerulion_macros is a proc-macro crate compiled into the host
       # toolchain — its own unit tests (parse + determinism) are NOT
@@ -2054,6 +2084,12 @@ jobs:
       - name: cerulion_macros tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros')
         run: cargo test -p cerulion_macros
+      - name: selection marker, cerulion_macros
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
       # The CLI crates are named here too. Their 160+ tests
       # are pure-logic / filesystem and safe to run with default threading.
@@ -2081,6 +2117,12 @@ jobs:
       - name: CLI TUI tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
         run: cargo test -p cerulion_cli_tui
+      - name: selection marker, cerulion_cli_tui
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_cli_tui (selected: $SELECTED)"
 
       # `cerulion_discovery` — the LAN peer-discovery substrate extracted
       # from `cerulion_cli_engine` (the peers.json format+reader, the discovered-peer
@@ -2093,6 +2135,12 @@ jobs:
       - name: cerulion_discovery tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery')
         run: cargo test -p cerulion_discovery
+      - name: selection marker, cerulion_discovery
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
 
       # The test jobs enumerate packages explicitly: there is NO blanket
       # `cargo test --workspace` step (it would hang on iceoryx2's SHM singleton). So
@@ -2104,6 +2152,12 @@ jobs:
       - name: cerulion_wireclient tests
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient')
         run: cargo test -p cerulion_wireclient
+      - name: selection marker, cerulion_wireclient
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_wireclient (selected: $SELECTED)"
 
       # cerulion_connectd is a workspace member excluded from
       # default-members (it pulls the iroh tree), so — like wireclient above — it needs
@@ -2116,6 +2170,12 @@ jobs:
       - name: cerulion_connectd tests
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd')
         run: cargo test -p cerulion_connectd
+      - name: selection marker, cerulion_connectd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_connectd (selected: $SELECTED)"
 
       # The wan step below is where all four of the red PRs ran the
       # runner out of disk, and until now the ONLY `df` in this job ran before a
@@ -2155,6 +2215,17 @@ jobs:
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: cargo test -p cerulion_netd --features wan
+      # The SKIP BRANCH of the gate above. A skipped step prints nothing of
+      # its own, so the one line that says what the selection dropped lives
+      # here, beside it, under the exact negation of its condition.
+      # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
+      # for every gated step in this job.
+      - name: selection marker, cerulion_netd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_netd (selected: $SELECTED)"
 
       # The terminal reading, and the one every post-mortem so far has
       # lacked — `if: always()` because the state that matters is the state a
@@ -2500,10 +2571,22 @@ jobs:
         env:
           CERULION_RMW_EXPECT_BINDINGS: vendored
         run: cargo test -p rmw_cerulion -- --test-threads=1
+      - name: selection marker, rmw_cerulion
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped rmw_cerulion (selected: $SELECTED)"
 
       - name: native_ros2_messages tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
         run: cargo test -p native_ros2_messages
+      - name: selection marker, native_ros2_messages
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped native_ros2_messages (selected: $SELECTED)"
 
       # See the Linux job's note — neither bag crate was in ANY job's
       # `-p` list, so both suites compiled and never ran. bagd is serial for the
@@ -2511,9 +2594,21 @@ jobs:
       - name: cerulion_bag tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')
         run: cargo test -p cerulion_bag
+      - name: selection marker, cerulion_bag
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_bag (selected: $SELECTED)"
       - name: cerulion_bagd tests (serial, process-global panic hook)
         if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
         run: cargo test -p cerulion_bagd -- --test-threads=1
+      - name: selection marker, cerulion_bagd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_bagd (selected: $SELECTED)"
 
       # cerulion_macros is a proc-macro crate compiled into the host
       # toolchain — its own unit tests (parse + determinism) are NOT
@@ -2521,6 +2616,12 @@ jobs:
       - name: cerulion_macros tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros')
         run: cargo test -p cerulion_macros
+      - name: selection marker, cerulion_macros
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
       # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
       # rides shard 1 and the binary rides shard 0, because the binary's suite
@@ -2535,6 +2636,12 @@ jobs:
       - name: CLI TUI tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
         run: cargo test -p cerulion_cli_tui
+      - name: selection marker, cerulion_cli_tui
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_cli_tui (selected: $SELECTED)"
 
       # `cerulion_discovery` — the LAN peer-discovery substrate extracted
       # from `cerulion_cli_engine` (the peers.json format+reader, the discovered-peer
@@ -2547,6 +2654,12 @@ jobs:
       - name: cerulion_discovery tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery')
         run: cargo test -p cerulion_discovery
+      - name: selection marker, cerulion_discovery
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
 
       # The test jobs enumerate packages explicitly: there is NO blanket
       # `cargo test --workspace` step (it would hang on iceoryx2's SHM singleton). So
@@ -2558,6 +2671,12 @@ jobs:
       - name: cerulion_wireclient tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient')
         run: cargo test -p cerulion_wireclient
+      - name: selection marker, cerulion_wireclient
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_wireclient (selected: $SELECTED)"
 
       # cerulion_connectd is a workspace member excluded from
       # default-members (it pulls the iroh tree), so — like wireclient above — it needs
@@ -2569,6 +2688,12 @@ jobs:
       - name: cerulion_connectd tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd')
         run: cargo test -p cerulion_connectd
+      - name: selection marker, cerulion_connectd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_connectd (selected: $SELECTED)"
 
       # The wan step is where the Linux leg ran out of disk on all four of
       # the red PRs. macOS has no measured ENOSPC — see the reclaim step at the
@@ -2584,6 +2709,12 @@ jobs:
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: cargo test -p cerulion_netd --features wan
+      - name: selection marker, cerulion_netd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_netd (selected: $SELECTED)"
 
       # THE macOS HALF OF `viz-tests`, folded in here rather than run as two
       # more macOS jobs. The `run:` lines are VERBATIM copies of the
@@ -2604,9 +2735,21 @@ jobs:
       - name: cerulion_vizd tests (whole suite, serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd')
         run: cargo test -p cerulion_vizd --no-fail-fast -- --test-threads=1
+      - name: selection marker, cerulion_vizd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_vizd (selected: $SELECTED)"
       - name: go2_tf tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')
         run: cargo test -p go2_tf
+      - name: selection marker, go2_tf
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped go2_tf (selected: $SELECTED)"
       - name: cargo test -p cerulion_viz --lib openh264_fetch
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --lib openh264_fetch
@@ -2616,6 +2759,17 @@ jobs:
       - name: cargo test -p cerulion_viz --test video_decode_test
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test video_decode_test -- --test-threads=1
+      # The SKIP BRANCH of the gate above. A skipped step prints nothing of
+      # its own, so the one line that says what the selection dropped lives
+      # here, beside it, under the exact negation of its condition.
+      # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
+      # for every gated step in this job.
+      - name: selection marker, cerulion_viz
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_viz (selected: $SELECTED)"
 
   # ==========================================================================
   # The packages that ran in NO job.
@@ -2802,27 +2956,75 @@ jobs:
       - name: cerulion_pairing tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
         run: cargo test -p cerulion_pairing
+      - name: selection marker, cerulion_pairing
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_pairing (selected: $SELECTED)"
       - name: cerud tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerud')
         run: cargo test -p cerud
+      - name: selection marker, cerud
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerud') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerud (selected: $SELECTED)"
       - name: cerulion_remoted tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
         run: cargo test -p cerulion_remoted
+      - name: selection marker, cerulion_remoted
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_remoted (selected: $SELECTED)"
       - name: cerulion_accountd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_accountd')
         run: cargo test -p cerulion_accountd
+      - name: selection marker, cerulion_accountd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_accountd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_accountd (selected: $SELECTED)"
       - name: cerulion_dds tests (default features, jazzy/live)
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_dds')
         run: cargo test -p cerulion_dds
+      - name: selection marker, cerulion_dds
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_dds') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_dds (selected: $SELECTED)"
       - name: cerulion_link tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_link')
         run: cargo test -p cerulion_link
+      - name: selection marker, cerulion_link
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_link') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_link (selected: $SELECTED)"
       - name: cerulion-wire tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire')
         run: cargo test -p cerulion-wire
+      - name: selection marker, cerulion-wire
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion-wire (selected: $SELECTED)"
       - name: cerulion_mdns tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_mdns')
         run: cargo test -p cerulion_mdns
+      - name: selection marker, cerulion_mdns
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_mdns') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_mdns (selected: $SELECTED)"
       # The ONE non-`cargo test` step here, and it is load-bearing.
       # `cerulion_wsd`'s two production `--inspect-node` arms run the SHIPPED
       # binary against a real node cdylib, and a cdylib is opened with
@@ -2841,6 +3043,17 @@ jobs:
       - name: cerulion_wsd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
         run: cargo test -p cerulion_wsd
+      # The SKIP BRANCH of the gate above. A skipped step prints nothing of
+      # its own, so the one line that says what the selection dropped lives
+      # here, beside it, under the exact negation of its condition.
+      # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
+      # for every gated step in this job.
+      - name: selection marker, cerulion_wsd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_wsd (selected: $SELECTED)"
       # doc-pin: cerulion_hygiene::crate_license_texts_test reads docs
       # doc-pin: cerulion_hygiene::dependency_rules_test reads examples
       # doc-pin: cerulion_hygiene::shipped_surface_structure_test reads .github, benches, docs, tools
@@ -3938,6 +4151,12 @@ jobs:
         if: matrix.lane == 'vizd' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd')
         timeout-minutes: 30
         run: cargo test -p cerulion_vizd --no-fail-fast -- --test-threads=1
+      - name: selection marker, cerulion_vizd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_vizd (selected: $SELECTED)"
 
       # `go2_tf` is the viz tree's THIRD package (`cerulion_viz/lib/go2_tf`);
       # naming only two packages would leave it executed by NO CI job, the exact
@@ -3947,6 +4166,12 @@ jobs:
       - name: go2_tf tests
         if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')
         run: cargo test -p go2_tf
+      - name: selection marker, go2_tf
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped go2_tf (selected: $SELECTED)"
 
       # The OpenH264 fetcher's own suite. SAME argument as the two
       # whole-suite lanes above — `cargo clippy --workspace --all-targets`
@@ -3977,6 +4202,17 @@ jobs:
       - name: cargo test -p cerulion_viz --test video_decode_test
         if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test video_decode_test -- --test-threads=1
+      # The SKIP BRANCH of the gate above. A skipped step prints nothing of
+      # its own, so the one line that says what the selection dropped lives
+      # here, beside it, under the exact negation of its condition.
+      # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
+      # for every gated step in this job.
+      - name: selection marker, cerulion_viz
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_viz (selected: $SELECTED)"
 
   # Unused-dependency audit (cargo-machete).
   #

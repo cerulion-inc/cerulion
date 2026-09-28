@@ -3496,3 +3496,155 @@ fn a_shape_that_is_not_an_observation_derives_no_edge() {
     );
     assert_eq!(fixture_edges(&table), edge("beta", EDGE_CRATE_PATH, 1));
 }
+
+// ---------------------------------------------------------------------------
+// A gated step's doc-pin marker abuts the step it pins.
+// ---------------------------------------------------------------------------
+
+/// The opening of the per-package selection gate `ci.yml` spells.
+///
+/// Held here as a literal because that is the only form
+/// `cerulion_cli_engine::ci_test_coverage_test` credits: a step gated on
+/// anything else is not a gated step and owes no adjacency.
+const SELECTION_GATE_OPEN: &str = "contains(fromJSON(needs.changes.outputs.pkgs), '";
+
+/// Is this workflow line the per-package selection gate for `package`?
+fn line_gates_package(line: &str, package: &str) -> bool {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return false;
+    }
+    line.contains(&format!("{SELECTION_GATE_OPEN}{package}'"))
+}
+
+/// Every complaint about a doc-pin marker that does not abut the GATED step it
+/// pins.
+///
+/// A marker beside another step of the same job is enough while nothing is
+/// gated: the job runs the package either way. Once a step is gated on the
+/// selection, the marker is what a path-to-step map reads to decide that THIS
+/// step has to run, and a marker parked beside a different step of the same job
+/// points at the wrong condition.
+///
+/// A marker for a package no step of the job gates is left alone, which is the
+/// state every marker in `ci.yml` was in before the gates existed.
+fn doc_pin_adjacency_complaints(job: &str, block: &str) -> Vec<String> {
+    let lines: Vec<&str> = block.lines().collect();
+    let step_at: Vec<usize> = (0..lines.len())
+        .filter(|i| lines[*i].starts_with("      - ") && !lines[*i].starts_with("       "))
+        .collect();
+    let step_end = |k: usize| -> usize {
+        step_at
+            .iter()
+            .copied()
+            .find(|&j| j > step_at[k])
+            .unwrap_or(lines.len())
+    };
+
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with(MARKER_PREFIX) {
+            continue;
+        }
+        let Some(package) = marker_package(trimmed) else {
+            continue;
+        };
+        let gated = (0..step_at.len()).any(|k| {
+            let body = &lines[step_at[k]..step_end(k)];
+            body.iter().any(|l| line_names_package(l, package))
+                && body.iter().any(|l| line_gates_package(l, package))
+        });
+        if !gated {
+            continue;
+        }
+        let abutting = step_at.iter().copied().find(|&j| j > i).filter(|&j| {
+            lines[i + 1..j]
+                .iter()
+                .all(|l| l.trim().is_empty() || l.trim().starts_with('#'))
+        });
+        let names_it = abutting.is_some_and(|j| {
+            let k = step_at
+                .iter()
+                .position(|&s| s == j)
+                .expect("j is a step start");
+            lines[j..step_end(k)]
+                .iter()
+                .any(|l| line_names_package(l, package))
+        });
+        if !names_it {
+            out.push(format!(
+                "  {job}: `{trimmed}` is the pin of a step GATED on the \
+                 selection, so it has to sit directly above THAT step. Nothing \
+                 but comments may come between them."
+            ));
+        }
+    }
+    out
+}
+
+/// The live workflow: every gated step's doc-pin marker abuts it.
+#[test]
+fn a_gated_steps_doc_pin_marker_abuts_the_step_it_pins() {
+    let text = ci_workflow_text();
+    let mut complaints = Vec::new();
+    for (job, block) in jobs_of(&text) {
+        complaints.extend(doc_pin_adjacency_complaints(&job, &block));
+    }
+    assert!(
+        complaints.is_empty(),
+        "doc-pin markers beside gated steps are in the wrong place:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The adjacency rule, both sides, on synthetic jobs.
+#[test]
+fn a_marker_parked_away_from_its_gated_step_is_a_red_walker() {
+    let gate = format!("        if: {SELECTION_GATE_OPEN}pkg')\n");
+    let marker = format!("      {MARKER_PREFIX} pkg::bin{MARKER_VERB}docs\n");
+    let gated_step = format!("{gate}        run: cargo test -p pkg\n");
+    let other = "      - name: something else\n        run: true\n";
+
+    // Adjacent, with a comment between: legal.
+    let good =
+        format!("  j:\n    steps:\n{marker}      # a note\n      - name: pkg tests\n{gated_step}");
+    assert_eq!(
+        doc_pin_adjacency_complaints("j", &good),
+        Vec::<String>::new(),
+        "a marker directly above its gated step, comments allowed, is legal"
+    );
+
+    // Parked beside ANOTHER step of the same job: refused.
+    let bad = format!(
+        "  j:\n    steps:\n{marker}      - name: something else\n        run: true\n      \
+         - name: pkg tests\n{gated_step}"
+    );
+    assert_eq!(
+        doc_pin_adjacency_complaints("j", &bad).len(),
+        1,
+        "a marker beside a step that does not run its package must be refused"
+    );
+
+    // The same layout with the step UNGATED: legal, because the job runs the
+    // package on every event and no condition reads the marker.
+    let ungated = format!(
+        "  j:\n    steps:\n{marker}{other}      - name: pkg tests\n        run: cargo test -p pkg\n"
+    );
+    assert_eq!(
+        doc_pin_adjacency_complaints("j", &ungated),
+        Vec::<String>::new(),
+        "a marker in a job whose steps are ungated owes no adjacency"
+    );
+
+    // A gate on a DIFFERENT package does not make this marker's step gated.
+    let other_gate = format!(
+        "  j:\n    steps:\n{marker}{other}      - name: pkg tests\n        if: \
+         {SELECTION_GATE_OPEN}elsewhere')\n        run: cargo test -p pkg\n"
+    );
+    assert_eq!(
+        doc_pin_adjacency_complaints("j", &other_gate),
+        Vec::<String>::new(),
+        "the gate has to name the marker's own package"
+    );
+}

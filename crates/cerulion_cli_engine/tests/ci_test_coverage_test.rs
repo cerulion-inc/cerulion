@@ -3144,6 +3144,9 @@ const SELECTION_SWITCH_READER_STEP: &str = "classify";
 /// The prefix every selection skip line carries.
 const SELECTION_MARKER_PREFIX: &str = "selection:";
 
+/// The whole opening of the line a gated step's skip branch prints.
+const SELECTION_SKIPPED_PREFIX: &str = "selection: skipped ";
+
 /// Why this condition is not a legal step-level selection gate, if it is not.
 ///
 /// THE RULE. The switch feeds the CLASSIFIER, and the classifier's three
@@ -3277,6 +3280,91 @@ fn step_name_of(block: &[&str]) -> Option<String> {
     None
 }
 
+/// The exact condition a gated step's SKIP-BRANCH marker carries: the negation
+/// of the per-package gate, wrapped so YAML reads the `!` as an expression
+/// rather than as a tag.
+fn selection_marker_condition(package: &str) -> String {
+    format!("${{{{ !{SELECTION_PKG_IF_OPEN}{package}{SELECTION_PKG_IF_CLOSE} }}}}")
+}
+
+/// The one line that marker prints, up to the selection it names.
+fn selection_marker_line(package: &str) -> String {
+    format!("{SELECTION_SKIPPED_PREFIX}{package} (selected: ")
+}
+
+/// Every package a step of this job is gated on, and the packages its marker
+/// steps cover.
+fn selection_gates_and_markers(job: &str) -> (BTreeSet<String>, BTreeSet<String>, Vec<String>) {
+    let mut gated: BTreeSet<String> = BTreeSet::new();
+    let mut marked: BTreeSet<String> = BTreeSet::new();
+    let mut complaints: Vec<String> = Vec::new();
+    for block in step_blocks(job) {
+        let cond = match step_if_of(&block) {
+            Ok(Some(cond)) => cond,
+            Ok(None) => continue,
+            Err(why) => {
+                complaints.push(format!("  {why}"));
+                continue;
+            }
+        };
+        for term in cond.split("&&") {
+            if let Some(package) = selection_condition_package(term) {
+                gated.insert(package.to_string());
+            }
+        }
+        // A marker step is recognised by its CONDITION, which is the exact
+        // negation of one gate, and then held to its print. Recognised by the
+        // condition rather than by the name, so a step called "selection
+        // marker" that gates on something else covers nothing.
+        for package in marked_candidates(&cond) {
+            if cond.trim() != selection_marker_condition(&package) {
+                continue;
+            }
+            let script = run_script_of(&block).unwrap_or_default();
+            let printed: Vec<&str> = script
+                .lines()
+                .filter(|l| l.contains(SELECTION_MARKER_PREFIX))
+                .collect();
+            let name = step_name_of(&block).unwrap_or_default();
+            if printed.len() != 1 {
+                complaints.push(format!(
+                    "  `{name}` is the skip branch of the `{package}` gate and \
+                     prints {} line(s) carrying `{SELECTION_MARKER_PREFIX}`; \
+                     exactly one is the rule",
+                    printed.len()
+                ));
+                continue;
+            }
+            if !printed[0].contains(&selection_marker_line(&package)) {
+                complaints.push(format!(
+                    "  `{name}` prints `{}` rather than a line opening \
+                     `{}`",
+                    printed[0].trim(),
+                    selection_marker_line(&package)
+                ));
+                continue;
+            }
+            marked.insert(package);
+        }
+    }
+    (gated, marked, complaints)
+}
+
+/// The packages a marker CONDITION could be about: the negated per-package form
+/// names exactly one.
+fn marked_candidates(cond: &str) -> Vec<String> {
+    let cond = cond.trim();
+    let Some(inner) = cond.strip_prefix("${{").and_then(|c| c.strip_suffix("}}")) else {
+        return Vec::new();
+    };
+    let Some(term) = inner.trim().strip_prefix('!') else {
+        return Vec::new();
+    };
+    selection_condition_package(term.trim())
+        .map(|p| vec![p.to_string()])
+        .unwrap_or_default()
+}
+
 /// The switch is declared once, at workflow level, WITH its default, and it
 /// reaches the classifier.
 #[test]
@@ -3406,3 +3494,102 @@ fn the_selection_gate_rule_names_the_switch_and_the_wrong_output() {
     }
 }
 
+/// Every gated step's job carries the skip-branch marker for its package.
+#[test]
+fn every_gated_step_has_a_selection_marker_in_its_job() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut gated_total = 0usize;
+    for (file, text) in workflow_texts() {
+        for (job, block) in jobs_of(&text) {
+            let (gated, marked, mut trouble) = selection_gates_and_markers(&block);
+            complaints.append(&mut trouble);
+            gated_total += gated.len();
+            for package in gated.difference(&marked) {
+                complaints.push(format!(
+                    "  {file} / {job}: a step is gated on `{package}` and the \
+                     job carries no marker step for it. Add a step with \
+                     `if: {}` whose script prints \
+                     `{}<the selection>)`",
+                    selection_marker_condition(package),
+                    selection_marker_line(package)
+                ));
+            }
+            for package in marked.difference(&gated) {
+                complaints.push(format!(
+                    "  {file} / {job}: a marker step names `{package}` and no \
+                     step of this job is gated on it; a marker that describes \
+                     nothing pre-authorises the next hole"
+                ));
+            }
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "selection markers do not match the gates:\n{}",
+        complaints.join("\n")
+    );
+    // Non-vacuity. Before PR B nothing in this tree was gated, so this arm and
+    // the totality arm both passed on an empty population; a workflow that lost
+    // every gate would do the same.
+    assert!(
+        gated_total >= 20,
+        "only {gated_total} step gate(s) were found across the workflows: the \
+         gate reader is broken, or the selection was removed, and this arm and \
+         the totality arm below would both be vacuous"
+    );
+}
+
+/// The marker rule, both sides, on synthetic jobs.
+#[test]
+fn a_gated_step_without_its_marker_is_a_red_walker() {
+    let gate = format!(
+        "        if: {}\n",
+        SELECTION_PKG_IF_OPEN.to_string() + "alpha" + SELECTION_PKG_IF_CLOSE
+    );
+    let step = format!("      - name: alpha tests\n{gate}        run: cargo test -p alpha\n");
+    let marker = format!(
+        "      - name: selection marker, alpha\n        if: {}\n        run: |\n          echo \"{}$SELECTED)\"\n",
+        selection_marker_condition("alpha"),
+        selection_marker_line("alpha")
+    );
+    let job = |steps: &str| format!("  j:\n    runs-on: ubuntu-latest\n    steps:\n{steps}");
+
+    let (gated, marked, trouble) = selection_gates_and_markers(&job(&format!("{step}{marker}")));
+    assert!(trouble.is_empty(), "-> {trouble:?}");
+    assert_eq!(gated, marked, "a gated step WITH its marker is covered");
+    assert_eq!(gated, ["alpha".to_string()].into_iter().collect());
+
+    let (gated, marked, trouble) = selection_gates_and_markers(&job(&step));
+    assert!(trouble.is_empty(), "-> {trouble:?}");
+    assert!(
+        marked.is_empty() && gated.len() == 1,
+        "a gated step with NO marker leaves its package uncovered: gated \
+         {gated:?}, marked {marked:?}"
+    );
+
+    // An UNGATED step needs no marker, and produces none.
+    let plain = "      - name: alpha tests\n        run: cargo test -p alpha\n";
+    let (gated, marked, trouble) = selection_gates_and_markers(&job(plain));
+    assert!(trouble.is_empty(), "-> {trouble:?}");
+    assert!(gated.is_empty() && marked.is_empty());
+
+    // A marker that prints nothing, and one that prints the wrong line, are
+    // both complaints rather than silent passes.
+    let silent = format!(
+        "      - name: selection marker, alpha\n        if: {}\n        run: true\n",
+        selection_marker_condition("alpha")
+    );
+    let (_, marked, trouble) = selection_gates_and_markers(&job(&format!("{step}{silent}")));
+    assert!(marked.is_empty(), "a silent marker covers nothing");
+    assert_eq!(trouble.len(), 1, "-> {trouble:?}");
+    let wrong = format!(
+        "      - name: selection marker, alpha\n        if: {}\n        run: |\n          echo \"selection: something else\"\n",
+        selection_marker_condition("alpha")
+    );
+    let (_, marked, trouble) = selection_gates_and_markers(&job(&format!("{step}{wrong}")));
+    assert!(
+        marked.is_empty(),
+        "a marker printing the wrong line covers nothing"
+    );
+    assert_eq!(trouble.len(), 1, "-> {trouble:?}");
+}
