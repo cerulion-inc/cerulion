@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 # ci_changed_paths.sh: classify a pull request's changed paths for ci.yml.
 #
-# Reads one path per line on stdin and writes `<class>=<value>` lines on stdout,
-# in the shape `$GITHUB_OUTPUT` wants:
+# Reads one path per line on stdin and writes the four classes as
+# `<class>=<value>` lines on stdout, one per line, alongside a `selection:` line
+# that names the rule that fired. The caller reads the classes BY NAME, which is
+# how ci.yml invokes it:
 #
-#   git diff --name-only "$BASE" HEAD | tools/scripts/ci_changed_paths.sh >> "$GITHUB_OUTPUT"
+#   git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+#   ./tools/scripts/ci_changed_paths.sh < "$RUNNER_TEMP/changed.txt" \
+#     > "$RUNNER_TEMP/classes.txt"
+#   code=$(sed -n 's/^code=//p' "$RUNNER_TEMP/classes.txt")
+#
+# and then writes each of `packaging`, `code`, `docs` and `pkgs` to
+# `$GITHUB_OUTPUT` under its own literal name. Reading by name is what keeps the
+# `selection:` lines OUT of `$GITHUB_OUTPUT`: they are for the reader of the job
+# log, they carry no `<name>=<value>` shape, and piping this whole stream into
+# the outputs file would declare an output nothing reads.
 #
 # FOUR CLASSES, and two directions. `packaging` only ever ADDS work: it runs a
 # push-only job on a pull request that touches its inputs. `code`, `docs` and
@@ -240,17 +251,24 @@ marker_packages_for_root() {
 # Kept separate so the self-test can drive the RULES without a cargo resolve.
 classify_touched() {
     local docs=false everything=false path owner name root entry rule
-    local touched=" " reasons=" "
+    local touched=" " reasons=""
     local switch=${CI_SELECTION:-on}
 
     # One token per RULE that fired, so the log line and every self-test row
     # name the rule rather than the answer. Two rules that agree on the answer
     # (and every workspace-level rule agrees with the unknown-path fallback)
     # are told apart by nothing else.
+    # ONE REASON PER LINE, never space separated: a reason token carries a
+    # changed path (`docs:My Notes.md`), and a space-separated accumulator
+    # splits that into two tokens the moment the join expands it.
     note() {
-        case "$reasons" in
-            *" $1 "*) ;;
-            *) reasons="$reasons$1 " ;;
+        case "
+$reasons" in
+            *"
+$1
+"*) ;;
+            *) reasons="$reasons$1
+" ;;
         esac
     }
     touch_package() {
@@ -338,8 +356,10 @@ classify_touched() {
         note "unknown-path"
     done
 
-    # shellcheck disable=SC2086
-    reasons=$(printf '%s\n' $reasons | sort -u | paste -sd, -)
+    # QUOTED, so a reason naming a path with a space stays ONE token. The
+    # accumulator is newline separated, so the sort and the join need no word
+    # splitting and no pathname expansion to find the tokens.
+    reasons=$(printf '%s' "$reasons" | sort -u | paste -sd, -)
     [ -n "$reasons" ] || reasons=none
     if $everything; then
         printf 'code=true\ndocs=true\ntouched=%s\nreason=%s\n' "$EVERY" "$reasons"
@@ -489,6 +509,11 @@ crates/cerulion_core/src/wire.rs;README.md|false
     # the rule; the reason names the rule that fired, so deleting it changes the
     # reason and the row reds.
     #
+    # A ROOT MARKDOWN PATH WITH A SPACE has a row of its own, because the reason
+    # is the one field a changed path reaches verbatim: the join has to keep
+    # `docs:My Notes.md` as ONE token, and an unquoted expansion splits it into
+    # two and then globs whichever half looks like a pattern.
+    #
     # THE SWITCH IS PINNED ON EVERY ROW, empty for "unset". Inheriting it from
     # the environment made the whole table answer `all` under the repository
     # variable `CI_SELECTION=off`, which is the emergency stop reddening the
@@ -532,6 +557,7 @@ pull_request;;LICENSE|true|true|all|unknown-path
 pull_request;;.github/CODEOWNERS|true|true|all|unknown-path
 pull_request;;CITATION.cff|true|true|all|unknown-path
 pull_request;;README.md|false|true||docs:README.md
+pull_request;;My Notes.md|false|true||docs:My Notes.md
 pull_request;;|false|false||none
 '
     local event switch head
