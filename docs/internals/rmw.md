@@ -159,10 +159,10 @@ build.rs layers three era probes on top of the source selection:
   decides the EXPORT set: an entry point whose parameter type a distro's headers do not
   declare is compiled out WHOLE under its capability cfg, never stubbed, because rcl
   resolves rmw symbols by name and a defined symbol is a claim the headers cannot back.
-  Ten exports sit behind such a cfg (the four listener callbacks and
-  `rmw_event_set_callback`, the two content filter calls and `rmw_feature_supported`
-  from Humble; `rmw_qos_profile_check_compatible` and the two network flow calls from
-  Galactic), as do the two `rmw_message_info_t` sequence numbers and the context's
+  Ten exports sit behind such a cfg (`rmw_event_set_callback` and the three listener
+  callbacks, the two content filter calls and `rmw_feature_supported` from Humble;
+  `rmw_qos_profile_check_compatible` and the two network flow calls from Galactic), as
+  do the two `rmw_message_info_t` sequence numbers and the context's
   `actual_domain_id`. Each distro lane audits the built library with `nm` against the
   list its headers lack, with `rmw_init` as the positive control so an unreadable symbol
   table cannot pass (`tools/ci/rmw-distros/gate.sh`).
