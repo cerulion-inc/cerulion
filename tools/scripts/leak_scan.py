@@ -2912,10 +2912,13 @@ def parse_args(argv):
         # conversation body with a commit message or a pull request title would
         # quietly demote the dash and identity rules on those too. Refusing is
         # the same call --skip-code makes for the same reason.
+        # The COMMIT surfaces only. A pull request title and body are text on a
+        # public thread like an issue or a comment, and when somebody else has
+        # edited them they are judged the same way, so those stay combinable. A
+        # commit message and an author identity are this project's own record
+        # and keep the full hard set, so mixing them in would demote them by a
+        # flag meant for somebody else's prose.
         for name, opt in (('range', '--range'), ('message_file', '--message-file'),
-                          ('pr_title_env', '--pr-title-env'), ('pr_body_env', '--pr-body-env'),
-                          ('pr_title_file', '--pr-title-file'),
-                          ('pr_body_file', '--pr-body-file'),
                           ('ident_from_git', '--ident-from-git')):
             if getattr(args, name, None):
                 raise Usage('--conversation is the conversation surface alone and cannot be '
@@ -4793,9 +4796,12 @@ def self_test(out, base_env, argv0):
         arm('conversation-cannot-be-mixed-with-another-surface',
             all(run(['messages', '--conversation'] + extra + ['--no-allow'],
                     refenv, repo_ref)[0] == EXIT_USAGE
-                for extra in (['--range', 'HEAD~1..HEAD'], ['--pr-title-env', 'T'],
-                              ['--pr-body-env', 'B'], ['--message-file', pf],
-                              ['--ident-from-git'])))
+                for extra in (['--range', 'HEAD~1..HEAD'], ['--message-file', pf],
+                              ['--ident-from-git']))
+            and run(['messages', '--conversation', '--pr-title-env', 'T', '--pr-body-env', 'B',
+                     '--no-allow'] + mine,
+                    dict(refenv, T='a title ' + DASH_EM, B='a body ' + P_MAC + PLAIN_USER
+                         + '/x\n'), repo_ref)[0] == EXIT_HIT)
         # The one body the workflow never reads is the guard's own ask. That is
         # a condition in the shipped YAML, so it is read OUT of the shipped YAML
         # and evaluated, rather than restated here where it could drift.

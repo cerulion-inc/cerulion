@@ -208,6 +208,7 @@ jobs:
         run: |
           set -euo pipefail
           flags=(--hard ref-unverified)
+          bot_text=no
           if [ "$REQUIRE" = yes ]; then flags+=(--require-private); fi
           case "$EVENT_NAME" in
             pull_request)
@@ -217,12 +218,17 @@ jobs:
               # The title and the body are the AUTHOR's text on opened and on
               # synchronize, and they stay hard there, dash rule included. An
               # `edited` event whose sender is a bot is a review app appending to
-              # someone else's body, and reding a required check for a dash a
-              # machine wrote is the same defect this workflow just fixed on the
-              # comment surface. A later human edit that leaves those dashes in
-              # place reds, which is right: by then it is the author's text.
+              # someone else's text, and reding a required check for a dash a
+              # machine wrote is the defect this workflow fixes on the comment
+              # surface. That text is still SCANNED, below, by the conversation
+              # hard set instead: an address, a home path, a private name or a
+              # closed reference in it is still a finding and only the style
+              # class steps down. Not scanning it at all would let a bot put a
+              # value in a pull request body and pass. A later human edit that
+              # leaves those dashes in place reds, which is right: by then it is
+              # the author's text.
               if [ "$ACTION" = edited ] && [ "$SENDER_IS_BOT" = true ]; then
-                echo "a bot edited the pull request text; its title and body are not scanned"
+                bot_text=yes
               else
                 flags+=(--pr-title-env PR_TITLE --pr-body-env PR_BODY)
               fi
@@ -243,6 +249,16 @@ jobs:
           esac
           python3 -B tools/scripts/leak_scan.py messages --range "$range" --format github \
             ${flags[@]+"${flags[@]}"}
+          # The bot-edited title and body, in a run of their own, because
+          # --conversation is scanner wide and the commit range above keeps the
+          # full hard set. Same private tier, same reference classes; only the
+          # style class steps down.
+          if [ "$bot_text" = yes ]; then
+            pflags=(--conversation --pr-title-env PR_TITLE --pr-body-env PR_BODY
+                    --hard ref-unverified)
+            if [ "$REQUIRE" = yes ]; then pflags+=(--require-private); fi
+            python3 -B tools/scripts/leak_scan.py messages --format github "${pflags[@]}"
+          fi
 
   media:
     name: Leak guard (media)
