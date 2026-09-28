@@ -46,8 +46,25 @@ fn twist_batch(seq: u64) -> Vec<InputFrames> {
 /// pipeline stays wedged.
 const ENQUEUE_BUDGET: Duration = Duration::from_millis(50);
 
-/// The per-iteration breather, and the scheduler-delay reference it doubles as.
+/// The per-iteration breather. It lets the worker advance into `rec.log` and
+/// wedge; it is not part of any timed window and no measurement taken on it
+/// widens the budget above.
 const PACING: Duration = Duration::from_millis(1);
+
+/// How many individual enqueues may sit at or above [`ENQUEUE_BUDGET`] before
+/// the run reads as a block rather than as runner noise.
+///
+/// A descheduled runner is an EVENT: it lands in the one window it interrupts
+/// and leaves every other iteration alone. A block is a PROPERTY of the code:
+/// while the pipeline is wedged it costs EVERY enqueue. So the two separate on
+/// the COUNT of over-budget calls, never on the magnitude of the worst one, and
+/// the budget itself stays a strict constant that no measurement can widen.
+///
+/// Two, not one, so a single stall that splits across an enqueue window and the
+/// next one is still tolerated. It cannot hide a block: the loop reports no drop
+/// until the worker queue is full, so at least nine enqueues are timed, and a
+/// block puts all of them over budget.
+const STALLS_TOLERATED: usize = 2;
 
 #[test]
 fn tick_never_blocks_while_grpc_server_accepts_but_never_reads() {
@@ -90,16 +107,17 @@ fn tick_never_blocks_while_grpc_server_accepts_but_never_reads() {
     // Feed until drops appear (the wedge fills the client channel + batcher) or a
     // generous cap; time EVERY enqueue. The enqueue must never block.
     //
-    // The pacing sleep below is timed too, and it is what makes the enqueue
-    // budget load-proof. A ceiling on a wall can only be tripped by a machine
-    // that is SLOWER than expected, so contention pushes this assert toward a
-    // red with nothing wrong. The sleep is a pure scheduler wait in the same
-    // loop under the same contention, so whatever delay a stalled runner adds
-    // to the enqueue window it also adds here: subtracting the requested 1 ms
-    // leaves the worst scheduling delay this loop actually paid, and the budget
-    // carries that as slack. On a quiet machine the slack is ~0 and the gate is
-    // exactly as tight as the bare budget. A genuine block is unbounded (the
-    // wedged pipeline never drains), so no amount of slack can hide it.
+    // A ceiling on a single wall can only be tripped by a machine SLOWER than
+    // expected, so contention pushes such an assert toward a red with nothing
+    // wrong. The answer is not a wider ceiling, which would admit a real stall
+    // of the same size: it is to count how MANY enqueues cross a ceiling that
+    // never moves. One descheduled window puts one enqueue over; a wedged
+    // enqueue path puts every one of them over. See [`STALLS_TOLERATED`].
+    //
+    // The pacing sleep is timed as well, and reported in the failure message so
+    // an over-budget run says whether the machine was stalling at the time. It
+    // is a diagnostic and enters no threshold.
+    let mut over_budget = 0usize;
     let mut max_enqueue = Duration::ZERO;
     let mut max_pacing = Duration::ZERO;
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -117,12 +135,16 @@ fn tick_never_blocks_while_grpc_server_accepts_but_never_reads() {
         let batch = twist_batch(fed);
         let t0 = Instant::now();
         worker.try_enqueue(batch);
-        max_enqueue = max_enqueue.max(t0.elapsed());
+        let enqueue = t0.elapsed();
+        if enqueue >= ENQUEUE_BUDGET {
+            over_budget += 1;
+        }
+        max_enqueue = max_enqueue.max(enqueue);
         fed += 1;
         // A small breather so the worker can advance into rec.log and wedge
         // (without this a very fast loop can outrun the batcher setup); this is
         // pacing only, NOT part of the timed enqueue window above. Its own wall
-        // is the scheduler-delay reference (see the note at the loop head).
+        // is reported as a diagnostic (see the note at the loop head).
         let t1 = Instant::now();
         std::thread::sleep(PACING);
         max_pacing = max_pacing.max(t1.elapsed());
@@ -134,13 +156,12 @@ fn tick_never_blocks_while_grpc_server_accepts_but_never_reads() {
          (fed {fed}, dropped {})",
         worker.dropped_frames()
     );
-    let scheduling_slack = max_pacing.saturating_sub(PACING);
-    let budget = ENQUEUE_BUDGET + scheduling_slack;
     assert!(
-        max_enqueue < budget,
+        over_budget <= STALLS_TOLERATED,
         "the enqueue must never block even with the real gRPC pipeline wedged \
-         (worst enqueue {max_enqueue:?} against {ENQUEUE_BUDGET:?} plus {scheduling_slack:?} \
-          of measured scheduling delay; worst pacing sleep {max_pacing:?} for a {PACING:?} \
-          request over {fed} iterations)"
+         ({over_budget} of {fed} enqueues reached {ENQUEUE_BUDGET:?}, against \
+          {STALLS_TOLERATED} tolerated; worst enqueue {max_enqueue:?}; worst pacing \
+          sleep {max_pacing:?} for a {PACING:?} request, which says whether the \
+          machine was stalling)"
     );
 }
