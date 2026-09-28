@@ -18,7 +18,8 @@ One paragraph on what this change does and why it is needed.
 # Real commands a reader can run. Name the packages you touched: the ROOT workspace has no
 # `cargo test --workspace` step (it deadlocks on iceoryx2's shared-memory singleton), so
 # ci.yml's root-workspace test steps enumerate their packages, and `cerulion_core` goes
-# through the shard runner. New tests and review replies follow docs/internals/testing-rules.md.
+# through the shard runner. `examples/go2` is its own workspace and runs `cargo test --workspace`
+# inside it. New tests and review replies follow docs/internals/testing-rules.md.
 cargo test -p <crate>
 ./tools/scripts/ci_test_shard.sh cerulion_core <shard> 4
 cargo clippy --workspace --all-targets -- -D warnings
