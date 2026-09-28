@@ -277,13 +277,23 @@ wrappers = ["cerulion_viz", "cerulion_vizd"]
 #      zero temporal replay) and `live_temporal_budget_bytes` (the LIVE
 #      broadcast queue, so a viewer that cannot keep up is served the present
 #      rather than a backlog). Pinned until upstream ships equivalents.
-# iceoryx2 and zenoh still come from crates.io.
+# zenoh still comes from crates.io; iceoryx2 comes from the pinned fork below.
 unknown-registry = "deny"
 unknown-git = "deny"
 # The pinned re_grpc_server fork. PRUNE this the moment the
 # root `[patch.crates-io]` is dropped (upstream re_grpc_server ships BOTH a
 # statics-only / drop-temporal history mode and a bounded, non-blocking live
 # queue).
+#
+# The iceoryx2 fork removes the process umask from the unix datagram socket
+# bind. The released 0.10.0 sets a process global umask for the duration of a
+# bind, which leaves any directory another thread creates in that window without
+# its owner search bit, and the value leaks permanently when two binds overlap.
+# The fork applies the socket permission with chmod after the bind instead. The
+# whole family is pinned to the one revision, because patching a single member
+# leaves the fork's copy of the shared containers beside the published one.
+# PRUNE this the moment an iceoryx2 release carries the fix.
 allow-git = [
     "https://github.com/cerulion-inc/re_grpc_server",
+    "https://github.com/cerulion-inc/iceoryx2",
 ]
