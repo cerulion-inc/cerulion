@@ -75,6 +75,15 @@
 //! any `||` disqualifies, and a `&&` chain is sanctioned only when every term
 //! is.
 //!
+//! GROUNDED, not merely well spelled. A condition is an expression over a value
+//! another job produced, so each of the three counts only where that value
+//! exists: the job carrying the step must `needs:` the `changes` job, and
+//! `changes` must declare the output the condition reads. Either one missing
+//! means the expression evaluates to the empty string on every event — the step
+//! runs NOWHERE while reading as a selected step — so the walk fails closed and
+//! drops it. Both halves are asserted on synthetic workflows by
+//! `a_selection_condition_credits_nothing_when_its_output_is_not_grounded`.
+//!
 //! TOTALITY UNDER SELECTION is the second thing the walk now decides, because
 //! being NAMED in a sanctioned step stops being enough once a selector exists:
 //! the step also has to RUN on the pull request that touches that package
@@ -240,9 +249,19 @@ fn jobs_of(text: &str) -> Vec<(String, String)> {
 
 /// The member of a selection set that means "the doc classes changed".
 ///
-/// It shares the set with package names, and no workspace member is named
-/// `docs`, so the two cannot collide.
+/// It shares the set with package names, so it only works while no workspace
+/// member carries that name. That is ASSERTED where the set is built, in
+/// `every_package_with_tests_is_credited_when_it_alone_is_selected`, rather
+/// than claimed here.
 const SELECTION_DOCS_MARKER: &str = "docs";
+
+/// The job id of the changed-path classifier whose outputs this walk reads.
+const SELECTION_JOB: &str = "changes";
+
+/// The output names the three sanctioned conditions read.
+const SELECTION_CODE_OUTPUT: &str = "code";
+const SELECTION_DOCS_OUTPUT: &str = "docs";
+const SELECTION_PKGS_OUTPUT: &str = "pkgs";
 
 /// The step conditions a changed-path classifier sets, spelled exactly.
 ///
@@ -250,6 +269,11 @@ const SELECTION_DOCS_MARKER: &str = "docs";
 /// an ordinary unknown condition and fails closed. `== 'false'` inverts the
 /// gate, and a different job id (`needs.other.outputs.code`) is a different
 /// classifier whose rules this walk has never seen.
+///
+/// Spelling them whole AND naming the job and the outputs separately is
+/// deliberate: the grounding check needs the parts, and
+/// `the_sanctioned_conditions_are_spelled_from_the_job_and_output_names` holds
+/// the two spellings to each other.
 const SELECTION_CODE_IF: &str = "needs.changes.outputs.code == 'true'";
 const SELECTION_DOCS_IF: &str = "needs.changes.outputs.docs == 'true'";
 
@@ -279,6 +303,47 @@ fn selection_condition_package(term: &str) -> Option<&str> {
     is_package_name.then_some(inner)
 }
 
+/// The selection outputs a step's condition may read: the ones the classifier
+/// declares, available to a job that needs the classifier.
+type GroundedOutputs = BTreeSet<String>;
+
+/// Which of the three selection outputs the classifier job of `jobs` declares.
+///
+/// Read from that job's `outputs:` mapping — the keys at six-space indent under
+/// it — so an output nobody publishes can ground nothing.
+fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
+    let mut out = BTreeSet::new();
+    let Some((_, block)) = jobs.iter().find(|(name, _)| name == SELECTION_JOB) else {
+        return out;
+    };
+    let lines: Vec<&str> = block.lines().collect();
+    let Some(at) = lines.iter().position(|l| l.trim_end() == "    outputs:") else {
+        return out;
+    };
+    for line in &lines[at + 1..] {
+        let Some(rest) = line.strip_prefix("      ") else {
+            break;
+        };
+        if rest.starts_with(' ') {
+            continue;
+        }
+        let Some((key, _)) = rest.split_once(':') else {
+            break;
+        };
+        let key = key.trim();
+        if [
+            SELECTION_CODE_OUTPUT,
+            SELECTION_DOCS_OUTPUT,
+            SELECTION_PKGS_OUTPUT,
+        ]
+        .contains(&key)
+        {
+            out.insert(key.to_string());
+        }
+    }
+    out
+}
+
 /// Can this step-level `if:` condition stop the step running on a pull
 /// request?
 ///
@@ -289,7 +354,12 @@ fn selection_condition_package(term: &str) -> Option<&str> {
 /// runs on at least one of them and can therefore fail one.
 /// `github.event_name == 'push'`, `runner.os == 'Linux'` and anything with a
 /// `||` do not qualify.
-fn step_if_is_pr_blocking(cond: &str) -> bool {
+///
+/// `grounded` names the selection outputs this step's job can actually read. A
+/// selection condition over anything else is an expression over the empty
+/// string: false on every event, so the step runs nowhere and is not
+/// sanctioned.
+fn step_if_is_pr_blocking_grounded(cond: &str, grounded: &GroundedOutputs) -> bool {
     let cond = cond.trim();
     if cond.is_empty() {
         return true;
@@ -303,12 +373,16 @@ fn step_if_is_pr_blocking(cond: &str) -> bool {
             return true;
         }
         // A sanctioned selection condition runs the step on exactly the pull
-        // requests whose changed paths select it, so it can fail one.
-        if t == SELECTION_CODE_IF || t == SELECTION_DOCS_IF {
-            return true;
+        // requests whose changed paths select it, so it can fail one — but
+        // only where the value it reads exists.
+        if t == SELECTION_CODE_IF {
+            return grounded.contains(SELECTION_CODE_OUTPUT);
+        }
+        if t == SELECTION_DOCS_IF {
+            return grounded.contains(SELECTION_DOCS_OUTPUT);
         }
         if selection_condition_package(t).is_some() {
-            return true;
+            return grounded.contains(SELECTION_PKGS_OUTPUT);
         }
         let Some(rest) = t.strip_prefix("matrix.") else {
             return false;
@@ -322,6 +396,26 @@ fn step_if_is_pr_blocking(cond: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     })
+}
+
+/// Every selection output — for the arms that ask about a CONDITION rather
+/// than about a step in a workflow.
+fn every_selection_output() -> GroundedOutputs {
+    [
+        SELECTION_CODE_OUTPUT,
+        SELECTION_DOCS_OUTPUT,
+        SELECTION_PKGS_OUTPUT,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// [`step_if_is_pr_blocking_grounded`] with every selection output available:
+/// the question "is this CONDITION one of the sanctioned shapes?", with
+/// grounding set aside.
+fn step_if_is_pr_blocking(cond: &str) -> bool {
+    step_if_is_pr_blocking_grounded(cond, &every_selection_output())
 }
 
 /// Does this step-level `if:` hold when the classifier selected exactly
@@ -356,8 +450,12 @@ fn step_if_holds_under_selection(cond: &str, selected: &BTreeSet<String>) -> boo
 }
 
 /// Drop every STEP of one job whose `if:` could stop it on a pull request.
-fn drop_gated_steps(job: &str) -> String {
-    retain_steps(job, step_if_is_pr_blocking)
+///
+/// `grounded` is the set of selection outputs THIS job can read — empty for a
+/// job that does not need the classifier, so a selection condition there is not
+/// sanctioned and its step goes.
+fn drop_gated_steps(job: &str, grounded: &GroundedOutputs) -> String {
+    retain_steps(job, |cond| step_if_is_pr_blocking_grounded(cond, grounded))
 }
 
 /// Keep the steps of one job whose every `if:` satisfies `keep`, and drop the
@@ -462,9 +560,24 @@ fn pr_blocking_jobs(text: &str) -> String {
         }
     }
 
+    // The selection outputs the classifier publishes, and which jobs can read
+    // them. A job that does not need the classifier reads an empty string from
+    // its outputs, so a step gated on one runs on NO event: that is not a
+    // selected step, it is an off step, and crediting it would put a package's
+    // coverage behind a condition that is never true.
+    let declared = declared_selection_outputs(&jobs);
+    let no_outputs: GroundedOutputs = BTreeSet::new();
+
     jobs.iter()
         .filter(|(name, block)| !gated.contains(name) && !is_soft(block))
-        .map(|(_, block)| drop_gated_steps(block))
+        .map(|(_, block)| {
+            let grounded = if job_needs(block).iter().any(|n| n == SELECTION_JOB) {
+                &declared
+            } else {
+                &no_outputs
+            };
+            drop_gated_steps(block, grounded)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1457,6 +1570,8 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
     );
 
     // ---- and the selection forms, end to end -----------------------------
+    // Whole-set equality rather than substring probes: a `contains` arm passes
+    // on a package name that survived inside a dropped step's text.
     let selection = "on:\n  pull_request:\njobs:\n  \
                      j:\n    runs-on: ubuntu-latest\n    needs: [changes]\n    steps:\n      \
                      - name: code\n        if: needs.changes.outputs.code == 'true'\n        \
@@ -1474,22 +1589,139 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
                      - name: or an event test\n        \
                      if: contains(fromJSON(needs.changes.outputs.pkgs), 'x') || \
                      github.event_name == 'push'\n        run: cargo test -p or_push_pkg\n  \
-                     changes:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
-    let kept = pr_blocking_jobs(selection);
-    for named in ["code_pkg", "docs_pkg", "sel_pkg"] {
-        assert!(
-            kept.contains(named),
-            "a step behind a sanctioned selection condition runs on the pull \
-             requests that select it and must credit `{named}`; got:\n{kept}"
-        );
-    }
-    for dropped in ["other_classifier_pkg", "inverted_pkg", "or_push_pkg"] {
-        assert!(
-            !kept.contains(dropped),
-            "a near miss of a sanctioned selection condition must stay \
-             disqualified, but `{dropped}` was credited; got:\n{kept}"
-        );
-    }
+                     changes:\n    runs-on: ubuntu-latest\n    outputs:\n      \
+                     code: ${{ steps.classify.outputs.code }}\n      \
+                     docs: ${{ steps.classify.outputs.docs }}\n      \
+                     pkgs: ${{ steps.classify.outputs.pkgs }}\n    steps:\n      - run: true\n";
+    let candidates: BTreeSet<String> = [
+        "code_pkg",
+        "docs_pkg",
+        "sel_pkg",
+        "other_classifier_pkg",
+        "inverted_pkg",
+        "or_push_pkg",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let sanctioned: BTreeSet<String> = ["code_pkg", "docs_pkg", "sel_pkg"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let texts: BTreeMap<String, String> = [("fake.yml".to_string(), pr_blocking_jobs(selection))]
+        .into_iter()
+        .collect();
+    let everything: BTreeSet<String> = ["sel_pkg", SELECTION_DOCS_MARKER]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        packages_credited_under_selection(&texts, &everything, &candidates),
+        sanctioned,
+        "exactly the three sanctioned selection conditions credit their \
+         package; every near miss stays disqualified"
+    );
+}
+
+/// The two spellings of a sanctioned condition agree: the whole string, and the
+/// job plus output names the grounding check reads.
+///
+/// They are separate constants because the check needs the parts, and two
+/// spellings of one fact drift. This is the arm that stops them.
+#[test]
+fn the_sanctioned_conditions_are_spelled_from_the_job_and_output_names() {
+    assert_eq!(
+        SELECTION_CODE_IF,
+        format!("needs.{SELECTION_JOB}.outputs.{SELECTION_CODE_OUTPUT} == 'true'")
+    );
+    assert_eq!(
+        SELECTION_DOCS_IF,
+        format!("needs.{SELECTION_JOB}.outputs.{SELECTION_DOCS_OUTPUT} == 'true'")
+    );
+    assert_eq!(
+        SELECTION_PKG_IF_OPEN,
+        format!("contains(fromJSON(needs.{SELECTION_JOB}.outputs.{SELECTION_PKGS_OUTPUT}), '")
+    );
+}
+
+/// A selection condition credits its step only where the value it reads EXISTS:
+/// the job needs the classifier, and the classifier declares that output.
+///
+/// Both are silent failures in the same direction. A step gated on a
+/// classifier output in a job that does not need that classifier reads the
+/// empty string, so the condition is false on every event and the step runs
+/// nowhere — while the coverage walk reads it as a selected step and credits
+/// the package it names. An output the classifier never declares does the
+/// same. Each half is asserted against the workflow that has it and the
+/// workflow that does not.
+#[test]
+fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
+    let body = |needs: &str, outputs: &str| {
+        format!(
+            "on:\n  pull_request:\njobs:\n  \
+             j:\n    runs-on: ubuntu-latest\n{needs}    steps:\n      \
+             - if: needs.changes.outputs.code == 'true'\n        \
+             run: cargo test -p code_pkg\n      \
+             - if: contains(fromJSON(needs.changes.outputs.pkgs), 'sel_pkg')\n        \
+             run: cargo test -p sel_pkg\n      \
+             - run: cargo test -p always_pkg\n  \
+             changes:\n    runs-on: ubuntu-latest\n{outputs}    steps:\n      - run: true\n"
+        )
+    };
+    let needs_changes = "    needs: [changes]\n";
+    let all_outputs = "    outputs:\n      code: ${{ steps.c.outputs.code }}\n      \
+                       pkgs: ${{ steps.c.outputs.pkgs }}\n";
+    let other_output = "    outputs:\n      packaging: ${{ steps.c.outputs.packaging }}\n";
+
+    let credited = |text: &str| -> BTreeSet<String> {
+        let texts: BTreeMap<String, String> =
+            [("fake.yml".to_string(), pr_blocking_jobs(text))]
+                .into_iter()
+                .collect();
+        ["code_pkg", "sel_pkg", "always_pkg"]
+            .into_iter()
+            .filter(|pkg| workflows_name(&texts, pkg).is_some())
+            .map(str::to_string)
+            .collect()
+    };
+    let set =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().copied().map(str::to_string).collect() };
+
+    // GROUNDED: the job needs the classifier and the classifier declares both
+    // outputs, so both selection steps credit their package.
+    assert_eq!(
+        credited(&body(needs_changes, all_outputs)),
+        set(&["always_pkg", "code_pkg", "sel_pkg"]),
+        "a grounded selection condition runs on the pull requests that select \
+         it and must credit the package it names"
+    );
+
+    // NOT GROUNDED, half one: the job does not need the classifier, so both
+    // conditions read an empty string and neither step ever runs.
+    assert_eq!(
+        credited(&body("", all_outputs)),
+        set(&["always_pkg"]),
+        "a job that does not need the classifier reads nothing from it, so a \
+         step gated on one of its outputs runs on no event and credits nothing"
+    );
+
+    // NOT GROUNDED, half two: the classifier is needed but publishes neither
+    // output.
+    assert_eq!(
+        credited(&body(needs_changes, other_output)),
+        set(&["always_pkg"]),
+        "an output the classifier does not declare grounds nothing"
+    );
+
+    // And the declaration reader itself, both ways.
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, all_outputs))),
+        set(&["code", "pkgs"])
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, other_output))),
+        BTreeSet::<String>::new()
+    );
 }
 
 /// `cargo test -p a -p b` covers BOTH — the module docs said so and the
@@ -1617,6 +1849,16 @@ fn every_package_with_tests_is_credited_when_it_alone_is_selected() {
         .into_keys()
         .filter(|pkg| !exempt.contains(pkg.as_str()))
         .collect();
+
+    // The doc marker shares the set with package names, so a workspace member
+    // of that name would make it mean two things at once and quietly credit
+    // that package on every doc-only change.
+    assert!(
+        !demanded.contains(SELECTION_DOCS_MARKER),
+        "a workspace package is named `{SELECTION_DOCS_MARKER}`, which is the \
+         marker this evaluator puts in the same set as package names. Rename \
+         the marker before the two meanings merge."
+    );
 
     let lost = packages_lost_to_their_own_selection(&texts, &demanded);
     assert!(

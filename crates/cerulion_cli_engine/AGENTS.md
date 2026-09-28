@@ -43,7 +43,7 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
 pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.
 ## Testing
-- Never gate a CI test step on a selection that omits the package it runs (`ci_test_coverage_test`).
+- `cargo test -p cerulion_cli_engine` covers most binaries.
 - Run `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`
   individually with `-- --test-threads=1`; the latter two share iceoryx2's ns.
 - Build `test_node_macro_period_cdylib` + `test_node_macro_data_trigger_cdylib`

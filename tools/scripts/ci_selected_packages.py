@@ -23,9 +23,11 @@ below therefore errs towards selecting more:
   * A NAME THAT IS NOT A WORKSPACE MEMBER IS AN ERROR, never an empty
     selection. Names reach here from changed paths, so a name the workspace
     does not carry means the caller's path rules and the manifest disagree, and
-    the honest answer is a refusal rather than "nothing to run".
+    a refusal is the answer rather than "nothing to run".
   * ANY PATH A CALLER CANNOT CLASSIFY selects everything, which is what `all`
-    and `--all` are for.
+    and `--all` are for. Either spelling is the WHOLE selection, so combining
+    it with a package name is a refusal too: the caller that wrote both meant
+    one of them, and picking for it would run the wrong set.
 
 A dependency is resolved to a workspace member BY NAME, and `dependencies[].name`
 is the real package name rather than the local alias, so a renamed dependency
@@ -365,7 +367,13 @@ def self_test():
     # on stdout: a refused invocation never prints something a caller can read
     # as a selection.
     for name, argv in (('cli-no-package-exits-2', []),
-                       ('cli-self-test-takes-no-package', ['--self-test', 'base'])):
+                       ('cli-self-test-takes-no-package', ['--self-test', 'base']),
+                       # `all` and `--all` are the WHOLE selection, so a caller
+                       # that also names a package contradicted itself and gets
+                       # a refusal rather than one of the two readings.
+                       ('cli-all-flag-with-a-package-exits-2', ['--all', 'base']),
+                       ('cli-all-sentinel-with-a-package-exits-2', ['all', 'base']),
+                       ('cli-all-sentinel-before-a-package-exits-2', ['base', 'all'])):
         code, out, _ = _run(argv, document_text)
         arm(name, (code, out) == (2, ''), '-> %s %r' % (code, out))
 
@@ -377,15 +385,23 @@ def self_test():
         arm('cli-reads-a-path', got == (0, '["left", "top"]\n', ''), '-> %r' % (got,))
         with open(path, 'w', encoding='utf-8') as handle:
             handle.write('{"version": 1, "packages": [{"name": "base"}]}')
-        for name, argv in (('cli-document-missing-a-field-exits-2', ['--metadata', path, 'base']),
-                           ('cli-absent-document-exits-2',
-                            ['--metadata', os.path.join(scratch, 'absent.json'), 'base'])):
-            code, out, err = _run(argv)
-            arm(name, (code, out) == (2, '') and err.startswith('ci_selected_packages: cannot read'),
-                '-> %s %r %r' % (code, out, err))
+        got = _run(['--metadata', path, 'base'])
+        arm('cli-document-missing-a-field-exits-2',
+            (got[0], got[1]) == (2, '')
+            and got[2].startswith('ci_selected_packages: cannot read'),
+            '-> %r' % (got,))
+        # The absent-file refusal is pinned WHOLE, not by a prefix: the line a
+        # caller reads has to name the path it could not open and why.
+        absent = os.path.join(scratch, 'absent.json')
+        expected_absent = (2, '', 'ci_selected_packages: cannot read %s: %r\n'
+                           % (absent, FileNotFoundError(2, 'No such file or directory')))
+        got = _run(['--metadata', absent, 'base'])
+        arm('cli-absent-document-refused-in-full', got == expected_absent,
+            '-> %r, wanted %r' % (got, expected_absent))
 
     arm('live-oracle-measured', LIVE_ORACLE_MEASURED,
-        'LIVE_ORACLE is empty: measure the workspace and fill it in')
+        'LIVE_ORACLE_MEASURED is False: measure the workspace, fill in '
+        'LIVE_ORACLE and LIVE_MEMBER_COUNT, and set it True')
     if LIVE_ORACLE_MEASURED:
         document = live_metadata()
         members = workspace_members(document)
@@ -436,6 +452,10 @@ def run(argv):
 
     if not args.packages and not args.all:
         parser.error('name at least one touched package, or `all`, or pass --all')
+    if args.all and args.packages:
+        parser.error('--all is the whole selection and takes no package name')
+    if 'all' in args.packages and len(args.packages) > 1:
+        parser.error('`all` is the whole selection and takes no other package name')
 
     try:
         document = read_metadata(args.metadata)
