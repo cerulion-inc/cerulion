@@ -504,7 +504,7 @@ fn stop_run(guard: &mut RunGuard, stderr_path: &Path) {
 /// One millisecond, in the nanoseconds the wire header stamps.
 const NS_PER_MS: u64 = 1_000_000;
 
-/// The fixture ticker's `period_ms = 50`, in nanoseconds — the unit the
+/// The fixture ticker's `period_ms = 50`, in nanoseconds: the unit the
 /// free-run burst bound below is DERIVED in rather than tuned against.
 const FIXTURE_PERIOD_NS: u64 = 50 * NS_PER_MS;
 
@@ -553,7 +553,7 @@ enum Gating {
 ///
 /// A free-run rank's clock advances once per step by the measured wall elapsed
 /// and is constant within the step, so a wall-delayed step fires the node for
-/// every period it owes and stamps each of those frames with the same target —
+/// every period it owes and stamps each of those frames with the same target,
 /// which is exactly what a resim re-advances to. Measured on one Linux capture:
 /// 345 ticker frames, 338 deltas at 50 ms, and exactly TWO 0 ns deltas, each
 /// right after a 101 ms / 110 ms step and followed by a 49 ms / 40 ms one.
@@ -562,8 +562,8 @@ enum Gating {
 ///
 /// "Never decreasing, and the last exceeds the first" is not a rule: over N
 /// frames it admits N-2 consecutive EQUAL stamps. A gating clock that stopped
-/// advancing per step — one quantised to a coarse tick, or advanced on the
-/// anchor cadence instead of per step — passes it unseen, and the STRICT
+/// advancing per step (one quantised to a coarse tick, or advanced on the
+/// anchor cadence instead of per step) passes it unseen, and the STRICT
 /// sequence check cannot see it either, because sequences are the producer's
 /// commit counter and keep counting through a frozen clock. The measured
 /// justification for admitting anything at all was 2 zero deltas in 345 frames;
@@ -597,7 +597,7 @@ enum Gating {
 /// The one place rule 1 cannot apply is the series' FIRST stamp run: a rolling
 /// window trims its head at an arbitrary frame, so a capture may legitimately
 /// begin part-way through a burst with the advance that produced it cut away.
-/// There the absolute ceiling stands alone — a long stall at the head still
+/// There the absolute ceiling stands alone: a long stall at the head still
 /// fails, a trimmed burst does not.
 fn gating_stamp_violation(stamps: &[u64], gating: Gating) -> Option<String> {
     // The advance the most recent step charged the clock (`None` until the
@@ -621,7 +621,7 @@ fn gating_stamp_violation(stamps: &[u64], gating: Gating) -> Option<String> {
         if gating == Gating::Lockstep {
             return Some(format!(
                 "repeats the stamp {cur} at frame {frame}, and under lockstep the quantum is \
-                 the tightest period — a step never owes a `period_ms` node a second fire, so \
+                 the tightest period: a step never owes a `period_ms` node a second fire, so \
                  every frame carries its own boundary target"
             ));
         }
@@ -633,7 +633,7 @@ fn gating_stamp_violation(stamps: &[u64], gating: Gating) -> Option<String> {
             Some(d) if d <= FIXTURE_PERIOD_NS => {
                 return Some(format!(
                     "repeats the stamp {cur} at frame {frame} after a step advance of {d} ns, \
-                     which is not more than the fixture's {FIXTURE_PERIOD_NS} ns period — a step \
+                     which is not more than the fixture's {FIXTURE_PERIOD_NS} ns period: a step \
                      the clock charged one period owes ONE fire, so this is a clock that stopped \
                      advancing per step and not a CATCH-UP BURST"
                 ));
@@ -650,7 +650,7 @@ fn gating_stamp_violation(stamps: &[u64], gating: Gating) -> Option<String> {
             return Some(format!(
                 "carries the stamp {cur} on {run_len} frames (through frame {frame}), past the \
                  {ceiling} that {advance} owes at a {FIXTURE_PERIOD_NS} ns period (absolute \
-                 ceiling {MAX_CATCH_UP_BURST_FRAMES}) — a CATCH-UP BURST cannot be that long, \
+                 ceiling {MAX_CATCH_UP_BURST_FRAMES}): a CATCH-UP BURST cannot be that long, \
                  and a clock quantised to a coarse tick or advanced on the anchor cadence \
                  instead of per step is exactly this shape"
             ));
@@ -685,7 +685,7 @@ fn gating_stamp_violation(stamps: &[u64], gating: Gating) -> Option<String> {
 /// it decides the STAMP rule: strictly increasing under lockstep, strictly
 /// increasing except a bounded catch-up burst under free run. The caller states
 /// it rather than the bag, so an arm that drives a lockstep run keeps the strict
-/// rule even though this helper is shared with the free-run arm — see
+/// rule even though this helper is shared with the free-run arm; see
 /// [`gating_stamp_violation`] for what the loose rule cannot catch.
 fn assert_frames_match_the_fixture_oracle(
     bag: &Path,
@@ -794,6 +794,19 @@ fn stamps_from_deltas(first: u64, deltas: &[u64]) -> Vec<u64> {
     stamps
 }
 
+/// The CATCH-UP BURST shape [`gating_stamp_violation`]'s rule 2 bounds: ONE
+/// step advance of `advance` ns, then `frames` frames carrying the target that
+/// advance produced.
+///
+/// Built at whatever depth a caller wants to probe, so an arm can drive the
+/// rule at exactly the burst an advance owes and at one frame past it instead
+/// of hand writing a delta list per phase.
+fn burst_stamps(first: u64, advance: u64, frames: usize) -> Vec<u64> {
+    let mut deltas = vec![advance];
+    deltas.resize(frames.max(1), 0);
+    stamps_from_deltas(first, &deltas)
+}
+
 /// **THE BURST, ADMITTED.** The measured free-run capture's own shape, the one
 /// the rule exists to let through: two catch-up bursts, each a 0 ns delta right
 /// after a step the clock charged 101 ms / 110 ms and followed by a short one.
@@ -822,7 +835,7 @@ fn the_stamp_rule_admits_the_measured_free_run_catch_up_burst() {
     );
 }
 
-/// **THE STALL, REFUSED** — and the arm that states what the relaxed rule cost.
+/// **THE STALL, REFUSED**, and the arm that states what the relaxed rule cost.
 ///
 /// A gating clock quantised to a coarse 1 s tick with the fixture's 50 ms
 /// period: it never decreases and its last stamp exceeds its first, so the
@@ -855,7 +868,7 @@ fn the_stamp_rule_refuses_a_stalled_stretch_the_relaxed_rule_admitted() {
     );
 }
 
-/// A healthy series — one stamp per step, every step — passes under BOTH modes.
+/// A healthy series (one stamp per step, every step) passes under BOTH modes.
 /// The free-run relaxation is an EXCEPTION, not a different rule.
 #[test]
 #[serial]
@@ -870,7 +883,7 @@ fn the_stamp_rule_admits_a_strictly_increasing_series_under_both_modes() {
     }
 }
 
-/// A clock that runs BACKWARDS is refused under both modes — the half neither
+/// A clock that runs BACKWARDS is refused under both modes, the half neither
 /// relaxation may ever reach.
 #[test]
 #[serial]
@@ -905,7 +918,7 @@ fn the_stamp_rule_refuses_under_lockstep_the_burst_it_admits_under_free_run() {
 }
 
 /// A zero delta after a step the clock charged ONE period or less owes no second
-/// fire, so it is a stopped clock however short the run of it is — the half the
+/// fire, so it is a stopped clock however short the run of it is, the half the
 /// absolute ceiling alone would miss.
 #[test]
 #[serial]
@@ -925,45 +938,58 @@ fn the_stamp_rule_refuses_a_zero_delta_after_an_ordinary_step() {
 #[test]
 #[serial]
 fn the_stamp_rule_refuses_a_burst_longer_than_its_advance_owes() {
-    // A 101 ms advance owes at most THREE fires, at the phase where the fire
-    // before it left the deadline just past that earlier stamp, so a FOURTH
-    // frame at the target is one no phase of that step ever owed.
-    let stamps = stamps_from_deltas(
-        1_000 * NS_PER_MS,
-        &[101 * NS_PER_MS, 0, 0, 0, 49 * NS_PER_MS],
-    );
-    let reason = gating_stamp_violation(&stamps, Gating::FreeRun)
-        .unwrap_or_else(|| panic!("a 101 ms step owes THREE fires, not four: {stamps:?}"));
+    // An advance ONE MILLISECOND past two periods owes at most THREE fires, at
+    // the phase where the fire before it left the deadline just past that
+    // earlier stamp, so a FOURTH frame at the target is one no phase of that
+    // step ever owed. Every padding here comes off [`FIXTURE_PERIOD_NS`], the
+    // unit the bound is derived in, so the bracket follows the fixture's
+    // period rather than a typed millisecond that stops bracketing it.
+    let over_two_periods = 2 * FIXTURE_PERIOD_NS + NS_PER_MS;
+    let short_tail = FIXTURE_PERIOD_NS - NS_PER_MS;
+    let stamps = stamps_from_deltas(1_000 * NS_PER_MS, &[over_two_periods, 0, 0, 0, short_tail]);
+    let reason = gating_stamp_violation(&stamps, Gating::FreeRun).unwrap_or_else(|| {
+        panic!("an advance of {over_two_periods} ns owes THREE fires, not four: {stamps:?}")
+    });
     assert!(reason.contains("CATCH-UP BURST"), "{reason}");
 }
 
 /// **THE PHASE BOUNDARY, PINNED BY HAND**, beside the exhaustive arm below.
 ///
-/// A 50 ms ticker fired at a step stamped 51 ms leaves its deadline at 100 ms;
-/// a step stamped 150 ms then owes it BOTH the 100 ms and the 150 ms deadline
-/// and carries two frames at one target behind an advance of 99 ms. The plain
-/// quotient `99 / 50` admits one of those two and REDS a capture the scheduler
-/// produced, which is the phase dependence this bound was carrying. The
-/// admission stays BOUNDED at the next frame, and at 101 ms it is three.
+/// A ticker fired at a step one millisecond past its period leaves its deadline
+/// one period further on; a step two periods along then owes it BOTH that
+/// deadline and the next, and carries two frames at one target behind an
+/// advance one millisecond SHORT of two periods. The plain quotient admits one
+/// of those two and REDS a capture the scheduler produced, which is the phase
+/// dependence this bound was carrying. The admission stays BOUNDED at the next
+/// frame, and one millisecond PAST two periods it is three. Every padding is
+/// derived from [`FIXTURE_PERIOD_NS`] so the arms keep bracketing the same
+/// boundary if the fixture's period moves.
 #[test]
 #[serial]
 fn the_stamp_rule_admits_the_burst_an_offset_phase_owes_and_still_bounds_it() {
-    let two = stamps_from_deltas(1_000 * NS_PER_MS, &[99 * NS_PER_MS, 0, 51 * NS_PER_MS]);
+    let under_two_periods = 2 * FIXTURE_PERIOD_NS - NS_PER_MS;
+    let over_two_periods = 2 * FIXTURE_PERIOD_NS + NS_PER_MS;
+    let long_tail = FIXTURE_PERIOD_NS + NS_PER_MS;
+    let short_tail = FIXTURE_PERIOD_NS - NS_PER_MS;
+    let two = stamps_from_deltas(1_000 * NS_PER_MS, &[under_two_periods, 0, long_tail]);
     assert_eq!(
         gating_stamp_violation(&two, Gating::FreeRun),
         None,
-        "a 99 ms advance owes TWO fires at the phase a 51 ms stamp leaves: {two:?}"
+        "an advance of {under_two_periods} ns owes TWO fires at the phase a {long_tail} ns \
+         stamp leaves: {two:?}"
     );
-    let three = stamps_from_deltas(1_000 * NS_PER_MS, &[99 * NS_PER_MS, 0, 0, 51 * NS_PER_MS]);
-    let reason = gating_stamp_violation(&three, Gating::FreeRun)
-        .unwrap_or_else(|| panic!("a 99 ms advance owes TWO fires, not three: {three:?}"));
+    let three = stamps_from_deltas(1_000 * NS_PER_MS, &[under_two_periods, 0, 0, long_tail]);
+    let reason = gating_stamp_violation(&three, Gating::FreeRun).unwrap_or_else(|| {
+        panic!("an advance of {under_two_periods} ns owes TWO fires, not three: {three:?}")
+    });
     assert!(reason.contains("CATCH-UP BURST"), "{reason}");
-    let three_at_101 =
-        stamps_from_deltas(1_000 * NS_PER_MS, &[101 * NS_PER_MS, 0, 0, 49 * NS_PER_MS]);
+    let three_at_over_two =
+        stamps_from_deltas(1_000 * NS_PER_MS, &[over_two_periods, 0, 0, short_tail]);
     assert_eq!(
-        gating_stamp_violation(&three_at_101, Gating::FreeRun),
+        gating_stamp_violation(&three_at_over_two, Gating::FreeRun),
         None,
-        "a 101 ms advance owes THREE fires at the tightest phase: {three_at_101:?}"
+        "an advance of {over_two_periods} ns owes THREE fires at the tightest phase: \
+         {three_at_over_two:?}"
     );
 }
 
@@ -990,7 +1016,12 @@ fn the_derived_bound_covers_every_phase_the_scheduler_can_fire_from() {
 
     let period = FIXTURE_PERIOD_NS;
     let prev = 1_000 * NS_PER_MS;
-    for advance_ms in 1..=500_u64 {
+    // The domain that matters is every advance a burst can CARRY, which the
+    // absolute ceiling caps at [`MAX_CATCH_UP_BURST_FRAMES`] periods, plus two
+    // periods of margin that show the cap still holding past its own reach.
+    // Derived from the two constants rather than typed, so it follows them.
+    let deepest_advance_ms = (MAX_CATCH_UP_BURST_FRAMES as u64 + 2) * FIXTURE_PERIOD_NS / NS_PER_MS;
+    for advance_ms in 1..=deepest_advance_ms {
         let d = advance_ms * NS_PER_MS;
         // The rule's DERIVED half, before the absolute ceiling caps it.
         let derived = d.div_ceil(period);
@@ -1014,6 +1045,26 @@ fn the_derived_bound_covers_every_phase_the_scheduler_can_fire_from() {
             deepest, derived,
             "the derived bound must be TIGHT: no phase of a {d} ns advance fires {derived} \
              times, so the rule admits a run no step can owe"
+        );
+        // …and the RULE itself, driven at the burst this advance owes and at
+        // one frame past it, rather than a second copy of its ceiling
+        // expression measured against the scheduler. Without this the arm is
+        // an oracle for the FORMULA, and a ceiling loosened inside
+        // `gating_stamp_violation` reads green on every advance here.
+        let cap = derived.min(MAX_CATCH_UP_BURST_FRAMES as u64) as usize;
+        let at_limit = burst_stamps(prev, d, cap);
+        assert_eq!(
+            gating_stamp_violation(&at_limit, Gating::FreeRun),
+            None,
+            "an advance of {d} ns owes {cap} frame(s) at one target, so the rule REFUSES a \
+             burst the scheduler itself produces: {at_limit:?}"
+        );
+        let past_limit = burst_stamps(prev, d, cap + 1);
+        assert!(
+            gating_stamp_violation(&past_limit, Gating::FreeRun).is_some(),
+            "an advance of {d} ns owes {cap} frame(s) at one target, so a run of {} carries a \
+             frame no phase of that step ever owed: {past_limit:?}",
+            cap + 1
         );
     }
 }
@@ -1432,7 +1483,7 @@ fn await_the_worker_has_stepped(topic: &str) {
 }
 
 /// The same wait, for a caller that needs the worker FURTHER along than arm 3's
-/// rendezvous does — see [`FREE_RUN_MID_RUN_FRAMES`].
+/// rendezvous does; see [`FREE_RUN_MID_RUN_FRAMES`].
 fn await_the_worker_has_published(topic: &str, wanted: usize) {
     let mgr = TransportManager::get_or_init().expect("the step probe's transport");
     let start = Instant::now();
@@ -2583,7 +2634,7 @@ const CLEAN_CAPTURE_ATTEMPTS: usize = 3;
 /// all arm 3's attach needs. This arm needs the run FURTHER along: the rolling
 /// window must hold a deep enough suffix that its head is genuinely trimmed, or
 /// the capture's first rank-0 boundary is step 0. A CONDITION rather than a
-/// sleep, for the usual reason and in the usual direction — a fixed span loses
+/// sleep, for the usual reason and in the usual direction: a fixed span loses
 /// on a starved runner, which sleeps it out having executed almost nothing and
 /// inverts the arm's precondition. The fixture's period is 50 ms, so this is
 /// ~2 s of a healthy run.
@@ -2604,24 +2655,34 @@ const FREE_RUN_MID_RUN_FRAMES: usize = 40;
 /// the per-topic counts already carry:
 ///
 ///  * `dropped_unwritten` frames left their tap's queue and never reached the
-///    bag at all (a latched writer error, or a full hand-off channel), so no
-///    per-topic counter can see them;
+///    bag at all (a writer that is GONE, a latched write error, or the
+///    force-drop test seam; a FULL hand-off channel defers the batch and
+///    retries it rather than dropping it), so no per-topic counter can see
+///    them;
 ///  * a `prefix_invisible` loss-counting basis says a contiguous prefix was
 ///    dropped before a tap's FIRST drain and TAKEN AS the baseline, so a zero
 ///    `frames_lost` beneath it means "nothing was counted", not "nothing was
 ///    lost".
 ///
-/// # The basis is ASSERTED, not gated, and the difference is measured
+/// # The basis is ASSERTED, not gated, and its token is DERIVED
 ///
-/// The always-on window plane discovers LIVE producers, so its taps attach to
-/// nodes that are already publishing and the document reads
-/// `prefix_invisible` on EVERY attempt of this arm (measured: three of three,
-/// every run). Retrying on it therefore refuses every capture this fixture can
-/// produce, which is why it is stated here and asserted below rather than
-/// added to the retry gate: it is a permanent property of the recorder this
-/// arm uses, not an attempt that went badly. The assert names that ONE
-/// measured token rather than accepting either of the two, so a basis that
-/// moves fails loudly here instead of passing a check it cannot fail.
+/// The always-on window recorder is spawned with an EMPTY `--topics-json`, so
+/// every tap it opens carries `source: discovered`, and a tap proves its
+/// prefix only when the recorder armed ahead of the producers AND the caller
+/// NAMED the topic AND the tap did not attach late. So `prefix_invisible` is
+/// what this plane reads by CONSTRUCTION rather than by luck, on any machine
+/// and at any speed. Retrying on it would therefore refuse every capture this
+/// fixture can produce, which is why it is asserted here rather than added to
+/// the retry gate: it is a permanent property of the recorder this arm uses,
+/// not an attempt that went badly.
+///
+/// The expected token is DERIVED from the capture's own coverage manifest by
+/// [`tap_basis_token`] and [`floor_basis_token`], the rules the recorder
+/// stamps the document with. So the oracle follows the run rather than a
+/// constant typed beside it, it fails when the two documents a capture carries
+/// DISAGREE, and a recorder that one day arms ahead of the producers moves
+/// both sides together instead of reddening an arm that measured nothing
+/// wrong.
 ///
 /// What the arm can still claim under that basis comes from its own shape:
 /// the comparison begins at the capture's ANCHOR, not at the topic's first
@@ -2658,6 +2719,49 @@ const FREE_RUN_MID_RUN_FRAMES: usize = 40;
 /// classification spanned the frames, which is the disabled-detector question
 /// already charged above; `first_seq` and `last_seq` describe the sequence
 /// GAPS this arm admits by design.
+/// The PER-TAP rule the recorder stamps a row's `loss_counting_basis` with,
+/// restated over the three coverage-manifest fields it reads.
+///
+/// A tap proves its prefix only when the recorder armed BEFORE the producers,
+/// the caller NAMED the topic, and the tap did not attach late; anything else
+/// took a contiguous head as its baseline and cannot see what it missed. The
+/// always-on window recorder is spawned with an empty `--topics-json`, so
+/// every tap it opens is `discovered` and this can only answer
+/// `prefix_invisible` there.
+fn tap_basis_token(
+    armed_before_producers: bool,
+    source: TapSource,
+    attached_late: bool,
+) -> &'static str {
+    if armed_before_producers && source == TapSource::Declared && !attached_late {
+        "prefix_proven"
+    } else {
+        "prefix_invisible"
+    }
+}
+
+/// The DOCUMENT floor: the weaker of every tap's own basis, and
+/// `prefix_invisible` outright unless the recorder armed ahead of the
+/// producers.
+///
+/// The `armed_before_producers` term is not redundant with the walk: a run
+/// with NO taps makes the walk vacuously true, and a recorder holding nothing
+/// must report the guarantee it was given rather than manufacture one.
+fn floor_basis_token(coverage: &RecordCoverage) -> &'static str {
+    let every_tap_proves = coverage.tapped.values().all(|tap| {
+        tap_basis_token(
+            coverage.armed_before_producers,
+            tap.source,
+            tap.attached_late,
+        ) == "prefix_proven"
+    });
+    if coverage.armed_before_producers && every_tap_proves {
+        "prefix_proven"
+    } else {
+        "prefix_invisible"
+    }
+}
+
 fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
     let reader = cerulion_bag::BagReader::open(bag).expect("open the capture");
     let att = reader
@@ -2674,6 +2778,22 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
              looked for:\n{raw}"
         )
     });
+    // The capture's OWN coverage manifest, which carries the three fields the
+    // recorder derives every `loss_counting_basis` from. The expected tokens
+    // below come off it rather than out of a literal, so the oracle states the
+    // coverage this run HAD.
+    let coverage_att = reader
+        .attachment(RECORD_COVERAGE_ATTACHMENT)
+        .expect("read attachments")
+        .unwrap_or_else(|| {
+            panic!(
+                "this capture carries `{CAPTURE_RECORDER_HEALTH_ATTACHMENT}` and no \
+                 `{RECORD_COVERAGE_ATTACHMENT}`, so the loss-counting basis its health states \
+                 cannot be checked against the coverage the recorder actually had"
+            )
+        });
+    let coverage: RecordCoverage = serde_json::from_slice(&coverage_att.data)
+        .unwrap_or_else(|e| panic!("the capture's coverage manifest must parse: {e}"));
     // The two topics this arm is SCOPED to, named once: the per-topic reads
     // below walk them, and the run-level count further down is charged only
     // when the document accounts for nothing else.
@@ -2743,56 +2863,59 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
                 "`{topic}` states no `loss_counting_basis`, so its counts carry no scope: {health}"
             )
         });
-        assert!(
-            basis == "prefix_invisible" || basis == "prefix_proven",
-            "`{topic}` states the unknown loss-counting basis `{basis}`, so the scope of its \
-             counts is one nothing here established: {health}"
+        let tap = coverage.tapped.get(topic).unwrap_or_else(|| {
+            panic!("the capture's coverage manifest carries no entry for `{topic}`")
+        });
+        let expected = tap_basis_token(
+            coverage.armed_before_producers,
+            tap.source,
+            tap.attached_late,
+        );
+        assert_eq!(
+            basis, expected,
+            "`{topic}` states the loss-counting basis `{basis}`, and its own coverage record \
+             (armed before producers {}, source {:?}, attached late {}) implies `{expected}`. \
+             A disjunction over both known tokens cannot fail on a well formed document; what \
+             the scope of this row's counts IS, is what the two documents agree on: {health}",
+            coverage.armed_before_producers, tap.source, tap.attached_late
         );
     }
-    // Run-level, and the SUM over every tap the recorder holds: on the
-    // always-on window plane that is every live producer on the machine, not
-    // this arm's two topics. So it is charged only when the document accounts
-    // for nothing beside them. A CO-TENANT graph's drop is named and left
-    // uncharged: retrying cannot make another process stop dropping, its
-    // frames are not in the comparison this gate protects, and failing the arm
-    // after three attempts on it would be a flake surface rather than a
-    // finding.
+    // Run-level, and the SUM over every tap the recorder holds. CHARGED
+    // whatever else the document accounts for, because a nonzero count here
+    // implicates this arm's own two topics as well: the counter has ONE
+    // increment site and it charges every tap in the drained batch, and all
+    // three ways to reach it are writer-wide rather than per topic (a writer
+    // that is gone, a latched write error, or the force-drop test seam). So
+    // "a co-tenant dropped and these two did not" is not a shape the recorder
+    // can produce, and exempting on the mere PRESENCE of a co-tenant row would
+    // retire the charge on the ordinary case this file documents elsewhere as
+    // ordinary. On the one shape that reaches a finalized bag the capture is
+    // untrustworthy for these two topics too, so refusing it is the answer.
     let unwritten = v["dropped_unwritten"].as_u64().unwrap_or_else(|| {
         panic!("the capture's recorder health carries no readable `dropped_unwritten`:\n{raw}")
     });
     if unwritten > 0 {
-        let foreign: Vec<&String> = topics
-            .keys()
-            .filter(|t| !graph_topics.iter().any(|g| g == *t))
-            .collect();
-        if foreign.is_empty() {
-            reported.push(format!(
-                "{unwritten} frame(s) were drained from a tap and never written to the bag"
-            ));
-        } else {
-            eprintln!(
-                "the recorder reports {unwritten} frame(s) drained and never written, and its \
-                 health document also accounts for {foreign:?}, so the count cannot be \
-                 attributed to either graph topic and is NOT charged to this capture"
-            );
-        }
+        reported.push(format!(
+            "{unwritten} frame(s) were drained from a tap and never written to the bag"
+        ));
     }
     // The basis is the SCOPE of every count above, so the gate states it
-    // rather than retries on it (see this function's own doc for the
-    // measurement). It names the ONE token this plane produces rather than
-    // accepting whichever arrives: a check that admits both cannot fail, and a
-    // basis that moved would leave the gate claiming a reach nobody
-    // established.
+    // rather than retries on it (see this function's own doc). The expected
+    // token is DERIVED from the capture's coverage manifest by the same floor
+    // rule the recorder applies, so the oracle moves with the run instead of
+    // pinning a literal beside it, and the two documents one capture carries
+    // are held to agreeing.
+    let expected_floor = floor_basis_token(&coverage);
     assert_eq!(
         v["loss_counting_basis"],
-        serde_json::json!("prefix_invisible"),
-        "this capture is taken by the ALWAYS-ON window plane, whose taps attach to producers \
-         that are already publishing, so its floor reads `prefix_invisible` on every attempt \
-         (measured: three of three). A `prefix_proven` here would mean the recorder armed \
-         ahead of this run's producers, which is a STRONGER scope than this gate's doc \
-         claims; a third token or a missing one is a scope nothing here established. Either \
-         way what this gate may say about a zero `frames_lost` is rewritten rather than \
-         widened:\n{raw}"
+        serde_json::json!(expected_floor),
+        "this capture's coverage manifest implies a `{expected_floor}` floor (armed before \
+         producers {}, over {} tapped topic(s)), and its health document states otherwise. \
+         The floor is what this gate may say a zero `frames_lost` MEANS, so a document that \
+         disagrees with the coverage it was written beside leaves that claim resting on \
+         nothing:\n{raw}",
+        coverage.armed_before_producers,
+        coverage.tapped.len()
     );
     Some(reported)
 }
@@ -2975,7 +3098,7 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
             // the code under test made it come out that way.
             last_retry = format!(
                 "attempt {attempt}: the capture's first rank-0 STEP_BOUNDARY is step 0, so it \
-                 begins FROM START and `plan_restore` would answer `FromStart` — the admission \
+                 begins FROM START and `plan_restore` would answer `FromStart`; the admission \
                  under test is never reached"
             );
             eprintln!("{last_retry}");
