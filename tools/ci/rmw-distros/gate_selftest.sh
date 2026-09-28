@@ -4,7 +4,10 @@
 # exercises it). The fixture carries every shape the real logs have shown: cargo status lines in
 # terminal colour, the lib's unit tests, three test binaries, a doc-test target, a stdout dump with
 # an indented line that looks like a name, a FAILED token on its own line after unterminated test
-# stdout, a failing doc test whose name carries spaces, and the final per-binary failures lists. Run: bash tools/ci/rmw-distros/gate_selftest.sh
+# stdout, a failing doc test whose name carries spaces, and the final per-binary failures lists.
+# The symbol audit is proven over three hand-built `nm -D --defined-only` fixtures, so the gate's
+# export check is exercised without a built library.
+# Run: bash tools/ci/rmw-distros/gate_selftest.sh
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=tools/ci/rmw-distros/harvest.sh
@@ -33,6 +36,32 @@ crashed "$plain" && { echo "SELFTEST FAIL: the clean fixture reads as crashed"; 
 # shellcheck disable=SC2016  # the backticks are cargo's literal message text, not a command
 printf 'error: could not compile `rmw_cerulion` (test "x") due to 3 previous errors\n' > "$plain.c"; crashed "$plain.c" || { echo "SELFTEST FAIL: a compile failure is not detected"; fail=1; }
 printf "  process didn't exit successfully: (signal: 11, SIGSEGV: invalid memory reference)\n" > "$plain.s"; crashed "$plain.s" || { echo "SELFTEST FAIL: a signal death is not detected"; fail=1; }
-rm -f "$plain" "$plain.c" "$plain.s"
-[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test)"
+# 7. The symbol audit, over three hand-built nm fixtures. Foxy's list is the subject: the clean
+#    table passes, one leaked entry point fails, and a table without the control symbol fails even
+#    though it contains none of the named symbols either.
+absent="rmw_feature_supported rmw_qos_profile_check_compatible rmw_subscription_set_content_filter"
+symbol_audit "$here/fixtures/nm-defined-clean.txt" "$absent" > /dev/null || { echo "SELFTEST FAIL: the clean symbol table does not pass the audit"; fail=1; }
+symbol_audit "$here/fixtures/nm-defined-leaked-symbol.txt" "$absent" > /dev/null && { echo "SELFTEST FAIL: a header-absent symbol passed the audit"; fail=1; }
+symbol_audit "$here/fixtures/nm-defined-no-control.txt" "$absent" > /dev/null && { echo "SELFTEST FAIL: a table without $NM_CONTROL_SYMBOL passed the audit"; fail=1; }
+# An EMPTY table is the same class and is exactly what a silently-failing `nm` leaves behind.
+: > "$plain.n"; symbol_audit "$plain.n" "$absent" > /dev/null && { echo "SELFTEST FAIL: an empty symbol table passed the audit"; fail=1; }
+# A row with an EMPTY absent list (jazzy, lyrical, humble) still checks the control, so the audit
+# is never a no-op on those rows.
+symbol_audit "$here/fixtures/nm-defined-clean.txt" "" > /dev/null || { echo "SELFTEST FAIL: an empty absent list must still pass on a table with the control"; fail=1; }
+symbol_audit "$here/fixtures/nm-defined-no-control.txt" "" > /dev/null && { echo "SELFTEST FAIL: an empty absent list must still FAIL without the control"; fail=1; }
+# 8. The name reader: a "@@VERSION" suffix is stripped, and the address and type columns are never
+#    mistaken for names.
+names="$(defined_symbols "$here/fixtures/nm-defined-clean.txt")"
+printf '%s\n' "$names" | grep -qx rmw_get_serialization_format || { echo "SELFTEST FAIL: a versioned symbol name is not stripped to its bare name"; fail=1; }
+printf '%s\n' "$names" | grep -qE '^[0-9a-f]{8}|^[TDB]$' && { echo "SELFTEST FAIL: an address or type column was read as a symbol name"; fail=1; }
+# 9. A `refuse` row must pin its refusal: the two inert defaults gate.sh carries for the next
+#    distro that starts there must be REFUSED, because both pass vacuously (grep -F '' matches
+#    every line, and an absent error count reads back as 0).
+refuse_row_pinned 21 "cannot find type" > /dev/null || { echo "SELFTEST FAIL: a properly pinned refuse row was rejected"; fail=1; }
+refuse_row_pinned 0 "cannot find type" > /dev/null && { echo "SELFTEST FAIL: a refuse row with errors=0 passed"; fail=1; }
+refuse_row_pinned 21 "" > /dev/null && { echo "SELFTEST FAIL: a refuse row with an empty marker passed"; fail=1; }
+refuse_row_pinned "" "cannot find type" > /dev/null && { echo "SELFTEST FAIL: a refuse row with no error count passed"; fail=1; }
+refuse_row_pinned "many" "cannot find type" > /dev/null && { echo "SELFTEST FAIL: a refuse row with a non-decimal error count passed"; fail=1; }
+rm -f "$plain" "$plain.c" "$plain.s" "$plain.n"
+[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, and the refuse-row pin guard"
 exit "$fail"

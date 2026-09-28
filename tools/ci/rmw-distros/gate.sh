@@ -2,8 +2,9 @@
 # rmw distro lane gate: PASS means the tree's KNOWN state for this distro holds.
 #
 # Each distro has an expected state in the table below. `build` means rmw_cerulion must compile
-# against the distro's real headers (generated bindings, never the vendored fallback) and its
-# serial test suite must pass. `refuse` means the build is expected to stop at a KNOWN place, and
+# against the distro's real headers (generated bindings, never the vendored fallback), must export
+# no symbol the distro's headers do not declare, and its serial test suite must pass. `refuse`
+# means the build is expected to stop at a KNOWN place, and
 # the gate requires that exact marker in the build log: any other failure is a lane failure, and a
 # distro that silently starts building fails the lane too, so the table can never lag the truth.
 # The table is flipped deliberately, one PR per distro, as support lands.
@@ -25,19 +26,42 @@ set -u
 #   humble:  builds from generated bindings and its whole suite is green (24-byte GID storage padded,
 #            int8 request guids cast, the C++ mirror in its pre-Iron shape under
 #            cfg(not(cerulion_has_is_key)));
-#   foxy:    the compile stops at the post-Foxy surface (rmw_feature_t and 20 more missing symbols,
-#            21 errors: the four pre-Iron type mismatches Foxy shared with Humble no longer occur once
-#            Humble builds, so Foxy's count is 21 where it was 25 before Humble support).
+#   foxy:    builds from generated bindings and its whole suite is green (the C++ mirror in its
+#            96-byte pre-Humble shape under cfg(not(cerulion_has_fetch_function)), and the ten
+#            post-Foxy rmw entry points compiled out whole rather than stubbed).
+# Every `build` row also names the entry points the distro's headers do NOT declare, in
+# absent_symbols: the built library must define none of them. rcl resolves by name, so a defined
+# symbol is a claim the distro cannot back, and a stub that answers UNSUPPORTED is worse than no
+# symbol at all. The audit reads the library with `nm` and also requires the control symbol
+# rmw_init, so an empty or unreadable symbol table can never pass it.
 # A `build` row also pins floors the suite must clear before "green" means anything: at least
 # min_targets target summaries and min_tests tests run (ok, failed or ignored), pinned PER ROW from
 # that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run; 33 and 479
 # with the two vendored-gate binaries) with margin for
 # targets that come and go; a lane that silently loses half its binaries lands below the floor.
+# The ten entry points Foxy's rmw headers do not declare: the four listener callbacks and
+# rmw_event_set_callback (Humble), the two content filter calls (Humble), rmw_feature_supported
+# (Humble), and rmw_qos_profile_check_compatible plus the two network flow calls (Galactic).
+foxy_absent_symbols="rmw_event_set_callback
+rmw_subscription_set_on_new_message_callback
+rmw_service_set_on_new_request_callback
+rmw_client_set_on_new_response_callback
+rmw_subscription_set_content_filter
+rmw_subscription_get_content_filter
+rmw_publisher_get_network_flow_endpoints
+rmw_subscription_get_network_flow_endpoints
+rmw_qos_profile_check_compatible
+rmw_feature_supported"
+# No row is `refuse` today; the arm stays for the next distro that starts there, so its two inputs
+# carry inert defaults rather than being unset under `set -u`. The arm REFUSES those defaults
+# (refuse_row_pinned): an errors=0 or empty-marker row would pass vacuously.
+errors=0
+marker=""
 case "$distro" in
-    jazzy)   expect=build; min_targets=25; min_tests=400; known_failures="" ;;
-    lyrical) expect=build; min_targets=25; min_tests=400; known_failures="" ;;
-    humble)  expect=build; min_targets=25; min_tests=400; known_failures="" ;;
-    foxy)    expect=refuse; errors=21; marker="cannot find type \`rmw_feature_t\` in module \`ffi\`" ;;
+    jazzy)   expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="" ;;
+    lyrical) expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="" ;;
+    humble)  expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="" ;;
+    foxy)    expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="$foxy_absent_symbols" ;;
     *) echo "FATAL: no expected state for distro '$distro'"; exit 1 ;;
 esac
 
@@ -60,6 +84,13 @@ case "$expect" in
         [ "$rc" -eq 0 ] || { echo "GATE FAIL: $distro is expected to BUILD against its real headers (rc=$rc)"; exit 1; }
         [ -f target/release/librmw_cerulion.so ] || { echo "GATE FAIL: no librmw_cerulion.so after a successful build"; exit 1; }
         ls target/release/build/rmw_cerulion-*/out/bindings.rs >/dev/null 2>&1 || { echo "GATE FAIL: no generated bindings.rs, the build did not run bindgen"; exit 1; }
+        # The export set must match what this distro's headers declare: none of absent_symbols
+        # defined, and the control symbol present so a zero finding means something.
+        nmlog="/tmp/rmw_symbols_${distro}.txt"
+        nm -D --defined-only target/release/librmw_cerulion.so > "$nmlog" || { echo "GATE FAIL: nm could not read librmw_cerulion.so"; exit 1; }
+        symbol_audit "$nmlog" "$absent_symbols" || { echo "GATE FAIL: $distro exports a symbol its headers do not declare"; exit 1; }
+        absent_n=$(printf '%s\n' "$absent_symbols" | sed '/^$/d' | wc -l | tr -d ' ')
+        echo "SYMBOL AUDIT PASS: $NM_CONTROL_SYMBOL defined and $absent_n header-absent symbol(s) undefined"
         tlog="/tmp/rmw_test_${distro}.log"
         echo "== rmw serial suite on $distro (every target, no fail-fast) =="
         cargo test --locked -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
@@ -92,6 +123,8 @@ case "$expect" in
         fi
         ;;
     refuse)
+        # The row must pin its refusal for real before anything is compared against it.
+        refuse_row_pinned "$errors" "$marker" || exit 1
         [ "$rc" -ne 0 ] || { echo "GATE FAIL: $distro BUILT, but the table says it is refused today; flip its row in the PR that lands $distro support"; exit 1; }
         grep -q -F -- "$marker" "$plain_log" || { echo "GATE FAIL: $distro failed WITHOUT the known marker; last lines:"; tail -n 40 "$plain_log"; exit 1; }
         count=$(grep -oE 'due to [0-9]+ previous errors?' "$plain_log" | grep -oE '[0-9]+' | tail -n 1)

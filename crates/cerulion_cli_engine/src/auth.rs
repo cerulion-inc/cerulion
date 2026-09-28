@@ -415,7 +415,8 @@ pub fn stage_device_cert_at(path: &Path, cert_b64: &str) -> std::io::Result<Stag
 
 /// Env var: `cerulion-netd`'s explicit device-cert path — a copy of that crate's
 /// `wan::DEVICE_CERT_ENV`, because the CLI links netd with `default-features = false`
-/// (the iroh-leanness rule) and the const lives behind its `wan` feature. Pinned to
+/// (the default build stays iroh-free) and the const lives behind its `wan` feature.
+/// Pinned to
 /// netd's own source by `netd_device_cert_env_matches_netds_const`.
 pub const NETD_DEVICE_CERT_ENV: &str = "CERULION_NETD_DEVICE_CERT";
 
@@ -1520,8 +1521,8 @@ mod tests {
     // --- stale device certs an account switch invalidates -------------------
 
     /// The env-var names duplicated here must be netd's own: its `wan` module is
-    /// behind a feature the CLI must not enable (iroh leanness), so the copy is
-    /// pinned against netd's source instead of its symbol.
+    /// behind a feature the CLI must not enable, so the copy is pinned against
+    /// netd's source instead of its symbol.
     #[test]
     fn netd_cert_env_names_match_netds_own_source() {
         let wan = include_str!("../../cerulion_netd/src/wan.rs");

@@ -298,10 +298,13 @@ members = [
 # `-p`/`--workspace` operate on THIS set, so NEITHER the rerun SDK NOR the iroh tree
 # is compiled on a plain build. This is the feature-flag mechanism for the
 # viz stack (it is opt-in: `-p cerulion_viz`, `-p cerulion-vizd`, or
-# `--workspace`) AND the iroh-leanness invariant: the CLI + vizd stay
-# iroh-free because netd (default-on `wan`) is out of this set — pinned by the
-# `iroh-leanness` CI job (`cargo tree` asserts the default graph has no iroh AND the
-# per-package netd still ships wan). Globs expand the same way as `members`; every
+# `--workspace`) AND the iroh leanness invariant: the CLI + vizd stay
+# iroh-free because netd (default-on `wan`) is out of this set. Pinned by
+# `default_member_build_is_iroh_free` and
+# `netd_per_package_build_pulls_the_iroh_wan_plane` in
+# `crates/cerulion_hygiene/tests/dependency_rules_test.rs`: the default-members
+# resolve reaches no iroh-family package AND the per-package netd still ships wan.
+# Globs expand the same way as `members`; every
 # entry below is a member above.
 default-members = [
     "crates/cerulion_core",

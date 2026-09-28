@@ -36,6 +36,7 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rmw_cerulion::ffi::introspection_cpp::{CppMessageMember, CppMessageMembers};
 use rmw_cerulion::ffi::{self, RMW_RET_OK};
 use rmw_cerulion::*;
 // no-env-filter so the capture reaches the `cerulion_core` target (the
@@ -48,6 +49,7 @@ use tracing_test::traced_test;
 // =====================================================================
 
 const ROS_TYPE_DOUBLE: u8 = 2;
+const ROS_TYPE_BOOLEAN: u8 = 6;
 
 fn cstr(s: &str) -> *const c_char {
     CString::new(s).expect("cstr").into_raw()
@@ -115,6 +117,73 @@ fn point_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
     )
 }
 
+/// A fake `std::vector<bool>`: BIT-PACKED like the real one, so nothing here
+/// can be served by a contiguous copy.
+#[repr(C)]
+struct FakeVecBool {
+    bits: *mut u8,
+    len: usize,
+}
+
+unsafe extern "C" fn vecbool_size(field: *const c_void) -> usize {
+    (*(field as *const FakeVecBool)).len
+}
+
+unsafe extern "C" fn vecbool_resize(field: *mut c_void, size: usize) {
+    let v = &mut *(field as *mut FakeVecBool);
+    let mut storage = vec![0u8; size.div_ceil(8).max(1)];
+    v.bits = storage.as_mut_ptr();
+    v.len = size;
+    std::mem::forget(storage);
+}
+
+/// A C++ typesupport for a one-member `bool[]` type, with `size_function` and
+/// `resize_function` but NO `assign_function`: the shape every distro before
+/// Humble has by construction (its generator emits no `assign` for
+/// `std::vector<bool>` and leaves `get`/`get_const` null), and the shape a
+/// hand fixture reaches on any era by leaving the accessor unset.
+fn cpp_bool_seq_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
+    let members = Box::leak(Box::new([CppMessageMember {
+        name_: cstr("flags"),
+        type_id_: ROS_TYPE_BOOLEAN,
+        string_upper_bound_: 0,
+        members_: std::ptr::null(),
+        #[cfg(cerulion_has_is_key)]
+        is_key_: false,
+        is_array_: true,
+        array_size_: 0,
+        is_upper_bound_: false,
+        offset_: 0,
+        default_value_: std::ptr::null(),
+        size_function: Some(vecbool_size),
+        get_const_function: None,
+        get_function: None,
+        #[cfg(cerulion_has_fetch_function)]
+        fetch_function: None,
+        #[cfg(cerulion_has_fetch_function)]
+        assign_function: None,
+        resize_function: Some(vecbool_resize),
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer_: false,
+    }]));
+    let mm = Box::leak(Box::new(CppMessageMembers {
+        message_namespace_: cstr("rmw_mismatch::msg"),
+        message_name_: cstr(unique),
+        member_count_: 1,
+        size_of_: std::mem::size_of::<FakeVecBool>(),
+        #[cfg(cerulion_has_is_key)]
+        has_any_key_member_: false,
+        members_: members.as_ptr(),
+        init_function: None,
+        fini_function: None,
+    }));
+    Box::leak(Box::new(ffi::rosidl_message_type_support_t {
+        typesupport_identifier: cstr("rosidl_typesupport_introspection_cpp"),
+        data: mm as *const _ as *const c_void,
+        ..Default::default()
+    }))
+}
+
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
 fn unique_suffix() -> u64 {
@@ -170,9 +239,33 @@ const HASH_RECOVERY: &str = "schema hashes match again";
 const DECODE_LOUD: &str = "dropping a frame the bridge could not decode";
 /// Substring unique to the SUPPRESSED (`debug!`) arm of the decode report.
 const DECODE_SUPPRESSED: &str = "decode failure suppressed";
+/// Substring unique to the LOUD (`error!`) arm of the PRE-WRITE entry refusal
+/// (the arm that carries `var_idx=` and `reason=`).
+const ENTRY_REFUSED_LOUD: &str = "refusing a frame before decoding it";
+/// Substring unique to the SUPPRESSED (`debug!`) arm of the same reporter. Its
+/// own arm, not the decode reporter's: a promotion of THIS repeat to `error!`
+/// is what the flood latch exists to prevent, and keying on the other
+/// reporter's text would never see it.
+const ENTRY_REFUSED_SUPPRESSED: &str = "frame refused before decoding (regime still open)";
 /// Substring unique to the DECADE RE-ANNOUNCEMENT (`error!`) arm of the decode
 /// report — the arm that exists precisely to survive a filter hiding `debug!`.
 const DECODE_STILL: &str = "decode failures are STILL dropping every frame";
+
+/// The value of a rendered field whose own value contains SPACES: everything
+/// between `<key>=` and the key that the emission declares NEXT. A
+/// whitespace-terminated read would truncate such a value at its first space,
+/// and `contains` would pass on a prefix; this returns the whole value so an
+/// oracle can compare it with `assert_eq!`.
+fn field_value_before(line: &str, key: &str, next_key: &str) -> Option<String> {
+    // `rfind`, not `find`: this reporter's own headline PROSE names its fields
+    // ("reason= says which check ..."), so the first occurrence of `key=` is
+    // inside the message. tracing renders the message before the fields, so
+    // the field is the LAST occurrence.
+    let start = line.rfind(&format!("{key}="))? + key.len() + 1;
+    let rest = &line[start..];
+    let end = rest.find(&format!(" {next_key}="))?;
+    Some(rest[..end].to_string())
+}
 
 /// Read the subscription's hash-mismatch counter — the log-level-independent
 /// Principle #3 signal.
@@ -241,6 +334,158 @@ fn raw_frame(schema_hash: u64, sequence: u32, payload_len: usize) -> Vec<u8> {
     let mut frame = vec![0u8; total];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame
+}
+
+/// A member this build's C++ typesupport gives no way to WRITE refuses the
+/// frame with the MEMBER NAMED, before anything is written.
+///
+/// A `bool[]` needs the member's `assign` accessor: `std::vector<bool>` is
+/// bit-packed, so there is no element address to copy into. Before Humble the
+/// C++ generator emits no `assign` (and leaves `get`/`get_const` null), so a
+/// Foxy subscriber on a `bool[]` topic can never decode a frame a rclpy or
+/// C-typesupport publisher puts there. What the user must be told is which
+/// member and why, not that the wire is malformed, which is what the generic
+/// entry refusal says and which sends an operator to redeploy both ends for a
+/// limit of this build that no redeploy changes.
+///
+/// Oracles, three of them, all hand-written here:
+/// * the WHOLE `reason=` value, typed out in this test rather than read back
+///   from the constant the bridge renders (rule 1: the oracle is the message
+///   the user reads), and compared with `assert_eq!`; a `contains` would pass
+///   on a prefix, and the value carries spaces, so it is extracted between its
+///   own key and the next field the emission declares;
+/// * the side effect that must NOT have happened (rule 5): `taken` stays
+///   false and the caller's message is byte-identical to the poison it went in
+///   with, because the refusal is taken BEFORE `unflatten`;
+/// * the refusal is LATCHED like every other decode refusal: exactly one
+///   loud line from the reporter for two frames, with the unconditional
+///   counter at 2, so a Foxy subscriber on a live topic neither floods the
+///   disk nor goes silent.
+#[test]
+#[serial]
+#[traced_test]
+fn a_bool_member_this_build_cannot_write_is_refused_with_the_member_named() {
+    const FRAMES: u64 = 2;
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = cpp_bool_seq_ts(&format!("Unwritable{suffix}"));
+        let (_, node, _opts) = setup_node(&format!("node_{suffix}"));
+        let topic = CString::new(format!("/rmw_mismatch/unwritable/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+
+        // Registration SUCCEEDS: the limit is per message, never per build.
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!subscription.is_null());
+        assert_eq!(decode_failure_count(subscription), 0);
+        let cer_topic = cerulion_topic(subscription);
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        let msl = cerulion_core::wire::MaxSliceLen::try_new(4096).expect("slice len");
+        let mut raw_pub = rt
+            .transport
+            .create_publisher_simple(&cer_topic, msl)
+            .expect("raw publisher on the subscription's topic");
+
+        // The frame carries the subscription's OWN schema hash, so the hash
+        // gate passes and the refusal under test is the one that fires. A
+        // producer that CAN write this member (rclpy, or any C-typesupport
+        // node) is what puts such a frame on the topic; what is pinned here is
+        // the SUBSCRIBER's refusal.
+        let expected = expected_schema_hash(subscription);
+        // The caller's message, poisoned: a refusal must not touch one byte.
+        let poison = FakeVecBool {
+            bits: 0xA5A5_A5A5_A5A5_A5A5u64 as *mut u8,
+            len: 0xA5A5_A5A5_A5A5_A5A5,
+        };
+        for i in 0..FRAMES {
+            raw_pub
+                .publish_raw(&raw_frame(expected, i as u32, 16))
+                .expect("publish the hand frame");
+            let mut out = FakeVecBool {
+                bits: poison.bits,
+                len: poison.len,
+            };
+            let mut taken = true;
+            assert_eq!(
+                rmw_take(
+                    subscription,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK,
+                "frame {i}: an undecodable member is a DROP, not a take failure"
+            );
+            assert!(
+                !taken,
+                "frame {i}: nothing was written, so nothing was taken"
+            );
+            assert_eq!(
+                out.bits as usize, poison.bits as usize,
+                "frame {i}: the refusal must not write the container's data pointer"
+            );
+            assert_eq!(
+                out.len, poison.len,
+                "frame {i}: nor its length, no resize, no assign, nothing"
+            );
+        }
+        assert_eq!(
+            decode_failure_count(subscription),
+            FRAMES,
+            "the counter is UNCONDITIONAL: it moves on the suppressed repeat too"
+        );
+
+        // The message the user reads. Typed out here, never read back from the
+        // bridge's own constant.
+        let want_reason = "bool sequence member 'flags' cannot be decoded: this build's C++ \
+                           typesupport has no fetch accessor for std::vector<bool>: its \
+                           generator emits no fetch or assign function and leaves get and \
+                           get_const null, so no element is reachable";
+        logs_assert(|lines: &[&str]| {
+            let heads = count_at_exclusively(lines, "ERROR", &[ENTRY_REFUSED_LOUD])?;
+            if heads != 1 {
+                return Err(format!(
+                    "{FRAMES} undecodable frames must produce exactly ONE loud refusal, got \
+                     {heads}"
+                ));
+            }
+            let head = lines
+                .iter()
+                .find(|l| l.contains(ENTRY_REFUSED_LOUD))
+                .ok_or_else(|| "the loud refusal line is missing".to_string())?;
+            let reason = field_value_before(head, "reason", "total_failures")
+                .ok_or_else(|| format!("the refusal carries no reason= field: {head}"))?;
+            if reason != want_reason {
+                return Err(format!(
+                    "the reason= value is not the one the user must read:\n  got:  {reason}\n  \
+                     want: {want_reason}"
+                ));
+            }
+            if !head.contains("var_idx=0") {
+                return Err(format!("the refusal must name WHICH entry: {head}"));
+            }
+            // The repeats: release-safe, because `debug!` is compiled out
+            // under `release_max_level_info` and a DEBUG count then reads 0
+            // whatever the code did. The expectation therefore routes through
+            // the static-level helper, and the level-free TWIN below is what
+            // still fails in release if the suppressed arm is ever promoted:
+            // a subscriber in this state refuses every frame, so a loud repeat
+            // is the disk-fill class.
+            let suppressed = count_at_exclusively(lines, "DEBUG", &[ENTRY_REFUSED_SUPPRESSED])?;
+            let want = debug_lines_expected(FRAMES as usize - 1);
+            if suppressed != want {
+                return Err(format!(
+                    "{FRAMES} refusals must leave exactly {want} suppressed repeat(s) at \
+                     DEBUG, got {suppressed}"
+                ));
+            }
+            never_loud(lines, ENTRY_REFUSED_SUPPRESSED)?;
+            Ok(())
+        });
+
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
 }
 
 /// The hash-mismatch latch at the PRODUCTION `rmw_take` call site (`api/pubsub.rs`).

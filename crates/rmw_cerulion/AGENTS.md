@@ -8,25 +8,25 @@ stage `RMW_IMPLEMENTATION` for the user.
 
 - Wrap every `extern "C"` entry point in `ffi::ffi_guard`: a panic across the C boundary aborts
   the process.
-- `#[repr(C)]` on every seam type; codecs zero padding byte-ranges (wire determinism).
+- `#[repr(C)]` on every seam type; codecs zero padding byte-ranges.
 - Allocate and free on the SAME side with the SAME allocator: rcl-owned out-params via the
-  caller's `rcutils_allocator_t`; bridge/rosidl containers via raw libc `malloc`/`free` (rosidl
-  `fini()` frees them).
+  caller's `rcutils_allocator_t`, bridge/rosidl containers via raw libc `malloc`/`free`.
 - No `Box<dyn>`/`Arc<dyn>` across the cdylib seam - dispatch via `AnyBridge`.
 - Lock entity mutexes with `runtime::lock_unpoisoned` (poison wedges the entity - torn SHM
-  bookkeeping risks use-after-free); raw-pointer `unsafe impl Send` newtypes are sound only under
+  bookkeeping risks use-after-free); raw-pointer `unsafe impl Send` newtypes hold only under
   their discipline.
 - Reject hostile/over-bound counts BEFORE any resize/alloc in a codec.
-- Failure paths: unconditional counters + flood-latched logs + decade re-announcements (the log is
-  a ROS user's only window).
+- Failure paths: unconditional counters + flood-latched logs + decade re-announcements.
 - ROS names are Cerulion names VERBATIM (`/chatter` ⇔ `/chatter/data`; relative refused, no alias);
   every publisher registers for egress (best-effort); no unregister.
 - Windowed borrows: NEVER link `cerulion_heaphook` (a 2nd malloc interposer); dlsym per-symbol
   (`src/heaphook.rs`). Only the FIRST outstanding borrow on a thread owns its window; a loan
   finished on the WRONG thread copies + HOLDS its slot until that thread borrows again
-  (destroy/poisoned LEAKS such slots AND the whole `PublisherData`: ports registered, slot held,
-  no disconnect edge for the process life, else the dead-node sweep wedges); quarantine retires at
-  slot REUSE, never at publish. Every degrade = the latched copy path, never a failed publish.
+  (destroy/poisoned then LEAKS the slot AND its `PublisherData`: freeing it wedges the dead-node
+  sweep); quarantine retires at slot REUSE, never at publish. Every degrade = the copy path,
+  never a failed publish.
+- NEVER export an entry point whose types a distro's headers lack: cfg the `extern "C"` fn out
+  WHOLE, never stub it (`nm` audit: `tools/ci/rmw-distros/gate.sh`).
 
 ## Testing
 
