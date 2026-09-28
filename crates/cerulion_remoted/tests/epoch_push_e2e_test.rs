@@ -22,9 +22,12 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cerulion_core::transport::demand_authorizer::{
+    DemandAuthorizer, DemandDecision, DemandSubject,
+};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{
@@ -224,6 +227,41 @@ async fn open_control(conn: &Connection) -> (SendStream, RecvStream) {
         .expect("open_bi control stream")
 }
 
+/// The application close reason the revocation sweep sends
+/// (`crates/cerulion_remoted/src/wire.rs`, `connection.close(0, b"access revoked")`).
+/// Spelled out here because it is the ONE thing that tells an eviction apart from
+/// any other connection failure.
+const EVICTION_REASON: &str = "access revoked";
+
+/// Why this connection is gone, if it is gone because the robot evicted it.
+///
+/// A read that fails is not evidence of an eviction on its own: a crash, a
+/// timeout or a torn transport fail the same way. The connection's own close
+/// reason is, so it is what the two-outcome reader consults before it tolerates
+/// anything.
+fn evicted_by_the_robot(conn: &Connection) -> bool {
+    conn.close_reason()
+        .is_some_and(|why| why.to_string().contains(EVICTION_REASON))
+}
+
+/// What a request on a connection the robot may evict at any moment observed.
+///
+/// The robot promises EVENTUAL eviction of a revoked party, never that an
+/// in-flight response is delivered first: the sweep that closes the connection
+/// runs on its own task and its own timer, decoupled from the control loop that
+/// writes responses (`crates/cerulion_remoted/src/wire.rs`, and the epoch verb's
+/// own comment says the sweep evicts "on its next tick"). So BOTH of these are
+/// the robot behaving correctly, and a test that demands the first one is
+/// asserting an ordering the product does not sell.
+#[derive(Debug)]
+enum RequestOutcome {
+    /// The response came back.
+    Answered(WireResponse),
+    /// The robot closed the connection naming the revocation before the response
+    /// was delivered.
+    EvictedFirst,
+}
+
 async fn request(send: &mut SendStream, recv: &mut RecvStream, req: &WireRequest) -> WireResponse {
     let bytes = serde_json::to_vec(req).unwrap();
     bounded("write request", write_frame(send, &bytes))
@@ -233,6 +271,39 @@ async fn request(send: &mut SendStream, recv: &mut RecvStream, req: &WireRequest
         .await
         .expect("read response");
     serde_json::from_slice(&resp).expect("decode WireResponse")
+}
+
+/// [`request`], but on a connection the robot is entitled to evict at any moment.
+///
+/// Either outcome is the contract. A failure that the connection's own close
+/// reason does NOT attribute to the revocation is re-raised, so this tolerates
+/// exactly one thing and stays loud about everything else.
+async fn request_or_evicted(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    req: &WireRequest,
+) -> RequestOutcome {
+    let bytes = serde_json::to_vec(req).unwrap();
+    if let Err(e) = bounded("write request", write_frame(send, &bytes)).await {
+        assert!(
+            evicted_by_the_robot(conn),
+            "write failed for a reason that is not the revocation: {e}"
+        );
+        return RequestOutcome::EvictedFirst;
+    }
+    match bounded("read response", read_frame(recv, DEFAULT_MAX_FRAME_LEN)).await {
+        Ok(resp) => {
+            RequestOutcome::Answered(serde_json::from_slice(&resp).expect("decode WireResponse"))
+        }
+        Err(e) => {
+            assert!(
+                evicted_by_the_robot(conn),
+                "the response read failed for a reason that is not the revocation: {e}"
+            );
+            RequestOutcome::EvictedFirst
+        }
+    }
 }
 
 /// Read `ustream` until it RESETS (an error) or the bound elapses; `true` if reset.
@@ -291,6 +362,53 @@ fn make_frame(seq: u32) -> Vec<u8> {
     frame
 }
 
+/// The [`DemandAuthorizer`] the robot's revocation sweep consults, with a HOLD the
+/// test can place on one device key.
+///
+/// The sweep asks this trait on its own timer and closes the connection the moment
+/// it hears `Deny`, so whether a pusher's own response is delivered before its
+/// eviction is a race the product deliberately leaves open. The hold takes the
+/// timer out of the arm: while a key is held every tick answers `Allow`, so the
+/// connection CANNOT be closed and the response is delivered by construction;
+/// releasing the key lets the real authorizer answer, so the very next tick denies
+/// and the eviction lands by construction. Neither half waits on a wall.
+///
+/// Held keys are the only thing it changes: every other demander, and every
+/// decision after the release, is the real [`PairingAuthorizer`]'s.
+struct HoldableAuthorizer {
+    inner: Arc<PairingAuthorizer>,
+    held: Mutex<Option<[u8; 32]>>,
+}
+
+impl HoldableAuthorizer {
+    fn new(inner: Arc<PairingAuthorizer>) -> Self {
+        HoldableAuthorizer {
+            inner,
+            held: Mutex::new(None),
+        }
+    }
+
+    fn hold(&self, key: [u8; 32]) {
+        *self.held.lock().unwrap() = Some(key);
+    }
+
+    fn release(&self) {
+        *self.held.lock().unwrap() = None;
+    }
+}
+
+impl DemandAuthorizer for HoldableAuthorizer {
+    fn authorize_demand(&self, subject: &DemandSubject, topic: &str) -> DemandDecision {
+        let DemandSubject::Wan { demander_key } = subject else {
+            panic!("the serving plane must pass a Wan subject, got {subject:?}");
+        };
+        if *self.held.lock().unwrap() == Some(*demander_key) {
+            return DemandDecision::Allow;
+        }
+        self.inner.authorize_demand(subject, topic)
+    }
+}
+
 /// One robot under test: its live trust handle, its served wire plane, and the address
 /// desks dial. `epoch_sink` controls whether `with_epoch_sink` is installed (the
 /// no-sink arm needs it OFF).
@@ -298,6 +416,7 @@ struct Robot {
     shared: SharedTrust,
     addr: EndpointAddr,
     topic: String,
+    gate: Arc<HoldableAuthorizer>,
     stop: Arc<AtomicBool>,
     producer: Option<std::thread::JoinHandle<()>>,
     accept: tokio::task::JoinHandle<()>,
@@ -339,6 +458,12 @@ impl Robot {
         let manager = test_manager(tag);
         let topic = format!("/wire/epoch/{}", unique_id());
         let stop = Arc::new(AtomicBool::new(false));
+        // The producer signals once its publisher EXISTS, and `start` does not
+        // return before that signal. A tap opens the data service, it never
+        // creates one, so a demand that lands before this point is refused for a
+        // topic that is simply not there yet, a race between two threads that
+        // nothing else orders.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let producer = {
             let manager = manager.clone();
             let topic = topic.clone();
@@ -347,6 +472,9 @@ impl Robot {
                 let mut publisher = manager
                     .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
                     .expect("producer");
+                ready_tx
+                    .send(())
+                    .expect("the starter must still be waiting");
                 let mut seq = 0u32;
                 while !stop.load(Ordering::Relaxed) {
                     let _ = publisher.publish_raw(&make_frame(seq));
@@ -355,9 +483,13 @@ impl Robot {
                 }
             })
         };
+        ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the producer must create its publisher");
 
+        let gate = Arc::new(HoldableAuthorizer::new(authz.clone()));
         let mut plane = WirePlane::with_manager(format!("robot-{tag}"), manager.clone())
-            .with_demand_authorizer(authz.clone())
+            .with_demand_authorizer(gate.clone())
             .with_revocation_sweep_interval(sweep);
         if epoch_sink {
             // The production wiring: the SAME live handle the accept gate reads.
@@ -383,10 +515,23 @@ impl Robot {
             shared,
             addr,
             topic,
+            gate,
             stop,
             producer: Some(producer),
             accept,
         }
+    }
+
+    /// Hold `key`'s demands open: the sweep admits them whatever the trust store
+    /// says, so it cannot close that desk's connection until [`Self::release`].
+    fn hold(&self, key: [u8; 32]) {
+        self.gate.hold(key);
+    }
+
+    /// Hand `key` back to the real authorizer. The next sweep tick decides on the
+    /// live trust state.
+    fn release(&self) {
+        self.gate.release();
     }
 
     /// The PROBE account's live access state — the observable that says whether a
@@ -429,6 +574,19 @@ async fn connect(desk_ep: &cerulion_link::Endpoint, addr: EndpointAddr, who: &st
 impl Desk {
     async fn push(&mut self, blob: String) -> WireResponse {
         request(
+            &mut self.send,
+            &mut self.recv,
+            &WireRequest::SyncEpoch {
+                epoch_postcard: blob,
+            },
+        )
+        .await
+    }
+
+    /// [`Self::push`] on a connection the robot may evict at any moment.
+    async fn push_or_evicted(&mut self, blob: String) -> RequestOutcome {
+        request_or_evicted(
+            &self.conn,
             &mut self.send,
             &mut self.recv,
             &WireRequest::SyncEpoch {
@@ -631,12 +789,36 @@ async fn a_stale_epoch_push_is_a_noop_and_never_un_revokes() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// 3. THE ISSUE'S HEADLINE CORRECTNESS CASE: a revoked desk pushing the very epoch
-//    that cuts it off is FINE — it delivers faithfully, then the sweep evicts it.
+// 3. THE HEADLINE CORRECTNESS CASE: a revoked desk pushing the very epoch that
+//    cuts it off is FINE: the revocation takes effect and the sweep evicts it.
+//    WHICH of those the desk sees first is not part of the contract.
 // ───────────────────────────────────────────────────────────────────────────────
 
+/// A desk that pushes its own revocation still delivers it, the revocation stands,
+/// and the desk ends evicted, in whichever order the robot gets to them.
+///
+/// WHAT IS PROMISED, and what is not. The robot's revocation sweep runs on its own
+/// spawned task and its own timer, deliberately decoupled from the control loop
+/// that writes responses (`crates/cerulion_remoted/src/wire.rs`; the epoch verb's
+/// own comment says the sweep evicts "on its next tick", and the decoupling exists
+/// so a desk that stalls its control stream is still evicted). So the product sells
+/// EVENTUAL eviction, never delivery-then-eviction, and the closing side cannot
+/// promise delivery either: closing a connection lets the peer discard data it has
+/// already acknowledged. An arm that requires the response to arrive first is
+/// therefore asserting an ordering nobody offers, and it failed exactly that way on
+/// a loaded runner, with the push's response read returning the revocation's own
+/// close reason.
+///
+/// So this reads BOTH observations as correct and pins what holds under either: the
+/// revocation is durable (the robot's live access state flipped, and the sibling's
+/// did not), and the pusher ends evicted. The delivery branch is STAGED rather than
+/// hoped for: `Robot::hold` makes the sweep admit desk A every tick, so the response
+/// cannot be preempted, and the release is what lets the eviction land. The
+/// tolerance branch is not dead code either: the same predicate that would accept
+/// it, the connection's own close reason, is asserted after the release, so every
+/// run proves it reads true exactly when the robot evicted the desk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn a_desk_pushing_its_own_revocation_delivers_it_then_is_evicted() {
+async fn a_desk_pushing_its_own_revocation_is_evicted_and_the_revocation_stands() {
     let desk_ep = disabled_endpoint([0x42; 32]).await;
     let k_desk = *desk_ep.id().as_bytes();
     // A SIBLING desk on the SAME account: it must NOT be collateral damage (the
@@ -660,22 +842,33 @@ async fn a_desk_pushing_its_own_revocation_delivers_it_then_is_evicted() {
     let mut desk_b = connect(&sib_ep, robot.addr.clone(), "desk-B").await;
     desk_b.demand(&robot.topic, "desk-B").await;
 
+    // STAGE the delivery ordering: while desk A's key is held, every sweep tick
+    // admits it, so the sweep cannot close the connection under the push. Nothing
+    // else about the robot changes: the epoch still applies to the live store,
+    // which is what the access asserts below read.
+    robot.hold(k_desk);
+
     // Desk A pushes the epoch revoking ITS OWN device key. The robot has not synced
     // yet, so A is admitted; delivering the epoch that cuts it off is correct.
-    let resp = desk_a
-        .push(push_blob(
+    match desk_a
+        .push_or_evicted(push_blob(
             epoch(4, vec![], vec![PublicKey(k_desk)]),
             intermediate_cert(),
         ))
-        .await;
-    assert_eq!(
-        resp,
-        WireResponse::EpochSynced {
-            epoch: 4,
-            applied: true
-        },
-        "a desk carrying its OWN revocation still delivers it — and is told it applied"
-    );
+        .await
+    {
+        RequestOutcome::Answered(resp) => assert_eq!(
+            resp,
+            WireResponse::EpochSynced {
+                epoch: 4,
+                applied: true
+            },
+            "a desk carrying its OWN revocation still delivers it, and is told it applied"
+        ),
+        // Legal, and impossible while the hold is on: kept because the ordering is
+        // the robot's to choose, so a future sweep shape must not turn this arm red.
+        RequestOutcome::EvictedFirst => {}
+    }
 
     // Its own access state has flipped...
     assert_eq!(
@@ -690,11 +883,39 @@ async fn a_desk_pushing_its_own_revocation_delivers_it_then_is_evicted() {
         "the SAME account's other device keeps access — a device revocation is surgical"
     );
 
-    // ...and the sweep EVICTS desk A's live stream.
+    // ...and once the hold is released the sweep EVICTS desk A's live stream.
+    robot.release();
     let mut a_stream = desk_a.ustream.take().expect("desk A demanded");
     assert!(
         read_until_reset(&mut a_stream).await,
         "the self-pushed device revocation MUST evict desk A's live stream (the revocation sweep)"
+    );
+    // The eviction is ATTRIBUTED, not merely observed, and this is the same
+    // predicate the tolerance above rests on, so it is exercised, with a true
+    // result, on every run.
+    assert!(
+        evicted_by_the_robot(&desk_a.conn),
+        "desk A's connection must be closed by the robot naming the revocation, not \
+         dropped for some other reason (close reason: {:?})",
+        desk_a.conn.close_reason().map(|why| why.to_string())
+    );
+
+    // THE TOLERANCE BRANCH, RUN rather than reasoned about. Desk A's connection is
+    // now closed by the robot, so a further push observes the eviction instead of an
+    // answer: every run of this arm therefore executes BOTH outcomes of
+    // `request_or_evicted`, and neither is dead code waiting for a bad day. It also
+    // says the eviction ENFORCES: a revoked desk pushes nothing more through it.
+    assert!(
+        matches!(
+            desk_a
+                .push_or_evicted(push_blob(
+                    epoch(5, vec![], vec![PublicKey(k_desk)]),
+                    intermediate_cert(),
+                ))
+                .await,
+            RequestOutcome::EvictedFirst
+        ),
+        "a push on an evicted connection must observe the eviction, never an answer"
     );
 
     // The SURGICAL claim is about the DATA PLANE, and the access-state assert above
