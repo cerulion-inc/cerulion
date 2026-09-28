@@ -7,10 +7,11 @@ or anything under `tools/scripts/`.
 ## Lint job budget
 
 The `Lint` job has a 45-minute limit covering runner setup, cache restore,
-compilation, the checks themselves, and the cache save. A cold cache restore can
-take a quarter of an hour on its own, so a tighter budget expires inside Clippy
-and the job dies before it saves a cache, which makes the next run pay the same
-restore again. The limit bounds this job alone; which checks are required is set
+compilation, the checks themselves, and the cache save (restore-only under the
+default save policy below; the save runs when `CACHE_SAVE_NAMESPACES` names
+`Linux-lint`). A cold cache restore can take a quarter of an hour on its own, so
+a tighter budget expires inside Clippy and the job dies before it saves a cache,
+which makes the next run pay the same restore again. The limit bounds this job alone; which checks are required is set
 elsewhere in the workflow.
 
 ## Lint policy: one table, inherited
@@ -520,6 +521,51 @@ The release workflows reject missing, malformed, impossible-calendar, pre-tag, a
 future dates before publishing artifacts. The shared implementation is
 `tools/scripts/check_citation_release.sh`, which is also exercised by the release-gate
 regression script.
+
+## The cache save policy (`CACHE_SAVE_*` in `ci.yml`)
+
+The Actions cache store has a 10 GB free allowance; storage above it is billed, and while the
+account carries a failed payment the service refuses every save into a store above 10 GB
+(measured 2026-09-28: 13 refusals into a 15.8 GB store, then one accepted save into an emptied
+one). One generation of every cache namespace the workflows write is 17.1 GB, so the workflows
+save only what fits and pays: the macOS test shards' archive (4.27 GB, shard 0 of `test-macos`,
+worth 29 minutes on the wall of a cold run) and the Linux test shards' archive (3.18 GB, shard 0
+of `test-linux`), 7.45 GB together, on `main` only. Every other `actions/cache/save` step is
+gated off by default and its job is restore-only.
+
+The policy is two workflow-level `env` values, each defaulting from a repository variable:
+
+* `CACHE_SAVE_NAMESPACES` (`${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}`): the
+  space-separated namespace tokens that may save, or `all`. A token is the key text between
+  `cargo-` and the scope segment: `macOS`, `Linux`, `crates-Linux`, `viz-vizd-Linux`,
+  `Linux-lint`, `rmw-distros-jazzy`, and so on. The default is the expression's literal, so a
+  repository with no variable saves the measured frontier and a misspelt variable matches
+  nothing.
+* `CACHE_SAVE_ON_PULL_REQUEST` (`${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}`): empty means saves
+  run on `main` only (`github.ref == 'refs/heads/main'`); any value lets pull-request runs
+  save into their own `-pr-` scoped keys as well.
+
+Directly before every save step runs `tools/scripts/ci_cache_prune.sh "<the save key>"` under
+the same gate: it keeps exactly that key and deletes every other entry of the namespace (stale
+lockfile generations, `pr` scoped entries, legacy unqualified keys), so the store never holds
+two archives of one namespace and a lockfile change costs one generation, never two. The
+jobs that prune carry `permissions: {contents: read, actions: write}`; nothing else does.
+
+`lint`, `docs` and `netd-wan` build far smaller targets than the shards and used to share the
+shards' `cargo-Linux-` key, so whichever finished first saved it (a 0.63 GB lint archive was
+what the shards restored on 2026-09-28). They now have their own namespaces
+(`cargo-Linux-lint-`, `cargo-Linux-docs-`, `cargo-Linux-netd-wan-`). Under the default all
+three are restore-only and fall through their `restore-keys` to `cargo-Linux-main-`, the
+shards' archive, a superset of what they need; `test-linux` shard 0 restores and saves its own
+key; the shards 1 to 3 restore it.
+
+`tools/scripts/ci_cache_policy_check.py` holds both workflow files to this contract (the gate
+names the key's namespace, the main-only clause is present, the prune step directly precedes
+the save with the byte-identical key, the job permission is declared, the default literal is
+unchanged, a save is never reachable from a merge-queue run, the save is the job's last step)
+and refuses a file with no save steps at all. The `Lint` step "Cache save policy" runs the
+prune script's self-test and the checker's self-test, both of which flip every rule from both
+sides, before the checker reads the real files.
 
 ## Test map
 

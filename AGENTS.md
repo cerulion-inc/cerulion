@@ -52,7 +52,7 @@ Lints live ONCE: `[workspace.lints]` in the root `Cargo.toml`, inherited via
 `[lints] workspace = true` (a manifest gate names any member that does not; an extra lint goes in
 the crate's own source, never a forked table). `dead_code`/`unused_imports`/`unused_variables` =
 **deny** - delete dead code at once. CI's stable is newer than most local ones: write the form the
-strictest clippy accepts (`if let` over `is_some()`+`unwrap()`). Detail: `docs/internals/ci-and-gates.md`.
+strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 
 ## Conventions
 
@@ -174,16 +174,17 @@ Unmarked crates have no scoped file: use this page plus the area dossier
 - **Always**: fmt/clippy/doc gates green before any push; docs ride the same PR.
 - **Ask first**: new dependencies (license + real-time fit; `deny.toml` gates CI), any
   user-API surface change, anything `unsafe`.
-- **Never**: hand-edit generated sources (`native_ros2_messages` types are `build.rs` output in `OUT_DIR`;
-  vendored `.msg` edits go via `tools/scripts/refresh_upstream_msg_manifest.sh`); commit
+- **Never**: hand-edit generated sources (`native_ros2_messages` types come from `build.rs`;
+  vendored `.msg` edits via `tools/scripts/refresh_upstream_msg_manifest.sh`); commit
   credentials; name a machine, address, path, login or person (public;
-  `docs/leak_guard.md`); fabricate data; leave dead code.
+  `docs/leak_guard.md`); fabricate data; leave dead code; add a cache save step without
+  its gate and prune (`ci_cache_policy_check.py`).
 
 ## Deeper context
 
 - `docs/user-api.md` - the user API reference (CLI, macros, YAML, env vars).
 - `crates/<crate>/AGENTS.md` - scoped invariants, serial-test lists, gotchas.
 - `docs/internals/*.md` - contributor dossiers (test maps, module contracts); each crate
-  names its own; `ci-and-gates.md`: the repo-wide gates.
+  names its own; `ci-and-gates.md`: repo-wide gates.
 - `docs/` - user guides (networking, multi-process, recording/replay, tutorials).
-- https://docs.cerulion.com - hosted docs; index at `/llms.txt`.
+- https://docs.cerulion.com - hosted docs; index `/llms.txt`.

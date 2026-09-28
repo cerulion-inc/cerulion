@@ -38,6 +38,13 @@ concurrency:
   group: rmw-distros-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Cache save policy, identical to ci.yml (see the CACHE_SAVE_* comment there):
+  # the rmw lanes are restore-only under the default and save when the variable
+  # names `rmw-distros-<distro>` or `all`.
+  CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
+  CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
+
 permissions:
   contents: read
 
@@ -45,6 +52,11 @@ jobs:
   lane:
     name: rmw distro lane (${{ matrix.distro }})
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -102,12 +114,26 @@ jobs:
       - name: Gate (expected state for this distro)
         run: bash tools/ci/rmw-distros/gate.sh "${{ matrix.distro }}"
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}" "cargo-rmw-distros-${{ matrix.distro }}-"
+
       # Saved as the LAST step so a green job stores what it built, and never from
       # a merge-queue build: its branch is deleted after the batch, so nothing could
       # restore what it saved, and the upload only adds eviction pressure on the
       # store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
