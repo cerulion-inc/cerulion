@@ -29,6 +29,7 @@ use std::sync::Arc;
 use clap::{CommandFactory, Parser};
 
 use cerulion_cli_engine::error::CliResult;
+use cerulion_cli_engine::ipc_cleanup::SweepMode;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
     account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, pair_cmd, partition_emit, ros_cmd,
@@ -169,7 +170,7 @@ fn main() -> ExitCode {
     // here, ABOVE the login gate, for the same reason the removed `replay` verb
     // is — you do not have to prove who you are to be told your command line is
     // wrong. `bag play` is identity-gated (`command_needs_identity` exempts only
-    // `login`, `completions` and the two internal `graph run-worker` /
+    // `login`, `completions`, `clean` and the two internal `graph run-worker` /
     // `run-gateway` subprocess verbs), and on a never-signed-in machine
     // `ensure_login_gate` runs the DEVICE-CODE FLOW inline, so `cerulion bag
     // play b.mcap --verify` would open a browser prompt and exit 7 (auth)
@@ -2070,7 +2071,11 @@ fn run(cli: Cli) -> CliResult<()> {
              driven by SIGTERM lifecycle signals and does not build on this platform"
                 .to_string(),
         )),
-        Commands::Clean { report_only } => clean_iceoryx2_state(report_only),
+        Commands::Clean { report_only } => clean_iceoryx2_state(if report_only {
+            SweepMode::ReportOnly
+        } else {
+            SweepMode::Remove
+        }),
         // `cerulion connect` never reaches `run()`: `main`
         // intercepts it to spawn `cerulion-connectd` + forward its exit code.
         Commands::Connect { .. } => {
@@ -2836,7 +2841,7 @@ fn map_levels_partition_result(partition_error: Option<String>) -> CliResult<()>
 ///
 /// Both `cerulion clean` and the implicit cleanup at the top of
 /// `graph_run` route through
-/// `cerulion_cli_engine::ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics`.
+/// `cerulion_cli_engine::ipc_cleanup::sweep_dead_nodes`.
 ///
 /// After the sweep, the verb reports the two POPULATIONS every
 /// sweep has to walk — iceoryx2's node registry, and (on macOS/FreeBSD) the
@@ -2846,16 +2851,22 @@ fn map_levels_partition_result(partition_error: Option<String>) -> CliResult<()>
 /// removes state files of its own through iceoryx2's `shm_unlink`, so a
 /// population reported before it would over-count, and a reclamation running
 /// first would unlink objects the sweep was about to inspect.
-fn clean_iceoryx2_state(report_only: bool) -> CliResult<()> {
-    let (result, converged) = clean_dead_nodes();
+///
+/// `--report-only` performs NO side effect anywhere in the verb. The mode
+/// reaches the dead-node walk before it starts, so the walk classifies and
+/// removes nothing and the report lists the nodes a bare run would have
+/// removed; the state-file half stays a bounded read; and the report closes
+/// by saying nothing was removed.
+fn clean_iceoryx2_state(mode: SweepMode) -> CliResult<()> {
+    let (result, converged) = clean_dead_nodes(mode);
     // The reclamation is DOWNGRADED to a report when the sweep above
     // left dead nodes registered. A `.shm_state` file is the only mapping from
     // an iceoryx2 resource name to the object behind it, so removing one that a
     // still-registered dead node needs makes that node permanently
     // unreclaimable — the sweep can never read its details again. The
     // population is still reported; only the destructive half stands down.
-    let reclaim = !report_only && converged;
-    if !report_only && !converged {
+    let reclaim = mode.removes() && converged;
+    if mode.removes() && !converged {
         println!(
             "Skipping stale `.shm_state` reclamation: the dead-node sweep did not converge \
              (see above — a refused node is still registered, or the registry could not be \
@@ -2863,16 +2874,37 @@ fn clean_iceoryx2_state(report_only: bool) -> CliResult<()> {
              make it permanently unreclaimable. Clear the failures, then re-run `cerulion clean`."
         );
     }
-    report_shm_state_population(!reclaim);
+    report_shm_state_population(if reclaim {
+        SweepMode::Remove
+    } else {
+        SweepMode::ReportOnly
+    });
+    if mode.reports_only() {
+        println!("{NOTHING_WAS_REMOVED}");
+    }
     result
 }
+
+/// The closing line of every `--report-only` run: the whole verb's promise,
+/// stated once, after both halves have reported.
+///
+/// It is unconditional under the flag. A report over an empty registry with
+/// no state files still ends here, because "nothing to clean" and "nothing
+/// was removed" are different claims and the operator asked for the second.
+const NOTHING_WAS_REMOVED: &str =
+    "Report only: nothing was removed. Run `cerulion clean` without `--report-only` to act on \
+     everything listed above.";
 
 /// The diagnostic block: the two populations, and the reclamation.
 ///
 /// Never fails the verb. It is a diagnostic bolted onto a cleanup command, so
 /// an unreadable directory or a refused unlink is reported in the block and
 /// leaves `cerulion clean`'s own exit code to the sweep.
-fn report_shm_state_population(report_only: bool) {
+///
+/// `mode` is NOT the operator's flag: the caller downgrades a `Remove` run to
+/// `ReportOnly` when the dead-node sweep left the registry unconverged, so
+/// this block reclaims only when the operator asked AND the sweep converged.
+fn report_shm_state_population(mode: SweepMode) {
     use cerulion_cli_engine::shm_state;
 
     let nodes = shm_state::count_node_registry(
@@ -2890,28 +2922,28 @@ fn report_shm_state_population(report_only: bool) {
         // and may hand back a floor. A RECLAIM was explicitly asked for and
         // is the remedy, so it is bounded long enough to clear the measured
         // pathological directory in ONE run — bounded either way.
-        let (mode, budget) = if report_only {
-            (
-                shm_state::ScanMode::ReportOnly,
-                shm_state::SHM_STATE_REPORT_BUDGET,
-            )
-        } else {
+        let (scan_mode, budget) = if mode.removes() {
             (
                 shm_state::ScanMode::Reclaim,
                 shm_state::SHM_STATE_RECLAIM_BUDGET,
+            )
+        } else {
+            (
+                shm_state::ScanMode::ReportOnly,
+                shm_state::SHM_STATE_REPORT_BUDGET,
             )
         };
         shm_state::scan(
             std::path::Path::new(shm_state::SHM_STATE_DIRECTORY),
             budget,
             shm_state::classify_budget(budget),
-            mode,
+            scan_mode,
             &shm_state::LibcProbe,
         )
     });
     #[cfg(not(unix))]
     let shm: Option<shm_state::ShmStateReport> = {
-        let _ = report_only;
+        let _ = mode;
         None
     };
 
@@ -2926,11 +2958,19 @@ fn report_shm_state_population(report_only: bool) {
 /// left registered. The `.shm_state` reclamation is gated on that second
 /// value; see [`clean_iceoryx2_state`].
 ///
-fn clean_dead_nodes() -> (CliResult<()>, bool) {
+/// ONE sweep, and the shape that used to need a second one is gone. A dead
+/// node's directory holding nothing but the orphan port tags of ports it had
+/// already deregistered used to fail the final `rmdir` on every sweep forever,
+/// and one such node blocked the `.shm_state` reclamation for good. iceoryx2
+/// 0.10 removes a dead port's tag with the rest of its stale resources
+/// (`service/stale_resource_cleanup.rs`, the port tag arm), so the shape cannot
+/// arise and the reclaim that healed it is gone with it. The convergence handed
+/// back is this sweep's.
+fn clean_dead_nodes(mode: SweepMode) -> (CliResult<()>, bool) {
     use cerulion_cli_engine::ipc_cleanup;
 
-    let report = ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics();
-    report_sweep(&report);
+    let report = ipc_cleanup::sweep_dead_nodes(mode);
+    report_sweep(&report, mode);
     // A failure of the registry WALK itself (printed first by `report_sweep`)
     // blocks convergence exactly as a refused node does: a dead node the walk
     // never reached is still registered and counted nowhere, so the
@@ -2945,7 +2985,12 @@ fn clean_dead_nodes() -> (CliResult<()>, bool) {
 /// breakdown, the per-node refusal listing and the unclassified arm. Every
 /// pre-existing line is byte-identical to what `cerulion clean` printed
 /// before the orphan-tag reclaim existed; called once per sweep.
-fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
+///
+/// Under [`SweepMode::ReportOnly`] the counters are both zero because nothing
+/// was attempted, so the summary line would read as a converged sweep. The
+/// would-remove listing takes its place: the same nodes, named, with the
+/// registry they sit under and the statement that none of them was touched.
+fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport, mode: SweepMode) {
     // A failure of the registry WALK itself is printed first and
     // under its own heading, so the operator reads a global failure as
     // global — never as the cause of whichever node happens to be listed
@@ -2953,6 +2998,15 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
     // counters would otherwise hide that nothing was reached.
     for line in render_registry_errors(&report.registry_errors) {
         println!("{line}");
+    }
+    if mode.reports_only() && !report.dead_nodes.is_empty() {
+        for line in render_would_remove(
+            &report.dead_nodes,
+            &cerulion_cli_engine::shm_state::iceoryx2_node_dir(),
+        ) {
+            println!("{line}");
+        }
+        return;
     }
     if report.cleanups == 0 && report.failed_cleanups == 0 {
         if report.registry_errors.is_empty() {
@@ -3020,18 +3074,71 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
     }
 }
 
-/// How many refused nodes `cerulion clean` lists in full before folding the
-/// rest into an `… and N more` line. A pathological desk (for example
-/// session-accumulated dead nodes) can hold dozens; the listing exists to
-/// attribute ONE stranded node, so ten is plenty and keeps the verb's output
-/// readable.
-const REFUSED_NODES_SHOWN: usize = 10;
+/// How many nodes `cerulion clean` lists in full — refused, or would-remove —
+/// before folding the rest into an `… and N more` line. A pathological desk
+/// (for example session-accumulated dead nodes) can hold dozens; a listing
+/// exists to name the nodes in play, so ten is plenty and keeps the verb's
+/// output readable. ONE number for both listings: a reader who learns the
+/// fold from one report reads the other the same way.
+const NODES_SHOWN: usize = 10;
+
+/// The line that keeps the would-sweep listing from over-promising.
+///
+/// The listing names the nodes a bare run ACTS ON, which is not the same set
+/// as the nodes it gets off disk: iceoryx2 raises
+/// `InsufficientPermissions` or `VersionMismatch` only from inside the
+/// removal, so which of them refuse is knowable ONLY by attempting, and a
+/// report attempts nothing. Saying "would remove" of the whole set would
+/// promise a deletion this run cannot know will happen, which is the same
+/// over-claim, one surface over, that `--report-only` exists to stop.
+const REMOVAL_CAN_STILL_BE_REFUSED: &str =
+    "  (what the sweep would ATTEMPT, not a promise each one comes off: iceoryx2 reports \
+     insufficient permissions or a version mismatch only when it tries to remove a node, which \
+     a report does not do)";
+
+/// Render the would-remove listing for `cerulion clean --report-only`: the
+/// dead nodes the sweep classified, by the NAME each carries under the
+/// registry directory (its entry name, checkable against `ls`), capped at
+/// [`NODES_SHOWN`] with the same `… and N more` fold the refusal listing
+/// uses.
+///
+/// The set is the sweep's own [`cerulion_cli_engine::ipc_cleanup::CleanupReport::dead_nodes`],
+/// which a destructive run over the same registry produces from the same
+/// classification — so this listing names exactly the nodes that run removes.
+///
+/// PURE (a `Vec` of lines) so `clean_diagnostic_tests` pins it against hand
+/// oracles. Empty input renders NOTHING: a report over a registry with no
+/// dead node falls through to the "nothing to clean" summary instead.
+fn render_would_remove(
+    dead: &[cerulion_cli_engine::ipc_cleanup::DeadNodeIdentity],
+    nodes_dir: &Path,
+) -> Vec<String> {
+    if dead.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Dead iceoryx2 node(s) `cerulion clean` would sweep: {} under {} (report only; \
+         none was removed)",
+        dead.len(),
+        nodes_dir.display()
+    )];
+    lines.extend(
+        dead.iter()
+            .take(NODES_SHOWN)
+            .map(|node| format!("  node {}", node.name)),
+    );
+    if dead.len() > NODES_SHOWN {
+        lines.push(format!("  … and {} more", dead.len() - NODES_SHOWN));
+    }
+    lines.push(REMOVAL_CAN_STILL_BE_REFUSED.to_string());
+    lines
+}
 
 /// The hint kept for the arms the listing cannot serve — a refusal iceoryx2
 /// gave NO captured explanation for, and the unclassified variants.
 ///
 /// `RUST_LOG`, not `IOX2_LOG_LEVEL`: the diagnostic sweep
-/// (`cleanup_dead_iceoryx2_nodes_with_diagnostics`) already pins iceoryx2's
+/// (`sweep_dead_nodes`) already pins iceoryx2's
 /// own level at `Trace` for its duration and the bridge forwards every line
 /// to `tracing` under `target: "iceoryx2"`, so the only gate left between the
 /// raw lines and the terminal is this process's `RUST_LOG` filter. The
@@ -3065,7 +3172,7 @@ fn render_registry_errors(errors: &[String]) -> Vec<String> {
 
 /// Render the per-node refusal listing for `cerulion clean`:
 /// `  node <id>: <variant>` followed by the sub-cause lines iceoryx2 logged
-/// about that node, indented beneath it, capped at [`REFUSED_NODES_SHOWN`]
+/// about that node, indented beneath it, capped at [`NODES_SHOWN`]
 /// nodes with an `… and N more` line. Empty input renders NOTHING — a
 /// converged sweep must not print a header for a listing that has no rows.
 ///
@@ -3082,7 +3189,7 @@ fn render_refused_nodes(
         return Vec::new();
     }
     let mut lines = vec!["Refused nodes:".to_string()];
-    for failure in failures.iter().take(REFUSED_NODES_SHOWN) {
+    for failure in failures.iter().take(NODES_SHOWN) {
         let variant = if failure.variant.is_empty() {
             "(variant not reported)"
         } else {
@@ -3098,11 +3205,8 @@ fn render_refused_nodes(
             lines.push(format!("    {cause}"));
         }
     }
-    if failures.len() > REFUSED_NODES_SHOWN {
-        lines.push(format!(
-            "  … and {} more",
-            failures.len() - REFUSED_NODES_SHOWN
-        ));
+    if failures.len() > NODES_SHOWN {
+        lines.push(format!("  … and {} more", failures.len() - NODES_SHOWN));
     }
     lines
 }
@@ -3532,6 +3636,13 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 ///   auth cache — auto-trigger an interactive device-code login MID-SPAWN,
 ///   wedging the whole run. (`bagd` is also internal but is dispatched away in
 ///   `main` BEFORE this hook, so it never reaches here.)
+/// - **`clean`** — it sweeps the iceoryx2 bookkeeping that provably dead
+///   processes left behind on THIS machine: it reads no account, sends nothing
+///   anywhere and reaches no network. The desks that need it most have never
+///   signed in — a CI runner, a fresh install a `kill -9` left wedged — and a
+///   machine must be able to clear its own state. Gating it would also make the
+///   remedy for a wedged desk depend on a device-code flow that the wedge is
+///   perfectly capable of outliving.
 ///
 /// The enforcement boundary: `run-worker` and `run-gateway` are hidden from
 /// help but still reachable as standalone `cerulion graph run-worker`
@@ -3547,6 +3658,7 @@ fn command_needs_identity(command: &Commands) -> bool {
             // completions zsh` in a shell rc file block startup on a device
             // -code prompt nobody is watching.
             | Commands::Completions { .. }
+            | Commands::Clean { .. }
             | Commands::Graph {
                 action: GraphAction::RunWorker { .. } | GraphAction::RunGateway { .. },
             }
@@ -3727,8 +3839,9 @@ mod login_gate_exemption_tests {
 
     // Pin the load-bearing exemption surface so a
     // future edit that drops/reorders the match — un-exempting `login` (a doubled
-    // login) or the worker/gateway subprocess verbs (a mid-spawn wedge) — fails
-    // CI instead of shipping green.
+    // login), the worker/gateway subprocess verbs (a mid-spawn wedge) or `clean`
+    // (a wedged desk with no way to clear its own state) — fails CI instead of
+    // shipping green.
 
     #[test]
     fn login_verb_is_exempt() {
@@ -3750,10 +3863,33 @@ mod login_gate_exemption_tests {
     }
 
     #[test]
-    fn ordinary_verbs_are_gated() {
-        // A representative spread of user-facing verbs must gate.
-        assert!(command_needs_identity(&Commands::Clean {
+    fn the_clean_verb_is_exempt() {
+        // `clean` sweeps provably dead local shared-memory bookkeeping: no
+        // account is read and nothing leaves the machine. The exemption is the
+        // VERB, so both forms of the flag carry it — a desk wedged badly enough
+        // to need the destructive form is exactly the desk that cannot sign in.
+        assert!(!command_needs_identity(&Commands::Clean {
+            report_only: true
+        }));
+        assert!(!command_needs_identity(&Commands::Clean {
             report_only: false
+        }));
+    }
+
+    #[test]
+    fn ordinary_verbs_are_gated() {
+        // A representative spread of user-facing verbs must gate. Without this
+        // arm every assertion above would still hold for a build that exempted
+        // everything. `topic list` is the twin of the behavioural control in
+        // `tests/login_gate_e2e_test.rs`.
+        assert!(command_needs_identity(&Commands::Topic {
+            action: TopicAction::List {
+                all: false,
+                no_network: true,
+                connect: Vec::new(),
+                listen: Vec::new(),
+                scan: false,
+            },
         }));
         assert!(command_needs_identity(&Commands::Graph {
             action: GraphAction::List,

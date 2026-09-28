@@ -35,7 +35,7 @@
 //! The subject set is the depth-1 `*.rs` files under `cerulion_core/tests/` —
 //! exactly what cargo builds as test binaries and exactly what
 //! `scripts/ci_test_shard.sh` enumerates, so the three agree by construction.
-//! The 104 trybuild fixtures (`tests/ui/**`) and the helper `tests/common/mod.rs`
+//! The 105 trybuild fixtures (`tests/ui/**`) and the helper `tests/common/mod.rs`
 //! are NOT depth-1 files, so they are excluded by the walk's shape rather than
 //! by a list that could go stale. [`EXEMPT`] exists for the case the shape
 //! cannot cover — a depth-1 file that genuinely should not be documented — and

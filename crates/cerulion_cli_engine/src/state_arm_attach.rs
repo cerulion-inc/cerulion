@@ -884,6 +884,7 @@ mod tests {
             identity: "noarm".to_string(),
             prefix: "c53na".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),

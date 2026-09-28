@@ -118,7 +118,8 @@ use core::time::Duration;
 
 use cerulion_core::iceoryx_logger::CapturedLog;
 use iceoryx2::config::Config;
-use iceoryx2::node::{CleanupState, NodeBuilder};
+use iceoryx2::node::{CleanupState, DeadNodeView, Node, NodeBuilder, NodeState, NodeView};
+use iceoryx2::prelude::{CallbackProgression, LogLevel as IoxLogLevel};
 
 // Route stale-resource cleanup through the same
 // Service type the core transport now uses (`ipc_threadsafe::Service`). The
@@ -177,6 +178,170 @@ pub struct CleanupReport {
     /// also means the counters above are a LOWER bound: a dead node the walk
     /// never reached is still registered and appears in neither.
     pub registry_errors: Vec<String>,
+    /// Every DEAD node the walk classified, in walk order — the set the sweep
+    /// acted on under [`SweepMode::Remove`], and the set it WOULD have acted
+    /// on under [`SweepMode::ReportOnly`]. One classification produces both,
+    /// so the report a user reads names the same nodes the run that removes
+    /// them names.
+    ///
+    /// It is NOT a count of what succeeded: a refused node appears here and
+    /// in `failures` both, and a node the walk never reached appears in
+    /// neither.
+    pub dead_nodes: Vec<DeadNodeIdentity>,
+}
+
+/// What a registry sweep is allowed to DO with the dead nodes it classifies.
+///
+/// The mode is read BEFORE the walk, never after it, which is the whole point
+/// of the type: a boolean threaded past a call that has already removed
+/// something cannot un-remove it.
+///
+/// What this type does NOT promise. It governs the DEAD-NODE sweep and
+/// nothing else. It says nothing about the `/tmp/*.shm_state` population
+/// (that half is gated separately, by the same mode value, in
+/// `cerulion clean`), nothing about whether the registry could be read at
+/// all, and nothing about what a later sweep over the same registry would
+/// find: a node alive during a `ReportOnly` walk may be dead by the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepMode {
+    /// Classify only. No node's stale resources are removed, nothing on disk
+    /// is written or unlinked, and [`CleanupReport::cleanups`] and
+    /// [`CleanupReport::failed_cleanups`] are both zero because nothing was
+    /// attempted — not because nothing was refused.
+    ReportOnly,
+    /// Classify, then remove each dead node's stale resources.
+    Remove,
+}
+
+impl SweepMode {
+    /// Does this mode remove anything?
+    #[must_use]
+    pub const fn removes(self) -> bool {
+        matches!(self, Self::Remove)
+    }
+
+    /// Is this mode a report that touches nothing?
+    ///
+    /// The complement of [`SweepMode::removes`], spelled out so a dry-run
+    /// argument reads as its own polarity rather than as a negation.
+    #[must_use]
+    pub const fn reports_only(self) -> bool {
+        matches!(self, Self::ReportOnly)
+    }
+}
+
+/// A dead node as the registry walk named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadNodeIdentity {
+    /// The node's ENTRY NAME under the registry directory: the decimal
+    /// `value` of its `UniqueSystemId`, which is exactly the filename
+    /// `UniqueNodeId::as_file_name` renders and the directory the sweep
+    /// removes. This is the name a reader can check against `ls`.
+    pub name: String,
+    /// iceoryx2's own `{:?}` rendering of the node id, verbatim
+    /// (`UniqueNodeId(UniqueSystemId { value: …, pid: …, creation_time: … })`).
+    /// Kept beside the name because it is the token every trace line about
+    /// the node carries, so a reader's grep against a raw trace matches.
+    pub token: String,
+}
+
+/// One node exactly as the registry walk classified it, before any sweep
+/// decision is taken.
+///
+/// `View` is the handle whose removal is the side effect — iceoryx2's
+/// `DeadNodeView` in production, and `()` (or a counter's token) in a test
+/// that drives the decision without a registry.
+#[derive(Debug)]
+pub enum SurveyedNode<View> {
+    /// Alive, inaccessible or undefined. A sweep never touches it, in either
+    /// mode, and makes no claim about it.
+    NotDead,
+    /// Dead: its stale resources are what a sweep removes.
+    Dead {
+        /// How the walk named it.
+        identity: DeadNodeIdentity,
+        /// The handle the removal consumes.
+        view: View,
+    },
+}
+
+/// What the sweep did with ONE node it classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeSweepOutcome {
+    /// The node was not dead. Carries nothing: the sweep neither touched it
+    /// nor counted it.
+    NotDead,
+    /// Dead, and classified ONLY — [`SweepMode::ReportOnly`] removed nothing.
+    /// This is the same set a [`SweepMode::Remove`] run over the same
+    /// registry would have attempted, and no claim about what that attempt
+    /// would have returned.
+    WouldRemove(DeadNodeIdentity),
+    /// Dead, and its stale resources were removed.
+    Removed(DeadNodeIdentity),
+    /// Dead, and the removal was refused. `failure` is iceoryx2's own `{:?}`
+    /// rendering of the error, never a re-spelling of it.
+    Refused {
+        /// How the walk named the node.
+        identity: DeadNodeIdentity,
+        /// iceoryx2's `{:?}` of the `NodeCleanupFailure`.
+        failure: String,
+    },
+}
+
+/// THE sweep decision, and the only place either mode reaches a dead node.
+///
+/// [`SweepMode::Remove`] is this classification FOLLOWED BY `remove`;
+/// [`SweepMode::ReportOnly`] is the same classification with `remove` never
+/// called. There is no second walk and no second predicate, so a report can
+/// never name a different set than the run that removes them.
+///
+/// `trace` receives the bookkeeping lines iceoryx2's own sweep loop emitted
+/// about each node, in the order it emitted them (detected, then removed or
+/// refused), so a caller that feeds them back through the log bridge keeps
+/// [`classify_cleanup_failures`] reading exactly the shapes it always read.
+/// A `ReportOnly` pass emits only the detection line: there is no removal to
+/// report and inventing one would be the defect this mode exists to close.
+pub fn sweep_one_node<View, Err, Remove, Trace>(
+    node: SurveyedNode<View>,
+    mode: SweepMode,
+    remove: Remove,
+    mut trace: Trace,
+) -> NodeSweepOutcome
+where
+    Err: core::fmt::Debug,
+    Remove: FnOnce(View) -> Result<(), Err>,
+    Trace: FnMut(IoxLogLevel, String),
+{
+    let SurveyedNode::Dead { identity, view } = node else {
+        return NodeSweepOutcome::NotDead;
+    };
+    trace(
+        IoxLogLevel::Debug,
+        format!("Dead node ({}) detected", identity.token),
+    );
+    if mode.reports_only() {
+        return NodeSweepOutcome::WouldRemove(identity);
+    }
+    match remove(view) {
+        Ok(()) => {
+            trace(
+                IoxLogLevel::Trace,
+                format!(
+                    "The dead node ({}) was successfully removed.",
+                    identity.token
+                ),
+            );
+            NodeSweepOutcome::Removed(identity)
+        }
+        Err(failure) => {
+            let failure = format!("{failure:?}");
+            trace(
+                IoxLogLevel::Trace,
+                format!("Unable to remove dead node {} ({failure}).", identity.token),
+            );
+            NodeSweepOutcome::Refused { identity, failure }
+        }
+    }
 }
 
 /// One dead node iceoryx2 could not remove, with the sub-causes it logged
@@ -608,13 +773,19 @@ pub fn classify_cleanup_failures(captured: &[CapturedLog]) -> ClassifiedFailures
     parts
 }
 
-/// Walk iceoryx2's node registry and remove the stale resources of
-/// every dead node. Same behaviour as
-/// [`cleanup_dead_iceoryx2_nodes`] but additionally captures
-/// iceoryx2's per-failure trace messages and classifies them by
-/// cause for actionable user-facing diagnostics.
+/// Walk iceoryx2's node registry ONCE, classifying every node, and — under
+/// [`SweepMode::Remove`] — removing each dead node's stale resources as it is
+/// classified. Live nodes are never touched in either mode.
 ///
-/// Replaces the opaque
+/// This is the whole of `cerulion clean`'s dead-node half, both ways round.
+/// The walk and the decision are shared: [`sweep_one_node`] is the only place
+/// a dead node is reached, so `--report-only` names exactly the nodes a bare
+/// run would have removed, and the destructive run is that classification
+/// followed by the removal rather than a second walk with a second predicate.
+///
+/// iceoryx2's per-failure trace messages are captured (via the
+/// [`cerulion_core::iceoryx_logger`] bridge) and classified by cause for
+/// actionable user-facing diagnostics, replacing the opaque
 /// "Cleaned N dead iceoryx2 node(s); M cleanup(s) failed (typically
 /// permission errors)" with a structured per-cause breakdown.
 /// Common causes:
@@ -637,13 +808,19 @@ pub fn classify_cleanup_failures(captured: &[CapturedLog]) -> ClassifiedFailures
 /// at process startup). Without the bridge, iceoryx2's traces
 /// go to its built-in console logger and the capture buffer
 /// stays empty, so this function falls back to the flat
-/// `CleanupState` counts and `unclassified` is empty.
-pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics() -> CleanupReport {
-    cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(Config::global_config())
+/// counters and `unclassified` is empty.
+///
+/// What a [`SweepMode::ReportOnly`] report does NOT promise: the sub-cause
+/// diagnostics are empty because nothing was attempted, so `failures`,
+/// `failures_by_cause` and `unclassified` say nothing about what a removal
+/// would have hit. `registry_errors` is still real — the walk itself can fail
+/// either way.
+pub fn sweep_dead_nodes(mode: SweepMode) -> CleanupReport {
+    sweep_dead_nodes_with_config(Config::global_config(), mode)
 }
 
-/// [`cleanup_dead_iceoryx2_nodes_with_diagnostics`] over an EXPLICIT iceoryx2
-/// config instead of the global one.
+/// [`sweep_dead_nodes`] over an EXPLICIT iceoryx2 config instead of the
+/// global one.
 ///
 /// The global config is what every CLI path wants; the explicit one is what
 /// lets a test run the SAME sweep-and-classify path over an isolated registry
@@ -651,13 +828,15 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics() -> CleanupReport {
 /// the machine's shared `/tmp/iceoryx2`. Same log-level guard, same capture,
 /// same classifier: the global variant is this one applied to
 /// `Config::global_config()`.
-pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config) -> CleanupReport {
-    use cerulion_core::iceoryx_logger::{capture_iceoryx_logs, init_iceoryx_log_level_from_env};
+pub fn sweep_dead_nodes_with_config(config: &Config, mode: SweepMode) -> CleanupReport {
+    use cerulion_core::iceoryx_logger::{
+        capture_iceoryx_logs, emit_iceoryx_log, init_iceoryx_log_level_from_env,
+    };
     use iceoryx2::prelude::{set_log_level, LogLevel};
 
     /// RAII guard: bumps iceoryx2's log level to Trace on
     /// construction and restores it on drop, even if the
-    /// scoped call panics. `Node::try_cleanup_dead_nodes` is documented
+    /// scoped call panics. A dead node's removal is documented
     /// to potentially panic on a registry corrupted by a non-iceoryx2
     /// writer; without the guard, that panic would leave the global
     /// log level pinned at Trace for the rest of the process
@@ -677,58 +856,126 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config)
 
     set_log_level(LogLevel::Trace);
     let _guard = LogLevelGuard;
-    // The sweep needs a node in the namespace it is cleaning: iceoryx2 carries
-    // `try_cleanup_dead_nodes` on `&Node` rather than on a bare config. That
-    // node is transient and is dropped the moment the sweep returns, and it is
-    // never a candidate for its own sweep (only DEAD nodes are).
-    //
-    // Creating it can fail, and the namespace this module is asked to clean is
-    // exactly where it is most likely to: a corrupted registry refuses the
-    // creation, which is the case the sweep exists for. Returning a 0/0
-    // `CleanupState` there would read as "nothing was dead", so the refusal is
-    // reported as a REGISTRY error instead, the field whose contract is
-    // already "the scan could not run, so the counters are a lower bound".
-    let sweep_config = cerulion_core::transport::dead_node_sweep::sweep_node_config(config);
-    let ((state, node_refusal), captured) = capture_iceoryx_logs(|| {
-        match NodeBuilder::new()
-            .config(&sweep_config)
-            .create::<CerService>()
-        {
-            Ok(node) => (node.try_cleanup_dead_nodes(), None),
-            Err(e) => (
-                CleanupState {
-                    cleanups: 0,
-                    failed_cleanups: 0,
+    // The origin iceoryx2's own sweep loop stamped on its per-node
+    // bookkeeping lines, reproduced exactly: the classifier's
+    // foreign-token and adjacency rules read origins, and a line arriving
+    // under a different origin would be attributed differently.
+    let origin = format!(
+        "Node::<{}>::cleanup_dead_nodes()",
+        core::any::type_name::<CerService>()
+    );
+    let (walk, captured) = capture_iceoryx_logs(|| {
+        let mut walk = RegistryWalk::default();
+        // ONE walk. The callback classifies each node and — only under
+        // `Remove` — removes it, through the one shared decision.
+        let listed = Node::<CerService>::list(config, |state| {
+            let outcome = sweep_one_node(
+                surveyed(state),
+                mode,
+                // `Duration::ZERO` is what `Node::try_cleanup_dead_nodes`
+                // passes: wait for no other cleaner, refuse instead.
+                |dead: DeadNodeView<CerService>| {
+                    dead.blocking_remove_stale_resources(Duration::ZERO)
                 },
-                Some(format!(
-                    "Unable to perform a full scan for dead nodes since a node could not \
-                     be created in the namespace being swept ({e:?})."
-                )),
-            ),
+                |level, message| emit_iceoryx_log(level, &origin, &message),
+            );
+            walk.record(outcome);
+            CallbackProgression::Continue
+        });
+        if let Err(e) = listed {
+            // The line iceoryx2's sweep entry logged when `Node::list`
+            // returned `Err`, verbatim — `is_registry_wide_line` reads this
+            // head, and a walk that aborted part-way must still be reported
+            // as a walk failure rather than as a clean registry.
+            emit_iceoryx_log(
+                LogLevel::Debug,
+                &origin,
+                &format!(
+                    "Unable to perform a full scan for dead nodes since the all existing nodes \
+                     could not be listed ({e:?})."
+                ),
+            );
         }
+        walk
     });
     // `_guard` restores the ENV-DERIVED level on drop at end-of-scope (or on
     // panic-unwind through `_guard`'s Drop) — `IOX2_LOG_LEVEL` if set, else
     // `error`. See the guard's own docs: a hardcoded `Error` restore here is
     // the inert-knob bug, not the contract.
 
+    // No node-creation refusal to fold in: the walk above needs no node of its
+    // own. `Node::list` reads the registry from the config, and the removal is
+    // injected per dead node, so the one failure mode left is the walk itself,
+    // which `classify_cleanup_failures` already reads out of the captured log.
     let ClassifiedFailures {
         failures_by_cause,
         unclassified,
         failures,
-        mut registry_errors,
+        registry_errors,
     } = classify_cleanup_failures(&captured);
-    if let Some(refusal) = node_refusal {
-        registry_errors.push(refusal);
-    }
 
     CleanupReport {
-        cleanups: state.cleanups,
-        failed_cleanups: state.failed_cleanups,
+        cleanups: walk.cleanups,
+        failed_cleanups: walk.failed_cleanups,
         failures_by_cause,
         unclassified,
         failures,
         registry_errors,
+        dead_nodes: walk.dead_nodes,
+    }
+}
+
+/// Name one visited node the way the sweep's classification needs it.
+///
+/// `Alive`, `Inaccessible` and `Undefined` all collapse to
+/// [`SurveyedNode::NotDead`]: the sweep removes a node's resources only on
+/// the evidence that its process is gone, and "we could not tell" is not
+/// that evidence.
+fn surveyed(state: NodeState<CerService>) -> SurveyedNode<DeadNodeView<CerService>> {
+    match state {
+        NodeState::Dead(view) => {
+            let id = *view.id();
+            SurveyedNode::Dead {
+                identity: DeadNodeIdentity {
+                    // `UniqueNodeId::as_file_name` renders the decimal
+                    // `value`, so this is the directory name under the
+                    // registry root, checkable against `ls`.
+                    name: id.value().to_string(),
+                    token: format!("{id:?}"),
+                },
+                view,
+            }
+        }
+        NodeState::Alive(_) | NodeState::Inaccessible(_) | NodeState::Undefined(_) => {
+            SurveyedNode::NotDead
+        }
+    }
+}
+
+/// The counters and identities one walk accumulated.
+#[derive(Debug, Default)]
+struct RegistryWalk {
+    cleanups: u64,
+    failed_cleanups: u64,
+    dead_nodes: Vec<DeadNodeIdentity>,
+}
+
+impl RegistryWalk {
+    /// Fold one node's outcome in. The ONLY place the counters move, so a
+    /// report and a removal cannot count differently.
+    fn record(&mut self, outcome: NodeSweepOutcome) {
+        match outcome {
+            NodeSweepOutcome::NotDead => {}
+            NodeSweepOutcome::WouldRemove(identity) => self.dead_nodes.push(identity),
+            NodeSweepOutcome::Removed(identity) => {
+                self.cleanups += 1;
+                self.dead_nodes.push(identity);
+            }
+            NodeSweepOutcome::Refused { identity, .. } => {
+                self.failed_cleanups += 1;
+                self.dead_nodes.push(identity);
+            }
+        }
     }
 }
 

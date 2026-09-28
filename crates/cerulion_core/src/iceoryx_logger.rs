@@ -277,6 +277,25 @@ pub fn install_iceoryx2_tracing_bridge() -> bool {
     iceoryx2::prelude::set_logger(&BRIDGE)
 }
 
+/// Emit one line through the bridge as iceoryx2 itself would have: forwarded
+/// to `tracing` and teed to the active capture buffer, in call order.
+///
+/// What it is for: a sweep Cerulion drives itself, node by node, in place of
+/// one of iceoryx2's own loop entry points. The per-node bookkeeping lines
+/// that loop emitted (`Dead node (…) detected`, `The dead node (…) was
+/// successfully removed.`, `Unable to remove dead node … (…).`) are the
+/// markers [`crate::iceoryx_logger`]'s consumers parse a sweep's outcome from,
+/// so a caller that owns the loop owns those lines too.
+///
+/// What it does NOT promise: it is not iceoryx2 speaking. It performs no level
+/// filtering of its own — iceoryx2 filters before the bridge is reached, and
+/// this entry point is past that — and it records nothing when no capture is
+/// active on this thread. The caller decides the level, the origin and the
+/// wording; nothing here validates that they match any iceoryx2 release.
+pub fn emit_iceoryx_log(level: LogLevel, origin: &str, message: &str) {
+    BRIDGE.log(level, format_args!("{origin}"), format_args!("{message}"));
+}
+
 /// Run `f` with a thread-local capture buffer collecting every
 /// iceoryx2 log emission. Returns `(f's result, captured logs)`.
 /// The buffer is taken at end-of-call so nested invocations on

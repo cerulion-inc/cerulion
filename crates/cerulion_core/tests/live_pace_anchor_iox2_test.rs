@@ -82,6 +82,7 @@ fn ticker_graph(
         identity: format!("{prefix}_ticker"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),

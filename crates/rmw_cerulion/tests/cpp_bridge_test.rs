@@ -45,6 +45,7 @@ use rmw_cerulion::ffi::introspection_cpp::{
 // down this file for the fixtures and are module-scope, so this
 // test reuses those rather than declaring a second set.
 use rmw_cerulion::ffi::rosidl_message_type_support_t;
+use rmw_cerulion::type_bridge::BridgeError;
 use rmw_cerulion::type_bridge_cpp::CppBridgedMessage;
 
 use cerulion_core::wire::WireHeader;
@@ -70,6 +71,7 @@ fn member(
         type_id_: type_id,
         string_upper_bound_: 0,
         members_: nested,
+        #[cfg(cerulion_has_is_key)]
         is_key_: false,
         is_array_: is_array,
         array_size_: 0,
@@ -79,9 +81,13 @@ fn member(
         size_function: None,
         get_const_function: None,
         get_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         fetch_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         assign_function: None,
         resize_function: None,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer_: false,
     }
 }
 
@@ -97,6 +103,7 @@ fn make_members(
         message_name_: cstr(name),
         member_count_: members.len() as u32,
         size_of_: size_of,
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: None,
@@ -148,11 +155,17 @@ struct FakeVecBool {
 unsafe extern "C" fn vecbool_size(field: *const c_void) -> usize {
     (*(field as *const FakeVecBool)).len
 }
+// `fetch`, `assign` and the resize that pairs with them only exist on a
+// member from Humble on; before that the C++ generator emits none of them
+// for `std::vector<bool>`, so the fixtures that install them, and the
+// tests that drive them, compile only where the mirror has the fields.
+#[cfg(cerulion_has_fetch_function)]
 unsafe extern "C" fn vecbool_fetch(field: *const c_void, idx: usize, out: *mut c_void) {
     let v = &*(field as *const FakeVecBool);
     let bit = (*v.bits.add(idx / 8) >> (idx % 8)) & 1;
     *(out as *mut bool) = bit != 0;
 }
+#[cfg(cerulion_has_fetch_function)]
 unsafe extern "C" fn vecbool_assign(field: *mut c_void, idx: usize, val: *const c_void) {
     let v = &mut *(field as *mut FakeVecBool);
     let b = *(val as *const bool);
@@ -163,6 +176,7 @@ unsafe extern "C" fn vecbool_assign(field: *mut c_void, idx: usize, val: *const 
         *byte &= !(1 << (idx % 8));
     }
 }
+#[cfg(cerulion_has_fetch_function)]
 unsafe extern "C" fn vecbool_resize(field: *mut c_void, size: usize) {
     let v = &mut *(field as *mut FakeVecBool);
     let mut storage = vec![0u8; size.div_ceil(8).max(1)];
@@ -442,8 +456,95 @@ fn cpp_mixed_message_roundtrips_through_function_pointers() {
     out.name.destruct();
 }
 
+/// A `bool` sequence whose member carries NO fetch accessor is refused per
+/// message, with the text the user reads and with nothing written into the
+/// destination.
+///
+/// This is the one member kind Foxy and Galactic cannot bridge: their C++
+/// generator emits no `fetch` or `assign` for `std::vector<bool>` and
+/// leaves `get`/`get_const` null, so the elements are unreachable. The
+/// fixture reaches the same state on every era by leaving the accessor
+/// unset, so the refusal is pinned wherever the suite runs, not only in the
+/// Foxy lane. The expected text is typed out here by hand: the oracle is
+/// the message the user reads, never the constant the bridge renders.
+#[test]
+fn a_bool_sequence_without_a_fetch_accessor_is_refused_and_writes_nothing() {
+    #[repr(C)]
+    struct CppFlags {
+        flags: FakeVecBool,
+    }
+    // `size_function` ONLY: the element COUNT is readable, the elements are
+    // not. That is exactly the pre-Humble shape.
+    let mut m = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
+    m.size_function = Some(vecbool_size);
+    let members = make_members(
+        "test_msgs::msg",
+        "UnreachableFlags",
+        std::mem::size_of::<CppFlags>(),
+        vec![m],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+
+    let pattern = [true, false, true];
+    let mut bits = vec![0b0000_0101u8];
+    let msg = CppFlags {
+        flags: FakeVecBool {
+            bits: bits.as_mut_ptr(),
+            len: pattern.len(),
+        },
+    };
+    let msg_ptr = &msg as *const _ as *const c_void;
+
+    // The size pre-pass SUCCEEDS: this is a refusal about reachability, not
+    // a corrupt sequence header, and the destination is exactly frame-sized.
+    let size = unsafe { bridge.frame_size(msg_ptr) }.expect("frame_size");
+    assert!(size > WireHeader::SIZE + pattern.len());
+
+    const POISON: u8 = 0xA5;
+    let mut out = vec![POISON; size];
+    let err = unsafe { bridge.flatten_into(msg_ptr, 7, 11, &mut out) }
+        .expect_err("a bool sequence with no fetch accessor must be refused");
+
+    // The WHOLE error value, then the rendering the caller prints.
+    let want_detail = "bool sequence member 'flags' cannot be encoded: this build's C++ \
+                       typesupport has no fetch accessor for std::vector<bool>: its \
+                       generator emits no fetch or assign function and leaves get and \
+                       get_const null, so no element is reachable";
+    match &err {
+        BridgeError::Encode { message, detail } => {
+            assert_eq!(message, "test_msgs/UnreachableFlags");
+            assert_eq!(detail, want_detail);
+        }
+        other => panic!("expected an Encode refusal, got {other:?}"),
+    }
+    assert_eq!(
+        err.to_string(),
+        format!("encode failed for test_msgs/UnreachableFlags: {want_detail}")
+    );
+
+    // The side effect that must NOT have happened: no frame. The header is
+    // written last and the elements are never fetched, so the head is still
+    // the cursor's deterministic zeroing and the element bytes are still the
+    // poison. A caller that published this buffer anyway would ship 32 zero
+    // bytes, which no reader accepts as a header.
+    assert!(
+        out[..WireHeader::SIZE].iter().all(|&b| b == 0),
+        "a refused encode must leave no wire header behind"
+    );
+    assert_eq!(
+        &out[size - pattern.len()..],
+        &[POISON; 3],
+        "the refused sequence's own bytes must be untouched"
+    );
+    assert!(
+        out.iter().all(|&b| b == POISON || b == 0),
+        "a refused encode must write no message data at all"
+    );
+}
+
 /// vector<bool> is bit-packed — the fixture is too, so a contiguous
 /// memcpy implementation CANNOT pass this test.
+#[cfg(cerulion_has_fetch_function)]
 #[test]
 fn cpp_bool_sequence_goes_through_fetch_assign() {
     #[repr(C)]
@@ -1242,6 +1343,7 @@ fn cpp_flatten_into_matches_flatten_for_mixed_message() {
 
 /// vector<bool> through flatten_into: the bit-packed fetch loop writes
 /// straight into the cursor's zeroed span — identical bytes to flatten.
+#[cfg(cerulion_has_fetch_function)]
 #[test]
 fn cpp_flatten_into_matches_flatten_for_bool_sequence() {
     #[repr(C)]
@@ -1286,6 +1388,7 @@ fn cpp_flatten_into_matches_flatten_for_bool_sequence() {
 /// loop (the spot the helper flags as "likeliest to miss a byte") must
 /// take its zero-count branch and still produce a byte-identical,
 /// fully-initialized frame (an empty variable entry, no fetch calls).
+#[cfg(cerulion_has_fetch_function)]
 #[test]
 fn cpp_flatten_into_matches_flatten_for_empty_bool_sequence() {
     #[repr(C)]
@@ -2075,6 +2178,7 @@ fn padded_members_cpp_with_init() -> *const CppMessageMembers {
         message_name_: cstr("PadFlagVal"),
         member_count_: members.len() as u32,
         size_of_: std::mem::size_of::<CppPadFlagVal>(),
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: Some(padded_cpp_init),

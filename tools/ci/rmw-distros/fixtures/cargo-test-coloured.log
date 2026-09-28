@@ -1,0 +1,75 @@
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/rmw_cerulion-8ce03b3d220ea42b)
+
+running 4 tests
+test api::dispatch_tests::direct_leaf_resolves_without_a_dispatcher ... FAILED
+test api::dispatch_tests::resolves_c_arm ... ok
+test api::dispatch_tests::resolves_cpp_arm_for_a_cpp_dispatcher ... FAILED
+test era::tests::vendored_era_is_lyrical ... ok
+
+failures:
+
+---- api::dispatch_tests::direct_leaf_resolves_without_a_dispatcher stdout ----
+    indented_dump_line_that_looks_like_a_name
+thread 'api::dispatch_tests::direct_leaf_resolves_without_a_dispatcher' panicked at src/api/mod.rs:10:5:
+refused
+
+---- api::dispatch_tests::resolves_cpp_arm_for_a_cpp_dispatcher stdout ----
+thread 'api::dispatch_tests::resolves_cpp_arm_for_a_cpp_dispatcher' panicked at src/api/mod.rs:20:5:
+refused
+
+
+failures:
+    api::dispatch_tests::direct_leaf_resolves_without_a_dispatcher
+    api::dispatch_tests::resolves_cpp_arm_for_a_cpp_dispatcher
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[32m     Running[0m tests/bridge_test.rs (target/release/deps/bridge_test-b1eb79763d415960)
+
+running 2 tests
+test hostile_count_is_rejected ... ok
+test padding_is_deterministic ... ignored
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m     Running[0m tests/rmw_shadow_take_test.rs (target/release/deps/rmw_shadow_take_test-1f2e3d4c5b6a7980)
+
+running 3 tests
+test cpp_image_loaned_take_aims_data_into_the_held_sample_and_recycles_the_shadow ... 2026-09-23T17:58:01Z  INFO rmw_cerulion: refusing the rclcpp (C++ typesupport) path at registration
+FAILED
+test forged_take_is_byte_stable ... ok
+test two_runs_of_the_forged_take_match_the_hand_oracle ... FAILED
+
+failures:
+
+---- cpp_image_loaned_take_aims_data_into_the_held_sample_and_recycles_the_shadow stdout ----
+thread 'main' panicked at tests/rmw_shadow_take_test.rs:400:9:
+refused
+
+---- two_runs_of_the_forged_take_match_the_hand_oracle stdout ----
+thread 'main' panicked at tests/rmw_shadow_take_test.rs:500:9:
+refused
+
+
+failures:
+    cpp_image_loaned_take_aims_data_into_the_held_sample_and_recycles_the_shadow
+    two_runs_of_the_forged_take_match_the_hand_oracle
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+[1m[32m   Doc-tests[0m rmw_cerulion
+
+running 2 tests
+test crates/rmw_cerulion/src/lib.rs - (line 12) ... ok
+test crates/rmw_cerulion/src/era.rs - era::classify_cpp_bridge (line 40) ... FAILED
+
+failures:
+
+---- crates/rmw_cerulion/src/era.rs - era::classify_cpp_bridge (line 40) stdout ----
+error[E0425]: cannot find value `gate` in this scope
+
+
+failures:
+    crates/rmw_cerulion/src/era.rs - era::classify_cpp_bridge (line 40)
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s

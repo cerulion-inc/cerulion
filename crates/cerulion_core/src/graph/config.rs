@@ -446,6 +446,26 @@ pub struct NodeDef {
     /// in v1). Mutually exclusive with `type:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ros2: Option<Ros2NodeDef>,
+    /// OPTIONAL per-node execution opt-out: `fuse: false` ENDS any fused
+    /// chain at this node.
+    ///
+    /// Absent means the node does not end a chain, which is the default for
+    /// every node that does not say otherwise. `true` is accepted and means
+    /// the same as absent, so a graph may state the default explicitly
+    /// without that reading as a request for something different.
+    ///
+    /// The opt-out is per INSTANCE rather than per node TYPE because whether
+    /// a consumer should pull its producer's period along with it is a
+    /// property of the deployment, not of the code: the same logger type is a
+    /// best-effort tail in one graph and a control node in another. Fusion
+    /// converts consumer lag into head-node period slip, which is what a
+    /// control chain wants and a best-effort tail does not.
+    ///
+    /// NOTHING in the executor reads this yet: an opted-out node appears in
+    /// the resolved decision that is logged at graph build and in no
+    /// execution path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse: Option<bool>,
 }
 
 impl NodeDef {

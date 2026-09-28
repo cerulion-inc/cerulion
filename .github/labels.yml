@@ -20,6 +20,17 @@
   color: 0e8a16
   description: Low priority — nice to have
 
+# --- Merge risk (the priority gradient, green -> red) ---
+- name: "merge-risk: low"
+  color: 0e8a16
+  description: Touches tests, docs or one crate with no public surface change
+- name: "merge-risk: medium"
+  color: fbca04
+  description: Changes behaviour or a public surface behind a gate
+- name: "merge-risk: high"
+  color: d93f0b
+  description: Changes a default, a wire format, a hot path or a security boundary
+
 # --- Contributor onboarding (GitHub-standard colors) ---
 - name: good first issue
   color: 7057ff
@@ -55,6 +66,9 @@
 - name: security
   color: ee0701
   description: Security-relevant, never auto-closed; see .github/SECURITY.md for private disclosure
+- name: leak
+  color: ee0701
+  description: Set by the leak guard on an issue or comment whose text points somewhere a stranger cannot open; cleared when the text is edited
 - name: duplicate
   color: cfd3d7
   description: Already tracked in another issue or pull request

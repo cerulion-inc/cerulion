@@ -232,6 +232,50 @@ and `docs/user-api.md` exists in the CLI, is enforced by the public-surface gate
 carries a markdown TABLE row, because a table cell is where those two pages spell their
 verbs.
 
+## The dependency-architecture rules
+
+Which crate may depend on what is an architecture decision, and each one was written as a
+sentence: in `.github/workflows/ci.yml`, in the root `Cargo.toml`, in a crate manifest
+header, in a crate `AGENTS.md`, or in `docs/internals/`. The machine half of every sentence
+is `crates/cerulion_hygiene/tests/dependency_rules_test.rs`, so an optional, renamed or
+transitive edge that breaks one fails `cargo test`. Each test quotes the sentence it
+enforces.
+
+| Test | What fails it |
+|---|---|
+| `default_member_build_is_iroh_free` | A `cargo build` with no `-p` reaches the iroh tree. `cerulion_netd`, `cerulion_link`, `cerulion_wireclient`, `cerulion_remoted`, `cerulion_connectd` and `cerulion_accountd` are workspace members and not default members for this reason, and lean consumers of netd depend with `default-features = false`. |
+| `netd_per_package_build_pulls_the_iroh_wan_plane` | `cargo build -p cerulion_netd` stops reaching iroh, which means the shipped daemon lost the WAN plane that its `wan` feature carries by default. Also the positive control for the rule above: the two differ only in the root set. |
+| `a_plain_cargo_test_compiles_no_iroh_and_no_rerun` | A `cargo test` with no `-p` reaches either tree. It walks each default member's own `[dev-dependencies]` as well, which is the other half of the sentence the root `Cargo.toml` states. |
+| `default_member_build_is_rerun_free` | A `cargo build` with no `-p` reaches the Rerun SDK. Rasterization is desk-side, so `cerulion_viz` and `cerulion_vizd` build with `-p`. |
+| `desk_viz_still_pulls_rerun` | `cargo build -p cerulion_viz` stops reaching rerun, which means either the desk viz stack lost its render edge or the rule above probes nothing. |
+| `the_robot_demo_workspace_is_rerun_free` | Any `examples/go2` crate takes a rerun dependency of any kind. Read from that workspace's committed manifests and lockfile, so dev edges, build edges and every platform count. |
+| `the_robot_workspace_reader_sees_normal_and_dev_packages` | The lockfile reader stops seeing `go2_tf`, or the manifest reader stops seeing `tempfile`, which `dds_bridge` declares only under `[dev-dependencies]`. A dev edge is how the Rerun SDK reached the robot the one time it did, so that is the arm worth a control of its own. |
+| `the_dds_stack_is_confined_to_cerulion_dds` | A second workspace member declares a DDS dependency, or the default build reaches the DDS stack along a route that avoids `cerulion_dds`. |
+| `the_lean_crates_declare_exactly_their_allowed_dependencies` | `cerulion_discovery` declares anything but serde, serde_json, dirs and tracing, or `cerulion_hygiene` anything but libc and tracing. Exact in both directions: an allowance nobody removed pre-authorises the next edge. |
+| `the_confined_crates_reach_nothing_they_forbid` | `cerulion_pairing` reaches iroh or rerun, `cerud` reaches iceoryx2 or zenoh, or `cerulion_link` reaches `cerulion_core`. |
+| `the_heavy_members_stay_out_of_default_members` | One of the eleven deliberate `default-members` exclusions is back in the default set, or a member left the default set with no row saying why. Checked in both directions, and each row names what a plain build would gain. |
+| `the_forbidden_families_exist_in_this_workspace` | A family pattern matches no package in the resolve at all, which would let every rule written over it pass while proving nothing. |
+| `the_checker_reports_a_forbidden_crate_when_one_is_present` | The one checker every rule above calls stops reporting a violation under roots that carry one. |
+| `the_resolver_covers_every_package_cargo_tree_reports` | The dependency closure the rules are stated over misses a package `cargo tree -e normal` reports, which is a place a forbidden crate could sit unseen. A floor on the reported count keeps a broken `cargo tree` invocation from satisfying it with silence. |
+
+Thirteen of the rules are stated over `cargo metadata --format-version 1`, run once per test
+binary; the fourteenth runs `cargo tree` as its oracle. The
+emitted `resolve.nodes` graph is not walked directly: it carries one feature set per package,
+unified across every member that selects it, so netd appears there with `wan` on and iroh
+attached even though the default build reaches netd through an edge that says
+`default-features = false`. The file runs cargo's feature algorithm itself from a chosen set
+of roots instead, and uses `resolve.nodes` only to map a manifest dependency onto the package
+id cargo picked for it. No target filtering is applied, so a `cfg(windows)` edge counts and
+the verdict is the same on every machine. The default-build rules walk normal AND build
+edges, because a build dependency on a forbidden crate compiles that crate during a
+`cargo build` exactly as a normal one does.
+
+Two `cargo tree` jobs in `.github/workflows/ci.yml` used to assert five of these rules and
+are retired, because each test that replaces one is strictly stronger: the tests walk build
+edges as well as normal ones, apply no target filter, and read the robot workspace off its
+committed lockfile and manifests, which covers every edge kind and every crate the demo
+reaches by `path`.
+
 ## The leak guard
 
 `tools/scripts/leak_scan.py` keeps machine names, addresses, home paths, logins, people and
@@ -257,35 +301,77 @@ arm pinned both ways. "Found something" and "could not run" never share an exit 
 built-in control per class must hit before any scan, and an allowlist entry that matches no
 file or excused nothing fails a full-tree run. Contributor-facing detail: `docs/leak_guard.md`.
 
-## The public-surface review (`.github/workflows/public-surface-review.yml`)
+## The public-surface review (`tools/review/public-surface-review.md`)
 
 `tools/scripts/check_public_surface.sh` refuses the wording it can NAME. A regex cannot
 see narrative, a stale claim, or a sentence that contradicts another page, and an
-independent audit of this tree found all three in files every pattern passed. This job
-reads the pull request's DIFF for those.
+independent audit of this tree found all three in files every pattern passed. The
+semantic half reads a pull request's DIFF for those. It is run locally, over the diff
+rather than the tree, and no CI job runs it.
 
-It runs the Claude Code action on the same terms as the Claude Code Review workflow: the
-same pinned action, the same three gates (a maintainer author, a head branch in this
-repository so a fork never holds the token, and not a draft), `show_full_output: false`,
-and no transcript artifact. It is smaller in every other way. The prompt is fixed and in
-the tree at `tools/review/public-surface-review.md` (the eleven families of tell, the
-vocabulary that is legitimate and must be judged rather than reported, and the four
-severities LEAK, EMBARRASSING, CONFUSING, COSMETIC). The diff is computed by a step and
-handed over as a file, so the model is allowed `Read`, `Grep`, `Glob` and `Write` and no
-shell at all. It writes ONE JSON verdict and posts nothing.
+The prompt is fixed and in the tree at `tools/review/public-surface-review.md` (the
+eleven families of tell, the vocabulary that is legitimate and must be judged rather
+than reported, and the four severities LEAK, EMBARRASSING, CONFUSING, COSMETIC). The
+diff is handed over as a file, the reader needs `Read`, `Grep`, `Glob` and `Write` and
+no shell at all, and the output is ONE JSON verdict.
 
 `tools/review/render_public_surface_verdict.py` reads that verdict, renders the one pull
 request comment, and decides the exit, so the outcome never depends on the session
 choosing to call a tool: clean is a silent pass, a LEAK or EMBARRASSING finding FAILS,
 advisory findings pass with the comment, and a missing or unparseable verdict FAILS,
 because a semantic review that did not happen looks exactly like a clean one. Its
-`--self-test` drives every arm, including a quoted pipe that must not add a table column
-and a blocking finding past the table's row cap.
+`--self-test` runs in `lint` on every push and drives every arm, including a quoted pipe
+that must not add a table column and a blocking finding past the table's row cap.
 
-ADVISORY until the maintainers add it to the required checks on `main`: a red here is a
-review to read, not a block. COST: one ubuntu job and one model session per push, over
-the diff rather than the tree, capped at 20 minutes, billed to the same OAuth account as
-the Claude Code Review workflow, and cancelled when a new push supersedes it.
+RUNNING IT, on the branch, before the pull request is opened, by whoever opened it:
+
+```bash
+# 1. Prepare the diff. The stale working files go FIRST, so a preparation that fails
+#    cannot leave an earlier diff or an earlier verdict standing in for this one.
+#    The steps are CHAINED, not run under errexit: a shell suspends `set -e` inside a
+#    command whose status is tested, an inner `set -e` included, so a guard written
+#    that way never fires.
+prepared=0
+rm -f pr.diff public-surface-review.json \
+  && git fetch -q https://github.com/cerulion-inc/cerulion.git main \
+  && base=$(git merge-base FETCH_HEAD HEAD) \
+  && git diff "$base..HEAD" > pr.diff \
+  && test -s pr.diff \
+  || prepared=$?
+echo "prepared: $prepared"
+
+# 2. With prepared 0, hand pr.diff and tools/review/public-surface-review.md to a local
+#    agent session holding Read, Grep, Glob and Write and no shell; it writes
+#    public-surface-review.json. Anything else and there is no diff to read.
+
+# 3. Read the verdict. A preparation that did not finish means there was nothing to
+#    review, which is 3 and never a clean pass, whatever file is lying around. A script
+#    that must FAIL on a blocking verdict ends `exit "$verdict"`.
+verdict=3
+if [ "$prepared" -eq 0 ]; then
+  verdict=0
+  python3 -B tools/review/render_public_surface_verdict.py public-surface-review.json || verdict=$?
+fi
+echo "verdict: $verdict"
+```
+
+The three steps fail CLOSED, the same way the renderer does: a fetch that does not land,
+a merge base that does not resolve, or an empty `pr.diff` leaves `prepared` non-zero and
+no file for step 2 to read, and step 3 over an absent verdict reports 3 rather than
+clean. Deleting both working files inside the chain is what makes that true a second
+time, because a verdict left over from the previous branch reads exactly like this one,
+and step 3 refuses to read any verdict at all unless `prepared` is 0, so a delete that
+does not happen cannot pass an old file off as this branch's result.
+Every status is captured rather than trapped, and no step relies on errexit, so none of
+the three can close a shell that already has it on.
+Neither working file is committed. The
+renderer's own status is the verdict, and `$verdict` is where the block keeps it, because
+a trailing `echo` would otherwise become the status a caller reads: 0 clean, 1 a LEAK or
+EMBARRASSING finding to fix before the branch lands, 2 advisory findings, 3 no verdict
+to read. The rendered comment is what goes on the pull request when it is 1 or 2.
+
+Its findings are ADVISORY: no required check on `main` carries them, so a finding is a
+review to read, not a block.
 
 ## The docs gate
 
@@ -327,7 +413,7 @@ against the type it has to parse as by a unit test in
 
 ## CI job map (`.github/workflows/ci.yml`)
 
-`lint` gates every test job and runs: `cargo fmt --all --check` plus a workspace-root WALK
+`lint` runs: `cargo fmt --all --check` plus a workspace-root WALK
 that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/*`, every
 `examples/*`, the fuzz workspace); `cargo clippy --workspace --all-targets -- -D warnings`;
 the hot-path alloc lint and its self-test; the agent-docs gate; the leak guard's self-test
@@ -339,32 +425,47 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 `merge_group` events like everything else: there is no cost gate, no routing expression
 and no stub job standing in for a skipped required check.
 
+`lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
+`viz-tests`, and the push-only `fuzz`, `miri` and latency jobs), so a red `lint` still
+saves their runner minutes. It does NOT gate the two that do: `test-linux` and
+`test-macos`. Both start at t=0. `test-linux` has no `needs:` at all: each shard builds the
+`cerulion_core` test binaries it runs, so nothing in front of it is a data dependency. A
+`lint` verdict was never a data dependency for either, and while it gated them the wall was
+`lint` plus the longest test job instead of the longest test job.
+
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
-2-way (`[0,1]`: every macOS shard pays a fixed build and setup cost, so the macOS side
-runs fewer, fuller shards); both `fail-fast: false`. Each leg
+3-way (`[0,1,2]`); both `fail-fast: false`. The macOS count is set from per-step
+measurement: under the earlier 2-way split the legs ran 28.3 and 46.0 min with a warm
+cargo cache and 57.4 and 55.1 with none, so one leg set the wall of the whole workflow
+while the other idled, and the skew INVERTED with the cache state (the pinned trybuild
+tail costs 6 min warm against 18 cold, so a hand tilt tuned on either column is wrong in
+the other). A third leg divides the variable work by 3 while the fixed per-leg cost
+(`cargo build --workspace`, toolchain, nextest install) is paid once more, which is
+better in both cache states: a longest leg PROJECTED from those per-step costs at 26.6
+min warm and 42.7 cold, not yet an observed three-shard wall. Each leg
 runs `./tools/scripts/ci_test_shard.sh cerulion_core <shard> <count>`, which ENUMERATES
 `crates/cerulion_core/tests/*.rs` at depth 1 and takes every file whose position is
 `index mod count`, GENERATED, never hand-listed, save for ONE pinned name
 (`macro_compile_fail_test`, the serial trybuild tail (see `PINNED_TEST` in that script for the
 per-run measurement), which must not relocate every time a test
-file is added; it lands on `PINNED_SHARD % count`, shard 2 of 4 on Linux, shard 0 of 2 on
+file is added; it lands on `PINNED_SHARD % count`, shard 2 of 4 on Linux, shard 2 of 3 on
 macOS, and `--check` proves the pin), and execs `cargo nextest run --profile ci`
 (install via `tools/scripts/install_nextest.sh`). It does NOT pass `--test-threads=1`; see the
 serialisation fence below. The split across runners is legal because each VM has its own
 `/dev/shm`.
 `--lib` and the doctests ride shard 0; the non-core packages are distributed across the
-shards (one per shard on Linux; a hand-balanced 2-way tilt on macOS), with the iroh-tree
-packages kept together so that large tree compiles once. On macOS, shard 1 also carries the
+shards (one per shard on Linux; a hand-balanced 3-way tilt on macOS), with the iroh-tree
+packages kept together so that large tree compiles once. On macOS, shard 2 also carries the
 six viz steps (`cerulion_viz`, `go2_tf`, the serial `cerulion-vizd` suite and the three
-OpenH264 steps); there is NO macOS `viz-tests` leg. Linux shard 0 is the cache SAVER and
-shards 1-3 restore only; the macOS job's shard 0 saves and shard 1 restores, for the same
+OpenH264 steps) beside the trybuild tail, which is why it takes the lightest package set;
+there is NO macOS `viz-tests` leg. Linux shard 0 is the cache SAVER and
+shards 1-3 restore only; the macOS job's shard 0 saves and shards 1-2 restore, for the same
 reason. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
 
-`test-linux` does not build the `cerulion_core` test binaries four times: `test-archive`
-builds them once with `cargo nextest archive`, uploads the archive as a run-scoped
-artifact with its `sha256` as a job output, and each shard downloads it, verifies the hash
-before extracting, and RUNS the archive rather than compiling one.
+Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the shard step
+compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
+what it built. There is no shared archive of test binaries and no job that builds one.
 
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`
@@ -373,14 +474,14 @@ real-iceoryx2 file claims an isolated per-test SHM root, so parallel is the stro
 gate), the daemon lane SERIAL. `machete` (unused-manifest sweep) and `fuzz` are non-blocking
 (`continue-on-error: true`), which is why the coverage walk refuses to count a package named
 only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `examples`,
-`demos-go2`, `netd-wan`, `iroh-leanness`, `rerun-leanness`, `docs`, `deps` (cargo-deny,
+`demos-go2`, `netd-wan`, `docs`, `deps` (cargo-deny,
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
 
 Six Linux jobs run on push / `workflow_dispatch` only and never
 on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `msrv`, `fuzz`, `miri` and
 `machete` each carry a job-level `if: github.event_name != 'pull_request' && github.event_name
-!= 'merge_group'`; the second
+!= 'merge_group'`; `deb-smoke` carries one exception, below; the second
 conjunct is required because a bare `!= 'pull_request'` ADMITS a merge-queue batch,
 which would run the same work a second time over the same commits (`main`'s push run is the
 control), with their `needs: [lint]` (`fuzz`, `miri`) and
@@ -390,6 +491,18 @@ They run on every merge to `main` (the push run is where their breakage
 surfaces, revert-on-red), and the coverage walk drops any job behind a job-level `if:`
 from its PR-blocking view, so none of the six can credit pull-request coverage it does not
 provide.
+
+The `changes` job classifies a pull request's changed paths (rules and a
+`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) and
+`deb-smoke` reads one class: a pull request that touches the packaging inputs
+themselves runs the 22-minute Debian and APT smoke instead of skipping it, because
+those are the only pull requests that can break it and "caught on the merge to main"
+means a revert rather than a red check. The direction is the safe one: a class only
+ever makes a job RUN that would otherwise skip, so no rule in that script can weaken a
+gate a pull request has today, and every class is `false` on `push`, `merge_group` and
+`workflow_dispatch`, where there is no pull request to diff. `deb-smoke` keeps its
+`push` run whatever the classifier did: the job is guarded with `!cancelled()`, because
+`needs:` alone would let a failed classifier skip a job that runs unconditionally today.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.

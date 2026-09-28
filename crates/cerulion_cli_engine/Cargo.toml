@@ -224,8 +224,9 @@ cerulion_bag = { workspace = true }
 # netd is excluded from `default-members` (root Cargo.toml) so cargo's per-package
 # feature unification cannot turn wan back on for the one shared netd rlib the CLI
 # links. Verify the WHOLE default build (not the isolated `-p cerulion_cli_engine`
-# graph, which cannot observe unification): `cargo tree -e normal -i iroh` at the
-# workspace root must find nothing — pinned by the `iroh-leanness` CI job.
+# graph, which cannot observe unification): the default-members resolve must reach no
+# iroh-family package, pinned by `default_member_build_is_iroh_free` in
+# `crates/cerulion_hygiene/tests/dependency_rules_test.rs`.
 cerulion_netd = { workspace = true }
 
 [dev-dependencies]

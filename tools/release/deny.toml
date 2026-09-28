@@ -181,9 +181,10 @@ wildcards = "warn"
 # into the workspace, and a crate that adds a second one fails here by name
 # instead of going unnoticed.
 #
-# READ THIS BEFORE DELETING THE `iroh-leanness` / `rerun-leanness` CI JOBS:
-# these entries do NOT subsume them, and cannot. `[[bans.deny]] wrappers`
-# constrains WHO DEPENDS on a crate; those jobs constrain WHICH RESOLVE GRAPH a
+# READ THIS BEFORE WEAKENING THE RESOLVE-GRAPH RULES IN
+# `crates/cerulion_hygiene/tests/dependency_rules_test.rs`: these entries do NOT
+# subsume them, and cannot. `[[bans.deny]] wrappers`
+# constrains WHO DEPENDS on a crate; those rules constrain WHICH RESOLVE GRAPH a
 # crate appears in - specifically that `default-members` (a plain `cargo build`)
 # resolves without iroh/rerun at all. That invariant is defeated by things this
 # file cannot see: cargo's per-package FEATURE UNIFICATION (netd's default-on
@@ -233,10 +234,10 @@ wildcards = "warn"
 # the UNION of each package's declared `repository` and a name-shape rule -
 # measured, neither alone is complete, and a name-shape rule alone was fail-open
 # on `sorted-index-buffer`, which iroh publishes under a prefix-less name. The
-# two CI leanness jobs probe the NAME-SHAPE family only (they are shell, reading
-# the lockfile); that is a weaker set than the Rust gate's, which is why the Rust
-# gate is the one that carries this invariant.
-# The two jobs also cover the ISOLATED `examples/go2` workspace and its DEV edges,
+# resolve-graph rules in `crates/cerulion_hygiene/tests/dependency_rules_test.rs`
+# probe the NAME-SHAPE family only; that is a weaker set than the door gate's,
+# which is why the door gate is the one that carries this invariant.
+# Those rules also cover the ISOLATED `examples/go2` workspace and its DEV edges,
 # which a root-workspace `cargo deny` run never reaches. They are complementary
 # gates on different invariants; keep both.
 #
@@ -258,8 +259,9 @@ name = "rerun"
 # No viz on the robot: rasterization is desk-side.
 # `cerulion_viz` is the generic viz support lib and `cerulion-vizd` the desk
 # daemon; nothing else in the workspace may link the Rerun SDK. This is the
-# direct-edge guard for the violation the `rerun-leanness` job was written after
-# - a robot-side crate acquiring a `cerulion_viz` + `rerun` dev-dependency.
+# direct-edge guard for the violation `the_robot_demo_workspace_is_rerun_free` was
+# written after - a robot-side crate acquiring a `cerulion_viz` + `rerun`
+# dev-dependency.
 wrappers = ["cerulion_viz", "cerulion_vizd"]
 
 # -----------------------------------------------------------------------------

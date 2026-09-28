@@ -9,43 +9,42 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   statement of `main()` - it owns stdout for a completion invocation. Nothing may print
   before it, and completion output must stay bare candidates with zero stderr bytes
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
-- Keep `Completions` excluded from `command_needs_identity` - `cerulion completions zsh`
-  runs from shell rc files and must never block shell startup on an auth prompt.
-- Multi-value flags use exact `num_args = N`, never a range - clap's default Append
-  action flattens repeated invocations into one Vec, making two partial invocations
-  indistinguishable from one full one. Length guards run BEFORE any positional access.
+- Never gate `Completions` or `Clean` behind `command_needs_identity` - a shell rc file
+  and a desk that never signed in must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
+- Multi-value flags use exact `num_args = N`, never a range - clap's default Append action
+  flattens repeated invocations into one Vec, making two partial ones indistinguishable from one
+  full one. Length guards run BEFORE any positional access.
 - Optional-value flags (`--record`, `--run`) use `require_equals` - load-bearing, not
   style: a bare flag takes its default and the following words parse as positionals.
 - Path completion: clap auto-derives `ValueHint::AnyPath` for `PathBuf`-typed args; a
-  `String`-typed path arg completes NOTHING until given an explicit `value_hint`. Every
-  new value-taking arg must get a completer/hint or be classified in the free-form
-  inventory - `src/completion_wiring_tests.rs` fails until you do, and the fix for a
-  path arg is a `value_hint`, never an inventory entry.
+  `String`-typed path arg completes NOTHING without an explicit `value_hint`. Every new
+  value-taking arg needs a completer/hint or a free-form inventory entry -
+  `src/completion_wiring_tests.rs` fails until you do, and for a path arg the fix is the hint.
 - Create verbs (`node|graph|schema create`) deliberately complete nothing - the existing
   name set is exactly what a create verb rejects.
 
 ## Testing
 
-- Wiring tests are binary-crate unit tests (no lib target):
-  `cargo test -p cerulion_cli --bin cerulion`. They move the process cwd + `HOME` under
-  a file-local mutex declared as the fixture's LAST field - Rust drops fields in
-  declaration order, so a mutex declared first releases before the env guards restore.
-- The e2e binaries drive the REAL binary; run each `#[serial]` one individually with
+- Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
+  They move cwd + `HOME` under a file-local mutex declared as the fixture's LAST field, never the
+  first (Rust drops fields in declaration order).
+- Never run a bare `cerulion clean` from a test: the `/tmp/*.shm_state` reclaim is machine wide by
+  construction (compile-time directory, no `TMPDIR`), so arms here pass `--report-only` only and the
+  destructive proof lives in `cerulion_cli_engine`'s `clean_orphan_port_tag_test.rs`
+  (`tests/trace_inspect_and_clean_cli_test.rs`).
+- E2E binaries drive the REAL binary; run each `#[serial]` one alone with
   `-- --test-threads=1`. Build fixtures first:
-  - `replay_cli_test`: `cargo build -p test_node_macro_period_cdylib
-    -p test_node_macro_period_perturbed_cdylib -p test_node_macro_period_panic_cdylib
-    -p test_node_nondeterministic_cdylib`
+  - `replay_cli_test`: `cargo build -p test_node_macro_period_cdylib -p
+    test_node_macro_period_perturbed_cdylib -p test_node_macro_period_panic_cdylib -p test_node_nondeterministic_cdylib`
   - `mp_record_e2e_test`, `mp_auto_partition_e2e_test`, `network_gateway{,_mp}_e2e_test`:
     `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`
-  - `signal_matrix_e2e_test`: `cargo build -p test_node_macro_period_cdylib`
-  - `credit_death_e2e_test`: + `..._trigger_block_cdylib`. `mp_split_pair`:
-    `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`
+  - `signal_matrix_e2e_test`: `cargo build -p test_node_macro_period_cdylib`. `credit_death_e2e_test`: + `..._trigger_block_cdylib`.
+    `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`
 
 ## Gotchas
 
-- Signal tests assert exit code EXACTLY 0: a signal-killed process reports
-  `code()==None`, so the integer 0 is the proof the handler drove a graceful shutdown
-  rather than a default-disposition kill. Don't loosen the discriminator.
+- Signal tests assert exit code EXACTLY 0: a signal-killed process reports `code()==None`, so 0
+  proves the handler drove a graceful shutdown, not a default-disposition kill. Don't loosen it.
 - Gateway-teardown tests require the gateway's own shutdown log line, not just
   exit 0 + child reaped - reap alone also passes a kill-on-drop teardown.
 - `mp_support::ChildGuard` has NO public field: `spawn_group_leader` if the child owns a

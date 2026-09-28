@@ -193,6 +193,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "fixed_producer".to_string(),
@@ -200,6 +201,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "dut".to_string(),
                 node_type: "period_dut".to_string(),
@@ -210,6 +212,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "delivery_sink".to_string(),
@@ -261,6 +264,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "fixed_producer".to_string(),
@@ -268,6 +272,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "dut".to_string(),
                 node_type: "block_out_dut".to_string(),
@@ -278,6 +283,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "delivery_sink".to_string(),
@@ -574,6 +580,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer_a".to_string(),
                 node_type: "fixed_producer".to_string(),
@@ -581,6 +588,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer_b".to_string(),
                 node_type: "fixed_producer_b".to_string(),
@@ -588,6 +596,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "dut".to_string(),
                 node_type: "two_input_dut".to_string(),
@@ -604,6 +613,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "delivery_sink".to_string(),

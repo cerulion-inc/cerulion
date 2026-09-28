@@ -17,8 +17,9 @@
 //! can never reap that node again, on this run or any future one. The node
 //! directory is then permanent, which is what
 //! `cerulion_cli/tests/trace_inspect_and_clean_cli_test.rs::
-//! clean_happy_path_reports_nothing_to_clean` asserts against when it requires
-//! a second `clean` to converge.
+//! clean_sweeps_its_own_registry_and_leaves_another_root_untouched` asserts
+//! against when it requires a second `clean` over the node it just swept to
+//! find nothing.
 //!
 //! # Shape
 //!

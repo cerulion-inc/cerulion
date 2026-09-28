@@ -4765,53 +4765,23 @@ fn build_inbound_view<T: ShmMessage, R>(
     f: impl FnOnce(InputView<'_, T>) -> R,
 ) -> TransportResult<R> {
     let raw = sample.payload();
-    if raw.len() < WireHeader::SIZE {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "undersized message: {} bytes, need at least {}",
-                raw.len(),
-                WireHeader::SIZE,
-            ),
-        });
-    }
-    let header = WireHeader::read_from_buf(raw).ok_or_else(|| TransportError::Deserialization {
-        topic: topic.to_string(),
-        reason: "failed to parse WireHeader from received message".to_string(),
-    })?;
-    if header.schema_hash != T::SCHEMA_HASH {
-        return Err(TransportError::SchemaMismatch {
-            topic: topic.to_string(),
-            expected_hash: T::SCHEMA_HASH,
-            actual_hash: header.schema_hash,
-        });
-    }
-    // Explicit lower-bound check (no silent
-    // `.max(WireHeader::SIZE)` coercion of a malformed sub-header size).
-    let total_size = header.total_size as usize;
-    if total_size < WireHeader::SIZE || total_size > raw.len() {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "wire header total_size {} out of bounds (frame {} bytes, header {} bytes)",
-                total_size,
-                raw.len(),
-                WireHeader::SIZE,
-            ),
-        });
-    }
+    // THE shared frame checks, so this path and the scheduler-bounded one in
+    // `super::bounded_view` refuse the same frames for the same reasons. Four
+    // bounds checks in two places is how one of them ends up accepting a frame
+    // the other rejects.
+    let (_header, payload) = super::input_view::validate_wire_frame::<T>(topic, raw)?;
     let payload_ptr = raw.as_ptr();
-    let payload_len = total_size - WireHeader::SIZE;
+    let payload_len = payload.len();
     // SAFETY: `raw` is a valid slice into the iceoryx2 SHM region owned by
     // `sample`, which is BORROWED — it is owned by the CALLER and guaranteed
     // to outlive this view (the caller holds it for `f`'s entire scope). We
     // build SampleHandle::InboundRef from the same `&sample` immediately
     // below, so the reader's borrow and the handle both point at the same
     // SHM slot and stay alive and aliasing-free for `f`'s entire scope. The
-    // bound check above keeps `payload_ptr.add(WireHeader::SIZE)` +
-    // `payload_len` within the original `raw` slice.
+    // range the shared checks returned keeps `payload_ptr.add(payload.start)`
+    // + `payload_len` within the original `raw` slice.
     let payload_slice: &[u8] =
-        unsafe { std::slice::from_raw_parts(payload_ptr.add(WireHeader::SIZE), payload_len) };
+        unsafe { std::slice::from_raw_parts(payload_ptr.add(payload.start), payload_len) };
     let reader = T::build_reader(payload_slice);
     let handle = SampleHandle::InboundRef { sample };
     let view = InputView::new(handle, reader);

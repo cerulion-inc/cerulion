@@ -3203,6 +3203,7 @@ mod block_colocation_tests {
 
     fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
         NodeDef {
+            fuse: None,
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),

@@ -28,6 +28,7 @@
 //! `{prefix}/{node}/{output}` body has 248 usable characters.
 
 pub mod adaptive_sizer;
+pub mod bounded_view;
 pub mod bridge;
 pub mod cerulion_q;
 pub mod dead_node_sweep;

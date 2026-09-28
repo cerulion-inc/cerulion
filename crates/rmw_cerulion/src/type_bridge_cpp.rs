@@ -43,8 +43,8 @@ use cerulion_core::wire::WireHeader;
 use crate::ffi;
 use crate::ffi::introspection_cpp::{
     assign_u8_vector, cppstring_bytes, debug_assert_vector_u8_layout, is_unbounded_u8_vector,
-    rmw_cerulion_cppstring_assign, vector_triplet_layout_verified, CppMessageMember,
-    CppMessageMembers, VecTriplet,
+    member_assign, member_fetch, rmw_cerulion_cppstring_assign, vector_triplet_layout_verified,
+    CppMessageMember, CppMessageMembers, VecTriplet,
 };
 use crate::type_bridge::{
     add_var_size, adopted_offset, align_up, check_out_cap, check_seq_bound, cursor_align_var,
@@ -54,6 +54,53 @@ use crate::type_bridge::{
     ForgeOutcome, ForgePlacement, FrameCursor, NestedLayouts, SealItem, SealRefusal, SealScratch,
     WindowExtent, BORROW_TAIL_ALIGN, MAX_FRAME_BYTES,
 };
+
+/// Why a `bool` sequence is unreachable when its member carries no `fetch`
+/// accessor: before Humble the C++ typesupport generator emits no `fetch`
+/// or `assign` function for `std::vector<bool>` and leaves its `get` and
+/// `get_const` null, so no element of it can be read or written. One
+/// literal, rendered by [`bool_seq_no_fetch_detail`] where the member can
+/// be named and by [`BOOL_SEQ_NO_FETCH_NESTED`] where it cannot.
+macro_rules! bool_seq_no_fetch_reason {
+    () => {
+        "this build's C++ typesupport has no fetch accessor for \
+         std::vector<bool>: its generator emits no fetch or assign function \
+         and leaves get and get_const null, so no element is reachable"
+    };
+}
+
+/// [`bool_seq_no_fetch_reason`] for a member inside a NESTED message,
+/// whose encode path carries a `&'static str` and so cannot format the
+/// member's name; the enclosing message is named by the `Encode` error the
+/// top-level caller wraps this in.
+pub(crate) const BOOL_SEQ_NO_FETCH_NESTED: &str = concat!(
+    "a bool sequence in a nested message cannot be encoded: ",
+    bool_seq_no_fetch_reason!()
+);
+
+/// The TAKE side's twin of [`bool_seq_no_fetch_detail`]: the same member,
+/// the same reason, the `assign` accessor instead of `fetch`. Reached
+/// BEFORE any write, so the caller's message is untouched.
+pub(crate) fn bool_seq_no_assign_detail(member: &str) -> String {
+    format!(
+        "bool sequence member '{member}' cannot be decoded: {}",
+        bool_seq_no_fetch_reason!()
+    )
+}
+
+/// [`bool_seq_no_fetch_reason`] naming the member the reader must go and
+/// look at. The enclosing message is the `Encode` error's own `message`
+/// field, so the two together locate the field exactly.
+///
+/// # Safety
+/// `member.name_` must be the member's own NUL-terminated name.
+pub(crate) unsafe fn bool_seq_no_fetch_detail(member: &CppMessageMember) -> String {
+    let field = ffi::cstr(member.name_).unwrap_or("<field>");
+    format!(
+        "bool sequence member '{field}' cannot be encoded: {}",
+        bool_seq_no_fetch_reason!()
+    )
+}
 
 /// One flatten/unflatten operation for a top-level C++ field.
 #[derive(Debug)]
@@ -112,6 +159,16 @@ pub struct CppBridgedMessage {
     /// Forgeable-sequence count — see the C twin's
     /// `forge_count` and [`Self::can_loan_take`].
     forge_count: usize,
+    /// The FIRST `bool[]` member this build cannot write, as
+    /// `(var_idx, member name)`, or `None` when every one of them has its
+    /// `assign` accessor. A property of the TYPE, decided once here rather
+    /// than per frame: before Humble the C++ typesupport generator emits no
+    /// `assign` for `std::vector<bool>`, so every frame carrying such a
+    /// member is undeliverable and the take refuses it BEFORE writing
+    /// anything. Reported through the decode latch with
+    /// [`bool_seq_no_assign_detail`], never as a generic malformed-entry
+    /// warning blaming the wire.
+    unwritable_bool_seq: Option<(usize, String)>,
 }
 
 // SAFETY: `members` points at rosidl's static typesupport data
@@ -281,6 +338,24 @@ impl CppBridgedMessage {
             }
         }
 
+        // The one type-level decode blocker (see the field's doc): a
+        // `bool[]` member whose `assign` accessor this build's C++
+        // `MessageMember` does not carry.
+        let unwritable_bool_seq = ops.iter().find_map(|op| match op {
+            CppFieldOp::PrimSeq {
+                var_idx,
+                is_bool: true,
+                member_index,
+                ..
+            } if member_assign(&member_slice[*member_index]).is_none() => Some((
+                *var_idx,
+                ffi::cstr(member_slice[*member_index].name_)
+                    .unwrap_or("<field>")
+                    .to_string(),
+            )),
+            _ => None,
+        });
+
         Ok(Self {
             qualified_name: root_qualified,
             layout,
@@ -291,6 +366,7 @@ impl CppBridgedMessage {
             nested_layouts,
             loan_pad_ranges,
             forge_count,
+            unwritable_bool_seq,
         })
     }
 
@@ -660,6 +736,15 @@ impl CppBridgedMessage {
         }
     }
 
+    /// The first `bool[]` member this build cannot write, if any; see the
+    /// field of the same name. Both take paths consult it BEFORE any write
+    /// and refuse the frame with the member named.
+    pub fn unwritable_bool_seq(&self) -> Option<(usize, &str)> {
+        self.unwritable_bool_seq
+            .as_ref()
+            .map(|(idx, name)| (*idx, name.as_str()))
+    }
+
     /// Can this frame's VARIABLE entries be resolved at
     /// all, WITHOUT writing anything?
     ///
@@ -1015,9 +1100,8 @@ impl CppBridgedMessage {
                         // vector<bool>: bit-packed, fetch element-wise —
                         // straight into the cursor's zeroed span (no
                         // intermediate buffer).
-                        let fetch = member.fetch_function.ok_or_else(|| {
-                            self.encode_err("bool sequence missing fetch_function")
-                        })?;
+                        let fetch = member_fetch(member)
+                            .ok_or_else(|| self.encode_err(&bool_seq_no_fetch_detail(member)))?;
                         let offset =
                             cursor_align_var(&mut cur, 1).map_err(|d| self.encode_err(d))?;
                         cursor_write_var_entry(&mut cur, table_base, *var_idx, offset, count)
@@ -1025,7 +1109,15 @@ impl CppBridgedMessage {
                         let dst = cur.append_zeroed(count).map_err(|d| self.encode_err(d))?;
                         for (i, b) in dst.iter_mut().enumerate() {
                             let mut v: bool = false;
-                            fetch(field, i, &mut v as *mut bool as *mut c_void);
+                            if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                                fetch,
+                                field,
+                                i,
+                                &mut v as *mut bool as *mut c_void,
+                            ) != 0
+                            {
+                                return Err(self.encode_err("sequence accessor threw"));
+                            }
                             *b = v as u8;
                         }
                     } else if count == 0 {
@@ -1038,7 +1130,20 @@ impl CppBridgedMessage {
                         let get = member.get_const_function.ok_or_else(|| {
                             self.encode_err("sequence missing get_const_function")
                         })?;
-                        let base = get(field, 0) as *const u8;
+                        // Through the noexcept wrapper: a rosidl Buffer on a
+                        // non-CPU backend THROWS from this accessor, and a
+                        // throw across the accessor pointer would be a
+                        // foreign unwind; a nonzero status refuses the frame.
+                        let mut elem: *const c_void = std::ptr::null();
+                        if ffi::introspection_cpp::rmw_cerulion_member_get_const(
+                            get, field, 0, &mut elem,
+                        ) != 0
+                        {
+                            return Err(self.encode_err(
+                                "sequence accessor threw (a rosidl Buffer on a non-CPU backend)",
+                            ));
+                        }
+                        let base = elem as *const u8;
                         if base.is_null() {
                             return Err(self.encode_err("sequence element pointer is null"));
                         }
@@ -1626,8 +1731,17 @@ fn cpp_op_var_idx(op: &CppFieldOp) -> usize {
 /// plus the C++-only precondition: the process's `std::vector` really is
 /// the three-pointer triplet ([`vector_triplet_layout_verified`]). A
 /// BOUNDED sequence is additionally a different C++ type here (rosidl's
-/// `BoundedVector`), which is reason enough on its own.
+/// `BoundedVector`), which is reason enough on its own; and on Lyrical and
+/// Rolling a `rosidl::Buffer` member is refused first (no triplet exists).
 fn is_forgeable_sequence_cpp(member: &CppMessageMember, triplet_layout_ok: bool) -> bool {
+    // Lyrical and Rolling: a `rosidl::Buffer` member (`is_rosidl_buffer_`)
+    // carries no in-struct triplet at all (its storage sits in a
+    // heap-allocated impl behind a pointer), so there is nothing to aim: a
+    // forge would overwrite the two pointers and 8 bytes past the object.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    if member.is_rosidl_buffer_ {
+        return false;
+    }
     triplet_layout_ok
         && member.is_array_
         && member.array_size_ == 0
@@ -1701,25 +1815,41 @@ unsafe fn write_prim_seq_cpp(
         let Some(resize) = member.resize_function else {
             return false;
         };
-        resize(field, count);
+        // Through the noexcept wrapper (see the encode twin): a throwing
+        // accessor is a refused frame, never a foreign unwind.
+        if ffi::introspection_cpp::rmw_cerulion_member_resize(resize, field, count) != 0 {
+            return false;
+        }
     }
     if count == 0 {
         return true;
     }
     if is_bool {
-        let Some(assign) = member.assign_function else {
+        let Some(assign) = member_assign(member) else {
             return false;
         };
         for (i, &b) in bytes.iter().enumerate() {
             let v: bool = b != 0;
-            assign(field, i, &v as *const bool as *const c_void);
+            if ffi::introspection_cpp::rmw_cerulion_member_assign(
+                assign,
+                field,
+                i,
+                &v as *const bool as *const c_void,
+            ) != 0
+            {
+                return false;
+            }
         }
         true
     } else {
         let Some(get) = member.get_function else {
             return false;
         };
-        let base = get(field, 0) as *mut u8;
+        let mut elem: *mut c_void = std::ptr::null_mut();
+        if ffi::introspection_cpp::rmw_cerulion_member_get(get, field, 0, &mut elem) != 0 {
+            return false;
+        }
+        let base = elem as *mut u8;
         if base.is_null() {
             return false;
         }
@@ -1790,7 +1920,13 @@ unsafe fn element_ptr(
     let get = member
         .get_const_function
         .ok_or("sequence missing get_const_function")?;
-    let p = get(field, i);
+    // Every introspection accessor is called through its noexcept catcher:
+    // a throwing accessor (a rosidl Buffer on a non-CPU backend) is a
+    // refused frame, never a foreign unwind.
+    let mut p: *const c_void = std::ptr::null();
+    if ffi::introspection_cpp::rmw_cerulion_member_get_const(get, field, i, &mut p) != 0 {
+        return Err("sequence accessor threw (a rosidl Buffer on a non-CPU backend)");
+    }
     if p.is_null() {
         return Err("sequence element pointer is null");
     }
@@ -1803,7 +1939,10 @@ unsafe fn element_ptr_mut(
     i: usize,
 ) -> Option<*mut c_void> {
     let get = member.get_function?;
-    let p = get(field, i);
+    let mut p: *mut c_void = std::ptr::null_mut();
+    if ffi::introspection_cpp::rmw_cerulion_member_get(get, field, i, &mut p) != 0 {
+        return None;
+    }
     if p.is_null() {
         None
     } else {
@@ -1893,11 +2032,19 @@ unsafe fn encode_message_payload_cpp(
             let elem = primitive_size(member.type_id_);
             check_seq_bound(count, elem)?;
             if member.type_id_ == ros_type::BOOLEAN {
-                let fetch = member.fetch_function.ok_or("bool seq missing fetch")?;
+                let fetch = member_fetch(member).ok_or(BOOL_SEQ_NO_FETCH_NESTED)?;
                 buf.resize(count, 0);
                 for (i, b) in buf.iter_mut().enumerate() {
                     let mut v: bool = false;
-                    fetch(field_ptr, i, &mut v as *mut bool as *mut c_void);
+                    if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                        fetch,
+                        field_ptr,
+                        i,
+                        &mut v as *mut bool as *mut c_void,
+                    ) != 0
+                    {
+                        return Err("sequence accessor threw");
+                    }
                     *b = v as u8;
                 }
             } else if count > 0 {
@@ -2043,7 +2190,9 @@ unsafe fn prepare_seq_cpp(member: &CppMessageMember, field: *mut c_void, count: 
     let Some(resize) = member.resize_function else {
         return false;
     };
-    resize(field, count);
+    if ffi::introspection_cpp::rmw_cerulion_member_resize(resize, field, count) != 0 {
+        return false;
+    }
     true
 }
 
@@ -2231,10 +2380,8 @@ impl CppBridgedMessage {
                         // Bit-packed: fetch into the reused owned arena (the
                         // same element walk the flatten path runs). Never
                         // forgeable, never adopted.
-                        let fetch = member.fetch_function.ok_or_else(|| {
-                            SealRefusal::Encode(
-                                self.encode_err("bool sequence missing fetch_function"),
-                            )
+                        let fetch = member_fetch(member).ok_or_else(|| {
+                            SealRefusal::Encode(self.encode_err(&bool_seq_no_fetch_detail(member)))
                         })?;
                         if count == 0 {
                             // `vector<bool>` is never forgeable.
@@ -2244,7 +2391,17 @@ impl CppBridgedMessage {
                             owned.resize(start + count, 0);
                             for (i, b) in owned[start..].iter_mut().enumerate() {
                                 let mut v: bool = false;
-                                fetch(field, i, &mut v as *mut bool as *mut c_void);
+                                if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                                    fetch,
+                                    field,
+                                    i,
+                                    &mut v as *mut bool as *mut c_void,
+                                ) != 0
+                                {
+                                    return Err(SealRefusal::Encode(
+                                        self.encode_err("sequence accessor threw"),
+                                    ));
+                                }
                                 *b = v as u8;
                             }
                             items.push(SealItem::CopyOwned {
@@ -2446,6 +2603,47 @@ impl CppBridgedMessage {
 
 #[cfg(test)]
 mod cpp_package_tests {
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    fn u8_sequence_member(is_rosidl_buffer: bool) -> super::CppMessageMember {
+        super::CppMessageMember {
+            name_: c"data".as_ptr(),
+            type_id_: super::ros_type::UINT8,
+            string_upper_bound_: 0,
+            members_: std::ptr::null(),
+            is_key_: false,
+            is_array_: true,
+            array_size_: 0,
+            is_upper_bound_: false,
+            offset_: 0,
+            default_value_: std::ptr::null(),
+            size_function: None,
+            get_const_function: None,
+            get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
+            fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
+            assign_function: None,
+            resize_function: None,
+            is_rosidl_buffer_: is_rosidl_buffer,
+        }
+    }
+
+    /// Lyrical and Rolling: a `uint8[]` member flagged as a rosidl Buffer is
+    /// never forged and never handed to the `std::vector` shim, while the
+    /// same member without the flag (a real vector) is both. The flag is
+    /// the ONLY difference between the two fixtures.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    #[test]
+    fn a_rosidl_buffer_member_is_never_forged_nor_treated_as_a_u8_vector() {
+        use crate::ffi::introspection_cpp::is_unbounded_u8_vector;
+        let buffer = u8_sequence_member(true);
+        assert!(!super::is_forgeable_sequence_cpp(&buffer, true));
+        assert!(!is_unbounded_u8_vector(&buffer));
+        let vector = u8_sequence_member(false);
+        assert!(super::is_forgeable_sequence_cpp(&vector, true));
+        assert!(is_unbounded_u8_vector(&vector));
+    }
+
     use super::cpp_package;
 
     /// Both accepted namespace spellings normalize to ONE

@@ -27,8 +27,9 @@
 //!   (`fd_blocks == 0` while the functional round trip still works);
 //! * a wait with no entities spends its timeout (bounded sleep, no spin);
 //! * the PARK tier: on Linux a publish wakes a parked wait through the
-//!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; the fd block is
-//!   never entered while a bell is mapped), off Linux the doorbell is a
+//!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; a call's FIRST
+//!   block parks while a bell is mapped, and only `ThroughRung` keeps the
+//!   allowance for the rest of the call), off Linux the doorbell is a
 //!   compile-time stub and the same rounds pin the fd tier — and
 //!   `CERULION_MONITOR_WAIT=0` forces the fd tier EVERYWHERE, which is
 //!   why the fd-counter pins below run under it (they pin the SAME tier
@@ -241,6 +242,54 @@ unsafe fn wait_counters(ws: *mut ffi::rmw_wait_set_t) -> (u64, u64, u64) {
 unsafe fn blocks_entered(ws: *mut ffi::rmw_wait_set_t) -> u64 {
     let data = &*((*ws).data as *const WaitSetData);
     data.fd_blocks.load(Ordering::Relaxed) + data.park_blocks.load(Ordering::Relaxed)
+}
+
+/// The park-tier counter oracle after `calls` forced-park wait calls that
+/// each entered at least one block (`await_fresh_block` guarantees that).
+///
+/// The horizon a FORCED park (`CERULION_MONITOR_WAIT=1`) resolves to is a
+/// HAND restatement of the platform table, written from the horizon
+/// definitions rather than read back from the production resolver: aarch64
+/// Linux keeps its own `ThroughRung`, and every other Linux target takes
+/// the bounded one-rung hatch, `FirstRungOnce`.
+///
+/// What each horizon PROMISES, and therefore what may be asserted:
+///
+/// * `ThroughRung` keeps a call's park allowance for EVERY block, so an fd
+///   block there means the park tier disengaged: `fd_blocks == 0`.
+/// * `FirstRungOnce` SPENDS the allowance on the call's FIRST block BY
+///   DESIGN (`guard_wait::block_parks`, pinned by a hand oracle in the lib
+///   tests), so every LATER block of the same call takes the kernel fd
+///   block. A publish that commits after the one-rung park horizon expires
+///   therefore finishes its call on the fd tier, with the frame and the
+///   wake intact. `fd_blocks == 0` is not a promise on that horizon, and
+///   asserting it made this file fail on a slow container while every
+///   delivery assertion passed.
+///
+/// So the bound sits on the counter the design DOES constrain: a call's
+/// first block always parks when a bell is mapped, hence
+/// `park_blocks >= calls`. That is what fails if the park tier stops
+/// engaging (a bell that never maps, or an allowance that never arms),
+/// which is the regression `fd_blocks == 0` was reaching for. The callers
+/// assert `doorbell_topics()`, so an fd block can never be blamed on a
+/// missing bell either.
+unsafe fn assert_park_tier_engaged(ws: *mut ffi::rmw_wait_set_t, calls: u64) {
+    let data = &*((*ws).data as *const WaitSetData);
+    let park_blocks = data.park_blocks.load(Ordering::Relaxed);
+    let fd_blocks = data.fd_blocks.load(Ordering::Relaxed);
+    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        assert_eq!(
+            fd_blocks, 0,
+            "ThroughRung keeps the park allowance for every block of a call, so an \
+             fd block means the park tier disengaged"
+        );
+    }
+    assert!(
+        park_blocks >= calls,
+        "every one of the {calls} calls must park its FIRST block (a mapped bell \
+         arms the allowance, block_parks spends it there): park_blocks={park_blocks} \
+         fd_blocks={fd_blocks}"
+    );
 }
 
 /// Block until the waiter on `ws` has entered a FRESH kernel block —
@@ -1901,8 +1950,9 @@ fn an_empty_wait_never_spins_under_a_nonzero_budget() {
 /// DOORBELL — the SHM line the rmw publisher armed at create and rings on
 /// every send (`notify_sent_sample`). Default env
 /// (`CERULION_MONITOR_WAIT` unset = auto ON): on Linux the wait must map
-/// exactly the one subscription topic's bell, take the park tier for
-/// EVERY block (`fd_blocks == 0`), and score at least one doorbell wake
+/// exactly the one subscription topic's bell, park the FIRST block of every
+/// call (see `assert_park_tier_engaged` for why the bound sits on
+/// `park_blocks` and not on `fd_blocks`), and score at least one doorbell wake
 /// across the rounds; off Linux the doorbell is a compile-time stub, the
 /// park tier must never engage, and the SAME rounds must wake through the
 /// fd path instead — both halves asserted, so the test is meaningful on
@@ -1936,7 +1986,8 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
         assert!(!publisher.is_null());
         let ws = rmw_create_wait_set(context, 8);
 
-        for round in 0..10u32 {
+        const ROUNDS: u32 = 10;
+        for round in 0..ROUNDS {
             let seen = blocks_entered(ws);
             let handle = wait_on_sub_in_thread((*subscription).data, ws, Duration::from_secs(5));
             // Publish INSIDE a fresh block (park or fd — whichever tier
@@ -1990,15 +2041,7 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
                 "the one subscription topic's doorbell page must be mapped \
                  (0 = the publisher never armed it, or the wait never refreshed)"
             );
-            assert!(
-                park_blocks >= 1,
-                "with a mapped bell every block must take the park tier"
-            );
-            assert_eq!(
-                data.fd_blocks.load(Ordering::Relaxed),
-                0,
-                "a parked wait set never falls back to the fd block"
-            );
+            assert_park_tier_engaged(ws, u64::from(ROUNDS));
             assert!(
                 park_wakes >= 1,
                 "across 10 parked-publish rounds at least one wake must ride \
@@ -2478,8 +2521,8 @@ fn a_second_queued_sample_is_ready_at_the_next_wait_without_a_wake() {
 /// therefore open the bell UNOWNED (created if absent, never unlinked).
 /// Pin: two publishers on one topic, destroy the FIRST, then a NEW
 /// subscription + wait set, publishes from the survivor: under the forced
-/// park (Linux) every wake rides the doorbell and the fd block is never
-/// entered; off Linux the same rounds wake through the fd. Mutant:
+/// park (Linux) the wakes ride the doorbell and every call still parks its
+/// first block; off Linux the same rounds wake through the fd. Mutant:
 /// restore the owned open ⇒ the new wait set scores fd wakes only
 /// (Linux-only kill — the park is stubbed off Linux). Residual, stated in
 /// the source: one page per topic can outlive every publisher on the machine
@@ -2514,7 +2557,8 @@ fn two_publishers_one_topic_the_survivor_still_rings_a_new_wait_set() {
         let ws = rmw_create_wait_set(context, 8);
         let data = &*((*ws).data as *const WaitSetData);
 
-        for round in 0..6u32 {
+        const ROUNDS: u32 = 6;
+        for round in 0..ROUNDS {
             let seen = blocks_entered(ws);
             let handle = wait_on_sub_in_thread((*subscription).data, ws, Duration::from_secs(5));
             await_fresh_block(ws, seen);
@@ -2563,12 +2607,7 @@ fn two_publishers_one_topic_the_survivor_still_rings_a_new_wait_set() {
         );
         if cfg!(target_os = "linux") {
             assert_eq!(data.doorbell_topics(), 1);
-            assert!(data.park_blocks.load(Ordering::Relaxed) >= 1);
-            assert_eq!(
-                data.fd_blocks.load(Ordering::Relaxed),
-                0,
-                "a parked wait set never falls back to the fd block"
-            );
+            assert_park_tier_engaged(ws, u64::from(ROUNDS));
             assert!(
                 park_wakes >= 1,
                 "the survivor's rings must reach a wait set created AFTER the first \
@@ -2581,6 +2620,111 @@ fn two_publishers_one_topic_the_survivor_still_rings_a_new_wait_set() {
 
         assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
         assert_eq!(rmw_destroy_publisher(node, second), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// The bell page is the CONSUMER's to create: `refresh_park_bells` opens
+/// each topic's doorbell with `open_unowned`, which `O_CREAT`s, so a topic
+/// with no producer at all is mapped on the wait set's FIRST call and never
+/// enters the `missing` retry list. That is what rules a missing bell out as
+/// the cause of an fd block: the park allowance is armed from call one, and
+/// every later fd block in a call is the horizon spending it
+/// (`guard_wait::block_parks`), not a bell that has not appeared yet.
+///
+/// Deterministic by construction: no publisher is ever created, no second
+/// thread runs, and nothing sleeps. One bounded `rmw_wait` on this thread
+/// times out, and the counters are read after it returns.
+#[test]
+#[serial]
+fn a_topic_with_no_publisher_still_maps_its_bell_on_the_first_wait() {
+    let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
+    let _park = EnvVarGuard::set("CERULION_MONITOR_WAIT", "1");
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("WevN{suffix}"));
+        let (context, node, _opts) = setup_node(&format!("wev_n_{suffix}"));
+        let topic = CString::new(format!("/rmw_wev/n/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        // NO publisher on this topic, ever: nothing has armed the page.
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!subscription.is_null());
+        let ws = rmw_create_wait_set(context, 8);
+        let data = &*((*ws).data as *const WaitSetData);
+        assert_eq!(
+            data.doorbell_topics(),
+            0,
+            "a fresh wait set has mapped nothing before its first call"
+        );
+
+        let mut sub_ptrs = [(*subscription).data];
+        let mut subs = ffi::rmw_subscriptions_t {
+            subscriber_count: 1,
+            subscribers: sub_ptrs.as_mut_ptr(),
+        };
+        let timeout = ffi::rmw_time_t {
+            sec: 0,
+            nsec: 20_000_000,
+        };
+        let ret = rmw_wait(
+            &mut subs,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            ws,
+            &timeout,
+        );
+        eprintln!(
+            "no-publisher wait: doorbell_topics={} park_blocks={} fd_blocks={}",
+            data.doorbell_topics(),
+            data.park_blocks.load(Ordering::Relaxed),
+            data.fd_blocks.load(Ordering::Relaxed),
+        );
+        // The absence (rule 5): no producer means nothing can become ready,
+        // so the call must time out with the entry neutralized, and a take
+        // must find nothing.
+        assert_eq!(ret, ffi::RMW_RET_TIMEOUT, "no producer, nothing to wake on");
+        assert!(
+            sub_ptrs[0].is_null(),
+            "a timed-out wait neutralizes the not-ready subscription entry"
+        );
+        let mut out = CPoint::default();
+        let mut taken = true;
+        assert_eq!(
+            rmw_take(
+                subscription,
+                &mut out as *mut _ as *mut c_void,
+                &mut taken,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
+        );
+        assert!(!taken, "no publisher can have delivered anything");
+
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                data.doorbell_topics(),
+                1,
+                "the consumer's open_unowned O_CREATs the page, so one topic with \
+                 no producer is still MAPPED after the first call (0 = the open \
+                 failed and the topic went into the retry list, which is the \
+                 ordering an fd block would otherwise be blamed on)"
+            );
+            // The allowance was armed from this very first call, so the park
+            // tier ran before anything could have created the page for us.
+            assert_park_tier_engaged(ws, 1);
+        } else {
+            assert_eq!(
+                data.doorbell_topics(),
+                0,
+                "off Linux the doorbell is a compile-time stub"
+            );
+        }
+
+        assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }

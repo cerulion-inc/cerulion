@@ -4835,6 +4835,39 @@ impl GraphRuntime {
         // to the earlier path (incl. the algebraic-cycle diagnostic,
         // which now lives in `resolve_levels`).
         let levels = super::topology::resolve_levels(&config, &topology, &trigger_edges)?;
+
+        // CHAIN FUSION, resolved once and logged once. The decision combines
+        // the `CERULION_FUSE_CHAINS` seam with the per-node `fuse: false`
+        // opt-out; the census beside it says which edges the graph's
+        // declarations would allow and, for every other consumer edge, the
+        // reason it keeps the queued path.
+        //
+        // NOTHING BELOW READS EITHER. The pair is logged and dropped, so this
+        // build is byte-identical to one made before either existed. It is
+        // resolved HERE, beside the other build-time seams, because a decision
+        // read twice in one build could disagree with itself and a fusion set
+        // that varied within a build would make a replay a different program.
+        //
+        // The census is judged against the graph's DECLARED colocation, the
+        // same shape `cerulion graph levels` reports and every run records, so
+        // one graph reads the same way from all three.
+        {
+            let decision = super::chain::resolve_fusion(&config);
+            let colocation = if config.has_process_groups() {
+                super::chain::Colocation::ProcessGroups(&config.process_groups)
+            } else {
+                super::chain::Colocation::SingleProcess
+            };
+            let census = super::chain::census_chains(
+                &config,
+                &entry_infos,
+                &topology,
+                &trigger_edges,
+                &levels,
+                colocation,
+            );
+            super::chain::log_fusion_decision(&decision, &census);
+        }
         // Take ownership of the full `Levels` struct for the
         // drain-between-levels executor in `step`. Wrap in an `Arc` so `step`
         // pays only an atomic refcount bump per tick (zero per-tick alloc —
@@ -17272,6 +17305,7 @@ mod tests {
             nodes: nodes
                 .into_iter()
                 .map(|(id, inputs)| NodeDef {
+                    fuse: None,
                     ros2: None,
                     id: id.to_string(),
                     node_type: "t".to_string(),
@@ -17543,6 +17577,7 @@ mod tests {
             topic: None,
         };
         let node = |inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
+            fuse: None,
             ros2: None,
             id: "me".to_string(),
             node_type: "me".to_string(),
@@ -17909,6 +17944,7 @@ mod tests {
     /// topics match and the infinite-loop backstop fires.
     fn self_loop_node_def() -> crate::graph::config::NodeDef {
         crate::graph::config::NodeDef {
+            fuse: None,
             ros2: None,
             id: "looper".to_string(),
             node_type: "looper".to_string(),
@@ -17965,6 +18001,7 @@ mod tests {
     #[test]
     fn resolve_macro_data_trigger_input_non_self_source_returns_ok() {
         let node_def = crate::graph::config::NodeDef {
+            fuse: None,
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),
@@ -17985,6 +18022,7 @@ mod tests {
     #[test]
     fn resolve_macro_data_trigger_input_missing_input_errors() {
         let node_def = crate::graph::config::NodeDef {
+            fuse: None,
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),

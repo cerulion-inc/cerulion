@@ -53,7 +53,7 @@
 4 crates/cerulion_cli_engine/src/device_binding.rs
 6 crates/cerulion_cli_engine/src/discovery_ladder.rs
 18 crates/cerulion_cli_engine/src/flashback_cmd.rs
-431 crates/cerulion_cli_engine/src/graph_cmd.rs
+428 crates/cerulion_cli_engine/src/graph_cmd.rs
 1 crates/cerulion_cli_engine/src/hostname_peers.rs
 7 crates/cerulion_cli_engine/src/ipc_cleanup.rs
 4 crates/cerulion_cli_engine/src/local_harvest.rs
@@ -66,7 +66,7 @@
 6 crates/cerulion_cli_engine/src/pair_cmd.rs
 38 crates/cerulion_cli_engine/src/partition_emit.rs
 1 crates/cerulion_cli_engine/src/peer_cache.rs
-40 crates/cerulion_cli_engine/src/replay_cmd.rs
+39 crates/cerulion_cli_engine/src/replay_cmd.rs
 187 crates/cerulion_cli_engine/src/replay_engine.rs
 8 crates/cerulion_cli_engine/src/replay_field_registry.rs
 7 crates/cerulion_cli_engine/src/replay_inject.rs
@@ -255,7 +255,7 @@
 28 crates/rmw_cerulion/src/api/pubsub.rs
 8 crates/rmw_cerulion/src/borrow_degrade_latch.rs
 13 crates/rmw_cerulion/src/decode_failure_latch.rs
-9 crates/rmw_cerulion/src/era.rs
+5 crates/rmw_cerulion/src/era.rs
 4 crates/rmw_cerulion/src/era_check.rs
 11 crates/rmw_cerulion/src/ffi/era_pins.rs
 1 crates/rmw_cerulion/src/ffi/introspection_cpp.rs

@@ -133,7 +133,7 @@ fn the_reclamation_stands_down_when_dead_nodes_are_still_registered() {
     // satisfied by that variant too, so it is pinned as a whole expression.
     let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        normalized.contains("let reclaim = !report_only && converged;"),
+        normalized.contains("let reclaim = mode.removes() && converged;"),
         "`cerulion clean` must reclaim only when the operator asked AND the sweep left no \
          dead nodes registered — an `||` would reclaim on a wedged desk; body was:\n{body}"
     );
@@ -205,7 +205,7 @@ fn the_diagnostic_reclaims_only_when_the_operator_did_not_ask_for_a_report() {
     // would delete on the one run whose whole point was not to.
     let src = code_only(&read_main());
     let body = fn_body(&src, "report_shm_state_population");
-    let (report_arm, reclaim_arm) = if_else_arms(&body, "report_only");
+    let (reclaim_arm, report_arm) = if_else_arms(&body, "mode.removes()");
 
     assert!(
         report_arm.contains("ScanMode::ReportOnly") && !report_arm.contains("ScanMode::Reclaim"),
@@ -258,15 +258,21 @@ fn the_walk_reads_the_code_it_claims_to_read() {
 //
 // Behavioural where it can be: `render_refused_nodes` is PURE, so the whole
 // listing is pinned against hand-written line vectors with no dead node in
-// the global iceoryx2 namespace. A subprocess test in
-// `tests/trace_inspect_and_clean_cli_test.rs` could only exercise this arm by
-// PLANTING a dead node in the shared `iox2_` namespace, which is exactly the
-// contamination that file's convergence test detects — so the CLI file is
-// deliberately untouched and the wiring is pinned by the source walk below.
+// the global iceoryx2 namespace. The subprocess arms in
+// `tests/trace_inspect_and_clean_cli_test.rs` plant their dead nodes under a
+// PRIVATE registry root rather than the shared `iox2_` namespace, and they
+// pin the converged shape (one node swept, nothing refused); minting a
+// REFUSED node needs the leaked-loan shape, which
+// `cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs` owns, so the
+// listing's own wiring is pinned by the source walk below.
 // ---------------------------------------------------------------------------
 
-use cerulion_cli_engine::ipc_cleanup::{classify_cleanup_failures, FailedNodeCleanup};
+use cerulion_cli_engine::ipc_cleanup::{
+    classify_cleanup_failures, sweep_one_node, DeadNodeIdentity, FailedNodeCleanup,
+    NodeSweepOutcome, SurveyedNode, SweepMode,
+};
 use cerulion_core::iceoryx_logger::CapturedLog;
+use iceoryx2::node::NodeCleanupFailure;
 use iceoryx2::prelude::LogLevel;
 
 /// The node token exactly as iceoryx2 0.9.1 renders it — kept verbatim so a
@@ -342,7 +348,7 @@ fn absences_are_stated_never_fabricated() {
 
 #[test]
 fn the_listing_is_capped_and_says_how_many_it_folded() {
-    let cap = super::REFUSED_NODES_SHOWN;
+    let cap = super::NODES_SHOWN;
     let node = |i: usize| {
         format!("UniqueNodeId(UniqueSystemId {{ value: {i}, pid: 1, creation_time: 0 }})")
     };
@@ -383,7 +389,7 @@ fn the_listing_is_capped_and_says_how_many_it_folded() {
 #[test]
 fn the_cap_is_ten_nodes() {
     // The item's contract, pinned so a drift is a deliberate change.
-    assert_eq!(super::REFUSED_NODES_SHOWN, 10);
+    assert_eq!(super::NODES_SHOWN, 10);
 }
 
 #[test]
@@ -508,8 +514,9 @@ fn each_renderer_is_handed_the_reports_own_field_never_an_empty_slice() {
     let sig = &src[sig_start..sig_start + src[sig_start..].find('{').expect("body")];
     let sig = sig.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        sig.contains("(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport)"),
-        "the reporter takes the sweep report as `report`; signature was:\n{sig}"
+        sig.contains("(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport, mode: SweepMode)"),
+        "the reporter takes the sweep report as `report` and the verb's mode; signature \
+         was:\n{sig}"
     );
 }
 
@@ -950,5 +957,354 @@ fn the_clean_verb_prints_the_registry_block_first_and_gates_convergence_on_it() 
     assert!(
         unscanned.contains("not evidence") && !unscanned.contains("No dead iceoryx2 nodes found"),
         "the unscanned arm must refuse the absence claim; arm was:\n{unscanned}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--report-only`: the whole report, and the proof nothing was removed.
+//
+// The listing renderer is PURE, so the whole would-remove report is pinned
+// against hand-written line vectors over a fixture-planted registry. The
+// "removed nothing" half is pinned at the SEAM the production sweep removes
+// through: `sweep_one_node` takes the removal as a parameter, so a counting
+// closure observes the same call the real path makes — no filesystem mock,
+// and no registry needed.
+// ---------------------------------------------------------------------------
+
+/// The registry directory a fixture report names back. A path, never a
+/// directory that exists: the renderer only prints it.
+const FIXTURE_NODE_DIR: &str = "/fixture/iox2-root/nodes";
+
+/// One planted dead node, named the two ways the walk names one: the entry
+/// name under the registry directory, and iceoryx2's `{:?}` token.
+fn planted(value: u128, pid: u32) -> DeadNodeIdentity {
+    DeadNodeIdentity {
+        name: value.to_string(),
+        token: format!(
+            "UniqueNodeId(UniqueSystemId {{ value: {value}, pid: {pid}, creation_time: Time {{ \
+             seconds: 7, nanoseconds: 0 }} }})"
+        ),
+    }
+}
+
+fn would_remove(dead: &[DeadNodeIdentity]) -> Vec<String> {
+    super::render_would_remove(dead, std::path::Path::new(FIXTURE_NODE_DIR))
+}
+
+#[test]
+fn the_report_only_listing_names_every_planted_node_and_claims_no_removal() {
+    let dead = [planted(1, 4242), planted(2, 4243)];
+    assert_eq!(
+        would_remove(&dead),
+        vec![
+            format!(
+                "Dead iceoryx2 node(s) `cerulion clean` would sweep: 2 under \
+                 {FIXTURE_NODE_DIR} (report only; none was removed)"
+            ),
+            "  node 1".to_string(),
+            "  node 2".to_string(),
+            super::REMOVAL_CAN_STILL_BE_REFUSED.to_string(),
+        ],
+        "the whole listing, line for line"
+    );
+    // The listing names what the sweep ATTEMPTS. A refusal is raised from
+    // inside the removal, so a report cannot know which of these come off,
+    // and the heading must not say "would remove" of the whole set.
+    assert!(
+        !would_remove(&dead)[0].contains("would remove"),
+        "the heading must not promise a removal: {:?}",
+        would_remove(&dead)[0]
+    );
+    assert!(
+        super::REMOVAL_CAN_STILL_BE_REFUSED.contains("not a promise each one comes off"),
+        "the caveat must say the sweep can still refuse: {}",
+        super::REMOVAL_CAN_STILL_BE_REFUSED
+    );
+    // No orphan port-tag section any more: iceoryx2 0.10 sweeps a dead port's
+    // tag with the rest of its stale resources, so the shape the reclaim healed
+    // cannot arise and the listing has nothing to say about it.
+    assert!(
+        !would_remove(&dead)
+            .iter()
+            .any(|line| line.contains("port tag")),
+        "the listing must not mention orphan port tags; the reclaim is gone: {:?}",
+        would_remove(&dead)
+    );
+    // And no line may claim a removal happened.
+    assert!(
+        !would_remove(&dead)
+            .iter()
+            .any(|line| line.contains("Cleaned") || line.contains("removed 1")),
+        "a report must never render a removal"
+    );
+}
+
+#[test]
+fn a_registry_with_no_dead_node_renders_no_would_remove_listing_at_all() {
+    // Not even the heading: `report_sweep` falls through to the
+    // "nothing to clean" summary, which is the line that arm already pins.
+    assert_eq!(would_remove(&[]), Vec::<String>::new());
+}
+
+#[test]
+fn the_would_remove_listing_folds_at_the_cap_and_at_the_cap_plus_one() {
+    // Both sides of the bound, with the fixtures COMPUTED from the constant.
+    let cap = super::NODES_SHOWN;
+    let plant =
+        |n: usize| -> Vec<DeadNodeIdentity> { (0..n).map(|i| planted(i as u128, 1)).collect() };
+
+    let at = would_remove(&plant(cap));
+    assert_eq!(
+        at.iter().filter(|l| l.starts_with("  node ")).count(),
+        cap,
+        "{at:?}"
+    );
+    assert!(
+        !at.iter().any(|l| l.contains("more")),
+        "at the cap there is no remainder to fold: {at:?}"
+    );
+
+    let over = would_remove(&plant(cap + 1));
+    assert_eq!(
+        over.iter().filter(|l| l.starts_with("  node ")).count(),
+        cap,
+        "{over:?}"
+    );
+    assert_eq!(
+        over[over.len() - 2],
+        "  … and 1 more",
+        "one past the cap folds exactly one, above the closing caveat: {over:?}"
+    );
+    assert!(
+        !over.iter().any(|l| **l == format!("  node {cap}")),
+        "a folded node must not leak past the cap: {over:?}"
+    );
+    // The heading counts what was FOUND, never what was listed.
+    assert!(
+        over[0].contains(&format!(": {} under ", cap + 1)),
+        "the heading counts every dead node, not the shown ones: {over:?}"
+    );
+}
+
+/// Drive [`sweep_one_node`] over a hand-built survey and report what the
+/// seam saw: the outcomes, how many times the removal was called, and every
+/// line the sweep traced.
+fn drive(
+    nodes: Vec<SurveyedNode<Result<(), NodeCleanupFailure>>>,
+    mode: SweepMode,
+) -> (Vec<NodeSweepOutcome>, usize, Vec<(LogLevel, String)>) {
+    let mut calls = 0usize;
+    let mut traced = Vec::new();
+    let outcomes = nodes
+        .into_iter()
+        .map(|node| {
+            sweep_one_node(
+                node,
+                mode,
+                |result: Result<(), NodeCleanupFailure>| {
+                    calls += 1;
+                    result
+                },
+                |level, message| traced.push((level, message)),
+            )
+        })
+        .collect();
+    (outcomes, calls, traced)
+}
+
+#[test]
+fn a_report_only_sweep_classifies_every_dead_node_and_never_calls_the_removal() {
+    let (a, b) = (planted(1, 4242), planted(2, 4243));
+    let survey = vec![
+        SurveyedNode::Dead {
+            identity: a.clone(),
+            view: Ok(()),
+        },
+        SurveyedNode::NotDead,
+        SurveyedNode::Dead {
+            identity: b.clone(),
+            view: Ok(()),
+        },
+    ];
+
+    let (outcomes, calls, traced) = drive(survey, SweepMode::ReportOnly);
+
+    assert_eq!(
+        outcomes,
+        vec![
+            NodeSweepOutcome::WouldRemove(a.clone()),
+            NodeSweepOutcome::NotDead,
+            NodeSweepOutcome::WouldRemove(b.clone()),
+        ],
+        "every dead node is classified, and no live one is"
+    );
+    assert_eq!(
+        calls, 0,
+        "a report must not call the removal, not once, for any node"
+    );
+    // Only the detection lines, transcribed from iceoryx2 0.9.1's own sweep
+    // loop (`node/mod.rs:1225`): a report emits no removal line, because
+    // there was no removal to report.
+    assert_eq!(
+        traced,
+        vec![
+            (LogLevel::Debug, format!("Dead node ({}) detected", a.token)),
+            (LogLevel::Debug, format!("Dead node ({}) detected", b.token)),
+        ]
+    );
+}
+
+#[test]
+fn a_removing_sweep_is_the_same_classification_followed_by_the_removal() {
+    // The other side of the ONE decision: the same survey, the same
+    // classification, and the removal called exactly once per dead node.
+    // Oracles for both trace lines transcribed from iceoryx2 0.9.1
+    // (`node/mod.rs:1227` and `:1231`).
+    let (a, b) = (planted(1, 4242), planted(2, 4243));
+    let survey = vec![
+        SurveyedNode::Dead {
+            identity: a.clone(),
+            view: Ok(()),
+        },
+        SurveyedNode::NotDead,
+        SurveyedNode::Dead {
+            identity: b.clone(),
+            view: Err(NodeCleanupFailure::InsufficientPermissions),
+        },
+    ];
+
+    let (outcomes, calls, traced) = drive(survey, SweepMode::Remove);
+
+    assert_eq!(
+        outcomes,
+        vec![
+            NodeSweepOutcome::Removed(a.clone()),
+            NodeSweepOutcome::NotDead,
+            NodeSweepOutcome::Refused {
+                identity: b.clone(),
+                failure: "InsufficientPermissions".to_string(),
+            },
+        ]
+    );
+    assert_eq!(calls, 2, "one call per DEAD node, and none for a live one");
+    assert_eq!(
+        traced,
+        vec![
+            (LogLevel::Debug, format!("Dead node ({}) detected", a.token)),
+            (
+                LogLevel::Trace,
+                format!("The dead node ({}) was successfully removed.", a.token)
+            ),
+            (LogLevel::Debug, format!("Dead node ({}) detected", b.token)),
+            (
+                LogLevel::Trace,
+                format!(
+                    "Unable to remove dead node {} (InsufficientPermissions).",
+                    b.token
+                )
+            ),
+        ],
+        "the refusal line is the marker `classify_cleanup_failures` parses"
+    );
+}
+
+#[test]
+fn the_clean_verb_renders_the_would_remove_listing_from_the_sweeps_own_field() {
+    // The inert-shipping guard for the report-only half: every arm above
+    // stays green with the renderer unwired, and a `render_would_remove(&[])`
+    // would keep the call in place and print nothing on exactly the run the
+    // flag was given for.
+    let src = code_only(&read_main());
+    let body = fn_body(&src, "report_sweep");
+    assert_eq!(
+        call_args(&body, "render_would_remove"),
+        "&report.dead_nodes, &cerulion_cli_engine::shm_state::iceoryx2_node_dir()",
+        "the listing must render the sweep's own dead-node set, under the registry the sweep \
+         read; body was:\n{body}"
+    );
+    // The fork sits AFTER the registry-wide block (a global failure is still
+    // read as global) and BEFORE the summary line, whose 0/0 counters would
+    // otherwise render a report as a converged sweep.
+    let registry = body
+        .find("render_registry_errors(")
+        .expect("the registry block must still be rendered");
+    let fork = body
+        .find("if mode.reports_only() && !report.dead_nodes.is_empty() {")
+        .expect("the report-only fork must guard the listing");
+    let summary = body
+        .find("Cleaned {} dead iceoryx2 node(s)")
+        .expect("the summary line must still exist");
+    assert!(
+        registry < fork && fork < summary,
+        "registry block, then the report-only fork, then the summary; body was:\n{body}"
+    );
+    // And the fork RETURNS: a report that fell through would print
+    // "No dead iceoryx2 nodes found — nothing to clean." under a listing of
+    // the nodes it had just named.
+    let block = block_after(&body, fork);
+    assert!(
+        block.contains("return;"),
+        "the report-only fork must return rather than fall through to the summary; block \
+         was:\n{block}"
+    );
+}
+
+#[test]
+fn the_verb_maps_the_flag_to_the_mode_in_both_directions() {
+    // The ONE mapping no arm in this repository can catch behaviourally in both
+    // directions, so it is pinned by VALUE here.
+    //
+    // An inverted `--report-only` is caught loudly: the report-only arm in
+    // `tests/trace_inspect_and_clean_cli_test.rs` would watch its planted node
+    // vanish and fail on the registry diff, which is exactly how the
+    // flag-read-after-the-sweep mutant dies. The OTHER direction is caught by
+    // NOTHING. A bare `cerulion clean` that silently became a report leaves no
+    // trace in this suite: no CLI arm may run the verb bare (its `/tmp`
+    // reclaim is machine wide), and the engine arms call
+    // `sweep_dead_nodes_with_config` directly, so the dispatch would be the
+    // only broken thing and every test would stay green while `cerulion clean`
+    // stopped cleaning.
+    let src = code_only(&read_main());
+    let at = src
+        .find("Commands::Clean { report_only } =>")
+        .expect("the clean verb must still be dispatched on its own flag");
+    assert_eq!(
+        call_args(&src[at..], "clean_iceoryx2_state"),
+        "if report_only { SweepMode::ReportOnly } else { SweepMode::Remove }",
+        "the flag maps to the mode in exactly this direction; a swap would make \
+         `--report-only` destructive or `clean` inert, and only the first of those \
+         is caught anywhere else; dispatch was:\n{}",
+        &src[at..at + 200.min(src.len() - at)]
+    );
+}
+
+#[test]
+fn the_verb_closes_a_report_only_run_by_saying_nothing_was_removed() {
+    // The flag's whole promise, stated once, after BOTH halves have
+    // reported — so it covers the `.shm_state` population too, which the
+    // dead-node listing says nothing about.
+    let src = code_only(&read_main());
+    let body = fn_body(&src, "clean_iceoryx2_state");
+    let diagnostic = body
+        .find("report_shm_state_population(")
+        .expect("the diagnostic must still be called");
+    let closing = body
+        .find("NOTHING_WAS_REMOVED")
+        .expect("a report-only run must close by saying nothing was removed");
+    assert!(
+        diagnostic < closing,
+        "the closing claim comes after both halves have reported; body was:\n{body}"
+    );
+    let guard = body
+        .find("if mode.reports_only() {")
+        .expect("the closing line is printed only under the flag");
+    assert!(
+        guard < closing,
+        "the closing line is guarded by the mode; body was:\n{body}"
+    );
+    assert!(
+        super::NOTHING_WAS_REMOVED.contains("nothing was removed"),
+        "the sentence must say it: {}",
+        super::NOTHING_WAS_REMOVED
     );
 }

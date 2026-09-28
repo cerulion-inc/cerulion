@@ -14,8 +14,9 @@ visualization daemon (`cerulion-vizd`), and the TF codec. Companion to
 
 All three are workspace members and deliberately NOT default-members: the rerun
 SDK tree enters a build only via `-p cerulion_viz` / `-p cerulion_vizd` /
-`--workspace`. CI's rerun-leanness job fails if a plain `cargo build` pulls
-rerun; keep new dependencies on the viz side of that line, and put tests that
+`--workspace`. `default_member_build_is_rerun_free` in
+`crates/cerulion_hygiene/tests/dependency_rules_test.rs` fails if a plain `cargo build`
+pulls rerun; keep new dependencies on the viz side of that line, and put tests that
 need the viz stack in `crates/cerulion_viz/lib/cerulion_viz/tests/`.
 
 ### The robot/desk boundary: visualization never runs on the robot
@@ -361,8 +362,8 @@ The job keeps its own cargo cache namespace: it builds under a different
 profile than the other jobs, and its rerun-linking test binaries stay out of
 the archive every other job pays to restore.
 
-The sibling rerun-leanness job enforces the build boundary from §1, with
-reverse-dependency probes that fail loudly if the probe itself goes stale.
+The dependency rules in `crates/cerulion_hygiene/tests/dependency_rules_test.rs` enforce
+the build boundary from §1, with controls that fail loudly if a rule stops probing.
 
 ### Assertion discipline (each rule bought by a real flake in these suites)
 

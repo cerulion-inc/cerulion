@@ -251,7 +251,9 @@ pub unsafe extern "C" fn rmw_take_request(
             *taken = true;
             let hdr = &mut *request_header;
             hdr.request_id.sequence_number = envelope.sequence;
-            hdr.request_id.writer_guid = envelope.client_guid;
+            // rmw_request_id_t.writer_guid is int8_t[16] before Iron and uint8_t[16]
+            // from Iron on; the element cast follows the bindings' type.
+            hdr.request_id.writer_guid = envelope.client_guid.map(|b| b as _);
             hdr.source_timestamp = 0;
             hdr.received_timestamp = match runtime::runtime() {
                 Ok(rt) => rt.transport.clock().now_ns() as i64,
@@ -278,8 +280,11 @@ pub unsafe extern "C" fn rmw_send_response(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*service).data as *const ServiceData);
+        // int8_t[16] before Iron, uint8_t[16] from Iron on (a no-op cast there).
+        #[allow(clippy::unnecessary_cast)]
+        let client_guid: [u8; 16] = (*request_header).writer_guid.map(|b| b as u8);
         let envelope = ServiceEnvelope {
-            client_guid: (*request_header).writer_guid,
+            client_guid,
             sequence: (*request_header).sequence_number,
         };
         // Flatten the response through the bridge into the service payload.
@@ -561,7 +566,7 @@ pub unsafe extern "C" fn rmw_take_response(
             *taken = true;
             let hdr = &mut *request_header;
             hdr.request_id.sequence_number = seq;
-            hdr.request_id.writer_guid = data.gid;
+            hdr.request_id.writer_guid = data.gid.map(|b| b as _);
             hdr.source_timestamp = 0;
             hdr.received_timestamp = match runtime::runtime() {
                 Ok(rt) => rt.transport.clock().now_ns() as i64,

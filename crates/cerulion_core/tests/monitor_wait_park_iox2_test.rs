@@ -190,6 +190,7 @@ fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn
         identity: "mwp_ticker".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -230,6 +231,7 @@ fn consumer_graph(
         identity: "mwp_consumer".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),
@@ -1612,6 +1614,7 @@ mod box_same_core {
             identity: "same_core_ponger_ctx".to_string(),
             prefix: "samecoreg".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "ponger".to_string(),
                 node_type: "same_core_ponger".to_string(),
