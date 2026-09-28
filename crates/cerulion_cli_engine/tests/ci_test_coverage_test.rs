@@ -3815,6 +3815,17 @@ fn the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blockin
 const SHARD_CHECK_STEP: &str = "Shard partition and selection check";
 const SHARD_CHECK_RUN: &str = "./tools/scripts/ci_test_shard.sh --check";
 
+/// Is this run script the shipped invocation, WHOLE?
+///
+/// Equality, never `contains`. `./tools/scripts/ci_test_shard.sh --check
+/// cerulion_core 2` and `./tools/scripts/ci_test_shard.sh --check || true` both
+/// carry the bare form as a prefix: the first proves a two-shard partition the
+/// workflow does not run, and the second reports success whatever the check
+/// says. The reader's own both-sides test compares for equality already.
+fn is_the_shard_check_run(script: &str) -> bool {
+    script.trim() == SHARD_CHECK_RUN
+}
+
 /// Does any step of this workflow run the shard check under its own name?
 fn shard_check_step_of(text: &str) -> Option<String> {
     for (_, block) in jobs_of(text) {
@@ -3854,10 +3865,11 @@ fn the_shard_check_runs_in_a_named_lint_step() {
             )
         });
     assert!(
-        script.contains(SHARD_CHECK_RUN),
+        is_the_shard_check_run(&script),
         "the `{SHARD_CHECK_STEP}` step does not run `{SHARD_CHECK_RUN}`; it runs \
-         `{}`. A bare `--check` is the shipped configuration, and an invocation \
-         with arguments proves a partition the workflow does not use.",
+         `{}`. A bare `--check` is the shipped configuration: an invocation with \
+         arguments proves a partition the workflow does not run, and a trailing \
+         `|| true` reports success whatever the check says.",
         script.trim()
     );
 }
@@ -3889,5 +3901,32 @@ fn a_renamed_or_rewritten_shard_check_step_is_not_found() {
             .expect("the step is named")
             .contains(SHARD_CHECK_RUN),
         "a step of the right name running something else does not satisfy the rule"
+    );
+    // THE SAME PREDICATE THE ARM ABOVE USES, on the two shapes its message
+    // names. Both carry the bare invocation as a prefix, so a `contains`
+    // reading accepts them: the first runs a two-shard partition the workflow
+    // does not run, and the second passes the step whatever the check reports.
+    for run in [
+        "./tools/scripts/ci_test_shard.sh --check cerulion_core 2",
+        "./tools/scripts/ci_test_shard.sh --check || true",
+    ] {
+        let script = shard_check_step_of(&job(SHARD_CHECK_STEP, run)).expect("the step is named");
+        assert!(
+            script.contains(SHARD_CHECK_RUN),
+            "`{run}` carries the bare invocation, so this row says something about \
+             the predicate and not about the reader; it read back `{}`",
+            script.trim()
+        );
+        assert!(
+            !is_the_shard_check_run(&script),
+            "`{run}` is not the shipped invocation, and the rule rejects it"
+        );
+    }
+    let bare = shard_check_step_of(&job(SHARD_CHECK_STEP, SHARD_CHECK_RUN))
+        .expect("the step is named");
+    assert!(
+        is_the_shard_check_run(&bare),
+        "the bare invocation IS the shipped one, so the rule is not satisfied by \
+         rejecting everything"
     );
 }
