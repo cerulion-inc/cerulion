@@ -84,7 +84,7 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
   id in the name (it goes in the PR body); gated by `tools/scripts/check_pr_title.sh`.
 - PR titles: `<type>(<scope>)!: <description>`. PRs are SQUASH-merged, so the title becomes
   the commit message. Commit bodies carry the WHY.
-- PR bodies (product voice, ~40 lines/450 words): a summary paragraph (bare or `## Summary`),
+- PR bodies (product voice, ~40 lines/450 words): a summary paragraph (or `## Summary`),
   `## What changed`, `## How to verify` (commands), a latency section when the landing rule requires it,
   `Closes #N` last on its own line (omit when no issue closes). No questions, process narrative,
   HTML, em or en dashes, internal ids, hostnames or paths. Diffs ~800 lines; breaking changes carry migration steps.
