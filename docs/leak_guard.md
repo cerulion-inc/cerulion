@@ -21,9 +21,13 @@ A conversation body is also judged by a narrower hard set than a file or a commi
 only the identity classes and the two reference classes, the ones whose finding is a value
 a reader should not have been shown. A style class reports there and no more. House style
 is a rule about text this project writes, and a label, an ask and a red run on someone
-else's thread over a dash is the guard crying wolf on a page that leaks nothing. On a finding it applies the `leak` label, asks the author once
-to edit the reference out (one ask per body, so an unchanged body is never asked twice),
-and goes red. The label tracks the THREAD: a clean body takes back the ask left for it,
+else's thread over a dash is the guard crying wolf on a page that leaks nothing.
+
+On a HARD finding, which on that surface means an identity class or a reference class, the
+job applies the `leak` label, asks the author once to edit the text (one ask per body, so
+an unchanged body is never asked twice), and goes red. A style class prints a `REPORT` line
+and does none of the three. The ask names what it found: a value asks to have that value
+taken out, a reference asks for a link anyone can follow in its place. The label tracks the THREAD: a clean body takes back the ask left for it,
 and the label comes off when the last outstanding ask on that thread is gone, so a clean
 comment cannot clear a label another body still deserves.
 
@@ -41,9 +45,10 @@ in the tree (new text reuses one of those or a documentation range such as
 name; a personal mail address, or a non-role address at the project domain; a host
 identity field (`uname`, `hostname`, `nodename` and friends) carrying a value; an
 overlay access control tag; the overlay product words in CI files; a reference nobody
-outside this project can open (below); and, as a report-only style class, en and em
-dashes. Placeholders such as `/Users/someone/`, `/home/ubuntu/` and `robot-a.local` are
-published vocabularies, never length rules.
+outside this project can open (below); and a style class, en and em
+dashes, whose severity the SURFACE decides: hard in a guard file, a commit message and a
+pull request title, a report on a conversation body. Placeholders such as `/Users/someone/`,
+`/home/ubuntu/` and `robot-a.local` are published vocabularies, never length rules.
 
 **Private patterns** never ship. They hold the real names: machine hostnames and short
 names, overlay device names, real LAN addresses, logins, people, the private

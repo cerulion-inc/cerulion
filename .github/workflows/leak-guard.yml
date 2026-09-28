@@ -196,6 +196,9 @@ jobs:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
           REQUIRE: ${{ steps.mode.outputs.require }}
           EVENT_NAME: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          SENDER_IS_BOT: ${{ endsWith(github.event.sender.login, '[bot]')
+                             || github.event.sender.type == 'Bot' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           BEFORE_SHA: ${{ github.event.before }}
@@ -210,7 +213,19 @@ jobs:
             pull_request)
               git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
               range="$BASE_SHA..$HEAD_SHA"
-              flags+=(--require-commits --pr-title-env PR_TITLE --pr-body-env PR_BODY)
+              flags+=(--require-commits)
+              # The title and the body are the AUTHOR's text on opened and on
+              # synchronize, and they stay hard there, dash rule included. An
+              # `edited` event whose sender is a bot is a review app appending to
+              # someone else's body, and reding a required check for a dash a
+              # machine wrote is the same defect this workflow just fixed on the
+              # comment surface. A later human edit that leaves those dashes in
+              # place reds, which is right: by then it is the author's text.
+              if [ "$ACTION" = edited ] && [ "$SENDER_IS_BOT" = true ]; then
+                echo "a bot edited the pull request text; its title and body are not scanned"
+              else
+                flags+=(--pr-title-env PR_TITLE --pr-body-env PR_BODY)
+              fi
               ;;
             merge_group)
               range="$BASE_SHA..$HEAD_SHA"
@@ -299,30 +314,27 @@ jobs:
     # in the context of this repository, so the private tier is always here and
     # is always required.
     #
-    # Text written by a BOT is out of scope, on every event. The author of the
-    # body decides that, not the actor who triggered the run: an app editing its
-    # own summary and a person editing theirs arrive as the same event, and it is
-    # the writing that is judged. The guard's own ask is covered by the same
-    # rule, since it writes as a bot too.
+    # Every author is in scope, bots included. A bot restates a diff and quotes
+    # what it found, so an address, a home path or a closed reference reaches a
+    # public thread through a bot exactly as it does through a person: the one
+    # genuine finding this guard has made was a home path inside a review app's
+    # comment. Skipping bots would give that class away on the surface where it
+    # is most likely to appear.
     #
-    # The bots here are the repository's own review apps. Their summaries quote
-    # examples, restate diffs and are rewritten on every push, so scanning them
-    # put a label, an ask and a red run on a contributor's pull request over a
-    # dash in a machine's prose. What a bot publishes is already the output of
-    # something that read a gated diff; what a person writes is the surface this
-    # job exists for.
+    # What made bot text unbearable was not the author, it was style classes
+    # counting as hard on a conversation body, so a dash in a machine's prose
+    # bought a label, an ask and a red run. The conversation hard set fixes that
+    # for EVERY author (see CONVERSATION_HARD), which leaves nothing for an
+    # author rule to buy.
     #
-    # The scan of a conversation body also skips fenced blocks and inline code
-    # spans (--skip-code), because the forge does not turn a reference inside
-    # them into a link either, and runs with --conversation, where only the
-    # identity and reference classes are hard.
+    # The one body never read is the guard's OWN ask: its account and its marker
+    # together, so the guard cannot read itself, and so a marker pasted by
+    # anybody else is still scanned like any other text.
     if: >-
       (github.event_name == 'issues' || github.event_name == 'issue_comment'
       || github.event_name == 'pull_request_review_comment')
-      && !endsWith(github.event.comment.user.login
-                   || github.event.issue.user.login, '[bot]')
-      && (github.event.comment.user.type
-          || github.event.issue.user.type) != 'Bot'
+      && !(github.event.comment.user.login == 'github-actions[bot]'
+           && contains(github.event.comment.body, '<!--leak-guard:'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # One run at a time per BODY, newest wins. The workflow level group keys on
@@ -409,10 +421,16 @@ jobs:
           LG_BODY: ${{ github.event.comment.body || github.event.issue.body }}
         run: |
           set -euo pipefail
-          if [ "$RC" = 3 ]; then
-            echo "::error ::the leak guard could not run on this body"
-            exit 1
-          fi
+          # 0 is clean and 1 is a finding. Everything else, a usage error at 2, a
+          # missing interpreter at 127, a signal, is a scan that did not happen,
+          # and a scan that did not happen must never reach the label and the ask
+          # with an empty classes file and tell an author their text carries
+          # something it did not find.
+          case "$RC" in
+            0|1) ;;
+            *) echo "::error ::the leak guard could not run on this body (exit $RC)"
+               exit 1 ;;
+          esac
           # The marker names the surface and digests the text that was refused,
           # so one body is asked once however often it is rescanned, and an edit
           # that leaves the reference in place is a new ask.
