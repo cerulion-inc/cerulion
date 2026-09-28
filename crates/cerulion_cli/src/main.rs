@@ -3221,6 +3221,20 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport, mode: 
 /// fold from one report reads the other the same way.
 const NODES_SHOWN: usize = 10;
 
+/// The line that keeps the would-sweep listing from over-promising.
+///
+/// The listing names the nodes a bare run ACTS ON, which is not the same set
+/// as the nodes it gets off disk: iceoryx2 raises
+/// `InsufficientPermissions` or `VersionMismatch` only from inside the
+/// removal, so which of them refuse is knowable ONLY by attempting, and a
+/// report attempts nothing. Saying "would remove" of the whole set would
+/// promise a deletion this run cannot know will happen, which is the same
+/// over-claim, one surface over, that `--report-only` exists to stop.
+const REMOVAL_CAN_STILL_BE_REFUSED: &str =
+    "  (what the sweep would ATTEMPT, not a promise each one comes off: iceoryx2 reports \
+     insufficient permissions or a version mismatch only when it tries to remove a node, which \
+     a report does not do)";
+
 /// The sentence `cerulion clean --report-only` prints where the orphan
 /// port-tag listing sits on a destructive run.
 ///
@@ -3256,7 +3270,7 @@ fn render_would_remove(
         return Vec::new();
     }
     let mut lines = vec![format!(
-        "Dead iceoryx2 node(s) `cerulion clean` would remove: {} under {} (report only; \
+        "Dead iceoryx2 node(s) `cerulion clean` would sweep: {} under {} (report only; \
          none was removed)",
         dead.len(),
         nodes_dir.display()
@@ -3269,6 +3283,7 @@ fn render_would_remove(
     if dead.len() > NODES_SHOWN {
         lines.push(format!("  … and {} more", dead.len() - NODES_SHOWN));
     }
+    lines.push(REMOVAL_CAN_STILL_BE_REFUSED.to_string());
     lines.push(ORPHAN_TAGS_NOT_LISTED.to_string());
     lines
 }

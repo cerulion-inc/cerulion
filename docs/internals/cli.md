@@ -930,10 +930,14 @@ bookkeeping lines iceoryx2's own loop emitted are re-emitted through
 `cerulion_core::iceoryx_logger::emit_iceoryx_log` in the same order, so
 `classify_cleanup_failures` reads the shapes it always read.
 
-A report renders `CleanupReport::dead_nodes` as the would-remove listing, by
+A report renders `CleanupReport::dead_nodes` as the would-sweep listing, by
 the entry name each node carries under the registry directory, capped at
 `NODES_SHOWN` with the fold the refusal listing uses, and closes the whole verb
-with one line saying nothing was removed. The counters stay at zero because
+with one line saying nothing was removed. The listing is the set the sweep
+ACTS ON, which is not the set it gets off disk: `InsufficientPermissions` and
+`VersionMismatch` are raised from inside the removal, so which nodes refuse is
+knowable only by attempting, and `REMOVAL_CAN_STILL_BE_REFUSED` states that
+under the list rather than letting the heading promise a deletion. The counters stay at zero because
 nothing was attempted, not because nothing was refused, which is why the
 listing replaces the summary line rather than sitting beside it.
 
@@ -943,6 +947,20 @@ and a report performs no removal. `ORPHAN_TAGS_NOT_LISTED` states that where
 the listing would have been. The dry-run bit still travels to
 `reclaim_orphan_port_tags` as the verb's own mode, so a report can never remove
 a tag even if a future sweep reported a refusal without attempting one.
+
+WHERE THE TESTS LIVE, and why they are split. A bare `cerulion clean` reclaims
+`/tmp/*.shm_state` MACHINE WIDE: `shm_state::SHM_STATE_DIRECTORY` is a
+compile-time constant mirroring `iceoryx2_pal_configuration::TEMP_DIRECTORY`,
+iceoryx2 honours no `TMPDIR`, and no environment variable moves it, so the
+reclaim unlinks every state file whose creator is provably gone whoever owns
+it. No test may run the verb bare. The CLI arms
+(`crates/cerulion_cli/tests/trace_inspect_and_clean_cli_test.rs`) therefore pass
+`--report-only` only and prove what needs the real binary: the lines a user
+reads, and the registry byte for byte beneath them. The destructive direction
+is proven where it CAN be confined, over the isolated root in
+`crates/cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs`: `sweep_dead_nodes_with_config` takes the
+registry config explicitly and never reaches the state-file pass, so
+`SweepMode::Remove` there touches exactly one root and nothing else.
 
 ## 11. Workspace dependencies and compiler compatibility
 

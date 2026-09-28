@@ -28,9 +28,9 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 - Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
   They move cwd + `HOME` under a file-local mutex declared as the fixture's LAST field, never the
   first (Rust drops fields in declaration order).
-- No `clean` arm may touch the machine's iceoryx2 registry, and `clean --report-only` may reach no
-  side effect: spawn from a temp cwd holding `config/iceoryx2.toml` with a private `root-path`, read
-  the mode before the walk, and classify both modes through `ipc_cleanup::sweep_one_node`
+- Never run a bare `cerulion clean` from a test: the `/tmp/*.shm_state` reclaim is machine wide by
+  construction (compile-time directory, no `TMPDIR`), so arms here pass `--report-only` only and the
+  destructive proof lives in `cerulion_cli_engine`'s `clean_orphan_port_tag_test.rs`
   (`tests/trace_inspect_and_clean_cli_test.rs`).
 - E2E binaries drive the REAL binary; run each `#[serial]` one alone with
   `-- --test-threads=1`. Build fixtures first:

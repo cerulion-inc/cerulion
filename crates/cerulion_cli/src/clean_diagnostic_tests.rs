@@ -1354,14 +1354,28 @@ fn the_report_only_listing_names_every_planted_node_and_claims_no_removal() {
         would_remove(&dead),
         vec![
             format!(
-                "Dead iceoryx2 node(s) `cerulion clean` would remove: 2 under \
+                "Dead iceoryx2 node(s) `cerulion clean` would sweep: 2 under \
                  {FIXTURE_NODE_DIR} (report only; none was removed)"
             ),
             "  node 1".to_string(),
             "  node 2".to_string(),
+            super::REMOVAL_CAN_STILL_BE_REFUSED.to_string(),
             super::ORPHAN_TAGS_NOT_LISTED.to_string(),
         ],
         "the whole listing, line for line"
+    );
+    // The listing names what the sweep ATTEMPTS. A refusal is raised from
+    // inside the removal, so a report cannot know which of these come off,
+    // and the heading must not say "would remove" of the whole set.
+    assert!(
+        !would_remove(&dead)[0].contains("would remove"),
+        "the heading must not promise a removal: {:?}",
+        would_remove(&dead)[0]
+    );
+    assert!(
+        super::REMOVAL_CAN_STILL_BE_REFUSED.contains("not a promise each one comes off"),
+        "the caveat must say the sweep can still refuse: {}",
+        super::REMOVAL_CAN_STILL_BE_REFUSED
     );
     // Absence STATED: the orphan-tag section is a sentence, never an empty
     // block a reader would take for "none".
@@ -1411,9 +1425,9 @@ fn the_would_remove_listing_folds_at_the_cap_and_at_the_cap_plus_one() {
         "{over:?}"
     );
     assert_eq!(
-        over[over.len() - 2],
+        over[over.len() - 3],
         "  … and 1 more",
-        "one past the cap folds exactly one: {over:?}"
+        "one past the cap folds exactly one, above the two closing lines: {over:?}"
     );
     assert!(
         !over.iter().any(|l| **l == format!("  node {cap}")),
