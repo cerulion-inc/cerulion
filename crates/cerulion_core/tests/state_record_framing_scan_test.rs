@@ -70,6 +70,12 @@ const REGION: &[Scanned] = &[
         path: "crates/cerulion_core/src/state_carrier/fork.rs",
         min_markers: 1,
     },
+    // ONE, and it is a different one than before. This file's only 40-byte
+    // sentence used to be the trace ring's, on a plane this sweep does not
+    // cover, so the minimum was satisfied by prose that could stay while every
+    // state record sentence in the file went. The state channel's own
+    // descriptor now states the framing it actually writes, and that sentence
+    // is the one the minimum counts.
     Scanned {
         path: "crates/cerulion_bag/src/writer.rs",
         min_markers: 1,
@@ -78,9 +84,14 @@ const REGION: &[Scanned] = &[
         path: "crates/cerulion_bagd/src/anchor_window.rs",
         min_markers: 5,
     },
+    // ONE, and the drop from four is the point rather than a weakening. Three
+    // of the four this file used to count were trace ring sentences, so a
+    // trace-side edit reddened the state framing gate while the state side's
+    // single sentence could go unnoticed. Those three now name their own plane
+    // and the minimum counts the state record sentence alone.
     Scanned {
         path: "crates/cerulion_bagd/src/lib.rs",
-        min_markers: 4,
+        min_markers: 1,
     },
     Scanned {
         path: "crates/cerulion_bagd/src/state_coverage.rs",
@@ -126,6 +137,30 @@ fn is_number_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '.'
 }
 
+/// Is `needle` in `line` with nothing that continues a number in FRONT of it?
+///
+/// The leading edge is the one that decides whether a marker is the number it
+/// claims to be: with it open, `140-byte` and `240-byte` stand in for the
+/// header width, and a file that lost every framing sentence keeps a green
+/// control on an unrelated size.
+///
+/// The trailing edge is left open ON PURPOSE, and that is the whole reason this
+/// is not [`contains_token`]. `40-byte` and `40-bytes` are the same framing
+/// sentence, and a trailing [`is_number_char`] bound stops counting the plural,
+/// which trades a silent stand-in for a silent gap rather than closing one.
+fn starts_a_token(line: &str, needle: &str, boundary: fn(char) -> bool) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while let Some(at) = line[i..].find(needle) {
+        let s = i + at;
+        if s == 0 || !boundary(bytes[s - 1] as char) {
+            return true;
+        }
+        i = s + needle.len();
+    }
+    false
+}
+
 /// Is `needle` in `line` standing on its own, by `boundary`?
 ///
 /// The boundary test is the whole point: it keeps `480` out of `4801`, `1.09 M`
@@ -166,6 +201,27 @@ fn names_format_version_0(line: &str) -> bool {
 fn names_the_wire_frame_plane(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     contains_token(&lower, "frame", is_word_char) || contains_token(&lower, "frames", is_word_char)
+}
+
+/// Does this line name the TRACE RING plane?
+///
+/// That plane's record is 40 bytes WHOLE, the same width this format's state
+/// record header grew to, and that coincidence is what made the control half
+/// vacuous for two files in the region: `cerulion_bag/src/writer.rs` and
+/// `cerulion_bagd/src/lib.rs` each cleared their minimum on a sentence about
+/// the trace ring, so deleting the state record framing prose beside it left
+/// the count unmoved and the sweep reported nothing.
+///
+/// The carve-out is SCOPED to the header width arm, for the same reason the
+/// wire frame one is scoped to the 32-byte arm: the payload region and the
+/// derived record counts are numbers only the state plane states, so a
+/// sentence that mentions the trace ring while stating one of those is still
+/// state record framing prose and still counts.
+fn names_the_trace_ring_plane(line: &str) -> bool {
+    // A plain substring rather than a word bound, because the plane is named
+    // as `TraceRingRecord`, `scheduler_trace` and `trace ring` in turn, and a
+    // word bound reaches none of the first two.
+    line.to_ascii_lowercase().contains("trace")
 }
 
 /// The DERIVED record counts format version 0 stated, retired at version 1.
@@ -228,15 +284,51 @@ fn carries_an_unexcused_stale_framing_literal(line: &str) -> bool {
 /// their control reads zero, which is the vacuity the control exists to catch.
 const CURRENT_DERIVED_COUNTS: &[&str] = &["1.11 M", "1_110_780", "139"];
 
-/// Does this line RESERVE the kind range this build mints out of?
+/// Does this line RESERVE everything from `first` upward?
 ///
 /// The claim is made of TWO parts, the range and the word, and this asks for both
-/// rather than for one spelling of the sentence that joins them. `4+` is token
-/// bound on a number boundary so `14+` and `24+`, which reserve a range nothing
-/// here mints, are not swept up with it.
-fn reserves_the_range_this_build_mints(line: &str) -> bool {
+/// rather than for one spelling of the sentence that joins them. Both halves are
+/// token bound on a number boundary so `14+` and `240 and above`, which reserve a
+/// range nothing here mints, are not swept up with it.
+///
+/// `first` is a PARAMETER because the detector and the control that proves it
+/// found the right sentence are the same claim about two different numbers: the
+/// range this build mints out of must not be reserved, and the range above it
+/// must be. A control built from a literal phrase instead reds a correct tree the
+/// moment the doc is reworded, and the reword it has to survive is one the
+/// detector's own control list already calls legitimate.
+fn reserves_everything_from(line: &str, first: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    contains_token(&lower, "4+", is_number_char) && lower.contains("reserv")
+    names_the_range_from(&lower, first) && lower.contains("reserv")
+}
+
+/// Does this lowercased line NAME the range running upward from `first`?
+///
+/// Three spellings, the last written with and without its space, because the
+/// detector reads a claim rather than a wording and a range has more than one
+/// way to be written down. `4 and up` is deliberately
+/// ABSENT and that is a stated residual, not an oversight: `state_ring.rs` says
+/// "its own doc already reserved 4 and up for" in the PAST tense, recording what
+/// the previous format's doc claimed, and a detector that reads that history as a
+/// live reservation reds a correct tree.
+fn names_the_range_from(lower: &str, first: &str) -> bool {
+    contains_token(lower, &format!("{first}+"), is_number_char)
+        || starts_a_token(lower, &format!("{first} and above"), is_number_char)
+        || contains_token(lower, &format!(">= {first}"), is_number_char)
+        || contains_token(lower, &format!(">={first}"), is_number_char)
+}
+
+/// Does this line RESERVE the kind range this build mints out of?
+fn reserves_the_range_this_build_mints(line: &str) -> bool {
+    reserves_everything_from(line, "4")
+}
+
+/// Does this line reserve the range ABOVE the kinds this build mints?
+///
+/// This is the sentence the doc is SUPPOSED to carry, and it is the positive
+/// control for the scan that looks for its opposite.
+fn reserves_the_range_above_the_kinds_this_build_mints(line: &str) -> bool {
+    reserves_everything_from(line, "7")
 }
 
 /// Does this line carry a CURRENT framing marker, for the control half?
@@ -253,8 +345,19 @@ fn reserves_the_range_this_build_mints(line: &str) -> bool {
 /// is: as a plain substring it matched `1472` and `4720`, so an unrelated number
 /// could stand in for the payload region and keep a stripped file's control
 /// green.
+///
+/// `40-byte` is the same class, bounded on its LEADING edge only. Unbounded it
+/// matched `140-byte`, letting an unrelated size stand in for the header width;
+/// bounded on BOTH edges it would stop counting the plural `40-bytes`, which is
+/// the same framing sentence. See [`starts_a_token`].
+///
+/// `40-byte` is also the one marker another PLANE states, so it carries the
+/// trace ring carve-out ([`names_the_trace_ring_plane`]). A 40-byte trace ring
+/// record is not state record framing prose, and while it counted, two files
+/// in the region cleared their whole minimum on one and could have lost every
+/// state record sentence they had without moving their count.
 fn carries_a_current_framing_marker(line: &str) -> bool {
-    line.contains("40-byte")
+    (starts_a_token(line, "40-byte", is_number_char) && !names_the_trace_ring_plane(line))
         || contains_token(line, "472", is_number_char)
         || CURRENT_DERIVED_COUNTS
             .iter()
@@ -370,10 +473,17 @@ fn the_stale_literal_detector_fires_on_every_number_this_format_retired() {
 /// the record size did not move at format version 1 and a file may state it
 /// without carrying one current framing sentence. `1472` and `4720` must not
 /// count either, which is what the number boundary on `472` is for.
+///
+/// `40-byte` carries BOTH of those halves in one marker, and they pull opposite
+/// ways, so each is pinned against the other. `140-byte` must not count, or a
+/// slot size stands in for the header width. `40-bytes` must still count, or
+/// the plural of the very sentence this marker looks for reads as its absence.
+/// That is why the bound is on the leading edge alone.
 #[test]
 fn the_current_marker_set_holds_only_numbers_this_format_minted() {
     for marker in [
         "/// the header is 40-byte wide",
+        "/// the header is 40-bytes wide",
         "/// the payload region is 472 bytes",
         "/// a 500 MB anchor is ~1.11 M records",
         "const PARTS: u64 = 1_110_780;",
@@ -386,6 +496,8 @@ fn the_current_marker_set_holds_only_numbers_this_format_minted() {
     }
     for not_a_marker in [
         "// every message on it is exactly one 512-byte record",
+        "/// the slot is 140-byte wide",
+        "/// a 240-byte slot on another plane",
         "/// the slot is 1472 bytes wide",
         "/// 4720 records fit",
         "/// a 500 MB anchor is ~1.09 M records",
@@ -445,6 +557,47 @@ fn the_frame_carve_out_is_word_bounded_and_scoped_to_its_own_arm() {
     }
 }
 
+/// The trace ring carve-out takes the header width arm and no other, so a
+/// sentence about the other plane cannot stand in for state record framing
+/// prose while a number only this plane states still counts wherever it falls.
+///
+/// Its own control is the pair, and the first half is the anti-vacuity one: the
+/// carved-out lines must be lines the header width arm WOULD have counted, or
+/// the carve-out is being credited with excluding sentences that were never in
+/// the set to begin with.
+#[test]
+fn the_trace_ring_carve_out_is_scoped_to_the_header_width_arm() {
+    for other_plane in [
+        "/// the 40-byte `TraceRingRecord` wire form is appended to the arena",
+        "// a trace ring's 40-byte records land on `__cerulion/scheduler_trace`",
+        "// a fixed 40-bytes stride over the scheduler_trace buffer",
+    ] {
+        assert!(
+            starts_a_token(other_plane, "40-byte", is_number_char),
+            "the control is only meaningful if the header width arm would have \
+             counted this line: {other_plane}"
+        );
+        assert!(
+            !carries_a_current_framing_marker(other_plane),
+            "a 40-byte record on the trace plane is not state record framing \
+             prose, and while it counted a file could lose every state sentence \
+             it had without moving its count: {other_plane}"
+        );
+    }
+    for still_a_marker in [
+        "/// a trace record rides beside the 472-byte state payload region",
+        "/// the state record header is 40-byte wide",
+        "/// a 500 MB anchor is ~1.11 M records, drained beside the trace ring",
+    ] {
+        assert!(
+            carries_a_current_framing_marker(still_a_marker),
+            "the carve-out is for the header WIDTH arm: the payload region and \
+             the derived counts are numbers only this plane states, so naming \
+             the other one must not discount them: {still_a_marker}"
+        );
+    }
+}
+
 /// The kind space doc says what the kind space IS, and no longer reserves a range
 /// this build mints out of.
 ///
@@ -467,8 +620,20 @@ fn the_reserved_kind_range_doc_names_the_range_that_is_actually_reserved() {
     );
     // The control: the doc DOES state a reservation, so this is a scan that found
     // the right sentence rather than one that matched nothing at all.
+    //
+    // It is built from the SAME predicate shape as the offenders scan, one number
+    // over, and that is the repair. It was a literal phrase pair, `7+ are
+    // RESERVED` and `values 7+ are RESERVED`, whose second arm could never fire
+    // that the first did not (any string holding the longer one holds the
+    // shorter), so it was one wording wearing two. Worse, `7+ is reserved` is a
+    // wording this file's own control list below declares legitimate, and it
+    // reddened this gate on a correct tree.
+    let reservations: Vec<&str> = text
+        .lines()
+        .filter(|l| reserves_the_range_above_the_kinds_this_build_mints(l))
+        .collect();
     assert!(
-        text.contains("7+ are RESERVED") || text.contains("values 7+ are RESERVED"),
+        !reservations.is_empty(),
         "the doc must still reserve the range above the kinds this build mints"
     );
 }
@@ -489,6 +654,13 @@ fn the_reserved_range_detector_reads_the_claim_and_not_one_wording_of_it() {
         "/// 4+ is reserved.",
         "/// 4+ are reserved for a later format.",
         "// kind 4+ remains reserved",
+        // THE EVASION the `4+` spelling left open, and the reason the range
+        // half reads three spellings rather than one. A doc that says this
+        // beside the `7+` sentence reserves three kinds this build mints, and
+        // the scan read empty while the control still found its sentence.
+        "/// kinds 4 and above are reserved for a later format",
+        "/// kinds >= 4 are reserved for a later format",
+        "/// kinds >=4 are reserved for a later format",
     ] {
         assert!(
             reserves_the_range_this_build_mints(offender),
@@ -499,13 +671,45 @@ fn the_reserved_range_detector_reads_the_claim_and_not_one_wording_of_it() {
     for allowed in [
         "// version 1 record this build mints; values 7+ are RESERVED.",
         "/// 7+ is reserved.",
+        "/// kinds 7 and above are reserved for a later format",
         "/// kind 4 is the rank-bearing final record",
         "/// 14+ is reserved, a range nothing here mints",
+        "/// kinds 14 and above are reserved, a range nothing here mints",
+        "/// its own doc already reserved 4 and up for, which this one took",
     ] {
         assert!(
             !reserves_the_range_this_build_mints(allowed),
             "the detector must not fire on the reservation the doc is supposed to \
              carry, or the gate reads red on a correct tree: {allowed}"
+        );
+    }
+
+    // The POSITIVE control's predicate is the same claim one number over, so it
+    // gets the same pair. Without this it could stop firing and the offenders
+    // scan above would go unwitnessed: an empty scan and a control that finds
+    // nothing look identical from the outside, which is the whole failure this
+    // file exists to prevent.
+    for reservation in [
+        "// version 1 record this build mints; values 7+ are RESERVED.",
+        "/// 7+ is reserved.",
+        "/// kinds 7 and above are reserved for a later format",
+        "/// kinds >= 7 are reserved for a later format",
+    ] {
+        assert!(
+            reserves_the_range_above_the_kinds_this_build_mints(reservation),
+            "the sentence the doc is supposed to carry must be found however it \
+             is worded: {reservation}"
+        );
+    }
+    for not_that_reservation in [
+        "/// Values 4+ are RESERVED.",
+        "/// 17+ is reserved, a range nothing here mints",
+        "/// kind 7 is a kind this build mints",
+    ] {
+        assert!(
+            !reserves_the_range_above_the_kinds_this_build_mints(not_that_reservation),
+            "the positive control must not be satisfied by a sentence that is not \
+             the reservation, or it stops witnessing anything: {not_that_reservation}"
         );
     }
 }

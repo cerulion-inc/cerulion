@@ -562,8 +562,9 @@ fn reserved_channels() -> [(&'static str, &'static str, SchemaDescriptor); 4] {
             STATE_SCHEMA,
             // `wire_fixed_size` is the record's fixed size, which for this
             // channel is a real number rather than the trace channel's
-            // stand-in: every message on it is exactly one 512-byte
-            // `StateRecordHeader` + payload. `schema_hash` is 0 for the
+            // stand-in: every message on it is exactly one 512-byte state record,
+            // a 40-byte `StateRecordHeader` over a 472-byte payload region, which
+            // is the framing this channel writes. `schema_hash` is 0 for the
             // same reason its siblings' is — the payload is a framework
             // record, not a user schema, so there is no recipe-3 hash to
             // carry and fabricating one would make a reader think it could

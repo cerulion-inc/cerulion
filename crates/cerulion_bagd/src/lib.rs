@@ -7221,7 +7221,7 @@ struct WriterCore {
     /// Zero-copy trace rider: the trace-ring consumers this thread drains zero-copy.
     rings: Vec<SendRing>,
     /// Per-ring header rank as 4 LE bytes — the provenance stamp. The
-    /// bag bytes' `reserved` field ([36..40] of each 40-byte record) must carry
+    /// bag bytes' `reserved` field ([36..40] of each 40-byte trace record) must carry
     /// the ring's rank, but the zero-copy path must not mutate ring SHM the
     /// producer will recycle — so the stamp is an IOVEC SUBSTITUTION: each
     /// record is written as record[0..36] straight from SHM + these 4 owned
@@ -8072,7 +8072,8 @@ impl WriterCore {
             let mut trailing_idx = 0usize;
             for (a, b) in spans.iter() {
                 // A wrapped region is two spans; records never straddle the
-                // wrap (fixed 40-byte stride over a records-multiple buffer),
+                // wrap (a fixed 40-byte trace record stride over a
+                // records-multiple buffer),
                 // so every record is contiguous in exactly one span.
                 for rec in a.as_chunks::<RS>().0.iter().chain(b.as_chunks::<RS>().0) {
                     // fire_time_ns at [8..16] LE (alignment-safe copy of 8

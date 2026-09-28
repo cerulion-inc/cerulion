@@ -19,13 +19,18 @@
 //!
 //! Two shapes cannot be read and are named instead of worked around:
 //!
-//! - **`rings_declared > 1`.** A state record carries `node_idx` and no rank,
-//!   and every ring numbers its own nodes from 0, so with two declared rings a
-//!   record with `node_idx = 0` could belong to either ring's first node and
-//!   nothing in the bag disambiguates it. `StateNodeCoverage::node_idx`'s own
-//!   documentation names this residual and says the restore engine refuses;
-//!   this is that refusal. Guessing would apply one node's recorded state to a
-//!   DIFFERENT node and then report a confident divergence about it.
+//! - **`rings_declared > 1`.** A state record carries its producer's RANK, and
+//!   the coverage manifest carries the ring to rank join, so the bag does say
+//!   which ring a record came from. What is still rankless is this READER: its
+//!   index table is keyed by `node_idx` alone, and [`StateAssembler`] groups
+//!   parts by `(run_id, step, node_idx)`, which carries no rank either. Every
+//!   ring numbers its own nodes from 0, so with two declared rings two
+//!   producers' `node_idx = 0` records would collide inside the assembler
+//!   before the manifest's join could be consulted at all. Refusing is an OVER
+//!   refusal and never a wrong answer; guessing would apply one node's recorded
+//!   state to a DIFFERENT node and then report a confident divergence about it.
+//!   Teaching the reader to carry the rank through is a read side change of its
+//!   own, so the remedy today is a recording of a single rank.
 //! - **Several runs' anchors at the resume step.** A machine-wide recording
 //!   legitimately carries more than one run, and picking one is picking which
 //!   execution the verdict is about. `plan_restore` takes the run as an INPUT
@@ -110,12 +115,14 @@ impl BagAnchors {
 pub enum AnchorReadRefusal {
     /// The bag declares more than one state ring, so `node_idx` is ambiguous.
     #[error(
-        "this recording drained {rings} state rings, and a state record carries a node index but \
-         no rank — every ring numbers its own nodes from 0, so a record's index names a different \
-         node in each of them and nothing in the bag says which ring it came from. Applying one \
-         node's recorded state to another would produce a confident divergence report about an \
-         execution that never happened. Fix: replay a single-process recording (`cerulion graph \
-         run --record --single-process`), or re-record once state records carry their rank"
+        "this recording drained {rings} state rings. Its state records carry their producer's \
+         rank and its coverage manifest carries the ring to rank join, so the bag does say which \
+         ring a record came from, but this reader keys its index table and its assembler by node \
+         index alone. Every ring numbers its own nodes from 0, so two producers' first nodes \
+         would collide before that join could be consulted, and applying one node's recorded \
+         state to another would produce a confident divergence report about an execution that \
+         never happened. Fix: replay a recording of a single rank (`cerulion graph run --record \
+         --single-process`)"
     )]
     MultiRingAmbiguous {
         /// How many rings the manifest declares.
@@ -174,7 +181,7 @@ pub enum AnchorReadRefusal {
          a decode from the wrong offset on, so assembling these bytes could restore a node from \
          data that is not its state and report a confident divergence about an execution that \
          never happened. The recording is not damaged and does not need re-recording. Fix: read \
-         it with a build that reads state record format version {carried} or later"
+         it with a build that reads state record format version {carried}"
     )]
     StateRecordFormatTooNew {
         /// The version the bag's manifest carries, above this build's.
@@ -212,9 +219,9 @@ pub enum AnchorReadRefusal {
 /// of lands on a REFUSAL rather than a confident restore:
 ///
 /// - `rings_declared` gates [`AnchorReadRefusal::MultiRingAmbiguous`]. A v2 that
-///   RELAXES multi-ring (the remedy that refusal itself names — "re-record once
-///   state records carry their rank") makes this build refuse a bag a newer one
-///   could read. Over-refusal, never a wrong answer.
+///   RELAXES multi-ring (by keying this reader on the rank its records already
+///   carry, which is the residual that refusal itself names) makes this build
+///   refuse a bag a newer one could read. Over-refusal, never a wrong answer.
 /// - `attached_mid_run` selects the assembler mode, and BOTH readings of it
 ///   refuse: armed-on-a-from-start eats the head and reports the node uncovered,
 ///   passthrough-on-a-mid-run reports the headless tail `Torn`. The discriminator
@@ -732,6 +739,32 @@ mod tests {
         let text = refusal.to_string();
         assert!(text.contains("2 state rings"), "{text}");
         assert!(text.contains("--single-process"), "names the fix: {text}");
+
+        // And the sentence says what is ACTUALLY true of the bag, which is the
+        // half that went stale under this stack. The records carry their
+        // producer's rank from state record format version 1 on and the
+        // manifest carries the ring to rank join, so a sentence claiming the
+        // bag cannot say which ring a record came from is false, and the remedy
+        // it used to name, re-record once the records carry their rank, is a
+        // LOOP: the operator re-records, the records carry their rank exactly as
+        // they already did, and the same refusal fires.
+        assert!(
+            text.contains("carry their producer's rank"),
+            "the refusal states what the records carry: {text}"
+        );
+        assert!(
+            !text.contains("no rank"),
+            "and never claims the opposite of it: {text}"
+        );
+        assert!(
+            !text.contains("re-record"),
+            "and never sends an operator round a loop that ends at this same \
+             refusal: {text}"
+        );
+        assert!(
+            text.contains("replay a recording of a single rank"),
+            "the remedy is the one that actually clears the refusal: {text}"
+        );
     }
 
     #[test]
@@ -875,6 +908,24 @@ mod tests {
         r
     }
 
+    /// One record this build CANNOT read, whatever version admits it.
+    ///
+    /// The kind word carries a value no format has minted, so
+    /// [`StateRecordHeader::validate`] refuses it on its own terms rather than
+    /// on a version disagreement: it is the record shape that lets a test tell
+    /// "the gate fired first" apart from "the reader could not read these
+    /// anyway", because at this build's version the same bytes are WALKED and
+    /// counted as malformed instead of refused.
+    fn unreadable_record() -> Vec<u8> {
+        let mut r = vec![0u8; cerulion_core::state_ring::STATE_RECORD_SIZE as usize];
+        r[0..8].copy_from_slice(&7u64.to_le_bytes());
+        r[8..16].copy_from_slice(&41u64.to_le_bytes());
+        r[24..28].copy_from_slice(&99u32.to_le_bytes()); // a kind no format mints
+        r[36..40]
+            .copy_from_slice(&cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION.to_le_bytes());
+        r
+    }
+
     /// A manifest with the two keys this build writes, or without them.
     fn manifest_json(format_version: Option<&str>, rings: usize) -> String {
         let key = match format_version {
@@ -1007,21 +1058,63 @@ mod tests {
             "and THIS BUILD's version, literally: {text}"
         );
         assert!(
-            text.contains("read it with a build that reads state record format version 2 or later"),
+            text.contains("read it with a build that reads state record format version 2"),
             "the remedy names the build to reach for: {text}"
+        );
+        // And it names that version EXACTLY. The remedy used to read "version 2
+        // or later", which the gate below it does not honour: it admits only
+        // `v == known`, so a build at version 3 hands this same bag the TOO OLD
+        // sentence and tells the operator to re-record a recording the sentence
+        // two clauses above just called undamaged. That is the misdiagnosis this
+        // arm exists to prevent, arriving from the third side, so the clause is
+        // pinned literally and the widening words are pinned ABSENT.
+        assert!(
+            !text.contains("or later"),
+            "the remedy must not widen past the one version the gate admits: {text}"
+        );
+        assert!(
+            text.ends_with("read it with a build that reads state record format version 2"),
+            "and the remedy is the LAST clause, ending at that version: {text}"
         );
         assert!(
             text.contains("does not need re-recording"),
             "and says the recording is not the thing at fault: {text}"
         );
 
-        // THE ABSENCE. `read_bag_anchors` returns before the index table and
-        // before the assembler is built, so there is no `BagAnchors` on this path
-        // at all: no anchor was served, no record was fed, and no malformed count
-        // exists to be read. `Err` is the whole of what the caller gets.
+        // THE ABSENCE, and it is asserted at a seam that can SEE it. This read
+        // the same call again and asked `is_err()`, three lines under an
+        // `assert_eq!` on the whole error value: it could not fail while the
+        // assertion above it passed, and it would pass unchanged if the early
+        // return were deleted and the assembler let loose on these records.
+        //
+        // What can only hold if NO record was read: hand the same version 2
+        // manifest a stream of records this build would reject one by one, and
+        // require the same version refusal anyway. A reader that reached the
+        // records would answer with their malformed count instead, which is what
+        // the control below shows it does when the gate admits the bag.
+        let malformed = vec![unreadable_record(), unreadable_record()];
+        assert_eq!(
+            craft_and_read(&manifest_json(Some("2"), 1), &malformed)
+                .expect_err("the version decision is taken before the records are"),
+            AnchorReadRefusal::StateRecordFormatTooNew {
+                carried: 2,
+                known: 1
+            },
+            "the version is decided before a single record is validated, so a bag \
+             of unreadable records under a later format still refuses by version"
+        );
+        let read_them = craft_and_read(&manifest_json(Some("1"), 1), &malformed)
+            .expect("the same records at this build's version are READ, not refused");
+        assert_eq!(
+            read_them.malformed_records, 2,
+            "the control: when the gate admits the bag the reader really does walk \
+             these records and count them, so the refusal above is the gate firing \
+             first and not a reader that cannot read them either way"
+        );
         assert!(
-            craft_and_read(&manifest_json(Some("2"), 1), &records).is_err(),
-            "the reader hands back a refusal and no anchors, so `finish` is never reached"
+            read_them.facts.is_empty(),
+            "and none of them assembled into an anchor: {:?}",
+            read_them.facts
         );
 
         // THE CONTROL, and it is the point of pairing it with these exact
@@ -1060,6 +1153,21 @@ mod tests {
         assert!(
             matches!(both, AnchorReadRefusal::MultiRingAmbiguous { rings: 2 }),
             "the manifest property is asked before the format: {both:?}"
+        );
+        // And the arm this fix ADDED, which is the one whose placement was newly
+        // decided and the one nothing pinned. A k>1 bag written by a LATER build
+        // is two unreadable things at once, and the ambiguity is the one its own
+        // capture judge wrote down, so that is the sentence an operator must
+        // meet. Hoisting the too-new arm above the ring check answers a version
+        // complaint instead, and a build the operator then goes and fetches
+        // refuses the bag all over again for the reason nobody mentioned.
+        let newer_and_ambiguous =
+            craft_and_read(&manifest_json(Some("2"), 2), &[]).expect_err("still refused");
+        assert_eq!(
+            newer_and_ambiguous,
+            AnchorReadRefusal::MultiRingAmbiguous { rings: 2 },
+            "the ring count is asked before the record format, so the capture's \
+             own reason is the one served: {newer_and_ambiguous:?}"
         );
     }
 
