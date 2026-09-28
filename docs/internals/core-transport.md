@@ -436,6 +436,20 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   version in the middle of the name (`isolated_root_evidence_test`). Crashed runs also
   leave stale `*.event` sockets under `/tmp/iceoryx2/` (not `/dev/shm`); sweep both
   locations.
+- Binding a listener's datagram socket moves the PROCESS umask, and 0.10 leaks it. iceoryx2's
+  `UnixDatagramSocket::bind` sets a process global umask of `!permission` for the bind and
+  restores it on scope exit; concurrent binds each save what the other installed, so the
+  restore writes back a value that was never the original and the process keeps it. At 0.10's
+  `SOCKET_PERMISSIONS` of `OWNER_READ_WRITE` the leaked mask is `0o7177` (the setuid, setgid
+  and sticky bits ride along in the complement), which clears the owner SEARCH bit: a
+  directory any thread creates afterwards comes out `0o600` and every later stat of a path
+  inside it fails with EACCES. We reach this on every listener creation, so it is not a test
+  hazard alone. 0.9.1 has the same handling and the same leak, silent only because its
+  permission is `OWNER_ALL`, whose complement leaves the search bit alone. The workspace
+  builds against a forked `iceoryx2-bb-posix` that sets the permission with chmod after the
+  bind (`[patch.crates-io]` in the root manifest). That patch reaches THIS workspace only:
+  anyone depending on a published `cerulion_core` resolves the unpatched upstream until the
+  fix merges there.
 - `generate_isolated_config()` mints a unique prefix baked into both service paths and
   the node-monitoring registry; a subprocess child must deserialize and reuse the
   parent's exact `Config`. `ipc_threadsafe::Service` is what makes ports `Send`
