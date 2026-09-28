@@ -595,7 +595,12 @@ jobs:
       # step below; test jobs keep their own profiles untouched.
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
+      # `fetch-depth: 0` so the added-line dash gate below can diff against the
+      # pull request's BASE commit. A shallow checkout does not carry it, and
+      # the gate would then refuse rather than read an empty diff.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
 
       - name: Release installer self-test
         run: ./tools/scripts/install.sh --self-test
@@ -628,11 +633,22 @@ jobs:
       - name: Crates.io publish retry self-test
         run: ./tools/scripts/test_publish_crates.sh
 
-      # The path classifier the `changes` job runs. Its table is what decides
-      # whether a pull request pays for the 22-minute packaging smoke, so it is
-      # executed here rather than only read by shellcheck below.
-      - name: Changed-path classifier self-test
-        run: ./tools/scripts/ci_changed_paths.sh --self-test
+      # NO ADDED LINE CARRIES A TYPOGRAPHIC DASH. Diff-scoped, not tree-wide:
+      # the cut tree carries an em or en dash in over a thousand files, almost
+      # all of it in comments, so a tree scan would red `main` and say nothing
+      # about the change under review. `check_public_surface.py` reads only
+      # string literals in non-test Rust files and no Python at all, which is
+      # the hole this closes.
+      - name: Added-line dash gate (self-test)
+        run: python3 -B tools/scripts/check_added_lines.py --self-test
+
+      # `fetch-depth: 0` above is what makes the base ref reachable. On a
+      # `merge_group` or `push` run there is no pull-request base, and the gate
+      # reads the default branch instead, which adds nothing on `main` itself.
+      - name: Added lines carry no typographic dash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || 'origin/main' }}
+        run: python3 -B tools/scripts/check_added_lines.py --base "$BASE_REF"
 
       # A static linter is the only automated reader most of these scripts
       # get: CI executes only a few of them (the two gates this workflow runs,
@@ -882,6 +898,15 @@ jobs:
       # out to `cargo metadata`.
       - name: Selected-packages closure self-test
         run: python3 -B tools/scripts/ci_selected_packages.py --self-test
+
+      # The path classifier the `changes` job runs. Its table is what decides
+      # which test steps a pull request pays for and whether it pays for the
+      # 22-minute packaging smoke, so it is executed here rather than only read
+      # by shellcheck. It sits beside the selector rather than with the other
+      # pure-shell gates because its last rows drive the whole pipeline, which
+      # resolves the workspace with `cargo metadata`.
+      - name: Changed-path classifier self-test
+        run: ./tools/scripts/ci_changed_paths.sh --self-test
 
       # The public-surface gate. The week before the public cut, seven classes
       # of mistake in the shipped tree were found and fixed BY HAND, one page
