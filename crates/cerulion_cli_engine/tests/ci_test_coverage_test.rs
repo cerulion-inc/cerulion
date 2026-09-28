@@ -106,6 +106,11 @@
 //! workflows by
 //! `a_selection_condition_credits_nothing_when_its_output_is_not_grounded`.
 //!
+//! The producing rule reads the script TEXT, so `ci.yml`'s own `changes` job
+//! grounds today only because its non-pull-request branch spells
+//! `packaging=false` literally, its pull-request branch piping
+//! `ci_changed_paths.sh` into the output file without ever naming a class.
+//!
 //! TOTALITY UNDER SELECTION is the second thing the walk now decides, because
 //! being NAMED in a sanctioned step stops being enough once a selector exists:
 //! the step also has to RUN on the pull request that touches that package
@@ -557,6 +562,14 @@ enum StepOutputs {
     Written(String),
 }
 
+/// The characters a written output name may sit immediately after.
+///
+/// The start of the script and whitespace are the ordinary ones; either quote
+/// covers `"<name>=$value"`, `{` a brace group, `(` a subshell, `;` the end of
+/// the command before it, and `&` the second half of an `&&`. Anything else
+/// means the name is the TAIL of a longer word.
+const OUTPUT_TOKEN_OPENERS: &[char] = &['\'', '"', '{', '(', ';', '&'];
+
 impl StepOutputs {
     /// Does this step write the output called `name`?
     ///
@@ -566,11 +579,29 @@ impl StepOutputs {
     /// that writes one: the fixture here wrote `code=` alone, declared `code:`
     /// and `pkgs:`, and the step gated on the package list was credited while
     /// `fromJSON('')` would have failed on every pull request.
+    ///
+    /// A WHOLE token, at an [`OUTPUT_TOKEN_OPENERS`] boundary. As a bare
+    /// substring `code=` is inside `barcode=1`, which writes `barcode` and
+    /// leaves `code` the empty string, so a step gated on the `code` class
+    /// would have been credited by a script that never sets it.
     fn writes(&self, name: &str) -> bool {
-        match self {
-            StepOutputs::Any => true,
-            StepOutputs::Written(script) => script.contains(&format!("{name}=")),
+        let StepOutputs::Written(script) = self else {
+            return true;
+        };
+        let needle = format!("{name}=");
+        let mut from = 0usize;
+        while let Some(offset) = script[from..].find(&needle) {
+            let at = from + offset;
+            from = at + needle.len();
+            let opens_a_token = script[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| ch.is_whitespace() || OUTPUT_TOKEN_OPENERS.contains(&ch));
+            if opens_a_token {
+                return true;
+            }
         }
+        false
     }
 }
 
@@ -2369,6 +2400,42 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
         ))),
         set(&["pkgs"])
     );
+
+    // A WHOLE token, not a substring. `barcode=1` writes `barcode`, and
+    // grounding `code` on it would credit a step gated on a class the
+    // classifier never sets; the same name at a token boundary still grounds,
+    // bare and quoted.
+    let writes_barcode = "      - id: c\n        run: echo \"barcode=1\" >> \"$GITHUB_OUTPUT\"\n";
+    let writes_bare = "      - id: c\n        run: echo code=1 >> \"$GITHUB_OUTPUT\"\n";
+    let writes_quoted = "      - id: c\n        run: echo \"code=$value\" >> \"$GITHUB_OUTPUT\"\n";
+    assert_eq!(
+        credited(&body_with_steps(needs_changes, all_outputs, writes_barcode)),
+        set(&["always_pkg"]),
+        "`barcode=1` writes `barcode`, so it grounds no `code` output"
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body_with_steps(
+            needs_changes,
+            all_outputs,
+            writes_barcode
+        ))),
+        BTreeSet::<String>::new()
+    );
+    for step in [writes_bare, writes_quoted] {
+        assert_eq!(
+            credited(&body_with_steps(needs_changes, all_outputs, step)),
+            set(&["always_pkg", "code_pkg"]),
+            "`code=` at a token boundary grounds `code`:\n{step}"
+        );
+        assert_eq!(
+            declared_selection_outputs(&jobs_of(&body_with_steps(
+                needs_changes,
+                all_outputs,
+                step
+            ))),
+            set(&["code"])
+        );
+    }
 
     // The `run:` SCRIPT, not the step block whole. A step whose NAME mentions
     // the output file and whose script never writes into it produces nothing.
