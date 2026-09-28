@@ -886,12 +886,12 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `tests/ros2_migrate_cli_test.rs` | `ros2 migrate` over the real binary with a stub engine script + stub `colcon` on the child PATH: the production `ClangToolEngine` spawn path, write/commit/patch + the exact colcon argv, failing-build exit 1 naming the revert commit, engine-absent exit 69, `--yes`-without-`--write` usage error | no (per-child env only) | none |
 | `tests/completions_cli_test.rs` | Zero-stderr completion protocol under a hostile env (trace-level logging, dead daemon socket); bare separator-delimited candidates only | no | none |
 | `src/completion_wiring_tests.rs` | Wired-completer inventory (set equality + spelled-out create-verb guard), free-form inventory walk, `.mcap` path filter; run via `cargo test -p cerulion_cli --bin cerulion` | file-local mutex | none |
-| `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the orphan port-tag reclaim between exactly two sweeps with `--report-only` as its dry-run bit and the SECOND sweep's convergence handed to the gate, plus hand-oracle pins of the two pure renderers. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
+| `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the orphan port-tag reclaim between exactly two sweeps with the verb's mode as its dry-run bit and the SECOND sweep's convergence handed to the gate, the report-only fork placed after the registry block and returning before the summary, plus hand-oracle pins of the three pure renderers and a call-count seam over `sweep_one_node` proving a report never calls the removal. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
 
 ## 10. `cerulion clean`: dead-node sweep, orphan port-tag reclaim, state-file gate
 
-`cerulion clean` runs iceoryx2's dead-node sweep with its trace lines captured
-(`ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics`), attributes every
+`cerulion clean` walks iceoryx2's node registry ONCE with its trace lines
+captured (`ipc_cleanup::sweep_dead_nodes`), attributes every
 refusal to its node with the sub-causes iceoryx2 logged, and reclaims
 `.shm_state` name mappings only when the sweep left the registry CONVERGED: a
 still-registered dead node needs its mappings, and one removed underneath it
@@ -914,12 +914,53 @@ from the sweep's memory of it) holds nothing but regular files named
 `<prefix><port id><port-tag suffix>`. Anything else refuses the whole directory
 and names the offenders. The verb prints one line per node, runs ONE more
 sweep, prints its summary, and hands the SECOND sweep's convergence to the
-state-file gate. `--report-only` still runs the FIRST dead-node sweep (iceoryx2's
-own reclaim of a dead node's resources), prints the
-candidates the reclaim WOULD act on, removes no port tag, and skips the second
-sweep; "removes nothing" is true of the reclaim, not of the sweep. The reclaimer heals a machine that already carries the shape; the
-rmw destroy path is what stops it being minted. Extend the
+state-file gate. The reclaimer heals a machine that already carries the shape;
+the rmw destroy path is what stops it being minted. Extend the
 refusals, never the acceptance.
+
+### `--report-only` reads the mode before the walk
+
+`SweepMode` (`ipc_cleanup`) governs the dead-node half and the state-file half
+both. `sweep_dead_nodes` walks the registry once and reaches every dead node
+through `sweep_one_node`, which is the ONE classification: `SweepMode::Remove`
+is that classification followed by `DeadNodeView::blocking_remove_stale_resources`,
+and `SweepMode::ReportOnly` is the same classification with the removal never
+called, so a report names exactly the nodes a bare run removes. The per-node
+bookkeeping lines iceoryx2's own loop emitted are re-emitted through
+`cerulion_core::iceoryx_logger::emit_iceoryx_log` in the same order, so
+`classify_cleanup_failures` reads the shapes it always read.
+
+A report renders `CleanupReport::dead_nodes` as the would-sweep listing, by
+the entry name each node carries under the registry directory, capped at
+`NODES_SHOWN` with the fold the refusal listing uses, and closes the whole verb
+with one line saying nothing was removed. The listing is the set the sweep
+ACTS ON, which is not the set it gets off disk: `InsufficientPermissions` and
+`VersionMismatch` are raised from inside the removal, so which nodes refuse is
+knowable only by attempting, and `REMOVAL_CAN_STILL_BE_REFUSED` states that
+under the list rather than letting the heading promise a deletion. The counters stay at zero because
+nothing was attempted, not because nothing was refused, which is why the
+listing replaces the summary line rather than sitting beside it.
+
+The orphan port-tag listing is the one thing a report cannot produce: a
+candidate is read out of the refusal iceoryx2 raises while REMOVING the node,
+and a report performs no removal. `ORPHAN_TAGS_NOT_LISTED` states that where
+the listing would have been. The dry-run bit still travels to
+`reclaim_orphan_port_tags` as the verb's own mode, so a report can never remove
+a tag even if a future sweep reported a refusal without attempting one.
+
+WHERE THE TESTS LIVE, and why they are split. A bare `cerulion clean` reclaims
+`/tmp/*.shm_state` MACHINE WIDE: `shm_state::SHM_STATE_DIRECTORY` is a
+compile-time constant mirroring `iceoryx2_pal_configuration::TEMP_DIRECTORY`,
+iceoryx2 honours no `TMPDIR`, and no environment variable moves it, so the
+reclaim unlinks every state file whose creator is provably gone whoever owns
+it. No test may run the verb bare. The CLI arms
+(`crates/cerulion_cli/tests/trace_inspect_and_clean_cli_test.rs`) therefore pass
+`--report-only` only and prove what needs the real binary: the lines a user
+reads, and the registry byte for byte beneath them. The destructive direction
+is proven where it CAN be confined, over the isolated root in
+`crates/cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs`: `sweep_dead_nodes_with_config` takes the
+registry config explicitly and never reaches the state-file pass, so
+`SweepMode::Remove` there touches exactly one root and nothing else.
 
 ## 11. Workspace dependencies and compiler compatibility
 

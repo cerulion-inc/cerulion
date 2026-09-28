@@ -1,8 +1,9 @@
 name: rmw distro lanes
 
 # One hosted lane per ROS 2 distro in the support set (Jazzy, the validated distro, as the regression
-# guard; Lyrical, Humble and Foxy as they land), inside the stock ros:<distro>-ros-base image,
-# building rmw_cerulion against that distro's REAL headers (bindgen; the vendored fallback is refused).
+# guard; Lyrical, Humble, Galactic and Foxy as they land), inside the stock ros:<distro>-ros-base
+# image, building rmw_cerulion against that distro's REAL headers (bindgen; the vendored fallback is
+# refused).
 # Each lane asserts the distro's KNOWN state through tools/ci/rmw-distros/gate.sh, so the lane is
 # green while the state is true and turns red the moment the truth moves in either direction.
 # Runs on PRs and pushes to main that touch the rmw path (the crate, its in-tree dependencies, the workspace manifests). No lane is a required context on main, so a
@@ -49,7 +50,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [jazzy, lyrical, humble, foxy]
+        distro: [jazzy, lyrical, humble, galactic, foxy]
     container:
       image: ros:${{ matrix.distro }}-ros-base
       options: --shm-size=1g
@@ -86,15 +87,32 @@ jobs:
           echo "distro header tree hash: $hh over $n files"
       - name: Self-test the gate's log harvester
         run: bash tools/ci/rmw-distros/gate_selftest.sh
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-main-
             cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-
       - name: Gate (expected state for this distro)
         run: bash tools/ci/rmw-distros/gate.sh "${{ matrix.distro }}"
+
+      # Saved as the LAST step so a green job stores what it built, and never from
+      # a merge-queue build: its branch is deleted after the batch, so nothing could
+      # restore what it saved, and the upload only adds eviction pressure on the
+      # store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}

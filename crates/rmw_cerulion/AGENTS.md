@@ -25,7 +25,7 @@ stage `RMW_IMPLEMENTATION`.
   quarantine retires at slot REUSE, never at publish. Every degrade = the copy path, never a
   failed publish.
 - NEVER export an entry point whose types a distro's headers lack: cfg the `extern "C"` fn out
-  WHOLE, never stub it (`nm` audit: `tools/ci/rmw-distros/gate.sh`).
+  WHOLE, never stub it (`rmw_absent_export_table_test`, lane `nm` audit).
 
 ## Testing
 
