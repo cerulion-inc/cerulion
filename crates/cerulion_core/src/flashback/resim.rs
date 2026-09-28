@@ -383,11 +383,21 @@ pub enum ResimGap {
         rings: usize,
         /// Ranks that exist and published no state ring at all, ascending.
         ///
-        /// Carried so this sentence answers the WARN that sent the operator
-        /// to it, exactly as `replay_state`'s `MultiRingAmbiguous` does. Both
-        /// render the clause through [`render_ranks_missing`], so a capture's
-        /// stored `resimmable_reason` and the refusal a resim of that capture
-        /// prints cannot come to say different things about one hole.
+        /// The RECORDER's own live sweep, which is the very set the operator's
+        /// rank warn is computed from, so this sentence answers that warn by
+        /// name.
+        ///
+        /// It is NOT the roster `replay_state`'s `MultiRingAmbiguous` carries,
+        /// and the two are not always equal. That one is read off the BAG's
+        /// `state_coverage.json`, and `StateCoverage::for_capture` writes an
+        /// EMPTY `ranks_missing` on purpose, because a capture walks no rank
+        /// space. So on a capture this stored reason names the hole and a resim
+        /// of that same capture cannot: the recorder looked and the bag did
+        /// not. Both sentences render through one set of words, which keeps the
+        /// WORDING from drifting and was mistaken in an earlier round of this
+        /// work for keeping the RANKS equal. What closes the gap for a reader
+        /// is [`render_rank_hole`], which makes a capture's refusal say that it
+        /// could not look, and name this sentence as the authority.
         ///
         /// EMPTY on a multi-ring recording with no hole, where the clause
         /// renders nothing and the sentence is the one it always was.
@@ -412,9 +422,17 @@ pub enum ResimGap {
 /// carries (through [`ResimGap::MultiRing`]) and the refusal a resim of that
 /// capture prints (`cerulion_cli_engine`'s
 /// `AnchorReadRefusal::MultiRingAmbiguous`). They are the two halves of one
-/// operator journey, and a reader who meets a rank in the first and not in the
-/// second learns that the tool changed its mind. Keeping the words in one place
-/// is what stops that.
+/// operator journey, so the WORDS are written once, here.
+///
+/// One renderer keeps the wording identical. It does NOT make the two sentences
+/// name the same ranks, and reading it as though it did is what an earlier
+/// round of this work got wrong: the two sides build their roster from
+/// DIFFERENT sources. The stored reason takes the recorder's live rank sweep.
+/// The refusal takes the bag's own `state_coverage.json`, which is written with
+/// an empty `ranks_missing` for a capture. They agree wherever both sources
+/// walked the rank space, and on a capture only one of them did, which is why a
+/// capture's refusal must say that it could not look rather than fall silent:
+/// see [`render_rank_hole`].
 ///
 /// EMPTY when there is no hole, so a multi-ring recording without one reads
 /// exactly as it did before this clause existed. The ranks are rendered in the
@@ -432,6 +450,53 @@ pub fn render_ranks_missing(ranks: &[u32]) -> String {
         .join(", ");
     let noun = if ranks.len() == 1 { "rank" } else { "ranks" };
     format!(" ({noun} {list} published none, which is the hole you were warned about)")
+}
+
+/// The clause a refusal appends when the bag it read is a CAPTURE, whose
+/// coverage manifest cannot witness a rank hole at all.
+///
+/// `StateCoverage::for_capture` writes an EMPTY `ranks_missing` on purpose,
+/// because a capture walks no rank space. So an empty roster on a capture is
+/// not the claim "no rank published nothing": it is no claim at all, and
+/// rendering it as silence reads as the first. That silence is what let one
+/// operator journey carry two sentences about one recording, the stored reason
+/// naming a rank and the refusal naming none, with neither saying which of them
+/// had looked.
+///
+/// It names the AUTHORITY rather than restating the hole, because the refusal
+/// genuinely does not know it: the roster that does is the recorder's own
+/// sweep, and the capture stores that as prose in the flashback manifest of
+/// this same bag.
+pub const CAPTURE_RANK_ROSTER_CLAUSE: &str =
+    " (this bag is a CAPTURE, and a capture's coverage manifest walks no rank space, so it names \
+     no rank here whether or not this run had a hole: the authority on that is the \
+     resimmable_reason stored in this same bag's flashback manifest, which `cerulion bag info` \
+     prints)";
+
+/// The rank clause for a reader that knows WHICH kind of bag its roster came from.
+///
+/// Three answers, and the middle one is the correction this exists for:
+///
+/// * a roster naming ranks renders the hole clause, whatever the bag;
+/// * an EMPTY roster read off a CAPTURE renders
+///   [`CAPTURE_RANK_ROSTER_CLAUSE`], because a capture cannot witness a hole
+///   and its silence must not read as "there is none";
+/// * an empty roster read off a RECORDING renders nothing, exactly as it always
+///   did: that manifest's sweep is the one the operator's warn was computed
+///   from, so its silence really is the claim that no rank published nothing.
+///
+/// [`ResimGap::MultiRing`] calls [`render_ranks_missing`] directly and needs no
+/// flag: the roster reaching it is the recorder's own sweep, which walked by
+/// construction. The refusal on the replay side reads whichever manifest the
+/// bag carries, so it is the caller that must state which kind it read.
+pub fn render_rank_hole(ranks_missing: &[u32], from_a_capture: bool) -> String {
+    if !ranks_missing.is_empty() {
+        return render_ranks_missing(ranks_missing);
+    }
+    if from_a_capture {
+        return CAPTURE_RANK_ROSTER_CLAUSE.to_string();
+    }
+    String::new()
 }
 
 impl ResimGap {
@@ -1643,11 +1708,16 @@ mod tests {
     /// named the rank. An operator warned about a RANK, told by `bag info` about
     /// RINGS, and then told by the resim about a rank again has to work out that
     /// all three are one event. Both sentences render the clause through
-    /// [`render_ranks_missing`], so they cannot come to disagree.
+    /// [`render_ranks_missing`], so the WORDS are one set of words.
     ///
-    /// The roster is a RECORDER fact and reaches this judge no other way: a
-    /// capture's own `state_coverage.json` carries an empty `ranks_missing` by
-    /// design, because a capture walks no rank space.
+    /// They are not one ROSTER, and the doc this replaces claimed they were.
+    /// The roster here is a RECORDER fact and reaches this judge no other way:
+    /// a capture's own `state_coverage.json` carries an empty `ranks_missing`
+    /// by design, because a capture walks no rank space. That is exactly the
+    /// manifest the replay side reads, so on a capture this sentence names the
+    /// hole and the refusal cannot. What the refusal does instead is say that
+    /// it did not look and name this sentence as the authority, which is
+    /// [`render_rank_hole`] and the arm below it.
     #[test]
     fn the_stored_multi_ring_reason_names_the_rank_that_published_no_ring() {
         let nodes = vec!["a".to_string()];
@@ -1699,6 +1769,54 @@ mod tests {
             }),
             Ok(()),
             "step 0 needs no anchor, so neither the ring count nor the hole is consulted"
+        );
+    }
+
+    /// An empty roster on a CAPTURE and an empty roster on a RECORDING must not
+    /// render the same, because they are not the same fact.
+    ///
+    /// This is the arm that holds the correction the doc above states. A
+    /// recording's empty roster is its own sweep reporting no hole. A capture's
+    /// empty roster is a manifest that walked no rank space and reports
+    /// nothing either way, while the stored reason built from the recorder's
+    /// sweep may be naming a rank in the very same bag. Rendering both as
+    /// silence is what let those two sentences disagree with nothing to say
+    /// which of them had looked.
+    #[test]
+    fn a_captures_empty_rank_roster_does_not_read_as_no_hole() {
+        assert_eq!(
+            render_rank_hole(&[], false),
+            "",
+            "a RECORDING with no hole renders nothing, exactly as it always did"
+        );
+        assert_eq!(
+            render_rank_hole(&[1], false),
+            render_ranks_missing(&[1]),
+            "and one with a hole renders the hole clause, word for word"
+        );
+
+        let capture = render_rank_hole(&[], true);
+        assert!(
+            capture.contains("walks no rank space"),
+            "a capture says that it could not look: {capture}"
+        );
+        assert!(
+            capture.contains("resimmable_reason"),
+            "and names the sentence that IS the authority for it: {capture}"
+        );
+        assert_ne!(
+            capture,
+            render_rank_hole(&[], false),
+            "the two readings of an empty roster must not render as one sentence"
+        );
+
+        // THE CONTROL on the ORDER of the two questions: a roster that really
+        // does name a rank is evidence whichever manifest carried it, so the
+        // hole clause wins and the capture note is not appended over it.
+        assert_eq!(
+            render_rank_hole(&[1], true),
+            render_ranks_missing(&[1]),
+            "a roster that names a rank is the answer, capture or not"
         );
     }
 

@@ -12667,6 +12667,35 @@ impl Recorder {
         }
     }
 
+    /// The ranks that exist and published no state ring at all, ascending.
+    ///
+    /// TWO readers ask this and each renders an operator sentence from it: the
+    /// rank warn in [`Self::discover_state_rings`], and the roster a capture
+    /// stores in its `resimmable_reason` (see `judge_capture_resimmable`). The
+    /// rule is written here once, so those two sentences cannot come to name
+    /// different ranks for one run.
+    ///
+    /// RECOMPUTED on every call rather than read off `state_rank_gaps_reported`,
+    /// which is a report once ledger and would answer EMPTY on the second
+    /// capture of a run whose hole is still open.
+    ///
+    /// The two sets are NOT interchangeable, and the argument order IS the
+    /// rule: the maximum comes from the ranks the discovery sweep WALKED, and
+    /// membership from every rank this recorder holds a ring for. A hand picked
+    /// `--state-ring` list walked no rank space, so it can prove no hole, and a
+    /// rank that WAS declared is never counted as one that published nothing.
+    /// See `missing_state_ring_ranks_within`, which states both halves.
+    fn state_rank_holes(&self) -> Vec<u32> {
+        cerulion_core::state_ring::missing_state_ring_ranks_within(
+            &self
+                .state_ring_swept_ranks
+                .iter()
+                .copied()
+                .collect::<Vec<u32>>(),
+            &self.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
+        )
+    }
+
     fn discover_state_rings(&mut self) {
         // Cheap once latched; the sweep is the loop that runs while a graph is
         // still coming up, so it is the natural place to keep looking.
@@ -12816,8 +12845,7 @@ impl Recorder {
         // durable half is `StateCoverage::ranks_missing`.
         let _ = found;
         let ranks: Vec<u32> = self.state_ring_ranks.iter().copied().collect();
-        let swept: Vec<u32> = self.state_ring_swept_ranks.iter().copied().collect();
-        for gap in cerulion_core::state_ring::missing_state_ring_ranks_within(&swept, &ranks) {
+        for gap in self.state_rank_holes() {
             if self.state_rank_gaps_reported.insert(gap) {
                 tracing::warn!(
                     tag = %tag,
@@ -16445,6 +16473,13 @@ impl Recorder {
         // ever count UP, and this capture's manifest wants the count as of the
         // close.
         let trace_records_drained = self.trace_records_drained();
+        // Read BEFORE that same borrow, for the same reason stated one step
+        // more precisely: `state_rank_holes` is a method on the RECORDER, over
+        // two of its fields, so it borrows all of `self` and cannot be called
+        // at the manifest site below while the plane's mutable borrow is open.
+        // Its value cannot change under us either: nothing between here and
+        // the manifest sweeps a rank or adopts a ring.
+        let state_rank_holes = self.state_rank_holes();
         let Some(plane) = self.flashback.as_mut() else {
             return;
         };
@@ -17049,20 +17084,13 @@ impl Recorder {
                 // costs is the HOLE above.
                 unreadable: self.rings_unavailable.len() + drain.rings_retired.len(),
             },
-            // The rank holes, by the SAME call the warn above makes over the
-            // SAME two sets, so the sentence a capture stores and the sentence
-            // the operator was warned with name the same ranks. Recomputed
-            // rather than read off `state_rank_gaps_reported`, which is a
-            // report-once ledger and would go EMPTY on the second capture of a
-            // run whose hole is still open.
-            &cerulion_core::state_ring::missing_state_ring_ranks_within(
-                &self
-                    .state_ring_swept_ranks
-                    .iter()
-                    .copied()
-                    .collect::<Vec<u32>>(),
-                &self.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
-            ),
+            // The rank holes, through the SAME method the warn calls, so the
+            // sentence a capture stores and the sentence the operator was
+            // warned with name the same ranks by construction rather than by
+            // two copies of one rule agreeing. See `Self::state_rank_holes`,
+            // which also states why it recomputes, and the read above for why
+            // the call cannot sit here.
+            &state_rank_holes,
         );
         // The earlier handoff, with the seam it left OPEN now CLOSED.
         //
@@ -19539,6 +19567,76 @@ impl Recorder {
                 trace_drain::TraceDrainState::default(),
             )),
         }
+    }
+}
+
+// ===========================================================================
+// The rank-hole roster: the one rule both operator sentences render
+// ===========================================================================
+#[cfg(test)]
+mod state_rank_holes_tests {
+    use super::*;
+
+    /// The roster BOTH operator sentences are rendered from, driven over the
+    /// recorder's own two sets.
+    ///
+    /// The fixture is deliberately ASYMMETRIC, because a symmetric one cannot
+    /// fail: with the swept set equal to the declared set, swapping the two
+    /// arguments and passing either one twice all give the same answer, and an
+    /// arm built on that shape passes against every wrong rule. Here rank 5 is
+    /// DECLARED and never swept, which is the ordinary `--state-ring` shape,
+    /// and it is what makes the three wrong readings disagree with the right
+    /// one.
+    #[test]
+    fn the_rank_roster_takes_its_ceiling_from_the_sweep_and_membership_from_the_rings() {
+        let mut rec = Recorder::rings_only_for_test(Vec::new());
+        // SWEPT rank 2 (so ranks 0 and 1 provably exist), and a rank 5 ring
+        // handed in by name, which walked nothing.
+        rec.state_ring_swept_ranks = [2].into_iter().collect();
+        rec.state_ring_ranks = [2, 5].into_iter().collect();
+
+        let holes = rec.state_rank_holes();
+        assert_eq!(
+            holes,
+            vec![0, 1],
+            "the ceiling is the SWEPT rank, so nothing above it is claimed to exist"
+        );
+
+        // THE SWAP, which is the mutation this arm exists for. Reading the
+        // declared ranks as the sweep claims ranks 3 and 4 exist and published
+        // nothing, on the evidence of a ring an operator named by hand.
+        let swapped = cerulion_core::state_ring::missing_state_ring_ranks_within(
+            &rec.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
+            &rec.state_ring_swept_ranks
+                .iter()
+                .copied()
+                .collect::<Vec<u32>>(),
+        );
+        assert_eq!(
+            swapped,
+            vec![0, 1, 3, 4],
+            "PRECONDITION: the swap must answer differently, or the arm above is vacuous"
+        );
+        assert_ne!(holes, swapped, "so the argument ORDER is what is pinned");
+
+        // THE WRONG SET, the other reachable mutation: the declared ranks used
+        // for both halves, which invents the same two holes the swap does.
+        let declared_twice = cerulion_core::state_ring::missing_state_ring_ranks_within(
+            &rec.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
+            &rec.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
+        );
+        assert_eq!(declared_twice, vec![0, 1, 3, 4]);
+        assert_ne!(holes, declared_twice, "and the CEILING is the swept set");
+
+        // A recorder that swept NOTHING can witness no hole whatever it holds,
+        // which is the half that keeps a hand picked ring list from marking a
+        // bag INCOMPLETE for a shape the operator chose.
+        rec.state_ring_swept_ranks = BTreeSet::new();
+        assert!(
+            rec.state_rank_holes().is_empty(),
+            "no walk, no hole: {:?}",
+            rec.state_rank_holes()
+        );
     }
 }
 

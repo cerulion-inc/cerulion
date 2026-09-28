@@ -115,7 +115,15 @@ impl BagAnchors {
 // capture prints it as the refusal below. Two renderers would let those two
 // sentences drift, and a reader who met a rank in one and not the other would
 // learn that the tool had changed its mind about the recording.
-use cerulion_core::flashback::resim::render_ranks_missing;
+//
+// One renderer is not one ROSTER, which is the correction this import once
+// overstated. The stored reason is built from the recorder's live rank sweep;
+// this side reads the bag's `state_coverage.json`, which carries an empty
+// `ranks_missing` for a capture because a capture walks no rank space. So
+// `render_rank_hole` is what is called here rather than the bare clause: it
+// takes whether this bag is a CAPTURE, and makes a capture's refusal say that
+// it could not look and name the stored sentence as the authority.
+use cerulion_core::flashback::resim::render_rank_hole;
 
 /// Why a bag's anchors cannot be read.
 ///
@@ -157,7 +165,7 @@ pub enum AnchorReadRefusal {
          state to another would produce a confident divergence report about an execution that \
          never happened. Fix: replay a recording of a single rank (`cerulion graph run --record \
          --single-process`)",
-        render_ranks_missing(ranks_missing),
+        render_rank_hole(ranks_missing, *from_a_capture),
         match state_record_format {
             Some(v) => format!("this recording's manifest names state record format version {v}"),
             None => "this recording's manifest names no state record format at all, so it makes \
@@ -179,8 +187,26 @@ pub enum AnchorReadRefusal {
         /// above it each publish a ring, so the operator is warned about a RANK
         /// and then met by a refusal about RINGS, with nothing joining the two.
         /// EMPTY on a multi-ring recording with no hole, where the clause
-        /// renders nothing and the sentence is the one it always was.
+        /// renders nothing and the sentence is the one it always was, AND empty
+        /// on every capture, which is what the flag below exists to separate.
         ranks_missing: Vec<u32>,
+        /// Whether the bag this roster was read off is a flashback CAPTURE.
+        ///
+        /// `ranks_missing` is empty in two unrelated cases and no reader can
+        /// tell them apart from the roster alone: a recording whose sweep ran
+        /// and found no hole, and a capture, whose manifest
+        /// (`StateCoverage::for_capture`) stamps the field empty by design
+        /// because a capture walks no rank space. Without this flag the second
+        /// rendered as the first, so a capture of a holed run carried a stored
+        /// `resimmable_reason` naming the rank while a resim of that same bag
+        /// named none, with neither sentence saying which had looked.
+        ///
+        /// Read from the presence of the capture's own
+        /// `__cerulion/flashback.json`, which is the discriminator this module
+        /// already uses for the same distinction: a `--record` bag carries
+        /// none. It is also where the authoritative sentence lives, so the
+        /// clause can send an operator to a file this very bag holds.
+        from_a_capture: bool,
     },
 
     /// The anchors at the resume step belong to more than one run.
@@ -488,6 +514,25 @@ fn index_table(coverage: &StateCoverage) -> BTreeMap<u32, String> {
 /// refusal below: nothing about an ordinary recording's resume changes.
 const FLASHBACK_MANIFEST_ATTACHMENT: &str = "__cerulion/flashback.json";
 
+/// Is this bag a flashback CAPTURE rather than an ordinary recording?
+///
+/// The attachment's mere PRESENCE is the answer, which is the same rule
+/// [`mixed_capture_identities`] below is gated on and the reason
+/// [`FLASHBACK_MANIFEST_ATTACHMENT`] documents it: a `--record` bag carries
+/// none.
+///
+/// Presence only, and deliberately nothing about the content: a capture whose
+/// manifest is truncated or unparseable is still a capture, and the one thing
+/// this answer is used for is whether an empty rank roster means "no hole" or
+/// "this manifest could not look". Reading it tolerantly and then treating a
+/// damaged manifest as a recording would put the confident answer back.
+fn is_flashback_capture(reader: &BagReader) -> bool {
+    matches!(
+        reader.attachment(FLASHBACK_MANIFEST_ATTACHMENT),
+        Ok(Some(_))
+    )
+}
+
 /// The capture numbers this bag's restore points name, when there is more than
 /// one of them. `None` when the set is whole.
 ///
@@ -564,9 +609,16 @@ pub fn read_bag_anchors(reader: &BagReader) -> Result<BagAnchors, AnchorReadRefu
         return Err(AnchorReadRefusal::MultiRingAmbiguous {
             rings: coverage.rings_declared,
             state_record_format: coverage.state_record_format_version,
-            // Read off the SAME manifest the ring count is, so the refusal and
-            // the recorder's rank warn cannot name different holes.
+            // Read off the SAME manifest the ring count is, which is what
+            // bounds the claim: this refusal can only ever name the hole THIS
+            // BAG witnessed. A capture witnessed none, because
+            // `StateCoverage::for_capture` walks no rank space and writes the
+            // roster empty, so the flag beside it carries that fact into the
+            // sentence rather than leaving an empty roster to read as "no
+            // hole". The recorder's own sweep is the authority there, and a
+            // capture stores it as `resimmable_reason`.
             ranks_missing: coverage.ranks_missing.clone(),
+            from_a_capture: is_flashback_capture(reader),
         });
     }
     // The version gate, BOTH WAYS, and it lives HERE rather than in the parse.
@@ -890,6 +942,9 @@ mod tests {
             rings: cov.rings_declared,
             state_record_format: cov.state_record_format_version,
             ranks_missing: cov.ranks_missing.clone(),
+            // A hand manifest, not a capture: the empty-roster silence here
+            // really is the claim that no rank published nothing.
+            from_a_capture: false,
         };
         let text = refusal.to_string();
         assert!(text.contains("2 state rings"), "{text}");
@@ -938,6 +993,7 @@ mod tests {
             rings: 2,
             state_record_format: None,
             ranks_missing: Vec::new(),
+            from_a_capture: false,
         }
         .to_string();
         assert!(
@@ -962,6 +1018,7 @@ mod tests {
             rings: 2,
             state_record_format: Some(1),
             ranks_missing: Vec::new(),
+            from_a_capture: false,
         }
         .to_string();
         assert!(
@@ -993,6 +1050,7 @@ mod tests {
             rings: holed.rings_declared,
             state_record_format: holed.state_record_format_version,
             ranks_missing: holed.ranks_missing.clone(),
+            from_a_capture: false,
         }
         .to_string();
         assert!(named.contains("2 state rings"), "{named}");
@@ -1008,6 +1066,9 @@ mod tests {
             rings: 2,
             state_record_format: Some(1),
             ranks_missing: Vec::new(),
+            // A RECORDING: this is the no hole control, and it only controls
+            // anything if the manifest under it really could have named one.
+            from_a_capture: false,
         }
         .to_string();
         assert!(
@@ -1027,9 +1088,77 @@ mod tests {
             rings: 2,
             state_record_format: Some(1),
             ranks_missing: vec![1, 3],
+            from_a_capture: false,
         }
         .to_string();
         assert!(two.contains("ranks 1, 3 published none"), "{two}");
+    }
+
+    /// A CAPTURE's manifest walked no rank space, so the refusal says so
+    /// rather than rendering the silence that reads as "no hole".
+    ///
+    /// This is the half the rank clause was missing. `bag info` on a capture of
+    /// a holed run prints a stored `resimmable_reason` naming the rank, because
+    /// that sentence is built from the recorder's own sweep. A resim of the
+    /// same bag reads `state_coverage.json`, which
+    /// `StateCoverage::for_capture` writes with an EMPTY `ranks_missing` by
+    /// design, so it has no rank to name. Two sentences about one recording
+    /// then disagreed about whether a rank published nothing, with neither
+    /// saying which of them had looked.
+    #[test]
+    fn a_manifest_that_walked_no_rank_space_says_so_and_names_the_authority() {
+        // A capture's manifest, built through the production constructor
+        // rather than by hand, so the empty roster under test is the one a
+        // capture really carries.
+        let capture = StateCoverage::for_capture(
+            None,
+            2,
+            Default::default(),
+            0,
+            Default::default(),
+            Default::default(),
+        );
+        assert!(
+            capture.ranks_missing.is_empty() && capture.ranks_discovered.is_empty(),
+            "PRECONDITION: a capture witnesses no rank space, which is the whole case: \
+             {capture:?}"
+        );
+        let text = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: capture.rings_declared,
+            state_record_format: capture.state_record_format_version,
+            ranks_missing: capture.ranks_missing.clone(),
+            from_a_capture: true,
+        }
+        .to_string();
+        assert!(text.contains("2 state rings"), "{text}");
+        assert!(
+            text.contains("walks no rank space"),
+            "the refusal states that it could not look: {text}"
+        );
+        assert!(
+            text.contains("resimmable_reason"),
+            "and names the sentence that is the authority for a capture: {text}"
+        );
+        assert!(
+            !text.contains("published none, which is the hole"),
+            "it must not invent a hole it never witnessed: {text}"
+        );
+
+        // THE CONTROL, and the arm fails without it: a RECORDING keeps the
+        // sentence it always had, with no note about a rank space its own
+        // manifest really could have spoken for.
+        let recording = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: Some(1),
+            ranks_missing: Vec::new(),
+            from_a_capture: false,
+        }
+        .to_string();
+        assert!(
+            !recording.contains("walks no rank space"),
+            "a manifest that could have named a hole says nothing about not \
+             having looked: {recording}"
+        );
     }
 
     #[test]
@@ -1469,7 +1598,11 @@ mod tests {
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
                 state_record_format: Some(1),
-                ranks_missing: Vec::new()
+                ranks_missing: Vec::new(),
+                // This bag DOES carry a flashback manifest (the crafter
+                // above attaches one), so it is a capture and the refusal
+                // must say that its roster could not witness a hole.
+                from_a_capture: true,
             }
         );
 
@@ -1826,7 +1959,8 @@ mod tests {
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
                 state_record_format: Some(1),
-                ranks_missing: Vec::new()
+                ranks_missing: Vec::new(),
+                from_a_capture: false
             },
             "{two_rings:?}"
         );
@@ -1838,7 +1972,8 @@ mod tests {
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
                 state_record_format: None,
-                ranks_missing: Vec::new()
+                ranks_missing: Vec::new(),
+                from_a_capture: false
             },
             "the manifest property is asked before the format: {both:?}"
         );
@@ -1856,7 +1991,8 @@ mod tests {
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
                 state_record_format: Some(2),
-                ranks_missing: Vec::new()
+                ranks_missing: Vec::new(),
+                from_a_capture: false
             },
             "the ring count is asked before the record format, so the capture's \
              own reason is the one served: {newer_and_ambiguous:?}"

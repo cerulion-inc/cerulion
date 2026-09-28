@@ -243,6 +243,22 @@ fn trace_across_the_anchor() -> Vec<TraceRingRecord> {
     out
 }
 
+/// A trace whose FIRST boundary is the run's own step 0.
+///
+/// The one fixture property that matters is the first boundary's step, because
+/// that is what `resolve_resume` reads and what `judge_resimmable` compares
+/// against 0. Built in the same shape as its sibling above, so the pair differs
+/// in the WINDOW and in nothing else.
+fn trace_from_step_zero() -> Vec<TraceRingRecord> {
+    let mut out = Vec::new();
+    for step in 0..=3u64 {
+        out.push(boundary(step));
+        out.push(fire(step, 0));
+        out.push(fire(step, 1));
+    }
+    out
+}
+
 /// The records at or after `boundary(ANCHOR_STEP + 1)` — what the capture MUST
 /// carry, stated independently of the code that trims.
 fn expected_kept() -> Vec<TraceRingRecord> {
@@ -541,10 +557,18 @@ fn capture_inner_full(
     // this function exactly as the primary one is. Declaring a name with no ring
     // behind it would exercise the recorder's degraded-open path instead of the
     // multi-ring one, which is a different arm.
+    //
+    // Each takes its OWN header rank, counting up from the primary ring's 0, so
+    // the shape is the multi RANK deployment these arms are named for rather
+    // than several rings all claiming rank 0, which no real run produces: one
+    // ring per rank is what `process_groups` provisions. A hand stamped
+    // manifest can assert the ring COUNT, and only real rings at real ranks can
+    // assert what a recorder does with them.
     let _extra_state_owners: Vec<StateRingOwner> = (0..extra_state_rings)
         .map(|i| {
             let extra_tag = unique_ring_tag(&format!("st{tag}x{i}"));
-            let owner = StateRingOwner::create(&extra_tag, RING_RECORDS, 0, RUN, &NODES)
+            let rank = i as u32 + 1;
+            let owner = StateRingOwner::create(&extra_tag, RING_RECORDS, rank, RUN, &NODES)
                 .expect("create an extra state ring");
             cfg.state_rings.push(owner.name().to_string());
             owner
@@ -1460,6 +1484,80 @@ fn a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares() 
         reason.contains("state rings") && reason.contains("no rank"),
         "the verdict must report the RING ambiguity the bag declares — the gap resim reaches \
          first — rather than an anchor-shaped reason: {reason}"
+    );
+
+    h.cleanup();
+}
+
+/// A window reaching the run's own step 0 is RESIMMABLE at two REAL state
+/// rings, on two REAL ranks.
+///
+/// This is leg (C) of the six operator sentences' behaviour oracle, over a
+/// recording rather than over a hand stamped manifest. The oracle in
+/// `cerulion_cli_engine` drives the claim end to end and reads the printed line
+/// back, but its two ring bag is a ONE rank fixture whose coverage manifest was
+/// edited to say `rings_declared: 2`: it pins what the REPLAYER does with a
+/// manifest, and it cannot pin what a RECORDER writes into one. So the claim
+/// that the step 0 exception governs both ring counts rested on a stamp, and a
+/// stamp is exactly the thing that cannot show the recorder agreeing.
+///
+/// The PAIR is what carries it, and the sibling is
+/// `a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares`
+/// directly above: the SAME driver, the SAME two real rings at ranks 0 and 1,
+/// the SAME absent anchor, and a trace whose window starts MID RUN. That one
+/// reads `resimmable: false` with the ring ambiguity. This one moves the window
+/// to step 0 and nothing else, and reads `resimmable: true`. Two real
+/// recordings differing in the window alone are what pin the refusal to the
+/// WINDOW rather than to the ring count.
+#[test]
+fn a_two_rank_capture_whose_window_reaches_step_zero_reads_resimmable() {
+    let h = capture_with_extra_state_rings("stepzeromulti", &trace_from_step_zero(), &[], 1);
+
+    let m = flashback_manifest(&h.bag);
+    // PRECONDITIONS. Without all three this arm could read `resimmable: true`
+    // for reasons that have nothing to do with the window: an anchor that
+    // covers everything, a single ring, or a trace that never reached the bag.
+    assert_eq!(
+        m["anchor"]["embedded"],
+        serde_json::json!(false),
+        "PRECONDITION: no anchor is embedded, so nothing but the window can be \
+         carrying the verdict: {m}"
+    );
+    assert_eq!(
+        m["handoff"]["trace_rings_configured"],
+        serde_json::json!(1),
+        "PRECONDITION: one TRACE ring, so the node map is resolvable and the \
+         verdict cannot be reporting the node-map gap: {m}"
+    );
+    assert!(
+        carried_records(&m) > 0,
+        "PRECONDITION: the bag really carries a trace, or the verdict would be \
+         the no-trace one: {m}"
+    );
+
+    assert_eq!(
+        m["anchor"]["resimmable"],
+        serde_json::json!(true),
+        "two REAL state rings and a window reaching step 0: the ring count is \
+         never consulted, because no anchor is read at all: {m}"
+    );
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a verdict states its reason");
+    assert!(
+        reason.contains("step 0"),
+        "and the sentence says WHY, which is the window: {reason}"
+    );
+    assert!(
+        reason.contains("--resim"),
+        "the positive reason tells the operator what to RUN: {reason}"
+    );
+    // THE ANTI-CLAIM: the sibling's sentence must not be the one rendered here.
+    // A verdict that reported the ring ambiguity on this bag would be the very
+    // reading the six sentences were reworded to retire.
+    assert!(
+        !reason.contains("state rings"),
+        "the ring ambiguity is not reached on this window: {reason}"
     );
 
     h.cleanup();
