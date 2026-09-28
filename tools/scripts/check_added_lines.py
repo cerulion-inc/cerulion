@@ -34,9 +34,10 @@ Usage:
   check_added_lines.py --diff FILE
   check_added_lines.py --self-test
 
-`--base` defaults to `origin/main`. `--diff` reads a unified diff from a file or
-from `-` (standard input) instead of running git, which is what the self-test
-drives.
+`--base` defaults to `origin/main`. `--diff` reads a diff from a file or from
+`-` (standard input) instead of running git, which is what the self-test drives.
+THE INPUT IS `git diff` OUTPUT in either mode: a hunk that arrives before any
+`diff --git` file header is refused with exit 2, never read as an empty diff.
 
 Exit codes:
   0  no added line carries a typographic dash, or the self-test passed
@@ -79,18 +80,28 @@ def added_lines(diff_text):
     The line number is the line's position in the NEW file, tracked from each
     hunk header, so the report names a line a maintainer can open. A `+++`
     header is not an added line, and neither is anything outside a hunk.
+
+    A hunk that arrives before any `diff --git` line is a REFUSAL. This reader
+    takes `git diff` output, and a diff it cannot place is a diff whose added
+    lines it cannot find, so it says so rather than reporting nothing.
     """
     out = []
     path = None
     line_number = 0
     in_hunk = False
     in_header = False
+    # A `diff --git` line opened the current file. That is a different fact
+    # from holding a path: a deletion is `+++ /dev/null`, so `path` is None
+    # there too, and a reader that keeps only the path cannot tell a deletion
+    # apart from a diff that names no file at all.
+    header_seen = False
     for raw in diff_text.splitlines():
         if raw.startswith("diff --git "):
             # A file's header opens here and runs to that file's first `@@`.
             in_header = True
             in_hunk = False
             path = None
+            header_seen = True
             continue
         if in_header and raw.startswith("+++ "):
             target = raw[4:].strip()
@@ -100,6 +111,10 @@ def added_lines(diff_text):
         if in_header and raw.startswith("--- "):
             continue
         if raw.startswith("@@"):
+            if not header_seen:
+                raise DiffError(
+                    "check_added_lines: hunk header before any `diff --git` file "
+                    "header; this reader takes `git diff` output")
             # `@@ -<old>,<n> +<new>,<m> @@ <heading>`; the heading is context
             # from the file and must never be read as a diff line.
             marker = raw.split("@@")
@@ -274,9 +289,11 @@ def self_test():
     # line whose CONTENT begins `-- ` (a SQL or Lua comment, a signature
     # separator, a `--` flag in a shell block) is spelled `--- ` in a unified
     # diff, byte for byte a file header. Read as one it closed the hunk, and
-    # every added line after it in that file escaped the gate: a false green in
-    # the one direction this gate exists to close. A reader that closes a hunk
-    # on such a line reports nothing at all for this fixture.
+    # the rest of THAT HUNK escaped the gate: the next `@@` reopens the reader
+    # and restores the line number, so a later hunk of the same file is read
+    # again and a one-hunk file loses every added line after the marker. A
+    # false green in the one direction this gate exists to close. A reader that
+    # closes a hunk on such a line reports nothing at all for this fixture.
     removed_marker = _hunk("db/schema.sql",
                            [" keep",
                             "--- a comment the change removes",
@@ -342,9 +359,12 @@ def self_test():
         [(p, n) for p, n, _, _ in got] == [("a.md", 5), ("b.md", 10)], "-> %r" % (got,))
 
     # A malformed hunk header is a refusal, never a quiet zero: a diff this
-    # reader cannot place is a diff whose added lines it cannot find.
-    for name, text in (("no-new-range", "+++ b/a.md\n@@ -1,1 @@\n+x\n"),
-                       ("no-line-number", "+++ b/a.md\n@@ -1,1 +x,1 @@\n+x\n")):
+    # reader cannot place is a diff whose added lines it cannot find. Each
+    # fixture opens with the `diff --git` line so the refusal it proves is the
+    # RANGE one and not the missing-header one the arms below cover.
+    header = "diff --git a/a.md b/a.md\n"
+    for name, text in (("no-new-range", header + "+++ b/a.md\n@@ -1,1 @@\n+x\n"),
+                       ("no-line-number", header + "+++ b/a.md\n@@ -1,1 +x,1 @@\n+x\n")):
         try:
             added_lines(text)
         except DiffError:
@@ -352,6 +372,43 @@ def self_test():
         else:
             arm("a-malformed-hunk-header-is-refused-%s" % name, False,
                 "-> parsed without a refusal")
+
+    # A DIFF THAT NAMES NO FILE is the same refusal for the same reason. The
+    # `--- `/`+++ ` pair alone is a unified diff any patch tool writes; this
+    # reader takes `git diff`, so a hunk opening with no `diff --git` line in
+    # front of it is a diff it cannot place. Reading it as zero added lines
+    # printed a pass over a diff nothing had scanned.
+    headerless = ("--- a/docs/planted.md\n"
+                  "+++ b/docs/planted.md\n"
+                  "@@ -1,1 +1,2 @@\n"
+                  " keep\n"
+                  "+A sentence %s here.\n" % EM_DASH)
+    try:
+        added_lines(headerless)
+    except DiffError:
+        arm("a-diff-with-no-git-file-header-is-refused", True)
+    else:
+        arm("a-diff-with-no-git-file-header-is-refused", False,
+            "-> parsed without a refusal")
+    # The other side: the same bytes behind the header report the dash, so the
+    # refusal above is about the missing header and not about the content.
+    placed = offending_lines("diff --git a/docs/planted.md b/docs/planted.md\n"
+                             + headerless)
+    arm("the-same-diff-behind-a-git-file-header-reports-the-dash",
+        [(p, n, w) for p, n, w, _ in placed] == [("docs/planted.md", 2, "U+2014")],
+        "-> %r" % (placed,))
+    # A DELETION is not a headerless diff: its header opened the file, its path
+    # is None because the new side is `/dev/null`, and its removed lines are
+    # read and contribute nothing. Refusing on the path rather than on the
+    # header would red every pull request that deletes a file.
+    deletion = ("diff --git a/docs/gone.md b/docs/gone.md\n"
+                "--- a/docs/gone.md\n"
+                "+++ /dev/null\n"
+                "@@ -1,2 +0,0 @@\n"
+                "-A sentence %s here.\n"
+                "-keep\n" % EM_DASH)
+    arm("a-deletion-only-diff-is-clean-and-not-a-refusal",
+        offending_lines(deletion) == [], "-> %r" % (offending_lines(deletion),))
 
     # THE REAL GIT ARM. Everything above is a hand-written diff; this one
     # proves the parser reads the format git actually writes, and that the
@@ -415,7 +472,7 @@ def run(argv):
     parser.add_argument("--repo", default=".", metavar="DIR",
                         help="the repository to diff in (default: the working directory)")
     parser.add_argument("--diff", metavar="FILE",
-                        help="read a unified diff from FILE, or `-` for stdin, instead of git")
+                        help="read `git diff` output from FILE, or `-` for stdin, instead of git")
     parser.add_argument("--self-test", action="store_true",
                         help="run the self-test and exit")
     args = parser.parse_args(argv)
