@@ -106,6 +106,19 @@
 //! workflows by
 //! `a_selection_condition_credits_nothing_when_its_output_is_not_grounded`.
 //!
+//! THE GUARD, OWED BY EVERY DEPENDANT OF THE CLASSIFIER. A job that `needs:`
+//! the `changes` job is SKIPPED when that job fails, and branch protection
+//! counts a skipped required context as SATISFIED, so the pull request merges
+//! with that job's contexts never run. Every dependant therefore carries a
+//! job-level `if:` that OPENS with `!cancelled()`: `${{ !cancelled() }}` on the
+//! four test jobs, and `!cancelled() && ...` where the job keeps a gate of its
+//! own. The population is the dependency, never the spelling of one step: a job
+//! reading the selection only through `env:`, and a job whose gate is a folded
+//! block scalar, owe the guard exactly as much as a job with a one-line `if:`.
+//! Whether a guarded job is PR-blocking is a separate question, decided by
+//! `job_is_gated` and pinned by
+//! `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+//!
 //! The producing rule reads the script TEXT, so `ci.yml`'s own `changes` job
 //! grounds today only because its non-pull-request branch spells
 //! `packaging=false` literally, its pull-request branch piping
@@ -3669,33 +3682,76 @@ fn a_gated_step_without_its_marker_is_a_red_walker() {
     assert_eq!(trouble.len(), 1, "-> {trouble:?}");
 }
 
-/// Every job that gates a step on the selection guards itself with
-/// `!cancelled()`.
+/// The call every dependant of the classifier has to open its job condition
+/// with, and the separator that follows it when the job keeps a gate of its
+/// own.
+const GUARD_CALL: &str = "!cancelled()";
+const GUARD_CALL_AND: &str = "!cancelled() && ";
+
+/// One condition as a single normalised expression: the `${{ }}` wrapper off,
+/// runs of whitespace down to one space.
 ///
-/// WHY THIS IS THE SEVEREST ARM IN THE FILE. A job that gates a step on the
-/// selection must `needs:` the classifier to read its outputs. GitHub SKIPS a
-/// dependant when its dependency fails, and branch protection counts a SKIPPED
-/// required context as SATISFIED: a classifier that failed for any reason, a
-/// checkout, a resolve, a typo in the script, would skip four jobs carrying
-/// eleven of the twenty required contexts and the pull request would merge with
-/// none of them run. `!cancelled()` is the one job-level condition that makes
-/// the job run anyway; `pkgs` is then the empty string, `fromJSON('')` is an
-/// expression error, the step fails and the job reds.
+/// A job condition means the same thing spelled `${{ expr }}` on one line and
+/// spelled `expr` in a folded block scalar, and `ci.yml` uses both.
+fn condition_expression(cond: &str) -> String {
+    let trimmed = cond.trim();
+    let inner = trimmed
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .unwrap_or(trimmed);
+    inner.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Does this job condition keep the job running when a job it `needs:` FAILED?
 ///
-/// The other direction is checked too: a job with no selection gate owes no
-/// guard, so the rule cannot be satisfied by pasting `!cancelled()` everywhere.
+/// Exactly `!cancelled()`, or `!cancelled()` as the FIRST term of an `&&`
+/// chain, which is `deb-smoke`'s shape. Nothing else: `success() &&
+/// !cancelled()` carries the call and still skips on a failed dependency,
+/// which is the whole fault.
+fn condition_survives_a_failed_dependency(cond: &str) -> bool {
+    let expr = condition_expression(cond);
+    expr == GUARD_CALL || expr.starts_with(GUARD_CALL_AND)
+}
+
+/// Every dependant of the classifier that does NOT guard itself against the
+/// classifier failing.
+///
+/// WHY THIS IS THE SEVEREST ARM IN THE FILE. GitHub SKIPS a dependant when its
+/// dependency fails, and branch protection counts a SKIPPED required context as
+/// SATISFIED: a classifier that failed for any reason, a checkout, a resolve, a
+/// typo in the script, would skip four jobs carrying eleven of the twenty
+/// required contexts and the pull request would merge with none of them run. A
+/// condition opening with `!cancelled()` makes the job run anyway; `pkgs` is
+/// then the empty string, `fromJSON('')` is an expression error, the step fails
+/// and the job reds.
+///
+/// THE POPULATION IS EVERY DEPENDANT, not every job with a one-line gate. A job
+/// that `needs:` the classifier is skipped by a classifier failure however it
+/// consumes the outputs, and `ci.yml` already passes the selection as a plain
+/// `env:` value on two steps. The step gates are read too, through
+/// [`step_if_of`], so a gate spelled as a folded block scalar counts like any
+/// other; a form that reader cannot classify counts as a gate as well, so an
+/// unreadable condition makes the job owe the guard instead of escaping it.
+///
+/// The other direction is checked too: a job that neither needs the classifier
+/// nor gates on the selection owes no guard, so the rule cannot be satisfied by
+/// pasting `!cancelled()` everywhere.
 fn jobs_missing_the_not_cancelled_guard(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (job, block) in jobs_of(text) {
-        let gates = block
-            .lines()
-            .filter(|l| !l.trim().starts_with('#'))
-            .any(|l| l.contains(SELECTION_PKG_IF_OPEN) && l.trim_start().starts_with("if:"));
-        if !gates {
+        let depends = job_needs(&block).iter().any(|n| n == SELECTION_JOB);
+        let gates = step_blocks(&block).iter().any(|step| match step_if_of(step) {
+            Ok(Some(cond)) => cond.contains(SELECTION_PKG_IF_OPEN),
+            Ok(None) => false,
+            Err(_) => true,
+        });
+        if !(depends || gates) {
             continue;
         }
-        let guarded =
-            matches!(job_if_of(&block), Some(Ok(cond)) if cond.trim() == JOB_IF_NOT_CANCELLED);
+        let guarded = matches!(
+            job_if_of(&block),
+            Some(Ok(cond)) if condition_survives_a_failed_dependency(&cond)
+        );
         if !guarded {
             out.push(job);
         }
@@ -3720,12 +3776,14 @@ fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
     }
     assert!(
         complaints.is_empty(),
-        "these jobs gate a step on the selection and do NOT carry \
-         `if: {JOB_IF_NOT_CANCELLED}`:\n{}\n\nSuch a job `needs:` the \
-         `{SELECTION_JOB}` job, GitHub skips a dependant of a FAILED job, and a \
-         skipped required context reads as satisfied. Without the guard a \
-         classifier failure is a silent green around every context this job \
-         reports.",
+        "these jobs depend on the `{SELECTION_JOB}` job, or gate a step on the \
+         selection, and their job-level `if:` does not open with \
+         `{GUARD_CALL}`:\n{}\n\nGitHub skips a dependant of a FAILED job and a \
+         skipped required context reads as satisfied, so without the guard a \
+         classifier failure is a silent green around every context these jobs \
+         report. `{JOB_IF_NOT_CANCELLED}` is the shape a job with no gate of its \
+         own carries; a job keeping its own gate spells it \
+         `{GUARD_CALL_AND}<the rest>`.",
         complaints.join("\n")
     );
     assert!(
@@ -3733,6 +3791,22 @@ fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
         "only {guarded} job(s) carry the guard: the four jobs that gate steps on \
          the selection each need it, so either the reader is broken or the \
          guards were removed"
+    );
+    // The population is not empty, so an emptied reader is not a pass. Five
+    // jobs of `ci.yml` need the classifier today.
+    let dependants: usize = workflow_texts()
+        .values()
+        .map(|text| {
+            jobs_of(text)
+                .iter()
+                .filter(|(_, block)| job_needs(block).iter().any(|n| n == SELECTION_JOB))
+                .count()
+        })
+        .sum();
+    assert!(
+        dependants >= 5,
+        "only {dependants} job(s) name `{SELECTION_JOB}` in `needs:`: the rule \
+         above is judging a population the reader is no longer finding"
     );
 }
 
@@ -3756,21 +3830,42 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
         Vec::<String>::new(),
         "the guard satisfies the rule"
     );
-    // A condition that merely CONTAINS the call is not the guard: it can stop
-    // the job on a pull request, which is the fault the rule exists for.
+    // A condition that OPENS with the call keeps the job running when the
+    // classifier failed, so it satisfies THIS rule; whether such a job is
+    // PR-blocking is the separate question `job_is_gated` decides, pinned by
+    // `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
     assert_eq!(
         jobs_missing_the_not_cancelled_guard(&job(
             "    if: ${{ !cancelled() && github.event_name != 'pull_request' }}\n"
         )),
-        vec!["j".to_string()],
-        "a wider condition is not the guard"
+        Vec::<String>::new(),
+        "a condition opening with the call still runs on a failed dependency"
     );
-    // The other side: a job with NO selection gate owes nothing.
+    // Carrying the call somewhere else is not opening with it: `success()` is
+    // false the moment the classifier fails, so this job skips exactly when the
+    // guard is meant to save it.
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(
+            "    if: ${{ success() && !cancelled() }}\n"
+        )),
+        vec!["j".to_string()],
+        "the call has to OPEN the condition"
+    );
+    // And a condition with no such call at all is named.
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(
+            "    if: ${{ github.event_name != 'pull_request' }}\n"
+        )),
+        vec!["j".to_string()],
+        "an ordinary event test is not the guard"
+    );
+    // The other side: a job that neither needs the classifier nor gates on the
+    // selection owes nothing.
     let ungated = "  j:\n    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
     assert_eq!(
         jobs_missing_the_not_cancelled_guard(ungated),
         Vec::<String>::new(),
-        "a job with no selection gate owes no guard"
+        "a job that is no dependant and carries no selection gate owes no guard"
     );
     // A gate spelled inside a COMMENT gates nothing, so it demands no guard.
     let commented = format!(
@@ -3781,6 +3876,51 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
         jobs_missing_the_not_cancelled_guard(&commented),
         Vec::<String>::new(),
         "a gate inside a comment gates nothing"
+    );
+
+    // A DEPENDANT THAT CARRIES NO GATE AT ALL. `ci.yml` already hands the
+    // selection to two steps as a plain `env:` value, and the shard runner
+    // intersects it script-side, so a job built that way has no `if:` naming
+    // the selection and is skipped by a classifier failure just the same.
+    let env_only = format!(
+        "  j:\n    needs: [{SELECTION_JOB}]\n    env:\n      CI_SELECTED_PACKAGES: ${{{{ \
+         needs.{SELECTION_JOB}.outputs.pkgs }}}}\n    steps:\n      - name: alpha tests\n        \
+         run: ./tools/scripts/ci_test_shard.sh alpha\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&env_only),
+        vec!["j".to_string()],
+        "a dependant consuming the selection through `env:` still owes the guard"
+    );
+
+    // A GATE SPELLED AS A FOLDED BLOCK SCALAR. The workflows spell compound
+    // conditions this way throughout, and the marker rule beside this one
+    // already reads every scalar form; a reader that needs both halves on one
+    // line drops the job out of the population.
+    let folded = format!(
+        "  j:\n    steps:\n      - name: alpha tests\n        if: >-\n          {gate}\n        \
+         run: cargo test -p alpha\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&folded),
+        vec!["j".to_string()],
+        "a gate spelled as a folded block scalar is still a gate"
+    );
+
+    // THE PACKAGING JOB'S SHAPE, accepted: it needs the classifier, it keeps a
+    // gate of its own, and it opens with the call, so a classifier failure
+    // leaves it running with an empty `packaging` and it skips on its own
+    // terms rather than on GitHub's.
+    let packaging = format!(
+        "  deb-smoke:\n    needs: [{SELECTION_JOB}]\n    if: >-\n      !cancelled()\n      \
+         && ((github.event_name != 'pull_request' && github.event_name != 'merge_group')\n      \
+         || (github.event_name == 'pull_request' && needs.{SELECTION_JOB}.outputs.packaging == \
+         'true'))\n    steps:\n      - name: smoke\n        run: ./tools/scripts/build_deb.sh\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&packaging),
+        Vec::<String>::new(),
+        "a dependant whose own gate follows the call is guarded"
     );
 }
 
