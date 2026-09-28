@@ -616,15 +616,18 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
       - name: Check formatting
@@ -858,6 +861,20 @@ jobs:
   # aarch64-macOS machines). `cargo check` (no link, no cross C/C++ toolchain
   # needed) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
   # cost on the critical path.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   cross-aarch64-linux:
     name: Cross-check (aarch64-linux)
     runs-on: ubuntu-latest
@@ -875,8 +892,9 @@ jobs:
           toolchain: stable
           targets: aarch64-unknown-linux-gnu
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -904,6 +922,20 @@ jobs:
   # the floor.
   # Runs in PARALLEL (no `needs:`) — off the critical path. STABLE, not the
   # PINNED_NIGHTLY used by fuzz/miri.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}
   msrv:
     name: MSRV (1.93)
     runs-on: ubuntu-latest
@@ -920,8 +952,9 @@ jobs:
         with:
           toolchain: 1.93.0
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -939,6 +972,20 @@ jobs:
   # them — without this gate they rot invisibly against macro/runtime API
   # changes. `cargo check` per example workspace is the cheap blocking
   # check: an example that does not compile fails CI.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}
   examples:
     name: Examples (cargo check)
     runs-on: ubuntu-latest
@@ -956,15 +1003,18 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             examples/*/target
-          key: cargo-examples-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'examples/**/Cargo.toml') }}
+          key: cargo-examples-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/**/Cargo.toml') }}
           restore-keys: |
+            cargo-examples-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-examples-${{ runner.os }}-main-
             cargo-examples-${{ runner.os }}-
 
       # Each example is its OWN workspace with its OWN lockfile + target dir
@@ -1013,6 +1063,20 @@ jobs:
   # property this job also proves. `--test loopback_e2e_test` is therefore NOT
   # run: it is the rig that needs GStreamer at runtime, and without the feature it deliberately FAILS
   # rather than reporting a vacuous `0 passed` (see its module docs).
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            examples/*/target
+          key: cargo-examples-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/**/Cargo.toml') }}
   demos-go2:
     name: Demo workspace (examples/go2)
     # THIS JOB NEEDS MULTICAST. `cargo test --workspace` below runs `dds_bridge
@@ -1067,15 +1131,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libudev-dev
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             examples/go2/target
-          key: cargo-examples-go2-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'examples/go2/**/Cargo.toml') }}
+          key: cargo-examples-go2-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/go2/**/Cargo.toml') }}
           restore-keys: |
+            cargo-examples-go2-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-examples-go2-${{ runner.os }}-main-
             cargo-examples-go2-${{ runner.os }}-
 
       # COMPILE EVERYTHING FIRST — `--tests`, because a plain `cargo build`
@@ -1187,6 +1254,20 @@ jobs:
   # within one runner it is the fence, not a flag, that keeps the namespace
   # binaries apart.
 
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            examples/go2/target
+          key: cargo-examples-go2-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/go2/**/Cargo.toml') }}
   test-linux:
     name: Test (Linux) shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
@@ -1325,17 +1406,41 @@ jobs:
           toolchain: stable
 
       # ONE SAVER, CHOSEN RATHER THAN RACED. All four legs of this matrix share
-      # `cargo-${{ runner.os }}-<lockhash>`, and `actions/cache` RESERVES a key
-      # at save time: whichever leg finishes first wins, the other three upload
-      # a multi-gigabyte archive that is then rejected ("another job may be
-      # creating this cache"), and the archive that lands is whichever leg's
+      # `cargo-${{ runner.os }}-<main|pr>-<lockhash>`, and `actions/cache` RESERVES
+      # a key at save time: whichever leg finishes first wins, the other three
+      # upload a multi-gigabyte archive that is then rejected ("another job may
+      # be creating this cache"), and the archive that lands is whichever leg's
       # `target/` happened to be newest — arbitrary, and different run to run.
       # Shard 0 saves; shards 1-3 restore only.
       #
       # NOT a per-shard key, deliberately: `target/` for this workspace runs to
-      # several GB, GitHub evicts a repository's caches against a 10 GB total,
-      # and four archives per OS per lockfile would have the shards evicting
-      # each other AND every other job's namespace. One archive, one writer.
+      # several GB, GitHub evicts a repository's caches against a store limit,
+      # and one archive per shard per OS per lockfile would have the shards
+      # evicting each other AND every other job's namespace. One archive, one
+      # writer.
+      #
+      # BRANCH-QUALIFIED (`main` on a push to `main`, `pr` on every other ref),
+      # from a measured failure rather than a theory. On a run on `main` EVERY
+      # caching job restored nothing ("Cache not found for input keys") and was
+      # then refused at save ("Unable to reserve cache with key ... another job
+      # may be creating this cache") -- including the two crate-test jobs, whose
+      # keys no other job in the run writes, so a race between this run's own
+      # jobs cannot be the cause. The store meanwhile held entries under those
+      # same keys, all created from pull-request and merge-queue refs. A key is
+      # reserved once per repository, and a run on `main` may restore only
+      # entries created on `main`: so while a pull request holds the key for the
+      # current lockfile, `main` can neither read that archive nor write its
+      # own, and it had done neither for two days. With the ref in the key the
+      # two never contend. `restore-keys` lists a run's own qualified prefix,
+      # then the `main` prefix (a pull request or merge-queue build reads
+      # `main`'s archive when it has none of its own), then the legacy bare
+      # prefix so the first runs after this change still restore the existing
+      # archives instead of building cold; the bare prefix decays on its own
+      # once nothing writes it. Two consequences a reader should expect: the
+      # first run on `main` after this change builds cold and saves; and a
+      # pull-request or merge-queue run now SAVES on every run (its key can
+      # never equal `main`'s, so it never skips as an exact hit), which adds
+      # upload volume against the repository's cache store.
       #
       # WHICH leg writes is a FIXED PICK, not a measured optimum, and shard 0
       # is a defensible one rather than the best one. It carries `--lib` and
@@ -1360,16 +1465,19 @@ jobs:
       # (On Linux `lint` normally reserves this key first and every save here is
       # skipped as an exact hit; there is no `lint` leg on macOS, which is where
       # the race actually bit.)
-      - name: Cache cargo (shard 0 is the saver)
+      - name: Cache cargo, shard 0 saves (restore)
+        id: cache-restore-1
         if: matrix.shard == 0
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
       - name: Restore cargo (shards 1-3, no save)
@@ -1380,8 +1488,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
@@ -1836,6 +1946,20 @@ jobs:
   # shard 2 gets the lightest package set. Re-tilt if a run shows the legs
   # more than 5 min apart WITH THE SAME CACHE STATE (comparing a warm leg
   # against a cold one measures the cache, not the map).
+
+      # Saved as the LAST step so a green shard 0 stores what it built, and
+      # never from a merge-queue build: its branch is deleted after the batch,
+      # so nothing could restore what it saved, and the upload only adds
+      # eviction pressure on the store.
+      - name: Cache cargo, shard 0 saves (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && matrix.shard == 0 && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
@@ -1929,19 +2053,43 @@ jobs:
         with:
           toolchain: stable
 
-      # ONE SAVER, CHOSEN RATHER THAN RACED. Both legs of this matrix share
-      # `cargo-${{ runner.os }}-<lockhash>`, and `actions/cache` RESERVES a key
-      # at save time: whichever leg finishes first wins, the other uploads a
-      # multi-gigabyte archive that is then rejected ("another job may be
+      # ONE SAVER, CHOSEN RATHER THAN RACED. All three legs of this matrix share
+      # `cargo-${{ runner.os }}-<main|pr>-<lockhash>`, and `actions/cache` RESERVES
+      # a key at save time: whichever leg finishes first wins, the other uploads
+      # a multi-gigabyte archive that is then rejected ("another job may be
       # creating this cache"), and the archive that lands is whichever leg's
       # `target/` happened to be newest — arbitrary, and different run to run.
       # Shard 0 saves; shards 1-2 restore only. (This job runs three shards; the
       # Linux twin above runs four, and its copy of this block says "four".)
       #
       # NOT a per-shard key, deliberately: `target/` for this workspace runs to
-      # several GB, GitHub evicts a repository's caches against a 10 GB total,
-      # and four archives per OS per lockfile would have the shards evicting
-      # each other AND every other job's namespace. One archive, one writer.
+      # several GB, GitHub evicts a repository's caches against a store limit,
+      # and one archive per shard per OS per lockfile would have the shards
+      # evicting each other AND every other job's namespace. One archive, one
+      # writer.
+      #
+      # BRANCH-QUALIFIED (`main` on a push to `main`, `pr` on every other ref),
+      # from a measured failure rather than a theory. On a run on `main` EVERY
+      # caching job restored nothing ("Cache not found for input keys") and was
+      # then refused at save ("Unable to reserve cache with key ... another job
+      # may be creating this cache") -- including the two crate-test jobs, whose
+      # keys no other job in the run writes, so a race between this run's own
+      # jobs cannot be the cause. The store meanwhile held entries under those
+      # same keys, all created from pull-request and merge-queue refs. A key is
+      # reserved once per repository, and a run on `main` may restore only
+      # entries created on `main`: so while a pull request holds the key for the
+      # current lockfile, `main` can neither read that archive nor write its
+      # own, and it had done neither for two days. With the ref in the key the
+      # two never contend. `restore-keys` lists a run's own qualified prefix,
+      # then the `main` prefix (a pull request or merge-queue build reads
+      # `main`'s archive when it has none of its own), then the legacy bare
+      # prefix so the first runs after this change still restore the existing
+      # archives instead of building cold; the bare prefix decays on its own
+      # once nothing writes it. Two consequences a reader should expect: the
+      # first run on `main` after this change builds cold and saves; and a
+      # pull-request or merge-queue run now SAVES on every run (its key can
+      # never equal `main`'s, so it never skips as an exact hit), which adds
+      # upload volume against the repository's cache store.
       #
       # WHICH leg writes is a FIXED PICK, not a measured optimum, and shard 0
       # is a defensible one rather than the best one. It carries `--lib` and
@@ -1961,16 +2109,19 @@ jobs:
       # (On Linux `lint` normally reserves this key first and every save here is
       # skipped as an exact hit; there is no `lint` leg on macOS, which is where
       # the race actually bit.)
-      - name: Cache cargo (shard 0 is the saver)
+      - name: Cache cargo, shard 0 saves (restore)
+        id: cache-restore-1
         if: matrix.shard == 0
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
       - name: Restore cargo (shards 1-2, no save)
@@ -1981,8 +2132,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
@@ -2245,6 +2398,20 @@ jobs:
   # bought for. 40 is 2.4x it, and it still guards a HUNG job rather than
   # rationing a healthy one, which is the rule this file applies everywhere.
   # ==========================================================================
+
+      # Saved as the LAST step so a green shard 0 stores what it built, and
+      # never from a merge-queue build: its branch is deleted after the batch,
+      # so nothing could restore what it saved, and the upload only adds
+      # eviction pressure on the store.
+      - name: Cache cargo, shard 0 saves (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && matrix.shard == 0 && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   crate-tests:
     name: Crate tests (${{ matrix.os }})
     needs: [lint]
@@ -2299,15 +2466,18 @@ jobs:
       # `cargo-${{ runner.os }}-` archive does not carry under this job's
       # profile, and writing them into that shared archive would grow a restore
       # every other job pays for. Same argument as `viz-tests`.
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-crates-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-crates-${{ runner.os }}-main-
             cargo-crates-${{ runner.os }}-
 
       # One step per package, deliberately: a single multi-`-p` invocation
@@ -2377,6 +2547,20 @@ jobs:
   # Accepted tradeoff: a PR that breaks release-only-compiled code
   # surfaces on main rather than on the PR. Use workflow_dispatch to run
   # it pre-merge when a PR touches release-gated code.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   test-latency:
     name: Latency Threshold (Linux)
     runs-on: ubuntu-latest
@@ -2401,8 +2585,9 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -2498,6 +2683,20 @@ jobs:
   # in release, several minutes per platform). It complements the in-process
   # `graph_latency_test` in the Linux-only `test-latency` job — this dedicated
   # matrix job is what gives the CLI-driven path its macOS coverage.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
   cli-e2e-latency:
     name: CLI E2E Graph Latency
     # Allowlist (not `!= 'pull_request'`), same as `test-latency` and for the
@@ -2535,8 +2734,9 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -2559,6 +2759,24 @@ jobs:
         run: cargo test -p cerulion_core --test cli_e2e_graph_latency_test --release -- --test-threads=1 --nocapture
 
   # Fuzz testing (Linux-only, nightly toolchain)
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Release-mode job: use the `cargo-release-` namespace (like
+          # test-latency) so it never shares a cache with the debug-profile
+          # test-linux/test-macos jobs — a debug restore would force a full
+          # release rebuild and risk tripping the 30-min timeout.
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
   fuzz:
     name: Fuzz (Linux)
     runs-on: ubuntu-latest
@@ -2580,8 +2798,9 @@ jobs:
 
       # Cache restore must precede the cargo-fuzz install so a warm
       # ~/.cargo/bin/cargo-fuzz skips the from-source compile entirely.
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -2637,6 +2856,21 @@ jobs:
   # 12+ consecutive CI runs across main + PRs (the FFI-free scope on the
   # PINNED_NIGHTLY is stable). If a future nightly / iceoryx2 bump breaks
   # Miri, fix or re-pin rather than silently reverting to non-blocking.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+            target
+          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
   miri:
     name: Miri (Linux, scoped to FFI-free tests)
     runs-on: ubuntu-latest
@@ -2660,8 +2894,9 @@ jobs:
       # target/ holds the Miri-interpreted dep builds and ~/.cache/miri
       # holds the Miri sysroot — without both, every run recompiles the
       # entire dependency tree under the (slow) interpreter from scratch.
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -2688,6 +2923,21 @@ jobs:
           --test max_slice_len_newtype_test
 
   # Documentation check
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/miri
+            target
+          key: cargo-miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
   docs:
     name: Documentation
     runs-on: ubuntu-latest
@@ -2725,15 +2975,18 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
       - name: Check documentation
@@ -2749,6 +3002,20 @@ jobs:
   # compiling. It still compiles the iroh tree COLD on its own budget, keeping the
   # explicit-feature + lean-variant analysis OFF the tight `lint`/`docs` gates. Pure
   # analysis (clippy + doc), so no debuginfo. It gates NO other job.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   netd-wan:
     name: netd WAN (clippy + docs, --features wan)
     runs-on: ubuntu-latest
@@ -2779,15 +3046,18 @@ jobs:
           toolchain: stable
           components: clippy
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
       - name: Clippy (cerulion_netd --features wan)
@@ -3003,6 +3273,20 @@ jobs:
   # tree, which is the bulk of it. What it halves is the TEST time and the LINK
   # output (the viz lane links its ~29 rerun-carrying test binaries, the vizd
   # lane its own), which is exactly the part that had been growing.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
     needs: [lint]
@@ -3136,15 +3420,18 @@ jobs:
       #
       # COST: one additional ~1.7 GB entry per ref (the repo measured 37.0 GB
       # over 50 active entries in the reviewed cache inventory, and GitHub evicts by LRU + 7 days).
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-viz-${{ matrix.lane }}-${{ runner.os }}-main-
             cargo-viz-${{ matrix.lane }}-${{ runner.os }}-
             cargo-viz-${{ runner.os }}-
 
@@ -3273,6 +3560,20 @@ jobs:
   #
   # Resolve-only against the manifests; no compile, no cargo cache, no `needs:`
   # gate. Runs in PARALLEL and gates nothing.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   machete:
     name: Unused dependencies (cargo-machete, non-blocking)
     runs-on: ubuntu-latest
@@ -3293,8 +3594,9 @@ jobs:
       # `~/.cargo/bin` only: machete resolves nothing and builds nothing, so a
       # warm binary is the whole cache. Same shape as the `fuzz` job's
       # `cargo-fuzz` restore.
-      - name: Cache cargo-machete
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Cache cargo-machete (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/bin/cargo-machete
           key: cargo-machete-bin-${{ runner.os }}-v0.9.2
@@ -3317,6 +3619,17 @@ jobs:
   # binary, so the config flag and the policy file mean the same thing in
   # both places. No Rust toolchain, no cargo cache, no `needs:` gate.
   # Policy lives in tools/release/deny.toml. Blocking by design.
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo-machete (save)
+        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-machete
+          key: cargo-machete-bin-${{ runner.os }}-v0.9.2
   deps:
     name: Dependency Audit (cargo-deny)
     runs-on: ubuntu-latest
