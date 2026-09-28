@@ -43,11 +43,11 @@ set -u
 # that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run; 33 and 479
 # with the two vendored-gate binaries) with margin for
 # targets that come and go; a lane that silently loses half its binaries lands below the floor.
-# The ten entry points Foxy's rmw headers do not declare, every callback named so no count can
-# stand in for the list: rmw_event_set_callback, rmw_subscription_set_on_new_message_callback,
-# rmw_service_set_on_new_request_callback and rmw_client_set_on_new_response_callback (Humble),
-# the two content filter calls (Humble), rmw_feature_supported (Humble), and
-# rmw_qos_profile_check_compatible plus the two network flow calls (Galactic).
+# The ten entry points Foxy's rmw headers do not declare: rmw_event_set_callback,
+# rmw_subscription_set_on_new_message_callback, rmw_service_set_on_new_request_callback and
+# rmw_client_set_on_new_response_callback (Humble), the two content filter calls (Humble),
+# rmw_feature_supported (Humble), and rmw_qos_profile_check_compatible plus the two network
+# flow calls (Galactic).
 foxy_absent_symbols="rmw_event_set_callback
 rmw_subscription_set_on_new_message_callback
 rmw_service_set_on_new_request_callback
@@ -63,9 +63,9 @@ rmw_feature_supported"
 # gives each capability the era whose headers introduced it. A distro lacks exactly the exports
 # whose capability is LATER than its own era, so Galactic's list is Foxy's without the three
 # Galactic-era entry points (qos_compatibility, network_flow): the event_callback exports, the
-# content_filter_options exports and rmw_feature_supported (features), all Humble. Seven. No row
-# is trusted to this comment: crates/rmw_cerulion/tests/rmw_absent_export_table_test.rs recomputes
-# every row's list from the guarded exports and the era tables and fails on any difference.
+# content_filter_options exports and rmw_feature_supported (features), all Humble. Seven.
+# crates/rmw_cerulion/tests/rmw_absent_export_table_test.rs recomputes every row's list from the
+# guarded exports and the era tables and fails on any difference.
 galactic_absent_symbols="rmw_event_set_callback
 rmw_subscription_set_on_new_message_callback
 rmw_service_set_on_new_request_callback

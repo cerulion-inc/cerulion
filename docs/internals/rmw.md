@@ -159,8 +159,8 @@ build.rs layers three era probes on top of the source selection:
   decides the EXPORT set: an entry point whose parameter type a distro's headers do not
   declare is compiled out WHOLE under its capability cfg, never stubbed, because rcl
   resolves rmw symbols by name and a defined symbol is a claim the headers cannot back.
-  Ten exports sit behind such a cfg, every callback named so no count can stand in for
-  the list: `rmw_event_set_callback`, `rmw_subscription_set_on_new_message_callback`,
+  Ten exports sit behind such a cfg: `rmw_event_set_callback`,
+  `rmw_subscription_set_on_new_message_callback`,
   `rmw_service_set_on_new_request_callback` and
   `rmw_client_set_on_new_response_callback`, the two content filter calls and
   `rmw_feature_supported` from Humble; `rmw_qos_profile_check_compatible` and the two
