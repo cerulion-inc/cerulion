@@ -202,20 +202,30 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Does this crate carry its own `tests/` directory beside its manifest?
+/// Does the tree the inventories actually walk sit beside this crate?
 ///
-/// The fact that separates a packaged copy from a checkout, and it is a fact
-/// about THIS crate rather than about the directory tree it was unpacked into.
-/// `cerulion_core`'s `include` is
-/// `["src/", "build.rs", "Cargo.toml", "README.md", "LICENSE"]`, so `tests/` is
-/// not packaged: measured on `cargo package --list`, zero of the 131 entries
-/// are under `tests/`.
+/// The fact that separates the repository from BOTH ways this file can end up
+/// outside it, and it is the fact the arms depend on: every inventory here
+/// walks `crates/<other crate>`, so if the siblings are not there the arms have
+/// nothing to read whatever any manifest says.
 ///
-/// Deliberately NOT a lockfile. A published crate SHIPS `Cargo.lock` (it is
-/// entry two of those 131), so a lockfile in an ancestor is true in exactly the
-/// configuration the skip serves and cannot tell the two apart.
-fn carries_its_tests(manifest_dir: &Path) -> bool {
-    manifest_dir.join("tests").is_dir()
+/// * A published crate has no `crates/` at all. Measured on this crate's own
+///   `cargo package --list`: zero of the 131 entries are under `crates/`, and
+///   zero are under `tests/` either, since `include` keeps them out.
+/// * A crate directory COPIED out of the tree keeps its `tests/`, so this file
+///   runs there, but it has no siblings.
+///
+/// Deliberately NOT a lockfile: a published crate SHIPS `Cargo.lock` (entry two
+/// of those 131), so a lockfile in an ancestor is true in exactly the
+/// configuration the skip serves and cannot tell the two apart. And
+/// deliberately not this crate's own `tests/`, which a copied directory keeps.
+fn has_sibling_crates(manifest_dir: &Path) -> bool {
+    manifest_dir.parent().is_some_and(|crates| {
+        crates
+            .join("cerulion_cli_engine")
+            .join("Cargo.toml")
+            .is_file()
+    })
 }
 
 /// Whether `manifest_dir` is a crate built OUTSIDE the repository, where every
@@ -898,33 +908,37 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
 /// manifest is two levels up, so five inventory arms passed in 0.00s having
 /// inventoried nothing.
 ///
-/// The anti-vacuity is the ASYMMETRY between two INDEPENDENT facts: the probe,
-/// and whether this crate carries its own `tests/`. A packaged copy has
-/// neither; a checkout has both. They may not disagree.
+/// It asserts on `skip_out_of_workspace` ITSELF, not on the predicate behind
+/// it. Pinning the predicate would leave the same hole one level down: a gate
+/// that grew a second condition could start skipping in the repository while
+/// this arm went on passing, which is the shape of the bug it exists to catch.
 ///
-/// The first version used a lockfile in an ancestor as the second fact, which
-/// was wrong in exactly the configuration the skip serves: a published crate
-/// ships `Cargo.lock`, so the two agreed there for the wrong reason and the arm
-/// would have failed an out-of-workspace build. `tests/` is never packaged here.
+/// The anti-vacuity is the ASYMMETRY between two INDEPENDENT facts: the gate,
+/// and whether the sibling crates the inventories walk are on disk. Neither a
+/// published crate nor a copied crate directory has them; the repository does.
+/// They may not disagree.
 #[test]
 fn the_out_of_workspace_skip_does_not_fire_inside_the_repository() {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if !carries_its_tests(here) {
-        // Unreachable while this file is running, since it IS one of those
-        // tests. Written out anyway, so the arm still says something true if
-        // the packaging rules ever change.
-        eprintln!("skip: {} carries no tests/ directory", here.display());
+    if !has_sibling_crates(here) {
+        // A published crate (no `tests/`, so this never runs there) or a crate
+        // directory copied out of the tree (which keeps its tests and loses its
+        // siblings). Both are what the skip serves.
+        eprintln!(
+            "skip: no sibling crates beside {}, so there is no tree to inventory",
+            here.display()
+        );
         return;
     }
     assert!(
-        !looks_unpacked(here),
-        "the workspace probe reports an out-of-workspace build while {} carries its \
-         own tests/, which a packaged copy never does. Every arm gated on that probe \
-         is returning early and passing without inventorying anything.",
+        !skip_out_of_workspace(),
+        "the gate every inventory arm calls reports an out-of-workspace build while the \
+         sibling crates those arms walk are on disk beside {}. Every one of them is \
+         returning early and passing without inventorying anything.",
         here.display()
     );
     // And the thing the arms actually need: a file named relative to the root
-    // must read back. A probe that says yes while reads fail would be worse than
+    // must read back. A gate that says yes while reads fail would be worse than
     // one that says no.
     assert!(
         read_at("crates/cerulion_core/tests/upstream_waivers_test.rs").contains("WAIVED_2034"),
@@ -933,16 +947,16 @@ fn the_out_of_workspace_skip_does_not_fire_inside_the_repository() {
     );
 }
 
-/// The negative control: the probe calls a PACKAGED layout packaged.
+/// The negative control: the gate calls an out-of-tree layout out of tree.
 ///
-/// Without this the arm above is one-sided. It proves the probe says "in the
-/// repository" here, and a probe hardwired to say that would satisfy it. This
-/// builds the other case on disk and watches the same two functions answer.
+/// Without this the arm above is one-sided. It proves the gate says "in the
+/// repository" here, and a gate hardwired to say that would satisfy it. This
+/// builds the other case on disk and watches the same predicates answer.
 ///
 /// The scratch layout is what `cargo package --list` reports for this crate: a
-/// manifest and `src/`, no `tests/`, and no workspace two levels up.
+/// manifest and `src/`, no `tests/`, no siblings, and no workspace two levels up.
 #[test]
-fn the_probe_calls_a_packaged_layout_packaged() {
+fn the_probe_calls_an_out_of_tree_layout_out_of_tree() {
     let scratch = std::env::temp_dir().join(format!(
         "cer_waiver_probe_{}_{}",
         std::process::id(),
@@ -964,19 +978,18 @@ fn the_probe_calls_a_packaged_layout_packaged() {
 
     assert!(
         looks_unpacked(&crate_dir),
-        "a crate with no `[workspace]` manifest two levels up must read as unpacked"
+        "a crate with no `[workspace]` manifest two levels up must read as out of tree"
     );
     assert!(
-        !carries_its_tests(&crate_dir),
-        "the packaged layout carries no tests/, or this control proves nothing about \
-         a packaged crate"
+        !has_sibling_crates(&crate_dir),
+        "the scratch layout has no sibling crates, or this control proves nothing"
     );
-    // The repository answers the other way on the same two functions, which is
+    // The repository answers the other way on the same two predicates, which is
     // what makes this a control rather than a second assertion about nothing.
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        carries_its_tests(here) && !looks_unpacked(here),
-        "the repository and the packaged layout must not read the same"
+        has_sibling_crates(here) && !looks_unpacked(here),
+        "the repository and the out-of-tree layout must not read the same"
     );
 
     std::fs::remove_dir_all(&scratch).expect("remove the scratch directory");
