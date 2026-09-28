@@ -1167,6 +1167,17 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 }
             }
 
+            // The same pass with the clock already read. The trait's default
+            // forwards to `pump_history`, which reads its own `Instant`, so a
+            // node that did not override this would charge the idle cadence one
+            // clock read per NODE and the live loop's single read per pass would
+            // buy nothing for ordinary in-process graphs.
+            fn pump_history_at(&mut self, now: ::std::time::Instant) {
+                if let Some(ctx) = self.context.as_mut() {
+                    ctx.pump_history_at(now);
+                }
+            }
+
             #snapshot_inputs_method
 
             #state_methods
