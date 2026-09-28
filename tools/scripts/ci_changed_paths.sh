@@ -145,16 +145,29 @@ matches_packaging() {
     return 1
 }
 
-# A path that changes how EVERY package builds or is tested.
-matches_workspace_input() {
+# A path that changes how EVERY package builds or is tested, and WHICH rule
+# says so.
+#
+# The rule NAME is the point. Every one of these paths also selects everything
+# through the unknown-path fallback at the bottom of `classify_touched`, so
+# deleting a rule changes no answer and no self-test row could ever fail:
+# mutant 20 was an EQUIVALENT mutant. The name reaches the caller, the caller
+# prints it as a reason token, and each self-test row pins that token, so
+# deleting a rule now changes the reason and the row fails.
+workspace_input_rule() {
     local path=$1
     case "$path" in
-        Cargo.lock|clippy.toml|deny.toml) return 0 ;;
-        rust-toolchain|rust-toolchain.*) return 0 ;;
-        Cargo.toml|*/Cargo.toml) return 0 ;;
-        build.rs|*/build.rs) return 0 ;;
-        .cargo/*|.config/*|.github/workflows/*|tools/*) return 0 ;;
-        test_fixtures/*|*/test_fixtures/*) return 0 ;;
+        Cargo.lock) printf 'Cargo.lock\n'; return 0 ;;
+        clippy.toml) printf 'clippy.toml\n'; return 0 ;;
+        deny.toml) printf 'deny.toml\n'; return 0 ;;
+        rust-toolchain|rust-toolchain.*) printf 'rust-toolchain\n'; return 0 ;;
+        Cargo.toml|*/Cargo.toml) printf 'Cargo.toml\n'; return 0 ;;
+        build.rs|*/build.rs) printf 'build.rs\n'; return 0 ;;
+        .cargo/*) printf '.cargo\n'; return 0 ;;
+        .config/*) printf '.config\n'; return 0 ;;
+        .github/workflows/*) printf '.github/workflows\n'; return 0 ;;
+        tools/*) printf 'tools\n'; return 0 ;;
+        test_fixtures/*|*/test_fixtures/*) printf 'test_fixtures\n'; return 0 ;;
     esac
     return 1
 }
@@ -226,54 +239,72 @@ marker_packages_for_root() {
 # space-separated list of package names, which `classify` turns into `pkgs`.
 # Kept separate so the self-test can drive the RULES without a cargo resolve.
 classify_touched() {
-    local docs=false everything=false path owner name root entry
-    local touched=" "
+    local docs=false everything=false path owner name root entry rule
+    local touched=" " reasons=" "
     local switch=${CI_SELECTION:-on}
+
+    # One token per RULE that fired, so the log line and every self-test row
+    # name the rule rather than the answer. Two rules that agree on the answer
+    # (and every workspace-level rule agrees with the unknown-path fallback)
+    # are told apart by nothing else.
+    note() {
+        case "$reasons" in
+            *" $1 "*) ;;
+            *) reasons="$reasons$1 " ;;
+        esac
+    }
+    touch_package() {
+        case "$touched" in
+            *" $1 "*) ;;
+            *) touched="$touched$1 " ;;
+        esac
+    }
 
     if [ "${GITHUB_EVENT_NAME:-}" != "pull_request" ]; then
         everything=true
+        note "event:${GITHUB_EVENT_NAME:-none}"
     elif [ "$switch" != "on" ]; then
         # `off` is the documented stop; any other value is a switch this script
         # cannot read, and an unreadable switch selects everything.
         everything=true
+        note "switch:$switch"
     fi
 
     while IFS= read -r path; do
         [ -n "$path" ] || continue
         $everything && continue
-        if matches_workspace_input "$path"; then
+        if rule=$(workspace_input_rule "$path"); then
             everything=true
+            note "workspace-input:$rule"
             continue
         fi
-        case "$path" in
-            *.md) docs=true ;;
-        esac
         while IFS= read -r entry; do
             [ -n "$entry" ] || continue
             case "$path" in
                 "${entry%%|*}"*)
                     docs=true
                     root=${entry##*|}
+                    note "docs:$root"
                     while IFS= read -r name; do
                         [ -n "$name" ] || continue
-                        case "$touched" in
-                            *" $name "*) ;;
-                            *) touched="$touched$name " ;;
-                        esac
+                        touch_package "$name"
                     done < <(marker_packages_for_root "$root")
                     ;;
             esac
         done <<< "$SHARED_TREES"
         case "$path" in
-            */*) ;;
+            */*)
+                case "$path" in
+                    *.md) docs=true; note "docs:md" ;;
+                esac
+                ;;
             *.md)
                 # A root markdown file: the markers name it by its own name.
+                docs=true
+                note "docs:$path"
                 while IFS= read -r name; do
                     [ -n "$name" ] || continue
-                    case "$touched" in
-                        *" $name "*) ;;
-                        *) touched="$touched$name " ;;
-                    esac
+                    touch_package "$name"
                 done < <(marker_packages_for_root "$path")
                 ;;
         esac
@@ -281,12 +312,11 @@ classify_touched() {
             case "$owner" in
                 crates/*)
                     if name=$(manifest_package_name "$ROOT/$owner/Cargo.toml"); then
-                        case "$touched" in
-                            *" $name "*) ;;
-                            *) touched="$touched$name " ;;
-                        esac
+                        touch_package "$name"
+                        note "crates:$name"
                     else
                         everything=true
+                        note "unnamed-manifest"
                     fi
                     ;;
                 *)
@@ -294,19 +324,25 @@ classify_touched() {
                     # or the example node crate the viz library reaches through
                     # a path dev-dependency. A path cannot say which.
                     everything=true
+                    note "foreign-workspace"
                     ;;
             esac
             continue
         fi
         case "$path" in
+            crates/*) everything=true; note "unowned-crate"; continue ;;
             docs/*|benches/*|examples/*) continue ;;
             *.md) continue ;;
         esac
         everything=true
+        note "unknown-path"
     done
 
+    # shellcheck disable=SC2086
+    reasons=$(printf '%s\n' $reasons | sort -u | paste -sd, -)
+    [ -n "$reasons" ] || reasons=none
     if $everything; then
-        printf 'code=true\ndocs=true\ntouched=%s\n' "$EVERY"
+        printf 'code=true\ndocs=true\ntouched=%s\nreason=%s\n' "$EVERY" "$reasons"
         return 0
     fi
     # Sorted and deduplicated, so the touched set is a function of the changed
@@ -321,7 +357,7 @@ classify_touched() {
     else
         printf 'code=false\n'
     fi
-    printf 'docs=%s\ntouched=%s\n' "$docs" "$touched"
+    printf 'docs=%s\ntouched=%s\nreason=%s\n' "$docs" "$touched" "$reasons"
 }
 
 # The selector's answer for a touched set, ALWAYS as a JSON array.
@@ -363,7 +399,7 @@ select_packages() {
 }
 
 classify() {
-    local packaging=false path lines code docs touched pkgs
+    local packaging=false path lines code docs touched reason pkgs
     local input
     input=$(cat)
     while IFS= read -r path; do
@@ -377,8 +413,13 @@ classify() {
     code=$(printf '%s\n' "$lines" | sed -n 's/^code=//p')
     docs=$(printf '%s\n' "$lines" | sed -n 's/^docs=//p')
     touched=$(printf '%s\n' "$lines" | sed -n 's/^touched=//p')
+    reason=$(printf '%s\n' "$lines" | sed -n 's/^reason=//p')
     pkgs=$(select_packages "$touched")
 
+    # THE REASON, on its own line with the fixed `selection:` prefix, and NOT as
+    # a `<name>=<value>` output: it is for the reader of the log, and the step
+    # that consumes this writes only the four named classes to `$GITHUB_OUTPUT`.
+    printf 'selection: reason=%s\n' "$reason"
     printf 'packaging=%s\n' "$packaging"
     printf 'code=%s\n' "$code"
     printf 'docs=%s\n' "$docs"
@@ -415,7 +456,8 @@ crates/cerulion_core/src/wire.rs;README.md|false
         [ -n "$line" ] || continue
         paths=${line%|*}
         want=${line##*|}
-        got=$(printf '%s\n' "${paths//;/$'\n'}" | GITHUB_EVENT_NAME=push classify \
+        got=$(printf '%s\n' "${paths//;/$'\n'}" \
+              | GITHUB_EVENT_NAME=push CI_SELECTION=on classify \
               | sed -n 's/^packaging=//p')
         if [ "$got" != "$want" ]; then
             printf 'ci_changed_paths self-test: %s -> packaging=%s, wanted packaging=%s\n' \
@@ -429,40 +471,61 @@ crates/cerulion_core/src/wire.rs;README.md|false
     # Every row is written out by hand: the expected answer says what the rule
     # IS, so a rule that changes its mind fails here rather than agreeing with
     # itself. Each row names the mutant it kills in the comment above it.
+    # `<event>;<switch>;<paths>|<code>|<docs>|<touched>|<reason>`, `,` separating
+    # paths. Every row is written out by hand: the expected answer says what the
+    # rule IS, so a rule that changes its mind fails here rather than agreeing
+    # with itself.
+    #
+    # THE REASON IS THE FOURTH FIELD and it is what makes the workspace-level
+    # rows able to fail. Every one of those paths also selects everything
+    # through the unknown-path fallback, so `all` alone is satisfied by deleting
+    # the rule; the reason names the rule that fired, so deleting it changes the
+    # reason and the row reds.
+    #
+    # THE SWITCH IS PINNED ON EVERY ROW, empty for "unset". Inheriting it from
+    # the environment made the whole table answer `all` under the repository
+    # variable `CI_SELECTION=off`, which is the emergency stop reddening the
+    # required Lint context on every event.
+    #
+    # The event rows name a path a manifest OWNS. They used to name
+    # `crates/cerulion_vizd/src/lib.rs`, which no manifest owns, so they
+    # answered `all` through the unknown-path fallback whatever the event rule
+    # did and the merge_group mutant survived them.
     local selection_cases='
-push;;crates/cerulion_vizd/src/lib.rs|true|true|all
-merge_group;;crates/cerulion_vizd/src/lib.rs|true|true|all
-workflow_dispatch;;crates/cerulion_vizd/src/lib.rs|true|true|all
-schedule;;crates/cerulion_vizd/src/lib.rs|true|true|all
-pull_request;off;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|true|all
-pull_request;maybe;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|true|all
-pull_request;on;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|false|cerulion_vizd
-pull_request;;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|false|cerulion_vizd
-pull_request;;Cargo.lock|true|true|all
-pull_request;;Cargo.toml|true|true|all
-pull_request;;crates/cerulion_core/Cargo.toml|true|true|all
-pull_request;;.cargo/config.toml|true|true|all
-pull_request;;.config/nextest.toml|true|true|all
-pull_request;;rust-toolchain.toml|true|true|all
-pull_request;;crates/cerulion_core/build.rs|true|true|all
-pull_request;;clippy.toml|true|true|all
-pull_request;;deny.toml|true|true|all
-pull_request;;.github/workflows/ci.yml|true|true|all
-pull_request;;tools/scripts/ci_selected_packages.py|true|true|all
-pull_request;;tools/ci/observation_edges.tsv|true|true|all
-pull_request;;crates/test_fixtures/test_node_cdylib/src/lib.rs|true|true|all
-pull_request;;crates/cerulion_core/src/wire.rs|true|false|cerulion_core
-pull_request;;crates/cerulion_viz/lib/go2_tf/src/lib.rs|true|false|go2_tf
-pull_request;;crates/cerulion_core/src/wire.rs,crates/cerulion_bag/src/lib.rs|true|false|cerulion_bag cerulion_core
-pull_request;;crates/cerulion_core/AGENTS.md|true|true|cerulion_core
-pull_request;;crates/cerulion_core/notes.txt|true|false|cerulion_core
-pull_request;;crates/nothing_owns_this.txt|true|true|all
-pull_request;;examples/go2/nodes/go2_tf_source/src/lib.rs|true|true|all
-pull_request;;benches/latency/workspace/nodes/ping_node/src/lib.rs|true|true|all
-pull_request;;LICENSE|true|true|all
-pull_request;;.github/CODEOWNERS|true|true|all
-pull_request;;CITATION.cff|true|true|all
-pull_request;;|false|false|
+push;;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|true|all|event:push
+merge_group;;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|true|all|event:merge_group
+workflow_dispatch;;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|true|all|event:workflow_dispatch
+schedule;;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|true|all|event:schedule
+pull_request;off;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|true|all|switch:off
+pull_request;maybe;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|true|all|switch:maybe
+pull_request;on;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|false|cerulion_vizd|crates:cerulion_vizd
+pull_request;;crates/cerulion_viz/bin/cerulion_vizd/src/main.rs|true|false|cerulion_vizd|crates:cerulion_vizd
+pull_request;;Cargo.lock|true|true|all|workspace-input:Cargo.lock
+pull_request;;Cargo.toml|true|true|all|workspace-input:Cargo.toml
+pull_request;;crates/cerulion_core/Cargo.toml|true|true|all|workspace-input:Cargo.toml
+pull_request;;.cargo/config.toml|true|true|all|workspace-input:.cargo
+pull_request;;.config/nextest.toml|true|true|all|workspace-input:.config
+pull_request;;rust-toolchain.toml|true|true|all|workspace-input:rust-toolchain
+pull_request;;crates/cerulion_core/build.rs|true|true|all|workspace-input:build.rs
+pull_request;;clippy.toml|true|true|all|workspace-input:clippy.toml
+pull_request;;deny.toml|true|true|all|workspace-input:deny.toml
+pull_request;;.github/workflows/ci.yml|true|true|all|workspace-input:.github/workflows
+pull_request;;tools/scripts/ci_selected_packages.py|true|true|all|workspace-input:tools
+pull_request;;tools/ci/observation_edges.tsv|true|true|all|workspace-input:tools
+pull_request;;crates/test_fixtures/test_node_cdylib/src/lib.rs|true|true|all|workspace-input:test_fixtures
+pull_request;;crates/cerulion_core/src/wire.rs|true|false|cerulion_core|crates:cerulion_core
+pull_request;;crates/cerulion_viz/lib/go2_tf/src/lib.rs|true|false|go2_tf|crates:go2_tf
+pull_request;;crates/cerulion_core/src/wire.rs,crates/cerulion_bag/src/lib.rs|true|false|cerulion_bag cerulion_core|crates:cerulion_bag,crates:cerulion_core
+pull_request;;crates/cerulion_core/AGENTS.md|true|true|cerulion_core|crates:cerulion_core,docs:md
+pull_request;;crates/cerulion_core/notes.txt|true|false|cerulion_core|crates:cerulion_core
+pull_request;;crates/nothing_owns_this.txt|true|true|all|unowned-crate
+pull_request;;examples/go2/nodes/go2_tf_source/src/lib.rs|true|true|all|docs:examples,foreign-workspace
+pull_request;;benches/latency/workspace/nodes/ping_node/src/lib.rs|true|true|all|docs:benches,foreign-workspace
+pull_request;;LICENSE|true|true|all|unknown-path
+pull_request;;.github/CODEOWNERS|true|true|all|unknown-path
+pull_request;;CITATION.cff|true|true|all|unknown-path
+pull_request;;README.md|false|true||docs:README.md
+pull_request;;|false|false||none
 '
     local event switch head
     while IFS= read -r line; do
@@ -475,7 +538,8 @@ pull_request;;|false|false|
         want=${line#*|}
         got=$(printf '%s\n' "${paths//,/$'\n'}" \
               | GITHUB_EVENT_NAME=$event CI_SELECTION=$switch classify_touched \
-              | sed -e 's/^code=//' -e 's/^docs=//' -e 's/^touched=//' | paste -sd'|' -)
+              | sed -e 's/^code=//' -e 's/^docs=//' -e 's/^touched=//' -e 's/^reason=//' \
+              | paste -sd'|' -)
         if [ "$got" != "$want" ]; then
             printf 'ci_changed_paths self-test: [%s %s] %s -> %s, wanted %s\n' \
                 "$event" "${switch:-<unset>}" "${paths:-<empty>}" "$got" "$want" >&2
@@ -493,7 +557,8 @@ pull_request;;|false|false|
     local tree root markers
     for tree in docs benches examples; do
         got=$(printf '%s/guide.md\n' "$tree" \
-              | GITHUB_EVENT_NAME=pull_request classify_touched | sed -n 's/^touched=//p')
+              | GITHUB_EVENT_NAME=pull_request CI_SELECTION=on classify_touched \
+              | sed -n 's/^touched=//p')
         if [ "$got" = "$EVERY" ] || [ -z "$got" ]; then
             printf 'ci_changed_paths self-test: %s/ -> touched=%s, wanted the packages whose doc-pin markers read %s\n' \
                 "$tree" "${got:-<empty>}" "$tree" >&2
@@ -527,7 +592,8 @@ $name
     fi
     # A root markdown file reaches the markers by its own name, and the four the
     # walk knows are the four `git ls-files` reports at the root.
-    got=$(printf 'AGENTS.md\n' | GITHUB_EVENT_NAME=pull_request classify_touched \
+    got=$(printf 'AGENTS.md\n' \
+          | GITHUB_EVENT_NAME=pull_request CI_SELECTION=on classify_touched \
           | sed -n 's/^docs=//p')
     if [ "$got" != "true" ]; then
         printf 'ci_changed_paths self-test: a root markdown file -> docs=%s, wanted true\n' \
@@ -540,7 +606,8 @@ $name
     # selector is invoked, the observation-edge table is read, and `pkgs` comes
     # back as a JSON array that holds the touched package itself.
     got=$(printf 'crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\n' \
-          | GITHUB_EVENT_NAME=pull_request classify | sed -n 's/^pkgs=//p')
+          | GITHUB_EVENT_NAME=pull_request CI_SELECTION=on classify \
+          | sed -n 's/^pkgs=//p')
     case "$got" in
         *'"cerulion_vizd"'*) ;;
         *)
@@ -561,7 +628,8 @@ $name
     # A workspace-level input selects every member, spelled as the array, never
     # as the word `all`: `fromJSON` on that word is an expression error.
     got=$(printf '.github/workflows/ci.yml\n' \
-          | GITHUB_EVENT_NAME=pull_request classify | sed -n 's/^pkgs=//p')
+          | GITHUB_EVENT_NAME=pull_request CI_SELECTION=on classify \
+          | sed -n 's/^pkgs=//p')
     case "$got" in
         *'"cerulion_vizd"'*'"cerulion_core"'*|*'"cerulion_core"'*'"cerulion_vizd"'*) ;;
         *)
@@ -570,6 +638,31 @@ $name
             fails=$((fails + 1))
             ;;
     esac
+
+    # ---- THE EMERGENCY STOP DOES NOT BREAK THIS GATE ---------------------
+    # `lint` runs this self-test with the workflow-level environment, so the
+    # repository variable `CI_SELECTION=off` reaches it. Every arm above pins
+    # the switch, and this arm proves it by running the WHOLE suite again with
+    # the variable set: turning the selection off must red nothing.
+    #
+    # Once, guarded by its own variable, because the nested run reaches this
+    # line too.
+    if [ -z "${CI_CHANGED_PATHS_NESTED_SELF_TEST:-}" ]; then
+        if ! CI_SELECTION=off CI_CHANGED_PATHS_NESTED_SELF_TEST=1 \
+                "$ROOT/tools/scripts/ci_changed_paths.sh" --self-test >/dev/null 2>&1; then
+            printf 'ci_changed_paths self-test: the suite fails under CI_SELECTION=off, so the emergency stop reds the Lint job\n' >&2
+            fails=$((fails + 1))
+        fi
+        # The other side: the nested run must really be running the suite, not
+        # exiting early on the guard.
+        if CI_CHANGED_PATHS_NESTED_SELF_TEST=1 \
+                "$ROOT/tools/scripts/ci_changed_paths.sh" --self-test >/dev/null 2>&1; then
+            :
+        else
+            printf 'ci_changed_paths self-test: the nested run fails with the switch unset, so the arm above proves nothing\n' >&2
+            fails=$((fails + 1))
+        fi
+    fi
 
     if [ "$fails" -ne 0 ]; then
         printf 'ci_changed_paths: %d self-test case(s) failed\n' "$fails" >&2
