@@ -263,7 +263,7 @@ fn the_walk_reads_the_code_it_claims_to_read() {
 // PRIVATE registry root rather than the shared `iox2_` namespace, and they
 // pin the converged shape (one node swept, nothing refused); minting a
 // REFUSED node needs the leaked-loan shape, which
-// `cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs` owns, so the
+// `cerulion_cli_engine/tests/sweep_dead_nodes_test.rs` owns, so the
 // listing's own wiring is pinned by the source walk below.
 // ---------------------------------------------------------------------------
 

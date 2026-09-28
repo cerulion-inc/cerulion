@@ -202,38 +202,58 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Whether this is a build OUTSIDE the repository, where every arm in this file
-/// has nothing to inventory and must skip rather than panic.
+/// Does this crate carry its own `tests/` directory beside its manifest?
 ///
-/// Keyed on the same fact the two `iceoryx2_version_lockstep_test` arms use, so
-/// the three files agree about what "out of workspace" means: the manifest one
-/// level above this crate declares `[workspace]`. A packaged or vendored crate
-/// carries neither that manifest nor the sibling `crates/` trees these
-/// inventories walk, so there is no file to read and nothing to compare.
+/// The fact that separates a packaged copy from a checkout, and it is a fact
+/// about THIS crate rather than about the directory tree it was unpacked into.
+/// `cerulion_core`'s `include` is
+/// `["src/", "build.rs", "Cargo.toml", "README.md", "LICENSE"]`, so `tests/` is
+/// not packaged: measured on `cargo package --list`, zero of the 131 entries
+/// are under `tests/`.
 ///
-/// Deliberately NOT keyed on a missing `Cargo.lock`: in the repository a
-/// missing lock means a broken walk, and this guard must fail loudly there
-/// instead of disabling itself. The skip prints its reason, so a build that
-/// starts skipping cannot do it silently.
+/// Deliberately NOT a lockfile. A published crate SHIPS `Cargo.lock` (it is
+/// entry two of those 131), so a lockfile in an ancestor is true in exactly the
+/// configuration the skip serves and cannot tell the two apart.
+fn carries_its_tests(manifest_dir: &Path) -> bool {
+    manifest_dir.join("tests").is_dir()
+}
+
+/// Whether `manifest_dir` is a crate built OUTSIDE the repository, where every
+/// arm in this file has nothing to inventory and must skip rather than panic.
+///
+/// The manifest two levels up declares `[workspace]`. `CARGO_MANIFEST_DIR` is
+/// `<repo>/crates/cerulion_core`, so ONE level up is `crates/`, which holds no
+/// manifest at all: keyed there, the read failed, the probe judged every build
+/// out of workspace, and every arm gated on it returned immediately and passed.
+/// TWO levels up is the repository root. The same correction main made to the
+/// sibling probe in `iceoryx2_version_lockstep_test`.
+///
+/// Taken as an argument rather than read from the environment so the arms below
+/// can hand it a scratch directory shaped like a packaged crate and watch it
+/// answer, which is the only negative control available: `CARGO_MANIFEST_DIR`
+/// is fixed at compile time.
+fn looks_unpacked(manifest_dir: &Path) -> bool {
+    !std::fs::read_to_string(manifest_dir.join("../../Cargo.toml"))
+        .map(|t| t.contains("[workspace]"))
+        .unwrap_or(false)
+}
+
+/// The gate every inventory arm calls first.
+///
+/// Worth knowing, and not a reason to delete this: since `tests/` is not
+/// packaged, this file never reaches a PUBLISHED crate at all. What it does
+/// reach is a crate directory COPIED out of the tree, which has the tests and
+/// no workspace above them, and that is what the skip serves. The skip prints
+/// its reason, so a build that starts skipping cannot do it silently.
 fn skip_out_of_workspace() -> bool {
-    // `../../Cargo.toml`, not `../`. `CARGO_MANIFEST_DIR` is
-    // `<repo>/crates/cerulion_core`, so ONE level up is `crates/`, which holds
-    // no manifest at all: the probe then failed its read, judged every build out
-    // of workspace, and every arm gated on it returned immediately and passed.
-    // TWO levels up is the repository root, the manifest that declares
-    // `[workspace]`. The same correction main made to the sibling probe in
-    // `iceoryx2_version_lockstep_test`.
-    let in_workspace =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
-            .map(|t| t.contains("[workspace]"))
-            .unwrap_or(false);
-    if !in_workspace {
+    let unpacked = looks_unpacked(Path::new(env!("CARGO_MANIFEST_DIR")));
+    if unpacked {
         eprintln!(
             "skip: out-of-workspace build, no crates/ tree to inventory \
              (the manifest `=` pins still govern downstream resolution)"
         );
     }
-    !in_workspace
+    unpacked
 }
 
 /// Read a file named by a path relative to the workspace root.
@@ -878,25 +898,30 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
 /// manifest is two levels up, so five inventory arms passed in 0.00s having
 /// inventoried nothing.
 ///
-/// The anti-vacuity is the ASYMMETRY between two independent facts. One is the
-/// probe under test. The other is whether the repository root is findable at
-/// all, which the lockfile walk answers. A packaged crate has neither; the
-/// repository has both. They may not disagree.
+/// The anti-vacuity is the ASYMMETRY between two INDEPENDENT facts: the probe,
+/// and whether this crate carries its own `tests/`. A packaged copy has
+/// neither; a checkout has both. They may not disagree.
+///
+/// The first version used a lockfile in an ancestor as the second fact, which
+/// was wrong in exactly the configuration the skip serves: a published crate
+/// ships `Cargo.lock`, so the two agreed there for the wrong reason and the arm
+/// would have failed an out-of-workspace build. `tests/` is never packaged here.
 #[test]
 fn the_out_of_workspace_skip_does_not_fire_inside_the_repository() {
-    let root_is_findable = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .any(|a| a.join("Cargo.lock").exists());
-    if !root_is_findable {
-        eprintln!("skip: no lockfile in any ancestor, so this really is a packaged build");
+    let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if !carries_its_tests(here) {
+        // Unreachable while this file is running, since it IS one of those
+        // tests. Written out anyway, so the arm still says something true if
+        // the packaging rules ever change.
+        eprintln!("skip: {} carries no tests/ directory", here.display());
         return;
     }
     assert!(
-        !skip_out_of_workspace(),
-        "the workspace probe reports an out-of-workspace build while the repository \
-         root IS findable from {}. Every arm gated on that probe is returning early \
-         and passing without inventorying anything.",
-        env!("CARGO_MANIFEST_DIR")
+        !looks_unpacked(here),
+        "the workspace probe reports an out-of-workspace build while {} carries its \
+         own tests/, which a packaged copy never does. Every arm gated on that probe \
+         is returning early and passing without inventorying anything.",
+        here.display()
     );
     // And the thing the arms actually need: a file named relative to the root
     // must read back. A probe that says yes while reads fail would be worse than
@@ -906,6 +931,55 @@ fn the_out_of_workspace_skip_does_not_fire_inside_the_repository() {
         "the workspace root resolves but this very file cannot be read back through \
          it, so every inventory arm would fail for the wrong reason"
     );
+}
+
+/// The negative control: the probe calls a PACKAGED layout packaged.
+///
+/// Without this the arm above is one-sided. It proves the probe says "in the
+/// repository" here, and a probe hardwired to say that would satisfy it. This
+/// builds the other case on disk and watches the same two functions answer.
+///
+/// The scratch layout is what `cargo package --list` reports for this crate: a
+/// manifest and `src/`, no `tests/`, and no workspace two levels up.
+#[test]
+fn the_probe_calls_a_packaged_layout_packaged() {
+    let scratch = std::env::temp_dir().join(format!(
+        "cer_waiver_probe_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_nanos()
+    ));
+    // `<scratch>/outer/cerulion_core-1.0.0` mirrors an unpacked crate: the
+    // directory two levels up is `<scratch>`, which carries no manifest.
+    let crate_dir = scratch.join("outer").join("cerulion_core-1.0.0");
+    std::fs::create_dir_all(crate_dir.join("src")).expect("create the scratch crate");
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        "[package]\nname = \"cerulion_core\"\nversion = \"1.0.0\"\n",
+    )
+    .expect("write the scratch manifest");
+    std::fs::write(crate_dir.join("src/lib.rs"), "").expect("write the scratch lib");
+
+    assert!(
+        looks_unpacked(&crate_dir),
+        "a crate with no `[workspace]` manifest two levels up must read as unpacked"
+    );
+    assert!(
+        !carries_its_tests(&crate_dir),
+        "the packaged layout carries no tests/, or this control proves nothing about \
+         a packaged crate"
+    );
+    // The repository answers the other way on the same two functions, which is
+    // what makes this a control rather than a second assertion about nothing.
+    let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        carries_its_tests(here) && !looks_unpacked(here),
+        "the repository and the packaged layout must not read the same"
+    );
+
+    std::fs::remove_dir_all(&scratch).expect("remove the scratch directory");
 }
 
 /// The 2035 arms subtract the known loans AND keep a bound on the remainder.

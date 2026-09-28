@@ -926,13 +926,6 @@ under the list rather than letting the heading promise a deletion. The counters 
 nothing was attempted, not because nothing was refused, which is why the
 listing replaces the summary line rather than sitting beside it.
 
-The orphan port-tag listing is the one thing a report cannot produce: a
-candidate is read out of the refusal iceoryx2 raises while REMOVING the node,
-and a report performs no removal. `ORPHAN_TAGS_NOT_LISTED` states that where
-the listing would have been. The dry-run bit still travels to
-`reclaim_orphan_port_tags` as the verb's own mode, so a report can never remove
-a tag even if a future sweep reported a refusal without attempting one.
-
 WHERE THE TESTS LIVE, and why they are split. A bare `cerulion clean` reclaims
 `/tmp/*.shm_state` MACHINE WIDE: `shm_state::SHM_STATE_DIRECTORY` is a
 compile-time constant mirroring `iceoryx2_pal_configuration::TEMP_DIRECTORY`,
@@ -943,7 +936,7 @@ it. No test may run the verb bare. The CLI arms
 `--report-only` only and prove what needs the real binary: the lines a user
 reads, and the registry byte for byte beneath them. The destructive direction
 is proven where it CAN be confined, over the isolated root in
-`crates/cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs`: `sweep_dead_nodes_with_config` takes the
+`crates/cerulion_cli_engine/tests/sweep_dead_nodes_test.rs`: `sweep_dead_nodes_with_config` takes the
 registry config explicitly and never reaches the state-file pass, so
 `SweepMode::Remove` there touches exactly one root and nothing else.
 

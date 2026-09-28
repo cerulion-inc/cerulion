@@ -30,7 +30,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   first (Rust drops fields in declaration order).
 - Never run a bare `cerulion clean` from a test: the `/tmp/*.shm_state` reclaim is machine wide by
   construction (compile-time directory, no `TMPDIR`), so arms here pass `--report-only` only and the
-  destructive proof lives in `cerulion_cli_engine`'s `clean_orphan_port_tag_test.rs`
+  destructive proof lives in `cerulion_cli_engine`'s `sweep_dead_nodes_test.rs`
   (`tests/trace_inspect_and_clean_cli_test.rs`).
 - E2E binaries drive the REAL binary; run each `#[serial]` one alone with
   `-- --test-threads=1`. Build fixtures first:
