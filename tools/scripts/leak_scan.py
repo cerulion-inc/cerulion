@@ -36,6 +36,8 @@ Usage:
           --offline (resolve no reference, report every candidate unverified)
           --skip-code (blank fenced blocks and inline code spans first; the
           conversation surfaces only, where a quoted example is not a link)
+          --conversation (someone else's issue or comment: only the identity and
+          reference classes are HARD there; a style class reports and no more)
           --self-repo OWNER/REPO (the repository being scanned; else the forge
           environment, else the origin remote)
 
@@ -156,6 +158,14 @@ IDENTITY_CLASSES = frozenset((
     'login-at-host', 'mdns-local', 'host-field', 'overlay-dns', 'email-personal', 'acl-tag',
     'ref-unopenable', 'ref-unverified'))
 MASK_RX = re.compile(r'[^\W_]')
+# What is HARD on a CONVERSATION surface: an issue body, an issue comment, a
+# review comment. Exactly the classes whose finding is a value a reader should
+# not have been shown, which is the identity classes and, inside them, the two
+# reference classes. A typographic class is not one of them: a dash in someone's
+# prose is a house style note about text WE write, and turning it into a label,
+# an ask and a red run on a contributor's thread is the guard crying wolf on a
+# page that leaks nothing. The private tier stays hard here as everywhere.
+CONVERSATION_HARD = IDENTITY_CLASSES
 
 # Published placeholder vocabularies. Explicit sets, never a length rule.
 PH_USER = frozenset((
@@ -1406,8 +1416,11 @@ class Scanner(object):
     """One scan. The sweep and the self-test both go through this class."""
 
     def __init__(self, mode, classes, private, allow, out, fmt='text', hard=(), quiet=False,
-                 refs=None, skip_code=False):
+                 refs=None, skip_code=False, conversation=False):
         self.mode = mode
+        # A conversation surface: someone else's issue or comment. See
+        # CONVERSATION_HARD for what may be hard there and why.
+        self.conversation = conversation
         # Conversation surfaces only: a fenced block or an inline code span is
         # blanked before any class reads the unit. See blank_code.
         self.skip_code = skip_code
@@ -1457,6 +1470,9 @@ class Scanner(object):
 
     def add(self, cid, sev, path, line, text, where='', private=None, raw_line='',
             ctx=None):
+        if (self.conversation and sev == 'HARD' and private is None
+                and cid not in CONVERSATION_HARD):
+            sev = 'REPORT'
         if cid in self.hard:
             sev = 'HARD'
         if private is not None:
@@ -2846,6 +2862,7 @@ def build_parser():
     # Spelling it anywhere else is a usage error rather than a silent no-op.
     m.add_argument('--skip-code', action='store_true')
     m.add_argument('--hard-classes-file')
+    m.add_argument('--conversation', action='store_true')
     m.add_argument('--allow-email-file')
     m.add_argument('--ident-from-git', action='store_true')
     m.add_argument('--require-commits', action='store_true')
@@ -2922,7 +2939,8 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
         return run_hook(args, root, env, out, classes, private, kind, refs)
     allow = load_allow(args, root, classes)
     sc = Scanner(args.mode, classes, private, allow, out, args.format, args.hard, args.quiet,
-                 refs=refs, skip_code=bool(getattr(args, 'skip_code', False)))
+                 refs=refs, skip_code=bool(getattr(args, 'skip_code', False)),
+                 conversation=bool(getattr(args, 'conversation', False)))
     t0 = time.time()
     if args.mode == 'messages':
         full_mode = run_messages(sc, git, args, env)
@@ -3127,7 +3145,7 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 226
+EXPECTED_ARMS = 230
 
 
 def _png(chunks):
@@ -4595,6 +4613,47 @@ def self_test(out, base_env, argv0):
             rc == EXIT_HIT and body is not None and fired == {'home-mac', REF_DEFECT}
             and PLAIN_USER not in body and R_GONE not in body,
             'written=%s fired=%s' % (body is not None, sorted(fired)))
+        # The CONVERSATION surface. A body of nothing but dashes must produce no
+        # finding at all, because a label, an ask and a red run on a
+        # contributor's thread over house style is the guard crying wolf. The
+        # same body still reports, so nothing is hidden, and the same run still
+        # goes hard on a value a reader should not have been shown. The commit
+        # and pull request surfaces are NOT conversation surfaces and keep the
+        # dash rule, which the control below pins.
+        dash_body = 'a range 3' + DASH_EN + '5 and an aside ' + DASH_EM + ' here\n'
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--conversation', '--no-allow'] + mine,
+                        dict(refenv, LG_BODY=dash_body), repo_ref)
+        hcf2 = os.path.join(tmp, 'hard-classes-dash')
+        rc2, lines2 = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                           '--conversation', '--hard-classes-file', hcf2, '--no-allow'] + mine,
+                          dict(refenv, LG_BODY=dash_body), repo_ref)
+        with open(hcf2) as fh:
+            dash_fired = [l.strip() for l in fh if l.strip()]
+        arm('conversation-a-dash-only-body-is-no-finding-no-label-no-ask',
+            rc == EXIT_OK and rc2 == EXIT_OK and not hits(lines)
+            and dash_fired == []
+            and any(ln.startswith('REPORT style-dash issue-body') for ln in lines),
+            'rc=%d fired=%s' % (rc, dash_fired))
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--no-allow'] + mine, dict(refenv, LG_BODY=dash_body), repo_ref)
+        arm('conversation-the-same-body-is-still-hard-on-a-commit-surface',
+            rc == EXIT_HIT and any(c == 'style-dash' for c, p, n in hits(lines)),
+            'rc=%d' % rc)
+        # ... and a value in the same body is still hard WITH --conversation
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--conversation', '--no-allow'] + mine,
+                        dict(refenv, LG_BODY=dash_body + 'b ' + P_MAC + PLAIN_USER + '/x\n'
+                             + 'c ' + RO + '/' + R_GONE + '#9\n'), repo_ref)
+        got = set(c for c, p, n in hits(lines))
+        arm('conversation-keeps-the-identity-and-reference-classes-hard',
+            rc == EXIT_HIT and {'home-mac', REF_DEFECT} <= got and 'style-dash' not in got,
+            str(sorted(got)))
+        arm('conversation-hard-set-is-the-identity-classes',
+            CONVERSATION_HARD == IDENTITY_CLASSES
+            and 'style-dash' not in CONVERSATION_HARD
+            and 'overlay-word' not in CONVERSATION_HARD
+            and REF_DEFECT in CONVERSATION_HARD and REF_UNVERIFIED in CONVERSATION_HARD)
         # The code-span exemption is the REFERENCE classes' alone. A host, a
         # login, an address or a private-tier name is as visible to a reader in
         # backticks as in prose, so every other class still reads the body whole.

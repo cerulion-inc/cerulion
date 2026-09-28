@@ -10,10 +10,18 @@ workflow, and the `Leak guard` workflow on every pull request, merge queue batch
 push to `main`, and on every issue and comment body as it is written or edited.
 
 A body is public the moment it is written and no check runs before it is, so that last
-job cannot block anything. It reads what people write and skips what bots write: a review
-bot quotes example references in its findings, an example has the shape of the thing it is
-an example of, and its text is machine written from a diff the other three jobs already
-gate. On a finding it applies the `leak` label, asks the author once
+job cannot block anything. It reads what PEOPLE write: a body whose author is a bot is
+skipped on every event, decided by the author of the body rather than the actor who
+triggered the run, because an app editing its own summary and a person editing theirs
+arrive as the same event. Review apps quote examples, restate diffs and rewrite their
+summaries on every push, and their text is machine written from a diff the other three jobs
+already gate.
+
+A conversation body is also judged by a narrower hard set than a file or a commit message:
+only the identity classes and the two reference classes, the ones whose finding is a value
+a reader should not have been shown. A style class reports there and no more. House style
+is a rule about text this project writes, and a label, an ask and a red run on someone
+else's thread over a dash is the guard crying wolf on a page that leaks nothing. On a finding it applies the `leak` label, asks the author once
 to edit the reference out (one ask per body, so an unchanged body is never asked twice),
 and goes red. The label tracks the THREAD: a clean body takes back the ask left for it,
 and the label comes off when the last outstanding ask on that thread is gone, so a clean
