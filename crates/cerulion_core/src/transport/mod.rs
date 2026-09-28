@@ -1620,6 +1620,18 @@ fn publish_subscribe_open_env_hint(
              reported as corrupted rather than as a version skew. \
              Sweep the iceoryx2 root once after the upgrade"
         }
+        // 0.10 additions. A service TAG is the per-node marker iceoryx2 writes
+        // so a dead node's sweep can find the services it held; failing to
+        // create one is a filesystem or descriptor problem in the iceoryx2
+        // root, not a Cerulion configuration problem, and without the remedy
+        // the operator reads only the variant name.
+        PublishSubscribeOpenError::UnableToCreateServiceTag => {
+            "; this process could not write its node's service tag under the \
+             iceoryx2 root, so the service was opened and then abandoned. \
+             Check that the root is writable and not full (`df`), and that \
+             the open-file limit is not exhausted (`ulimit -n 65536`); a root \
+             owned by another user is the other common cause"
+        }
         _ => "",
     }
 }
@@ -1678,6 +1690,35 @@ fn event_env_hint(e: &iceoryx2::service::builder::event::EventOpenOrCreateError)
              than this process needs. It was created by an older Cerulion \
              whose event enum was shorter. Stop the older process and let \
              this one create the service"
+        }
+        // The three 0.10 variants that reached the operator as a bare name.
+        EventOpenOrCreateError::EventOpenError(EventOpenError::UnableToCreateServiceTag)
+        | EventOpenOrCreateError::EventCreateError(EventCreateError::UnableToCreateServiceTag) => {
+            "; this process could not write its node's service tag for the \
+             event service under the iceoryx2 root. Check that the root is \
+             writable and not full (`df`), and that the open-file limit is not \
+             exhausted (`ulimit -n 65536`); a root owned by another user is \
+             the other common cause"
+        }
+        EventOpenOrCreateError::EventCreateError(
+            EventCreateError::ServiceConfigCouldNotBeCreated,
+        ) => {
+            "; the event service's static config could not be written under \
+             the iceoryx2 root, so the service does not exist. Same causes as \
+             a failed service tag: a root that is not writable, is full, or \
+             belongs to another user, or an exhausted open-file limit \
+             (`ulimit -n 65536`)"
+        }
+        // Not an environment failure at all: a Cerulion-side ceiling mistake,
+        // so the remedy names the constant rather than the filesystem.
+        EventOpenOrCreateError::EventCreateError(
+            EventCreateError::EventIdExceedsMaxSupportedValue,
+        ) => {
+            "; the event-id ceiling this process asked for exceeds what \
+             iceoryx2 supports on this platform. Cerulion sizes it from \
+             `PubSubEvent::MAX_ID`, so this means the event enum grew past \
+             the platform's limit and the transport, not the operator, has to \
+             change: report it with the platform and the ceiling in the error"
         }
         _ => "",
     }
@@ -2049,8 +2090,8 @@ pub struct TransportManager {
 /// DISABLED on every axis — the config EVERY [`TransportManager`] node is built
 /// from must pass through here first.
 ///
-/// iceoryx2 0.9.1 defaults all three auto-cleanup flags ON
-/// (`iceoryx2-0.9.1/src/config.rs`: `global.service.cleanup_dead_nodes_on_open`,
+/// iceoryx2 defaults all three auto-cleanup flags ON, on the linked release as
+/// on 0.9.1 (`config.rs`: `global.service.cleanup_dead_nodes_on_open`,
 /// `global.node.cleanup_dead_nodes_on_creation` / `_on_destruction`). On every
 /// service open/create/destroy, auto-cleanup probes each registered node's
 /// liveness and, judging it dead, reaps that node's services. The probe
@@ -2174,11 +2215,11 @@ fn report_startup_dead_node_sweep(state: &dead_node_sweep::BoundedCleanup) {
 /// run's identity ([`ix_config_shm_identity_from_json`]) against netd's
 /// shared-session identity ([`TransportManager::iox_shm_identity`]) before its
 /// embedded gateway taps the run's topics. The identity must be COMPLETE:
-/// iceoryx2 0.9.1 discovers a service's static config under
+/// iceoryx2 discovers a service's static config under
 /// `root_path + global.service.directory` (default `services`), its nodes under
 /// `root_path + global.node.directory` (default `nodes`), and resolves each of a
 /// service's SHM files by a per-file SUFFIX
-/// (`iceoryx2-0.9.1/src/service/config_scheme.rs`). Two configs sharing only
+/// (`service/config_scheme.rs`). Two configs sharing only
 /// `(root_path, prefix)` but differing in ANY of those discover DIFFERENT
 /// services — so an identity of `(root_path, prefix)` alone would report a MATCH
 /// while netd taps its OWN (empty) service directory, sees none of the run's
@@ -6937,7 +6978,8 @@ mod tests {
             got, want,
             "the JSON path reads the same full identity as the struct path"
         );
-        // Hand oracle for the well-known iceoryx2 0.9.1 defaults — every
+        // Hand oracle for the well-known iceoryx2 defaults, unchanged on the
+        // linked release — every
         // discovery-keying field, so a codegen/default drift fails here loudly.
         assert_eq!(got.prefix, "iox2_", "default segment prefix");
         assert_eq!(got.service_dir, "services", "default service directory");
@@ -7263,7 +7305,7 @@ mod tests {
     /// that cannot start.
     #[test]
     fn the_ingress_depth_budget_bounds_a_hundred_route_bridge() {
-        // iceoryx2 0.9.1's own pool formula, with the defaults
+        // iceoryx2's own pool formula, with the defaults
         // `create_ingress_publisher` leaves in place (8 subscribers, 2 borrowed,
         // 0 history, 2 loaned).
         fn pool_bytes(depth: usize, msl: usize) -> u64 {
@@ -7483,6 +7525,10 @@ mod tests {
         // Every variant of the open enum (kept beside `want_open`: the
         // exhaustive match is what BREAKS on an upstream addition, and the fix
         // is to extend both).
+        /// Variants `PublishSubscribeOpenError` declares upstream, which is
+        /// the arm count of the exhaustive `want_open` match above.
+        const OPEN_VARIANTS: usize = 22;
+
         let all_open = [
             O::DoesNotExist,
             O::InternalFailure,
@@ -7507,11 +7553,30 @@ mod tests {
             O::UnableToAcquireTypeDefinition,
             O::InvalidTypeDefinition,
         ];
+        // The count's source of truth is the exhaustive `want_open` match
+        // above: it cannot compile without naming every variant upstream
+        // declares, so its arm count IS the variant count. Rust cannot count an
+        // upstream enum's variants without a derive on it, so the number is
+        // still written down here and the two move together.
+        //
+        // What the literal alone could NOT catch is the way this list actually
+        // decays: a copy-paste that REPEATS a variant keeps the length at 22
+        // while dropping coverage of the one it replaced. The dedup check is
+        // what closes that, and it needs no literal.
+        let mut distinct = all_open.map(|v| format!("{v:?}")).to_vec();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            all_open.len(),
+            "the open-variant list repeats a variant, so its length no longer \
+             measures coverage: {distinct:?}"
+        );
         assert_eq!(
             all_open.len(),
-            22,
-            "the sweep must cover every open variant — extend BOTH this list \
-             and `want_open` when iceoryx2 adds one"
+            OPEN_VARIANTS,
+            "the sweep must cover every open variant — extend the list, \
+             `want_open` AND `OPEN_VARIANTS` together when iceoryx2 adds one"
         );
         for v in all_open {
             assert_eq!(

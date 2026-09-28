@@ -47,6 +47,7 @@
 //! which is the wrong way round. It checks that the CONDITIONS the waivers were
 //! written under still hold, and it names what to do when they stop.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Every arm carrying the 2034 macOS waiver, as `(path from the workspace root,
@@ -188,12 +189,44 @@ const WAIVED_2035: &[(&str, usize)] = &[
 
 /// The workspace root, found by walking up to the directory holding the
 /// lockfile, so a waiver in another crate is nameable from here.
+///
+/// Panics IN the repository, because a walk that cannot find the root there is
+/// a broken guard and must say so. Out of the repository there is no root and
+/// no `crates/` tree to inventory, which is what [`skip_out_of_workspace`]
+/// detects BEFORE any arm calls this.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .find(|a| a.join("Cargo.lock").exists())
         .expect("the workspace root is findable from this crate")
         .to_path_buf()
+}
+
+/// Whether this is a build OUTSIDE the repository, where every arm in this file
+/// has nothing to inventory and must skip rather than panic.
+///
+/// Keyed on the same fact the two `iceoryx2_version_lockstep_test` arms use, so
+/// the three files agree about what "out of workspace" means: the manifest one
+/// level above this crate declares `[workspace]`. A packaged or vendored crate
+/// carries neither that manifest nor the sibling `crates/` trees these
+/// inventories walk, so there is no file to read and nothing to compare.
+///
+/// Deliberately NOT keyed on a missing `Cargo.lock`: in the repository a
+/// missing lock means a broken walk, and this guard must fail loudly there
+/// instead of disabling itself. The skip prints its reason, so a build that
+/// starts skipping cannot do it silently.
+fn skip_out_of_workspace() -> bool {
+    let in_workspace =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml"))
+            .map(|t| t.contains("[workspace]"))
+            .unwrap_or(false);
+    if !in_workspace {
+        eprintln!(
+            "skip: out-of-workspace build, no crates/ tree to inventory \
+             (the manifest `=` pins still govern downstream resolution)"
+        );
+    }
+    !in_workspace
 }
 
 /// Read a file named by a path relative to the workspace root.
@@ -366,6 +399,9 @@ fn locked_iceoryx2_version() -> String {
 /// BOTH waivers expire together, because both name one release.
 #[test]
 fn both_waivers_are_pinned_to_the_iceoryx2_release_they_describe() {
+    if skip_out_of_workspace() {
+        return;
+    }
     let locked = locked_iceoryx2_version();
     let named = cerulion_core::testing::UPSTREAM_WAIVER_IOX2_VERSION;
     assert_eq!(
@@ -380,6 +416,9 @@ fn both_waivers_are_pinned_to_the_iceoryx2_release_they_describe() {
 /// contiguous attribute run, naming the defect.
 #[test]
 fn every_declared_2034_arm_carries_a_macos_scoped_ignore_that_names_the_defect() {
+    if skip_out_of_workspace() {
+        return;
+    }
     for (file, test) in WAIVED_2034 {
         let src = read_at(file);
         let run = attribute_run(&src, test).unwrap_or_else(|| {
@@ -459,6 +498,9 @@ fn second_arm() {
 /// name would ship green.
 #[test]
 fn the_2034_inventory_equals_what_the_workspace_carries() {
+    if skip_out_of_workspace() {
+        return;
+    }
     let mut found: Vec<(String, String)> = Vec::new();
     for file in every_rust_source() {
         let src = read_at(&file);
@@ -496,18 +538,20 @@ fn the_2034_inventory_equals_what_the_workspace_carries() {
     );
 }
 
-/// The waiver did NOT widen to every platform.
+/// The waiver did NOT widen to every platform, read off the SOURCE.
 ///
-/// This reads the source rather than asking a test binary what it will run, and
-/// that is a deliberate limit: libtest's `--list` prints ignored arms exactly
-/// like the rest, so a list based check would report "the arm is there" and be
-/// read as "the arm runs". The source scan at least says the true thing, and
-/// what makes it exact is the contiguous attribute walk the 2034 verdict uses:
-/// an `ignore` anywhere in the arm's own attribute run is visible here, and one
-/// on a neighbour is not attributed to it.
+/// Kept beside the runtime oracle below rather than replaced by it, because the
+/// two fail on different things and neither subsumes the other: this one runs
+/// whether or not a sibling binary has been built, and it is exact because of
+/// the contiguous attribute walk the 2034 verdict uses, so an `ignore` anywhere
+/// in the arm's own attribute run is visible here and one on a neighbour is not
+/// attributed to it. What it cannot see is what libtest will actually DO.
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn on_this_platform_every_waived_arm_actually_runs() {
+    if skip_out_of_workspace() {
+        return;
+    }
     for (file, test) in WAIVED_2034 {
         let src = read_at(file);
         let run = attribute_run(&src, test).expect("the arm exists");
@@ -670,9 +714,159 @@ fn subtraction_sites(src: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The directory holding this run's test binaries, which is where a sibling
+/// waived binary is if it was built at all.
+fn deps_dir() -> PathBuf {
+    std::env::current_exe()
+        .expect("the running test binary")
+        .parent()
+        .expect("a test binary lives in a directory")
+        .to_path_buf()
+}
+
+/// The newest built binary for `stem` in this run's own deps directory, or
+/// `None` when this invocation did not build it.
+///
+/// Newest by modification time on purpose: cargo leaves older hashes behind, and
+/// an ancient one would answer for source nobody is running.
+fn built_test_binary(stem: &str) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(deps_dir()).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        // `<stem>-<hash>` and nothing else: not `<stem>-<hash>.d`, not a
+        // different test whose name merely starts with this one.
+        let Some(tail) = name.strip_prefix(&format!("{stem}-")) else {
+            continue;
+        };
+        if !tail.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let when = entry.metadata().ok()?.modified().ok()?;
+        if best.as_ref().is_none_or(|(b, _)| when > *b) {
+            best = Some((when, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Ask a test binary what libtest knows. `ignored` selects the `--ignored`
+/// filter, which prints ONLY the arms libtest would SKIP.
+fn arms_of(bin: &Path, ignored: bool) -> BTreeSet<String> {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--list");
+    if ignored {
+        cmd.arg("--ignored");
+    }
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{} --list: {e}", bin.display()));
+    assert!(
+        out.status.success(),
+        "{} --list exited {:?}",
+        bin.display(),
+        out.status.code()
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_suffix(": test"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// What libtest will actually DO with the waived arms, asked of the binaries
+/// rather than inferred from their source.
+///
+/// `--list --ignored` prints ONLY the arms libtest would skip, which makes this
+/// a real oracle in BOTH directions: on macOS every declared waived arm must be
+/// in that set, and on every other platform none of them may be. The source
+/// scan above cannot reach either fact, because a `cfg_attr` is a claim about
+/// what the compiler did and this is a reading of what it produced.
+///
+/// It also catches a declared arm whose NAME no longer exists, since libtest
+/// lists what it will run and a renamed arm is simply absent.
+#[test]
+fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
+    // Anti-vacuity for the discovery itself: this binary is always built, so if
+    // the search cannot find IT the search is looking in the wrong place and a
+    // zero below would be a lie rather than a fact.
+    assert!(
+        built_test_binary("upstream_waivers_test").is_some(),
+        "the binary search cannot find this very test binary in {}, so it would \
+         report every waived binary as unbuilt",
+        deps_dir().display()
+    );
+
+    let mut by_binary: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (file, test) in WAIVED_2034 {
+        let stem = Path::new(file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("a waived path names a .rs file");
+        by_binary.entry(stem).or_default().push(test);
+    }
+
+    let mut checked_binaries = 0usize;
+    let mut checked_arms = 0usize;
+    let mut unbuilt: Vec<&str> = Vec::new();
+    for (stem, tests) in &by_binary {
+        let Some(bin) = built_test_binary(stem) else {
+            unbuilt.push(stem);
+            continue;
+        };
+        checked_binaries += 1;
+        let listed = arms_of(&bin, false);
+        let skipped = arms_of(&bin, true);
+        for test in tests {
+            assert!(
+                listed.contains(*test),
+                "{stem}::{test} is declared waived but libtest does not list it. \
+                 Either the arm was renamed and this inventory is stale, or the \
+                 built binary is older than the source: rebuild and re-run."
+            );
+            checked_arms += 1;
+            if cfg!(target_os = "macos") {
+                assert!(
+                    skipped.contains(*test),
+                    "{stem}::{test} carries the 2034 waiver but libtest will RUN it \
+                     on macOS. The waiver exists because the arm cannot pass here, \
+                     so a running arm means the `cfg_attr` did not take."
+                );
+            } else {
+                assert!(
+                    !skipped.contains(*test),
+                    "{stem}::{test} is SKIPPED on this platform. The 2034 waiver is \
+                     macOS only and the coverage is supposed to be lost on one \
+                     platform, not everywhere: this is the widened-waiver failure."
+                );
+            }
+        }
+    }
+
+    if checked_binaries == 0 {
+        eprintln!(
+            "skip: this invocation built none of the {} waived binaries, so there \
+             is nothing to ask libtest (the source scan still covers them)",
+            by_binary.len()
+        );
+        return;
+    }
+    eprintln!(
+        "libtest list oracle: {checked_arms} waived arm(s) across {checked_binaries} \
+         of {} binaries; not built here: {unbuilt:?}",
+        by_binary.len()
+    );
+}
+
 /// The 2035 arms subtract the known loans AND keep a bound on the remainder.
 #[test]
 fn every_declared_2035_arm_subtracts_the_known_loans_and_keeps_its_bound() {
+    if skip_out_of_workspace() {
+        return;
+    }
     let mut total = 0usize;
     for (file, arms) in WAIVED_2035 {
         let src = read_at(file);
@@ -718,6 +912,9 @@ fn every_declared_2035_arm_subtracts_the_known_loans_and_keeps_its_bound() {
 /// directions. Same reason as the 2034 one.
 #[test]
 fn the_2035_inventory_equals_what_the_workspace_carries() {
+    if skip_out_of_workspace() {
+        return;
+    }
     let mut found: Vec<(String, usize)> = Vec::new();
     for file in every_rust_source() {
         let n = read_at(&file)

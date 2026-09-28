@@ -865,8 +865,15 @@ impl RunRegistryInner {
         }
     }
 
-    fn note_doorbell_ring(&self) {
-        self.doorbell_rings.fetch_add(1, Ordering::Relaxed);
+    /// Count the RINGS a wait delivered, not the wait.
+    ///
+    /// Under 0.10 one `timed_wait` drains every queued activation and reports
+    /// how many, so several gatherers ringing between two waits arrive as one
+    /// wake carrying `n`. Adding 1 per wake would make
+    /// `doorbell_rings_answered` under-count exactly when it matters most, and
+    /// its name claims rings. Adding `n` makes the name true.
+    fn note_doorbell_rings(&self, rings: u64) {
+        self.doorbell_rings.fetch_add(rings, Ordering::Relaxed);
     }
 
     fn record_doorbell_failure(&self, reason: &str) {
@@ -1051,13 +1058,23 @@ fn pump_loop(
     while !exit.load(Ordering::Relaxed) {
         match doorbell.as_ref() {
             // iceoryx2 0.10: `timed_wait_one` is gone. `timed_wait` drains every
-            // queued activation and returns how many were delivered, so a ring is
-            // `Ok(n > 0)` where it used to be `Ok(Some(_))` and the timeout is
-            // `Ok(0)` where it used to be `Ok(None)`.
+            // queued activation and returns how many were delivered, so a ring
+            // is `Ok(n > 0)` where it used to be `Ok(Some(_))`.
+            //
+            // `Ok(0)` is NOT only the timeout, which is the one thing the old
+            // shape guaranteed: it is the deadline expiring OR a wake that
+            // found the queue already drained (a concurrent drain, or an
+            // activation the level-triggered doorbell had already collapsed).
+            // Both mean the same thing here — republish on the interval — so
+            // the arm is correct either way, and the distinction is written
+            // down because a reader reasoning about wake counts from this
+            // comment would otherwise conclude that `Ok(0)` implies a timeout.
             Some(listener) => match listener.timed_wait(|_a| {}, RUN_REPUBLISH_INTERVAL) {
                 // A ring: somebody is gathering and wants this run's answer.
-                Ok(n) if n > 0 => inner.note_doorbell_ring(),
-                // The fallback timeout — republish on the interval as before.
+                // `n` activations, not one wake — see `note_doorbell_rings`.
+                Ok(n) if n > 0 => inner.note_doorbell_rings(n),
+                // No ring to answer: the deadline, or a wake that drained
+                // nothing. Republish on the interval as before.
                 Ok(_) => {}
                 // A broken listener must degrade to the interval, never spin.
                 Err(e) => {

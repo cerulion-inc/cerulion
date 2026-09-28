@@ -2345,12 +2345,23 @@ impl CerulionPublisher {
     /// when no `SubscriberConnected` is pending (a single non-blocking listener
     /// drain); never fatal (see `deliver_history`).
     pub fn pump_history(&mut self) {
+        self.pump_history_at(Instant::now());
+    }
+
+    /// [`Self::pump_history`] with the clock already read.
+    ///
+    /// The idle cadence visits every publisher of every node on each
+    /// `live_step`, and the deadline only needs to know WHICH pass this is, not
+    /// which publisher within it. So the caller reads the clock once per pass
+    /// and hands the same `Instant` down: one read per pass instead of one per
+    /// publisher, and the deadline is evaluated against a single consistent
+    /// instant across the whole pass rather than a drifting one.
+    pub fn pump_history_at(&mut self, now: Instant) {
         // The deadline lives here and nowhere else. On the first idle pass it
         // is armed; afterwards it re-arms the drain whenever the interval has
         // elapsed, so a late joiner is picked up within one interval even when
         // the listener count never moved (a net zero attach and detach swap) and
         // even when the call budget was spent before the connect landed.
-        let now = Instant::now();
         match self.next_self_drain_rearm {
             Some(due) if now < due => {}
             _ => {

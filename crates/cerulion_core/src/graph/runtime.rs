@@ -15499,6 +15499,11 @@ impl GraphRuntime {
     /// `step()`/`drain_level` (replay firewall). Iterates `self.nodes` like
     /// `shutdown_all_nodes`; a poisoned mutex is logged and skipped.
     fn pump_history_all(&mut self) {
+        // ONE clock read for the whole pass. The publisher-side idle deadline
+        // only needs to know which pass this is, so reading per node, or worse
+        // per publisher, would charge the idle cadence a syscall-class read per
+        // port for no information.
+        let now = std::time::Instant::now();
         for entry in self.nodes.values() {
             // Poison-safe: a prior tick panic — caught by
             // the scheduler's `catch_unwind` (and already surfaced via
@@ -15514,7 +15519,7 @@ impl GraphRuntime {
             let mut e = entry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            e.pump_history();
+            e.pump_history_at(now);
         }
     }
 

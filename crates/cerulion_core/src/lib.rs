@@ -661,15 +661,16 @@ pub mod wire;
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 /// - v23: the whole iceoryx2 family moves to 0.10.0, and `CerulionPublisher`
-///   gains two fields (`last_listener_count`, `self_drains_armed`) for the
-///   gate on its self drain.
+///   gains three fields (`last_listener_count`, `self_drains_armed`,
+///   `next_self_drain_rearm`) for the gate on its self drain and the idle
+///   deadline that bounds it in time.
 ///
 ///   Either half alone would bump this constant; the iceoryx2 half is the one
 ///   that MUST. A node cdylib statically links its own `cerulion_core` and
 ///   therefore its own iceoryx2, and 0.10 partitions a machine by version:
 ///   iceoryx2 0.9.3 added the package version to the global management
-///   segment's name, so a 0.9.1 process and a 0.10.0 process on one box keep
-///   SEPARATE node registries and cannot see each other's services at all.
+///   segment's name, so a 0.9.1 process and a 0.10.0 process on one machine
+///   keep SEPARATE node registries and cannot see each other's services at all.
 ///   Mixing a host and a cdylib across that line gives no data, no node fires
 ///   and no actionable error. Nothing detected it at load time before this
 ///   bump: the `RUSTC_FINGERPRINT` check (v22) compares compilers, not linked

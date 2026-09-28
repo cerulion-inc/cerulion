@@ -50,17 +50,20 @@ fn all_iceoryx2_deps_are_exact_pinned() {
         .parent()
         .expect("crates/ is the parent of this manifest")
         .to_path_buf();
-    let mut manifests: Vec<PathBuf> = std::fs::read_dir(&crates_dir)
-        .expect("read crates/")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path().join("Cargo.toml"))
-        .filter(|p| p.is_file())
-        .collect();
+    let mut manifests = Vec::new();
+    collect_manifests(&crates_dir, 0, &mut manifests);
     manifests.sort();
+    // NESTED, not just the direct children. `crates/cerulion_core/fuzz` and the
+    // thirty-eight crates under `crates/test_fixtures/` each carry their own
+    // manifest, and a direct-child scan sees none of them: one loose
+    // `iceoryx2 = "0.10"` there would resolve to the pinned version today and
+    // stay invisible until a 0.10.1 floated it. None of them declares iceoryx2
+    // right now, which is exactly when a guard should be widened.
+    //
     // A walk that stops finding manifests would pass every assert below
-    // vacuously; the workspace has well over ten crates.
+    // vacuously; the workspace carries well over fifty.
     assert!(
-        manifests.len() >= 10,
+        manifests.len() >= 50,
         "the manifest walk found only {} Cargo.toml files under {}, so this guard \
          would pass without checking anything",
         manifests.len(),
@@ -70,11 +73,13 @@ fn all_iceoryx2_deps_are_exact_pinned() {
     let want = format!("={PIN}");
     let mut per_crate: BTreeMap<String, usize> = BTreeMap::new();
     for manifest in &manifests {
+        // Nested members share a leaf directory name with nothing, but the path
+        // relative to `crates/` is unique and is what a reader needs to find it.
         let name = manifest
             .parent()
-            .and_then(|d| d.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .and_then(|d| d.strip_prefix(&crates_dir).ok())
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_else(|| manifest.display().to_string());
         let toml = std::fs::read_to_string(manifest)
             .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
         // Force inline form: a `[...dependencies.iceoryx2-*]` TABLE header would
@@ -210,7 +215,9 @@ fn every_committed_lockfile_resolves_the_family_to_the_pin() {
     collect_lockfiles(&repo, 0, &mut locks);
     assert!(
         locks.len() >= 10,
-        "expected at least the workspace lock, the two bench locks and the seven          example locks (>=10), found {} ({locks:?}) — a walk that stops finding them          is an inert guard",
+        "expected at least the workspace lock, the two bench locks and the seven \
+         example locks (>=10), found {} ({locks:?}) — a walk that stops finding them \
+         is an inert guard",
         locks.len()
     );
 
@@ -231,6 +238,30 @@ fn every_committed_lockfile_resolves_the_family_to_the_pin() {
         offenders.is_empty(),
         "these lockfiles do not resolve the iceoryx2 family to exactly {PIN}: {offenders:#?}"
     );
+}
+
+/// Every `Cargo.toml` under `dir`, nested members included, skipping build
+/// output and version control. Depth-bounded so a symlink loop cannot hang.
+fn collect_manifests(dir: &PathBuf, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if name == "target" || name == ".git" || name == "node_modules" {
+                continue;
+            }
+            collect_manifests(&path, depth + 1, out);
+        } else if name == "Cargo.toml" {
+            out.push(path);
+        }
+    }
 }
 
 /// Every `Cargo.lock` under `dir`, skipping build output and version control.

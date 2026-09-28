@@ -41,10 +41,18 @@ fn origin_is_drained(arg: &str) -> bool {
         || arg == "&s.listener"
 }
 
-/// The construction sites this walk must find. Twelve trigger subscriber wraps
-/// across the live loop's source builders, the external doorbell, and
-/// `WakeSet::wait`. A walk that stops finding them is inert, so it fails.
-const MIN_CONSTRUCTIONS: usize = 14;
+/// Trigger subscriber wraps across the live loop's source builders.
+const TRIGGER_SUBSCRIBER_WRAPS: usize = 12;
+
+/// The two remaining origins: the external `Notified` doorbell and the
+/// `WakeSource` a caller hands `WakeSet::wait`.
+const OTHER_DRAINED_ORIGINS: usize = 2;
+
+/// The construction sites this walk must find, DERIVED from the two counts
+/// above rather than written down beside them, so the number and the sentence
+/// that explains it cannot drift apart. A walk that stops finding them is
+/// inert, so it fails.
+const MIN_CONSTRUCTIONS: usize = TRIGGER_SUBSCRIBER_WRAPS + OTHER_DRAINED_ORIGINS;
 
 #[test]
 fn every_listener_wake_source_comes_from_a_listener_something_drains() {
@@ -55,21 +63,14 @@ fn every_listener_wake_source_comes_from_a_listener_something_drains() {
 
     for path in rust_sources(&src) {
         let text = std::fs::read_to_string(&path).expect("readable source file");
-        for (line_no, arg) in listener_arguments(&text) {
-            // `WaitSource::Listener(listener)` in a `match` arm or a `let ... else`
-            // BINDS the listener out of a source the loop already holds; it does
-            // not register a new one. A binding pattern is a bare identifier,
-            // and no legal construction here is.
-            if arg
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-            {
+        for site in listener_sites(&text) {
+            if site.is_pattern {
                 patterns += 1;
                 continue;
             }
             constructed += 1;
-            if !origin_is_drained(&arg) {
-                offenders.push(format!("{}:{line_no}: {arg}", path.display()));
+            if !origin_is_drained(&site.arg) {
+                offenders.push(format!("{}:{}: {}", path.display(), site.line, site.arg));
             }
         }
     }
@@ -81,8 +82,10 @@ fn every_listener_wake_source_comes_from_a_listener_something_drains() {
     );
     assert!(
         constructed >= MIN_CONSTRUCTIONS,
-        "expected at least {MIN_CONSTRUCTIONS} listener wake-source constructions, walked \
-         {constructed} (a renamed variant would make this guard inert)"
+        "expected at least {MIN_CONSTRUCTIONS} listener wake-source constructions \
+         ({TRIGGER_SUBSCRIBER_WRAPS} trigger subscriber wraps plus \
+         {OTHER_DRAINED_ORIGINS} other drained origins), walked {constructed} \
+         (a renamed variant would make this guard inert)"
     );
     assert!(
         offenders.is_empty(),
@@ -94,10 +97,32 @@ fn every_listener_wake_source_comes_from_a_listener_something_drains() {
     );
 }
 
-/// Every `WaitSource::Listener(` argument in `text`, as `(1-based line, argument
-/// text with whitespace collapsed)`. The argument is closed at the paren that
-/// BALANCES the opener, so a multi-line wrap reads the same as a one-liner.
-fn listener_arguments(text: &str) -> Vec<(usize, String)> {
+/// One `WaitSource::Listener(...)` site.
+struct ListenerSite {
+    /// 1-based line of the opener.
+    line: usize,
+    /// The argument text, whitespace collapsed, so a multi-line wrap reads the
+    /// same as a one-liner.
+    arg: String,
+    /// A binding PATTERN (a `match` arm, or a `let ... = ... else`) rather than
+    /// a construction. A pattern takes a listener the loop already holds out of
+    /// a source; it registers nothing.
+    is_pattern: bool,
+}
+
+/// Every `WaitSource::Listener(` site in `text`, classified.
+///
+/// The classification is by POSITION, not by the argument's shape. Shape was
+/// the first attempt and it had a hole: it called any bare snake_case argument a
+/// pattern, so `WaitSource::Listener(body_listener)` — a real construction from
+/// a local binding, which is exactly the never-drained body subscriber this file
+/// exists to refuse — was silently skipped instead of checked.
+///
+/// What actually separates the two is what FOLLOWS the balanced close paren.
+/// A pattern is always immediately followed by `=>` (a match arm) or `=` (a
+/// `let` destructuring). A construction is followed by a comma, a close paren,
+/// a brace or end of line. That holds whatever the argument looks like.
+fn listener_sites(text: &str) -> Vec<ListenerSite> {
     const OPEN: &str = "WaitSource::Listener(";
     let mut out = Vec::new();
     for (start, _) in text.match_indices(OPEN) {
@@ -129,7 +154,14 @@ fn listener_arguments(text: &str) -> Vec<(usize, String)> {
         if arg.is_empty() {
             continue;
         }
-        out.push((text[..start].matches('\n').count() + 1, arg));
+        let after = text[end + 1..].trim_start();
+        let is_pattern =
+            after.starts_with("=>") || (after.starts_with('=') && !after.starts_with("=="));
+        out.push(ListenerSite {
+            line: text[..start].matches('\n').count() + 1,
+            arg,
+            is_pattern,
+        });
     }
     out
 }
@@ -149,4 +181,75 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+// ===========================================================================
+// The classifier's own arms, including the counter-example the shape-based
+// first attempt got wrong.
+// ===========================================================================
+
+/// A construction whose argument is a bare snake_case local is CHECKED, not
+/// waved through as a binding pattern.
+///
+/// This is the hole the shape test had. `WaitSource::Listener(body_listener)`
+/// is indistinguishable from a match binding by shape alone, and it is precisely
+/// the shape a future change would take if it registered a node body
+/// subscriber's listener — the never drained doorbell this whole file exists to
+/// refuse. Position tells them apart.
+#[test]
+fn a_bare_identifier_construction_is_checked_and_refused() {
+    let src = "\
+        let s = WaitSource::Listener(body_listener);\n\
+    ";
+    let sites = listener_sites(src);
+    assert_eq!(sites.len(), 1, "one site expected, got {}", sites.len());
+    assert!(
+        !sites[0].is_pattern,
+        "a bare identifier in construction position must NOT be classified as a \
+         binding pattern; that misclassification is what let an undrained body \
+         subscriber's listener through"
+    );
+    assert!(
+        !origin_is_drained(&sites[0].arg),
+        "`{}` is not one of the drained origins, so the walk must refuse it",
+        sites[0].arg
+    );
+}
+
+/// The two real pattern positions are still recognised, so the walk does not
+/// start reporting every `match` arm as an undrained registration.
+#[test]
+fn a_match_arm_and_a_let_destructuring_are_still_patterns() {
+    for src in [
+        "            WaitSource::Listener(listener) => attach(*listener),\n",
+        "        let WaitSource::Listener(listener) = source else { return };\n",
+        "        let waitset::WaitSource::Listener(listener) = source else { return };\n",
+    ] {
+        let sites = listener_sites(src);
+        assert_eq!(sites.len(), 1, "one site expected in {src:?}");
+        assert!(
+            sites[0].is_pattern,
+            "this is a binding pattern, not a registration: {src:?}"
+        );
+    }
+}
+
+/// Each drained origin is accepted in construction position, so the rule admits
+/// what the live loop actually does.
+#[test]
+fn every_drained_origin_is_accepted_in_construction_position() {
+    for src in [
+        "                    WaitSource::Listener(\n                        self.trigger_subscribers[binding.subscriber_idx].listener(),\n                    ),\n",
+        "                    WaitSource::Listener(&bell.listener)\n",
+        "                    WaitSource::Listener(&s.listener),\n",
+    ] {
+        let sites = listener_sites(src);
+        assert_eq!(sites.len(), 1, "one site expected in {src:?}");
+        assert!(!sites[0].is_pattern, "construction position expected: {src:?}");
+        assert!(
+            origin_is_drained(&sites[0].arg),
+            "`{}` is a drained origin and must be accepted",
+            sites[0].arg
+        );
+    }
 }

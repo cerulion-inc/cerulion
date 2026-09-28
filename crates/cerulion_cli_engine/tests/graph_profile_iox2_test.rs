@@ -1283,6 +1283,28 @@ fn auto_derive_costs_low_rate_graph_not_isolated() {
 // costed.
 // ==========================================================================
 
+// Not waived for upstream 2034, unlike the eight full-profile arms around it,
+// and that is deliberate rather than an omission.
+//
+// The 2034 inventory in `upstream_waivers_test` is the set of arms that actually
+// FAIL under the harness CI uses, enumerated from a full run rather than
+// predicted: the defect bites the second plugin graph in a process, so under
+// nextest, one process per test, only the arms it bites are waived. This arm is
+// not one of them. Measured on macOS against a freshly built binary: it passes,
+// alone, in 4 seconds.
+//
+// Waiving it anyway would be the widening the waiver file argues against: it
+// would mark coverage as lost on macOS that macOS actually has, and the
+// inventory would stop describing the defect. If this arm ever does start
+// failing here, the fix is a waiver naming 2034, not an ignore.
+//
+// One trap worth knowing when checking that by hand: running this binary
+// directly is only valid if it was built from the current source. A binary older
+// than a `CerulionPublisher` field change segfaults, because the node dylibs the
+// arm builds in its temp workspace compile against current source while the host
+// binary does not, and the two then disagree about the publisher's layout. That
+// is the ABI pin's M1 arriving through a stale test binary; rebuild before
+// judging.
 #[tracing_test::traced_test]
 #[test]
 #[serial]
