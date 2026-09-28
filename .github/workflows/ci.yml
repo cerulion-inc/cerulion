@@ -87,22 +87,39 @@ env:
   # rest is billed, and a failed payment makes the service refuse every save
   # while the store is above 10 GB (measured 2026-09-28: 13 refusals into a
   # 15.8 GB store, one accepted save into an emptied one). One generation of
-  # every namespace here is 17.1 GB, so the default saves only the two archives
-  # that buy wall time and fit together: the macOS test shards (4.27 GB) and the
-  # Linux test shards (3.18 GB), 7.45 GB, main only. Every other namespace is
-  # restore-only. Directly before each save a prune step keeps exactly the
-  # job's current `main` key and deletes every other entry of its namespace
-  # (stale lockfile generations, `pr` scope, legacy unqualified keys), so the
-  # store never holds two archives of one namespace.
+  # the eight namespaces measured is 17.1 GB (the rmw lanes and the smaller
+  # tool caches are not in that figure), so the default saves two archives: the
+  # macOS test shards' archive, which saves 29 minutes of wall time, and the
+  # Linux test shards' archive the shards need, which fit together (4.27 GB and
+  # 3.18 GB, 7.45 GB, main only). Every other namespace is restore-only.
+  # Directly before every save of a lockfile-keyed archive (the machete tool
+  # cache is exempt) a prune step keeps exactly the job's current `main` key and
+  # deletes every other entry of its namespace (stale lockfile generations,
+  # `pr` scope, legacy unqualified keys), so the store never holds two archives
+  # of one namespace.
+  #
+  # THE PRUNE IS NOT GATED ON THE NAMESPACE LIST, only on the branch: every
+  # default-branch run of a job that has a prune step prunes, and keeps exactly
+  # that job's current key even when no entry under it exists. A restore-only
+  # namespace is therefore EMPTIED rather than left holding stale archives
+  # nothing will replace -- a pull request's restore refreshes an entry's
+  # last-access time, so GitHub's idle eviction never reclaims one on its own.
   #
   # CACHE_SAVE_NAMESPACES: space-separated namespace tokens that may save, the
-  # token being the key text between `cargo-` and the scope/hash (`macOS`,
-  # `Linux`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `rmw-distros-jazzy`,
-  # ...), or `all`. The default lives HERE, so a repository with no variable
-  # saves the measured frontier and a typo matches nothing (fail-closed on
-  # content). CACHE_SAVE_ON_PULL_REQUEST: empty means saves run on main only;
-  # any value lets pull-request runs save too. `tools/scripts/ci_cache_policy_check.py`
-  # (Lint job) holds every save step to this contract.
+  # token being the key text between `cargo-` and the scope segment with any
+  # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`,
+  # `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
+  # `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lock
+  # hash>`, whose header hash is a cache generation rather than part of the
+  # namespace), or `all`. The default lives HERE, so a repository with no
+  # variable saves the measured frontier and a typo matches nothing
+  # (fail-closed on content). CACHE_SAVE_ON_PULL_REQUEST: empty means saves run
+  # on main only; any value lets pull-request runs save too, and only from a
+  # branch of this repository -- a fork's token cannot hold `actions: write`, so
+  # the prune's delete would fail the job. rmw-distros.yml and
+  # examples-replay.yml carry the same two values, and
+  # `tools/scripts/ci_cache_policy_check.py` (Lint job) holds every save step in
+  # every workflow to this contract.
   CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
   CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
   CARGO_TERM_COLOR: always
@@ -627,14 +644,17 @@ jobs:
           actionlint
 
       # The cache save policy (CACHE_SAVE_* in `env`) is enforced by a checker
-      # over this file and rmw-distros.yml; its self-test and the prune
+      # over EVERY workflow in the directory, not a hand list of the two that
+      # were known to cache: two others were writing into the same store with
+      # the combined `actions/cache` action, ungated and unpruned, while a
+      # two-file invocation reported clean. Its self-test and the prune
       # script's self-test run first so a silent checker cannot pass.
       - name: Cache save policy (self-tests, then the workflows)
         run: |
           set -euo pipefail
           bash tools/scripts/ci_cache_prune.sh --self-test
           python3 tools/scripts/ci_cache_policy_check.py --self-test
-          python3 tools/scripts/ci_cache_policy_check.py .github/workflows/ci.yml .github/workflows/rmw-distros.yml
+          python3 tools/scripts/ci_cache_policy_check.py .github/workflows
 
 
       # The workspace + restored target cache no longer fit ubuntu-latest's
@@ -905,8 +925,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-lint ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -919,7 +938,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-lint ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -985,8 +1004,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}"
@@ -999,7 +1017,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -1054,8 +1072,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' msrv-1.93 '))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}"
@@ -1068,7 +1085,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' msrv-1.93 '))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -1164,8 +1181,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-{0} ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-examples-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/**/Cargo.toml') }}"
@@ -1178,7 +1194,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -1374,8 +1390,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-go2-{0} ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-examples-go2-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/go2/**/Cargo.toml') }}"
@@ -1388,7 +1403,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-go2-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -1596,9 +1611,10 @@ jobs:
       # superset of shard 0's (`rmw_cerulion` rides shard 3). If the package
       # map moves again, re-derive this
       # rather than trusting it.)
-      # (On Linux `lint` normally reserves this key first and every save here is
-      # skipped as an exact hit; there is no `lint` leg on macOS, which is where
-      # the race actually bit.)
+      # (Shard 0 is the SOLE saver of `cargo-Linux-`. `lint`, `docs` and
+      # `netd-wan` used to share this key and whichever finished first wrote it;
+      # they have their own namespaces now and fall through their `restore-keys`
+      # to this one, which is a superset of what they build.)
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
         if: matrix.shard == 0
@@ -1746,9 +1762,12 @@ jobs:
       #     `target/debug/build/`, whose entries are hardlinks to these, and a
       #     hardlink means deleting one copy frees no blocks anyway.
       #
-      # No cache cost: the `cargo-Linux-` archive measures ~563 MB restored
-      # (registry + git — this job builds `target` cold), so there are no test
-      # executables in it to lose.
+      # Cache cost, restated now that shard 0 is the sole saver of
+      # `cargo-Linux-` (3.18 GB measured 2026-09-28, this job's own `target/`
+      # included): the save step runs at the END of this job, after this
+      # reclaim, so the executables removed here are not in the archive the next
+      # run restores. Cargo relinks them from the `.rlib`/`.rmeta` artefacts
+      # that stay, which is the cost this reclaim already accepted.
       #
       # TWO placements, not one. Before the wan step alone would fix the five
       # observed firings and nothing else: the second main push entered that step
@@ -2086,8 +2105,7 @@ jobs:
         if: >-
           matrix.shard == 0
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -2101,7 +2119,7 @@ jobs:
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && matrix.shard == 0
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -2261,9 +2279,8 @@ jobs:
       # saver under this map than under the 2-way one, not merely a defensible
       # one. If the package map moves again, re-derive this rather than
       # trusting it.
-      # (On Linux `lint` normally reserves this key first and every save here is
-      # skipped as an exact hit; there is no `lint` leg on macOS, which is where
-      # the race actually bit.)
+      # (Shard 0 is the SOLE saver of `cargo-macOS-`: no other job on this
+      # runner writes that key.)
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
         if: matrix.shard == 0
@@ -2559,8 +2576,7 @@ jobs:
         if: >-
           matrix.shard == 0
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -2574,7 +2590,7 @@ jobs:
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && matrix.shard == 0
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -2728,8 +2744,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' crates-{0} ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -2742,7 +2757,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' crates-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -2883,8 +2898,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -2897,7 +2911,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -2978,8 +2992,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -2992,7 +3005,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -3094,8 +3107,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' fuzz-{0} ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-fuzz-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -3108,7 +3120,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' fuzz-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -3180,8 +3192,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' miri-{0} ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -3194,7 +3205,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' miri-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -3279,8 +3290,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-docs ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -3293,7 +3303,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-docs ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -3570,8 +3580,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-netd-wan ', runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -3584,7 +3593,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-netd-wan ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -3876,8 +3885,7 @@ jobs:
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' viz-{0}-{1} ', matrix.lane, runner.os)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -3890,7 +3898,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' viz-{0}-{1} ', matrix.lane, runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -3945,17 +3953,21 @@ jobs:
   # both places. No Rust toolchain, no cargo cache, no `needs:` gate.
   # Policy lives in tools/release/deny.toml. Blocking by design.
 
-      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
-      # Saved as the LAST step so a green job stores what it built, and never
-      # from a merge-queue build: its branch is deleted after the batch, so
-      # nothing could restore what it saved, and the upload only adds eviction
-      # pressure on the store.
+      # NOT under the cache save policy, deliberately. This is a TOOL cache: one
+      # binary of a few MB under `~/.cargo/bin`, keyed on the pinned version and
+      # not on a lockfile hash. It has no lockfile generation for
+      # `ci_cache_prune.sh` to prune by, and gating it into a namespace the
+      # default never names meant the binary was never cached and
+      # `cargo install cargo-machete` ran on every push. It keeps the two tests
+      # that are about correctness rather than budget: do not re-upload what was
+      # restored, and never save from a merge-queue build whose branch is
+      # deleted after the batch. `ci_cache_policy_check.py` holds this shape
+      # (rule TOOL_CACHE) so a lockhash-free key over a `target/` directory
+      # cannot slip through the same door.
       - name: Cache cargo-machete (save)
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' machete-bin-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/bin/cargo-machete

@@ -9,7 +9,7 @@ or anything under `tools/scripts/`.
 The `Lint` job has a 45-minute limit covering runner setup, cache restore,
 compilation, the checks themselves, and the cache save (restore-only under the
 default save policy below; the save runs when `CACHE_SAVE_NAMESPACES` names
-`Linux-lint`). A cold cache restore can take a quarter of an hour on its own, so
+`Linux-lint` on a default-branch run). A cold cache restore can take a quarter of an hour on its own, so
 a tighter budget expires inside Clippy and the job dies before it saves a cache,
 which makes the next run pay the same restore again. The limit bounds this job alone; which checks are required is set
 elsewhere in the workflow.
@@ -527,45 +527,96 @@ regression script.
 The Actions cache store has a 10 GB free allowance; storage above it is billed, and while the
 account carries a failed payment the service refuses every save into a store above 10 GB
 (measured 2026-09-28: 13 refusals into a 15.8 GB store, then one accepted save into an emptied
-one). One generation of every cache namespace the workflows write is 17.1 GB, so the workflows
-save only what fits and pays: the macOS test shards' archive (4.27 GB, shard 0 of `test-macos`,
-worth 29 minutes on the wall of a cold run) and the Linux test shards' archive (3.18 GB, shard 0
-of `test-linux`), 7.45 GB together, on `main` only. Every other `actions/cache/save` step is
-gated off by default and its job is restore-only.
+one). One generation of the eight namespaces measured is 17.1 GB (the rmw lanes and the smaller
+tool caches are not in that figure), so the workflows save only what fits and pays: the macOS
+test shards' archive (4.27 GB, shard 0 of `test-macos`, worth 29 minutes on the wall of a cold
+run) and the Linux test shards' archive (3.18 GB, shard 0 of `test-linux`), 7.45 GB together, on
+`main` only. Every other `actions/cache/save` step is gated off by default and its job is
+restore-only.
 
 The policy is two workflow-level `env` values, each defaulting from a repository variable:
 
 * `CACHE_SAVE_NAMESPACES` (`${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}`): the
   space-separated namespace tokens that may save, or `all`. A token is the key text between
-  `cargo-` and the scope segment: `macOS`, `Linux`, `crates-Linux`, `viz-vizd-Linux`,
-  `Linux-lint`, `rmw-distros-jazzy`, and so on. The default is the expression's literal, so a
-  repository with no variable saves the measured frontier and a misspelt variable matches
-  nothing.
+  `cargo-` and the scope segment, with any `${{ steps.*.outputs.* }}` segment removed: `macOS`,
+  `Linux`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
+  `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lockhash>`, whose
+  header hash is a cache generation rather than part of the namespace. The default is the
+  expression's literal, so a repository with no variable saves the measured frontier and a
+  misspelt variable matches nothing.
 * `CACHE_SAVE_ON_PULL_REQUEST` (`${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}`): empty means saves
-  run on `main` only (`github.ref == 'refs/heads/main'`); any value lets pull-request runs
-  save into their own `-pr-` scoped keys as well.
+  run on `main` only; any value lets pull-request runs save into their own `-pr-` scoped keys
+  as well, and only from a branch of this repository. A fork pull request's token cannot hold
+  `actions: write`, so the prune's delete would fail the job; the clause tests
+  `github.event.pull_request.head.repo.full_name == github.repository`.
 
-Directly before every save step runs `tools/scripts/ci_cache_prune.sh "<the save key>"` under
-the same gate: it keeps exactly that key and deletes every other entry of the namespace (stale
-lockfile generations, `pr` scoped entries, legacy unqualified keys), so the store never holds
-two archives of one namespace and a lockfile change costs one generation, never two. The
-jobs that prune carry `permissions: {contents: read, actions: write}`; nothing else does.
+Before every save of a lockfile-keyed archive (the machete tool cache is exempt, below)
+`tools/scripts/ci_cache_prune.sh "<the save key>"` runs: it keeps exactly that key and deletes
+every other entry of the namespace (stale lockfile generations, `pr` scoped entries, legacy
+unqualified keys), so the store never holds two archives of one namespace and a lockfile change
+costs one generation, never two. The jobs that prune carry
+`permissions: {contents: read, actions: write}`; nothing else does.
+
+The prune's gate is WIDER than the save's, deliberately: the branch clause and the merge-queue
+clause, never the namespace list. Every default-branch run of a job that has a prune step
+prunes, whether or not its namespace may save, and keeps exactly that job's current key even
+when no entry under that key exists -- so a restore-only namespace is emptied rather than left
+holding archives nothing will ever replace. Nothing else reclaims them: a pull request's restore
+refreshes an entry's last-access time, so GitHub's seven-day idle eviction never fires on a
+stale archive that pull requests keep reading.
+
+Three rules inside the script keep a prune from deleting what another run still needs.
+
+* **The tip check.** On `refs/heads/main` the script reads the branch tip once and deletes
+  nothing unless the tip is this run's own commit. Two runs on `main` overlap all the time, and
+  the older one would otherwise delete the generation the newer one had just saved -- and then
+  skip its own save as an exact hit, leaving the namespace empty. The older run still saves; the
+  next tip run prunes what it left.
+* **The clock guard.** The prune records the UTC second it began before it lists, and deletes
+  only entries created strictly earlier than that. An entry that appeared while the prune was
+  running belongs to a run ahead of this one; it is kept and named in the log.
+* **The scope rule.** A keep key scoped `-pr-` may delete only `-pr-` entries of its namespace:
+  a pull-request prune must never take the `-main-` archive or the legacy unqualified entries,
+  which are what every other run restores. A `-main-` or unscoped keep key deletes every
+  shape-matching entry of the namespace, which is the point of the prune. Identity is (key,
+  ref), because GitHub stores one entry per pair and under the pull-request override every open
+  branch holds its own entry under the same key string.
 
 `lint`, `docs` and `netd-wan` build far smaller targets than the shards and used to share the
-shards' `cargo-Linux-` key, so whichever finished first saved it (a 0.63 GB lint archive was
-what the shards restored on 2026-09-28). They now have their own namespaces
-(`cargo-Linux-lint-`, `cargo-Linux-docs-`, `cargo-Linux-netd-wan-`). Under the default all
-three are restore-only and fall through their `restore-keys` to `cargo-Linux-main-`, the
-shards' archive, a superset of what they need; `test-linux` shard 0 restores and saves its own
-key; the shards 1 to 3 restore it.
+shards' `cargo-Linux-` key, so whichever finished first saved it: on 2026-09-28 the entry under
+the shards' key was a 0.63 GB archive saved by one of the smaller jobs, not the shards' 3.18 GB
+one. They now have their own namespaces (`cargo-Linux-lint-`, `cargo-Linux-docs-`,
+`cargo-Linux-netd-wan-`). Under the default all three are restore-only and fall through their
+`restore-keys` to `cargo-Linux-main-`, the shards' archive, a superset of what they need;
+`test-linux` shard 0 restores and saves its own key; the shards 1 to 3 restore it.
 
-`tools/scripts/ci_cache_policy_check.py` holds both workflow files to this contract (the gate
-names the key's namespace, the main-only clause is present, the prune step directly precedes
-the save with the byte-identical key, the job permission is declared, the default literal is
-unchanged, a save is never reachable from a merge-queue run, the save is the job's last step)
-and refuses a file with no save steps at all. The `Lint` step "Cache save policy" runs the
-prune script's self-test and the checker's self-test, both of which flip every rule from both
-sides, before the checker reads the real files.
+Two exemptions, both narrow. The machete binary cache (`~/.cargo/bin/cargo-machete`, keyed on
+the pinned version and not on a lockfile hash) is a TOOL cache: a few MB with no lockfile
+generation for the prune to work from, so it carries no namespace gate and no prune step, only
+the cache-hit test and the merge-queue test. Gating it into a namespace the default never names
+meant the binary was never cached and `cargo install cargo-machete` ran on every push.
+`release.yml` restores and never saves: a tag run's entry is restorable by no other ref, so
+saving one would only add to the store.
+
+`tools/scripts/ci_cache_policy_check.py` holds every workflow in `.github/workflows` to this
+contract -- the directory, not a hand list of the files known to cache, because two workflows
+were writing into the same store with the combined `actions/cache` action while a two-file
+invocation reported clean. The rules: the gate names the key's namespace (R1); it carries the
+main-only clause with its fork condition (R2); the prune step directly precedes the save with
+the byte-identical key, an explicit sweep prefix is exactly the key text before the generation
+segment, and the save's condition is the prune's own plus the cache-hit test in front and the
+namespace gate behind (R3); the job permission is declared (R4); the default literal is
+unchanged (R5); a save is never reachable from a merge-queue run (R6); the save is the job's
+last step (R7); every gate is a conjunction of clauses from a closed set, each at most once,
+with no top-level `||` (R8 -- which is what stops `... || true` from turning a gate off while
+every other rule still passes); a container job installs `gh` and `jq` in the step before its
+prune, under the prune's own condition (R9); nothing shadows the policy in a job- or step-level
+`env` (R10); a key with no lockfile hash is a tool cache or a violation (TOOL_CACHE); the
+combined `actions/cache` action appears nowhere (NO_COMBINED_CACHE_ACTION); and a job whose
+steps the reader cannot enumerate -- a reusable-workflow call, or one carrying no `steps:` -- is
+refused rather than passed in silence. The `Lint` step "Cache save policy" runs the prune
+script's self-test and the checker's self-test, both of which flip every rule from both sides,
+before the checker reads the real files.
 
 ## Test map
 

@@ -41,7 +41,9 @@ concurrency:
 env:
   # Cache save policy, identical to ci.yml (see the CACHE_SAVE_* comment there):
   # the rmw lanes are restore-only under the default and save when the variable
-  # names `rmw-distros-<distro>` or `all`.
+  # names `rmw-distros-<distro>` or `all`. The PRUNE runs on every
+  # default-branch run of this lane either way, so a restore-only namespace is
+  # emptied rather than left holding archives nothing will replace.
   CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
   CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
 
@@ -114,12 +116,41 @@ jobs:
       - name: Gate (expected state for this distro)
         run: bash tools/ci/rmw-distros/gate.sh "${{ matrix.distro }}"
 
+      # `gh` and `jq` are on every hosted runner image and on NEITHER of the
+      # ros:<distro>-ros-base images this lane runs in, so the prune step below
+      # died at its first `gh cache list` the moment the policy enabled this
+      # namespace. Installed under the prune's own condition, so it costs this
+      # lane nothing on the runs that do not prune. `ci_cache_policy_check.py`
+      # holds the pairing (rule R9_CONTAINER_TOOLS).
+      - name: Install the cache prune tools (gh, jq)
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl jq
+          install -m 0755 -d /usr/share/keyrings
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          arch=$(dpkg --print-architecture)
+          printf 'deb [arch=%s signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' \
+            "$arch" > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gh
+          gh --version
+          jq --version
+
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      # The prune is gated on the BRANCH only, never on the namespace list: this
+      # lane is restore-only under the default, and a namespace that never
+      # prunes keeps its stale archives for ever.
       - name: Cache cargo (prune the namespace to the current key)
         if: >-
           github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}" "cargo-rmw-distros-${{ matrix.distro }}-"
@@ -132,7 +163,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:

@@ -64,6 +64,14 @@ permissions:
   contents: read
 
 env:
+  # CACHE SAVE POLICY, the same two values ci.yml carries and with the same
+  # meaning (the reasoning is in ci.yml's `env` comment). This workflow used the
+  # combined `actions/cache` action, which saves at the end of the job with no
+  # gate and no prune, so it wrote into the same rationed store on every pull
+  # request, push and nightly. It now restores and saves in separate steps, the
+  # save behind the policy and a prune before it.
+  CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
+  CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
   # The demo runs the `cerulion` binary directly, not through cargo, so it does
   # not pick up the workspace cargo configuration. The login gate is on in every
   # build; this is how this repository's own runs pass it without an account.
@@ -77,6 +85,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # Generous but bounded: the loop itself measured ~4s, but a cold release
     # build of the example cdylibs + a fresh cerulion_core + the cerulion
     # binary dominates. 45 min leaves headroom for a cold build.
@@ -115,17 +128,28 @@ jobs:
       # Cargo.lock, the example's own pinned Cargo.lock (both tracked) and the
       # example's Cargo.toml files.
       # runner.os is in the key so the ubuntu + macOS matrix arms don't collide.
-      - name: Cache cargo
+      #
+      # BRANCH-QUALIFIED (`main` on a push to `main`, `pr` on every other ref)
+      # for the reason ci.yml records at length: a key is reserved once per
+      # repository and a run on `main` may only restore entries created on
+      # `main`, so a pull request holding the unqualified key stopped `main`
+      # from both reading and writing it. `restore-keys` falls through this
+      # ref's own scope, then `main`'s archive, then the pre-split
+      # `cargo-examples-perception-` entries, which nothing writes any more.
+      - name: Cache cargo (restore)
+        id: cache-restore-1
         if: steps.present.outputs.present == 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
             examples/perception/target
-          key: cargo-examples-perception-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'examples/perception/Cargo.lock', 'examples/perception/**/Cargo.toml') }}
+          key: cargo-examples-replay-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/perception/Cargo.lock', 'examples/perception/**/Cargo.toml') }}
           restore-keys: |
+            cargo-examples-replay-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-examples-replay-${{ runner.os }}-main-
             cargo-examples-perception-${{ runner.os }}-
 
       # The demo drives the `cerulion` on PATH, exactly as a user's shell would.
@@ -167,3 +191,37 @@ jobs:
             examples/perception/recordings/
             examples/perception/demo.log
           if-no-files-found: ignore
+
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      # The prune is gated on the BRANCH only, never on the namespace list: this
+      # namespace is restore-only under the default, and one that never prunes
+      # keeps its stale archives for ever (a pull request's restore refreshes an
+      # entry's last-access time, so idle eviction never reclaims it).
+      - name: Cache cargo (prune the namespace to the current key)
+        if: >-
+          steps.present.outputs.present == 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-examples-replay-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/perception/Cargo.lock', 'examples/perception/**/Cargo.toml') }}"
+
+      # Saved as the LAST step so a green job stores what it built. It sits
+      # after the failure-only upload above deliberately: neither this step nor
+      # the prune carries `always()`, so a failed demo skips both and a broken
+      # build is never what lands in the cache.
+      - name: Cache cargo (save)
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && steps.present.outputs.present == 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-replay-{0} ', runner.os)))
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            examples/perception/target
+          key: cargo-examples-replay-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/perception/Cargo.lock', 'examples/perception/**/Cargo.toml') }}

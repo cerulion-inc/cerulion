@@ -10,8 +10,18 @@
 # each holding a `main` entry, a stale `main` entry from the previous lockfile,
 # and one `pr` entry per open branch reaches the allowance in a day. The
 # workflows run this script in the step DIRECTLY BEFORE every
-# `actions/cache/save`, so the namespace holds at most the entry the job is
-# about to write.
+# `actions/cache/save` of a lockfile-keyed archive, so the namespace holds at
+# most the entry the job is about to write.
+#
+# THE PRUNE RUNS WIDER THAN THE SAVE, deliberately. A save is gated on its
+# namespace being named in `CACHE_SAVE_NAMESPACES`; the prune is not. Every
+# default-branch run of a job that has a prune step prunes, and keeps exactly
+# that job's current key even when no entry under that key exists — so a
+# namespace that is restore-only under the policy is EMPTIED rather than left
+# holding archives nothing will ever replace. Pull-request restores refresh an
+# entry's last-access time, so GitHub's seven-day idle eviction never fires on
+# a stale archive a pull request keeps reading; this script is the only thing
+# that reclaims it.
 #
 # WHAT IT DELETES, and why the shape test is narrow. `gh cache list --key` is a
 # PREFIX filter, so a listing for `cargo-crates-Linux-` also returns
@@ -23,6 +33,40 @@
 # nothing else. Anything under the prefix that does not have that shape is
 # counted and left alone: a prune step must never be the reason another job's
 # cache disappears.
+#
+# THE TIP CHECK (default-branch runs only). Two runs on `main` overlap all the
+# time: run A for an older commit is still building when run B for a newer one
+# prunes and saves, and A's prune would then delete the generation B just
+# wrote — with A skipping its own save as an exact hit, so nothing replaces it.
+# Neither "created after my run started" nor "created after my prune began"
+# fixes that on its own, because a RERUN of an older push run starts after the
+# newer generation was saved. So on `refs/heads/main` the script reads the
+# branch tip once and deletes nothing unless the tip is this run's own commit.
+# Only the run for the newest commit ever deletes; the others still save, and
+# the next tip run prunes what they left.
+#
+# THE CLOCK GUARD (every run). The prune records the UTC second it began before
+# it lists, and deletes only entries created STRICTLY EARLIER than that. An
+# entry that appeared while the prune was running belongs to a run that is
+# ahead of this one, so it is kept and named in the log. An entry whose
+# `createdAt` cannot be read as a timestamp stops the run: pruning blind is
+# worse than not pruning.
+#
+# THE SCOPE RULE. A keep key scoped `-pr-` may delete only `-pr-` scoped
+# entries of its namespace. A pull-request run (which only prunes at all when
+# `CACHE_SAVE_ON_PULL_REQUEST` is set) must never delete the `-main-` archive
+# or the legacy unqualified entries: those are what every other run restores,
+# and it is about to write a key that no other ref can read. A keep key scoped
+# `-main-`, or unscoped (the push-only namespaces), deletes every shape-
+# matching entry of the namespace, which is the whole point of the prune.
+#
+# REF IS PART OF THE IDENTITY. GitHub stores one entry per (key, ref), so with
+# `CACHE_SAVE_ON_PULL_REQUEST` set every open pull request holds its own entry
+# under the same `-pr-` key string. The entry this run is about to write is the
+# one whose key AND ref match; a same-key entry on another ref is a candidate
+# like any other (within the scope rule above). A merge-queue ref never reaches
+# this script — the prune and save gates both exclude `merge_group` — so no
+# queue-branch entry can be the one this run would keep.
 #
 # THE EXPLICIT PREFIX. `cargo-rmw-distros-<distro>-<header hash>-<scope>-<lock
 # hash>` carries a second hash, so the prefix derived from the keep key pins one
@@ -44,7 +88,12 @@
 # as a question: re-list once, and if the id is gone the other runner took it.
 # A delete that fails while the entry is still listed is a real failure and
 # stops the run, because continuing would delete more under an error we do not
-# understand.
+# understand. A re-list that itself fails, or whose body cannot be read, is
+# also a real failure: "I could not ask" is not "it vanished".
+#
+# THE LISTING IS BOUNDED. `gh cache list` is asked for at most 1000 entries and
+# the script refuses to continue if it gets exactly that many, because a
+# truncated listing would silently under-prune a namespace that has run away.
 #
 # A KEEP KEY MAY BE UNSCOPED. The push-only namespaces (`cargo-fuzz-Linux-<lock
 # hash>`, miri, msrv, cross-aarch64, release) carry no `(main|pr)` segment
@@ -55,15 +104,24 @@
 # 64-hex hash at all (the machete binary cache) is refused (exit 2): it has no
 # lockfile generation to prune by, and its save step carries no prune step.
 #
-# Environment: GH_TOKEN (the workflow step sets it from `github.token`) and
-# GITHUB_REPOSITORY (Actions sets it). Uses `gh` and `jq`, both preinstalled on
-# hosted runners.
+# Environment: GH_TOKEN (the workflow step sets it from `github.token`),
+# GITHUB_REPOSITORY, GITHUB_REF and GITHUB_SHA (Actions sets all three). A
+# missing one is exit 2, never a prune that guesses. Uses `gh` and `jq`, both
+# preinstalled on hosted runner images; a job running in a `container:` installs
+# them in the step before the prune.
 #
-# Exit 0 pruned, 1 an API failure, 2 a usage or key-shape failure.
+# Exit 0 pruned (or skipped because this run is not the tip), 1 an API failure,
+# 2 a usage or key-shape failure.
 #
 # `--self-test` drives the whole script against a fake `gh` on PATH and asserts
-# the exact delete set and exit code of seven cases, each with a passing
-# near-miss beside the failing one.
+# the exact delete set, the exact `gh` invocations (including the listing's
+# `--key` prefix and `-L` limit) and the exit code of seventeen lettered cases,
+# (a) to (q). Every case that proves a rule is stated twice: the failing side
+# and a passing near-miss one step away from it, so a rule that stopped holding
+# cannot pass as a rule that never fired. The case count is printed. Entries
+# staged for the clock guard carry far-past (2020) and far-future (2999)
+# `createdAt` values, which is how the "created while I was running" ordering is
+# staged without a sleep.
 set -euo pipefail
 
 SELF=$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)/$(basename "$0")
@@ -75,6 +133,11 @@ SELF=$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)/$(basename "$0")
 KEEP_KEY_RE='^(.+-)(main|pr)-[0-9a-f]{64}$'
 KEEP_KEY_UNSCOPED_RE='^(.+-)[0-9a-f]{64}$'
 
+# One listing, bounded. 1000 is far above any namespace this repository can
+# hold (one entry per lockfile generation per ref); reaching it means the
+# listing was truncated, and a truncated listing under-prunes silently.
+LIST_LIMIT=1000
+
 err() { printf '::error::%s\n' "$*" >&2; }
 note() { printf '::notice::%s\n' "$*"; }
 
@@ -85,24 +148,39 @@ mb() {
     printf '%d.%d' "$((tenths / 10))" "$((tenths % 10))"
 }
 
+sha8() { printf '%.8s' "$1"; }
+
 # Escape every character that is not alphanumeric, `_` or `-` so the prefix is
 # matched literally inside an extended regular expression.
 ere_quote() {
     printf '%s' "$1" | sed 's/[^A-Za-z0-9_-]/\\&/g'
 }
 
+# An RFC 3339 instant as the 14 digits YYYYMMDDHHMMSS, or the empty string if
+# the text does not carry that many. Comparing two of these as integers orders
+# them; comparing them as text would not, once a fractional second appears.
+ts_digits() {
+    local digits
+    digits=$(printf '%s' "$1" | tr -cd '0-9')
+    [ "${#digits}" -ge 14 ] || { printf ''; return 0; }
+    printf '%s' "${digits:0:14}"
+}
+
 gh_cache_list() {
-    gh cache list -R "$GITHUB_REPOSITORY" --key "$1" -L 100 --json id,key,ref,sizeInBytes
+    gh cache list -R "$GITHUB_REPOSITORY" --key "$1" -L "$LIST_LIMIT" \
+        --json id,key,ref,sizeInBytes,createdAt
 }
 
 prune() {
     local keep_key="$1" explicit_prefix="${2:-}"
-    local prefix esc cand_re json tsv
+    local prefix scope esc shape_re cand_re json tsv tip started
 
     if [[ $keep_key =~ $KEEP_KEY_RE ]]; then
         prefix="${BASH_REMATCH[1]}"
+        scope="${BASH_REMATCH[2]}"
     elif [[ $keep_key =~ $KEEP_KEY_UNSCOPED_RE ]]; then
         prefix="${BASH_REMATCH[1]}"
+        scope=""
     else
         err "cache prune: keep key carries no 64-hex lockfile hash: $keep_key"
         return 2
@@ -123,43 +201,100 @@ prune() {
         err "cache prune: GITHUB_REPOSITORY is unset"
         return 2
     fi
+    if [ -z "${GITHUB_REF:-}" ]; then
+        err "cache prune: GITHUB_REF is unset; the prune needs the ref to know which entry is its own"
+        return 2
+    fi
+    if [ -z "${GITHUB_SHA:-}" ]; then
+        err "cache prune: GITHUB_SHA is unset; the prune needs the commit to compare against the tip"
+        return 2
+    fi
 
     esc=$(ere_quote "$prefix")
     if [ -n "$explicit_prefix" ]; then
-        cand_re="^${esc}([0-9a-f]+-)?((main|pr)-)?[0-9a-f]{64}$"
+        shape_re="^${esc}([0-9a-f]+-)?((main|pr)-)?[0-9a-f]{64}$"
+        cand_re="^${esc}([0-9a-f]+-)?pr-[0-9a-f]{64}$"
     else
-        cand_re="^${esc}((main|pr)-)?[0-9a-f]{64}$"
+        shape_re="^${esc}((main|pr)-)?[0-9a-f]{64}$"
+        cand_re="^${esc}pr-[0-9a-f]{64}$"
     fi
+    # The scope rule: only a `-pr-` keep narrows the candidate set.
+    if [ "$scope" != "pr" ]; then
+        cand_re="$shape_re"
+    fi
+
+    # The tip check. A pull-request run never asks: it is not competing with
+    # another ref for the `main` generation, and the scope rule already keeps it
+    # inside its own `-pr-` entries.
+    if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+        if ! tip=$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha 2>&1); then
+            err "cache prune: reading the default-branch tip failed: $tip"
+            return 1
+        fi
+        tip=$(printf '%s' "$tip" | tr -d '[:space:]')
+        if [ "$tip" != "$GITHUB_SHA" ]; then
+            printf "cache prune: skipped, this run's commit %s is not the current default-branch tip %s\n" \
+                "$(sha8 "$GITHUB_SHA")" "$(sha8 "$tip")"
+            return 0
+        fi
+    fi
+
+    # Recorded BEFORE the listing, so an entry that appears between this instant
+    # and the listing is still classified as newer than the prune.
+    started=$(date -u +%Y%m%d%H%M%S)
 
     if ! json=$(gh_cache_list "$prefix" 2>&1); then
         err "cache prune: listing $prefix failed: $json"
         return 1
     fi
-    if ! tsv=$(printf '%s' "$json" | jq -r '.[] | [(.id|tostring), .key, .ref, (.sizeInBytes|tostring)] | @tsv' 2>&1); then
+    if ! tsv=$(printf '%s' "$json" | jq -r '.[] | [(.id|tostring), .key, .ref, (.sizeInBytes|tostring), .createdAt] | @tsv' 2>&1); then
         err "cache prune: could not read the cache listing for $prefix: $tsv"
         return 1
     fi
 
     local cand_ids=() cand_keys=() cand_refs=() cand_sizes=()
-    local n_cand=0 ignored=0
-    local id key ref size
-    while IFS=$'\t' read -r id key ref size; do
+    local n_cand=0 ignored=0 out_of_scope=0 newer=0 n_rows=0
+    local id key ref size created created_digits
+    while IFS=$'\t' read -r id key ref size created; do
         [ -n "$id" ] || continue
+        n_rows=$((n_rows + 1))
         case "$key" in
             "$prefix"*) ;;
             *) continue ;;
         esac
-        if ! [[ $key =~ $cand_re ]]; then
+        if ! [[ $key =~ $shape_re ]]; then
             ignored=$((ignored + 1))
             continue
         fi
-        [ "$key" != "$keep_key" ] || continue
+        if [ "$key" = "$keep_key" ] && [ "$ref" = "$GITHUB_REF" ]; then
+            continue
+        fi
+        if ! [[ $key =~ $cand_re ]]; then
+            printf 'cache prune: %s (%s) kept by the pull-request scope rule\n' "$key" "$ref"
+            out_of_scope=$((out_of_scope + 1))
+            continue
+        fi
+        created_digits=$(ts_digits "$created")
+        if [ -z "$created_digits" ]; then
+            err "cache prune: entry $key ($id) has an unreadable createdAt: ${created:-<empty>}"
+            return 1
+        fi
+        if [ "$((10#$created_digits))" -ge "$((10#$started))" ]; then
+            printf 'cache prune: %s (%s) kept (created after this prune began)\n' "$key" "$ref"
+            newer=$((newer + 1))
+            continue
+        fi
         cand_ids[n_cand]="$id"
         cand_keys[n_cand]="$key"
         cand_refs[n_cand]="$ref"
         cand_sizes[n_cand]="${size:-0}"
         n_cand=$((n_cand + 1))
     done <<< "$tsv"
+
+    if [ "$n_rows" -ge "$LIST_LIMIT" ]; then
+        err "cache prune: the listing for $prefix returned $n_rows entries, the full limit of $LIST_LIMIT; it is truncated, so this namespace cannot be pruned safely"
+        return 1
+    fi
 
     local i=0 deleted=0 deleted_bytes=0 vanished=0 out relist still
     while [ "$i" -lt "$n_cand" ]; do
@@ -180,8 +315,11 @@ prune() {
             err "cache prune: deleting $key ($id) failed and the re-list failed too: $out"
             return 1
         fi
-        still=$(printf '%s' "$relist" | jq -r --arg id "$id" '.[] | select((.id|tostring) == $id) | .id' 2>/dev/null || true)
-        if [ -z "$still" ]; then
+        if ! still=$(printf '%s' "$relist" | jq -r --arg id "$id" '[.[] | select((.id|tostring) == $id)] | length' 2>&1); then
+            err "cache prune: deleting $key ($id) failed and the re-list could not be read ($still); refusing to treat that as vanished: $out"
+            return 1
+        fi
+        if [ "$still" = "0" ]; then
             note "cache prune: $key vanished before delete (concurrent run)"
             vanished=$((vanished + 1))
             continue
@@ -195,6 +333,12 @@ prune() {
         "$keep_key" "$deleted" "$(mb "$deleted_bytes")" "$ignored" "$prefix")
     if [ "$vanished" -gt 0 ]; then
         summary="$summary; $vanished vanished concurrently"
+    fi
+    if [ "$newer" -gt 0 ]; then
+        summary="$summary; $newer kept (created after this prune began)"
+    fi
+    if [ "$out_of_scope" -gt 0 ]; then
+        summary="$summary; $out_of_scope kept by the pull-request scope rule"
     fi
     printf '%s\n' "$summary"
     return 0
@@ -222,20 +366,49 @@ st_write_fake_gh() {
     cat > "$ST_DIR/bin/gh" <<'FAKE'
 #!/usr/bin/env bash
 # Fake `gh` for ci_cache_prune.sh --self-test. Logs every invocation so a case
-# can assert the exact delete set, and can be told to fail one delete.
+# can assert the exact API calls and delete set, HONOURS the listing's `--key`
+# prefix filter and `-L` limit (a mutant that widens either is then visible in
+# the log and in what comes back), and can be told to fail one delete.
 set -eu
 log="$FAKE_GH_LOG"
 state="$FAKE_GH_STATE"
+
+if [ "${1:-}" = "api" ]; then
+    printf 'API:%s\n' "${2:-}" >> "$log"
+    if [ -z "${FAKE_GH_TIP:-}" ]; then
+        printf 'fake gh: no branch tip staged for this case\n' >&2
+        exit 1
+    fi
+    printf '%s\n' "$FAKE_GH_TIP"
+    exit 0
+fi
+
 sub=""
 [ "${1:-}" = "cache" ] && sub="${2:-}"
 case "$sub" in
     list)
-        printf 'LIST\n' >> "$log"
-        if [ -f "$state/gone" ] && [ -n "${FAKE_GH_RELIST_JSON:-}" ]; then
-            cat "$FAKE_GH_RELIST_JSON"
-        else
-            cat "$FAKE_GH_LIST_JSON"
+        shift 2
+        key=""
+        limit=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --key) key="${2:-}"; shift 2 ;;
+                -L) limit="${2:-}"; shift 2 ;;
+                -R | --json) shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        printf 'LIST key=%s limit=%s\n' "$key" "$limit" >> "$log"
+        if [ -f "$state/gone" ] && [ -n "${FAKE_GH_RELIST_RAW:-}" ]; then
+            cat "$FAKE_GH_RELIST_RAW"
+            exit 0
         fi
+        src="$FAKE_GH_LIST_JSON"
+        if [ -f "$state/gone" ] && [ -n "${FAKE_GH_RELIST_JSON:-}" ]; then
+            src="$FAKE_GH_RELIST_JSON"
+        fi
+        jq --arg k "$key" --argjson l "$limit" \
+           '[.[] | select(.key | startswith($k))] | .[0:$l]' "$src"
         ;;
     delete)
         id="${3:-}"
@@ -261,11 +434,26 @@ FAKE
     chmod +x "$ST_DIR/bin/gh"
 }
 
-# st_run <case> <list-json-file> <relist-json-file|-> <fail-id|-> <fail-mode|-> <args...>
-# Sets ST_RC, ST_OUT and ST_LOG for the assertions that follow.
+# The run environment of one case. `st_reset` puts every knob back to the
+# ordinary shape — a default-branch run that IS the tip — so a case states only
+# what it changes and no setting can leak from the case above it.
+st_reset() {
+    ST_LIST=""
+    ST_RELIST="-"
+    ST_RELIST_RAW="-"
+    ST_FAIL_ID="-"
+    ST_FAIL_MODE="-"
+    ST_REF="refs/heads/main"
+    ST_SHA="$ST_SHA_TIP"
+    ST_TIP="$ST_SHA_TIP"
+}
+
+# st_run <case> <args...>. Reads the ST_* knobs above; sets ST_RC, ST_OUT and
+# ST_LOG for the assertions that follow. An empty ST_REF or ST_SHA is passed
+# through as an empty value, which is what the script's own guard tests.
 st_run() {
-    local name="$1" list_json="$2" relist_json="$3" fail_id="$4" fail_mode="$5"
-    shift 5
+    local name="$1"
+    shift
     rm -rf "$ST_DIR/state"
     mkdir -p "$ST_DIR/state"
     : > "$ST_DIR/gh.log"
@@ -274,13 +462,17 @@ st_run() {
     ST_OUT=$(
         PATH="$ST_DIR/bin:$PATH" \
         GITHUB_REPOSITORY="owner/repo" \
+        GITHUB_REF="$ST_REF" \
+        GITHUB_SHA="$ST_SHA" \
         GH_TOKEN="fake-token" \
         FAKE_GH_LOG="$ST_DIR/gh.log" \
         FAKE_GH_STATE="$ST_DIR/state" \
-        FAKE_GH_LIST_JSON="$list_json" \
-        FAKE_GH_RELIST_JSON="$([ "$relist_json" = "-" ] || printf '%s' "$relist_json")" \
-        FAKE_GH_FAIL_ID="$([ "$fail_id" = "-" ] || printf '%s' "$fail_id")" \
-        FAKE_GH_FAIL_MODE="$([ "$fail_mode" = "-" ] || printf '%s' "$fail_mode")" \
+        FAKE_GH_TIP="$ST_TIP" \
+        FAKE_GH_LIST_JSON="$ST_LIST" \
+        FAKE_GH_RELIST_JSON="$([ "$ST_RELIST" = "-" ] || printf '%s' "$ST_RELIST")" \
+        FAKE_GH_RELIST_RAW="$([ "$ST_RELIST_RAW" = "-" ] || printf '%s' "$ST_RELIST_RAW")" \
+        FAKE_GH_FAIL_ID="$([ "$ST_FAIL_ID" = "-" ] || printf '%s' "$ST_FAIL_ID")" \
+        FAKE_GH_FAIL_MODE="$([ "$ST_FAIL_MODE" = "-" ] || printf '%s' "$ST_FAIL_MODE")" \
         bash "$SELF" "$@" 2>&1
     ) || ST_RC=$?
     ST_LOG=$(cat "$ST_DIR/gh.log")
@@ -309,6 +501,22 @@ st_expect_absent() {
     esac
 }
 
+# A listing of `count` entries that the shape test IGNORES, used to drive the
+# listing-limit rule without staging a thousand deletes.
+st_gen_ignored_listing() {
+    local out="$1" count="$2" prefix="$3" hash="$4" created="$5" i=0
+    {
+        printf '['
+        while [ "$i" -lt "$count" ]; do
+            [ "$i" -eq 0 ] || printf ','
+            printf '{"id": %d, "key": "%sfoo-main-%s", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "%s"}' \
+                "$((i + 1))" "$prefix" "$hash" "$created"
+            i=$((i + 1))
+        done
+        printf ']'
+    } > "$out"
+}
+
 self_test() {
     ST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ci_cache_prune_selftest.XXXXXX")
     trap st_cleanup EXIT
@@ -320,95 +528,127 @@ self_test() {
     H4=$(h64 44444444); H5=$(h64 55555555); H6=$(h64 66666666)
     H63="${H5:0:63}"
 
+    # Staged instants. The clock guard compares against the second the prune
+    # began, so a far-past and a far-future value stage "already there" and
+    # "appeared while I was running" with no sleep and no clock injection.
+    local PAST="2020-01-01T00:00:00Z"
+    local FUTURE="2999-01-01T00:00:00Z"
+    local UNREADABLE="whenever"
+
+    ST_SHA_TIP="aaaaaaaabbbbbbbbccccccccdddddddd11111111"
+    local OLD_SHA="99999999888888887777777766666666555555ff"
+    local API="API:repos/owner/repo/branches/main"
+
     local P="cargo-crates-Linux-"
     local KEEP="${P}main-${H1}"
+    local LIST_P="LIST key=${P} limit=1000"
 
     # ---- (a) the full mixture: three stale, two ignored, one duplicate keep --
     cat > "$ST_DIR/a.json" <<JSON
 [
-  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576},
-  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152},
-  {"id": 3, "key": "${P}pr-${H3}", "ref": "refs/pull/9/merge", "sizeInBytes": 3145728},
-  {"id": 4, "key": "${P}${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304},
-  {"id": 5, "key": "${P}foo-main-${H5}", "ref": "refs/heads/main", "sizeInBytes": 5242880},
-  {"id": 6, "key": "${P}main-${H63}", "ref": "refs/heads/main", "sizeInBytes": 6291456},
-  {"id": 7, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576}
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${P}pr-${H3}", "ref": "refs/pull/9/merge", "sizeInBytes": 3145728, "createdAt": "${PAST}"},
+  {"id": 4, "key": "${P}${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304, "createdAt": "${PAST}"},
+  {"id": 5, "key": "${P}foo-main-${H5}", "ref": "refs/heads/main", "sizeInBytes": 5242880, "createdAt": "${PAST}"},
+  {"id": 6, "key": "${P}main-${H63}", "ref": "refs/heads/main", "sizeInBytes": 6291456, "createdAt": "${PAST}"},
+  {"id": 7, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"}
 ]
 JSON
-    st_run a "$ST_DIR/a.json" - - - "$KEEP"
+    st_reset; ST_LIST="$ST_DIR/a.json"
+    st_run a "$KEEP"
     st_expect_rc 0
-    st_expect_log 'LIST
+    st_expect_log "${API}
+${LIST_P}
 OK:2
 OK:3
-OK:4'
+OK:4"
     st_expect_contains "cache prune: kept ${KEEP}; deleted 3 entries, 9.0 MB; ignored 2 other keys under ${P}"
     st_expect_contains "cache prune: deleted ${P}pr-${H3} (refs/pull/9/merge, 3.0 MB)"
     st_expect_absent "${P}foo-main-${H5}"
     # Near-miss beside it: the sibling IS a well-formed keep key, and pruning
     # for it derives the narrower `${P}foo-` prefix, so it touches nothing in
     # the namespace above. A prune step can only ever reach its own namespace.
-    st_run a-nearmiss "$ST_DIR/a.json" - - - "${P}foo-main-${H5}"
+    st_reset; ST_LIST="$ST_DIR/a.json"
+    st_run a-nearmiss "${P}foo-main-${H5}"
     st_expect_rc 0
-    st_expect_log 'LIST'
+    st_expect_log "${API}
+LIST key=${P}foo- limit=1000"
     st_expect_contains "deleted 0 entries, 0.0 MB; ignored 0 other keys under ${P}foo-"
 
     # ---- (b) keep key without a 64-hex hash: exit 2, gh never invoked --------
-    st_run b "$ST_DIR/a.json" - - - "cargo-crates-Linux-deadbeef"
+    st_reset; ST_LIST="$ST_DIR/a.json"
+    st_run b "cargo-crates-Linux-deadbeef"
     st_expect_rc 2
     st_expect_log ''
     st_expect_contains "::error::cache prune: keep key carries no 64-hex lockfile hash: cargo-crates-Linux-deadbeef"
     # Passing near-miss: 64 hex with a scope is accepted.
-    st_run b-nearmiss "$ST_DIR/a.json" - - - "$KEEP"
+    st_reset; ST_LIST="$ST_DIR/a.json"
+    st_run b-nearmiss "$KEEP"
     st_expect_rc 0
 
     # ---- (c) explicit prefix that is not a leading substring ----------------
-    st_run c "$ST_DIR/a.json" - - - "$KEEP" "cargo-other-"
+    st_reset; ST_LIST="$ST_DIR/a.json"
+    st_run c "$KEEP" "cargo-other-"
     st_expect_rc 2
     st_expect_log ''
     st_expect_contains "::error::cache prune: prefix cargo-other- is not a leading substring of ${KEEP}"
-    # Passing near-miss: a genuine leading substring is accepted and widens.
-    st_run c-nearmiss "$ST_DIR/a.json" - - - "$KEEP" "cargo-crates-"
+    # Passing near-miss: a genuine leading substring is accepted and widens, and
+    # every key in the listing is then outside the candidate shape.
+    st_reset; ST_LIST="$ST_DIR/a.json"
+    st_run c-nearmiss "$KEEP" "cargo-crates-"
     st_expect_rc 0
+    st_expect_log "${API}
+LIST key=cargo-crates- limit=1000"
+    st_expect_contains "deleted 0 entries, 0.0 MB; ignored 7 other keys under cargo-crates-"
 
     # ---- (d) empty listing ---------------------------------------------------
     printf '[]\n' > "$ST_DIR/d.json"
-    st_run d "$ST_DIR/d.json" - - - "$KEEP"
+    st_reset; ST_LIST="$ST_DIR/d.json"
+    st_run d "$KEEP"
     st_expect_rc 0
-    st_expect_log 'LIST'
+    st_expect_log "${API}
+${LIST_P}"
     st_expect_contains "cache prune: kept ${KEEP}; deleted 0 entries, 0.0 MB; ignored 0 other keys under ${P}"
 
     # ---- (e) a delete loses a race: 404-like, gone on the re-list -----------
     cat > "$ST_DIR/e.json" <<JSON
 [
-  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576},
-  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152},
-  {"id": 3, "key": "${P}pr-${H3}", "ref": "refs/pull/9/merge", "sizeInBytes": 3145728},
-  {"id": 4, "key": "${P}${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304}
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${P}pr-${H3}", "ref": "refs/pull/9/merge", "sizeInBytes": 3145728, "createdAt": "${PAST}"},
+  {"id": 4, "key": "${P}${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304, "createdAt": "${PAST}"}
 ]
 JSON
     cat > "$ST_DIR/e-relist.json" <<JSON
 [
-  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576},
-  {"id": 4, "key": "${P}${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304}
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 4, "key": "${P}${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304, "createdAt": "${PAST}"}
 ]
 JSON
-    st_run e "$ST_DIR/e.json" "$ST_DIR/e-relist.json" 3 404 "$KEEP"
+    st_reset; ST_LIST="$ST_DIR/e.json"; ST_RELIST="$ST_DIR/e-relist.json"
+    ST_FAIL_ID=3; ST_FAIL_MODE=404
+    st_run e "$KEEP"
     st_expect_rc 0
-    st_expect_log 'LIST
+    st_expect_log "${API}
+${LIST_P}
 OK:2
 FAIL:3
-LIST
-OK:4'
+${LIST_P}
+OK:4"
     st_expect_contains "::notice::cache prune: ${P}pr-${H3} vanished before delete (concurrent run)"
     st_expect_contains "deleted 2 entries, 6.0 MB; ignored 0 other keys under ${P}; 1 vanished concurrently"
 
     # ---- (f) a delete fails for real: 500-like, still listed ----------------
-    st_run f "$ST_DIR/e.json" "$ST_DIR/e-relist.json" 3 500 "$KEEP"
+    st_reset; ST_LIST="$ST_DIR/e.json"; ST_RELIST="$ST_DIR/e-relist.json"
+    ST_FAIL_ID=3; ST_FAIL_MODE=500
+    st_run f "$KEEP"
     st_expect_rc 1
-    st_expect_log 'LIST
+    st_expect_log "${API}
+${LIST_P}
 OK:2
 FAIL:3
-LIST'
+${LIST_P}"
     st_expect_contains "::error::cache prune: deleting ${P}pr-${H3} (3) failed and it is still listed"
     st_expect_absent "OK:4"
 
@@ -417,28 +657,32 @@ LIST'
     local RKEEP="${RP}aaaaaaaaaaaaaaaa-main-${H1}"
     cat > "$ST_DIR/g.json" <<JSON
 [
-  {"id": 1, "key": "${RKEEP}", "ref": "refs/heads/main", "sizeInBytes": 1048576},
-  {"id": 2, "key": "${RP}bbbbbbbbbbbbbbbb-main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152},
-  {"id": 3, "key": "${RP}bbbbbbbbbbbbbbbb-pr-${H3}", "ref": "refs/pull/4/merge", "sizeInBytes": 1048576},
-  {"id": 4, "key": "${RP}extra-main-${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304},
-  {"id": 5, "key": "cargo-rmw-distros-humble-cccccccccccccccc-main-${H5}", "ref": "refs/heads/main", "sizeInBytes": 5242880},
-  {"id": 6, "key": "${RP}aaaaaaaaaaaaaaaa-${H6}", "ref": "refs/heads/main", "sizeInBytes": 3145728}
+  {"id": 1, "key": "${RKEEP}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${RP}bbbbbbbbbbbbbbbb-main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${RP}bbbbbbbbbbbbbbbb-pr-${H3}", "ref": "refs/pull/4/merge", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 4, "key": "${RP}extra-main-${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304, "createdAt": "${PAST}"},
+  {"id": 5, "key": "cargo-rmw-distros-humble-cccccccccccccccc-main-${H5}", "ref": "refs/heads/main", "sizeInBytes": 5242880, "createdAt": "${PAST}"},
+  {"id": 6, "key": "${RP}aaaaaaaaaaaaaaaa-${H6}", "ref": "refs/heads/main", "sizeInBytes": 3145728, "createdAt": "${PAST}"}
 ]
 JSON
-    st_run g "$ST_DIR/g.json" - - - "$RKEEP" "$RP"
+    st_reset; ST_LIST="$ST_DIR/g.json"
+    st_run g "$RKEEP" "$RP"
     st_expect_rc 0
-    st_expect_log 'LIST
+    st_expect_log "${API}
+LIST key=${RP} limit=1000
 OK:2
 OK:3
-OK:6'
+OK:6"
     st_expect_contains "cache prune: kept ${RKEEP}; deleted 3 entries, 6.0 MB; ignored 1 other keys under ${RP}"
     st_expect_absent "cargo-rmw-distros-humble-"
     # Failing mutant beside it: WITHOUT the explicit prefix the derived prefix
     # pins the header generation, so the other generation is never reclaimed.
-    st_run g-derived "$ST_DIR/g.json" - - - "$RKEEP"
+    st_reset; ST_LIST="$ST_DIR/g.json"
+    st_run g-derived "$RKEEP"
     st_expect_rc 0
-    st_expect_log 'LIST
-OK:6'
+    st_expect_log "${API}
+LIST key=${RP}aaaaaaaaaaaaaaaa- limit=1000
+OK:6"
     st_expect_contains "deleted 1 entries, 3.0 MB"
 
     # ---- (h) an unscoped keep key: the push-only namespaces -----------------
@@ -449,25 +693,239 @@ OK:6'
     local UKEEP="${UP}${H1}"
     cat > "$ST_DIR/h.json" <<JSON
 [
-  {"id": 1, "key": "${UP}${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576},
-  {"id": 2, "key": "${UP}${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152},
-  {"id": 3, "key": "${UP}main-${H3}", "ref": "refs/heads/main", "sizeInBytes": 3145728},
-  {"id": 4, "key": "${UP}foo-${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304},
-  {"id": 5, "key": "${UP}pr-${H63}", "ref": "refs/pull/9/merge", "sizeInBytes": 5242880}
+  {"id": 1, "key": "${UP}${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${UP}${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${UP}main-${H3}", "ref": "refs/heads/main", "sizeInBytes": 3145728, "createdAt": "${PAST}"},
+  {"id": 4, "key": "${UP}foo-${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304, "createdAt": "${PAST}"},
+  {"id": 5, "key": "${UP}pr-${H63}", "ref": "refs/pull/9/merge", "sizeInBytes": 5242880, "createdAt": "${PAST}"}
 ]
 JSON
-    st_run h "$ST_DIR/h.json" - - - "$UKEEP"
+    st_reset; ST_LIST="$ST_DIR/h.json"
+    st_run h "$UKEEP"
     st_expect_rc 0
-    st_expect_log 'LIST
+    st_expect_log "${API}
+LIST key=${UP} limit=1000
 OK:2
-OK:3'
+OK:3"
     st_expect_contains "cache prune: kept ${UKEEP}; deleted 2 entries, 5.0 MB; ignored 2 other keys under ${UP}"
     st_expect_absent "${UP}foo-${H4}"
     # Failing partner: no 64-hex hash at all (the machete binary key shape).
-    st_run h-fail "$ST_DIR/h.json" - - - "cargo-machete-bin-Linux-v0.9.2"
+    st_reset; ST_LIST="$ST_DIR/h.json"
+    st_run h-fail "cargo-machete-bin-Linux-v0.9.2"
     st_expect_rc 2
     st_expect_log ''
     st_expect_contains "::error::cache prune: keep key carries no 64-hex lockfile hash: cargo-machete-bin-Linux-v0.9.2"
+
+    # ---- (i) TIP CHECK: an older main run deletes nothing --------------------
+    # The ordering the bot found: run A (older commit) is still going when run B
+    # (newer commit) has pruned and saved. A is not the tip, so A deletes
+    # nothing and B's generation survives.
+    st_reset; ST_LIST="$ST_DIR/a.json"; ST_SHA="$OLD_SHA"
+    st_run i "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}"
+    st_expect_contains "cache prune: skipped, this run's commit 99999999 is not the current default-branch tip aaaaaaaa"
+    st_expect_absent "deleted"
+    # Passing near-miss: the same run one commit later, now the tip, prunes.
+    st_reset; ST_LIST="$ST_DIR/a.json"
+    st_run i-nearmiss "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}
+OK:2
+OK:3
+OK:4"
+
+    # ---- (j) CLOCK GUARD: an entry created after the prune began is kept -----
+    cat > "$ST_DIR/j.json" <<JSON
+[
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${P}main-${H3}", "ref": "refs/heads/main", "sizeInBytes": 3145728, "createdAt": "${FUTURE}"}
+]
+JSON
+    st_reset; ST_LIST="$ST_DIR/j.json"
+    st_run j "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}
+OK:2"
+    st_expect_contains "cache prune: ${P}main-${H3} (refs/heads/main) kept (created after this prune began)"
+    st_expect_contains "cache prune: kept ${KEEP}; deleted 1 entries, 2.0 MB; ignored 0 other keys under ${P}; 1 kept (created after this prune began)"
+    # Failing partner: the same entry with an older createdAt IS deleted, so the
+    # guard is what spared it and not the shape test or the scope rule.
+    cat > "$ST_DIR/j-old.json" <<JSON
+[
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${P}main-${H3}", "ref": "refs/heads/main", "sizeInBytes": 3145728, "createdAt": "${PAST}"}
+]
+JSON
+    st_reset; ST_LIST="$ST_DIR/j-old.json"
+    st_run j-nearmiss "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}
+OK:2
+OK:3"
+    st_expect_contains "cache prune: kept ${KEEP}; deleted 2 entries, 5.0 MB; ignored 0 other keys under ${P}"
+
+    # ---- (k) the tip run with everything stale deletes all of it -------------
+    st_reset; ST_LIST="$ST_DIR/j-old.json"
+    st_run k "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}
+OK:2
+OK:3"
+    # Failing partner: every entry newer than the prune, so nothing goes.
+    cat > "$ST_DIR/k-future.json" <<JSON
+[
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${FUTURE}"},
+  {"id": 3, "key": "${P}main-${H3}", "ref": "refs/heads/main", "sizeInBytes": 3145728, "createdAt": "${FUTURE}"}
+]
+JSON
+    st_reset; ST_LIST="$ST_DIR/k-future.json"
+    st_run k-future "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}"
+    st_expect_contains "cache prune: kept ${KEEP}; deleted 0 entries, 0.0 MB; ignored 0 other keys under ${P}; 2 kept (created after this prune began)"
+
+    # ---- (l) an unreadable createdAt stops the run --------------------------
+    cat > "$ST_DIR/l.json" <<JSON
+[
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${UNREADABLE}"}
+]
+JSON
+    st_reset; ST_LIST="$ST_DIR/l.json"
+    st_run l "$KEEP"
+    st_expect_rc 1
+    st_expect_log "${API}
+${LIST_P}"
+    st_expect_contains "::error::cache prune: entry ${P}main-${H2} (2) has an unreadable createdAt: ${UNREADABLE}"
+    # Passing near-miss: the same entry with a readable instant is deleted.
+    cat > "$ST_DIR/l-ok.json" <<JSON
+[
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"}
+]
+JSON
+    st_reset; ST_LIST="$ST_DIR/l-ok.json"
+    st_run l-nearmiss "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}
+OK:2"
+
+    # ---- (m) THE SCOPE RULE: a pull-request prune touches only `pr` entries --
+    cat > "$ST_DIR/m.json" <<JSON
+[
+  {"id": 1, "key": "${P}pr-${H1}", "ref": "refs/pull/9/merge", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${P}${H4}", "ref": "refs/heads/main", "sizeInBytes": 4194304, "createdAt": "${PAST}"},
+  {"id": 4, "key": "${P}pr-${H3}", "ref": "refs/pull/7/merge", "sizeInBytes": 3145728, "createdAt": "${PAST}"}
+]
+JSON
+    st_reset; ST_LIST="$ST_DIR/m.json"; ST_REF="refs/pull/9/merge"
+    st_run m "${P}pr-${H1}"
+    st_expect_rc 0
+    st_expect_log "${LIST_P}
+OK:4"
+    st_expect_contains "cache prune: ${P}main-${H2} (refs/heads/main) kept by the pull-request scope rule"
+    st_expect_contains "cache prune: ${P}${H4} (refs/heads/main) kept by the pull-request scope rule"
+    st_expect_contains "cache prune: kept ${P}pr-${H1}; deleted 1 entries, 3.0 MB; ignored 0 other keys under ${P}; 2 kept by the pull-request scope rule"
+    # Failing partner: the same listing under a `main` keep deletes all three,
+    # so the scope rule is what spared them.
+    st_reset; ST_LIST="$ST_DIR/m.json"
+    st_run m-main "${P}main-${H2}"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}
+OK:1
+OK:3
+OK:4"
+    st_expect_contains "cache prune: kept ${P}main-${H2}; deleted 3 entries, 8.0 MB; ignored 0 other keys under ${P}"
+
+    # ---- (n) the same key on another ref is a different entry ---------------
+    cat > "$ST_DIR/n.json" <<JSON
+[
+  {"id": 1, "key": "${P}pr-${H1}", "ref": "refs/pull/9/merge", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}pr-${H1}", "ref": "refs/pull/8/merge", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 3145728, "createdAt": "${PAST}"}
+]
+JSON
+    st_reset; ST_LIST="$ST_DIR/n.json"; ST_REF="refs/pull/9/merge"
+    st_run n "${P}pr-${H1}"
+    st_expect_rc 0
+    st_expect_log "${LIST_P}
+OK:2"
+    st_expect_contains "cache prune: kept ${P}pr-${H1}; deleted 1 entries, 2.0 MB; ignored 0 other keys under ${P}; 1 kept by the pull-request scope rule"
+    # Partner: a main run deletes every `pr` entry whatever its ref.
+    st_reset; ST_LIST="$ST_DIR/n.json"
+    st_run n-main "${P}main-${H1}"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}
+OK:1
+OK:2"
+    st_expect_contains "cache prune: kept ${P}main-${H1}; deleted 2 entries, 3.0 MB; ignored 0 other keys under ${P}"
+
+    # ---- (o) the run context must be present --------------------------------
+    st_reset; ST_LIST="$ST_DIR/a.json"; ST_SHA=""
+    st_run o "$KEEP"
+    st_expect_rc 2
+    st_expect_log ''
+    st_expect_contains "::error::cache prune: GITHUB_SHA is unset; the prune needs the commit to compare against the tip"
+    st_reset; ST_LIST="$ST_DIR/a.json"; ST_REF=""
+    st_run o-ref "$KEEP"
+    st_expect_rc 2
+    st_expect_log ''
+    st_expect_contains "::error::cache prune: GITHUB_REF is unset; the prune needs the ref to know which entry is its own"
+    # Passing near-miss: both present is the ordinary run.
+    st_reset; ST_LIST="$ST_DIR/a.json"
+    st_run o-nearmiss "$KEEP"
+    st_expect_rc 0
+
+    # ---- (p) a listing that comes back at the limit is refused --------------
+    st_gen_ignored_listing "$ST_DIR/p.json" 1000 "$P" "$H1" "$PAST"
+    st_reset; ST_LIST="$ST_DIR/p.json"
+    st_run p "$KEEP"
+    st_expect_rc 1
+    st_expect_log "${API}
+${LIST_P}"
+    st_expect_contains "::error::cache prune: the listing for ${P} returned 1000 entries, the full limit of 1000; it is truncated, so this namespace cannot be pruned safely"
+    # Passing near-miss: one entry fewer is a complete listing.
+    st_gen_ignored_listing "$ST_DIR/p-999.json" 999 "$P" "$H1" "$PAST"
+    st_reset; ST_LIST="$ST_DIR/p-999.json"
+    st_run p-nearmiss "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}"
+    st_expect_contains "cache prune: kept ${KEEP}; deleted 0 entries, 0.0 MB; ignored 999 other keys under ${P}"
+
+    # ---- (q) a re-list that cannot be read is a failure, not a vanishing ----
+    printf 'gateway timeout, not json\n' > "$ST_DIR/q-relist.txt"
+    st_reset; ST_LIST="$ST_DIR/e.json"; ST_RELIST_RAW="$ST_DIR/q-relist.txt"
+    ST_FAIL_ID=3; ST_FAIL_MODE=404
+    st_run q "$KEEP"
+    st_expect_rc 1
+    st_expect_log "${API}
+${LIST_P}
+OK:2
+FAIL:3
+${LIST_P}"
+    st_expect_contains "::error::cache prune: deleting ${P}pr-${H3} (3) failed and the re-list could not be read"
+    st_expect_absent "vanished before delete"
+    # Passing near-miss: a readable re-list that no longer holds the id is the
+    # concurrent-run case and is not fatal.
+    st_reset; ST_LIST="$ST_DIR/e.json"; ST_RELIST="$ST_DIR/e-relist.json"
+    ST_FAIL_ID=3; ST_FAIL_MODE=404
+    st_run q-nearmiss "$KEEP"
+    st_expect_rc 0
+    st_expect_contains "::notice::cache prune: ${P}pr-${H3} vanished before delete (concurrent run)"
 
     if [ "$ST_FAILS" -ne 0 ]; then
         printf 'ci_cache_prune: %d self-test case(s) failed\n' "$ST_FAILS" >&2

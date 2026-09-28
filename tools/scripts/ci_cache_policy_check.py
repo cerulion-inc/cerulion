@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ci_cache_policy_check.py — hold the cache-save policy in the workflows.
 
+    python3 tools/scripts/ci_cache_policy_check.py .github/workflows
     python3 tools/scripts/ci_cache_policy_check.py .github/workflows/ci.yml ...
     python3 tools/scripts/ci_cache_policy_check.py --self-test
 
@@ -9,10 +10,11 @@ allowance, and above it saves are refused while the account carries a failed
 payment. The workflows now gate every `actions/cache/save` step behind a policy
 -- a list of namespaces that may save (`CACHE_SAVE_NAMESPACES`, default
 `macOS Linux`), main-only unless `CACHE_SAVE_ON_PULL_REQUEST` lifts it -- and a
-prune step runs directly before each save so the namespace holds exactly the
-key the job is about to write. Every one of those conditions lives in an `if:`
-expression, which no runner evaluates until the job is already running and
-which nothing else in the tree reads. This file reads them.
+prune step runs directly before each save of a lockfile-keyed archive so the
+namespace holds exactly the key the job is about to write. Every one of those
+conditions lives in an `if:` expression, which no runner evaluates until the job
+is already running and which nothing else in the tree reads. This file reads
+them.
 
 The failure this guards against is not a wrong expression, it is a MISSING one:
 a new job copied from an old one, a save step whose gate was dropped during a
@@ -20,20 +22,32 @@ rebase, or a namespace token that no longer matches the key it gates. All three
 are silent -- the workflow is still valid YAML, the job still runs, and the only
 symptom is the store filling up again a week later.
 
+IT READS THE WHOLE DIRECTORY. A path that names a directory is walked for
+`*.yml`/`*.yaml`, and the Lint step passes `.github/workflows`. Naming the files
+by hand is what let two workflows write into the same store with the combined
+`actions/cache@` action, ungated and unpruned, while this checker reported the
+two files it had been told about as clean. Every file is read; the policy rules
+themselves apply to the files that bear the policy (a save step, or the policy
+`env` block), and the structural rules apply everywhere.
+
 Stdlib only: PyYAML is not installed on the runners, so the reader below is a
 purpose-built one for the YAML subset these workflows use. It refuses anything
 outside that subset with a parse error naming the line rather than skipping it,
 because a reader that silently ignores what it cannot understand reports a
-green file it never read.
+green file it never read. A job that calls a reusable workflow (`uses:` at job
+level), or that carries no `steps:`, is refused for the same reason: the reader
+would otherwise contribute zero steps for it and every rule would pass on a job
+nobody read.
 
 Exit 0 every rule holds, 1 one line per violation on stdout, 2 usage or a file
 it cannot parse.
 
-`--self-test` builds a workflow in memory, asserts it passes, then applies one
+`--self-test` builds workflows in memory, asserts they pass, then applies one
 mutation per rule and asserts each mutant reports exactly that rule. The CI step
 that runs it is the only thing that proves this checker is not inert.
 """
 
+import os
 import re
 import sys
 
@@ -323,7 +337,14 @@ class Parser(object):
         if text[0] in "&*":
             raise ParseError(line, "YAML anchors and aliases are outside this reader's subset")
         if text[0] == "{":
-            raise ParseError(line, "YAML flow mappings are outside this reader's subset")
+            # `permissions: {}` and `workflow_dispatch: {}` are the only flow
+            # mappings the workflows use, and an EMPTY one has an unambiguous
+            # meaning the rules below need (a job or workflow that grants no
+            # permission at all). A non-empty one is still refused.
+            head = text.split("#", 1)[0].strip()
+            if head == "{}":
+                return Map(line), i + 1
+            raise ParseError(line, "a non-empty YAML flow mapping is outside this reader's subset")
         if text[0] == "!":
             raise ParseError(line, "YAML tags are outside this reader's subset")
         if text[0] == "[":
@@ -401,11 +422,6 @@ class Parser(object):
                 block_indent = ind
             elif ind < block_indent:
                 break
-            if style == ">" and ind > block_indent:
-                raise ParseError(
-                    j + 1,
-                    "a more-indented line inside a folded scalar is outside this reader's subset",
-                )
             body.append(raw[block_indent:])
             j += 1
         while body and body[-1] == "":
@@ -413,14 +429,29 @@ class Parser(object):
         if style == "|":
             text = "\n".join(body)
         else:
+            # Folding, with the more-indented rule. A line indented further
+            # than the block keeps its own line break on both sides (YAML
+            # folds only the lines at the block's own indentation), which is
+            # how a hand-wrapped `if:` expression reads. Every rule here
+            # compares whitespace-normalised text, so the distinction changes
+            # no verdict -- it is here so the reader reports what the file
+            # says rather than refusing a shape GitHub accepts.
             chunks = []
+            prev_more = False
             for entry in body:
                 if entry == "":
                     chunks.append("\n")
-                else:
-                    if chunks and not chunks[-1].endswith("\n"):
+                    prev_more = False
+                    continue
+                more = entry[:1] == " "
+                if chunks:
+                    if more or prev_more:
+                        if not chunks[-1].endswith("\n"):
+                            chunks.append("\n")
+                    elif not chunks[-1].endswith("\n"):
                         chunks.append(" ")
-                    chunks.append(entry)
+                chunks.append(entry)
+                prev_more = more
             text = "".join(chunks)
         if chomp != "-" and text:
             text += "\n"
@@ -472,11 +503,16 @@ class Step(object):
         self.run = _get_str(node, "run", what)
         self.with_ = _get_map(node, "with", what)
         self.env = _get_map(node, "env", what)
+        self.env_line = node.line_of("env") if node.has("env") else node.line
         self.cond_line = node.line_of("if") if node.has("if") else node.line
 
     @property
     def is_save(self):
         return bool(self.uses) and self.uses.startswith(SAVE_USES_PREFIX)
+
+    @property
+    def is_combined_cache(self):
+        return bool(self.uses) and self.uses.startswith(COMBINED_USES_PREFIX)
 
     @property
     def is_prune(self):
@@ -487,6 +523,12 @@ class Step(object):
         if self.with_ is None:
             return None
         return _get_str(self.with_, "key", "step at line %d" % self.line)
+
+    @property
+    def path(self):
+        if self.with_ is None:
+            return None
+        return _get_str(self.with_, "path", "step at line %d" % self.line)
 
     def label(self):
         return self.name or (self.uses or "step") or "step"
@@ -499,12 +541,29 @@ class Job(object):
         self.job_id = job_id
         self.node = node
         self.line = node.line
+        # A job this reader cannot enumerate is REFUSED, not skipped. Before
+        # this rule a reusable-workflow call contributed zero steps and every
+        # rule below passed on it in silence.
+        if node.has("uses"):
+            raise ParseError(
+                node.line_of("uses"),
+                "job %s calls a reusable workflow (`uses:` at job level); this reader cannot see "
+                "the steps it runs, so a cache save inside it would be invisible to every rule "
+                "here" % job_id,
+            )
         self.permissions = _get_map(node, "permissions", "job %s" % job_id)
         self.permissions_line = node.line_of("permissions") if node.has("permissions") else node.line
+        self.env = _get_map(node, "env", "job %s" % job_id)
+        self.env_line = node.line_of("env") if node.has("env") else node.line
+        self.container = node.has("container")
         self.steps = []
         steps_node = node.get("steps")
-        if steps_node is None:
-            return
+        if steps_node is None or (isinstance(steps_node, Scalar) and steps_node.value is None):
+            raise ParseError(
+                node.line_of("steps") if node.has("steps") else node.line,
+                "job %s has no `steps`; a job whose steps this reader cannot enumerate is refused "
+                "rather than silently contributing none" % job_id,
+            )
         if not isinstance(steps_node, Seq):
             raise ParseError(node.line_of("steps"), "job %s: `steps` must be a list" % job_id)
         for index, item in enumerate(steps_node.items):
@@ -516,24 +575,42 @@ class Job(object):
 # ---------------------------------------------------------------------------
 
 SAVE_USES_PREFIX = "actions/cache/save@"
+COMBINED_USES_PREFIX = "actions/cache@"
 PRUNE_CMD = "bash tools/scripts/ci_cache_prune.sh"
 PRUNE_RUN_RE = re.compile(
     r'^bash tools/scripts/ci_cache_prune\.sh "(?P<key>[^"]*)"(?: "(?P<prefix>[^"]*)")?$'
 )
-MAIN_ONLY_CLAUSE = "(github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')"
+PRUNE_TOOLS_STEP_NAME = "Install the cache prune tools (gh, jq)"
+# The fork half is load-bearing: a pull request from a fork gets a read-only
+# token, so the prune's delete would fail the job outright.
+MAIN_ONLY_CLAUSE = (
+    "(github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' "
+    "&& github.event.pull_request.head.repo.full_name == github.repository))"
+)
 MERGE_GROUP_CLAUSE = "github.event_name != 'merge_group'"
+SHARD_CLAUSE = "matrix.shard == 0"
 NS_ALL_CLAUSE = "env.CACHE_SAVE_NAMESPACES == 'all'"
 NS_CONTAINS_HEAD = "contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), "
-CACHE_HIT_PREFIX_RE = re.compile(r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.cache-hit != 'true' && $")
+CACHE_HIT_RE = re.compile(r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.cache-hit != 'true'$")
 CACHE_HIT_MARKER = ".outputs.cache-hit != 'true' && "
+CACHE_HIT_PREFIX_RE = re.compile(r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.cache-hit != 'true' && $")
+# A job-shape guard such as `steps.present.outputs.present == 'true'`. It can
+# only ever NARROW the gate (every clause is a conjunct), which is why it is in
+# the closed set; anything else in an `if:` here is refused.
+STEP_OUTPUT_GUARD_RE = re.compile(
+    r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.[A-Za-z0-9_.\-]+ == '[A-Za-z0-9_.\-]+'$"
+)
+TOOL_CACHE_PATH_RE = re.compile(r"^~/\.cargo/bin/[A-Za-z0-9_.\-]+$")
 SCOPE_SUFFIX = "-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}"
 HASHFILES_RE = re.compile(r"-\$\{\{\s*hashFiles\(")
 STEPS_OUTPUT_SEG_RE = re.compile(r"-\$\{\{\s*steps\.[A-Za-z0-9_.\-]+\.outputs\.[A-Za-z0-9_.\-]+\s*\}\}")
+STEPS_OUTPUT_EXPR_RE = re.compile(r"\$\{\{\s*steps\.[A-Za-z0-9_.\-]+\.outputs\.[A-Za-z0-9_.\-]+\s*\}\}")
 EXPR_RE = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 POLICY_ENV = {
     "CACHE_SAVE_NAMESPACES": "${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}",
     "CACHE_SAVE_ON_PULL_REQUEST": "${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}",
 }
+POLICY_ENV_NAMES = tuple(sorted(POLICY_ENV))
 
 
 def norm(text):
@@ -588,9 +665,128 @@ def namespace_clause(fragment):
     return "(%s || %s%s))" % (NS_ALL_CLAUSE, NS_CONTAINS_HEAD, fragment)
 
 
+def namespace_clauses(key):
+    return [namespace_clause(token_fragment(t)) for t in namespace_templates(key)]
+
+
+def split_conjuncts(text):
+    """Split a normalised `if:` at every depth-0 `&&`.
+
+    Returns `(conjuncts, saw_or)`. `saw_or` is the whole point: `... || true`
+    appended to a gate keeps every required substring and every equality the
+    other rules test, and turns the gate off. A parenthesised alternative (the
+    main-only clause, the namespace gate) is inside one conjunct and is not a
+    depth-0 `||`.
+    """
+    parts = []
+    current = []
+    depth = 0
+    quote = None
+    saw_or = False
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if quote is not None:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            index += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            current.append(ch)
+            index += 1
+            continue
+        if ch == "(":
+            depth += 1
+            current.append(ch)
+            index += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            current.append(ch)
+            index += 1
+            continue
+        if depth == 0 and text[index:index + 2] == "&&":
+            parts.append("".join(current).strip())
+            current = []
+            index += 2
+            continue
+        if depth == 0 and text[index:index + 2] == "||":
+            saw_or = True
+        current.append(ch)
+        index += 1
+    parts.append("".join(current).strip())
+    return [part for part in parts if part], saw_or
+
+
+def classify_conjunct(part, ns_clauses):
+    if CACHE_HIT_RE.match(part):
+        return "cache-hit"
+    if part == SHARD_CLAUSE:
+        return "shard"
+    if part == MERGE_GROUP_CLAUSE:
+        return "merge-group"
+    if part == MAIN_ONLY_CLAUSE:
+        return "main-only"
+    if part in ns_clauses:
+        return "namespace"
+    if STEP_OUTPUT_GUARD_RE.match(part):
+        return "step-output guard"
+    return None
+
+
+def _check_closed_conjunction(add, line, what, cond, allowed, ns_clauses):
+    """R8. The gate is a conjunction of clauses from a CLOSED set, each once."""
+    conjuncts, saw_or = split_conjuncts(cond)
+    if saw_or:
+        add(
+            line,
+            "R8_CLOSED_CONJUNCTION",
+            "%s carries a top-level `||`; this gate must be a conjunction only, because one "
+            "`|| true` turns it off while every other rule here still passes" % what,
+        )
+    seen = []
+    for part in conjuncts:
+        name = classify_conjunct(part, ns_clauses)
+        if name is None or name not in allowed:
+            add(
+                line,
+                "R8_CLOSED_CONJUNCTION",
+                "%s carries the conjunct %r, which is not one of the clauses this gate may "
+                "hold (%s)" % (what, part, ", ".join(allowed)),
+            )
+            continue
+        if name in seen:
+            add(
+                line,
+                "R8_CLOSED_CONJUNCTION",
+                "%s carries the %s clause twice" % (what, name),
+            )
+        seen.append(name)
+    return seen
+
+
 # ---------------------------------------------------------------------------
 # the rules
 # ---------------------------------------------------------------------------
+
+# The gates, as conjunctions:
+#
+#   prune  = [matrix.shard == 0 &&] [a step-output guard &&]
+#            github.event_name != 'merge_group' && <main-only>
+#   save   = steps.<restore id>.outputs.cache-hit != 'true' && <the prune's if>
+#            && <namespace gate>
+#
+# The prune deliberately does NOT carry the namespace gate. When it did, a
+# namespace the policy does not name was never pruned and its stale archives
+# stayed for ever (a pull request's restore refreshes an entry's last-access
+# time, so GitHub's idle eviction never fires on one). Now every default-branch
+# run of a job that has a prune step prunes, keeping exactly that job's current
+# key -- which empties a restore-only namespace, and that is the intent.
+PRUNE_ALLOWED = ("shard", "step-output guard", "merge-group", "main-only")
+SAVE_ALLOWED = ("cache-hit",) + PRUNE_ALLOWED + ("namespace",)
+TOOL_CACHE_ALLOWED = ("cache-hit", "merge-group")
 
 
 def check_text(path, text):
@@ -600,6 +796,37 @@ def check_text(path, text):
 
     def add(line, code, msg):
         problems.append("%s:%d: %s: %s" % (path, line, code, msg))
+
+    jobs_node = doc.get("jobs")
+    if not isinstance(jobs_node, Map):
+        raise ParseError(doc.line_of("jobs") if doc.has("jobs") else 1, "no `jobs` mapping")
+    jobs = [Job(job_id, jobs_node.get(job_id)) for job_id in jobs_node.keys()]
+
+    save_count = sum(1 for job in jobs for step in job.steps if step.is_save)
+    prune_count = sum(1 for job in jobs for step in job.steps if step.is_prune)
+
+    # ---- rules that apply to EVERY workflow in the directory ---------------
+    for job in jobs:
+        _check_local_policy_env(add, job)
+        for step in job.steps:
+            if step.is_combined_cache:
+                add(
+                    step.line,
+                    "NO_COMBINED_CACHE_ACTION",
+                    "step %r uses the combined `actions/cache` action, which saves at the end of "
+                    "the job with no gate and no prune; split it into `actions/cache/restore` and "
+                    "a gated `actions/cache/save`" % step.label(),
+                )
+
+    wf_env = _get_map(doc, "env", "workflow")
+    bears_policy = save_count > 0 or (
+        wf_env is not None and any(wf_env.has(name) for name in POLICY_ENV_NAMES)
+    )
+    stats = {"saves": save_count, "prunes": prune_count, "policy": 1 if bears_policy else 0}
+    if not bears_policy:
+        # A workflow that neither saves nor declares the policy has nothing to
+        # hold: restore-only caching costs the store nothing.
+        return problems, stats
 
     # R4, workflow half: the file itself may not hand `actions: write` to jobs
     # that do not prune. A job that prunes opts in on its own line.
@@ -616,7 +843,6 @@ def check_text(path, text):
             )
 
     # R5: the two policy variables and their defaults.
-    wf_env = _get_map(doc, "env", "workflow")
     if wf_env is None:
         add(1, "R5_POLICY_DEFAULT", "no workflow-level `env`; the cache-save policy lives there")
     else:
@@ -636,53 +862,33 @@ def check_text(path, text):
                     "%s is %r; expected %r" % (name, got, want),
                 )
 
-    jobs_node = doc.get("jobs")
-    if not isinstance(jobs_node, Map):
-        raise ParseError(doc.line_of("jobs") if doc.has("jobs") else 1, "no `jobs` mapping")
-
-    save_count = 0
-    prune_count = 0
-    for job_id in jobs_node.keys():
-        job = Job(job_id, jobs_node.get(job_id))
+    for job in jobs:
         steps = job.steps
         has_prune = any(step.is_prune for step in steps)
-        prune_count += sum(1 for step in steps if step.is_prune)
 
         # R4, job half.
-        got = _permission_pairs(job.permissions, "job %s" % job_id) if job.permissions else {}
+        got = _permission_pairs(job.permissions, "job %s" % job.job_id) if job.permissions else {}
         if has_prune:
             if got != {"contents": "read", "actions": "write"}:
                 add(
                     job.permissions_line,
                     "R4_PERMISSIONS",
                     "job %s prunes but its permissions are %s; expected exactly "
-                    "{contents: read, actions: write}" % (job_id, _fmt(got)),
+                    "{contents: read, actions: write}" % (job.job_id, _fmt(got)),
                 )
         elif "actions" in got:
             add(
                 job.permissions_line,
                 "R4_PERMISSIONS",
                 "job %s has no prune step but takes `actions: %s`; only a pruning job needs it"
-                % (job_id, got["actions"]),
+                % (job.job_id, got["actions"]),
             )
 
         for index, step in enumerate(steps):
-            # R3, the orphan half: a prune that guards nothing is a prune that
-            # was left behind when its save moved or was deleted.
             if step.is_prune:
-                nxt = steps[index + 1] if index + 1 < len(steps) else None
-                if nxt is None or not nxt.is_save:
-                    add(
-                        step.line,
-                        "R3_PRUNE_BEFORE_SAVE",
-                        "step %r prunes but the step after it is %s; a prune step must sit "
-                        "directly before the save it makes room for"
-                        % (step.label(), "the end of the job" if nxt is None else repr(nxt.label())),
-                    )
+                _check_prune_step(add, job, steps, index, step)
             if not step.is_save:
                 continue
-            save_count += 1
-            cond = norm(step.cond)
             key = step.key
             if key is None:
                 add(
@@ -692,6 +898,20 @@ def check_text(path, text):
                 )
                 continue
 
+            # R7 applies to every save, tool cache included.
+            if index != len(steps) - 1:
+                add(
+                    step.line,
+                    "R7_SAVE_IS_LAST",
+                    "save step %r is followed by %r; a save must be the last step of its job"
+                    % (step.label(), steps[index + 1].label()),
+                )
+
+            if not is_lockhash_key(key):
+                _check_tool_cache(add, steps, index, step, key)
+                continue
+
+            cond = norm(step.cond)
             _check_namespace_gate(add, step, key)
 
             # R2.
@@ -712,61 +932,159 @@ def check_text(path, text):
                     % (step.label(), MERGE_GROUP_CLAUSE),
                 )
 
-            # R7.
-            if index != len(steps) - 1:
-                add(
-                    step.line,
-                    "R7_SAVE_IS_LAST",
-                    "save step %r is followed by %r; a save must be the last step of its job"
-                    % (step.label(), steps[index + 1].label()),
-                )
+            # R8.
+            _check_closed_conjunction(
+                add, step.cond_line, "save step %r" % step.label(), cond,
+                SAVE_ALLOWED, namespace_clauses(key),
+            )
 
             # R3, the pairing half.
-            if is_lockhash_key(key):
-                _check_prune_before_save(add, steps, index, step, key)
-
-        # R2 also applies to the prune steps: pruning off `main` without the
-        # variable set would delete a cache nothing is about to replace.
-        for step in steps:
-            if not step.is_prune:
-                continue
-            if MAIN_ONLY_CLAUSE not in norm(step.cond):
-                add(
-                    step.cond_line,
-                    "R2_MAIN_ONLY",
-                    "prune step %r does not carry the clause %s"
-                    % (step.label(), MAIN_ONLY_CLAUSE),
-                )
+            _check_prune_before_save(add, steps, index, step, key)
 
     if save_count == 0:
-        add(1, "NO_SAVE_STEPS", "no `actions/cache/save` step in this file; the policy checks "
-                                "below have nothing to hold")
+        add(1, "NO_SAVE_STEPS", "this workflow declares the cache-save policy but has no "
+                                "`actions/cache/save` step; the policy checks have nothing to hold")
 
-    return problems, {"saves": save_count, "prunes": prune_count}
+    return problems, stats
+
+
+def _check_local_policy_env(add, job):
+    """R10. The policy lives at workflow level and nowhere else.
+
+    R5 pins the workflow-level values. A job- or step-level `env` of the same
+    name overrides them for exactly the steps whose gate reads them, which is a
+    policy change invisible to every other rule here.
+    """
+    for name in POLICY_ENV_NAMES:
+        if job.env is not None and job.env.has(name):
+            add(
+                job.env.line_of(name),
+                "R10_NO_LOCAL_POLICY_OVERRIDE",
+                "job %s sets %s in its own `env`; the policy is the workflow-level value and "
+                "nothing may shadow it" % (job.job_id, name),
+            )
+        for step in job.steps:
+            if step.env is not None and step.env.has(name):
+                add(
+                    step.env.line_of(name),
+                    "R10_NO_LOCAL_POLICY_OVERRIDE",
+                    "step %r in job %s sets %s in its own `env`; the policy is the workflow-level "
+                    "value and nothing may shadow it" % (step.label(), job.job_id, name),
+                )
+
+
+def _check_tool_cache(add, steps, index, step, key):
+    """TOOL_CACHE.
+
+    A key with no `hashFiles(...)` has no lockfile generation, so
+    `ci_cache_prune.sh` refuses it and there is nothing for the namespace policy
+    to name -- gating it into a namespace the default never lists means the tool
+    is never cached and gets reinstalled on every run. Exactly one shape is
+    allowed to be keyed that way: a TOOL binary under `~/.cargo/bin/`, a few MB,
+    whose key names the pinned version. It keeps the cache-hit test (do not
+    re-upload what was restored) and the merge-queue test (nothing could restore
+    it), and carries no namespace gate and no prune step. Any other
+    lockhash-free key is a violation: a per-commit key inside a namespace the
+    policy does name would drift generation on generation with no prune.
+    """
+    label = step.label()
+    path = (step.path or "").strip()
+    if "\n" in path or not TOOL_CACHE_PATH_RE.match(path):
+        add(
+            step.line,
+            "TOOL_CACHE",
+            "save step %r has a key with no hashFiles(...) lockfile hash (%r), so no prune can "
+            "reclaim its generations; only a tool binary cache (one `with.path` under "
+            "`~/.cargo/bin/`) may be keyed that way, and this one caches %r"
+            % (label, key, step.path),
+        )
+        return
+    if index > 0 and steps[index - 1].is_prune:
+        add(
+            step.line,
+            "TOOL_CACHE",
+            "save step %r is a tool binary cache and needs no prune step, but %r precedes it; "
+            "the prune script refuses a key with no lockfile hash"
+            % (label, steps[index - 1].label()),
+        )
+    _check_closed_conjunction(
+        add, step.cond_line, "tool-cache save step %r" % label, norm(step.cond),
+        TOOL_CACHE_ALLOWED, (),
+    )
+    for wanted in (CACHE_HIT_MARKER.rstrip(" &"), MERGE_GROUP_CLAUSE):
+        if wanted not in norm(step.cond):
+            add(
+                step.cond_line,
+                "TOOL_CACHE",
+                "tool-cache save step %r does not carry %s" % (label, wanted),
+            )
 
 
 def _check_namespace_gate(add, step, key):
     """R1."""
     cond = norm(step.cond)
-    if not is_lockhash_key(key):
-        # One key today has no lockfile hash (`cargo-machete-bin-...-v0.9.2`),
-        # so it has no template to derive a token from. It must still be behind
-        # the policy: the list alternative and the `all` escape, both present.
-        if NS_ALL_CLAUSE not in cond or NS_CONTAINS_HEAD not in cond:
-            add(
-                step.cond_line,
-                "R1_NAMESPACE_GATE",
-                "save step %r is not behind the namespace policy; expected "
-                "(%s || %s<token>)) in its `if`" % (step.label(), NS_ALL_CLAUSE, NS_CONTAINS_HEAD),
-            )
-        return
-    wanted = [namespace_clause(token_fragment(t)) for t in namespace_templates(key)]
+    wanted = namespace_clauses(key)
     if not any(clause in cond for clause in wanted):
         add(
             step.cond_line,
             "R1_NAMESPACE_GATE",
             "save step %r does not carry the namespace gate for its key; expected %s"
             % (step.label(), " or ".join(wanted)),
+        )
+
+
+def _check_prune_step(add, job, steps, index, step):
+    """R3's orphan half, R2, R6, R8 and R9 for one prune step."""
+    label = step.label()
+    nxt = steps[index + 1] if index + 1 < len(steps) else None
+    if nxt is None or not nxt.is_save:
+        add(
+            step.line,
+            "R3_PRUNE_BEFORE_SAVE",
+            "step %r prunes but the step after it is %s; a prune step must sit "
+            "directly before the save it makes room for"
+            % (label, "the end of the job" if nxt is None else repr(nxt.label())),
+        )
+    cond = norm(step.cond)
+    if MAIN_ONLY_CLAUSE not in cond:
+        add(
+            step.cond_line,
+            "R2_MAIN_ONLY",
+            "prune step %r does not carry the clause %s" % (label, MAIN_ONLY_CLAUSE),
+        )
+    if MERGE_GROUP_CLAUSE not in cond:
+        add(
+            step.cond_line,
+            "R6_NO_QUEUE_SAVE",
+            "prune step %r does not carry %s; a merge-queue run must not delete what it cannot "
+            "replace" % (label, MERGE_GROUP_CLAUSE),
+        )
+    _check_closed_conjunction(
+        add, step.cond_line, "prune step %r" % label, cond, PRUNE_ALLOWED, (),
+    )
+    # R9: `gh` and `jq` are on every hosted runner image and on none of the
+    # container images the rmw lanes run in, where the prune died at its first
+    # `gh cache list` the moment the policy enabled that namespace.
+    if not job.container:
+        return
+    prev = steps[index - 1] if index > 0 else None
+    if prev is None or norm(prev.name) != PRUNE_TOOLS_STEP_NAME:
+        add(
+            step.line,
+            "R9_CONTAINER_TOOLS",
+            "job %s runs in a container, so prune step %r must be directly preceded by a step "
+            "named %r; it is preceded by %s"
+            % (job.job_id, label, PRUNE_TOOLS_STEP_NAME,
+               "the start of the job" if prev is None else repr(prev.label())),
+        )
+        return
+    if norm(prev.cond) != cond:
+        add(
+            prev.cond_line,
+            "R9_CONTAINER_TOOLS",
+            "step %r runs under %r but the prune step after it runs under %r; the install step "
+            "must carry the prune's own gate so it costs nothing when the prune does not run"
+            % (prev.label(), norm(prev.cond), cond),
         )
 
 
@@ -777,8 +1095,7 @@ def _check_prune_before_save(add, steps, index, step, key):
     hash>`, the push-only namespaces) is accepted here and by
     `ci_cache_prune.sh`, which derives the namespace prefix from the hash
     boundary in that case; the two tools agree on every key shape the
-    workflows carry. A key with no lockfile hash at all (the machete binary
-    cache) needs no prune step and gets none.
+    workflows carry.
     """
     label = step.label()
     if index == 0:
@@ -810,13 +1127,29 @@ def _check_prune_before_save(add, steps, index, step, key):
             "the save is about to create" % (prune.label(), mo.group("key"), key),
         )
     prefix = mo.group("prefix")
-    if prefix is not None and not key.startswith(prefix):
-        add(
-            prune.line,
-            "R3_PRUNE_BEFORE_SAVE",
-            "prune step %r sweeps prefix %r, which is not a leading substring of the save key %r"
-            % (prune.label(), prefix, key),
-        )
+    if prefix is not None:
+        # The explicit prefix widens the sweep across the generations of a key
+        # that carries a `${{ steps.<id>.outputs.<name> }}` segment (the rmw
+        # header hash). It must be the key text up to that segment EXACTLY: any
+        # shorter leading substring reaches into sibling namespaces, and "is a
+        # leading substring" alone does not say where the namespace ends.
+        gen = STEPS_OUTPUT_EXPR_RE.search(key)
+        if gen is None:
+            add(
+                prune.line,
+                "R3_PRUNE_BEFORE_SAVE",
+                "prune step %r passes the explicit prefix %r, but the save key %r carries no "
+                "`${{ steps.<id>.outputs.<name> }}` generation segment for it to stop at"
+                % (prune.label(), prefix, key),
+            )
+        elif prefix != key[: gen.start()]:
+            add(
+                prune.line,
+                "R3_PRUNE_BEFORE_SAVE",
+                "prune step %r sweeps prefix %r; for this key the only prefix that names the "
+                "namespace and no more is %r (the text before the generation segment)"
+                % (prune.label(), prefix, key[: gen.start()]),
+            )
     token = _get_str(prune.env, "GH_TOKEN", "prune step") if prune.env else None
     if token != "${{ github.token }}":
         add(
@@ -843,12 +1176,15 @@ def _check_prune_before_save(add, steps, index, step, key):
             % (label, head, CACHE_HIT_MARKER),
         )
         return
-    if save_cond != head + prune_cond:
+    # The save is the prune's own gate, plus the cache-hit test in front and the
+    # namespace gate behind: the save runs on a subset of the runs that prune.
+    expected = [head + prune_cond + " && " + clause for clause in namespace_clauses(key)]
+    if save_cond not in expected:
         add(
             step.cond_line,
             "R3_PRUNE_BEFORE_SAVE",
-            "save step %r runs under a different condition from the prune step before it: "
-            "save %r, expected %r" % (label, save_cond, head + prune_cond),
+            "save step %r is not the prune step's condition plus the cache-hit test and the "
+            "namespace gate: save %r, expected %r" % (label, save_cond, expected[0]),
         )
 
 
@@ -921,10 +1257,9 @@ jobs:
 
       - name: Prune the cache namespace, Linux shard
         if: >-
-          (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && matrix.shard == 0
+          matrix.shard == 0
           && github.event_name != 'merge_group'
+          && <MAIN>
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
@@ -932,10 +1267,10 @@ jobs:
       - name: Cache cargo, Linux shard (save)
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
           && matrix.shard == 0
           && github.event_name != 'merge_group'
+          && <MAIN>
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
         uses: actions/cache/save@v4
         with:
           path: |
@@ -961,18 +1296,17 @@ jobs:
         run: cargo clippy --locked --all-targets
       - name: Prune the cache namespace, lint
         if: >-
-          (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-lint ', runner.os)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && github.event_name != 'merge_group'
+          github.event_name != 'merge_group'
+          && <MAIN>
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
       - name: Cache cargo, lint (save)
         if: >-
           steps.cache-restore-lint.outputs.cache-hit != 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-lint ', runner.os)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
           && github.event_name != 'merge_group'
+          && <MAIN>
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-lint ', runner.os)))
         uses: actions/cache/save@v4
         with:
           key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
@@ -996,18 +1330,17 @@ jobs:
           cargo test -p cerulion_vizd --locked
       - name: Prune the cache namespace, viz
         if: >-
-          (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' viz-{0}-{1} ', matrix.lane, runner.os)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && github.event_name != 'merge_group'
+          github.event_name != 'merge_group'
+          && <MAIN>
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
       - name: Cache cargo, viz (save)
         if: >-
           steps.cache-restore-viz.outputs.cache-hit != 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' viz-{0}-{1} ', matrix.lane, runner.os)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
           && github.event_name != 'merge_group'
+          && <MAIN>
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' viz-{0}-{1} ', matrix.lane, runner.os)))
         uses: actions/cache/save@v4
         with:
           key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
@@ -1018,6 +1351,9 @@ jobs:
       contents: read
       actions: write
     steps:
+      - name: Skip if the target is absent on this ref
+        id: present
+        run: echo "present=true" >> "$GITHUB_OUTPUT"
       - name: Cache cargo (restore)
         id: cache-restore-cross
         uses: actions/cache/restore@v4
@@ -1027,18 +1363,19 @@ jobs:
         run: cargo build --locked --target aarch64-unknown-linux-gnu
       - name: Prune the cache namespace, cross
         if: >
-          (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          steps.present.outputs.present == 'true'
           && github.event_name != 'merge_group'
+          && <MAIN>
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}"
       - name: Cache cargo, cross (save)
         if: >
           steps.cache-restore-cross.outputs.cache-hit != 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
+          && steps.present.outputs.present == 'true'
           && github.event_name != 'merge_group'
+          && <MAIN>
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))
         uses: actions/cache/save@v4
         with:
           key: cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}
@@ -1051,6 +1388,8 @@ jobs:
     strategy:
       matrix:
         distro: [jazzy, humble]
+    container:
+      image: ros:${{ matrix.distro }}-ros-base
     steps:
       - name: Header tree hash
         id: headers
@@ -1065,20 +1404,24 @@ jobs:
             cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-
       - name: Gate (expected state for this distro)
         run: bash tools/ci/rmw-distros/gate.sh "${{ matrix.distro }}"
+      - name: Install the cache prune tools (gh, jq)
+        if: >-
+          github.event_name != 'merge_group'
+          && <MAIN>
+        run: apt-get install -y gh jq
       - name: Prune the cache namespace, rmw distro
         if: >-
-          (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && github.event_name != 'merge_group'
+          github.event_name != 'merge_group'
+          && <MAIN>
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}" "cargo-rmw-distros-${{ matrix.distro }}-"
       - name: Cache cargo, rmw distro (save)
         if: >-
           steps.cache-restore-lane.outputs.cache-hit != 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
           && github.event_name != 'merge_group'
+          && <MAIN>
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
         uses: actions/cache/save@v4
         with:
           key: cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
@@ -1100,26 +1443,101 @@ jobs:
       - name: Cache the machete binary (save)
         if: >-
           steps.cache-restore-machete.outputs.cache-hit != 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' machete-bin-{0} ', runner.os)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
           && github.event_name != 'merge_group'
         uses: actions/cache/save@v4
         with:
           path: ~/.cargo/bin/cargo-machete
           key: cargo-machete-bin-${{ runner.os }}-v0.9.2
+""".replace("<MAIN>", MAIN_ONLY_CLAUSE)
+
+# A workflow that restores and never saves costs the store nothing, so it
+# carries no policy `env`, no `actions: write` and no prune step -- and the
+# policy rules must NOT fire on it. The structural rules still do.
+RESTORE_ONLY_WORKFLOW = """name: Release
+'on':
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # A tag run's save is restorable by no other ref, so this one only reads.
+      - name: Cache cargo (restore)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-
+      - name: Publish
+        run: cargo publish --workspace
+"""
+
+REUSABLE_CALL_WORKFLOW = """name: Caller
+'on':
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  delegate:
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+"""
+
+NO_STEPS_WORKFLOW = """name: Empty
+'on':
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  nothing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
 """
 
 STRAY_PRUNE_STEP = """      - name: Stray prune with nothing to guard
         if: >-
-          (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
-          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')
-          && matrix.shard == 0
+          matrix.shard == 0
           && github.event_name != 'merge_group'
+          && <MAIN>
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
 
-"""
+""".replace("<MAIN>", MAIN_ONLY_CLAUSE)
+
+# The `cross` job's two gates, quoted exactly as the fixture writes them. They
+# are the only gates in the fixture that carry a step-output guard, so each of
+# these anchors occurs exactly once and a mutation can move prune and save in
+# step (which is what an attack on R8 looks like: R3's equality still holds).
+CROSS_PRUNE_IF = (
+    "          steps.present.outputs.present == 'true'\n"
+    "          && github.event_name != 'merge_group'\n"
+    "          && " + MAIN_ONLY_CLAUSE + "\n"
+)
+CROSS_SAVE_IF = (
+    "          && steps.present.outputs.present == 'true'\n"
+    "          && github.event_name != 'merge_group'\n"
+    "          && " + MAIN_ONLY_CLAUSE + "\n"
+)
+CROSS_NS_CLAUSE = (
+    "          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
+    "env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))\n"
+)
 
 
 def _mut(text, old, new, total=1, occurrence=1):
@@ -1183,57 +1601,83 @@ def _codes(problems):
     return set(seen)
 
 
+# The pre-fork-condition main-only clause, used by the mutant that drops the
+# fork half: a fork pull request's token cannot hold `actions: write`, so the
+# prune's delete would fail the job.
+MAIN_ONLY_WITHOUT_FORK = "(github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')"
+
+
 def _mutants():
-    """(name, mutated text, expected rule codes). `None` codes means exit 2."""
+    """(name, mutated text, expected rule codes).
+
+    `None` means the file must be refused with a parse error; an EMPTY set
+    means the variant must still pass (the near-miss beside a mutation, which
+    is what keeps a rule from passing by never firing).
+    """
     clean = CLEAN_WORKFLOW
     out = []
 
     # R1: the lint job's token no longer matches its own key template.
     out.append((
         "R1 wrong token",
-        _mut(clean, "format(' {0}-lint ', runner.os)))", "format(' {0}-lintx ', runner.os)))",
-             total=2, occurrence="all"),
-        {"R1_NAMESPACE_GATE"},
+        _mut(clean, "format(' {0}-lint ', runner.os)))", "format(' {0}-lintx ', runner.os)))"),
+        {"R1_NAMESPACE_GATE", "R3_PRUNE_BEFORE_SAVE", "R8_CLOSED_CONJUNCTION"},
     ))
     # R1: the shard job keeps the shard key but carries the lint job's token.
     # There is no `-<job id>` allowance, so the two must match exactly.
     out.append((
         "R1 shard key with the lint token",
-        _mut(clean, "format(' {0} ', runner.os)))", "format(' {0}-lint ', runner.os)))",
-             total=2, occurrence="all"),
-        {"R1_NAMESPACE_GATE"},
+        _mut(clean, "format(' {0} ', runner.os)))", "format(' {0}-lint ', runner.os)))"),
+        {"R1_NAMESPACE_GATE", "R3_PRUNE_BEFORE_SAVE", "R8_CLOSED_CONJUNCTION"},
     ))
     # R1: the `all` escape dropped from the literal-token job.
     out.append((
         "R1 missing the == 'all' alternative",
         _mut(
             clean,
-            "(env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
-            "env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))",
-            "(contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))",
-            total=2, occurrence="all",
+            CROSS_NS_CLAUSE,
+            "          && (contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), "
+            "' cross-aarch64 '))\n",
         ),
-        {"R1_NAMESPACE_GATE"},
+        {"R1_NAMESPACE_GATE", "R3_PRUNE_BEFORE_SAVE", "R8_CLOSED_CONJUNCTION"},
     ))
     # R2 on a save. The save and prune conditions must stay in step, so removing
     # the clause from one side necessarily trips R3 as well.
-    viz_frag = "format(' viz-{0}-{1} ', matrix.lane, runner.os)))"
-    main_only_line = "          && (github.ref == 'refs/heads/main' || env.CACHE_SAVE_ON_PULL_REQUEST != '')\n"
     out.append((
         "R2 clause removed from a save",
-        _mut(clean, "          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
-                    "env.CACHE_SAVE_NAMESPACES), " + viz_frag + "\n" + main_only_line,
-             "          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
-             "env.CACHE_SAVE_NAMESPACES), " + viz_frag + "\n"),
+        _mut(
+            clean,
+            "          steps.cache-restore-viz.outputs.cache-hit != 'true'\n"
+            "          && github.event_name != 'merge_group'\n"
+            "          && " + MAIN_ONLY_CLAUSE + "\n",
+            "          steps.cache-restore-viz.outputs.cache-hit != 'true'\n"
+            "          && github.event_name != 'merge_group'\n",
+        ),
         {"R2_MAIN_ONLY", "R3_PRUNE_BEFORE_SAVE"},
     ))
     out.append((
         "R2 clause removed from a prune",
-        _mut(clean, "\n          (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
-                    "env.CACHE_SAVE_NAMESPACES), " + viz_frag + "\n" + main_only_line,
-             "\n          (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
-             "env.CACHE_SAVE_NAMESPACES), " + viz_frag + "\n"),
+        _mut(
+            clean,
+            "          && " + MAIN_ONLY_CLAUSE + "\n        env:\n"
+            "          GH_TOKEN: ${{ github.token }}\n"
+            '        run: bash tools/scripts/ci_cache_prune.sh "cargo-viz-',
+            "        env:\n          GH_TOKEN: ${{ github.token }}\n"
+            '        run: bash tools/scripts/ci_cache_prune.sh "cargo-viz-',
+        ),
         {"R2_MAIN_ONLY", "R3_PRUNE_BEFORE_SAVE"},
+    ))
+    # R2: the fork half dropped from BOTH sides, so R3's equality still holds
+    # and only the clause itself is wrong. A fork pull request's token is
+    # read-only, so the prune's delete would fail the job.
+    forkless = _mut(clean, CROSS_PRUNE_IF,
+                    CROSS_PRUNE_IF.replace(MAIN_ONLY_CLAUSE, MAIN_ONLY_WITHOUT_FORK))
+    forkless = _mut(forkless, CROSS_SAVE_IF,
+                    CROSS_SAVE_IF.replace(MAIN_ONLY_CLAUSE, MAIN_ONLY_WITHOUT_FORK))
+    out.append((
+        "R2 fork condition dropped from the main-only clause",
+        forkless,
+        {"R2_MAIN_ONLY", "R8_CLOSED_CONJUNCTION"},
     ))
     # R3: the prune keeps a key one character away from the one the save writes,
     # so it would delete the entry the save is about to upload.
@@ -1248,6 +1692,13 @@ def _mutants():
             "${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || "
             "'pr' }}-${{ hashFiles('**/Cargo.locl') }}\" \"cargo-rmw-distros-${{ matrix.distro }}-\"",
         ),
+        {"R3_PRUNE_BEFORE_SAVE"},
+    ))
+    # R3: the explicit prefix is a leading substring but not the structural one.
+    # `cargo-rmw-distros-` sweeps every distro's namespace, not this lane's.
+    out.append((
+        "R3 explicit prefix wider than the generation segment",
+        _mut(clean, '" "cargo-rmw-distros-${{ matrix.distro }}-"', '" "cargo-rmw-distros-"'),
         {"R3_PRUNE_BEFORE_SAVE"},
     ))
     out.append((
@@ -1272,13 +1723,24 @@ def _mutants():
         {"R3_PRUNE_BEFORE_SAVE"},
     ))
     out.append((
-        "R3 save if is not cache-hit plus the prune if",
+        "R3 save if is not cache-hit plus the prune if plus the namespace gate",
         _mut(clean,
-             "          && matrix.shard == 0\n          && github.event_name != 'merge_group'\n"
+             "          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
+             "env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))\n"
              "        uses: actions/cache/save@v4\n",
-             "          && matrix.shard == 0\n          && github.event_name != 'merge_group'\n"
+             "          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
+             "env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))\n"
              "          && true\n        uses: actions/cache/save@v4\n"),
-        {"R3_PRUNE_BEFORE_SAVE"},
+        {"R3_PRUNE_BEFORE_SAVE", "R8_CLOSED_CONJUNCTION"},
+    ))
+    # R3 + R8: the namespace gate back on the PRUNE, which is the shape this
+    # change removed. It left a namespace the policy does not name unpruned for
+    # ever, because nothing else ever deletes a cache entry a pull request keeps
+    # restoring.
+    out.append((
+        "R3 namespace gate back on the prune",
+        _mut(clean, CROSS_PRUNE_IF, CROSS_PRUNE_IF + CROSS_NS_CLAUSE),
+        {"R3_PRUNE_BEFORE_SAVE", "R8_CLOSED_CONJUNCTION"},
     ))
     out.append((
         "R3 prune present but no save after it",
@@ -1320,19 +1782,101 @@ def _mutants():
         _mut(clean, "  CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}\n", ""),
         {"R5_POLICY_DEFAULT"},
     ))
-    out.append((
-        "R6 merge-queue clause removed",
-        _mut(clean,
-             "' cross-aarch64 '))\n" + main_only_line
-             + "          && github.event_name != 'merge_group'\n",
-             "' cross-aarch64 '))\n" + main_only_line,
-             total=2, occurrence="all"),
-        {"R6_NO_QUEUE_SAVE"},
-    ))
+    # R6 on both sides of the cross job, so R3's equality still holds.
+    queue_ok = _mut(clean, CROSS_PRUNE_IF,
+                    CROSS_PRUNE_IF.replace("          && github.event_name != 'merge_group'\n", ""))
+    queue_ok = _mut(queue_ok, CROSS_SAVE_IF,
+                    CROSS_SAVE_IF.replace("          && github.event_name != 'merge_group'\n", ""))
+    out.append(("R6 merge-queue clause removed", queue_ok, {"R6_NO_QUEUE_SAVE"}))
     out.append((
         "R7 a step appended after the save",
         clean + "      - name: Report\n        run: echo done\n",
         {"R7_SAVE_IS_LAST"},
+    ))
+    # R8: `|| true` appended to the prune AND the save. Every required substring
+    # is still there and R3's equality still holds -- the gate is simply off.
+    or_true = _mut(clean, CROSS_PRUNE_IF,
+                   CROSS_PRUNE_IF.replace(MAIN_ONLY_CLAUSE + "\n", MAIN_ONLY_CLAUSE + " || true\n"))
+    or_true = _mut(or_true, CROSS_SAVE_IF,
+                   CROSS_SAVE_IF.replace(MAIN_ONLY_CLAUSE + "\n", MAIN_ONLY_CLAUSE + " || true\n"))
+    out.append(("R8 || true appended to both gates", or_true, {"R8_CLOSED_CONJUNCTION"}))
+    # R8: an unknown conjunct, added to both sides so nothing else fires.
+    unknown = _mut(clean, CROSS_PRUNE_IF, CROSS_PRUNE_IF + "          && success()\n")
+    unknown = _mut(unknown, CROSS_SAVE_IF, CROSS_SAVE_IF + "          && success()\n")
+    out.append(("R8 an unknown conjunct", unknown, {"R8_CLOSED_CONJUNCTION"}))
+    # R8, the passing side: a complete conjunction in a different ORDER is fine,
+    # so the rule is about membership and not about the text of one file.
+    reordered = _mut(
+        clean, CROSS_PRUNE_IF,
+        "          github.event_name != 'merge_group'\n"
+        "          && " + MAIN_ONLY_CLAUSE + "\n"
+        "          && steps.present.outputs.present == 'true'\n",
+    )
+    reordered = _mut(
+        reordered, CROSS_SAVE_IF,
+        "          && github.event_name != 'merge_group'\n"
+        "          && " + MAIN_ONLY_CLAUSE + "\n"
+        "          && steps.present.outputs.present == 'true'\n",
+    )
+    out.append(("R8 a reordered but complete conjunction passes", reordered, set()))
+    # R9: the container lane without the install step. `gh` and `jq` are on
+    # every hosted image and on none of the ros: images.
+    install_step = (
+        "      - name: Install the cache prune tools (gh, jq)\n"
+        "        if: >-\n"
+        "          github.event_name != 'merge_group'\n"
+        "          && " + MAIN_ONLY_CLAUSE + "\n"
+        "        run: apt-get install -y gh jq\n"
+    )
+    out.append((
+        "R9 container job without the tool install step",
+        _mut(clean, install_step, ""),
+        {"R9_CONTAINER_TOOLS"},
+    ))
+    out.append((
+        "R9 install step under a different condition",
+        _mut(clean, install_step,
+             "      - name: Install the cache prune tools (gh, jq)\n"
+             "        if: github.event_name != 'merge_group'\n"
+             "        run: apt-get install -y gh jq\n"),
+        {"R9_CONTAINER_TOOLS"},
+    ))
+    # R10: the policy shadowed on a job, and on a step.
+    out.append((
+        "R10 job-level policy override",
+        _mut(clean,
+             "  lint:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n"
+             "      actions: write\n",
+             "  lint:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n"
+             "      actions: write\n    env:\n      CACHE_SAVE_NAMESPACES: Linux-lint\n"),
+        {"R10_NO_LOCAL_POLICY_OVERRIDE"},
+    ))
+    out.append((
+        "R10 step-level policy override",
+        _mut(clean,
+             "        env:\n          GH_TOKEN: ${{ github.token }}\n"
+             '        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-'
+             "${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-"
+             "${{ hashFiles('**/Cargo.lock') }}\"",
+             "        env:\n          GH_TOKEN: ${{ github.token }}\n"
+             "          CACHE_SAVE_ON_PULL_REQUEST: yes\n"
+             '        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-'
+             "${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-"
+             "${{ hashFiles('**/Cargo.lock') }}\""),
+        {"R10_NO_LOCAL_POLICY_OVERRIDE"},
+    ))
+    # TOOL_CACHE: the same lockhash-free key over a cargo target directory. That
+    # key has no generation to prune by, so the archive would accumulate.
+    out.append((
+        "TOOL_CACHE a lockhash-free key over target/",
+        _mut(clean,
+             "        uses: actions/cache/save@v4\n        with:\n"
+             "          path: ~/.cargo/bin/cargo-machete\n"
+             "          key: cargo-machete-bin-${{ runner.os }}-v0.9.2\n",
+             "        uses: actions/cache/save@v4\n        with:\n"
+             "          path: target\n"
+             "          key: cargo-machete-bin-${{ runner.os }}-v0.9.2\n"),
+        {"TOOL_CACHE"},
     ))
     # Removing every save leaves five prune steps guarding nothing, so this
     # mutation necessarily trips R3 beside NO_SAVE_STEPS.
@@ -1347,6 +1891,15 @@ def _mutants():
              total=6, occurrence=1),
         None,
     ))
+    # The restore-only workflow and its two structural failures.
+    out.append(("restore-only workflow passes", RESTORE_ONLY_WORKFLOW, set()))
+    out.append((
+        "NO_COMBINED_CACHE_ACTION the combined action saves ungated",
+        _mut(RESTORE_ONLY_WORKFLOW, "uses: actions/cache/restore@v4", "uses: actions/cache@v4"),
+        {"NO_COMBINED_CACHE_ACTION"},
+    ))
+    out.append(("parse error: a reusable-workflow job", REUSABLE_CALL_WORKFLOW, None))
+    out.append(("parse error: a job with no steps", NO_STEPS_WORKFLOW, None))
     return out
 
 
@@ -1360,8 +1913,15 @@ def self_test():
         fails.append("clean workflow reported %d violation(s): %s" % (len(problems), problems))
     # Guard against a fixture or reader that silently stopped seeing the steps:
     # every rule below would pass vacuously on an empty step list.
-    if stats != {"saves": 6, "prunes": 5}:
+    if stats != {"saves": 6, "prunes": 5, "policy": 1}:
         fails.append("clean workflow parsed to %r, expected 6 saves and 5 prunes" % (stats,))
+
+    cases += 1
+    problems, stats = check_text("mem.yml", RESTORE_ONLY_WORKFLOW)
+    if problems:
+        fails.append("restore-only workflow reported %d violation(s): %s" % (len(problems), problems))
+    if stats != {"saves": 0, "prunes": 0, "policy": 0}:
+        fails.append("restore-only workflow parsed to %r, expected no saves and no policy" % (stats,))
 
     for name, text, expected in _mutants():
         cases += 1
@@ -1374,14 +1934,11 @@ def self_test():
         if expected is None:
             fails.append("%s: expected a parse error, got %r" % (name, problems))
             continue
-        if not problems:
-            fails.append("%s: mutant passed; expected %s" % (name, sorted(expected)))
-            continue
         got = _codes(problems)
         if got != expected:
             fails.append(
                 "%s: reported %s, expected %s\n    %s"
-                % (name, sorted(got), sorted(expected), "\n    ".join(problems))
+                % (name, sorted(got), sorted(expected), "\n    ".join(problems) or "(nothing)")
             )
 
     # Usage half: a file with no jobs is a parse error, not a quiet pass.
@@ -1409,9 +1966,26 @@ def self_test():
 # ---------------------------------------------------------------------------
 
 USAGE = (
-    "usage: python3 tools/scripts/ci_cache_policy_check.py <workflow.yml>...\n"
+    "usage: python3 tools/scripts/ci_cache_policy_check.py <workflow.yml|directory>...\n"
     "       python3 tools/scripts/ci_cache_policy_check.py --self-test\n"
 )
+
+
+def expand(paths):
+    """Every argument that names a directory contributes its workflow files.
+
+    A directory is the form the Lint step uses, so a new workflow is covered the
+    day it lands rather than the day somebody remembers to add it to a list.
+    """
+    out = []
+    for path in paths:
+        if os.path.isdir(path):
+            for name in sorted(os.listdir(path)):
+                if name.endswith(".yml") or name.endswith(".yaml"):
+                    out.append(os.path.join(path, name))
+            continue
+        out.append(path)
+    return out
 
 
 def main(argv):
@@ -1420,8 +1994,13 @@ def main(argv):
     if not argv or any(a.startswith("-") for a in argv):
         sys.stderr.write(USAGE)
         return 2
+    files = expand(argv)
+    if not files:
+        sys.stderr.write("%s: no workflow files found under %s\n" % (USAGE, ", ".join(argv)))
+        return 2
     violations = []
-    for path in argv:
+    saves = 0
+    for path in files:
         try:
             with open(path, "r") as handle:
                 text = handle.read()
@@ -1429,11 +2008,18 @@ def main(argv):
             sys.stderr.write("%s: cannot read: %s\n" % (path, exc))
             return 2
         try:
-            problems, _ = check_text(path, text)
+            problems, stats = check_text(path, text)
         except ParseError as exc:
             sys.stderr.write("%s:%d: PARSE_ERROR: %s\n" % (path, exc.line, exc.msg))
             return 2
         violations.extend(problems)
+        saves += stats["saves"]
+    if saves == 0:
+        sys.stderr.write(
+            "%s: no `actions/cache/save` step in any of the %d file(s) read; this checker would "
+            "pass on anything\n" % (", ".join(argv), len(files))
+        )
+        return 2
     if violations:
         for line in violations:
             sys.stdout.write(line + "\n")

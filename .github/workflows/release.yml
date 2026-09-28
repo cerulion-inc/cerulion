@@ -74,8 +74,13 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
           df -h /
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      # RESTORE ONLY. A tag run's save would be an entry on `refs/tags/v*`, which
+      # no other ref can restore (a cache entry is readable from the ref that
+      # created it and its descendants), so it would only add to a store the
+      # rest of the repository rations under a 10 GB allowance. This job reads
+      # `main`'s archives through the keys below and writes nothing.
+      - name: Cache cargo (restore)
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
