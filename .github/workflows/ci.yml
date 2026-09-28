@@ -2075,23 +2075,27 @@ jobs:
   # automatically faster; the question is whether the variable work divides
   # further than the fixed cost grows, and on this job it does.
   #
-  # WHAT THE 2-WAY SPLIT MEASURED, per step, on two runs a week apart:
+  # WHAT THE 2-WAY SPLIT MEASURED, per step, with a cache hit on the
+  # default-branch run 35666419690 (2026-09-21):
   #
-  #   leg      cache hit    cache miss
-  #   shard 0    28.3 min     57.4 min
-  #   shard 1    46.0 min     55.1 min
+  #   leg      cache hit
+  #   shard 0    28.3 min
+  #   shard 1    46.0 min
   #
-  # Two facts out of that table, and they point the same way. The legs were
-  # skewed 1.6 to 1 with a warm cache, so one of them set the wall of the whole
-  # workflow while the other idled for 18 minutes. And the skew INVERTS when
-  # the cache misses, because shard 0 carried the pinned `macro_compile_fail_test`
-  # trybuild tail, which compiles 91 fixture projects and costs 6 min warm
-  # against 18 min cold. A hand tilt tuned on either column is wrong in the
-  # other one; a third shard is better in BOTH, because it divides the variable
-  # work by 3 while the fixed cost is paid once more.
+  # Two facts out of that, and they point the same way. The legs were skewed
+  # 1.6 to 1, so one of them set the wall of the whole workflow while the
+  # other idled for 18 minutes. And the skew turns over when the cache misses,
+  # because shard 0 carried the pinned `macro_compile_fail_test` trybuild tail,
+  # which compiles 91 fixture projects: 6 min with a cache hit and the largest
+  # single step of a cold leg. A hand tilt tuned on the cache-hit column is
+  # wrong on a miss; a third shard is better in BOTH states, because it divides
+  # the variable work by 3 while the fixed cost is paid once more. (A cache-miss
+  # measurement of the 2-way split was taken but its run id was not kept, so
+  # its numbers are not cited here.)
   #
   # PREDICTED from the same per-step numbers: longest leg 26.6 min warm (from
-  # 46.0) and 42.7 min cold (from 57.4).
+  # 46.0). OBSERVED since: the eight default-branch runs of 2026-09-27 put the
+  # macOS shards' wall at 29 to 44 min, cache state not recorded.
   #
   # The package map below is balanced by hand against those numbers, under
   # three constraints: the iroh-tree packages (wireclient, connectd, netd-wan)
@@ -2168,12 +2172,12 @@ jobs:
     # runtime budget.
     # 75 → 60 (the 3-way split), and DOWN for the first time in this file's
     # history, because for the first time there are per-step MEASUREMENTS to
-    # derive it from rather than a guess. The per-step costs are measured, on
-    # the 2-way runs tabulated above; the longest 3-way leg is PROJECTED from
-    # them at 26.6 min warm and 42.7 min cold, and no three-shard run has put
-    # an observed wall on it yet. 60 leaves 40 percent headroom over the WORSE
-    # of those two projections. Re-set it from the first three green 3-way
-    # runs, which replace the projection with a measurement. A ceiling that tracks the measured wall
+    # derive it from rather than a guess. The per-step costs are measured on
+    # the 2-way cache-hit run tabulated above; the longest 3-way leg is
+    # PROJECTED from them at 26.6 min warm, and the eight default-branch runs
+    # of 2026-09-27 observed the macOS shards' wall at 29 to 44 min with the
+    # cache state not recorded. 60 leaves a third of headroom over the worst
+    # observed wall. Re-set it from green 3-way runs as they accumulate. A ceiling that tracks the measured wall
     # turns a hang into a fast red instead of a 75-minute one, which is the
     # point of having one. Every raise above is a run that was CANCELLED with
     # every suite green, so the rule those raises teach still holds: tighten

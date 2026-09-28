@@ -436,14 +436,16 @@ saves their runner minutes. It does NOT gate the two that do: `test-linux` and
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
 3-way (`[0,1,2]`); both `fail-fast: false`. The macOS count is set from per-step
-measurement: under the earlier 2-way split the legs ran 28.3 and 46.0 min with a warm
-cargo cache and 57.4 and 55.1 with none, so one leg set the wall of the whole workflow
-while the other idled, and the skew INVERTED with the cache state (the pinned trybuild
-tail costs 6 min warm against 18 cold, so a hand tilt tuned on either column is wrong in
-the other). A third leg divides the variable work by 3 while the fixed per-leg cost
-(`cargo build --workspace`, toolchain, nextest install) is paid once more, which is
-better in both cache states: a longest leg PROJECTED from those per-step costs at 26.6
-min warm and 42.7 cold, not yet an observed three-shard wall. Each leg
+measurement: under the earlier 2-way split the legs ran 28.3 and 46.0 min with a cache hit
+on the default-branch run 35666419690, so one leg set the wall of the whole workflow while
+the other idled, and the skew turns over when the cache misses (the pinned trybuild tail
+costs 6 min with a cache hit and is the largest single step of a cold leg, so a hand tilt
+tuned on the cache-hit column is wrong on a miss; the cache-miss measurement of that split
+was taken but its run id was not kept, so its numbers are not cited). A third leg divides
+the variable work by 3 while the fixed per-leg cost (`cargo build --workspace`, toolchain,
+nextest install) is paid once more, which is better in both cache states: a longest leg
+PROJECTED from those per-step costs at 26.6 min warm; the eight default-branch runs of
+2026-09-27 put the observed macOS shard walls at 29 to 44 min, cache state not recorded. Each leg
 runs `./tools/scripts/ci_test_shard.sh cerulion_core <shard> <count>`, which ENUMERATES
 `crates/cerulion_core/tests/*.rs` at depth 1 and takes every file whose position is
 `index mod count`, GENERATED, never hand-listed, save for ONE pinned name
