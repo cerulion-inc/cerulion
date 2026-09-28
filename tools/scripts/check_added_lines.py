@@ -275,8 +275,8 @@ def self_test():
     # separator, a `--` flag in a shell block) is spelled `--- ` in a unified
     # diff, byte for byte a file header. Read as one it closed the hunk, and
     # every added line after it in that file escaped the gate: a false green in
-    # the one direction this gate exists to close. MEASURED against the reader
-    # before the fix, on this exact fixture: it reported nothing.
+    # the one direction this gate exists to close. A reader that closes a hunk
+    # on such a line reports nothing at all for this fixture.
     removed_marker = _hunk("db/schema.sql",
                            [" keep",
                             "--- a comment the change removes",
