@@ -230,7 +230,14 @@ pub unsafe extern "C" fn rmw_init(
                 let ctx = &mut *context;
                 ctx.instance_id = (*options).instance_id;
                 ctx.implementation_identifier = ffi::implementation_identifier_ptr();
-                ctx.actual_domain_id = 0;
+                // `rmw_context_t.actual_domain_id` arrived at Galactic; a
+                // Foxy context has no such field. A shared-memory context
+                // carries no domain of its own, so the value is 0 wherever
+                // the field exists and nothing is lost where it does not.
+                #[cfg(cerulion_has_actual_domain_id)]
+                {
+                    ctx.actual_domain_id = 0;
+                }
                 ctx.impl_ = std::ptr::null_mut();
                 // Everything below is
                 // fallible in a way this module does not control — the

@@ -31,7 +31,7 @@
 //! and `process::exit(0)`s. The parent then drives the SAME engine path
 //! `cerulion clean` runs, over the isolated config:
 //!
-//! 1. the diagnostics sweep (`ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config`)
+//! 1. the diagnostics sweep (`ipc_cleanup::sweep_dead_nodes_with_config`)
 //!    refuses the node with `InternalError` and the four-line chain, and
 //!    `orphan_port_tags::orphan_port_tag_candidates` selects exactly that node;
 //! 2. `reclaim_orphan_port_tags` removes exactly the one tag;
@@ -90,6 +90,7 @@
 //! cargo test -p cerulion_cli_engine --test clean_orphan_port_tag_test
 //! ```
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -97,7 +98,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::ipc_cleanup::{
-    cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config, CleanupReport, FailedNodeCleanup,
+    sweep_dead_nodes_with_config, CleanupReport, FailedNodeCleanup, SweepMode,
 };
 use cerulion_cli_engine::orphan_port_tags::{
     orphan_port_tag_candidates, reclaim_orphan_port_tags, OrphanTagNode, OrphanTagReclaim,
@@ -384,17 +385,25 @@ fn subprocess_child_mint_orphan_port_tag() {
         cfg,
     )
     .expect("the child initialises a transport manager on the handed config");
-    let mut publisher = manager
-        .create_publisher(&topic, MaxSliceLen::const_new(4096), 0)
-        .expect("publisher");
+    // `plain` mints a node with NO port of its own: registered, never
+    // deregistered, and removable by an ordinary sweep. Every other mode
+    // mints the orphan-tag shape below, which a sweep REFUSES until its tags
+    // are reclaimed — so an arm that needs to watch a removal SUCCEED cannot
+    // use it, or "the report held the node back" could not be told apart from
+    // "the removal would have failed anyway".
+    if mode != "plain" {
+        let mut publisher = manager
+            .create_publisher(&topic, MaxSliceLen::const_new(4096), 0)
+            .expect("publisher");
 
-    // THE LEAK: a raw loan that is never returned. The sample holds the
-    // publisher's shared state, and that state owns the port's on-disk tag.
-    let loan = publisher.loan_raw_uninit(64).expect("raw loan");
-    std::mem::forget(loan);
-    // THE DESTROY: the port is deregistered from the service, the tag is not
-    // — exactly the shape a leaked rmw loan leaves behind.
-    drop(publisher);
+        // THE LEAK: a raw loan that is never returned. The sample holds the
+        // publisher's shared state, and that state owns the port's on-disk tag.
+        let loan = publisher.loan_raw_uninit(64).expect("raw loan");
+        std::mem::forget(loan);
+        // THE DESTROY: the port is deregistered from the service, the tag is
+        // not — exactly the shape a leaked rmw loan leaves behind.
+        drop(publisher);
+    }
 
     let mut out = std::io::stdout().lock();
     // A leading newline: libtest has already printed `test <name> ... ` on
@@ -471,9 +480,19 @@ struct ChildRun {
 
 /// Spawn the child in `exit` mode and wait for it to die.
 fn run_exit_child(root: &IsolatedRoot, arm: &str) -> ChildRun {
+    run_child_in_mode(root, arm, "exit")
+}
+
+/// Spawn the child in `plain` mode (a dead node with no port of its own, so an
+/// ordinary sweep removes it) and wait for it to die.
+fn run_plain_child(root: &IsolatedRoot, arm: &str) -> ChildRun {
+    run_child_in_mode(root, arm, "plain")
+}
+
+fn run_child_in_mode(root: &IsolatedRoot, arm: &str, mode: &str) -> ChildRun {
     let topic = root.topic(arm);
     let mut child = ChildGuard(
-        child_command(root, &topic, "exit")
+        child_command(root, &topic, mode)
             .spawn()
             .expect("spawn child"),
     );
@@ -725,7 +744,7 @@ fn sweep(root: &IsolatedRoot) -> CleanupReport {
     let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
     // The explicit config equals the process's global one (see `IsolatedRoot::get`),
     // exactly as `cerulion clean` hands `Config::global_config()` to the same fn.
-    cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(&root.config())
+    sweep_dead_nodes_with_config(&root.config(), SweepMode::Remove)
 }
 
 /// `shm_state`'s one liveness verdict, exactly as `cerulion clean` hands it to
@@ -1263,4 +1282,249 @@ fn a_node_directory_swapped_for_a_symlink_is_refused_and_the_outside_tag_survive
         render_report(&fourth)
     );
     assert!(!shape.node_dir.exists());
+}
+
+// =====================================================================
+// `SweepMode`: the report-only half of `cerulion clean`, proven where a
+// REMOVAL can be confined.
+//
+// The CLI arms in `cerulion_cli/tests/trace_inspect_and_clean_cli_test.rs`
+// drive the real binary, so they can only ever pass `--report-only`: a bare
+// `cerulion clean` reclaims `/tmp/*.shm_state` MACHINE WIDE (the directory is
+// a compile-time constant and iceoryx2 honours no `TMPDIR`), and a test must
+// not unlink another workload's shared memory to make its point. This entry
+// point takes the registry config explicitly and never reaches the state-file
+// pass at all, which lives above it in the verb, so the destructive direction
+// belongs here.
+// =====================================================================
+
+/// Every path under `dir`, relative to it, sorted, each carrying its CONTENT:
+/// the bytes of a file, or `None` for a directory.
+///
+/// Paths alone would not be enough. A sweep that truncated or rewrote a node's
+/// `iox2_node.details` in place, leaving every name where it was, would
+/// compare equal to an untouched registry. A file that cannot be read is
+/// recorded as its error rather than skipped, so a permission change is a
+/// difference too.
+fn registry_contents(dir: &Path) -> BTreeMap<PathBuf, Option<Result<Vec<u8>, String>>> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let content = if path.is_dir() {
+                stack.push(path.clone());
+                None
+            } else {
+                Some(std::fs::read(&path).map_err(|e| e.to_string()))
+            };
+            out.insert(
+                path.strip_prefix(dir)
+                    .expect("a walked path is under the directory walked")
+                    .to_path_buf(),
+                content,
+            );
+        }
+    }
+    out
+}
+
+/// The sweep under an EXPLICIT mode, over an explicit config. Same entry point
+/// `cerulion clean` reaches, with the mode the flag decides.
+fn sweep_with(config: &Config, mode: SweepMode) -> CleanupReport {
+    let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
+    sweep_dead_nodes_with_config(config, mode)
+}
+
+#[test]
+#[serial]
+fn a_report_only_sweep_leaves_the_planted_node_byte_for_byte() {
+    let _use = RootUse::acquire();
+    let root = IsolatedRoot::get();
+    let before_dirs = node_dirs(root);
+    let child = run_plain_child(root, "report_only_untouched");
+    let node_dir = new_node_dir(root, &before_dirs, "report_only_untouched");
+    let before = registry_contents(&node_dir);
+    assert!(
+        !before.is_empty(),
+        "precondition: the child must leave state under {}",
+        node_dir.display()
+    );
+
+    let report = sweep_with(&root.config(), SweepMode::ReportOnly);
+
+    // The classification names the node, and the counters stay at zero
+    // because nothing was ATTEMPTED, not because nothing was refused.
+    let name = node_dir
+        .file_name()
+        .expect("the node directory has a name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        report.dead_nodes.iter().any(|n| n.name == name),
+        "the report must name the planted node {name} among {:?}",
+        report
+            .dead_nodes
+            .iter()
+            .map(|n| &n.name)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        (report.cleanups, report.failed_cleanups),
+        (0, 0),
+        "a report attempts nothing, so both counters are zero: {}",
+        render_report(&report)
+    );
+    assert!(
+        report.failures.is_empty(),
+        "a report refuses nothing: {}",
+        render_report(&report)
+    );
+
+    // The claim, on disk: every path and every byte exactly as they were.
+    assert_eq!(
+        registry_contents(&node_dir),
+        before,
+        "a `SweepMode::ReportOnly` walk must leave the registry byte for byte as it found it"
+    );
+    assert!(
+        liveness(child.pid) == CreatorVerdict::Gone,
+        "precondition: the child must really be dead, or the node was never sweepable"
+    );
+
+    // Leave the root CONVERGED. Every arm over this harness must: the root is
+    // removed by its last holder, and a node still registered at that moment
+    // strands its shared-memory objects under the same prefix, which the next
+    // arm's node then collides with. Sweeping here is also the cheap control
+    // that the node this report held back was removable all along.
+    let swept = sweep_with(&root.config(), SweepMode::Remove);
+    assert!(
+        swept.cleanups >= 1,
+        "the node the report held back must sweep on a Remove pass: {}",
+        render_report(&swept)
+    );
+    assert!(!node_dir.exists(), "teardown must leave the registry empty");
+}
+
+#[test]
+#[serial]
+fn a_removing_sweep_takes_the_node_off_disk() {
+    // The other direction of the control the report-only arm needs: the node
+    // it held back was removable all along. Without this, a sweep that had
+    // stopped removing anything would satisfy every report-only assertion.
+    let _use = RootUse::acquire();
+    let root = IsolatedRoot::get();
+    let before_dirs = node_dirs(root);
+    let child = run_plain_child(root, "remove_takes_it_off");
+    let node_dir = new_node_dir(root, &before_dirs, "remove_takes_it_off");
+    assert!(node_dir.exists(), "precondition: the node directory exists");
+
+    // One report FIRST, over the same root, so the two modes are compared on
+    // one planted node rather than on two different ones.
+    let reported = sweep_with(&root.config(), SweepMode::ReportOnly);
+    let name = node_dir
+        .file_name()
+        .expect("the node directory has a name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        reported.dead_nodes.iter().any(|n| n.name == name),
+        "the report must name the node the removal then takes: {name}"
+    );
+    assert!(node_dir.exists(), "the report must not have removed it");
+
+    let removed = sweep_with(&root.config(), SweepMode::Remove);
+
+    assert!(
+        removed.dead_nodes.iter().any(|n| n.name == name),
+        "the removing sweep classifies the SAME node: {name}"
+    );
+    assert!(
+        removed.cleanups >= 1,
+        "the removing sweep must report at least this node cleaned: {}",
+        render_report(&removed)
+    );
+    assert!(
+        own_failure(&removed, child.pid).is_none(),
+        "the child's node must not be refused: {}",
+        render_report(&removed)
+    );
+    assert!(
+        !node_dir.exists(),
+        "the node directory must be gone after a `SweepMode::Remove` walk"
+    );
+}
+
+#[test]
+#[serial]
+fn a_sweep_reaches_only_the_root_it_is_handed() {
+    // The boundary the confinement is worth anything at, in both directions.
+    // A sweep pointed at ANOTHER root must leave this one byte for byte, and
+    // the node must then come off when its OWN root is swept, so "untouched"
+    // can only mean the sweep never reached it rather than that there was
+    // nothing there to reach.
+    //
+    // The other root is EMPTY rather than a second live namespace on purpose:
+    // macOS caps a shared-memory name at 31 bytes, which a second prefix beside
+    // this harness's own does not fit, and the scoping claim does not need a
+    // second node to be true. What it needs is a config naming a different
+    // root, which is exactly what the sweep is handed.
+    let _use = RootUse::acquire();
+    let root = IsolatedRoot::get();
+    let before_dirs = node_dirs(root);
+    let child = run_plain_child(root, "boundary_scope");
+    let node_dir = new_node_dir(root, &before_dirs, "boundary_scope");
+    let before = registry_contents(&node_dir);
+    assert!(
+        !before.is_empty(),
+        "precondition: the node left state on disk"
+    );
+
+    let elsewhere_dir = root.dir.with_file_name(format!(
+        "{}-elsewhere",
+        root.dir
+            .file_name()
+            .expect("the root has a name")
+            .to_string_lossy()
+    ));
+    std::fs::create_dir_all(&elsewhere_dir).expect("create the other root");
+    let elsewhere = isolated_config(&elsewhere_dir.to_string_lossy(), &root.prefix);
+
+    let away = sweep_with(&elsewhere, SweepMode::Remove);
+
+    assert_eq!(
+        (away.cleanups, away.failed_cleanups),
+        (0, 0),
+        "a sweep of an empty root reaches no node: {}",
+        render_report(&away)
+    );
+    assert!(
+        away.dead_nodes.is_empty(),
+        "a sweep of another root must classify none of this root's nodes: {:?}",
+        away.dead_nodes
+    );
+    assert_eq!(
+        registry_contents(&node_dir),
+        before,
+        "a sweep pointed at another root must leave this one byte for byte"
+    );
+
+    // The other direction: the node was removable all along, so "untouched"
+    // above means "never reached", not "nothing was sweepable".
+    let home = sweep_with(&root.config(), SweepMode::Remove);
+    assert!(
+        home.cleanups >= 1,
+        "the node must sweep once its OWN root is swept: {}",
+        render_report(&home)
+    );
+    assert!(
+        own_failure(&home, child.pid).is_none(),
+        "the child's node must not be refused: {}",
+        render_report(&home)
+    );
+    assert!(!node_dir.exists(), "the node directory must be gone");
+    std::fs::remove_dir_all(&elsewhere_dir).ok();
 }

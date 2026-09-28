@@ -270,8 +270,11 @@ the verdict is the same on every machine. The default-build rules walk normal AN
 edges, because a build dependency on a forbidden crate compiles that crate during a
 `cargo build` exactly as a normal one does.
 
-The `iroh-leanness` and `rerun-leanness` jobs in `.github/workflows/ci.yml` assert five of
-these rules over `cargo tree`, and still run.
+Two `cargo tree` jobs in `.github/workflows/ci.yml` used to assert five of these rules and
+are retired, because each test that replaces one is strictly stronger: the tests walk build
+edges as well as normal ones, apply no target filter, and read the robot workspace off its
+committed lockfile and manifests, which covers every edge kind and every crate the demo
+reaches by `path`.
 
 ## The leak guard
 
@@ -471,7 +474,7 @@ real-iceoryx2 file claims an isolated per-test SHM root, so parallel is the stro
 gate), the daemon lane SERIAL. `machete` (unused-manifest sweep) and `fuzz` are non-blocking
 (`continue-on-error: true`), which is why the coverage walk refuses to count a package named
 only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `examples`,
-`demos-go2`, `netd-wan`, `iroh-leanness`, `rerun-leanness`, `docs`, `deps` (cargo-deny,
+`demos-go2`, `netd-wan`, `docs`, `deps` (cargo-deny,
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
 

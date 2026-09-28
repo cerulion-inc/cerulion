@@ -13,8 +13,8 @@
 //! frames; `cerulion-netd` mirrors a demanded topic into desk-local shared
 //! memory and `cerulion-vizd` decodes + renders on the user's machine
 //! (`cerulion viz --robot go2`). This crate therefore has ZERO rerun edges even
-//! under `-e normal,dev` — the `rerun-leanness` CI job enforces it, and the viz
-//! e2e lives desk-side at
+//! under every edge kind. `the_robot_demo_workspace_is_rerun_free` in
+//! cerulion_hygiene enforces it, and the viz e2e lives desk-side at
 //! `cerulion_viz/lib/cerulion_viz/tests/tf_source_e2e_test.rs`.
 //!
 //! # What it publishes

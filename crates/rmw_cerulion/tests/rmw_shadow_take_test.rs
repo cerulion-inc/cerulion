@@ -362,7 +362,9 @@ fn cpp_member(name: &str, type_id: u8, offset: u32) -> CppMessageMember {
         size_function: None,
         get_const_function: None,
         get_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         fetch_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         assign_function: None,
         resize_function: None,
         #[cfg(cerulion_has_is_rosidl_buffer)]
@@ -895,7 +897,11 @@ fn cpp_image_loaned_take_aims_data_into_the_held_sample_and_recycles_the_shadow(
                 .wire_header()
                 .expect("held frame header");
             assert_eq!(info.source_timestamp, header.timestamp_ns as i64);
+            // `rmw_message_info_t` carries the sequence numbers from Humble
+            // on; the source timestamp above is asserted on every era.
+            #[cfg(cerulion_has_message_info_sequence_numbers)]
             assert_eq!(info.publication_sequence_number, u64::from(header.sequence));
+            #[cfg(cerulion_has_message_info_sequence_numbers)]
             assert_eq!(info.publication_sequence_number, 0, "first publish");
         }
 
