@@ -8,7 +8,8 @@
 #
 # Columns, tab separated: observing package, observed package, kind, and the
 # source line that witnesses the edge. One row per edge; the witness is the
-# first source line that carries it. `all` in the observed column means the walk
+# first source line that carries it, first by path and then by LINE NUMBER.
+# `all` in the observed column means the walk
 # could not attribute the read to one package, so the observing package is
 # selected on every change and no step of it may be gated.
 cerulion_cli	all	unattributable	crates/cerulion_cli/tests/mp_supervisor_box_test.rs:420

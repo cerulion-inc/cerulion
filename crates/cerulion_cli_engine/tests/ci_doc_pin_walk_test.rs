@@ -2600,7 +2600,7 @@ fn interpolated_literal_is_unattributable(literal: &str, multi: &BTreeSet<String
 /// text is a literal; comments are blanked there, so a chain spelled inside one
 /// joins nothing. A chain this reader cannot follow yields the links it did
 /// follow, which classifies a SHORTER path: the over-inclusive direction.
-fn join_chain_prefix(code_with_literals: &str, at: usize) -> Vec<String> {
+fn join_chain_prefix(code_with_literals: &str, at: usize) -> (Vec<String>, usize) {
     let mut parts: Vec<String> = Vec::new();
     let mut end = code_with_literals[..at].trim_end().len();
     while parts.len() < 16 {
@@ -2631,7 +2631,77 @@ fn join_chain_prefix(code_with_literals: &str, at: usize) -> Vec<String> {
         end = open;
     }
     parts.reverse();
-    parts
+    // `end` now sits just after the OUTERMOST `.join(` of the chain, which is
+    // where the receiver that the whole path is resolved against ends.
+    (parts, end)
+}
+
+/// The bare NAME a `.join(` at `end` is called on, if it is called on one.
+///
+/// `end` is the offset just after a `.join(` token. A receiver that is a call
+/// rather than a name answers `None`: this reader resolves one hop through a
+/// binding and no further.
+fn join_receiver_name(code: &str, end: usize) -> Option<&str> {
+    let head = code[..end].trim_end().strip_suffix(".join(")?;
+    let head = head.trim_end();
+    let start = head
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '_'))
+        .map_or(0, |(i, ch)| i + ch.len_utf8());
+    let name = &head[start..];
+    (!name.is_empty()).then_some(name)
+}
+
+/// Names this source binds to the crate's own manifest directory and then POPS.
+///
+/// A popped manifest directory is the directory that HOLDS the members
+/// (`crates/` for `crates/<x>`), so a literal joined onto such a name is a
+/// SIBLING crate's path. [`crate_directory_bindings`] drops these names, which
+/// is right for the suppression rule it serves and wrong here: read against the
+/// repository root instead, `root.pop(); root.join("cerulion_bagd/src")` names
+/// no member at all and a real cross-crate read derives nothing.
+fn popped_crate_directory_bindings(code: &str, code_with_literals: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let name_of = |text: &str| -> String {
+        text.chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect()
+    };
+    for keyword in ["let ", "const ", "static "] {
+        let mut from = 0usize;
+        while let Some(offset) = code[from..].find(keyword) {
+            let at = from + offset;
+            from = at + keyword.len();
+            let opens_a_token = code[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+            if !opens_a_token {
+                continue;
+            }
+            let mut start = from;
+            let skip_blanks = |text: &str| text.len() - text.trim_start().len();
+            start += skip_blanks(&code[start..]);
+            if let Some(rest) = code[start..].strip_prefix("mut ") {
+                start += "mut ".len() + skip_blanks(rest);
+            }
+            let name = name_of(&code[start..]);
+            if name.is_empty() || !is_popped(code, &name) {
+                continue;
+            }
+            let end = code[start..]
+                .find(';')
+                .map_or(code.len(), |semicolon| start + semicolon);
+            let Some(equals) = code[start..end].find('=') else {
+                continue;
+            };
+            if is_crate_directory_expression(code, code_with_literals, start + equals + 1, end) {
+                out.insert(name);
+            }
+        }
+    }
+    out
 }
 
 /// The calls whose argument a repository-root path can be WITHOUT the source
@@ -2861,6 +2931,7 @@ fn observation_edges_of_source(
         .filter(|item| const_is_used_elsewhere(&views.code, item))
         .collect();
     let crate_dir_names = crate_directory_bindings(&views.code, &views.code_with_literals);
+    let popped_dir_names = popped_crate_directory_bindings(&views.code, &views.code_with_literals);
 
     for literal in &views.literals {
         // PROSE IS NOT A PATH, the rule `doc_root_of` lives by and for the same
@@ -2918,7 +2989,7 @@ fn observation_edges_of_source(
                 continue;
             }
         }
-        let mut chain = join_chain_prefix(&views.code_with_literals, literal.at);
+        let (mut chain, chain_start) = join_chain_prefix(&views.code_with_literals, literal.at);
         chain.push(literal.text.clone());
         let whole = chain.join("/");
         let line = line_at(src, literal.at);
@@ -2930,9 +3001,18 @@ fn observation_edges_of_source(
         if whole.contains('{') {
             continue;
         }
-        // BOTH readings of a relative literal, because both are how this tree
-        // spells one: joined onto the crate directory, and joined onto the
-        // repository root. The union is the over-inclusive direction.
+        // EVERY reading of the literal, because this tree spells one all three
+        // ways and the union is the over-inclusive direction:
+        //
+        //   * joined onto the crate's own directory, which is what a relative
+        //     climb is written against;
+        //   * joined onto the repository root;
+        //   * joined onto the crate directory's PARENT, and ONLY where the
+        //     receiver is a name this source popped its manifest directory
+        //     into. That reading was missing, and a source that pops its own
+        //     crate out and then joins a sibling's name (`root.pop();
+        //     root.join("cerulion_bagd/src")`) derived no edge at all: a real
+        //     cross-crate read, invisible, in the miss direction.
         let mut candidates: Vec<String> = Vec::new();
         if whole.starts_with("./") || whole.starts_with("../") {
             if let Some(resolved) = normalised_relative(&format!("{source_dir}/{whole}")) {
@@ -2943,6 +3023,21 @@ fn observation_edges_of_source(
             }
         } else if let Some(resolved) = normalised_relative(&whole) {
             candidates.push(resolved);
+        }
+        // ...and the third reading applies ONLY where the receiver is a name
+        // this source popped its own manifest directory into. A blanket parent
+        // reading turned every bare literal into a sibling crate's path and
+        // manufactured edges nobody reads.
+        let popped_receiver = join_receiver_name(&views.code, chain_start)
+            .is_some_and(|name| popped_dir_names.contains(name));
+        if popped_receiver {
+            if let Some((parent, _)) = source_dir.rsplit_once('/') {
+                if !parent.is_empty() {
+                    if let Some(resolved) = normalised_relative(&format!("{parent}/{whole}")) {
+                        candidates.push(resolved);
+                    }
+                }
+            }
         }
 
         for candidate in candidates {
@@ -3016,7 +3111,7 @@ fn derived_observation_edges() -> Vec<ObservationEdge> {
     let multi = multi_member_directories(&members);
     let cdylibs = cdylib_artifact_stems();
 
-    let mut best: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    let mut best: BTreeMap<(String, String, String), (String, usize)> = BTreeMap::new();
     let mut sources_read = 0usize;
     for (rel, package) in &members {
         let dir = root.join(rel);
@@ -3035,7 +3130,11 @@ fn derived_observation_edges() -> Vec<ObservationEdge> {
             for (observed, kind, line) in
                 observation_edges_of_source(&src, package, rel, &members, &multi, &cdylibs)
             {
-                let witness = format!("{source_rel}:{line}");
+                // The witness is the FIRST source line, and `first` is decided
+                // on the (path, LINE NUMBER) pair. Compared as the formatted
+                // string `path:line` it was decided alphabetically, which puts
+                // line 10 before line 9 and made the header's own claim false.
+                let witness = (source_rel.clone(), line);
                 let key = (package.clone(), observed, kind.to_string());
                 best.entry(key)
                     .and_modify(|held| {
@@ -3053,12 +3152,14 @@ fn derived_observation_edges() -> Vec<ObservationEdge> {
          reaching the tree, and every edge it reports would be vacuous"
     );
     best.into_iter()
-        .map(|((observing, observed, kind), witness)| ObservationEdge {
-            observing,
-            observed,
-            kind,
-            witness,
-        })
+        .map(
+            |((observing, observed, kind), (source, line))| ObservationEdge {
+                observing,
+                observed,
+                kind,
+                witness: format!("{source}:{line}"),
+            },
+        )
         .collect()
 }
 
@@ -3414,6 +3515,39 @@ fn each_observation_edge_kind_is_derived_from_its_own_shape() {
     assert_eq!(
         fixture_edges("let p = root.join(\"examples/demo\");\n"),
         edge("delta", EDGE_CRATE_PATH, 1)
+    );
+
+    // (j) A manifest directory that has been POPPED points at the directory
+    //     that HOLDS the members, so a literal joined onto it names a sibling
+    //     crate. Read against the repository root instead, `beta/src/lib.rs`
+    //     matches no member and the edge is lost.
+    let popped = format!(
+        "let mut root = PathBuf::from(env!(\"{CRATE_DIR_ENV}\"));\nroot.pop();\n\
+         let p = root.join(\"beta/src/lib.rs\");\n"
+    );
+    assert_eq!(
+        fixture_edges(&popped),
+        edge("beta", EDGE_CRATE_PATH, 3),
+        "a literal joined onto a popped manifest directory is a sibling crate's \
+         path"
+    );
+    // The other side: the SAME shape naming the observing package's own
+    // directory is not an edge, so the parent reading does not manufacture one.
+    let own = format!(
+        "let mut root = PathBuf::from(env!(\"{CRATE_DIR_ENV}\"));\nroot.pop();\n\
+         let p = root.join(\"alpha/src/lib.rs\");\n"
+    );
+    assert_eq!(
+        fixture_edges(&own),
+        BTreeSet::<SourceEdge>::new(),
+        "a package always observes its own tree, however the path is reached"
+    );
+    // And a name this walk cannot place is not the parent either: a literal
+    // joined onto an ordinary scratch directory still resolves nowhere.
+    assert_eq!(
+        fixture_edges("let p = tmp.join(\"beta_fixture/src/lib.rs\");\n"),
+        BTreeSet::<SourceEdge>::new(),
+        "a directory that is no member's is no edge"
     );
 }
 
