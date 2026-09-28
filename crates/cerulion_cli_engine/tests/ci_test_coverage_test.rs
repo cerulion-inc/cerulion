@@ -274,6 +274,59 @@ fn jobs_of(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The ONE job-level condition this walk sanctions, spelled whole.
+///
+/// A job-level `if:` normally disqualifies a job outright: it can stop the job
+/// on a pull request, and a package covered only there is covered by nothing.
+/// `!cancelled()` is the exception and it is the exception for the OPPOSITE
+/// reason: it exists so the job runs when a job it `needs:` FAILED. GitHub
+/// skips a dependant of a failed job, a skipped required context counts as
+/// satisfied, and a pull request would then merge with that job's contexts
+/// never run. So a job carrying exactly this condition runs on every pull
+/// request that is not cancelled, and a cancelled run is not a pass.
+///
+/// EXACT, not a substring: `!cancelled() && github.event_name != 'pull_request'`
+/// is a different condition and stays disqualified, which is why `deb-smoke`
+/// (whose `if:` opens with the same call) is still dropped from this view.
+const JOB_IF_NOT_CANCELLED: &str = "${{ !cancelled() }}";
+
+/// The indent a job's own keys sit at: two for the job id, two more for the key.
+const JOB_KEY_INDENT: &str = "    ";
+
+/// The job-level `if:` value of one job block, read in every scalar form.
+///
+/// `None` when the job carries none. `Err` for a form the scalar reader cannot
+/// classify, which the caller turns into a failure rather than into "no
+/// condition": an unread job condition reads as an ungated job, and a job
+/// behind `github.event_name == 'push'` would then credit coverage.
+fn job_if_of(block: &str) -> Option<Result<String, String>> {
+    let lines: Vec<&str> = block.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("    if:"))?;
+    let rest = &lines[at]["    if:".len()..];
+    Some(read_scalar_value(
+        "if",
+        rest,
+        &lines,
+        at,
+        JOB_KEY_INDENT.len(),
+    ))
+}
+
+/// Does this job carry a job-level condition that can stop it on a pull
+/// request?
+fn job_is_gated(block: &str) -> bool {
+    match job_if_of(block) {
+        None => false,
+        Some(Ok(cond)) => cond.trim() != JOB_IF_NOT_CANCELLED,
+        Some(Err(why)) => panic!(
+            "{why}\n\nThe walk cannot say whether this JOB runs on a pull \
+             request, so it refuses to guess. Spell the job's `if:` as a \
+             NON-EMPTY plain, quoted or block scalar, or teach \
+             `read_scalar_form` the form."
+        ),
+    }
+}
+
 /// The member of a selection set that means "the doc classes changed".
 ///
 /// It shares the set with package names, so it only works while no workspace
@@ -1102,7 +1155,7 @@ fn retain_steps<F: Fn(&str) -> bool>(job: &str, keep: F) -> String {
 /// a package named only there is named in nothing that gates anything.
 fn pr_blocking_jobs(text: &str) -> String {
     let jobs = jobs_of(text);
-    let has_job_if = |block: &str| block.lines().any(|l| l.starts_with("    if:"));
+    let has_job_if = job_is_gated;
     let is_soft = |block: &str| {
         block.lines().any(|l| {
             l.starts_with("    continue-on-error:")
@@ -3000,11 +3053,10 @@ fn every_package_with_tests_is_credited_when_it_alone_is_selected() {
         demanded.len()
     );
 
-    // REAL GATES, not a hypothetical. Until PR B nothing in this tree carried a
-    // selection condition, so every set this arm evaluated ran every step and
-    // the arm could not have failed whatever the evaluator did. It holds a live
-    // population now, and a workflow that lost every gate has to say so here
-    // rather than go quietly green.
+    // REAL GATES, not a hypothetical. A workflow that carries no selection
+    // condition runs every step under every set, so this arm cannot fail on one
+    // whatever the evaluator does. It holds a live population, and a workflow
+    // that lost every gate has to say so here rather than go quietly green.
     let gated: usize = texts
         .values()
         .map(|text| {
@@ -3418,7 +3470,9 @@ fn the_selection_switch_is_declared_once_and_read_by_the_classifier() {
         .into_iter()
         .find(|b| step_id_of(b).as_deref() == Some(SELECTION_SWITCH_READER_STEP))
         .unwrap_or_else(|| {
-            panic!("the `{SELECTION_JOB}` job carries no step with id `{SELECTION_SWITCH_READER_STEP}`")
+            panic!(
+                "the `{SELECTION_JOB}` job carries no step with id `{SELECTION_SWITCH_READER_STEP}`"
+            )
         });
     let script = run_script_of(&reader).unwrap_or_default();
     assert!(
@@ -3549,9 +3603,9 @@ fn every_gated_step_has_a_selection_marker_in_its_job() {
         "selection markers do not match the gates:\n{}",
         complaints.join("\n")
     );
-    // Non-vacuity. Before PR B nothing in this tree was gated, so this arm and
-    // the totality arm both passed on an empty population; a workflow that lost
-    // every gate would do the same.
+    // Non-vacuity. A workflow whose steps are all ungated satisfies this arm
+    // and the totality arm without either one looking at anything, so the live
+    // population is required to be real.
     assert!(
         gated_total >= 20,
         "only {gated_total} step gate(s) were found across the workflows: the \
@@ -3613,4 +3667,140 @@ fn a_gated_step_without_its_marker_is_a_red_walker() {
         "a marker printing the wrong line covers nothing"
     );
     assert_eq!(trouble.len(), 1, "-> {trouble:?}");
+}
+
+/// Every job that gates a step on the selection guards itself with
+/// `!cancelled()`.
+///
+/// WHY THIS IS THE SEVEREST ARM IN THE FILE. A job that gates a step on the
+/// selection must `needs:` the classifier to read its outputs. GitHub SKIPS a
+/// dependant when its dependency fails, and branch protection counts a SKIPPED
+/// required context as SATISFIED: a classifier that failed for any reason, a
+/// checkout, a resolve, a typo in the script, would skip four jobs carrying
+/// eleven of the twenty required contexts and the pull request would merge with
+/// none of them run. `!cancelled()` is the one job-level condition that makes
+/// the job run anyway; `pkgs` is then the empty string, `fromJSON('')` is an
+/// expression error, the step fails and the job reds.
+///
+/// The other direction is checked too: a job with no selection gate owes no
+/// guard, so the rule cannot be satisfied by pasting `!cancelled()` everywhere.
+fn jobs_missing_the_not_cancelled_guard(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (job, block) in jobs_of(text) {
+        let gates = block
+            .lines()
+            .filter(|l| !l.trim().starts_with('#'))
+            .any(|l| l.contains(SELECTION_PKG_IF_OPEN) && l.trim_start().starts_with("if:"));
+        if !gates {
+            continue;
+        }
+        let guarded =
+            matches!(job_if_of(&block), Some(Ok(cond)) if cond.trim() == JOB_IF_NOT_CANCELLED);
+        if !guarded {
+            out.push(job);
+        }
+    }
+    out
+}
+
+#[test]
+fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut guarded = 0usize;
+    for (file, text) in workflow_texts() {
+        for job in jobs_missing_the_not_cancelled_guard(&text) {
+            complaints.push(format!("  {file} / {job}"));
+        }
+        guarded += jobs_of(&text)
+            .iter()
+            .filter(|(_, block)| {
+                matches!(job_if_of(block), Some(Ok(cond)) if cond.trim() == JOB_IF_NOT_CANCELLED)
+            })
+            .count();
+    }
+    assert!(
+        complaints.is_empty(),
+        "these jobs gate a step on the selection and do NOT carry \
+         `if: {JOB_IF_NOT_CANCELLED}`:\n{}\n\nSuch a job `needs:` the \
+         `{SELECTION_JOB}` job, GitHub skips a dependant of a FAILED job, and a \
+         skipped required context reads as satisfied. Without the guard a \
+         classifier failure is a silent green around every context this job \
+         reports.",
+        complaints.join("\n")
+    );
+    assert!(
+        guarded >= 4,
+        "only {guarded} job(s) carry the guard: the four jobs that gate steps on \
+         the selection each need it, so either the reader is broken or the \
+         guards were removed"
+    );
+}
+
+/// The guard rule, both sides, on synthetic jobs.
+#[test]
+fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
+    let gate = format!("{SELECTION_PKG_IF_OPEN}alpha{SELECTION_PKG_IF_CLOSE}");
+    let body = format!(
+        "    needs: [changes]\n{{guard}}    steps:\n      - name: alpha tests\n        \
+         if: {gate}\n        run: cargo test -p alpha\n"
+    );
+    let job = |guard: &str| format!("  j:\n{}", body.replace("{guard}", guard));
+
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job("")),
+        vec!["j".to_string()],
+        "a job that gates a step and carries no job-level condition is named"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(&format!("    if: {JOB_IF_NOT_CANCELLED}\n"))),
+        Vec::<String>::new(),
+        "the guard satisfies the rule"
+    );
+    // A condition that merely CONTAINS the call is not the guard: it can stop
+    // the job on a pull request, which is the fault the rule exists for.
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(
+            "    if: ${{ !cancelled() && github.event_name != 'pull_request' }}\n"
+        )),
+        vec!["j".to_string()],
+        "a wider condition is not the guard"
+    );
+    // The other side: a job with NO selection gate owes nothing.
+    let ungated = "  j:\n    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(ungated),
+        Vec::<String>::new(),
+        "a job with no selection gate owes no guard"
+    );
+    // A gate spelled inside a COMMENT gates nothing, so it demands no guard.
+    let commented = format!(
+        "  j:\n    steps:\n      - name: alpha tests\n        # if: {gate}\n        \
+         run: cargo test -p alpha\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&commented),
+        Vec::<String>::new(),
+        "a gate inside a comment gates nothing"
+    );
+}
+
+/// A job carrying exactly `!cancelled()` still credits its packages, and one
+/// carrying any other job-level condition still does not.
+#[test]
+fn the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking() {
+    let body = "    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
+    let with = format!("  j:\n    if: {JOB_IF_NOT_CANCELLED}\n{body}");
+    let without = format!("  j:\n{body}");
+    let other = format!("  j:\n    if: github.event_name == 'push'\n{body}");
+
+    for (name, text) in [("guarded", &with), ("ungated", &without)] {
+        assert!(
+            pr_blocking_jobs(text).contains("cargo test -p alpha"),
+            "the {name} job must stay in the PR-blocking view"
+        );
+    }
+    assert!(
+        !pr_blocking_jobs(&other).contains("cargo test -p alpha"),
+        "a job behind an ordinary event test is still dropped"
+    );
 }

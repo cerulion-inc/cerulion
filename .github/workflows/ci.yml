@@ -153,17 +153,27 @@ env:
 
 jobs:
   # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
-  # that care. Two runner-seconds of work plus a checkout.
+  # that care: a checkout with full history plus a workspace resolve.
   #
-  # Only `deb-smoke` reads it today, and only to RUN ITSELF on a pull request it
-  # would otherwise skip. Nothing in this file uses a class to SKIP a job that
-  # would otherwise run, which is the direction that could weaken a gate: the
-  # rules live in `tools/scripts/ci_changed_paths.sh` with the reasoning and a
-  # `--self-test` table, and `lint` runs that table.
+  # FOUR CLASSES, in two directions. `packaging` only ever makes `deb-smoke` RUN
+  # on a pull request it would otherwise skip. `code`, `docs` and `pkgs` are the
+  # test-impact selection and they SKIP test steps, so every rule behind them is
+  # fail-closed. The rules, the reason token each one emits and a `--self-test`
+  # table live in `tools/scripts/ci_changed_paths.sh`, and `lint` runs that
+  # table.
   #
-  # On `push`, `merge_group` and `workflow_dispatch` there is no pull request to
-  # diff, so every class is `false` and the jobs that consult it fall back to the
-  # event test they had before.
+  # PULL REQUESTS ONLY. On `push`, `merge_group` and `workflow_dispatch` there
+  # is no pull request to diff, and the classifier answers with EVERY package
+  # rather than with nothing: the queue run is the last gate before `main`.
+  # The repository variable `CI_SELECTION` is the stop: `off`, and any value the
+  # classifier does not know, selects every package on a pull request too.
+  #
+  # A FAILURE HERE REDS THE TEST JOBS, by design. Every job that carries a
+  # selection gate needs this one and guards itself with `if: ${{ !cancelled() }}`,
+  # so a failed classification runs those jobs with an empty `pkgs`, every gated
+  # step's `fromJSON('')` is an expression error, and the pull request blocks on
+  # a red rather than on a skipped required context that GitHub reads as
+  # satisfied.
   #
   # Never gate a test step on a class that omits the package that step runs
   # (`cerulion_cli_engine::ci_test_coverage_test`).
@@ -1518,17 +1528,29 @@ jobs:
   test-linux:
     name: Test (Linux) shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # `needs: [changes]` for the per-package selection only. The job itself is
-    # never gated: every leg still runs and still reports its own context.
+    # `needs: [changes]` for the per-package selection only. Every leg still
+    # runs and still reports its own context. The shards no longer start at
+    # t=0: they wait for the classifier, about a minute of checkout and
+    # workspace resolve, on every event, which is the price of a selection that
+    # can be read by a step rather than guessed at by a job.
     needs: [changes]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. `needs: [changes]` makes the
+    # classifier a prerequisite on every event, and GitHub SKIPS a dependent
+    # when its dependency fails; a skipped required context counts as
+    # SATISFIED, so without this guard a failed classifier would wave the pull
+    # request through with this job's contexts never run. With it the job runs,
+    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
+    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    if: ${{ !cancelled() }}
     # `actions: write` is for the cache prune step only (it deletes stale
     # entries of this job's cache namespace). Every other step needs read.
     permissions:
       contents: read
       actions: write
-    # No `needs:`. Each shard builds the `cerulion_core` test binaries it runs,
-    # so nothing in front of it is a data dependency and the four shards start
-    # at t=0 with every other job.
+    # Each shard builds the `cerulion_core` test binaries it runs, so the
+    # classifier above is the only thing in front of it and the four shards
+    # start together once it reports.
     strategy:
       # One shard's failure must not cancel the other three: the whole point of
       # the split is that the shards report independently, and a red shard 2
@@ -2341,9 +2363,19 @@ jobs:
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
-    # `needs: [changes]` for the per-package selection only. The job itself is
-    # never gated: every leg still runs and still reports its own context.
+    # `needs: [changes]` for the per-package selection only. Every leg still
+    # runs and still reports its own context, and every leg now waits for the
+    # classifier (about a minute) before it starts, on every event.
     needs: [changes]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. `needs: [changes]` makes the
+    # classifier a prerequisite on every event, and GitHub SKIPS a dependent
+    # when its dependency fails; a skipped required context counts as
+    # SATISFIED, so without this guard a failed classifier would wave the pull
+    # request through with this job's contexts never run. With it the job runs,
+    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
+    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    if: ${{ !cancelled() }}
     # `actions: write` is for the cache prune step only (it deletes stale
     # entries of this job's cache namespace). Every other step needs read.
     permissions:
@@ -2904,6 +2936,15 @@ jobs:
   crate-tests:
     name: Crate tests (${{ matrix.os }})
     needs: [lint, changes]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. `needs:` makes the classifier a
+    # prerequisite on every event, and GitHub SKIPS a dependent when its
+    # dependency fails; a skipped required context counts as SATISFIED, so
+    # without this guard a failed classifier would wave the pull request
+    # through with this job's contexts never run. With it the job runs,
+    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
+    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -3994,6 +4035,15 @@ jobs:
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
     needs: [lint, changes]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. `needs:` makes the classifier a
+    # prerequisite on every event, and GitHub SKIPS a dependent when its
+    # dependency fails; a skipped required context counts as SATISFIED, so
+    # without this guard a failed classifier would wave the pull request
+    # through with this job's contexts never run. With it the job runs,
+    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
+    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
