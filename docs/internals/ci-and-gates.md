@@ -427,8 +427,12 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 and no stub job standing in for a skipped required check.
 
 `lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
-`viz-tests`, and the push-only `fuzz`, `miri` and latency jobs), so a red `lint` still
-saves their runner minutes. It does NOT gate the two that do: `test-linux` and
+`viz-tests`, and the push-only `fuzz`, `miri` and latency jobs). A red `lint` saves the
+runner minutes of the ones that carry no job-level condition. `crate-tests` and
+`viz-tests` are not among them: their `!cancelled()` guard replaces the implicit
+`success()` over the whole `needs:` set, GitHub offers no per-dependency form, so both run
+and report through a red `lint` and the dependency buys the ordering alone. It does NOT
+gate the two that set the wall: `test-linux` and
 `test-macos`. Both start at t=0. `test-linux` has no `needs:` at all: each shard builds the
 `cerulion_core` test binaries it runs, so nothing in front of it is a data dependency. A
 `lint` verdict was never a data dependency for either, and while it gated them the wall was
@@ -500,9 +504,14 @@ The `changes` job classifies a pull request's changed paths (rules and a
 outputs. `packaging` only ever makes a job RUN that would otherwise skip: a pull request
 that touches the packaging inputs themselves runs the 22-minute Debian and APT smoke,
 because those are the only pull requests that can break it and "caught on the merge to
-main" means a revert rather than a red check. `deb-smoke` keeps its `push` run whatever
-the classifier did: the job is guarded with `!cancelled()`, because `needs:` alone would
-let a failed classifier skip a job that runs unconditionally today.
+main" means a revert rather than a red check. EVERY job that `needs:` the classifier opens
+its job-level `if:` with `!cancelled()`, not `deb-smoke` alone: `needs:` by itself lets a
+failed classifier skip a dependant, and a skipped required context reads as satisfied.
+`test-linux`, `test-macos`, `crate-tests` and `viz-tests` carry the bare call; `deb-smoke`
+carries it in front of its own event gate, so it keeps its `push` run whatever the
+classifier did. `cerulion_cli_engine::ci_test_coverage_test` holds the rule over every
+dependant, however the job consumes the outputs, rather than over the jobs with a one-line
+selection gate alone.
 
 `code`, `docs` and `pkgs` are the test-impact selection, and they run in the other
 direction: they SKIP test steps. Four rules bound them.

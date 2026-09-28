@@ -2960,6 +2960,14 @@ jobs:
     # through with this job's contexts never run. With it the job runs,
     # `needs.changes.outputs.pkgs` is the empty string, every gated step's
     # `fromJSON('')` is an expression error, the step fails and the job reds.
+    #
+    # IT LIFTS THE SHORT-CIRCUIT ON `lint` TOO. A job-level condition replaces
+    # the implicit `success()` over the WHOLE `needs:` set, and GitHub offers no
+    # per-dependency form, so a red `lint` no longer skips this job either. That
+    # direction is the acceptable one: more runs, never fewer. `Lint` is its own
+    # required context and a red one still blocks the pull request, and this job
+    # reports its own result rather than being waved through as a skip. What
+    # `needs: [lint]` still buys is the ordering.
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
@@ -3981,8 +3989,10 @@ jobs:
   # `needs: [lint]`. This job COMPILES
   # the rerun SDK tree (257 crates, ~7 min measured). Gating it behind `lint` costs
   # nothing on a healthy PR (the critical path is the ~hour-long `test-linux` /
-  # `test-macos` jobs, which are gated too) and saves a whole runner when a
-  # PR arrives with a fmt/clippy failure. NB for anyone comparing: `demos-go2`,
+  # `test-macos` jobs, which are gated too). It no longer saves a runner on a red
+  # `lint`: the `!cancelled()` guard below lifts the short-circuit over the whole
+  # `needs:` set, so this job runs and reports its own result, and the dependency
+  # buys the ordering alone. NB for anyone comparing: `demos-go2`,
   # `msrv`, `examples` and `cross-aarch64-linux` also compile source and are NOT
   # gated — "every compile job is gated" is not the house rule; this one is
   # gated because it is expensive AND nothing waits on its result.
@@ -4059,6 +4069,14 @@ jobs:
     # through with this job's contexts never run. With it the job runs,
     # `needs.changes.outputs.pkgs` is the empty string, every gated step's
     # `fromJSON('')` is an expression error, the step fails and the job reds.
+    #
+    # IT LIFTS THE SHORT-CIRCUIT ON `lint` TOO. A job-level condition replaces
+    # the implicit `success()` over the WHOLE `needs:` set, and GitHub offers no
+    # per-dependency form, so a red `lint` no longer skips this job either. That
+    # direction is the acceptable one: more runs, never fewer. `Lint` is its own
+    # required context and a red one still blocks the pull request, and this job
+    # reports its own result rather than being waved through as a skip. What
+    # `needs: [lint]` still buys is the ordering.
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
