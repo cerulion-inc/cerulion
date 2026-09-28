@@ -922,6 +922,20 @@ jobs:
       - name: Changed-path classifier self-test
         run: ./tools/scripts/ci_changed_paths.sh --self-test
 
+      # THE SHARD PARTITION AND ITS SELECTION READER. `--check` proves the
+      # partition of `cerulion_core`'s test files is total and disjoint, that
+      # the one routing exception landed where it declares, and that the
+      # selection reader agrees with its hand table. A bare `--check` is the
+      # SHIPPED configuration, which is why no argument follows it.
+      #
+      # `cerulion_cli_engine::ci_test_coverage_test` drives the same invocation
+      # from a test, so a broken split is a local red as well; this step is what
+      # makes it a red on a pull request that never runs that package, and the
+      # walker's `the_shard_check_runs_in_a_named_lint_step` arm fails if this
+      # step is renamed or removed.
+      - name: Shard partition and selection check
+        run: ./tools/scripts/ci_test_shard.sh --check
+
       # The public-surface gate. The week before the public cut, seven classes
       # of mistake in the shipped tree were found and fixed BY HAND, one page
       # at a time: example programs that were not workspaces (several node

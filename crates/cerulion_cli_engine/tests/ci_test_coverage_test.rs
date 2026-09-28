@@ -3804,3 +3804,90 @@ fn the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blockin
         "a job behind an ordinary event test is still dropped"
     );
 }
+
+/// The name of the Lint step that must run the shard check, and the invocation
+/// it must carry.
+///
+/// Spelled whole, because a renamed step is a step nobody can find in a log and
+/// a step with a different argument is a different check: `--check` with no
+/// argument is the SHIPPED configuration (the script's own defaults), and
+/// `--check cerulion_core 3` proves a partition the workflow does not run.
+const SHARD_CHECK_STEP: &str = "Shard partition and selection check";
+const SHARD_CHECK_RUN: &str = "./tools/scripts/ci_test_shard.sh --check";
+
+/// Does any step of this workflow run the shard check under its own name?
+fn shard_check_step_of(text: &str) -> Option<String> {
+    for (_, block) in jobs_of(text) {
+        for step in step_blocks(&block) {
+            if step_name_of(&step).as_deref() != Some(SHARD_CHECK_STEP) {
+                continue;
+            }
+            return Some(run_script_of(&step).unwrap_or_default());
+        }
+    }
+    None
+}
+
+/// The shard check runs in CI, under a named step, with the invocation the
+/// script documents.
+///
+/// WHY A TEST HOLDS A WORKFLOW STEP. `ci_test_shard.sh --check` carries the
+/// proof that the partition is total and disjoint AND the hand table its
+/// selection reader is held to. Nothing in the workflow ran it: the only
+/// caller was `the_ci_test_shard_partition_is_total_and_disjoint` in this
+/// file, which runs under `cargo test -p cerulion_cli_engine`. That is a gate
+/// whose CI invocation is one selection away from disappearing, and a gate
+/// nothing invokes is inert.
+#[test]
+fn the_shard_check_runs_in_a_named_lint_step() {
+    let texts = workflow_texts();
+    let script = texts
+        .values()
+        .find_map(|text| shard_check_step_of(text))
+        .unwrap_or_else(|| {
+            panic!(
+                "no workflow carries a step named `{SHARD_CHECK_STEP}`. \
+                 `{SHARD_CHECK_RUN}` proves the shard partition is total and \
+                 disjoint and holds the selection reader to its hand table; \
+                 without a step running it, the only caller is a test in this \
+                 crate."
+            )
+        });
+    assert!(
+        script.contains(SHARD_CHECK_RUN),
+        "the `{SHARD_CHECK_STEP}` step does not run `{SHARD_CHECK_RUN}`; it runs \
+         `{}`. A bare `--check` is the shipped configuration, and an invocation \
+         with arguments proves a partition the workflow does not use.",
+        script.trim()
+    );
+}
+
+/// The reader, both sides, on synthetic workflows.
+#[test]
+fn a_renamed_or_rewritten_shard_check_step_is_not_found() {
+    let job = |name: &str, run: &str| {
+        format!("  lint:\n    steps:\n      - name: {name}\n        run: {run}\n")
+    };
+    assert_eq!(
+        shard_check_step_of(&job(SHARD_CHECK_STEP, SHARD_CHECK_RUN))
+            .as_deref()
+            .map(str::trim),
+        Some(SHARD_CHECK_RUN),
+        "the named step running the documented invocation is found"
+    );
+    assert_eq!(
+        shard_check_step_of(&job("Shard check", SHARD_CHECK_RUN)),
+        None,
+        "a renamed step is not found"
+    );
+    let wrong = job(
+        SHARD_CHECK_STEP,
+        "./tools/scripts/ci_test_shard.sh --list cerulion_core 0 4",
+    );
+    assert!(
+        !shard_check_step_of(&wrong)
+            .expect("the step is named")
+            .contains(SHARD_CHECK_RUN),
+        "a step of the right name running something else does not satisfy the rule"
+    );
+}
