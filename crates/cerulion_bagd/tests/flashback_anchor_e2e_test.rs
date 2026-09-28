@@ -976,6 +976,12 @@ struct RankPlan {
 struct MultiRankRun {
     dir: PathBuf,
     manifests: Vec<serde_json::Value>,
+    /// The SHM name of each plan's state ring, in plan order.
+    ///
+    /// Minted inside the driver from a unique tag, so an arm that wants to name
+    /// one (the missing-rank stamp carries the ring's name) cannot spell it and
+    /// must be handed it.
+    rings: Vec<String>,
 }
 
 /// Drive a window-only recorder against ONE REAL STATE RING PER RANK and read
@@ -1041,11 +1047,13 @@ fn multi_rank_captures(tag: &str, plans: Vec<RankPlan>, captures_wanted: usize) 
     // Declaring a name with no ring behind it would exercise the recorder's
     // degraded-open path instead of the multi-ring one, which is a different arm.
     let mut owners: Vec<cerulion_core::state_ring::StateRingOwner> = Vec::new();
+    let mut rings: Vec<String> = Vec::new();
     for plan in &plans {
         let ring_tag = unique_ring_tag(&format!("{tag}r{}", plan.rank));
         let owner = StateRingOwner::create(&ring_tag, RING_RECORDS, plan.rank, RUN, plan.nodes)
             .expect("create a rank's state ring");
         cfg.state_rings.push(owner.name().to_string());
+        rings.push(owner.name().to_string());
         owners.push(owner);
     }
     // MINTED ONCE each and held: a state ring is SPSC, so a second `producer()`
@@ -1156,6 +1164,7 @@ fn multi_rank_captures(tag: &str, plans: Vec<RankPlan>, captures_wanted: usize) 
     MultiRankRun {
         dir,
         manifests: bags.iter().map(|b| flashback_manifest(b)).collect(),
+        rings,
     }
 }
 
@@ -1454,10 +1463,15 @@ fn two_captures_stamp_each_ranks_entry_with_its_own_captures_number() {
 /// capture has to carry rank 0's state rather than be discarded for rank 1's
 /// absence.
 ///
-/// The stamp is asserted as a WHOLE OBJECT against a hand written one, rank,
-/// cause and remedy together. Asserting only that the block is non-empty would
-/// pass for a stamp naming the wrong rank, and asserting the rank alone would
-/// pass for one whose remedy points at the wrong knob.
+/// The stamp is asserted as a WHOLE OBJECT against a hand written one: ring,
+/// rank, cause and remedy together. Asserting only that the block is non-empty
+/// would pass for a stamp naming the wrong rank, and asserting the rank alone
+/// would pass for one whose remedy points at the wrong knob.
+///
+/// The RING is in the object because the rank is the half that can be absent,
+/// and it is read off the driver rather than spelled here: the name is minted
+/// from a unique tag, so an arm that could write it down would be asserting
+/// against its own guess.
 #[test]
 fn a_two_rank_capture_missing_one_rank_stamps_that_rank_in_the_bag() {
     let rank0 = anchor_on_rank(0, 0, 50, 1, 6);
@@ -1497,17 +1511,25 @@ fn a_two_rank_capture_missing_one_rank_stamps_that_rank_in_the_bag() {
     );
     assert_eq!(per_rank["0"]["step"], serde_json::json!(50));
 
-    // THE STAMP, whole and by hand.
+    // THE STAMP, whole and by hand. The ring is rank 1's, the second the driver
+    // minted, and naming it here is what fails if the stamp ever renders a
+    // neighbour's ring or drops the name again.
+    let rank1_ring = &run.rings[1];
+    assert_ne!(
+        rank1_ring, &run.rings[0],
+        "the two plans hold two different rings, or the assert below proves nothing"
+    );
     assert_eq!(
         m["anchor"]["missing_ranks"],
         serde_json::json!([{
+            "ring": rank1_ring,
             "rank": 1,
             "reason": "no_anchor_retained",
             "remedy": "this rank retained no checkpoint: it published no state ring, its \
                        plane was refused at arm time, or it had not reached its first anchor \
                        cadence when the capture was triggered",
         }]),
-        "the capture names the rank it lacks, the cause and the remedy: {m}"
+        "the capture names the ring and rank it lacks, the cause and the remedy: {m}"
     );
 
     std::fs::remove_dir_all(&run.dir).ok();

@@ -948,8 +948,9 @@ pub fn log_state_coverage_terminal(sc: &StateCoverage) {
                 "bagd checkpoint coverage INCOMPLETE: a rank BELOW the highest one discovered \
                  published no state ring, and a graph-wide anchor is all-or-nothing across \
                  ranks, so every anchor of this run LACKS that rank's records (see \
-                 state_coverage.json's ranks_missing). A resim of any capture from this run \
-                 reports PARTIAL and exits 8, naming that rank"
+                 state_coverage.json's ranks_missing). A resim of a capture from this run is \
+                 refused as not replay-grade and exits 2 with no verdict, unless that \
+                 capture's window reaches step 0 and needs no anchor"
             ),
         }
     }

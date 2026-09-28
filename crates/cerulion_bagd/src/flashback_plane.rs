@@ -2103,8 +2103,9 @@ pub(crate) struct CaptureManifest<'a> {
 /// with `missing_ranks` over every ring the retention knows about, and the
 /// recorder's rule is STRICTLY NEVER SILENTLY PARTIAL. A member that reached
 /// neither map is a hole in a written capture with no sentence beside it, which
-/// is the one outcome the anchor plane exists to make impossible. So each of the
-/// two ways the keying can fail refuses the whole capture BY NAME.
+/// is the one outcome the anchor plane exists to make impossible, and a rank in
+/// BOTH maps is the same failure wearing the other face. So each of the three
+/// ways the keying can fail refuses the whole capture BY NAME.
 ///
 /// The keying is by the rank read off the member's OWN records rather than by a
 /// counter or by the ring's position, because the rank is a fact the producer
@@ -2121,13 +2122,33 @@ pub(crate) struct CaptureManifest<'a> {
 ///   the map is keyed by rank. One ring's numbers would be published as the
 ///   other's and the second member would vanish with nothing said.
 ///
-/// Neither is a shape the harvester produces, which is why each is a refusal
+/// * A rank claimed by a SELECTED member and by a ring that contributed nothing
+///   would sit in `per_rank` and in `missing_ranks` at once, and the two are
+///   published as disjoint. The section below carries that one.
+///
+/// None is a shape the harvester produces, which is why each is a refusal
 /// rather than a repair: there is no correct capture to write, and the run is
 /// misconfigured or its records are damaged in a way an operator has to be told
 /// about.
+///
+/// # The collision is judged over EVERY ring the retention knows
+///
+/// `shortfall` is the other half of the selection, and its rings carry ranks
+/// too. Judged over the selected members alone, a ring that contributed
+/// nothing could report a rank a member already holds: the rank would then sit
+/// in `per_rank` and in `missing_ranks` at once, and the two maps are published
+/// as exhaustive AND DISJOINT. A reader resolving that rank is told the same
+/// number both has a restore point and has none. So the shortfall's rings are
+/// walked here as well and a rank claimed twice refuses the capture, whichever
+/// half of the selection each claimant came from.
+///
+/// A shortfall ring whose rank is unknown collides with nothing: it is filed by
+/// its ring name, and the stamp it produces carries that name for exactly this
+/// reason.
 pub(crate) fn build_per_rank_block(
     members: &[&crate::anchor_window::SelectedAnchor],
     achieved_from_ns: Option<u64>,
+    shortfall: &std::collections::BTreeMap<String, crate::anchor_window::MissingRank>,
 ) -> Result<std::collections::BTreeMap<u32, RankAnchor>, String> {
     let mut per_rank: std::collections::BTreeMap<u32, RankAnchor> =
         std::collections::BTreeMap::new();
@@ -2169,6 +2190,20 @@ pub(crate) fn build_per_rank_block(
                 frames_missing_after_anchor_ms: missing_ms,
             },
         );
+    }
+    // The rings that contributed NOTHING, walked for the same collision. In
+    // ring-name order, so two runs of one damaged capture name the same pair.
+    for (ring, missing) in shortfall {
+        let Some(rank) = missing.rank else {
+            continue;
+        };
+        if let Some(first) = ring_of_rank.insert(rank, ring.clone()) {
+            return Err(format!(
+                "state rings {first} and {ring} both report rank {rank}, so this capture would \
+                 publish that rank as holding a restore point and as holding none at once, and \
+                 it was NOT written. Fix: give every worker of a run its own rank"
+            ));
+        }
     }
     Ok(per_rank)
 }
@@ -2320,8 +2355,24 @@ impl RankAnchor {
 /// run where one rank went wrong, so throwing that recording away is the worst
 /// possible moment to be strict. What the strictness moves to instead is this
 /// stamp: a capture written with a hole always names the hole.
+///
+/// # The RING is what makes the naming hold
+///
+/// The rank is the name an operator wants and it is exactly the value that can
+/// be absent: a ring the retention was never told the rank of, holding no
+/// record to read one off, stamps `rank: null`. With the rank as the only
+/// identifier, two such rings render as two identical `rank: null` objects, and
+/// a reader is told two holes exist with no way to tell which ring either one
+/// is. So the stamp carries the ring's own name as well, which the selection
+/// keys its shortfall by and which is therefore always available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MissingRankStamp {
+    /// The state ring's declared name, which is always known.
+    ///
+    /// The shortfall this stamp is built from is KEYED by it, so no ring can
+    /// reach the manifest without one, and it is the identifier a reader falls
+    /// back to whenever `rank` is `null`.
+    pub ring: String,
     /// The rank, or `None` for a ring whose rank nothing could answer.
     pub rank: Option<u32>,
     /// The wire word, so a machine reader can branch on the cause.
@@ -2340,7 +2391,8 @@ impl MissingRankStamp {
             None => "null".to_string(),
         };
         format!(
-            "{{\"rank\":{rank},\"reason\":\"{}\",\"remedy\":\"{}\"}}",
+            "{{\"ring\":\"{}\",\"rank\":{rank},\"reason\":\"{}\",\"remedy\":\"{}\"}}",
+            esc(&self.ring),
             self.reason,
             esc(self.remedy)
         )
@@ -2427,12 +2479,20 @@ pub(crate) enum AnchorReport {
         /// selection returned a non-empty set, and every member of that set
         /// becomes an entry here.
         per_rank: std::collections::BTreeMap<u32, RankAnchor>,
-        /// The ranks this capture was written WITHOUT, each named with why.
+        /// The rings this capture was written WITHOUT, each named with its rank
+        /// and why.
         ///
         /// Exhaustive with `per_rank` over every ring the retention knows about,
-        /// which is the property the whole stamp rests on: a rank is in one map
-        /// or the other, so a capture cannot be written with a rank that is in
+        /// which is the property the whole stamp rests on: a ring is in one map
+        /// or the other, so a capture cannot be written with a ring that is in
         /// neither.
+        ///
+        /// DISJOINT from `per_rank` by RANK as well, and that half is enforced
+        /// rather than assumed: `build_per_rank_block` walks the selected
+        /// members and these rings together and refuses the whole capture when
+        /// one rank is claimed twice. A ring whose rank nothing can answer
+        /// renders `rank: null` and is told apart by the ring name every stamp
+        /// carries.
         ///
         /// EMPTY is the ordinary answer and is a statement rather than a
         /// placeholder: every rank the retention knew about contributed. It is
@@ -3068,6 +3128,7 @@ mod tests {
                         },
                     )]),
                     missing_ranks: vec![MissingRankStamp {
+                        ring: "worker-b".to_string(),
                         rank: Some(1),
                         reason: reason.as_wire(),
                         remedy: reason.rank_remedy(),
@@ -3243,10 +3304,11 @@ mod tests {
         );
 
         // THE CONTROL first: the rankable member alone builds a block of one.
-        let ok = build_per_rank_block(&[&good], Some(0)).expect("a rankable member builds");
+        let ok = build_per_rank_block(&[&good], Some(0), &no_shortfall())
+            .expect("a rankable member builds");
         assert_eq!(ok.keys().copied().collect::<Vec<u32>>(), vec![0]);
 
-        let err = build_per_rank_block(&[&good, &unrankable], Some(0))
+        let err = build_per_rank_block(&[&good, &unrankable], Some(0), &no_shortfall())
             .expect_err("an unrankable member must refuse the capture");
         for needle in [
             "state ring worker-b",
@@ -3303,17 +3365,184 @@ mod tests {
                 7, 44, 0, 3, &[2; 64],
             )],
         );
-        let ok = build_per_rank_block(&[&first, &apart], Some(0)).expect("two ranks build");
+        let ok = build_per_rank_block(&[&first, &apart], Some(0), &no_shortfall())
+            .expect("two ranks build");
         assert_eq!(ok.keys().copied().collect::<Vec<u32>>(), vec![2, 3]);
         assert_eq!(ok[&2].step, 41, "rank 2 keeps ITS step");
         assert_eq!(ok[&3].step, 44, "rank 3 keeps ITS step");
 
-        let err = build_per_rank_block(&[&first, &second], Some(0))
+        let err = build_per_rank_block(&[&first, &second], Some(0), &no_shortfall())
             .expect_err("two rings at one rank must refuse the capture");
         for needle in [
             "worker-a",
             "worker-b",
             "both report rank 2",
+            "was NOT written",
+            "Fix:",
+        ] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+    }
+
+    /// A retention whose every ring contributed: the shortfall the ordinary
+    /// capture hands the block builder.
+    fn no_shortfall() -> std::collections::BTreeMap<String, crate::anchor_window::MissingRank> {
+        std::collections::BTreeMap::new()
+    }
+
+    /// A shortfall of one ring, at `rank` (or at none), with a reason whose
+    /// identity the arms below do not depend on.
+    fn shortfall_of(
+        entries: &[(&str, Option<u32>)],
+    ) -> std::collections::BTreeMap<String, crate::anchor_window::MissingRank> {
+        entries
+            .iter()
+            .map(|(ring, rank)| {
+                (
+                    (*ring).to_string(),
+                    crate::anchor_window::MissingRank {
+                        rank: *rank,
+                        reason: NoAnchorReason::NothingRetained,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// TWO rings whose rank NOTHING can answer render DISTINGUISHABLY.
+    ///
+    /// The stamp's rank is the name a reader wants and it is exactly the value
+    /// that can be absent. With the rank alone, two such rings produce two
+    /// byte-identical `rank: null` objects: the manifest says two holes exist
+    /// and nothing in it says which ring either one is, so the promise that a
+    /// capture written with a hole always NAMES the hole fails on precisely the
+    /// shape the null was introduced for.
+    ///
+    /// The arm that fails if the ring name is dropped again: the two objects are
+    /// required to DIFFER, and each is required to name its own ring, so a
+    /// renderer that emitted the name for one entry and not the other, or that
+    /// emitted a positional index, cannot pass.
+    #[test]
+    fn two_rankless_shortfall_rings_are_told_apart_by_their_ring_names() {
+        let text = manifest(
+            AnchorReport::Embedded {
+                run_id: 7,
+                step: 41,
+                nodes: 1,
+                complete: 1,
+                records: 1,
+                fit: AnchorFit::CoversTheClaimedWindow,
+                taken_at_ns: 10_000,
+                frames_before_anchor_ms: 0,
+                frames_missing_after_anchor_ms: 0,
+                per_rank: std::collections::BTreeMap::from([(
+                    0,
+                    RankAnchor {
+                        capture_seq: 1,
+                        step: 41,
+                        taken_at_ns: 10_000,
+                        nodes: 1,
+                        complete: 1,
+                        records: 1,
+                        fit: AnchorFit::CoversTheClaimedWindow,
+                        frames_before_anchor_ms: 0,
+                        frames_missing_after_anchor_ms: 0,
+                    },
+                )]),
+                missing_ranks: vec![
+                    MissingRankStamp {
+                        ring: "worker-b".to_string(),
+                        rank: None,
+                        reason: NoAnchorReason::NothingRetained.as_wire(),
+                        remedy: NoAnchorReason::NothingRetained.rank_remedy(),
+                    },
+                    MissingRankStamp {
+                        ring: "worker-c".to_string(),
+                        rank: None,
+                        reason: NoAnchorReason::NothingRetained.as_wire(),
+                        remedy: NoAnchorReason::NothingRetained.rank_remedy(),
+                    },
+                ],
+            },
+            12,
+        );
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let stamps = doc["anchor"]["missing_ranks"]
+            .as_array()
+            .expect("an array of stamps")
+            .clone();
+        assert_eq!(stamps.len(), 2, "both rings are stamped: {text}");
+
+        // The RANK stays null on both, which is the state the ring name exists
+        // to survive: a stamp that invented a number here would accuse a rank
+        // that may be perfectly healthy.
+        for stamp in &stamps {
+            assert_eq!(
+                stamp["rank"],
+                serde_json::Value::Null,
+                "a ring whose rank nothing answered stamps null: {text}"
+            );
+        }
+
+        assert_eq!(stamps[0]["ring"], serde_json::json!("worker-b"));
+        assert_eq!(stamps[1]["ring"], serde_json::json!("worker-c"));
+        assert_ne!(
+            stamps[0], stamps[1],
+            "two rankless rings must not render as one repeated object: {text}"
+        );
+    }
+
+    /// A NON-MEMBER ring whose rank collides with a MEMBER's refuses the
+    /// capture BY NAME.
+    ///
+    /// `per_rank` and `missing_ranks` are published as exhaustive AND DISJOINT
+    /// over every ring the retention knows. Judged over the selected members
+    /// alone, the collision below passes: the member files rank 2 in
+    /// `per_rank`, the shortfall ring stamps rank 2 in `missing_ranks`, and a
+    /// reader resolving rank 2 is told that it both has a restore point and has
+    /// none. The trim reads its per-rank cuts off the first map, so the reader
+    /// is not the only one misled.
+    ///
+    /// Three legs, because the refusal has to be about the collision and not
+    /// about having a shortfall at all: a shortfall ring at a DIFFERENT rank
+    /// builds, a shortfall ring with NO rank builds, and the collision refuses.
+    #[test]
+    fn a_shortfall_rings_rank_colliding_with_a_members_refuses_the_capture() {
+        let member = crate::anchor_window::selected_anchor_for_test(
+            "worker-a",
+            7,
+            41,
+            10_000_000_000,
+            CAPTURE_SEQ,
+            AnchorFit::CoversTheClaimedWindow,
+            vec![crate::anchor_window::ranked_records_for_test(
+                7, 41, 0, 2, &[1; 64],
+            )],
+        );
+
+        // CONTROL 1: a shortfall ring at a rank the member does not hold.
+        let apart =
+            build_per_rank_block(&[&member], Some(0), &shortfall_of(&[("worker-b", Some(3))]))
+                .expect("a shortfall ring at its own rank builds");
+        assert_eq!(apart.keys().copied().collect::<Vec<u32>>(), vec![2]);
+        assert_eq!(apart[&2].step, 41, "the member keeps ITS step");
+
+        // CONTROL 2: a shortfall ring whose rank nothing answered collides with
+        // nothing, which is why such a ring is told apart by its NAME.
+        let rankless =
+            build_per_rank_block(&[&member], Some(0), &shortfall_of(&[("worker-b", None)]))
+                .expect("a rankless shortfall ring builds");
+        assert_eq!(rankless.keys().copied().collect::<Vec<u32>>(), vec![2]);
+
+        // THE COLLISION.
+        let err =
+            build_per_rank_block(&[&member], Some(0), &shortfall_of(&[("worker-b", Some(2))]))
+                .expect_err("a rank in both maps must refuse the capture");
+        for needle in [
+            "worker-a",
+            "worker-b",
+            "both report rank 2",
+            "as holding none at once",
             "was NOT written",
             "Fix:",
         ] {

@@ -12818,8 +12818,9 @@ impl Recorder {
                     "bagd found node-state rings for HIGHER ranks than {gap} but none for {gap} \
                      itself: that rank exists and published no ring, and a graph-wide anchor is \
                      all-or-nothing across ranks, so every anchor of this run LACKS rank {gap}'s \
-                     records. A resim of any capture from this run reports PARTIAL and exits 8, \
-                     naming that rank"
+                     records. A resim of a capture from this run is refused as not \
+                     replay-grade and exits 2 with no verdict, unless that capture's window \
+                     reaches step 0 and needs no anchor"
                 );
             }
         }
@@ -16709,21 +16710,28 @@ impl Recorder {
                     };
                     // THE SET, un-folded, beside the folded scalars above, and
                     // EXHAUSTIVE over the members by construction. The rule, the
-                    // keying and the two ways it can fail are all in
+                    // keying and the three ways it can fail are all in
                     // `build_per_rank_block`; a failure REFUSES this capture
-                    // rather than publishing a block with a rank in neither map.
-                    let per_rank =
-                        match flashback_plane::build_per_rank_block(&members, achieved_from_ns) {
-                            Ok(block) => block,
-                            // EMPTY on the refusal path, and nothing reads it: the
-                            // report is still built so the refusal can name the
-                            // capture it is refusing, and the finalize gate below
-                            // returns before any bag is written.
-                            Err(reason) => {
-                                rank_identity_refusal = Some(reason);
-                                BTreeMap::new()
-                            }
-                        };
+                    // rather than publishing a block with a rank in neither map
+                    // or in both. The SHORTFALL is handed over as well, because
+                    // the rings that contributed nothing carry ranks too and a
+                    // rank claimed by both halves would break the disjointness
+                    // the two maps are published under.
+                    let per_rank = match flashback_plane::build_per_rank_block(
+                        &members,
+                        achieved_from_ns,
+                        &selection.shortfall,
+                    ) {
+                        Ok(block) => block,
+                        // EMPTY on the refusal path, and nothing reads it: the
+                        // report is still built so the refusal can name the
+                        // capture it is refusing, and the finalize gate below
+                        // returns before any bag is written.
+                        Err(reason) => {
+                            rank_identity_refusal = Some(reason);
+                            BTreeMap::new()
+                        }
+                    };
                     // The two SPAN scalars, folded over the SET by the rule
                     // `fold_anchor_spans` states and plan section 2.1 assigns:
                     // each is the LARGEST of the ranks' own figures, and the two
@@ -16777,10 +16785,18 @@ impl Recorder {
                         // contributed nothing is a fact only its own retention
                         // has, and re-deriving it here would be a second opinion
                         // that can disagree with the first.
+                        //
+                        // The shortfall's KEY travels with the reason. It is the
+                        // ring's own name, it is what the map is keyed by, and
+                        // it is the only identifier two rings whose ranks
+                        // nothing can answer differ in: dropping it leaves a
+                        // reader two identical `rank: null` stamps and no way to
+                        // tell which ring either one names.
                         missing_ranks: selection
                             .shortfall
-                            .values()
-                            .map(|m| flashback_plane::MissingRankStamp {
+                            .iter()
+                            .map(|(ring, m)| flashback_plane::MissingRankStamp {
+                                ring: ring.clone(),
                                 rank: m.rank,
                                 reason: m.reason.as_wire(),
                                 remedy: m.reason.rank_remedy(),

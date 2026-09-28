@@ -525,8 +525,13 @@ fn a_worker_over_the_ceiling_declines_for_itself_and_says_which_rank() {
          anchor of the run lacks THIS rank's records"
     );
     assert!(
-        logs_contain("reports PARTIAL and exits 8"),
-        "…and the consequence a reader will meet downstream, named with its exit code"
+        logs_contain("refused as not replay-grade and exits 2"),
+        "…and the consequence a reader will meet downstream, named with the exit code the \
+         resim really returns"
+    );
+    assert!(
+        !logs_contain("exits 8"),
+        "…and NOT a verdict the resim has no code for: its contract runs 0 to 6"
     );
 }
 

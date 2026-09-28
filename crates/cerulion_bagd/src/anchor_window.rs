@@ -602,9 +602,13 @@ pub(crate) fn selected_anchor_for_test(
 /// the clock as the fallback.
 ///
 /// The two maps are exhaustive together over the rings the retention knows
-/// about, which is the property the missing-rank stamp rests on: a rank absent
+/// about, which is the property the missing-rank stamp rests on: a ring absent
 /// from `selected` is NAMED in `shortfall` with the reason its own retention
 /// gave, so a capture can never be written with a hole nobody can account for.
+/// Both are keyed by the ring's own name, so exhaustiveness holds even for a
+/// ring whose rank nothing can answer. Disjointness BY RANK is a separate
+/// property and is not established here: two rings can report one rank, and
+/// `flashback_plane::build_per_rank_block` refuses the capture when they do.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnchorSelection {
     /// The chosen checkpoint per ring, keyed by the ring's SHM name.

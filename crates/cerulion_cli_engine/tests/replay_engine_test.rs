@@ -13192,6 +13192,119 @@ fn a_two_ring_recording_refuses_because_a_node_index_names_nothing() {
     assert!(text.contains("--single-process"), "names the fix: {text}");
 }
 
+/// The coverage manifest a capture written WITHOUT one rank carries: ranks 0
+/// and 2 published state rings, rank 1 published none, and the recorder stamps
+/// the hole in `ranks_missing`.
+///
+/// Built on the sibling helper rather than beside it, so the only difference
+/// from the healthy manifest is the hole and the ring count it implies.
+fn coverage_stamped_with_a_missing_rank() -> Vec<u8> {
+    let mut cov: StateCoverage =
+        serde_json::from_slice(&checkpoint_coverage(2, Some(CHECKPOINT_NODE_IDX)))
+            .expect("the sibling helper produces a readable manifest");
+    cov.ranks_discovered = vec![0, 2];
+    cov.ranks_missing = vec![1];
+    serde_json::to_vec(&cov).expect("state coverage serializes")
+}
+
+#[test]
+#[serial]
+fn a_capture_stamped_with_a_missing_rank_is_refused_rather_than_given_a_verdict() {
+    // THE SENTENCE THIS PINS. The recorder, the graph side that arms a rank's
+    // ring and the coverage manifest all tell an operator what a resim of a
+    // capture from a run with a rank hole will do, and what they say has to be
+    // what it does. What it does is REFUSE: the exit contract runs 0 to 6, and
+    // this shape lands on 2, the not-replay-grade class, with no verdict about
+    // the run at all. The sentences at those six sites are held equal to this
+    // by `cerulion_bagd`'s own
+    // `the_six_operator_sentences_name_the_rank_whose_records_are_lacking`,
+    // which reads them off the source; this arm is the behaviour half.
+    //
+    // Three legs, because neither the refusal nor the exception is worth
+    // anything alone:
+    //
+    //  (a) CONTROL: the same recording with a whole coverage resumes and
+    //      passes, so leg (b) is about the hole and not about the harness.
+    //  (b) the stamped capture, beginning MID-RUN, is refused with exit 2.
+    //  (c) the stamped capture whose recording reaches step 0 PASSES, which is
+    //      the "unless that capture's window reaches step 0" clause: the
+    //      resume never runs, so the hole costs nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = checkpoint_reference();
+
+    // (a) THE CONTROL.
+    let healthy = write_healthy_checkpoint_bag(&dir, CP_FIRST_STEP);
+    let ok = replay(&healthy, checkpoint_factories, None, None)
+        .expect("a capture every rank contributed to resumes");
+    assert!(ok.passed, "control: {ok:?}");
+
+    // (b) THE STAMPED CAPTURE, mid-run.
+    let mid = make_mid_run(&rec, CP_FIRST_STEP);
+    let holed = dir.path().join("missing_rank_mid_run.mcap");
+    write_checkpoint_bag(
+        &mid,
+        &holed,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+        ),
+        Some(&coverage_stamped_with_a_missing_rank()),
+        None,
+    );
+    let err = replay(&holed, checkpoint_factories, None, None)
+        .expect_err("a capture written without a rank cannot be resumed");
+    assert_eq!(
+        err.exit_code(),
+        2,
+        "the code the operator-facing sentences name, and the only one this shape \
+         produces: {err}"
+    );
+    // WHAT THE OPERATOR SEES. `resim_cmd::run_resim` renders a typed error as
+    // `Error: {e}` on stderr and returns `e.exit_code()`, so the refusal's own
+    // Display IS the line, and there is no verdict block at all on this path.
+    let printed = err.to_string();
+    assert!(
+        printed.contains("state rings"),
+        "the refusal names what it could not read: {printed}"
+    );
+    // The ANTI-CLAIM half, and the reason this arm exists: a verdict word and
+    // an exit code the contract does not have. An operator handed either goes
+    // looking for a failure mode that cannot occur.
+    for absent in ["PARTIAL", "exits 8", "exit 8"] {
+        assert!(
+            !printed.contains(absent),
+            "the resim has no {absent:?} outcome: {printed}"
+        );
+    }
+
+    // (c) THE EXCEPTION, and the leg that fails if the sentences over-claim:
+    // the SAME stamp on a recording that reaches step 0 needs no anchor, so
+    // nothing reads the coverage and the resim runs to a verdict of its own.
+    let from_start = dir.path().join("missing_rank_from_start.mcap");
+    write_checkpoint_bag(
+        &rec,
+        &from_start,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+        ),
+        Some(&coverage_stamped_with_a_missing_rank()),
+        None,
+    );
+    let whole = replay(&from_start, checkpoint_factories, None, None)
+        .expect("a recording that reaches step 0 needs no anchor, hole or not");
+    assert!(whole.passed, "{whole:?}");
+    assert!(
+        whole.resume.is_none(),
+        "nothing resumed, which is why the hole cost nothing: {:?}",
+        whole.resume
+    );
+}
+
 #[test]
 #[serial]
 fn two_runs_anchored_at_the_resume_step_refuse_naming_both() {
@@ -17108,6 +17221,10 @@ const DECLARED_LITERAL_SHAPE_SITES: &[(&str, &str)] = &[
     (
         "a_two_ring_recording_refuses_because_a_node_index_names_nothing",
         "the `cp` counter",
+    ),
+    (
+        "a_capture_stamped_with_a_missing_rank_is_refused_rather_than_given_a_verdict",
+        "the `cp` counter, twice",
     ),
     (
         "a_state_manifest_from_a_newer_bagd_is_read_and_used_and_the_skew_is_named",

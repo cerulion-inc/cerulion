@@ -7260,8 +7260,9 @@ pub fn graph_run_worker(
                     error = %e,
                     "this worker is ARMED for checkpoints but its rank cannot name a \
                      state ring, so it captures NOTHING and every anchor of this run LACKS \
-                     the records of the rank this event names. A resim of any capture from \
-                     this run reports PARTIAL and exits 8, naming that rank"
+                     the records of the rank this event names. A resim of a capture from this \
+                     run is refused as not replay-grade and exits 2 with no verdict, unless \
+                     that capture's window reaches step 0 and needs no anchor"
                 );
                 return None;
             }

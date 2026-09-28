@@ -529,8 +529,9 @@ fn report_arm_refusal(
             .to_string(),
         PlaneRole::Worker { rank } => format!(
             "rank {rank} captures NOTHING while its peers carry on, so every anchor of this \
-             run LACKS rank {rank}'s records. A resim of any capture from this run reports \
-             PARTIAL and exits 8, naming that rank"
+             run LACKS rank {rank}'s records. A resim of a capture from this run is refused \
+             as not replay-grade and exits 2 with no verdict, unless that capture's window \
+             reaches step 0 and needs no anchor"
         ),
         // UNREACHABLE today: a supervisor never reaches the memory gate
         // (`pays_the_fork_cost` is false for it), so nothing calls this with that
@@ -672,8 +673,9 @@ fn create_state_ring(
                 "this run is ARMED for checkpoints but its state-ring name cannot be \
                  derived, so this rank captures NOTHING, and because a graph-wide anchor is \
                  all-or-nothing across ranks, every anchor of this run LACKS the records of \
-                 the rank this event names. A resim of any capture from this run reports \
-                 PARTIAL and exits 8, naming that rank. The graph continues running"
+                 the rank this event names. A resim of a capture from this run is refused as \
+                 not replay-grade and exits 2 with no verdict, unless that capture's window \
+                 reaches step 0 and needs no anchor. The graph continues running"
             );
             return None;
         }
@@ -708,8 +710,9 @@ fn create_state_ring(
                 "this run is ARMED for checkpoints but its state ring could not be \
                  created, so this rank captures NOTHING, and because a graph-wide anchor is \
                  all-or-nothing across ranks, every anchor of this run LACKS the records of \
-                 the rank this event names. A resim of any capture from this run reports \
-                 PARTIAL and exits 8, naming that rank. The graph continues running"
+                 the rank this event names. A resim of a capture from this run is refused as \
+                 not replay-grade and exits 2 with no verdict, unless that capture's window \
+                 reaches step 0 and needs no anchor. The graph continues running"
             );
             return None;
         }

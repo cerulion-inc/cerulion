@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The word PARTIAL, swept mechanically over the state anchor plane's sources.
 //!
-//! PARTIAL is the RESIM VERDICT's word: a resume that restored some ranks and
-//! not others reports PARTIAL and exits 8. The same word used to name a
-//! different fact in these files, a run whose rank published no state ring, so
-//! one `bag info` session could hand an operator one word for two things. Those
-//! sentences now state the fact instead: every anchor of the run LACKS that
-//! rank's records. This file is what keeps them stated that way.
+//! PARTIAL is a RESIM VERDICT word, and the resim has no verdict by that name:
+//! its exit contract runs 0 to 6, and a capture whose ranks did not all restore
+//! is refused as not replay-grade with exit 2. The word used to name a
+//! different fact in these files as well, a run whose rank published no state
+//! ring, so one `bag info` session could hand an operator one word for two
+//! things, neither of which the resim answers with. Those sentences now state
+//! the fact instead: every anchor of the run LACKS that rank's records, and the
+//! resim refuses a capture of it. This file is what keeps them stated that way.
 //!
 //! # A POSITIVE scan, and why the conditional one it replaces was not enough
 //!
@@ -135,7 +137,6 @@ const REGION: &[Scanned] = &[
         path: "crates/cerulion_bagd/src/state_coverage.rs",
         allowed: &[
             "\"the mid-run attach discards its partial head\",",
-            "PARTIAL and exits 8, naming that rank\"",
             "dropped as a mid-run attach's partial head anchor.",
             "ledger is still discarding a partial head anchor.",
             "mid-run attach discarded as a partial head anchor.",
@@ -170,7 +171,6 @@ const REGION: &[Scanned] = &[
             "partial.env_json.is_some(), \"{partial:?}\");",
             "partial.graph_yaml.is_some(), \"{partial:?}\");",
             "partial.process_groups = [(\"p0\".to_string(), vec![config.nod",
-            "this run reports PARTIAL and exits 8, naming that rank",
         ],
     },
     Scanned {
@@ -179,12 +179,7 @@ const REGION: &[Scanned] = &[
     },
     Scanned {
         path: "crates/cerulion_cli_engine/src/state_arm_attach.rs",
-        allowed: &[
-            "PARTIAL and exits 8, naming that rank\"",
-            "partial-capture design.",
-            "partial-capture reporting is",
-            "PARTIAL and exits 8, naming that rank. The graph continues running",
-        ],
+        allowed: &["partial-capture design.", "partial-capture reporting is"],
     },
     Scanned {
         path: "crates/cerulion_core/src/state_ring.rs",
@@ -305,10 +300,11 @@ fn every_allow_entry_matches_a_line_and_the_region_is_not_empty() {
 /// A LITERAL, and the only number in this file. It moves only when a person has
 /// read the sentence that moved it, which is what makes it a control rather
 /// than a second copy of the list's length.
-const ALLOW_LIST_ENTRIES: usize = 91;
+const ALLOW_LIST_ENTRIES: usize = 87;
 
 /// ORACLE 15, arm (a): the SIX operator-facing sentences say the new fact, in
-/// their new wording, naming the rank whose records are LACKING.
+/// their new wording, naming the rank whose records are LACKING and the exit
+/// code a resim of such a capture really returns.
 ///
 /// Asserted as literal text read off the source, because these are the four
 /// warns and errors and the two scope sentences an operator actually meets, and
@@ -319,6 +315,20 @@ const ALLOW_LIST_ENTRIES: usize = 91;
 /// ranks, "every anchor of this run lacks a rank's records" without saying which
 /// rank is a sentence an operator cannot act on, so each site's own rank term is
 /// asserted beside the sentence.
+///
+/// # The CONSEQUENCE half, and what pins it to the behaviour
+///
+/// These sentences also tell an operator what a resim of such a capture does,
+/// and that half was wrong: they named a PARTIAL verdict and an exit 8, neither
+/// of which exists. `cerulion bag play --resim` has a 0 to 6 contract, and a
+/// capture whose ranks did not all restore is refused as not replay-grade with
+/// exit 2, while a capture whose window reaches step 0 needs no anchor and
+/// resims. The BEHAVIOUR those two clauses now name is driven end to end by
+/// `cerulion_cli_engine`'s own
+/// `a_capture_stamped_with_a_missing_rank_is_refused_rather_than_given_a_verdict`,
+/// which builds such a capture and reads the exit code back. This arm is the
+/// half that keeps the SENTENCES equal to it, and it fails on a message that
+/// goes back to naming a code the contract does not have.
 #[test]
 fn the_six_operator_sentences_name_the_rank_whose_records_are_lacking() {
     let root = repo_root();
@@ -327,32 +337,38 @@ fn the_six_operator_sentences_name_the_rank_whose_records_are_lacking() {
             "crates/cerulion_bagd/src/lib.rs",
             &[
                 "so every anchor of this run LACKS rank {gap}'s",
-                "records. A resim of any capture from this run reports PARTIAL and exits 8,",
+                "records. A resim of a capture from this run is refused as not",
+                "replay-grade and exits 2 with no verdict, unless that capture's window",
             ],
         ),
         (
             "crates/cerulion_bagd/src/state_coverage.rs",
             &[
                 "ranks, so every anchor of this run LACKS that rank's records (see",
-                "reports PARTIAL and exits 8, naming that rank",
+                "refused as not replay-grade and exits 2 with no verdict, unless that",
             ],
         ),
         (
             "crates/cerulion_cli_engine/src/graph_cmd.rs",
             &[
                 "state ring, so it captures NOTHING and every anchor of this run LACKS",
-                "the records of the rank this event names. A resim of any capture from",
+                "the records of the rank this event names. A resim of a capture from this",
+                "run is refused as not replay-grade and exits 2 with no verdict, unless",
             ],
         ),
         (
             "crates/cerulion_cli_engine/src/state_arm_attach.rs",
             &[
                 // The `PlaneRole::Worker` scope sentence.
-                "run LACKS rank {rank}'s records. A resim of any capture from this run reports",
+                "run LACKS rank {rank}'s records. A resim of a capture from this run is refused",
                 // The ring NAME cannot be derived.
                 "derived, so this rank captures NOTHING, and because a graph-wide anchor is",
                 // The ring could not be CREATED.
                 "created, so this rank captures NOTHING, and because a graph-wide anchor is",
+                // Both ring sites carry the consequence and the promise that the
+                // graph is not taken down with the plane.
+                "not replay-grade and exits 2 with no verdict, unless that capture's window",
+                "reaches step 0 and needs no anchor. The graph continues running",
             ],
         ),
     ];
@@ -369,13 +385,18 @@ fn the_six_operator_sentences_name_the_rank_whose_records_are_lacking() {
 
     // THE CONTROL, and the half that fails if the rename was reverted rather
     // than reworded: the OLD sentences are gone from every one of these files.
-    // Without it every assert above could hold beside a leftover copy.
+    // Without it every assert above could hold beside a leftover copy. The last
+    // two are the CONSEQUENCE half's control: a verdict word and an exit code
+    // the resim contract does not have, either of which reaching an operator
+    // sends them looking for a failure mode that cannot occur.
     for (path, _) in sites {
         let text = std::fs::read_to_string(root.join(path)).expect("readable");
         for gone in [
             "every anchor of this run is partial",
             "every anchor of this run will be reported partial",
             "every anchor of this run will be reported PARTIAL",
+            "reports PARTIAL",
+            "exits 8",
         ] {
             assert!(
                 !text.contains(gone),
