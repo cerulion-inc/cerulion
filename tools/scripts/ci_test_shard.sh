@@ -347,7 +347,7 @@ check_selection() {
         fi
     done <<< "$SELECTION_CASES"
     [ "$_fails" -eq 0 ] || exit 1
-    printf 'ci_test_shard --check: OK — the selection reader agrees with its hand table.\n'
+    printf 'ci_test_shard --check: OK, the selection reader agrees with its hand table.\n'
 }
 
 # --------------------------------------------------------------------------
