@@ -62,9 +62,9 @@ pub struct StreamResolution {
     /// disabled fallback both read `None`; HOST mode reads the port it handed to
     /// `serve_grpc_opts`, which is the port in [`Self::rerun_url`].
     ///
-    /// [`host_endpoint`] is the one function here that opens a listening socket,
-    /// and it is the one place this reads `Some`, so the equivalence holds by
-    /// construction. A second hosting path must set it too.
+    /// `host_endpoint` (private) is the one function here that opens a listening
+    /// socket, and it is the one place this reads `Some`, so the equivalence holds
+    /// by construction. A second hosting path must set it too.
     pub hosted_port: Option<u16>,
 }
 
