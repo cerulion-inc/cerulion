@@ -86,7 +86,7 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
   the commit message. Commit bodies carry the WHY.
 - PR bodies (product voice, ~40 lines/450 words): a summary paragraph (or `## Summary`),
   `## What changed`, `## How to verify` (commands), a latency section when the landing rule needs it,
-  `Closes #N` last (omit when no issue closes). No questions, process talk, HTML, em or en dashes,
+  `Closes #N` last on its own line (omit when no issue closes). No questions, process talk, HTML, em or en dashes,
   internal ids, hostnames or machine paths. Diffs ~800 lines; breaking changes carry migration steps.
 - Stacked PRs (B on unmerged A): base B on A's branch; merge in dependency order
   (deleting a merged base retargets B; a rename closes it).
