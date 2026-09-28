@@ -141,17 +141,6 @@ env:
   # gated on the variable itself would read a value the `changes` job never
   # saw, and `cerulion_cli_engine::ci_test_coverage_test` refuses that shape.
   CI_SELECTION: ${{ vars.CI_SELECTION || 'on' }}
-  # THE SELECTION OFF SWITCH. `ci_changed_paths.sh` narrows a pull request's
-  # test steps to the packages the change can reach; this variable stops that
-  # with no pull request, no deploy and no review. Unset or `on` applies the
-  # selection; `off`, and any value the classifier does not know, selects every
-  # package and runs every step. The default lives HERE, in the expression, so a
-  # repository with no variable behaves exactly as this file reads.
-  #
-  # The switch reaches a step ONLY through the classifier's outputs. A step
-  # gated on the variable itself would read a value the `changes` job never
-  # saw, and `cerulion_cli_engine::ci_test_coverage_test` refuses that shape.
-  CI_SELECTION: ${{ vars.CI_SELECTION || 'on' }}
   RUST_BACKTRACE: 1
   # Suppress iceoryx2 log noise
   IOX2_LOG_LEVEL: error
@@ -184,36 +173,70 @@ jobs:
     timeout-minutes: 10
     outputs:
       packaging: ${{ steps.classify.outputs.packaging }}
+      code: ${{ steps.classify.outputs.code }}
+      docs: ${{ steps.classify.outputs.docs }}
+      pkgs: ${{ steps.classify.outputs.pkgs }}
     steps:
       # `fetch-depth: 0` because the diff is against the pull request's BASE
       # commit, which a shallow checkout does not have. It is the whole cost of
-      # this job.
+      # this job, apart from the workspace resolve below.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
+      # `cargo` is preinstalled on `ubuntu-latest`; the classifier runs
+      # `cargo metadata --no-deps`, which resolves nothing off the network.
       - name: Classify the changed paths
         id: classify
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "not a pull request: every class is false"
-            echo "packaging=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          # THE OFF SWITCH, printed on its own line before anything reads it.
+          echo "selection: switch=${CI_SELECTION}"
+          : > "$RUNNER_TEMP/changed.txt"
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            # On a `pull_request` event the checkout is the MERGE commit, so
+            # `diff <base> HEAD` is exactly what the pull request changes.
+            # `--no-renames` so a rename arrives as its DELETE plus its ADD.
+            # With rename detection left on, `--name-only` prints the DESTINATION
+            # path alone, so renaming a listed packaging input to an unlisted
+            # path would classify as `packaging=false` and skip the job that
+            # reads it.
+            git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+            echo "== changed paths =="
+            cat "$RUNNER_TEMP/changed.txt"
+          else
+            echo "selection: not a pull request, every package is selected"
           fi
-          # On a `pull_request` event the checkout is the MERGE commit, so
-          # `diff <base> HEAD` is exactly what the pull request changes.
-          # `--no-renames` so a rename arrives as its DELETE plus its ADD.
-          # With rename detection left on, `--name-only` prints the DESTINATION
-          # path alone, so renaming a listed packaging input to an unlisted path
-          # would classify as `packaging=false` and skip the job that reads it.
-          git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
-          echo "== changed paths =="
-          cat "$RUNNER_TEMP/changed.txt"
           ./tools/scripts/ci_changed_paths.sh < "$RUNNER_TEMP/changed.txt" \
-            | tee -a "$GITHUB_OUTPUT"
+            > "$RUNNER_TEMP/classes.txt"
+          cat "$RUNNER_TEMP/classes.txt"
+          packaging=$(sed -n 's/^packaging=//p' "$RUNNER_TEMP/classes.txt")
+          code=$(sed -n 's/^code=//p' "$RUNNER_TEMP/classes.txt")
+          docs=$(sed -n 's/^docs=//p' "$RUNNER_TEMP/classes.txt")
+          pkgs=$(sed -n 's/^pkgs=//p' "$RUNNER_TEMP/classes.txt")
+          # FAIL CLOSED on a class the classifier did not produce. An absent
+          # output is the empty string in every job that consults it: `== 'true'`
+          # is then false on every event, and `fromJSON('')` is an expression
+          # error that fails the step rather than running it.
+          for value in "$packaging" "$code" "$docs" "$pkgs"; do
+            if [ -z "$value" ]; then
+              echo "the classifier produced no value for one of its four classes" >&2
+              exit 1
+            fi
+          done
+          # Each name written LITERALLY, because that is the evidence
+          # `cerulion_cli_engine::ci_test_coverage_test` grounds a gated step on:
+          # an output whose declaration names a step that writes no such name is
+          # the empty string on every event, and a step gated on it runs nowhere
+          # while reading as a selected step.
+          {
+            echo "packaging=$packaging"
+            echo "code=$code"
+            echo "docs=$docs"
+            echo "pkgs=$pkgs"
+          } >> "$GITHUB_OUTPUT"
 
   deb-smoke:
     name: Debian and APT package smoke
