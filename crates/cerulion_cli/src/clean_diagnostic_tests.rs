@@ -1604,6 +1604,35 @@ fn the_clean_verb_renders_the_would_remove_listing_from_the_sweeps_own_field() {
 }
 
 #[test]
+fn the_verb_maps_the_flag_to_the_mode_in_both_directions() {
+    // The ONE mapping no arm in this repository can catch behaviourally in both
+    // directions, so it is pinned by VALUE here.
+    //
+    // An inverted `--report-only` is caught loudly: the report-only arm in
+    // `tests/trace_inspect_and_clean_cli_test.rs` would watch its planted node
+    // vanish and fail on the registry diff, which is exactly how the
+    // flag-read-after-the-sweep mutant dies. The OTHER direction is caught by
+    // NOTHING. A bare `cerulion clean` that silently became a report leaves no
+    // trace in this suite: no CLI arm may run the verb bare (its `/tmp`
+    // reclaim is machine wide), and the engine arms call
+    // `sweep_dead_nodes_with_config` directly, so the dispatch would be the
+    // only broken thing and every test would stay green while `cerulion clean`
+    // stopped cleaning.
+    let src = code_only(&read_main());
+    let at = src
+        .find("Commands::Clean { report_only } =>")
+        .expect("the clean verb must still be dispatched on its own flag");
+    assert_eq!(
+        call_args(&src[at..], "clean_iceoryx2_state"),
+        "if report_only { SweepMode::ReportOnly } else { SweepMode::Remove }",
+        "the flag maps to the mode in exactly this direction; a swap would make \
+         `--report-only` destructive or `clean` inert, and only the first of those \
+         is caught anywhere else; dispatch was:\n{}",
+        &src[at..at + 200.min(src.len() - at)]
+    );
+}
+
+#[test]
 fn the_verb_closes_a_report_only_run_by_saying_nothing_was_removed() {
     // The flag's whole promise, stated once, after BOTH halves have
     // reported — so it covers the `.shm_state` population too, which the
