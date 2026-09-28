@@ -41,9 +41,9 @@ produced with or without `--no-deps` gives the same answer.
 WHAT THIS CLOSURE PROVES, AND WHAT IT DOES NOT. It is the reverse CARGO
 DEPENDENCY closure over normal, build and dev edges: a package whose tests can
 observe a change through a dependency edge is in the output. A test can also
-observe another package WITHOUT an edge to it — by opening a path literal into
+observe another package WITHOUT an edge to it, by opening a path literal into
 that package's tree, by walking the whole repository, or by loading an artifact
-built from it at run time (`dlopen`) — and NONE of those classes is covered
+built from it at run time (`dlopen`), and NONE of those classes is covered
 here. One of them is covered elsewhere: the doc-pin walk in
 `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` pins every test
 binary that opens the shared documentation and tool trees. Cross-crate source
@@ -58,13 +58,21 @@ Usage:
 
 `--metadata` defaults to `-`, standard input.
 
-THE DOCUMENT IS VALIDATED BEFORE ANY MODE, `--all` included. A document that is
-not an object carrying `packages` (a list), `workspace_members` (a list) and
+THE DOCUMENT IS VALIDATED BEFORE ANY MODE, `--all` included, because every mode
+reaches `workspace_members` and that is where the check lives. A document that
+is not an object carrying `packages` (a list), `workspace_members` (a list) and
 `version` is refused with exit 2 and one line naming the field, never read as a
 selection: `null` and a list used to reach `.get()` and die with a traceback,
 which is exit 1 and reads as "the self-test found a miss", and under `--all` a
 document missing either list printed `[]` with exit 0, which a caller reads as
-"nothing to test" — the silent empty selection this script exists to refuse.
+"nothing to test".
+
+WHAT AN EMPTY SELECTION STILL MEANS. The refusal is about the DOCUMENT, not
+about the answer. A well-formed document whose `workspace_members` list is empty
+prints `[]` at exit 0 under `all` and `--all`, and that is the true answer for
+such a workspace; so does a selection whose touched set is empty. What no caller
+can get is an empty selection read out of a document this script could not
+parse.
 
 Exit codes:
   0  the selection is on stdout, or the self-test passed
@@ -164,11 +172,13 @@ class MalformedMetadata(SelectionError):
 def validate_metadata(document):
     """Refuse a document that is not the shape this walk reads.
 
-    Runs BEFORE any mode, `--all` included, which is the whole point: a
-    document that is `null` or a list reached `.get()` and died with an
-    AttributeError traceback — exit 1, the code that means "the self-test found
-    a miss" — and under `--all` a document missing either list printed `[]` with
-    exit 0, a silent empty selection a caller reads as "nothing to test".
+    Called from `workspace_members`, which every mode reaches, so it runs
+    before any mode reads a value out of the document. That is the whole point:
+    a document that is `null` or a list reached `.get()` and died with an
+    AttributeError traceback, which is exit 1, the code that means "the
+    self-test found a miss"; and under `--all` a document missing either list
+    printed `[]` with exit 0, a silent empty selection a caller reads as
+    "nothing to test".
 
     The `version` FIELD is checked for presence here and its VALUE by
     `workspace_members`; both answer with `UnsupportedMetadata`, so one fact has
@@ -497,7 +507,7 @@ def self_test():
     # A MALFORMED DOCUMENT IS REFUSED IN EVERY MODE, the whole triple pinned.
     # `null` and a list used to reach `.get()` and die with a traceback (exit 1,
     # the self-test's own code), and under `--all` a document missing either
-    # list printed `[]` with exit 0 — a silent empty selection.
+    # list printed `[]` with exit 0, a silent empty selection.
     for name, text, expected_error in (
             ('null-document', 'null', MalformedMetadata('document', 'NoneType')),
             ('list-document', '[]', MalformedMetadata('document', 'list')),
@@ -587,9 +597,10 @@ def run(argv):
 
     try:
         document = read_metadata(args.metadata)
-        # BEFORE the mode split, so `--all` refuses a malformed document rather
-        # than printing the empty selection it reads out of one.
-        validate_metadata(document)
+        # No validation call here: `workspace_members` validates, and BOTH
+        # branches below reach it, `--all` directly and the closure through
+        # `dependents`. A second call was an equivalent mutant, green when
+        # deleted, which is a check that proves nothing.
         if args.all or args.packages == ['all']:
             selected = sorted(workspace_members(document))
         else:
