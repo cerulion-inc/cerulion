@@ -83,6 +83,52 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # CACHE SAVE POLICY. The Actions cache store has a 10 GB free allowance; the
+  # rest is billed, and a failed payment makes the service refuse every save
+  # while the store is above 10 GB (measured 2026-09-28: 13 refusals into a
+  # 15.8 GB store, one accepted save into an emptied one). One generation of
+  # the eight namespaces measured is 17.1 GB (the rmw lanes and the smaller
+  # tool caches are not in that figure), so the default saves two archives: the
+  # macOS test shards' archive (shard 0 ran 28.3 min with a cache hit on run
+  # 35666419690 against 29 to 44 min across eight 2026-09-27 runs whose cache
+  # state is not recorded) and the Linux test shards' archive the shards need,
+  # which fit together (4.27 GB and 3.18 GB, 7.45 GB, main only). Every other
+  # namespace is restore-only.
+  # Directly before every save of a lockfile-keyed archive (the machete tool
+  # cache is exempt) a prune step keeps exactly the job's current `main` key and
+  # deletes every other entry of its namespace (stale lockfile generations,
+  # `pr` scope, legacy unqualified keys), so the store never holds two archives
+  # of one namespace.
+  #
+  # THE PRUNE IS NOT GATED ON THE NAMESPACE LIST, only on the branch: every
+  # default-branch run of a job that has a prune step prunes, and keeps exactly
+  # that job's current key even when no entry under it exists. A restore-only
+  # namespace is therefore EMPTIED rather than left holding stale archives
+  # nothing will replace -- a pull request's restore refreshes an entry's
+  # last-access time, so GitHub's idle eviction never reclaims one on its own.
+  # A run BEHIND THE TIP deletes nothing and saves nothing: only the run for the
+  # newest commit may delete, and its save step is gated on the prune step's
+  # `proceed` output, because a run that skipped the prune and uploaded anyway
+  # would leave two generations of its namespace resident and the next save
+  # would be refused.
+  #
+  # CACHE_SAVE_NAMESPACES: space-separated namespace tokens that may save, the
+  # token being the key text between `cargo-` and the scope segment with any
+  # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`,
+  # `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
+  # `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lock
+  # hash>`, whose header hash is a cache generation rather than part of the
+  # namespace), or `all`. The default lives HERE, so a repository with no
+  # variable saves the measured frontier and a typo matches nothing
+  # (fail-closed on content). CACHE_SAVE_ON_PULL_REQUEST: empty means saves run
+  # on main only; any value lets pull-request runs save too, and only from a
+  # branch of this repository -- a fork's token cannot hold `actions: write`, so
+  # the prune's delete would fail the job. rmw-distros.yml and
+  # examples-replay.yml carry the same two values, and
+  # `tools/scripts/ci_cache_policy_check.py` (Lint job) holds every save step in
+  # every workflow to this contract.
+  CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
+  CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   # Suppress iceoryx2 log noise
@@ -482,6 +528,11 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # The limit covers runner setup, cache restore, cold compilation of the
     # iroh tree (netd's `wan` is default-ON, so feature unification pulls it
     # into `cargo clippy --workspace --all-targets`), the checks, and the cache
@@ -602,6 +653,20 @@ jobs:
           actionlint -version
           actionlint
 
+      # The cache save policy (CACHE_SAVE_* in `env`) is enforced by a checker
+      # over EVERY workflow in the directory, not a hand list of the two that
+      # were known to cache: two others were writing into the same store with
+      # the combined `actions/cache` action, ungated and unpruned, while a
+      # two-file invocation reported clean. Its self-test and the prune
+      # script's self-test run first so a silent checker cannot pass.
+      - name: Cache save policy (self-tests, then the workflows)
+        run: |
+          set -euo pipefail
+          bash tools/scripts/ci_cache_prune.sh --self-test
+          python3 tools/scripts/ci_cache_policy_check.py --self-test
+          python3 tools/scripts/ci_cache_policy_check.py .github/workflows
+
+
       # The workspace + restored target cache no longer fit ubuntu-latest's
       # free disk alongside the preinstalled toolchains the workspace never
       # uses. `ubuntu-latest` ships tens of GB of them, and reclaiming ~25 GB up
@@ -627,9 +692,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-lint-main-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
@@ -874,22 +940,42 @@ jobs:
   # needed) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
   # cost on the critical path.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-lint ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   cross-aarch64-linux:
     name: Cross-check (aarch64-linux)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
@@ -935,12 +1021,27 @@ jobs:
   # Runs in PARALLEL (no `needs:`) — off the critical path. STABLE, not the
   # PINNED_NIGHTLY used by fuzz/miri.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -951,6 +1052,11 @@ jobs:
   msrv:
     name: MSRV (1.93)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
@@ -985,12 +1091,27 @@ jobs:
   # changes. `cargo check` per example workspace is the cheap blocking
   # check: an example that does not compile fails CI.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' msrv-1.93 '))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -1001,6 +1122,11 @@ jobs:
   examples:
     name: Examples (cargo check)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 30
     env:
       # Same ENOSPC class as the lint job (see its comment): each example
@@ -1076,12 +1202,27 @@ jobs:
   # run: it is the rig that needs GStreamer at runtime, and without the feature it deliberately FAILS
   # rather than reporting a vacuous `0 passed` (see its module docs).
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-examples-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/**/Cargo.toml') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -1101,6 +1242,11 @@ jobs:
     # one; a container network that does not carry `IFF_MULTICAST` would make
     # the precondition unsatisfiable, so this job must stay on the plain VM.
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 40
     env:
       # Same ENOSPC class as the lint/examples jobs: this workspace compiles
@@ -1267,12 +1413,27 @@ jobs:
   # binaries apart.
 
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-examples-go2-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/go2/**/Cargo.toml') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-go2-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -1283,6 +1444,11 @@ jobs:
   test-linux:
     name: Test (Linux) shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # No `needs:`. Each shard builds the `cerulion_core` test binaries it runs,
     # so nothing in front of it is a data dependency and the four shards start
     # at t=0 with every other job.
@@ -1474,9 +1640,10 @@ jobs:
       # superset of shard 0's (`rmw_cerulion` rides shard 3). If the package
       # map moves again, re-derive this
       # rather than trusting it.)
-      # (On Linux `lint` normally reserves this key first and every save here is
-      # skipped as an exact hit; there is no `lint` leg on macOS, which is where
-      # the race actually bit.)
+      # (Shard 0 is the SOLE saver of `cargo-Linux-`. `lint`, `docs` and
+      # `netd-wan` used to share this key and whichever finished first wrote it;
+      # they have their own namespaces now and fall through their `restore-keys`
+      # to this one, which is a superset of what they build.)
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
         if: matrix.shard == 0
@@ -1630,9 +1797,12 @@ jobs:
       #     `target/debug/build/`, whose entries are hardlinks to these, and a
       #     hardlink means deleting one copy frees no blocks anyway.
       #
-      # No cache cost: the `cargo-Linux-` archive measures ~563 MB restored
-      # (registry + git; this job builds `target` cold), so there are no test
-      # executables in it to lose.
+      # Cache cost, restated now that shard 0 is the sole saver of
+      # `cargo-Linux-` (3.18 GB measured 2026-09-28, this job's own `target/`
+      # included): the save step runs at the END of this job, after this
+      # reclaim, so the executables removed here are not in the archive the next
+      # run restores. Cargo relinks them from the `.rlib`/`.rmeta` artefacts
+      # that stay, which is the cost this reclaim already accepted.
       #
       # TWO placements, not one. Before the wan step alone would fix the five
       # observed firings and nothing else: the second main push entered that step
@@ -1950,23 +2120,27 @@ jobs:
   # automatically faster; the question is whether the variable work divides
   # further than the fixed cost grows, and on this job it does.
   #
-  # WHAT THE 2-WAY SPLIT MEASURED, per step, on two runs a week apart:
+  # WHAT THE 2-WAY SPLIT MEASURED, per step, with a cache hit on the
+  # default-branch run 35666419690 (2026-09-21):
   #
-  #   leg      cache hit    cache miss
-  #   shard 0    28.3 min     57.4 min
-  #   shard 1    46.0 min     55.1 min
+  #   leg      cache hit
+  #   shard 0    28.3 min
+  #   shard 1    46.0 min
   #
-  # Two facts out of that table, and they point the same way. The legs were
-  # skewed 1.6 to 1 with a warm cache, so one of them set the wall of the whole
-  # workflow while the other idled for 18 minutes. And the skew INVERTS when
-  # the cache misses, because shard 0 carried the pinned `macro_compile_fail_test`
-  # trybuild tail, which compiles 91 fixture projects and costs 6 min warm
-  # against 18 min cold. A hand tilt tuned on either column is wrong in the
-  # other one; a third shard is better in BOTH, because it divides the variable
-  # work by 3 while the fixed cost is paid once more.
+  # Two facts out of that, and they point the same way. The legs were skewed
+  # 1.6 to 1, so one of them set the wall of the whole workflow while the
+  # other idled for 18 minutes. And the skew turns over when the cache misses,
+  # because shard 0 carried the pinned `macro_compile_fail_test` trybuild tail,
+  # which compiles 91 fixture projects: 6 min with a cache hit and the largest
+  # single step of a cold leg. A hand tilt tuned on the cache-hit column is
+  # wrong on a miss; a third shard is better in BOTH states, because it divides
+  # the variable work by 3 while the fixed cost is paid once more. (A cache-miss
+  # measurement of the 2-way split was taken but its run id was not kept, so
+  # its numbers are not cited here.)
   #
   # PREDICTED from the same per-step numbers: longest leg 26.6 min warm (from
-  # 46.0) and 42.7 min cold (from 57.4).
+  # 46.0). OBSERVED since: the eight default-branch runs of 2026-09-27 put the
+  # macOS shards' wall at 29 to 44 min, cache state not recorded.
   #
   # The package map below is balanced by hand against those numbers, under
   # three constraints: the iroh-tree packages (wireclient, connectd, netd-wan)
@@ -1977,12 +2151,29 @@ jobs:
   # more than 5 min apart WITH THE SAME CACHE STATE (comparing a warm leg
   # against a cold one measures the cache, not the map).
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          matrix.shard == 0
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green shard 0 stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
       # so nothing could restore what it saved, and the upload only adds
       # eviction pressure on the store.
       - name: Cache cargo, shard 0 saves (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && matrix.shard == 0 && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && matrix.shard == 0
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -1993,6 +2184,11 @@ jobs:
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # NO `needs: [lint]`: a `lint` verdict was never a data dependency for a
     # test job. This is the job the omission is aimed at. It is
     # the longest in the workflow (46.1 min of the 54.0 min wall on the last
@@ -2023,12 +2219,12 @@ jobs:
     # runtime budget.
     # 75 → 60 (the 3-way split), and DOWN for the first time in this file's
     # history, because for the first time there are per-step MEASUREMENTS to
-    # derive it from rather than a guess. The per-step costs are measured, on
-    # the 2-way runs tabulated above; the longest 3-way leg is PROJECTED from
-    # them at 26.6 min warm and 42.7 min cold, and no three-shard run has put
-    # an observed wall on it yet. 60 leaves 40 percent headroom over the WORSE
-    # of those two projections. Re-set it from the first three green 3-way
-    # runs, which replace the projection with a measurement. A ceiling that tracks the measured wall
+    # derive it from rather than a guess. The per-step costs are measured on
+    # the 2-way cache-hit run tabulated above; the longest 3-way leg is
+    # PROJECTED from them at 26.6 min warm, and the eight default-branch runs
+    # of 2026-09-27 observed the macOS shards' wall at 29 to 44 min with the
+    # cache state not recorded. 60 leaves a third of headroom over the worst
+    # observed wall. Re-set it from green 3-way runs as they accumulate. A ceiling that tracks the measured wall
     # turns a hang into a fast red instead of a 75-minute one, which is the
     # point of having one. Every raise above is a run that was CANCELLED with
     # every suite green, so the rule those raises teach still holds: tighten
@@ -2136,9 +2332,8 @@ jobs:
       # saver under this map than under the 2-way one, not merely a defensible
       # one. If the package map moves again, re-derive this rather than
       # trusting it.
-      # (On Linux `lint` normally reserves this key first and every save here is
-      # skipped as an exact hit; there is no `lint` leg on macOS, which is where
-      # the race actually bit.)
+      # (Shard 0 is the SOLE saver of `cargo-macOS-`: no other job on this
+      # runner writes that key.)
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
         if: matrix.shard == 0
@@ -2429,12 +2624,29 @@ jobs:
   # rationing a healthy one, which is the rule this file applies everywhere.
   # ==========================================================================
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          matrix.shard == 0
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green shard 0 stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
       # so nothing could restore what it saved, and the upload only adds
       # eviction pressure on the store.
       - name: Cache cargo, shard 0 saves (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && matrix.shard == 0 && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && matrix.shard == 0
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2452,6 +2664,11 @@ jobs:
         # so each leg renders its own required check name.
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 40
     env:
       # `line-tables-only`, matching the other TEST jobs: backtraces keep
@@ -2582,12 +2799,27 @@ jobs:
   # surfaces on main rather than on the PR. Use workflow_dispatch to run
   # it pre-merge when a PR touches release-gated code.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' crates-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2598,6 +2830,11 @@ jobs:
   test-latency:
     name: Latency Threshold (Linux)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # Allowlist (not `!= 'pull_request'`): a new event class has to be NAMED
     # here to reach the job, which is why the merge_group trigger on this
     # workflow does NOT start this slow release build on queued batches.
@@ -2718,12 +2955,27 @@ jobs:
   # `graph_latency_test` in the Linux-only `test-latency` job — this dedicated
   # matrix job is what gives the CLI-driven path its macOS coverage.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2746,6 +2998,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # Generous: the cold cerulion_core release compile in the fresh tempdir dominates
     # (~11 min on a cache miss) and the test itself is ~17 min, so the ubuntu leg has
     # run 26-29 min for weeks; 30 cancelled a GREEN run on main (the test had already
@@ -2794,12 +3051,27 @@ jobs:
 
   # Fuzz testing (Linux-only, nightly toolchain)
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2814,6 +3086,11 @@ jobs:
   fuzz:
     name: Fuzz (Linux)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
@@ -2891,12 +3168,27 @@ jobs:
   # PINNED_NIGHTLY is stable). If a future nightly / iceoryx2 bump breaks
   # Miri, fix or re-pin rather than silently reverting to non-blocking.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-fuzz-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' fuzz-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2908,6 +3200,11 @@ jobs:
   miri:
     name: Miri (Linux, scoped to FFI-free tests)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
@@ -2958,12 +3255,27 @@ jobs:
 
   # Documentation check
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' miri-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2975,6 +3287,11 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     needs: [lint]
     # 30, and the number follows the MACHINE rather than the job. On a 4-core
     # runner the healthy build ran 8m56s-9m18s and 15 was ample; on a 2-core one
@@ -3017,9 +3334,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-docs-main-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
@@ -3037,22 +3355,42 @@ jobs:
   # explicit-feature + lean-variant analysis OFF the tight `lint`/`docs` gates. Pure
   # analysis (clippy + doc), so no debuginfo. It gates NO other job.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-docs ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   netd-wan:
     name: netd WAN (clippy + docs, --features wan)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     needs: [lint]
     timeout-minutes: 25
     env:
@@ -3088,9 +3426,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-netd-wan-main-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
@@ -3308,19 +3647,34 @@ jobs:
   # output (the viz lane links its ~29 rerun-carrying test binaries, the vizd
   # lane its own), which is exactly the part that had been growing.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-netd-wan ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
     needs: [lint]
@@ -3336,6 +3690,11 @@ jobs:
         # `vizd` — the `cerulion-vizd` daemon suite, which is the serial one.
         lane: [viz, vizd]
     runs-on: ${{ matrix.os }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # 55, matching `test-linux` / `test-macos` rather than the predecessor's 40.
     # That 40 was set for a Linux-only job building TWO test binaries against a
     # WARM cache; this builds 29, and while it still had a macOS leg that leg
@@ -3595,12 +3954,27 @@ jobs:
   # Resolve-only against the manifests; no compile, no cargo cache, no `needs:`
   # gate. Runs in PARALLEL and gates nothing.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' viz-{0}-{1} ', matrix.lane, runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -3654,12 +4028,21 @@ jobs:
   # both places. No Rust toolchain, no cargo cache, no `needs:` gate.
   # Policy lives in tools/release/deny.toml. Blocking by design.
 
-      # Saved as the LAST step so a green job stores what it built, and never
-      # from a merge-queue build: its branch is deleted after the batch, so
-      # nothing could restore what it saved, and the upload only adds eviction
-      # pressure on the store.
+      # NOT under the cache save policy, deliberately. This is a TOOL cache: one
+      # binary of a few MB under `~/.cargo/bin`, keyed on the pinned version and
+      # not on a lockfile hash. It has no lockfile generation for
+      # `ci_cache_prune.sh` to prune by, and gating it into a namespace the
+      # default never names meant the binary was never cached and
+      # `cargo install cargo-machete` ran on every push. It keeps the two tests
+      # that are about correctness rather than budget: do not re-upload what was
+      # restored, and never save from a merge-queue build whose branch is
+      # deleted after the batch. `ci_cache_policy_check.py` holds this shape
+      # (rule TOOL_CACHE) so a lockhash-free key over a `target/` directory
+      # cannot slip through the same door.
       - name: Cache cargo-machete (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/bin/cargo-machete
