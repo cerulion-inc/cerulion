@@ -731,6 +731,69 @@ fn a_bool_sequence_inside_a_nested_message_array_is_recorded_with_its_path() {
     assert_eq!(bridge.unwritable_bool_seq(), Some((0, "poses.flags")));
 }
 
+/// A FIXED array of nested messages carries the same member, and the census
+/// must go through it too.
+///
+/// A `Pose[2]` member is not a sequence: `is_variable_member_cpp` calls it
+/// variable only because its ELEMENT type is variable, and the layout maps it
+/// to a `FixedArray` of `Nested`, which the op planner sends to `Complex`
+/// along with every other shape it does not recognise. A census that walked
+/// only dynamic arrays would miss it. Oracle: the path typed out here.
+#[test]
+fn a_bool_sequence_inside_a_fixed_nested_message_array_is_recorded_with_its_path() {
+    #[repr(C)]
+    struct CppInner {
+        flags: FakeVecBool,
+    }
+    #[repr(C)]
+    struct CppOuter {
+        poses: [CppInner; 2],
+    }
+    let inner = unwritable_bool_members("FixedElemFlags", std::mem::size_of::<CppInner>());
+    let mut poses = member("poses", ROS_TYPE_MESSAGE, 0, true, cpp_nested_ts(inner));
+    // A fixed array: a declared length and no upper bound. No accessor: the
+    // elements sit inline, so the walk needs none.
+    poses.array_size_ = 2;
+    let members = make_members(
+        "test_msgs::msg",
+        "FixedArrayOfFlags",
+        std::mem::size_of::<CppOuter>(),
+        vec![poses],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), Some((0, "poses.flags")));
+}
+
+/// A BOUNDED bool sequence is unwritable for the same reason as an unbounded
+/// one, and is recorded.
+///
+/// `bool[<=N]` is a different C++ type (rosidl's `BoundedVector`) and a
+/// different introspection shape (`array_size_` set AND `is_upper_bound_`),
+/// yet it is still filled element by element through `assign`, so a build
+/// without that accessor cannot write it either. It reaches the top-level
+/// census through the layout's `DynamicArray` mapping, which covers bounded
+/// and unbounded alike. Oracle: the member name typed out here, with no dot,
+/// because the member is at the top level.
+#[test]
+fn a_bounded_bool_sequence_at_the_top_level_is_recorded() {
+    #[repr(C)]
+    struct CppFlags {
+        flags: FakeVecBool,
+    }
+    let mut flags = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
+    flags.size_function = Some(vecbool_size);
+    flags.array_size_ = 5;
+    flags.is_upper_bound_ = true;
+    let members = make_members(
+        "test_msgs::msg",
+        "BoundedFlags",
+        std::mem::size_of::<CppFlags>(),
+        vec![flags],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), Some((0, "flags")));
+}
+
 /// Nesting hops from the root down to the bool sequence in the DEPTH
 /// fixture below.
 ///

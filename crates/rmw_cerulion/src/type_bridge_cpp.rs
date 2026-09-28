@@ -1891,6 +1891,17 @@ unsafe fn seq_size(member: &CppMessageMember, field: *const c_void) -> Result<us
 /// other case resizes through the typesupport then bulk-copies (or
 /// assigns per element for vector<bool>). Returns false on missing
 /// accessors or fixed-array length mismatch.
+///
+/// The missing-`assign` refusal for a bool sequence is taken FIRST, before
+/// the resize: a `std::vector<bool>` is written element by element through
+/// `assign`, so a member without that accessor can never be filled whatever
+/// the frame says, and deciding it after the resize would leave the
+/// container emptied or grown on a decode that then fails. Registration
+/// already refuses every such TYPE
+/// ([`unwritable_bool_seq_census`]), so this leaf is the second line: it
+/// holds even for a member a future census gap lets through, and it makes
+/// the zero-length case agree with the type-level verdict instead of
+/// succeeding on a member nothing can write.
 unsafe fn write_prim_seq_cpp(
     member: &CppMessageMember,
     field: *mut c_void,
@@ -1898,6 +1909,9 @@ unsafe fn write_prim_seq_cpp(
     count: usize,
     is_bool: bool,
 ) -> bool {
+    if is_bool && member_assign(member).is_none() {
+        return false;
+    }
     if member.array_size_ > 0 && !member.is_upper_bound_ {
         if count != member.array_size_ {
             return false;
@@ -1945,6 +1959,8 @@ unsafe fn write_prim_seq_cpp(
         return true;
     }
     if is_bool {
+        // Bound here, refused at the top of the function: this arm cannot be
+        // reached with `None` (no `else` branch can be covered by a test).
         let Some(assign) = member_assign(member) else {
             return false;
         };
@@ -2762,6 +2778,181 @@ mod cpp_package_tests {
         let vector = u8_sequence_member(false);
         assert!(super::is_forgeable_sequence_cpp(&vector, true));
         assert!(is_unbounded_u8_vector(&vector));
+    }
+
+    /// A bit-packed `std::vector<bool>` stand-in. The bridge reaches a
+    /// sequence only through the member's function pointers, so a Rust
+    /// struct with Rust `extern "C"` accessors is indistinguishable from the
+    /// real container, and the bit packing means no contiguous copy can
+    /// serve it.
+    #[repr(C)]
+    struct FakeVecBool {
+        bits: *mut u8,
+        len: usize,
+    }
+
+    /// The pre-Humble `bool[]` member: a container that can be resized and
+    /// whose elements cannot be written, because the C++ generator emits no
+    /// `assign` for `std::vector<bool>`.
+    fn bool_sequence_member(
+        resize: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, usize)>,
+    ) -> super::CppMessageMember {
+        super::CppMessageMember {
+            name_: c"flags".as_ptr(),
+            type_id_: super::ros_type::BOOLEAN,
+            string_upper_bound_: 0,
+            members_: std::ptr::null(),
+            #[cfg(cerulion_has_is_key)]
+            is_key_: false,
+            is_array_: true,
+            array_size_: 0,
+            is_upper_bound_: false,
+            offset_: 0,
+            default_value_: std::ptr::null(),
+            size_function: None,
+            get_const_function: None,
+            get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
+            fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
+            assign_function: None,
+            resize_function: resize,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer_: false,
+        }
+    }
+
+    /// The poison the destination carries in and must still carry out.
+    const POISON: usize = 0xA5A5_A5A5_A5A5_A5A5;
+
+    fn poisoned_destination() -> FakeVecBool {
+        FakeVecBool {
+            bits: POISON as *mut u8,
+            len: POISON,
+        }
+    }
+
+    static REFUSED_RESIZES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_resize(field: *mut std::os::raw::c_void, size: usize) {
+        REFUSED_RESIZES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let v = &mut *(field as *mut FakeVecBool);
+        let mut storage = vec![0u8; size.div_ceil(8).max(1)];
+        v.bits = storage.as_mut_ptr();
+        v.len = size;
+        std::mem::forget(storage);
+    }
+
+    /// The LEAF refuses a bool sequence with no `assign` accessor before it
+    /// touches the destination, including the zero-length frame.
+    ///
+    /// Registration refuses every such type first, so no frame reaches this
+    /// leaf in a shipped build; the leaf is the second line, and it must not
+    /// depend on the census being complete. The decision used to come AFTER
+    /// the resize, so the destination was already emptied or grown on a
+    /// decode that then failed.
+    ///
+    /// Oracles, both hand-written here: the destination's bytes, poisoned
+    /// going in and compared field by field coming out; and a resize SPY
+    /// whose count must stay 0, which is what proves the refusal is taken
+    /// before the side effect rather than merely reported. The zero-length
+    /// call is the arm the hoist changed: it used to resize and report
+    /// success on a member nothing can ever write, which disagreed with the
+    /// type-level verdict.
+    #[test]
+    fn the_leaf_refuses_a_bool_sequence_with_no_assign_before_any_resize() {
+        use std::sync::atomic::Ordering;
+        let member = bool_sequence_member(Some(counting_resize));
+        for (bytes, count) in [(&[1u8, 0, 1][..], 3usize), (&[][..], 0usize)] {
+            REFUSED_RESIZES.store(0, Ordering::SeqCst);
+            let mut dest = poisoned_destination();
+            let wrote = unsafe {
+                super::write_prim_seq_cpp(
+                    &member,
+                    &mut dest as *mut _ as *mut std::os::raw::c_void,
+                    bytes,
+                    count,
+                    true,
+                )
+            };
+            assert!(
+                !wrote,
+                "count {count}: a bool sequence with no assign accessor is unwritable"
+            );
+            assert_eq!(
+                dest.bits as usize, POISON,
+                "count {count}: the refusal must not touch the container's data pointer"
+            );
+            assert_eq!(dest.len, POISON, "count {count}: nor its length");
+            assert_eq!(
+                REFUSED_RESIZES.load(Ordering::SeqCst),
+                0,
+                "count {count}: the refusal must come BEFORE the resize"
+            );
+        }
+    }
+
+    #[cfg(cerulion_has_fetch_function)]
+    static WRITING_RESIZES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(cerulion_has_fetch_function)]
+    unsafe extern "C" fn writing_resize(field: *mut std::os::raw::c_void, size: usize) {
+        WRITING_RESIZES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let v = &mut *(field as *mut FakeVecBool);
+        let mut storage = vec![0u8; size.div_ceil(8).max(1)];
+        v.bits = storage.as_mut_ptr();
+        v.len = size;
+        std::mem::forget(storage);
+    }
+
+    #[cfg(cerulion_has_fetch_function)]
+    unsafe extern "C" fn writing_assign(
+        field: *mut std::os::raw::c_void,
+        index: usize,
+        value: *const std::os::raw::c_void,
+    ) {
+        let v = &mut *(field as *mut FakeVecBool);
+        let byte = v.bits.add(index / 8);
+        if *(value as *const bool) {
+            *byte |= 1 << (index % 8);
+        } else {
+            *byte &= !(1 << (index % 8));
+        }
+    }
+
+    /// The positive control for the arm above: the SAME leaf, the SAME
+    /// fixture with the accessor installed, writes. Refusing a sequence the
+    /// accessor can fill would drop deliverable data, which is worse than
+    /// the partial write the refusal prevents.
+    ///
+    /// Oracle: the bit pattern typed out here, read back out of the
+    /// destination's own packed bits, plus the resize spy at exactly 1.
+    #[cfg(cerulion_has_fetch_function)]
+    #[test]
+    fn the_leaf_writes_a_bool_sequence_whose_assign_accessor_is_present() {
+        use std::sync::atomic::Ordering;
+        let mut member = bool_sequence_member(Some(writing_resize));
+        member.assign_function = Some(writing_assign);
+        WRITING_RESIZES.store(0, Ordering::SeqCst);
+        let mut dest = poisoned_destination();
+        let pattern = [true, false, true, true, false];
+        let bytes: Vec<u8> = pattern.iter().map(|&b| b as u8).collect();
+        let wrote = unsafe {
+            super::write_prim_seq_cpp(
+                &member,
+                &mut dest as *mut _ as *mut std::os::raw::c_void,
+                &bytes,
+                pattern.len(),
+                true,
+            )
+        };
+        assert!(wrote, "the accessor is there, so the sequence is writable");
+        assert_eq!(WRITING_RESIZES.load(Ordering::SeqCst), 1);
+        assert_eq!(dest.len, pattern.len());
+        let decoded: Vec<bool> = (0..dest.len)
+            .map(|i| unsafe { (*dest.bits.add(i / 8) >> (i % 8)) & 1 != 0 })
+            .collect();
+        assert_eq!(decoded, pattern);
     }
 
     use super::cpp_package;

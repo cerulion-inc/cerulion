@@ -290,14 +290,31 @@ fn cpp_nested_service_ts(unique: &str) -> *const ffi::rosidl_service_type_suppor
     }))
 }
 
-/// rosidl's C `bool[]`: a plain pointer, size and capacity, which the C
-/// bridge reads and writes as bytes. No accessor exists or is needed, which
-/// is why this condition is a C++-only one.
-#[repr(C)]
-struct CBoolSeq {
-    data: *mut bool,
-    size: usize,
-    capacity: usize,
+/// rosidl's C `bool[]`, which the C bridge reads and writes as bytes. No
+/// accessor exists or is needed, which is why the unwritable condition is a
+/// C++-only one.
+///
+/// The GENERATED struct, never a hand mirror. From Lyrical on it carries
+/// `is_rosidl_buffer` and `owns_rosidl_buffer` after `capacity`, and the C
+/// bridge reads that first flag off the sequence INSTANCE
+/// (`type_bridge.rs`'s `prim_seq_is_rosidl_buffer`): a narrower hand fixture
+/// leaves the flag byte uninitialized, so the bridge reads whatever the
+/// stack held and refuses the frame wherever that byte is nonzero. Taking
+/// the real struct makes the fixture era-correct by construction on every
+/// distro, and `size_of` follows it into the typesupport below.
+type CBoolSeq = ffi::rosidl_runtime_c__boolean__Sequence;
+
+/// One `bool[]` value over that struct: zeroed first, so every field the
+/// era carries beyond the three this test sets is initialized.
+///
+/// # Safety
+/// `bools` must outlive every use of the returned sequence.
+unsafe fn c_bool_sequence(bools: &mut [bool]) -> CBoolSeq {
+    let mut seq: CBoolSeq = std::mem::zeroed();
+    seq.data = bools.as_mut_ptr();
+    seq.size = bools.len();
+    seq.capacity = bools.len();
+    seq
 }
 
 /// The C twin of [`cpp_nested_service_ts`]: the SAME package, type names,
@@ -496,6 +513,22 @@ unsafe fn hash_mismatch_count(subscription: *const ffi::rmw_subscription_t) -> u
     let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
     cerulion_core::transport::failure_regime_latch::lock_regime_latch(&data.hash_mismatches)
         .total_failures()
+}
+
+/// The shadow pool's own counters: shadows BUILT and shadows sitting FREE.
+///
+/// The direct oracle for "the refused take put its shadow BACK". The absence
+/// of a loan-refusal line cannot tell that apart from a RETIRE, because a
+/// retire is silent: `ShadowPool::release` decrements `built` and drops a
+/// tainted shadow, so a retire leaves `(0, 0)` where a return leaves
+/// `(1, 1)`. Read the way `tests/rmw_shadow_take_test.rs` reads it.
+///
+/// # Safety
+/// `subscription` must be a live subscription created by this implementation.
+unsafe fn shadows_built_and_free(subscription: *const ffi::rmw_subscription_t) -> (usize, usize) {
+    let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
+    let inner = data.inner.lock().unwrap_or_else(|e| e.into_inner());
+    (inner.shadows.built(), inner.shadows.free_count())
 }
 
 /// Read the subscription's -failure counter (the sibling latch).
@@ -1438,11 +1471,13 @@ fn a_nested_bool_member_this_build_cannot_write_is_refused_with_its_path() {
 /// WIRE for a limit of this build and sends an operator to redeploy both
 /// ends, and it retired a shadow per frame.
 ///
-/// Oracles: the same hand-written `reason=` value, the entry index of the
+/// Oracles: the same hand-written `reason=` value; the entry index of the
 /// top-level member the nested one rides in (`data` is entry 0, `inner` is
-/// entry 1), the loaned pointer still NULL, and the absence of any
-/// loan-refusal line, which is what a retired or leaked shadow would
-/// eventually produce.
+/// entry 1); the loaned pointer still NULL; the shadow pool read straight
+/// off the subscription at `(built, free) == (1, 1)`, which is what
+/// separates a shadow RETURNED from one retired (a retire decrements
+/// `built`, so it would read `(0, 0)`); and the absence of any loan-refusal
+/// line.
 #[test]
 #[serial]
 #[traced_test]
@@ -1483,6 +1518,14 @@ fn the_loaned_take_refuses_a_nested_unwritable_member_and_keeps_its_shadow() {
         assert!(!taken, "nothing was forged, so nothing was taken");
         assert!(loaned.is_null(), "a refused loan hands out no pointer");
         assert_eq!(decode_failure_count(subscription), 1);
+        // The DIRECT oracle: one shadow was built for this take and it is
+        // sitting FREE again. A retired shadow would read (0, 0), which the
+        // absence of a refusal line below cannot distinguish.
+        assert_eq!(
+            shadows_built_and_free(subscription),
+            (1, 1),
+            "the shadow must be back in the pool, not retired"
+        );
         logs_assert(|lines: &[&str]| {
             assert_one_refusal_naming(lines, 1)?;
             if lines.iter().any(|l| l.contains(LOAN_REFUSED)) {
@@ -1557,11 +1600,7 @@ fn a_service_request_with_a_nested_unwritable_member_is_refused_before_any_write
         let mut bools = [true, false, true];
         let request = CRequest {
             inner: CNestedRequest {
-                flags: CBoolSeq {
-                    data: bools.as_mut_ptr(),
-                    size: bools.len(),
-                    capacity: bools.len(),
-                },
+                flags: c_bool_sequence(&mut bools),
             },
         };
         let mut sequence_id: i64 = 0;
