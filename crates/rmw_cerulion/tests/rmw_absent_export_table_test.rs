@@ -24,22 +24,33 @@
 //! guarded export fails until every row names it and a stale row fails until it
 //! drops the name.
 //!
-//! An export guarded by a NEGATED capability cfg would invert the rule (it
-//! exists where the capability is absent), and no such export exists today, so
-//! one is a failure here rather than a silently wrong derivation.
+//! Only two guard shapes carry a rule this gate can apply:
+//! `#[cfg(cerulion_has_<cap>)]` and `#[cfg(not(cerulion_has_<cap>))]`. The
+//! negated one INVERTS the rule (the export exists where the capability is
+//! absent), and any other `#[cfg(...)]` or `#[cfg_attr(...)]` directly over an
+//! export (a compound `all(...)`, an `any(...)`, a platform predicate) carries a
+//! rule this file does not model. Reading either as "unguarded" would be a
+//! SILENT FALSE GREEN in the completeness check: the export lands in no derived
+//! set, every row agrees, and the audit never asks any row to name it. So an
+//! unmodelled guard shape is a REFUSAL that names the export and the attribute
+//! text, never an unguarded export. A bare `#[cfg(...)]` whose reach a code line
+//! ends still guards nothing, which is not a refusal.
 //!
 //! # The oracles
 //!
 //! Both parsers are pinned by hand-written fixtures with hand-written expected
 //! readings, never by the tree they read: a source snippet carrying a guarded
-//! export, an unguarded export, a negated guard and a cfg whose reach a code
-//! line ends, and a gate snippet carrying a list-valued row, an empty row and
-//! the fallback arm. Both directions of the comparison are pinned on a fixture
-//! era table: the baseline agrees, and a symbol added to or removed from either
-//! side fails, naming it on the side it appeared. The tree comparison refuses a
-//! vacuous read as well: the walk must find the whole export surface, and at
-//! least one row's derived set must be non-empty, so a parser that silently
-//! matched nothing cannot pass by reading zero against zero.
+//! export, an unguarded export, a negated guard, a COMPOUND guard, a cfg whose
+//! reach a code line ends and a platform cfg whose reach a code line ends, and a
+//! gate snippet carrying a list-valued row, an empty row and the fallback arm.
+//! Both directions of the comparison are pinned on a fixture era table: the
+//! baseline agrees, and a symbol added to or removed from either side fails,
+//! naming it on the side it appeared. The compound arm pins the false green
+//! itself: the comparison AGREES over that fixture, and the refusal is what
+//! fails. The tree comparison refuses a vacuous read as well: the walk must find
+//! the whole export surface, and at least one row's derived set must be
+//! non-empty, so a parser that silently matched nothing cannot pass by reading
+//! zero against zero.
 //!
 //! Pure text and two constant tables: no transport, no iceoryx2 root, nothing
 //! that behaves differently under `--release`.
@@ -63,16 +74,33 @@ struct GateRow {
     absent: BTreeSet<String>,
 }
 
-/// What one source file yields: the exports, and any export a NEGATED
-/// capability cfg guards (the inverted rule this gate does not model).
+/// What one source file yields: the exports, every export a NEGATED capability
+/// cfg guards (the inverted rule), and every export under a guard shape this
+/// file does not interpret (export name, attribute text). The last two are
+/// refusals, not readings.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Parsed {
     exports: Vec<Export>,
     negated_guards: Vec<(String, String)>,
+    uninterpreted_guards: Vec<(String, String)>,
+}
+
+/// The guard attribute standing over the next export, as far as this file reads
+/// attributes.
+#[derive(Debug)]
+enum Guard {
+    /// `#[cfg(cerulion_has_<cap>)]`: the export is absent before that era.
+    Capability(String),
+    /// `#[cfg(not(cerulion_has_<cap>))]`: the inverse rule.
+    NegatedCapability(String),
+    /// Any other `#[cfg(...)]` or `#[cfg_attr(...)]`, kept verbatim.
+    Uninterpreted(String),
 }
 
 const CFG_OPEN: &str = "#[cfg(cerulion_has_";
 const CFG_NOT_OPEN: &str = "#[cfg(not(cerulion_has_";
+const CFG_ANY_OPEN: &str = "#[cfg(";
+const CFG_ATTR_OPEN: &str = "#[cfg_attr(";
 const ABSENT_VAR_SUFFIX: &str = "_absent_symbols=\"";
 
 /// The export name on this line, if it declares one.
@@ -87,45 +115,55 @@ fn export_name(line: &str) -> Option<String> {
     name.starts_with("rmw_").then_some(name)
 }
 
-/// Read every `rmw_*` export out of one source file with the capability cfg
-/// guarding it. Only attributes, doc comments and blank lines may sit between a
-/// cfg and the export it guards; any other line ends that cfg's reach, so a cfg
-/// over a constant cannot be read as a guard on the next export.
+/// The guard this line declares, if it is a cfg attribute at all.
+fn guard_on_line(trimmed: &str) -> Option<Guard> {
+    if let Some(cap) = trimmed
+        .strip_prefix(CFG_NOT_OPEN)
+        .and_then(|rest| rest.strip_suffix("))]"))
+    {
+        return Some(Guard::NegatedCapability(cap.to_string()));
+    }
+    if let Some(cap) = trimmed
+        .strip_prefix(CFG_OPEN)
+        .and_then(|rest| rest.strip_suffix(")]"))
+    {
+        return Some(Guard::Capability(cap.to_string()));
+    }
+    if trimmed.starts_with(CFG_ANY_OPEN) || trimmed.starts_with(CFG_ATTR_OPEN) {
+        return Some(Guard::Uninterpreted(trimmed.to_string()));
+    }
+    None
+}
+
+/// Read every `rmw_*` export out of one source file with the guard standing over
+/// it. Only attributes, doc comments and blank lines may sit between a guard and
+/// the export it covers; any other line ends its reach, so a cfg over a constant
+/// cannot be read as a guard on the next export. A guard shape this file does not
+/// interpret is recorded as a refusal rather than dropped, because dropping it
+/// would read the export as unguarded and hide it from every row.
 fn parse_exports(src: &str) -> Parsed {
     let mut parsed = Parsed::default();
-    let mut pending: Option<(String, bool)> = None;
+    let mut pending: Option<Guard> = None;
     for line in src.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(CFG_NOT_OPEN) {
-            if let Some(cap) = rest.strip_suffix("))]") {
-                pending = Some((cap.to_string(), true));
-                continue;
-            }
-        }
-        if let Some(rest) = trimmed.strip_prefix(CFG_OPEN) {
-            if let Some(cap) = rest.strip_suffix(")]") {
-                pending = Some((cap.to_string(), false));
-                continue;
-            }
+        if let Some(guard) = guard_on_line(trimmed) {
+            pending = Some(guard);
+            continue;
         }
         if let Some(name) = export_name(trimmed) {
-            match pending.take() {
-                Some((cap, true)) => {
+            let capability = match pending.take() {
+                Some(Guard::Capability(cap)) => Some(cap),
+                Some(Guard::NegatedCapability(cap)) => {
                     parsed.negated_guards.push((name.clone(), cap));
-                    parsed.exports.push(Export {
-                        name,
-                        capability: None,
-                    });
+                    None
                 }
-                Some((cap, false)) => parsed.exports.push(Export {
-                    name,
-                    capability: Some(cap),
-                }),
-                None => parsed.exports.push(Export {
-                    name,
-                    capability: None,
-                }),
-            }
+                Some(Guard::Uninterpreted(attribute)) => {
+                    parsed.uninterpreted_guards.push((name.clone(), attribute));
+                    None
+                }
+                None => None,
+            };
+            parsed.exports.push(Export { name, capability });
             continue;
         }
         if !(trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//")) {
@@ -133,6 +171,28 @@ fn parse_exports(src: &str) -> Parsed {
         }
     }
     parsed
+}
+
+/// `None` when every guard over an export carries a rule this file models;
+/// otherwise the refusal, naming each export and the attribute over it.
+fn unmodelled_guard_refusal(parsed: &Parsed) -> Option<String> {
+    if parsed.negated_guards.is_empty() && parsed.uninterpreted_guards.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for (name, capability) in &parsed.negated_guards {
+        lines.push(format!(
+            "{name} is guarded by `#[cfg(not(cerulion_has_{capability}))]`, the INVERSE rule: it \
+             exists where the capability is absent, so this gate's derivation does not hold for it"
+        ));
+    }
+    for (name, attribute) in &parsed.uninterpreted_guards {
+        lines.push(format!(
+            "{name} is guarded by `{attribute}`, a shape this gate does not interpret; reading it \
+             as unguarded would hide the export from every row's list"
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 /// `<prefix>_absent_symbols="` at the head of a line: the FULL variable name,
@@ -342,7 +402,21 @@ const FIXTURE_REACH_ENDS_HERE: bool = true;
 
 #[no_mangle]
 pub unsafe extern "C" fn rmw_fixture_after_a_code_line() -> i32 { 0 }
+
+#[cfg(all(cerulion_has_fixture_late, target_os = "linux"))]
+#[no_mangle]
+pub unsafe extern "C" fn rmw_fixture_compound_guard() -> i32 { 0 }
+
+#[cfg(target_os = "linux")]
+const FIXTURE_PLATFORM_REACH_ENDS_HERE: bool = true;
+
+#[no_mangle]
+pub unsafe extern "C" fn rmw_fixture_after_a_platform_cfg() -> i32 { 0 }
 "#;
+
+/// The attribute text the compound arm must report VERBATIM.
+const FIXTURE_COMPOUND_ATTRIBUTE: &str =
+    "#[cfg(all(cerulion_has_fixture_late, target_os = \"linux\"))]";
 
 const GATE_FIXTURE: &str = r#"
 # a comment naming absent_symbols must not read as an assignment
@@ -395,6 +469,17 @@ fn the_source_parser_reads_the_hand_built_snippet() {
             name: "rmw_fixture_after_a_code_line".to_string(),
             capability: None,
         },
+        // A compound guard carries a rule this file does not model, so it is
+        // reported rather than read as a capability or as unguarded.
+        Export {
+            name: "rmw_fixture_compound_guard".to_string(),
+            capability: None,
+        },
+        // Nor does a platform cfg over a constant reach past it.
+        Export {
+            name: "rmw_fixture_after_a_platform_cfg".to_string(),
+            capability: None,
+        },
     ];
     assert_eq!(parsed.exports, expected);
     assert_eq!(
@@ -403,6 +488,58 @@ fn the_source_parser_reads_the_hand_built_snippet() {
             "rmw_fixture_legacy_only".to_string(),
             "fixture_late".to_string()
         )]
+    );
+    assert_eq!(
+        parsed.uninterpreted_guards,
+        vec![(
+            "rmw_fixture_compound_guard".to_string(),
+            FIXTURE_COMPOUND_ATTRIBUTE.to_string()
+        )],
+        "only the compound guard is uninterpreted: the two recognised shapes parse as guards, and \
+         a cfg whose reach a code line ends guards nothing"
+    );
+}
+
+#[test]
+fn an_unmodelled_guard_shape_is_a_refusal_never_an_unguarded_export() {
+    let parsed = parse_exports(SOURCE_FIXTURE);
+    // The false green itself: the comparison is BLIND to the compound-guarded
+    // export, because an export read as unguarded lands in no derived set.
+    let derived = derived_absent(&parsed.exports, FIXTURE_CAPS, FIXTURE_ERA);
+    assert!(
+        !derived.contains("rmw_fixture_compound_guard"),
+        "a compound-guarded export cannot reach the derivation, which is why it needs a refusal"
+    );
+    assert!(
+        disagreement(&derived, &fixture_pinned()).is_none(),
+        "the comparison agrees over this fixture, so only the refusal can catch the omission"
+    );
+    // The refusal is what fails, naming the export and the attribute verbatim.
+    let report = unmodelled_guard_refusal(&parsed).expect("an unmodelled guard shape must refuse");
+    assert!(
+        report.contains("rmw_fixture_compound_guard")
+            && report.contains(FIXTURE_COMPOUND_ATTRIBUTE),
+        "the refusal must name the export and the attribute over it: {report}"
+    );
+    assert!(
+        report.contains("rmw_fixture_legacy_only"),
+        "the negated guard is refused by the same reader: {report}"
+    );
+    // Both recognised shapes still parse as guards rather than as refusals.
+    let recognised = parse_exports(
+        "#[cfg(cerulion_has_fixture_late)]\n#[no_mangle]\npub unsafe extern \"C\" fn \
+         rmw_fixture_recognised() -> i32 { 0 }\n",
+    );
+    assert_eq!(
+        recognised.exports,
+        vec![Export {
+            name: "rmw_fixture_recognised".to_string(),
+            capability: Some("fixture_late".to_string()),
+        }]
+    );
+    assert!(
+        unmodelled_guard_refusal(&recognised).is_none(),
+        "a recognised capability guard is a reading, not a refusal"
     );
 }
 
@@ -488,12 +625,12 @@ fn the_comparison_agrees_on_the_fixture_and_fails_in_both_directions() {
 #[test]
 fn every_gate_row_names_exactly_the_exports_its_distro_lacks() {
     let parsed = tree_exports();
-    assert!(
-        parsed.negated_guards.is_empty(),
-        "an export guarded by a NEGATED capability cfg inverts this gate's rule and needs its own \
-         arm here before it can land: {:?}",
-        parsed.negated_guards
-    );
+    if let Some(report) = unmodelled_guard_refusal(&parsed) {
+        panic!(
+            "every guard over an export must carry a rule this gate models; extend the reader and \
+             the fixtures before such an export lands:\n{report}"
+        );
+    }
     // Anti-vacuity: a parser that matched nothing would read zero against the
     // empty rows and pass.
     assert!(
