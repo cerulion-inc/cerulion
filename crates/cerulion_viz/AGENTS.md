@@ -39,10 +39,10 @@ cargo test -p go2_tf                             # pure codec, no globals
 
 - A new `cerulion_viz` test must confine process-global state by one of the five
   mechanisms in docs/internals/viz.md §4 - if it fits none, it goes in the vizd lane.
-- Rate/Hz asserts: absolute ceiling + ratio-vs-achieved-rate - never a band (a
-  loaded runner only pushes measured rates DOWN). Never assert a wall in units of
-  a poll interval (macOS CI timer coalescing); bound conditions in whole seconds
-  and reproduce locally with `taskpolicy -b`.
+- Rate/Hz asserts: absolute ceiling + ratio-vs-achieved-rate - never a band (a loaded runner only
+  pushes measured rates DOWN). Never assert a wall in units of a poll interval (macOS CI timer
+  coalescing); bound conditions in whole seconds and reproduce locally with `taskpolicy -b`.
+- Never assert a machine-wide port absence: read `StreamResolution::hosted_port` (`host_test.rs`).
 - Exact-value frame oracles: per-frame lockstep (one frame in flight), never publish-N-then-drain.
 
 ## Gotchas

@@ -15,7 +15,7 @@ stage `RMW_IMPLEMENTATION`.
 - Failure paths: unconditional counters + flood-latched logs + decade re-announcements.
 - ROS names are Cerulion names VERBATIM (`/chatter` ⇔ `/chatter/data`; relative refused, no alias); every publisher registers for egress (best-effort), never unregisters.
 - Windowed borrows: NEVER link `cerulion_heaphook` (a 2nd malloc interposer); dlsym per-symbol (`src/heaphook.rs`). Only a thread's FIRST outstanding borrow owns its window; a loan finished on the WRONG thread copies + HOLDS its slot till that thread borrows again (destroy/poisoned LEAKS slot + `PublisherData`: freeing it wedges the dead-node sweep); quarantine retires at slot REUSE, never at publish. Every degrade = the copy path, never a failed publish.
-- NEVER export an entry point whose types a distro's headers lack: cfg the `extern "C"` fn out WHOLE, never stub it (`nm` audit: `tools/ci/rmw-distros/gate.sh`).
+- NEVER export an entry point whose types a distro's headers lack: cfg the `extern "C"` fn out WHOLE, never stub it (`rmw_absent_export_table_test`, lane `nm` audit).
 - NEVER leave a fixture's `ROS_DISTRO` unset: a post-Jazzy `.so` refuses it (`rmw_era_guard_test`).
 
 ## Testing
@@ -30,14 +30,10 @@ docs/internals/rmw.md; update THAT when a binary is added, not a list here.
 
 - build.rs bindings: bindgen over ROS headers (`AMENT_PREFIX_PATH`/`CERULION_RMW_SYS_INCLUDE`), else vendored (headerless warns; a SET prefix var with no usable headers ERRORS); `RMW_RET_*` consts shadow bindgen's. Era gate: `wrapper.h` includes, `cerulion_has_*` cfgs + the claim derive from the SELECTED bindings; `era_check.rs` FAILS the build on a claim/fingerprint contradiction or the reserved `vendored-dev` marker; init exports refuse first.
 - `install_tracing()` installs the stderr subscriber (`rmw_cerulion=warn,cerulion_core=warn`); never a 2nd.
-- Element-body framing has NO wire version signal: publisher + desk walker deploy TOGETHER; a skew
-  degrades nested arrays to opaque text, never a wrong decode.
-- A forged take's shadow aims container headers INTO a held SHM sample - un-forge before release or
-  `fini`. Only compiled C++: `shim/cppstring_shim.cpp`.
+- Element-body framing has NO wire version signal: publisher + desk walker deploy TOGETHER; a skew degrades nested arrays to opaque text, never a wrong decode.
+- A forged take's shadow aims container headers INTO a held SHM sample - un-forge before release or `fini`. Only compiled C++: `shim/cppstring_shim.cpp`.
 - `rmw_deserialize` has no coverage: pin when touched.
-- Adopt-take is NOT armed below a service borrow ceiling of 2 (one unit for the held message, one for
-  the receive): below it a reusing caller wedges - the release freeing its borrow runs inside the take
-  that borrow blocks. Copying take instead.
+- Adopt-take is NOT armed below a service borrow ceiling of 2 (one unit for the held message, one for the receive): below it a reusing caller wedges - the release freeing its borrow runs inside the take that borrow blocks. Copying take instead.
 - Accepted residual: an adopted take racing the FINAL `rmw_shutdown` can return a sample whose release
   callback is gone - at most ONE borrow + pool slot per such take, shutdown-only, bounded (later takes
   degrade to copies). No check inside the take closes it, only moves it; rcl stops executors before
