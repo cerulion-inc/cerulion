@@ -44,8 +44,8 @@
 //!    the same run under `CERULION_EXECUTION_MODE=free_run` (the free-run
 //!    default is not on `main` yet, so the opt-in is set explicitly), a capture taken
 //!    MID-RUN, `bag play --resim all --verify` exit 0 twice with one report, and the
-//!    perturbed ticker caught at exit 1 naming its topic. The mutant is the base
-//!    commit: before the admission the same arm exits 2 by name at the resim.
+//!    perturbed ticker caught at exit 1 naming its topic. The negative control is
+//!    the base tree: without the admission the same arm exits 2 by name at the resim.
 //!
 //! # What each arm alone catches
 //!
@@ -162,7 +162,8 @@ use std::time::{Duration, Instant};
 // a `--record` bag's is — that the two artifacts carry ONE document is the whole
 // point, so parsing it some other way would not check the claim.
 use cerulion_bagd::{
-    RecordCoverage, TapSource, CAPTURE_RECORDER_HEALTH_ATTACHMENT, RECORD_COVERAGE_ATTACHMENT,
+    RecordCoverage, TapSource, TappedTopic, CAPTURE_RECORDER_HEALTH_ATTACHMENT,
+    RECORD_COVERAGE_ATTACHMENT,
 };
 use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_STEP_BOUNDARY};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
@@ -517,8 +518,8 @@ const FIXTURE_PERIOD_NS: u64 = 50 * NS_PER_MS;
 /// whose whole job is to publish 24 zero bytes, which is the "the clock stopped
 /// advancing per step" shape and not a catch-up. The deepest burst ever
 /// measured is TWO frames (see
-/// [`gating_stamp_violation`]), so desk load has 4x of room before it reaches
-/// this.
+/// [`gating_stamp_violation`]), so a loaded machine has 4x of room before it
+/// reaches this.
 const MAX_CATCH_UP_BURST_FRAMES: usize = 8;
 
 /// Which coordination contract the run under test executed under.
@@ -816,16 +817,16 @@ fn the_stamp_rule_admits_the_measured_free_run_catch_up_burst() {
     let stamps = stamps_from_deltas(
         1_000 * NS_PER_MS,
         &[
-            50 * NS_PER_MS,
-            50 * NS_PER_MS,
+            FIXTURE_PERIOD_NS,
+            FIXTURE_PERIOD_NS,
             101 * NS_PER_MS,
             0,
             49 * NS_PER_MS,
-            50 * NS_PER_MS,
+            FIXTURE_PERIOD_NS,
             110 * NS_PER_MS,
             0,
             40 * NS_PER_MS,
-            50 * NS_PER_MS,
+            FIXTURE_PERIOD_NS,
         ],
     );
     assert_eq!(
@@ -873,7 +874,7 @@ fn the_stamp_rule_refuses_a_stalled_stretch_the_relaxed_rule_admitted() {
 #[test]
 #[serial]
 fn the_stamp_rule_admits_a_strictly_increasing_series_under_both_modes() {
-    let stamps = stamps_from_deltas(7 * NS_PER_MS, &[50 * NS_PER_MS; 8]);
+    let stamps = stamps_from_deltas(7 * NS_PER_MS, &[FIXTURE_PERIOD_NS; 8]);
     for gating in [Gating::Lockstep, Gating::FreeRun] {
         assert_eq!(
             gating_stamp_violation(&stamps, gating),
@@ -909,7 +910,7 @@ fn the_stamp_rule_refuses_a_decreasing_pair_under_both_modes() {
 fn the_stamp_rule_refuses_under_lockstep_the_burst_it_admits_under_free_run() {
     let stamps = stamps_from_deltas(
         1_000 * NS_PER_MS,
-        &[101 * NS_PER_MS, 0, 49 * NS_PER_MS, 50 * NS_PER_MS],
+        &[101 * NS_PER_MS, 0, 49 * NS_PER_MS, FIXTURE_PERIOD_NS],
     );
     assert_eq!(gating_stamp_violation(&stamps, Gating::FreeRun), None);
     let reason = gating_stamp_violation(&stamps, Gating::Lockstep)
@@ -925,7 +926,7 @@ fn the_stamp_rule_refuses_under_lockstep_the_burst_it_admits_under_free_run() {
 fn the_stamp_rule_refuses_a_zero_delta_after_an_ordinary_step() {
     let stamps = stamps_from_deltas(
         1_000 * NS_PER_MS,
-        &[50 * NS_PER_MS, 50 * NS_PER_MS, 0, 50 * NS_PER_MS],
+        &[FIXTURE_PERIOD_NS, FIXTURE_PERIOD_NS, 0, FIXTURE_PERIOD_NS],
     );
     let reason = gating_stamp_violation(&stamps, Gating::FreeRun)
         .unwrap_or_else(|| panic!("a 50 ms step owes ONE fire: {stamps:?}"));
@@ -2616,10 +2617,10 @@ const PERTURBED_FIXTURE: &str = "test_node_macro_period_perturbed_cdylib";
 /// How many run+capture attempts arm 6 makes to obtain a capture its oracle can
 /// judge, before failing loudly.
 ///
-/// TWO preconditions are the desk's rather than the candidate's, and both are
-/// retried here rather than weakened:
+/// TWO preconditions are the machine's rather than the candidate's, and both
+/// are retried here rather than weakened:
 ///
-/// * LOSS-FREE. A window tap that overflowed under desk load drops frames the
+/// * LOSS-FREE. A window tap that overflowed on a busy machine drops frames the
 ///   re-execution then reproduces, which `--verify` reports as a divergence.
 /// * MID-RUN. The capture must begin past step 0, or `plan_restore` answers
 ///   `FromStart` and the arm never reaches the admission it exists to pin. That
@@ -2640,85 +2641,6 @@ const CLEAN_CAPTURE_ATTEMPTS: usize = 3;
 /// ~2 s of a healthy run.
 const FREE_RUN_MID_RUN_FRAMES: usize = 40;
 
-/// Every RECORDER LOSS the capture's own health document
-/// (`CAPTURE_RECORDER_HEALTH_ATTACHMENT`, the run-cumulative document, so an
-/// UPPER bound on what this window lost) reports for this run's two graph
-/// topics, as the sentences the retry gate prints. An EMPTY vector is the
-/// loss-free claim; `None` means the attachment is absent, which on a
-/// finalized capture is a harness failure rather than health.
-///
-/// # `frames_lost` alone is not a loss-free claim
-///
-/// It counts one producer, tap-queue overflow against an established
-/// sequence baseline. The SAME document states two more, and both are
-/// run-level rather than per-topic, which is the same upper-bound direction
-/// the per-topic counts already carry:
-///
-///  * `dropped_unwritten` frames left their tap's queue and never reached the
-///    bag at all (a writer that is GONE, a latched write error, or the
-///    force-drop test seam; a FULL hand-off channel defers the batch and
-///    retries it rather than dropping it), so no per-topic counter can see
-///    them;
-///  * a `prefix_invisible` loss-counting basis says a contiguous prefix was
-///    dropped before a tap's FIRST drain and TAKEN AS the baseline, so a zero
-///    `frames_lost` beneath it means "nothing was counted", not "nothing was
-///    lost".
-///
-/// # The basis is ASSERTED, not gated, and its token is DERIVED
-///
-/// The always-on window recorder is spawned with an EMPTY `--topics-json`, so
-/// every tap it opens carries `source: discovered`, and a tap proves its
-/// prefix only when the recorder armed ahead of the producers AND the caller
-/// NAMED the topic AND the tap did not attach late. So `prefix_invisible` is
-/// what this plane reads by CONSTRUCTION rather than by luck, on any machine
-/// and at any speed. Retrying on it would therefore refuse every capture this
-/// fixture can produce, which is why it is asserted here rather than added to
-/// the retry gate: it is a permanent property of the recorder this arm uses,
-/// not an attempt that went badly.
-///
-/// The expected token is DERIVED from the capture's own coverage manifest by
-/// [`tap_basis_token`] and [`floor_basis_token`], the rules the recorder
-/// stamps the document with. So the oracle follows the run rather than a
-/// constant typed beside it, it fails when the two documents a capture carries
-/// DISAGREE, and a recorder that one day arms ahead of the producers moves
-/// both sides together instead of reddening an arm that measured nothing
-/// wrong.
-///
-/// What the arm can still claim under that basis comes from its own shape:
-/// the comparison begins at the capture's ANCHOR, not at the topic's first
-/// frame, so a contiguous prefix dropped before the first drain sits outside
-/// the compared suffix by construction. What the gate below cannot rule out
-/// is a prefix loss INSIDE that suffix, and no counter in this document can:
-/// the coverage manifest's per-topic `prefix_lost` would, and a Flashback
-/// capture carries this health document and no coverage manifest.
-///
-/// Sequence GAPS stay admitted for the same reason: the rolling window trims
-/// this capture's head, so its first recorded frame is ordinarily not the
-/// topic's first.
-///
-/// # The SIBLING terms, read or accounted for
-///
-/// Read and CHARGED beside `frames_lost`: `gap_detection_disabled_reason`,
-/// which makes `frames_lost` 0 by construction and is the one field that
-/// reports both the declared and the runtime disable (so it covers
-/// `multi_publisher` and `sequence_anomaly` as well), and
-/// `baseline_resets_after_first`, a mid-stream re-arm that swallows a wire gap
-/// with no counter moving at all.
-///
-/// Read and NOT charged: `staging_full_passes` rides the `frames_lost`
-/// sentence as context rather than standing as its own reason, because on a
-/// tap whose detector is armed it says the drain stopped and the topic's queue
-/// then held the wait, and whatever that queue did not hold is already counted
-/// as `frames_lost`; charging it alone would refuse a capture that lost
-/// nothing. The per-row `loss_counting_basis` is read and asserted known, for
-/// the reason the document floor is.
-///
-/// Not loss terms, so not read: `gap_events` counts the gaps whose sizes
-/// `frames_lost` already sums; `defer_count` counts batches RETAINED and
-/// retried, which is the opposite of a drop; `classify_calls` reports whether
-/// classification spanned the frames, which is the disabled-detector question
-/// already charged above; `first_seq` and `last_seq` describe the sequence
-/// GAPS this arm admits by design.
 /// The PER-TAP rule the recorder stamps a row's `loss_counting_basis` with,
 /// restated over the three coverage-manifest fields it reads.
 ///
@@ -2762,6 +2684,215 @@ fn floor_basis_token(coverage: &RecordCoverage) -> &'static str {
     }
 }
 
+/// A coverage manifest carrying nothing but the terms [`floor_basis_token`]
+/// reads, so the floor rule can be driven at shapes no fixture produces.
+fn coverage_with(armed_before_producers: bool, taps: &[(TapSource, bool)]) -> RecordCoverage {
+    RecordCoverage {
+        armed_before_producers,
+        tapped: taps
+            .iter()
+            .enumerate()
+            .map(|(i, (source, attached_late))| {
+                (
+                    format!("/t{i}"),
+                    TappedTopic {
+                        source: *source,
+                        frames_recorded: 0,
+                        attached_late: *attached_late,
+                        prefix_lost: None,
+                        schema_source: None,
+                    },
+                )
+            })
+            .collect(),
+        ..RecordCoverage::default()
+    }
+}
+
+/// The PER-TAP token, pinned over the full 2x2x2 of the fields it reads.
+///
+/// [`tap_basis_token`] is PURE and the arm above drives it only at the shape
+/// this fixture can produce, where every tap is `discovered` and the answer is
+/// `prefix_invisible` whatever the rule says. So a token collapsed to its else
+/// arm, or one that dropped any single conjunct, passes the capture gate in
+/// full. The oracle is the HAND table the recording crate states beside its own
+/// `tap_loss_counting_basis`, copied rather than re-derived: exactly one shape
+/// proves a prefix, and flipping any one term off it loses the proof.
+#[test]
+#[serial]
+fn a_taps_basis_token_is_proven_only_where_all_three_coverage_terms_hold() {
+    for (armed, source, late, want) in [
+        (true, TapSource::Declared, false, "prefix_proven"),
+        // DISCOVERED on an armed recorder: the producer was already running
+        // when the tap opened, which is what this whole plane reads.
+        (true, TapSource::Discovered, false, "prefix_invisible"),
+        // Named, but attached mid-run: coverage begins at the attach.
+        (true, TapSource::Declared, true, "prefix_invisible"),
+        (true, TapSource::Discovered, true, "prefix_invisible"),
+        // With no arm-ordering guarantee at all, nothing is proven.
+        (false, TapSource::Declared, false, "prefix_invisible"),
+        (false, TapSource::Discovered, false, "prefix_invisible"),
+        (false, TapSource::Declared, true, "prefix_invisible"),
+        (false, TapSource::Discovered, true, "prefix_invisible"),
+    ] {
+        assert_eq!(
+            tap_basis_token(armed, source, late),
+            want,
+            "the per-tap rule reads armed before producers {armed}, source {source:?}, \
+             attached late {late}"
+        );
+    }
+}
+
+/// The DOCUMENT floor, pinned over its rows AND over the EMPTY tap set.
+///
+/// Same reason as the arm above: on this fixture the floor is
+/// `prefix_invisible` by construction, so a collapsed [`floor_basis_token`]
+/// reads green through the capture gate. Both of its terms are driven here, and
+/// the weaker row is placed at each end of the walk so a rule that stopped at
+/// the first row cannot pass both.
+#[test]
+#[serial]
+fn the_document_floor_token_is_the_weakest_row_and_the_arming_term_gates_it() {
+    let proving = (TapSource::Declared, false);
+    let discovered = (TapSource::Discovered, false);
+    let late = (TapSource::Declared, true);
+    // Armed, and every row proves its own head: the one proving shape.
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[proving, proving])),
+        "prefix_proven"
+    );
+    // ONE row short of it takes the whole document with it, at either end.
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[proving, discovered])),
+        "prefix_invisible"
+    );
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[discovered, proving])),
+        "prefix_invisible"
+    );
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[proving, late])),
+        "prefix_invisible"
+    );
+    // The arming term gates: no row is more covered than the guarantee.
+    assert_eq!(
+        floor_basis_token(&coverage_with(false, &[proving, proving])),
+        "prefix_invisible"
+    );
+    // NO TAPS: the walk is vacuously true, so the arming term is what answers,
+    // and dropping it would have an EMPTY unarmed document claim a proof.
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[])),
+        "prefix_proven"
+    );
+    assert_eq!(
+        floor_basis_token(&coverage_with(false, &[])),
+        "prefix_invisible"
+    );
+}
+
+/// Every RECORDER LOSS the capture's own health document
+/// (`CAPTURE_RECORDER_HEALTH_ATTACHMENT`, the run-cumulative document, so an
+/// UPPER bound on what this window lost) reports for this run's two graph
+/// topics, as the sentences the retry gate prints. An EMPTY vector is the
+/// loss-free claim; `None` means the attachment is absent, which on a
+/// finalized capture is a harness failure rather than health.
+///
+/// # `frames_lost` alone is not a loss-free claim
+///
+/// It counts one producer, tap-queue overflow against an established
+/// sequence baseline. The SAME document states two more, and both are
+/// run-level rather than per-topic, which is the same upper-bound direction
+/// the per-topic counts already carry:
+///
+///  * `dropped_unwritten` frames left their tap's queue and never reached the
+///    bag at all (a writer that is GONE, a latched write error, or the
+///    force-drop test seam; a FULL hand-off channel defers the batch and
+///    retries it rather than dropping it), so no per-topic counter can see
+///    them;
+///  * a `prefix_invisible` loss-counting basis says a contiguous prefix was
+///    dropped before a tap's FIRST drain and TAKEN AS the baseline, so a zero
+///    `frames_lost` beneath it means "nothing was counted", not "nothing was
+///    lost".
+///
+/// # The basis is ASSERTED, not gated, and its token is DERIVED
+///
+/// The always-on window recorder is spawned with an EMPTY `--topics-json`, so
+/// every tap it opens carries `source: discovered`, and a tap proves its
+/// prefix only when the recorder armed ahead of the producers AND the caller
+/// NAMED the topic AND the tap did not attach late. So `prefix_invisible` is
+/// what this plane reads by CONSTRUCTION rather than by luck, on any machine
+/// and at any speed. Retrying on it would therefore refuse every capture this
+/// fixture can produce, which is why it is asserted here rather than added to
+/// the retry gate: it is a permanent property of the recorder this arm uses,
+/// not an attempt that went badly.
+///
+/// The expected token is DERIVED from the capture's own coverage manifest by
+/// [`tap_basis_token`] and [`floor_basis_token`], the rules the recorder
+/// stamps the document with, so the oracle follows the run rather than a
+/// constant typed beside it and it fails when the two documents a capture
+/// carries DISAGREE.
+///
+/// WHICH term carries the pin is worth stating exactly, because the two
+/// documents do not read the same inputs. A capture's manifest stamps
+/// `armed_before_producers: false` unconditionally (`build_capture_coverage`:
+/// a rolling window begins at its own floor, so it makes no head claim on any
+/// topic), while the health document derives its token from the recorder's
+/// REAL arming flag. That term is therefore a constant on the manifest side
+/// and carries nothing.
+///
+/// What holds the two sides together is the term that IS a function of this
+/// recording, and it is enough on its own: every tap's `source` is
+/// `discovered`, because the window recorder is spawned with an empty
+/// `--topics-json`, and a discovered tap answers `prefix_invisible` whatever
+/// the arming flag says. So both documents reach `prefix_invisible` from the
+/// same structural fact about the tap set rather than from one constant
+/// meeting another.
+///
+/// The limit that leaves, stated rather than papered over: a recorder that
+/// one day both armed ahead of its producers AND named these topics would
+/// state `prefix_proven` in its health document while a capture's manifest
+/// still stamped `false`, and this assert would RED. That is the loud
+/// direction, and it is the one to take while a capture's manifest carries no
+/// arming guarantee to read.
+///
+/// What the arm can still claim under that basis comes from its own shape:
+/// the comparison begins at the capture's ANCHOR, not at the topic's first
+/// frame, so a contiguous prefix dropped before the first drain sits outside
+/// the compared suffix by construction. What the gate below cannot rule out
+/// is a prefix loss INSIDE that suffix, and no counter in this document can:
+/// the coverage manifest's per-topic `prefix_lost` would, and a Flashback
+/// capture carries this health document and no coverage manifest.
+///
+/// Sequence GAPS stay admitted for the same reason: the rolling window trims
+/// this capture's head, so its first recorded frame is ordinarily not the
+/// topic's first.
+///
+/// # The SIBLING terms, read or accounted for
+///
+/// Read and CHARGED beside `frames_lost`: `gap_detection_disabled_reason`,
+/// which makes `frames_lost` 0 by construction and is the one field that
+/// reports both the declared and the runtime disable (so it covers
+/// `multi_publisher` and `sequence_anomaly` as well), and
+/// `baseline_resets_after_first`, a mid-stream re-arm that swallows a wire gap
+/// with no counter moving at all.
+///
+/// Read and NOT charged: `staging_full_passes` rides the `frames_lost`
+/// sentence as context rather than standing as its own reason, because on a
+/// tap whose detector is armed it says the drain stopped and the topic's queue
+/// then held the wait, and whatever that queue did not hold is already counted
+/// as `frames_lost`; charging it alone would refuse a capture that lost
+/// nothing. The per-row `loss_counting_basis` is read and asserted EQUAL to
+/// the token that row's own coverage record implies, for the reason the
+/// document floor is.
+///
+/// Not loss terms, so not read: `gap_events` counts the gaps whose sizes
+/// `frames_lost` already sums; `defer_count` counts batches RETAINED and
+/// retried, which is the opposite of a drop; `classify_calls` reports whether
+/// classification spanned the frames, which is the disabled-detector question
+/// already charged above; `first_seq` and `last_seq` describe the sequence
+/// GAPS this arm admits by design.
 fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
     let reader = cerulion_bag::BagReader::open(bag).expect("open the capture");
     let att = reader
@@ -2795,8 +2926,8 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
     let coverage: RecordCoverage = serde_json::from_slice(&coverage_att.data)
         .unwrap_or_else(|e| panic!("the capture's coverage manifest must parse: {e}"));
     // The two topics this arm is SCOPED to, named once: the per-topic reads
-    // below walk them, and the run-level count further down is charged only
-    // when the document accounts for nothing else.
+    // below walk them. The run-level count further down is charged whatever
+    // else the document accounts for, for the reason stated at its own read.
     let graph_topics: Vec<String> = ["ticker/cmd", "relay/cmd"]
         .iter()
         .map(|suffix| format!("/{prefix}/{suffix}"))
@@ -2950,10 +3081,10 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
 /// so the re-execution produces frames the window dropped; this arm's capture
 /// RESUMES from its anchor, so the comparison begins where the recording does.
 /// What can still break it is a tap overflow INSIDE the window on a loaded
-/// desk, which is why the capture is gated on the recorder's own loss count and
-/// retried rather than the oracle loosened (see `CLEAN_CAPTURE_ATTEMPTS`).
+/// machine, which is why the capture is gated on the recorder's own loss count
+/// and retried rather than the oracle loosened (see `CLEAN_CAPTURE_ATTEMPTS`).
 ///
-/// TWO mutants, both RUN: at the base tree the same arm exits 2 at leg 3 with
+/// TWO negative controls, both RUN: at the base tree the same arm exits 2 at leg 3 with
 /// the refusal naming the free-run stamp and the mid-run first boundary; at
 /// the admission WITHOUT the worker's clock fix (the free-run rank still on
 /// the `RealClock` "live arm"), it exits 2 at leg 3 with check 3 naming the
@@ -2991,7 +3122,7 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         // THE MID-RUN RENDEZVOUS (arm 3's, deepened): a capture whose trace
         // begins at step 0 needs no anchor and would not exercise the
         // admission, so this waits on the CONDITION that the run is well past
-        // its first step rather than sleeping out a span that a loaded desk
+        // its first step rather than sleeping out a span that a loaded machine
         // would spend doing nothing.
         await_the_worker_has_published(&format!("/{prefix}/ticker/cmd"), FREE_RUN_MID_RUN_FRAMES);
         // run.json's `gating` label follows the SAME predicate the
