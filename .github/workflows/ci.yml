@@ -89,9 +89,11 @@ env:
   # 15.8 GB store, one accepted save into an emptied one). One generation of
   # the eight namespaces measured is 17.1 GB (the rmw lanes and the smaller
   # tool caches are not in that figure), so the default saves two archives: the
-  # macOS test shards' archive, which saves 29 minutes of wall time, and the
-  # Linux test shards' archive the shards need, which fit together (4.27 GB and
-  # 3.18 GB, 7.45 GB, main only). Every other namespace is restore-only.
+  # macOS test shards' archive (shard 0 ran 28.3 min with a cache hit on run
+  # 35666419690 against 29 to 44 min across eight 2026-09-27 runs whose cache
+  # state is not recorded) and the Linux test shards' archive the shards need,
+  # which fit together (4.27 GB and 3.18 GB, 7.45 GB, main only). Every other
+  # namespace is restore-only.
   # Directly before every save of a lockfile-keyed archive (the machete tool
   # cache is exempt) a prune step keeps exactly the job's current `main` key and
   # deletes every other entry of its namespace (stale lockfile generations,

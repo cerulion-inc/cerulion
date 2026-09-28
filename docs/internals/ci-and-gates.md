@@ -529,9 +529,10 @@ account carries a failed payment the service refuses every save into a store abo
 (measured 2026-09-28: 13 refusals into a 15.8 GB store, then one accepted save into an emptied
 one). One generation of the eight namespaces measured is 17.1 GB (the rmw lanes and the smaller
 tool caches are not in that figure), so the workflows save only what fits and pays: the macOS
-test shards' archive (4.27 GB, shard 0 of `test-macos`, worth 29 minutes on the wall of a cold
-run) and the Linux test shards' archive (3.18 GB, shard 0 of `test-linux`), 7.45 GB together, on
-`main` only. Every other `actions/cache/save` step is gated off by default and its job is
+test shards' archive (4.27 GB, shard 0 of `test-macos`; shard 0 ran 28.3 min with a cache hit on
+run 35666419690, against 29 to 44 min across eight 2026-09-27 runs whose cache state is not
+recorded) and the Linux test shards' archive (3.18 GB, shard 0 of `test-linux`; 19 to 28 min
+across runs 36284081039, 36295731007 and 36357164260), 7.45 GB together, on `main` only. Every other `actions/cache/save` step is gated off by default and its job is
 restore-only.
 
 The policy is two workflow-level `env` values, each defaulting from a repository variable:
