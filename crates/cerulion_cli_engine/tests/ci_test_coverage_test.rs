@@ -3740,11 +3740,13 @@ fn jobs_missing_the_not_cancelled_guard(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (job, block) in jobs_of(text) {
         let depends = job_needs(&block).iter().any(|n| n == SELECTION_JOB);
-        let gates = step_blocks(&block).iter().any(|step| match step_if_of(step) {
-            Ok(Some(cond)) => cond.contains(SELECTION_PKG_IF_OPEN),
-            Ok(None) => false,
-            Err(_) => true,
-        });
+        let gates = step_blocks(&block)
+            .iter()
+            .any(|step| match step_if_of(step) {
+                Ok(Some(cond)) => cond.contains(SELECTION_PKG_IF_OPEN),
+                Ok(None) => false,
+                Err(_) => true,
+            });
         if !(depends || gates) {
             continue;
         }
@@ -3845,9 +3847,7 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
     // false the moment the classifier fails, so this job skips exactly when the
     // guard is meant to save it.
     assert_eq!(
-        jobs_missing_the_not_cancelled_guard(&job(
-            "    if: ${{ success() && !cancelled() }}\n"
-        )),
+        jobs_missing_the_not_cancelled_guard(&job("    if: ${{ success() && !cancelled() }}\n")),
         vec!["j".to_string()],
         "the call has to OPEN the condition"
     );
@@ -4071,9 +4071,9 @@ fn shard_check_complaints(text: &str) -> Vec<String> {
 #[test]
 fn the_shard_check_runs_in_a_named_lint_step() {
     let texts = workflow_texts();
-    let ci = texts.get(SHARD_CHECK_WORKFLOW).unwrap_or_else(|| {
-        panic!("the workflow walk found no `{SHARD_CHECK_WORKFLOW}`")
-    });
+    let ci = texts
+        .get(SHARD_CHECK_WORKFLOW)
+        .unwrap_or_else(|| panic!("the workflow walk found no `{SHARD_CHECK_WORKFLOW}`"));
     let complaints = shard_check_complaints(ci);
     assert!(
         complaints.is_empty(),
@@ -4171,7 +4171,9 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
         "a step in another job is named by its job: {complaints:?}"
     );
     assert!(
-        complaints.iter().any(|c| c.contains("pull-request blocking")),
+        complaints
+            .iter()
+            .any(|c| c.contains("pull-request blocking")),
         "a step in a job that skips on a pull request is named for that: \
          {complaints:?}"
     );
@@ -4184,11 +4186,15 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
     );
     let complaints = shard_check_complaints(&gated);
     assert!(
-        complaints.iter().any(|c| c.contains("pull-request blocking")),
+        complaints
+            .iter()
+            .any(|c| c.contains("pull-request blocking")),
         "the right job behind an event test is still named: {complaints:?}"
     );
     assert!(
-        !complaints.iter().any(|c| c.contains("job, and the rule names")),
+        !complaints
+            .iter()
+            .any(|c| c.contains("job, and the rule names")),
         "and it is not named for sitting in the wrong job: {complaints:?}"
     );
 
