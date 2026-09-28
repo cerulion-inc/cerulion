@@ -20,6 +20,5 @@ docs/media/development-loop-static.svg | unreferenced-media | * | the no-motion 
 crates/rmw_cerulion/src/ffi/vendored_bindings.rs | shipped-text | names an owner | bindgen output over the upstream ROS 2 headers; the owner tag is upstream's own text
 tools/scripts/check_agents_md.sh | work-state | the founder said so | a banned-word fixture of the agent-docs gate's self-test: the gate must spell the word it refuses
 tools/scripts/check_agents_md.sh | work-state | see pt56 for the measurement | a banned session-reference fixture of the agent-docs gate's self-test: the gate must spell the shape it refuses
-.github/CONTRIBUTING.md | work-state | coming soon | maintainer ruling: the Discord row announces the chat as coming
 docs/media/charts/build_benchmark_plots.py | work-state | coming soon | maintainer ruling: the macOS latency improvement is announced as coming
 docs/media/platform-rtt.svg | work-state | coming soon | maintainer ruling: the macOS latency improvement is announced as coming
