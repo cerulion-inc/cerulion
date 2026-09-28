@@ -47,10 +47,13 @@
 //! baseline agrees, and a symbol added to or removed from either side fails,
 //! naming it on the side it appeared. The compound arm pins the false green
 //! itself: the comparison AGREES over that fixture, and the refusal is what
-//! fails. The tree comparison refuses a vacuous read as well: the walk must find
-//! the whole export surface, and at least one row's derived set must be
-//! non-empty, so a parser that silently matched nothing cannot pass by reading
-//! zero against zero.
+//! fails. The refusal is then driven again at the WALK level over a source
+//! directory the test writes, because a fixture arm proves the parser and not
+//! the aggregation: a walk that dropped the refusal list would hand every real
+//! tree an empty one. The tree comparison refuses a vacuous read as well: the
+//! walk must find the whole export surface, and at least one row's derived set
+//! must be non-empty, so a parser that silently matched nothing cannot pass by
+//! reading zero against zero.
 //!
 //! Pure text and two constant tables: no transport, no iceoryx2 root, nothing
 //! that behaves differently under `--release`.
@@ -347,13 +350,17 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every export in the crate's own source tree, with its guard.
-fn tree_exports() -> Parsed {
+/// Every export under `root`, with its guard, aggregated across every file.
+/// EVERY list the parser fills is carried out, refusals included: a walk that
+/// drops `uninterpreted_guards` would hand the refusal an empty list and read a
+/// compound-guarded export in real source as no finding at all.
+///
+/// The root is a parameter so the real-tree call and the synthetic-directory
+/// test run the same function; a test that exercised `parse_exports` alone would
+/// prove the parser and leave this aggregation unproven.
+fn walk_exports(root: &Path) -> Parsed {
     let mut files = Vec::new();
-    rust_sources(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut files,
-    );
+    rust_sources(root, &mut files);
     files.sort();
     let mut all = Parsed::default();
     for file in &files {
@@ -361,8 +368,51 @@ fn tree_exports() -> Parsed {
         let mut parsed = parse_exports(&text);
         all.exports.append(&mut parsed.exports);
         all.negated_guards.append(&mut parsed.negated_guards);
+        all.uninterpreted_guards
+            .append(&mut parsed.uninterpreted_guards);
     }
     all
+}
+
+/// Every export in the crate's own source tree, with its guard.
+fn tree_exports() -> Parsed {
+    walk_exports(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+}
+
+/// A directory that removes itself, so a failing assertion leaves nothing behind.
+struct ScratchDir(PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl ScratchDir {
+    /// A fresh directory under the environment's temporary root, with one
+    /// subdirectory so the walk's recursion is exercised too.
+    fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rmw_absent_export_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(path.join("nested"))
+            .unwrap_or_else(|e| panic!("create {path:?}: {e}"));
+        Self(path)
+    }
+
+    fn write(&self, name: &str, text: &str) {
+        let file = self.0.join(name);
+        std::fs::write(&file, text).unwrap_or_else(|e| panic!("write {file:?}: {e}"));
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +467,31 @@ pub unsafe extern "C" fn rmw_fixture_after_a_platform_cfg() -> i32 { 0 }
 /// The attribute text the compound arm must report VERBATIM.
 const FIXTURE_COMPOUND_ATTRIBUTE: &str =
     "#[cfg(all(cerulion_has_fixture_late, target_os = \"linux\"))]";
+
+/// One synthetic source file whose only guard is a recognised one: the control
+/// for the walk, so a refusal over the mixed directory is not a blind `Some`.
+const RECOGNISED_ONLY_FILE: &str = r#"
+/// # Safety
+/// rmw ABI contract.
+#[cfg(cerulion_has_fixture_late)]
+#[no_mangle]
+pub unsafe extern "C" fn rmw_fixture_walked_late_call() -> i32 {
+    0
+}
+"#;
+
+/// One synthetic source file carrying a compound-guarded export, written into a
+/// DIFFERENT file (and a nested directory) from the recognised one, so the walk
+/// has to carry the refusal across both the file loop and the recursion.
+const COMPOUND_ONLY_FILE: &str = r#"
+/// # Safety
+/// rmw ABI contract.
+#[cfg(all(cerulion_has_fixture_late, target_os = "linux"))]
+#[no_mangle]
+pub unsafe extern "C" fn rmw_fixture_compound_guard() -> i32 {
+    0
+}
+"#;
 
 const GATE_FIXTURE: &str = r#"
 # a comment naming absent_symbols must not read as an assignment
@@ -620,6 +695,78 @@ fn the_comparison_agrees_on_the_fixture_and_fails_in_both_directions() {
         disagreement(&later, &fixture_pinned()).is_some(),
         "a capability that moves era must fail every row that still names its export"
     );
+}
+
+/// The refusal on the TREE path, over a source directory this test writes.
+///
+/// The parser arm above proves `parse_exports`; it cannot see whether the walk
+/// carries a refusal out of the file it sits in. A walk that aggregated only
+/// `exports` and `negated_guards` would hand `unmodelled_guard_refusal` an empty
+/// list on every real tree, and a compound-guarded export would pass silently
+/// while the parser test stayed green. So the walk itself is driven here, both
+/// ways (rule 12): a directory with only recognised guards must refuse NOTHING,
+/// and the same directory plus one compound-guarded export in another file must
+/// refuse, naming it.
+#[test]
+fn the_walk_carries_an_unmodelled_guard_out_of_the_file_it_sits_in() {
+    // The control first, so the refusal below cannot be a blind `Some`.
+    let clean = ScratchDir::new("clean");
+    clean.write("recognised.rs", RECOGNISED_ONLY_FILE);
+    let walked = walk_exports(clean.path());
+    assert_eq!(
+        walked.exports.len(),
+        1,
+        "the control directory holds exactly one export: {:?}",
+        walked.exports
+    );
+    assert_eq!(
+        walked.exports[0].capability.as_deref(),
+        Some("fixture_late"),
+        "a recognised guard must still read as a capability through the walk"
+    );
+    assert!(walked.uninterpreted_guards.is_empty());
+    assert!(
+        unmodelled_guard_refusal(&walked).is_none(),
+        "a directory whose only guard is recognised must refuse nothing"
+    );
+
+    // The subject: the compound guard sits in a different file, one directory
+    // down, so the aggregate has to carry it across the file loop AND the
+    // recursion.
+    let mixed = ScratchDir::new("mixed");
+    mixed.write("recognised.rs", RECOGNISED_ONLY_FILE);
+    mixed.write("nested/compound.rs", COMPOUND_ONLY_FILE);
+    let walked = walk_exports(mixed.path());
+    assert_eq!(
+        walked.exports.len(),
+        2,
+        "both files' exports must reach the aggregate: {:?}",
+        walked.exports
+    );
+    assert_eq!(
+        walked.uninterpreted_guards,
+        vec![(
+            "rmw_fixture_compound_guard".to_string(),
+            FIXTURE_COMPOUND_ATTRIBUTE.to_string()
+        )],
+        "the walk must carry the uninterpreted guard out of the file it sits in"
+    );
+    let report = unmodelled_guard_refusal(&walked)
+        .expect("the tree path must refuse a compound-guarded export, not only the parser");
+    assert!(
+        report.contains("rmw_fixture_compound_guard")
+            && report.contains(FIXTURE_COMPOUND_ATTRIBUTE),
+        "the refusal must name the export and the attribute over it: {report}"
+    );
+    // The blindness that makes the refusal necessary, restated at tree level: the
+    // compound-guarded export reaches no derived set at any era.
+    for era in 0..=5 {
+        assert!(
+            !derived_absent(&walked.exports, FIXTURE_CAPS, era)
+                .contains("rmw_fixture_compound_guard"),
+            "a compound-guarded export never reaches the derivation, at any era"
+        );
+    }
 }
 
 #[test]
