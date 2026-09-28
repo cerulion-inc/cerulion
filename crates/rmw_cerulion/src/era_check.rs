@@ -538,12 +538,44 @@ pub enum DistroClaimVerdict {
 }
 
 /// Era rank for a known distro name (input must already be normalized).
-fn distro_era_rank(distro: &str) -> Option<usize> {
+///
+/// (Also the runtime side's rank lookup for the unset-distro guard, which
+/// is why it is public: `era::classify_unset_distro` compares a baked
+/// claim's rank against [`UNSET_DISTRO_REFUSED_FROM_ERA`], and a second
+/// copy of this table walk is exactly the drift the one-table rule
+/// forbids.)
+pub fn distro_era_rank(distro: &str) -> Option<usize> {
     DISTRO_ERAS
         .iter()
         .find(|(name, _)| *name == distro)
         .map(|(_, rank)| *rank)
 }
+
+/// Era rank of an `era:<token>` claim's token (the `era:` prefix already
+/// stripped), read from the SAME canonical token table the claims are
+/// baked from, so a claim's rank and its spelling cannot disagree.
+/// `None` for a token no era carries.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub fn era_claim_token_rank(token: &str) -> Option<usize> {
+    ERA_CLAIM_TOKENS.iter().position(|t| *t == token)
+}
+
+/// The FIRST era whose GENERATED builds refuse to load when the runtime
+/// names no distro at all.
+///
+/// From Lyrical on, the introspection `MessageMember` carries
+/// `is_rosidl_buffer_` and the stride is 120 bytes against Jazzy's 112, so
+/// a library of this era handed an earlier distro's member array walks it
+/// at the wrong stride and dies at the first typed operation. An
+/// environment that sets no `ROS_DISTRO` offers no evidence that the
+/// process really runs this era, and the refusal is cheap while the
+/// crash is not: these builds fail closed. Jazzy-era and earlier
+/// generated builds keep admitting an unnamed runtime, and the VENDORED
+/// snapshot's admission rule ([`RESERVED_UNCLAIMED_MARKER`]) is
+/// untouched: its whole purpose is a development machine with no ROS
+/// environment.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub const UNSET_DISTRO_REFUSED_FROM_ERA: usize = ERA_LYRICAL;
 
 /// The era rank an observed fingerprint matches EXACTLY, if any.
 pub fn observed_era_rank(observed: &[&str]) -> Option<usize> {
@@ -1721,6 +1753,51 @@ mod tests {
             era_claim_members(VENDORED_SNAPSHOT_ERA_TOKEN),
             Some(&["lyrical", "rolling"][..])
         );
+    }
+
+    #[test]
+    fn the_unset_distro_bound_is_the_era_that_grew_the_introspection_stride() {
+        // The bound is stated INDEPENDENTLY of the constant: the refusal
+        // exists because the introspection MessageMember grew
+        // `is_rosidl_buffer_`, so the first refusing era must be that
+        // capability's own minimum era, read from the capability table. A
+        // future era that moves the marker moves the bound, or this fails.
+        let stride_era = CAPABILITY_MIN_ERA
+            .iter()
+            .find(|(cap, _)| *cap == "is_rosidl_buffer")
+            .map(|(_, rank)| *rank)
+            .expect("the capability table names is_rosidl_buffer");
+        assert_eq!(UNSET_DISTRO_REFUSED_FROM_ERA, stride_era);
+        // The era below the bound is the one whose claims keep admitting an
+        // unnamed runtime, and it exists.
+        assert_eq!(UNSET_DISTRO_REFUSED_FROM_ERA - 1, ERA_JAZZY);
+    }
+
+    #[test]
+    fn an_era_claim_tokens_rank_is_the_rank_of_every_distro_it_names() {
+        // The token table and the distro table agree, in both directions,
+        // so a rank read through a claim label can never disagree with the
+        // rank read through a distro name.
+        for (rank, token) in ERA_CLAIM_TOKENS.iter().enumerate() {
+            assert_eq!(era_claim_token_rank(token), Some(rank), "token {token}");
+            assert_eq!(distro_era_rank(token), Some(rank), "token {token}");
+        }
+        for (distro, rank) in DISTRO_ERAS {
+            assert_eq!(distro_era_rank(distro), Some(*rank), "distro {distro}");
+        }
+        for (token, members) in ERA_CLAIM_ADMITTED_MEMBERS {
+            for member in *members {
+                assert_eq!(
+                    distro_era_rank(member),
+                    era_claim_token_rank(token),
+                    "`{token}` admits `{member}` of another era"
+                );
+            }
+        }
+        // An unknown token ranks nothing, so an unrecognizable claim can
+        // never satisfy a rank comparison by accident.
+        assert_eq!(era_claim_token_rank("m_next"), None);
+        assert_eq!(era_claim_token_rank(""), None);
     }
 
     #[test]

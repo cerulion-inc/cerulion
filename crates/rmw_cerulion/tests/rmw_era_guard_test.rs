@@ -30,18 +30,20 @@ use std::mem::size_of;
 use std::os::raw::c_char;
 
 use rmw_cerulion::era::{
-    baked_distro, built_for, classify_distro_pair, DISTRO_MISMATCH_REFUSAL, VENDORED_DEV_DISTRO,
+    baked_distro, built_for, classify_distro_pair, DISTRO_MISMATCH_REFUSAL, UNSET_DISTRO_REFUSAL,
+    VENDORED_DEV_DISTRO,
 };
 use rmw_cerulion::era_check::{
-    era_claim_admits, era_claim_members, ERA_CLAIM_PREFIX, VENDORED_SNAPSHOT_ERA_TOKEN,
+    era_claim_admits, era_claim_members, era_claim_token_rank, ERA_CLAIM_PREFIX,
+    UNSET_DISTRO_REFUSED_FROM_ERA, VENDORED_SNAPSHOT_ERA_TOKEN,
 };
 use rmw_cerulion::ffi::{
     self, rcutils_allocator_t, rmw_context_t, rmw_init_options_t, RMW_RET_ERROR,
     RMW_RET_INCORRECT_RMW_IMPLEMENTATION, RMW_RET_OK,
 };
 use rmw_cerulion::test_seams::{
-    era_guard_panics_fired, BakedDistroOverrideGuard, EnvVarGuard, EraGuardPanicGuard,
-    ERA_GUARD_PANIC_MSG,
+    admitted_runtime_for, era_guard_panics_fired, BakedDistroOverrideGuard, EnvVarGuard,
+    EraGuardPanicGuard, ERA_GUARD_PANIC_MSG,
 };
 use rmw_cerulion::{
     rmw_context_fini, rmw_init, rmw_init_options_copy, rmw_init_options_fini,
@@ -52,8 +54,16 @@ use tracing_test::traced_test;
 
 const LEVELS: [&str; 5] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
 
-/// The phrase every refusal paragraph carries.
+/// The phrase every mismatch refusal paragraph carries.
 const REFUSAL_MARKER: &str = "built for a DIFFERENT ROS distro";
+
+/// The phrase every unset-distro refusal paragraph carries. Distinct from
+/// [`REFUSAL_MARKER`] on purpose: neither paragraph contains the other's
+/// marker, so an arm that expects one can never be satisfied by the other.
+const UNSET_REFUSAL_MARKER: &str = "sets no ROS_DISTRO";
+
+/// The environment variable the unset-distro refusal reports as missing.
+const RUNTIME_DISTRO_ENV: &str = "ROS_DISTRO";
 
 /// The poison word: no field of a zeroed-then-initialized options struct
 /// ever holds it, so a single stamped field shows up in the byte compare.
@@ -78,16 +88,40 @@ fn agreeing_runtime_for(claim: &'static str) -> &'static str {
     // and admits only that era's members — derived from the same row the
     // guard consults, never a literal (`kilted`, the earlier choice, is
     // now refused: 160-byte init options but a 112-byte MessageMember).
-    let token = if claim == VENDORED_DEV_DISTRO {
-        VENDORED_SNAPSHOT_ERA_TOKEN
-    } else if let Some(token) = claim.strip_prefix(ERA_CLAIM_PREFIX) {
-        token
-    } else {
-        return claim;
-    };
-    era_claim_members(token)
+    // The derivation itself lives in the crate, shared with the lib arms
+    // that must build their fixtures under an admitted runtime too: one
+    // answer, not two that can drift.
+    admitted_runtime_for(claim)
+}
+
+/// A GENERATED baked claim of the FIRST era that refuses an unnamed
+/// runtime, read from the guard's own tables rather than typed: the
+/// vendored snapshot's era is that era, and its admitted set holds the
+/// concrete distro names of it. A fixture typed as `"lyrical"` would keep
+/// passing after a table change that moved the bound.
+fn post_jazzy_claim() -> &'static str {
+    assert!(
+        era_claim_token_rank(VENDORED_SNAPSHOT_ERA_TOKEN)
+            .is_some_and(|rank| rank >= UNSET_DISTRO_REFUSED_FROM_ERA),
+        "the snapshot's era must be one the unset-distro guard refuses"
+    );
+    era_claim_members(VENDORED_SNAPSHOT_ERA_TOKEN)
         .and_then(|members| members.first().copied())
-        .unwrap_or_else(|| panic!("the build bakes `{claim}` but era.rs admits no member for it"))
+        .expect("the snapshot's era names at least one concrete distro")
+}
+
+/// A GENERATED baked claim of the era just BELOW the bound, whose unnamed
+/// runtime must still be admitted. `agreeing_runtime_for` proves it is a
+/// real runtime name; the rank assertion proves it is the right side of
+/// the boundary.
+fn pre_boundary_claim() -> &'static str {
+    let claim = "jazzy";
+    assert_eq!(
+        rmw_cerulion::era_check::distro_era_rank(claim),
+        Some(UNSET_DISTRO_REFUSED_FROM_ERA - 1),
+        "`{claim}` must be the era one below the unset-distro bound"
+    );
+    claim
 }
 
 /// An identifier that is NOT ours — a foreign rmw's, NUL-terminated.
@@ -279,6 +313,74 @@ fn check_refusal(lines: &[&str], entry: &str) -> Result<(), String> {
     }
     // The refusal line renders `built_for` LAST (era.rs, the mismatch
     // refusal): nothing may follow it.
+    if !has_field_starting_a_token(line, "built_for", built_for(), &[]) {
+        return Err(format!("refusal missing built_for={}: {line}", built_for()));
+    }
+    let extra = unexpected_loud_lines(lines, &[line]);
+    if !extra.is_empty() {
+        return Err(format!(
+            "unexpected loud line(s) beside the refusal:\n{}",
+            extra.join("\n")
+        ));
+    }
+    Ok(())
+}
+
+/// Exactly one unset-distro refusal line, at ERROR, whose BODY is exactly
+/// the constant paragraph plus the five structured fields in declaration
+/// order, naming the baked claim, the variable that was not set and the
+/// remedy command WITH the real distro name in it, and NO other loud line
+/// in the capture. The expected string is typed here, from the message a
+/// user reads, and never built by asking the code under test.
+fn check_unset_refusal(lines: &[&str], entry: &str, baked: &str) -> Result<(), String> {
+    let hits: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains(UNSET_REFUSAL_MARKER))
+        .collect();
+    if hits.len() != 1 {
+        return Err(format!(
+            "expected exactly 1 unset-distro refusal line, got {}:\n{}",
+            hits.len(),
+            lines.join("\n")
+        ));
+    }
+    let line = hits[0];
+    if line_level(line) != Some("ERROR") {
+        return Err(format!("refusal not at ERROR level: {line}"));
+    }
+    // `rcl_error_channel=unavailable`: a cargo test process maps no
+    // librcutils, so the rcl channel is provably absent here.
+    let expected = format!(
+        "{UNSET_DISTRO_REFUSAL} entry={entry} baked_ros_distro={baked} missing_env=ROS_DISTRO \
+         remedy=source /opt/ros/{baked}/setup.bash rcl_error_channel=unavailable built_for={}",
+        built_for()
+    );
+    let body = body_of(line);
+    if body != expected {
+        return Err(format!(
+            "refusal body is not exactly the paragraph + fields:\n  got:  {body}\n  want: {expected}"
+        ));
+    }
+    for (key, value) in [
+        ("entry", entry),
+        ("baked_ros_distro", baked),
+        ("missing_env", RUNTIME_DISTRO_ENV),
+    ] {
+        if !has_field(line, key, value) {
+            return Err(format!("refusal missing {key}={value}: {line}"));
+        }
+    }
+    // The remedy value carries a space, so it is bounded by the key that
+    // follows it in the emission rather than by whitespace.
+    if !has_field_starting_a_token(
+        line,
+        "remedy",
+        &format!("source /opt/ros/{baked}/setup.bash"),
+        &["rcl_error_channel"],
+    ) {
+        return Err(format!("refusal missing the remedy command: {line}"));
+    }
     if !has_field_starting_a_token(line, "built_for", built_for(), &[]) {
         return Err(format!("refusal missing built_for={}: {line}", built_for()));
     }
@@ -574,6 +676,176 @@ fn a_panic_inside_the_era_guard_degrades_to_the_failure_code_not_an_abort() {
 #[test]
 #[traced_test]
 #[serial]
+fn a_post_jazzy_build_under_an_unnamed_runtime_refuses_every_guarded_entry_point() {
+    // The behaviour at the entry points a user reaches: a GENERATED build of
+    // a post-Jazzy era loaded by a process that sets no ROS_DISTRO refuses,
+    // before a byte of the caller's struct moves, and the line it emits is
+    // the whole message the operator reads: the paragraph, the baked
+    // claim, the variable that was not set and a remedy they can paste.
+    //
+    // The fixtures are built FIRST, under a runtime the build's own claim
+    // admits: the guard is in `rmw_init_options_init` too, so a fixture
+    // built after the arming would be refused instead of prepared.
+    let src = initialized_options();
+    let src_before = words_of(&src);
+    let mut fini_target = initialized_options();
+    let fini_before = words_of(&fini_target);
+    let claim = post_jazzy_claim();
+
+    let _baked = BakedDistroOverrideGuard::set(claim);
+    let _env = EnvVarGuard::unset(RUNTIME_DISTRO_ENV);
+
+    // `rmw_init_options_init`: refused with the poisoned buffer untouched.
+    let mut buffer = poisoned_uninitialized_options();
+    let before = buffer.clone();
+    let allocator: rcutils_allocator_t = unsafe { std::mem::zeroed() };
+    let ret =
+        unsafe { rmw_init_options_init(buffer.as_mut_ptr() as *mut rmw_init_options_t, allocator) };
+    assert_eq!(
+        ret, RMW_RET_ERROR,
+        "a {claim} build with no ROS_DISTRO must refuse"
+    );
+    assert_eq!(
+        buffer, before,
+        "rmw_init_options_init wrote into the caller's struct before refusing"
+    );
+    logs_assert(|lines: &[&str]| check_unset_refusal(lines, "rmw_init_options_init", claim));
+
+    // `_copy`: `dst` untouched and `src` read-only.
+    let mut dst = poisoned_uninitialized_options();
+    let dst_before = dst.clone();
+    let ret = unsafe { rmw_init_options_copy(&src, dst.as_mut_ptr() as *mut rmw_init_options_t) };
+    assert_eq!(ret, RMW_RET_ERROR);
+    assert_eq!(
+        dst, dst_before,
+        "rmw_init_options_copy memcpy'd into `dst` before refusing"
+    );
+    assert_eq!(
+        words_of(&src),
+        src_before,
+        "`src` must be read-only either way"
+    );
+
+    // `_fini`: not zeroed.
+    let ret = unsafe { rmw_init_options_fini(&mut fini_target) };
+    assert_eq!(ret, RMW_RET_ERROR);
+    assert_eq!(
+        words_of(&fini_target),
+        fini_before,
+        "rmw_init_options_fini zeroed the struct before refusing"
+    );
+
+    // `rmw_init`: defense in depth for a hand-stamped static struct, with
+    // the context untouched.
+    let mut stamped: rmw_init_options_t = unsafe { std::mem::zeroed() };
+    stamped.implementation_identifier = ffi::implementation_identifier_ptr();
+    let mut context = poisoned_words::<rmw_context_t>();
+    let context_before = context.clone();
+    let ret = unsafe { rmw_init(&stamped, context.as_mut_ptr() as *mut rmw_context_t) };
+    assert_eq!(ret, RMW_RET_ERROR);
+    assert_eq!(
+        context, context_before,
+        "rmw_init wrote into the caller's context before refusing"
+    );
+    // Four refusals, one per entry point, each naming its own entry and
+    // carrying the same paragraph, remedy and baked claim. Nothing else
+    // loud: a second diagnostic beside any of them fails here.
+    logs_assert(|lines: &[&str]| {
+        let refusals: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains(UNSET_REFUSAL_MARKER))
+            .collect();
+        if refusals.len() != 4 {
+            return Err(format!(
+                "expected one refusal per guarded entry point, got {}:\n{}",
+                refusals.len(),
+                lines.join("\n")
+            ));
+        }
+        for (entry, line) in [
+            "rmw_init_options_init",
+            "rmw_init_options_copy",
+            "rmw_init_options_fini",
+            "rmw_init",
+        ]
+        .into_iter()
+        .zip(refusals.iter().copied())
+        {
+            check_unset_refusal(&[line], entry, claim)?;
+        }
+        let extra = unexpected_loud_lines(lines, &refusals);
+        if !extra.is_empty() {
+            return Err(format!("unexpected loud line(s):\n{}", extra.join("\n")));
+        }
+        Ok(())
+    });
+}
+
+#[test]
+#[traced_test]
+#[serial]
+fn an_unnamed_runtime_still_admits_the_era_below_the_bound_and_a_named_one_admits_above_it() {
+    // BOTH SIDES of the boundary, through the real C entry point:
+    //
+    // * the era one rank BELOW the bound with no ROS_DISTRO at all keeps
+    //   passing, and really writes, because the refusal must not over-reach into
+    //   the distros a headerless run is still allowed to serve;
+    // * the refusing era WITH its own ROS_DISTRO named passes too, and
+    //   really writes, because the refusal is about the absence, never about the
+    //   era.
+    //
+    // Both arms end in a real write, so neither can pass by refusing.
+    for (claim, runtime) in [
+        (pre_boundary_claim(), None),
+        (post_jazzy_claim(), Some(post_jazzy_claim())),
+    ] {
+        let _baked = BakedDistroOverrideGuard::set(claim);
+        let _env = match runtime {
+            Some(distro) => EnvVarGuard::set(RUNTIME_DISTRO_ENV, distro),
+            None => EnvVarGuard::unset(RUNTIME_DISTRO_ENV),
+        };
+        let mut buffer = poisoned_uninitialized_options();
+        let before = buffer.clone();
+        let allocator: rcutils_allocator_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            rmw_init_options_init(buffer.as_mut_ptr() as *mut rmw_init_options_t, allocator)
+        };
+        assert_eq!(
+            ret, RMW_RET_OK,
+            "claim `{claim}` under ROS_DISTRO {runtime:?} must be admitted"
+        );
+        assert_ne!(
+            buffer, before,
+            "claim `{claim}`: an admitted init must WRITE (the poison moved)"
+        );
+        assert_ne!(
+            buffer[IDENTIFIER_WORD], 0,
+            "claim `{claim}`: the identifier was stamped"
+        );
+        let ret = unsafe { rmw_init_options_fini(buffer.as_mut_ptr() as *mut rmw_init_options_t) };
+        assert_eq!(ret, RMW_RET_OK, "claim `{claim}`: fini must succeed");
+    }
+    // Anti-tautology anchor: every assertion above is positive or a
+    // silence, so an EMPTY capture would satisfy the loud-line check.
+    // Drive ONE unset refusal and require exactly it, so the capture must
+    // be able to see the seam it just claimed was quiet.
+    {
+        let claim = post_jazzy_claim();
+        let _baked = BakedDistroOverrideGuard::set(claim);
+        let _env = EnvVarGuard::unset(RUNTIME_DISTRO_ENV);
+        let mut buffer = poisoned_uninitialized_options();
+        let ret = unsafe { rmw_init_options_fini(buffer.as_mut_ptr() as *mut rmw_init_options_t) };
+        assert_eq!(ret, RMW_RET_ERROR, "the anchor refusal must refuse");
+    }
+    logs_assert(|lines: &[&str]| {
+        check_unset_refusal(lines, "rmw_init_options_fini", post_jazzy_claim())
+    });
+}
+
+#[test]
+#[traced_test]
+#[serial]
 fn pass_one_names_a_runtime_the_builds_own_claim_admits_for_every_claim_shape() {
     // Every claim shape build.rs can bake, pinned
     // to the guard ITSELF — the selected runtime must be admitted by that
@@ -768,7 +1040,16 @@ fn era_probe_child() {
     // MISMATCH: the override supplies the baked side; the parent supplied
     // ROS_DISTRO=kilted. AGREE: no override — the build's own claim
     // against a ROS_DISTRO it admits (also supplied by the parent).
-    let _override = (mode == "mismatch").then(|| BakedDistroOverrideGuard::set("jazzy"));
+    // UNSET / UNSET_AGREE: a post-Jazzy generated claim, with the parent
+    // REMOVING ROS_DISTRO for the first and naming an admitted distro for
+    // the second. An unknown mode panics rather than silently behaving like
+    // AGREE, which would make the refusing arms vacuous.
+    let _override = match mode.as_str() {
+        "mismatch" => Some(BakedDistroOverrideGuard::set("jazzy")),
+        "unset" | "unset_agree" => Some(BakedDistroOverrideGuard::set(post_jazzy_claim())),
+        "agree" => None,
+        unknown => panic!("unknown probe mode `{unknown}`"),
+    };
     let page = InaccessiblePage::new();
     let other = InaccessiblePage::new();
     {
@@ -792,9 +1073,21 @@ fn era_probe_child() {
 }
 
 /// Spawn the child for `entry` under `mode` with the given `ROS_DISTRO`.
-fn probe(entry: &str, mode: &str, runtime_distro: &str) -> (std::process::ExitStatus, String) {
+/// `None` REMOVES the variable, which is the unset-distro arms' whole
+/// subject (a child that merely inherited an empty value would prove
+/// nothing about an absent one).
+fn probe(
+    entry: &str,
+    mode: &str,
+    runtime_distro: Option<&str>,
+) -> (std::process::ExitStatus, String) {
     let exe = std::env::current_exe().expect("current_exe");
-    let out = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    match runtime_distro {
+        Some(distro) => command.env(RUNTIME_DISTRO_ENV, distro),
+        None => command.env_remove(RUNTIME_DISTRO_ENV),
+    };
+    let out = command
         .args([
             "--exact",
             "era_probe_child",
@@ -804,7 +1097,6 @@ fn probe(entry: &str, mode: &str, runtime_distro: &str) -> (std::process::ExitSt
         ])
         .env(PROBE_ENTRY_ENV, entry)
         .env(PROBE_MODE_ENV, mode)
-        .env("ROS_DISTRO", runtime_distro)
         // The child has NO test subscriber: the refusal reaches its stderr
         // only through the PRODUCTION installer and the DEFAULT filter —
         // exactly the channel a real host sees — so a lane's RUST_LOG must
@@ -823,7 +1115,7 @@ fn assert_refuses_without_touching_caller_memory(entry: &str) {
     use std::os::unix::process::ExitStatusExt;
 
     // MISMATCH: refusal, and the PROT_NONE page was never touched.
-    let (status, stderr) = probe(entry, "mismatch", "kilted");
+    let (status, stderr) = probe(entry, "mismatch", Some("kilted"));
     assert!(
         stderr.contains(PROBE_REACHED),
         "{entry}: the child must REACH the call before anything else happens:\n{stderr}"
@@ -882,7 +1174,7 @@ fn assert_refuses_without_touching_caller_memory(entry: &str) {
 
     // AGREE: the same page under the same entry must FAULT on first touch —
     // proof the fixture detects reads at all.
-    let (status, stderr) = probe(entry, "agree", agreeing_runtime_for(baked_distro()));
+    let (status, stderr) = probe(entry, "agree", Some(agreeing_runtime_for(baked_distro())));
     assert!(
         stderr.contains(PROBE_REACHED),
         "{entry}: the agreeing child must REACH the call:\n{stderr}"
@@ -918,6 +1210,104 @@ fn options_fini_on_a_mismatched_era_refuses_without_reading_the_callers_struct()
 #[serial]
 fn rmw_init_on_a_mismatched_era_refuses_without_reading_options_or_context() {
     assert_refuses_without_touching_caller_memory("rmw_init");
+}
+
+#[test]
+#[serial]
+fn a_post_jazzy_build_under_an_unnamed_runtime_refuses_without_reading_the_callers_struct() {
+    // The READ-detecting proof for the unset-distro refusal, the same
+    // two-mode contract the mismatch probes use, in a CHILD process whose
+    // ROS_DISTRO is genuinely REMOVED (not emptied) and whose caller struct
+    // is a PROT_NONE page:
+    //
+    // * UNSET (post-Jazzy claim, no ROS_DISTRO): the entry must return the
+    //   refusal WITHOUT touching the page. A pre-guard read faults, the
+    //   child dies by signal, and the arm fails.
+    // * UNSET_AGREE (the same claim, ROS_DISTRO naming its own distro): the
+    //   same page under the same entry must FAULT, proof the fixture
+    //   detects reads at all, so "returned normally" above means "never
+    //   touched".
+    //
+    // The child also has no test subscriber, so the paragraph reaches its
+    // stderr through the PRODUCTION installer and the default filter,
+    // the channel a real host sees.
+    use std::os::unix::process::ExitStatusExt;
+    let entry = "options_init";
+    let claim = post_jazzy_claim();
+
+    let (status, stderr) = probe(entry, "unset", None);
+    assert!(
+        stderr.contains(PROBE_REACHED),
+        "the child must REACH the call before anything else happens:\n{stderr}"
+    );
+    assert_eq!(
+        status.signal(),
+        None,
+        "the child died by signal {:?} with no ROS_DISTRO: the entry point touched the \
+         caller's struct BEFORE the era guard:\n{stderr}",
+        status.signal()
+    );
+    assert_eq!(
+        status.code(),
+        Some(PROBE_EXIT_OFFSET + RMW_RET_ERROR),
+        "the child must exit with the refusal code, got {status:?}:\n{stderr}"
+    );
+    let refusals: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains(UNSET_REFUSAL_MARKER))
+        .collect();
+    let [refusal] = refusals[..] else {
+        panic!(
+            "expected exactly one refusal on the child's stderr, got {}:\n{stderr}",
+            refusals.len()
+        );
+    };
+    assert_eq!(line_level(refusal), Some("ERROR"), "{refusal}");
+    let other_loud: Vec<&str> = stderr
+        .lines()
+        .filter(|l| *l != refusal && matches!(line_level(l), Some("ERROR") | Some("WARN")))
+        .collect();
+    assert!(
+        other_loud.is_empty(),
+        "loud line(s) beside the refusal:\n{}",
+        other_loud.join("\n")
+    );
+    // The remedy the operator reads, on the real channel: the whole command
+    // with the real distro name in it, never a placeholder.
+    assert!(
+        has_field_starting_a_token(
+            refusal,
+            "remedy",
+            &format!("source /opt/ros/{claim}/setup.bash"),
+            &["rcl_error_channel"],
+        ),
+        "the child's refusal must carry the remedy command: {refusal}"
+    );
+    for (key, value) in [
+        ("entry", "rmw_init_options_init"),
+        ("baked_ros_distro", claim),
+        ("missing_env", RUNTIME_DISTRO_ENV),
+    ] {
+        assert!(
+            has_field(refusal, key, value),
+            "the child's refusal is missing {key}={value}: {refusal}"
+        );
+    }
+
+    // The anti-tautology: the same claim WITH its ROS_DISTRO named is
+    // admitted, reaches the page and faults.
+    let (status, stderr) = probe(entry, "unset_agree", Some(claim));
+    assert!(
+        stderr.contains(PROBE_REACHED),
+        "the admitted child must REACH the call:\n{stderr}"
+    );
+    let signal = status.signal();
+    assert!(
+        matches!(signal, Some(s) if s == libc::SIGSEGV || s == libc::SIGBUS),
+        "under a NAMED runtime the PROT_NONE page must fault (SIGSEGV/SIGBUS): a child that \
+         exited ({status:?}) means the page was never touched, which would make the refusing \
+         arm vacuous:\n{stderr}"
+    );
 }
 
 #[test]
