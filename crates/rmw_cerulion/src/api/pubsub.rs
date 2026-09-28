@@ -2604,14 +2604,15 @@ unsafe fn take_impl(
         }
         // A member this build's C++ typesupport gives no way to WRITE
         // (a `bool[]` before Humble: the generator emits no `assign` for
-        // `std::vector<bool>`) makes every frame of this type undeliverable.
+        // `std::vector<bool>`), at the top level or inside a nested message,
+        // makes every frame of this type undeliverable.
         // Decided at registration, so this is one `Option` read per frame,
         // and taken BEFORE `unflatten` so the caller's message is untouched.
         // The frame is consumed and dropped through the SAME latch and
         // regime as every other decode refusal, with the member named,
         // never as a generic malformed-entry warning, which would blame the
         // wire for a limit of this build.
-        if let Some((var_idx, member)) = data.bridge.unwritable_bool_seq() {
+        if let Some((var_idx, path)) = data.bridge.unwritable_bool_seq() {
             crate::decode_failure_latch::report_decode_entry_refused(
                 &data.decode_failures,
                 crate::decode_failure_latch::DecodeSite::Subscription,
@@ -2619,7 +2620,7 @@ unsafe fn take_impl(
                 &data.type_name,
                 msg.payload().len(),
                 var_idx,
-                &crate::type_bridge_cpp::bool_seq_no_assign_detail(member),
+                &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
             );
             return;
         }
@@ -3047,10 +3048,11 @@ unsafe fn take_adopted(
     // member, and an unaligned forged entry) still fail mid-decode — exactly
     // as the plain copying take does.
     // The type-level blocker first (see the copying take's arm): a member
-    // this build cannot write refuses the frame here, before the entry walk
-    // and before any write, with the member named. Read off the bridge, so it
-    // borrows nothing from the held sample.
-    if let Some((var_idx, member)) = data.bridge.unwritable_bool_seq() {
+    // this build cannot write, at the top level or inside a nested message,
+    // refuses the frame here, before the entry walk and before any write,
+    // with the member named. Read off the bridge, so it borrows nothing from
+    // the held sample.
+    if let Some((var_idx, path)) = data.bridge.unwritable_bool_seq() {
         let body_len = owned.payload().len() - WireHeader::SIZE;
         drop(owned);
         crate::decode_failure_latch::report_decode_entry_refused(
@@ -3060,7 +3062,7 @@ unsafe fn take_adopted(
             &data.type_name,
             body_len,
             var_idx,
-            &crate::type_bridge_cpp::bool_seq_no_assign_detail(member),
+            &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
         );
         return RMW_RET_OK;
     }
@@ -3787,6 +3789,31 @@ unsafe fn take_loaned_impl(
             cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
             &data.topic,
         );
+    }
+    // The type-level blocker (see the copying take's arm): a member this
+    // build cannot write refuses the frame HERE, before the forge writes its
+    // first field into the shadow, with the member named. The shadow goes
+    // back to the pool UNUSED rather than being retired with copies in it,
+    // and the frame is consumed and dropped through the same reporter the
+    // other two take paths use, so a subscriber on such a topic neither
+    // churns the shadow pool nor reads a malformed-entry line blaming the
+    // wire for a limit of this build.
+    if let Some((var_idx, path)) = data.bridge.unwritable_bool_seq() {
+        if let Some(s) = shadow.take() {
+            inner.shadows.release(s);
+        }
+        let body_len = owned.payload().len() - WireHeader::SIZE;
+        drop(owned);
+        crate::decode_failure_latch::report_decode_entry_refused(
+            &data.decode_failures,
+            crate::decode_failure_latch::DecodeSite::Subscription,
+            &data.topic,
+            &data.type_name,
+            body_len,
+            var_idx,
+            &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+        );
+        return RMW_RET_OK;
     }
     let ts = header.timestamp_ns;
     let seq = header.sequence as u64;
