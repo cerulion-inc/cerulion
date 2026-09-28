@@ -70,15 +70,20 @@ const REGION: &[Scanned] = &[
         path: "crates/cerulion_core/src/state_carrier/fork.rs",
         min_markers: 1,
     },
-    // ONE, and it is a different one than before. This file's only 40-byte
-    // sentence used to be the trace ring's, on a plane this sweep does not
-    // cover, so the minimum was satisfied by prose that could stay while every
-    // state record sentence in the file went. The state channel's own
-    // descriptor now states the framing it actually writes, and that sentence
-    // is the one the minimum counts.
+    // TWO, and where they sit matters more than how many there are. This
+    // file's only 40-byte sentence used to be the trace ring's, on a plane this
+    // sweep does not cover, so the minimum was satisfied by prose that could
+    // stay while every state record sentence in the file went. That is closed,
+    // but a count is still a count: it is met by a framing sentence ANYWHERE in
+    // the file. The framing is now stated in the doc of the function that
+    // DECLARES the state channel as well as beside the descriptor line, the
+    // minimum counts both, and
+    // `the_writers_state_channel_doc_carries_the_framing_the_control_rests_on`
+    // proves the declaring function's doc is load bearing by cutting it out and
+    // watching this minimum fail.
     Scanned {
         path: "crates/cerulion_bag/src/writer.rs",
-        min_markers: 1,
+        min_markers: 2,
     },
     Scanned {
         path: "crates/cerulion_bagd/src/anchor_window.rs",
@@ -232,6 +237,30 @@ fn names_the_trace_ring_plane(line: &str) -> bool {
 /// did once and wrote down, so it is exactly the class this file reads for.
 const RETIRED_DERIVED_COUNTS: &[&str] = &["1.09 M", "1_092_267", "1092267"];
 
+/// The contiguous `///` doc block immediately above the line that introduces
+/// `item`, joined back into one string, or `None` when the item carries none.
+///
+/// This is the STRUCTURAL reader, and it exists because a count is a weak
+/// anchor. A file's minimum is met by a framing sentence ANYWHERE in it, so the
+/// doc that actually carries the fact can be reworded away while an unrelated
+/// sentence elsewhere holds the count up. A doc block is tied to the item it
+/// describes by the language itself, so a control anchored on one fails when
+/// the fact leaves the declaration that owns it.
+fn doc_block_above(text: &str, item: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with(item))?;
+    let mut first = at;
+    while first > 0 && lines[first - 1].trim_start().starts_with("///") {
+        first -= 1;
+    }
+    if first == at {
+        return None;
+    }
+    Some(lines[first..at].join("\n"))
+}
+
 /// Does this line carry a state record framing number that moved, EXCUSES ASIDE?
 fn carries_a_stale_framing_literal(line: &str) -> bool {
     carries_a_stale_header_size(line)
@@ -287,9 +316,13 @@ const CURRENT_DERIVED_COUNTS: &[&str] = &["1.11 M", "1_110_780", "139"];
 /// Does this line RESERVE everything from `first` upward?
 ///
 /// The claim is made of TWO parts, the range and the word, and this asks for both
-/// rather than for one spelling of the sentence that joins them. Both halves are
-/// token bound on a number boundary so `14+` and `240 and above`, which reserve a
-/// range nothing here mints, are not swept up with it.
+/// rather than for one spelling of the sentence that joins them. Every range
+/// spelling is bound against a number boundary on its LEADING edge, which is the
+/// edge that does the work here: it is what keeps `14+` and `240 and above`,
+/// which reserve a range nothing here mints, from being swept up with it. Three
+/// of the four are bound on the trailing edge too; the `and above` spelling is
+/// bound in front only, because what follows it is a word rather than a digit
+/// and a bound there would buy nothing.
 ///
 /// `first` is a PARAMETER because the detector and the control that proves it
 /// found the right sentence are the same claim about two different numbers: the
@@ -304,13 +337,15 @@ fn reserves_everything_from(line: &str, first: &str) -> bool {
 
 /// Does this lowercased line NAME the range running upward from `first`?
 ///
-/// Three spellings, the last written with and without its space, because the
-/// detector reads a claim rather than a wording and a range has more than one
-/// way to be written down. `4 and up` is deliberately
-/// ABSENT and that is a stated residual, not an oversight: `state_ring.rs` says
-/// "its own doc already reserved 4 and up for" in the PAST tense, recording what
-/// the previous format's doc claimed, and a detector that reads that history as a
-/// live reservation reds a correct tree.
+/// Three spellings, the last written with and without its space. That is wider
+/// than one wording and NARROWER than the claim, which is the honest way to read
+/// it: `4 and up`, `4 or higher` and `4 onward` reserve the same range in the
+/// same breath and every one of them walks through. The first of those is not
+/// merely unread, it is deliberately ABSENT and that is a stated residual rather
+/// than an oversight: `state_ring.rs` says "its own doc already reserved 4 and
+/// up for" in the PAST tense, recording what the previous format's doc claimed,
+/// and a detector that reads that history as a live reservation reds a correct
+/// tree. The other two are unread and nothing here forces them to stay so.
 fn names_the_range_from(lower: &str, first: &str) -> bool {
     contains_token(lower, &format!("{first}+"), is_number_char)
         || starts_a_token(lower, &format!("{first} and above"), is_number_char)
@@ -712,4 +747,66 @@ fn the_reserved_range_detector_reads_the_claim_and_not_one_wording_of_it() {
              the reservation, or it stops witnessing anything: {not_that_reservation}"
         );
     }
+}
+
+/// `cerulion_bag/src/writer.rs` states the state channel's framing in the DOC
+/// of the function that declares the channel, and the control is that cutting
+/// that doc out fails the sweep.
+///
+/// What this closes is not a wrong count, it is what the count RESTS ON. The
+/// whole of this file's minimum used to be carried by one comment in the middle
+/// of a function body: prose a reflow, a tidy or an unrelated refactor can take
+/// away without touching a line of code, and the sweep would have read the loss
+/// as a file that simply says less. The framing is now stated on the doc of
+/// `reserved_channels`, the item that declares `__cerulion/state` and the
+/// record width its descriptor carries, so the fact sits on the declaration the
+/// language ties it to.
+///
+/// Both halves are here. The doc must name the header width, the payload region
+/// and the record size; and with the doc block cut out of the text, the file's
+/// marker count must fall UNDER its own region minimum, which is what proves
+/// the minimum is resting on this doc rather than on prose elsewhere in the
+/// file.
+#[test]
+fn the_writers_state_channel_doc_carries_the_framing_the_control_rests_on() {
+    let path = "crates/cerulion_bag/src/writer.rs";
+    let text = std::fs::read_to_string(repo_root().join(path)).expect("writer.rs");
+    let doc = doc_block_above(&text, "fn reserved_channels(")
+        .expect("the function that declares the reserved channels must carry a doc block");
+    assert!(
+        doc.lines().any(carries_a_current_framing_marker),
+        "the declaring function's own doc must state the framing it declares:\n{doc}"
+    );
+    for number in ["40-byte", "472", "512-byte"] {
+        assert!(
+            doc.contains(number),
+            "the doc must name the record shape whole, and {number} is missing \
+             from it:\n{doc}"
+        );
+    }
+
+    // THE CONTROL: cut that doc block out and the file falls under the minimum
+    // the region declares for it. Without this the test above is satisfied by a
+    // doc that says the right thing while the minimum leans on something else,
+    // which is the exact shape of the vacuity this file exists to catch.
+    let min = REGION
+        .iter()
+        .find(|f| f.path == path)
+        .expect("writer.rs is in the scan region")
+        .min_markers;
+    let without = text.replace(&doc, "");
+    assert!(
+        without.len() < text.len(),
+        "the doc block must really have been cut out of the text"
+    );
+    let left = without
+        .lines()
+        .filter(|l| carries_a_current_framing_marker(l))
+        .count();
+    assert!(
+        left < min,
+        "cutting the declaring function's doc must FAIL the sweep, or this \
+         file's control is resting on prose somewhere else in it: {left} \
+         markers left, minimum {min}"
+    );
 }

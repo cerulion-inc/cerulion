@@ -19,9 +19,10 @@
 //!
 //! Two shapes cannot be read and are named instead of worked around:
 //!
-//! - **`rings_declared > 1`.** A state record carries its producer's RANK, and
-//!   the coverage manifest carries the ring to rank join, so the bag does say
-//!   which ring a record came from. What is still rankless is this READER: its
+//! - **`rings_declared > 1`.** From state record format version 1 a state
+//!   record carries its producer's RANK, and the coverage manifest carries the
+//!   ring to rank join, so a recording of that format does say which ring a
+//!   record came from. What is still rankless is this READER: its
 //!   index table is keyed by `node_idx` alone, and [`StateAssembler`] groups
 //!   parts by `(run_id, step, node_idx)`, which carries no rank either. Every
 //!   ring numbers its own nodes from 0, so with two declared rings two
@@ -114,19 +115,41 @@ impl BagAnchors {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AnchorReadRefusal {
     /// The bag declares more than one state ring, so `node_idx` is ambiguous.
+    ///
+    /// The rank clause is a property of the FORMAT, and the version in it is a
+    /// literal 1 rather than `STATE_RECORD_FORMAT_VERSION`: rank arrived on the
+    /// record at version 1 and stays arrived whatever this build reads, so
+    /// templating the number would make the sentence claim the property began
+    /// wherever the constant happens to sit.
+    ///
+    /// The claim about the BAG AT HAND is the second clause, and it branches on
+    /// what the manifest proves. A manifest naming no state record format is a
+    /// recording from before the key existed, and telling its operator that its
+    /// records carry a rank is the same false sentence one bag population over.
     #[error(
-        "this recording drained {rings} state rings. Its state records carry their producer's \
-         rank and its coverage manifest carries the ring to rank join, so the bag does say which \
-         ring a record came from, but this reader keys its index table and its assembler by node \
-         index alone. Every ring numbers its own nodes from 0, so two producers' first nodes \
-         would collide before that join could be consulted, and applying one node's recorded \
+        "this recording drained {rings} state rings. From state record format version 1 a state \
+         record carries its producer's rank and the coverage manifest carries the ring to rank \
+         join, so a recording of that format does say which ring each record came from; {}. \
+         What is rankless in either case is this READER: its index table is keyed by node index \
+         alone, and its assembler groups parts by run, step and node index, and neither of those \
+         keys carries a rank. Every ring numbers its own nodes from 0, so two producers' first \
+         nodes would collide before any join could be consulted, and applying one node's recorded \
          state to another would produce a confident divergence report about an execution that \
          never happened. Fix: replay a recording of a single rank (`cerulion graph run --record \
-         --single-process`)"
+         --single-process`)",
+        match state_record_format {
+            Some(v) => format!("this recording's manifest names state record format version {v}"),
+            None => "this recording's manifest names no state record format at all, so it makes \
+                     no such claim about its own records"
+                .to_string(),
+        }
     )]
     MultiRingAmbiguous {
         /// How many rings the manifest declares.
         rings: usize,
+        /// The state record format the manifest names, or `None` when it names
+        /// none, which is every recording from before the key existed.
+        state_record_format: Option<u32>,
     },
 
     /// The anchors at the resume step belong to more than one run.
@@ -422,6 +445,7 @@ pub fn read_bag_anchors(reader: &BagReader) -> Result<BagAnchors, AnchorReadRefu
     if coverage.rings_declared > 1 {
         return Err(AnchorReadRefusal::MultiRingAmbiguous {
             rings: coverage.rings_declared,
+            state_record_format: coverage.state_record_format_version,
         });
     }
     // The version gate, BOTH WAYS, and it lives HERE rather than in the parse.
@@ -735,22 +759,30 @@ mod tests {
         assert!(cov.rings_declared > 1);
         let refusal = AnchorReadRefusal::MultiRingAmbiguous {
             rings: cov.rings_declared,
+            state_record_format: cov.state_record_format_version,
         };
         let text = refusal.to_string();
         assert!(text.contains("2 state rings"), "{text}");
         assert!(text.contains("--single-process"), "names the fix: {text}");
 
-        // And the sentence says what is ACTUALLY true of the bag, which is the
-        // half that went stale under this stack. The records carry their
-        // producer's rank from state record format version 1 on and the
-        // manifest carries the ring to rank join, so a sentence claiming the
-        // bag cannot say which ring a record came from is false, and the remedy
-        // it used to name, re-record once the records carry their rank, is a
-        // LOOP: the operator re-records, the records carry their rank exactly as
-        // they already did, and the same refusal fires.
+        // And the sentence says what is ACTUALLY true, which is the half that
+        // went stale under this stack. The rank clause is a property of the
+        // FORMAT and is stated as one, so it holds for every bag that reads
+        // this sentence: from state record format version 1 the records carry
+        // their producer's rank and the manifest carries the ring to rank
+        // join. The remedy the sentence used to name, re-record once the
+        // records carry their rank, is a LOOP: the operator re-records, the
+        // records carry their rank exactly as they already did, and the same
+        // refusal fires.
         assert!(
-            text.contains("carry their producer's rank"),
-            "the refusal states what the records carry: {text}"
+            text.contains(
+                "From state record format version 1 a state record carries its producer's rank"
+            ),
+            "the clause is about the FORMAT, not about this bag: {text}"
+        );
+        assert!(
+            text.contains("the coverage manifest carries the ring to rank join"),
+            "and it names the other half of the format's own claim: {text}"
         );
         assert!(
             !text.contains("no rank"),
@@ -764,6 +796,49 @@ mod tests {
         assert!(
             text.contains("replay a recording of a single rank"),
             "the remedy is the one that actually clears the refusal: {text}"
+        );
+
+        // THE BRANCH, which is the half a format-level clause alone does not
+        // buy. The ring gate is asked BEFORE the format gate, so a two-ring bag
+        // whose manifest names no state record format reads this same
+        // sentence, and that bag is a recording from before rank existed. It
+        // gets the property of the format, which is true whoever reads it, and
+        // NO claim that its own records carry a rank.
+        let pre_rank = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: None,
+        }
+        .to_string();
+        assert!(
+            pre_rank.contains(
+                "From state record format version 1 a state record carries its producer's rank"
+            ),
+            "the format's property holds for every bag: {pre_rank}"
+        );
+        assert!(
+            pre_rank.contains("names no state record format at all"),
+            "and the bag clause says what THIS bag proves: {pre_rank}"
+        );
+        assert!(
+            !pre_rank.contains("manifest names state record format version"),
+            "a pre-rank recording is never told its manifest names a format it \
+             does not name: {pre_rank}"
+        );
+
+        // And the bag that DOES name one is told which, so the branch is a
+        // branch rather than one arm wearing two.
+        let named = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: Some(1),
+        }
+        .to_string();
+        assert!(
+            named.contains("manifest names state record format version 1"),
+            "the bag clause names the version the manifest carries: {named}"
+        );
+        assert!(
+            !named.contains("names no state record format at all"),
+            "and not the other arm: {named}"
         );
     }
 
@@ -1081,17 +1156,27 @@ mod tests {
             "and says the recording is not the thing at fault: {text}"
         );
 
-        // THE ABSENCE, and it is asserted at a seam that can SEE it. This read
-        // the same call again and asked `is_err()`, three lines under an
+        // THE DERIVATION, and it is asserted at a seam that can SEE it. This
+        // read the same call again and asked `is_err()`, three lines under an
         // `assert_eq!` on the whole error value: it could not fail while the
         // assertion above it passed, and it would pass unchanged if the early
         // return were deleted and the assembler let loose on these records.
         //
-        // What can only hold if NO record was read: hand the same version 2
-        // manifest a stream of records this build would reject one by one, and
-        // require the same version refusal anyway. A reader that reached the
-        // records would answer with their malformed count instead, which is what
-        // the control below shows it does when the gate admits the bag.
+        // What THIS assertion pins, and the whole of it: the version decision
+        // is taken from the MANIFEST and not from the records. Hand the same
+        // version 2 manifest a stream of records this build rejects one by one
+        // and the answer is still the version refusal, so a reader that read
+        // the decision off the record stream is caught. The control under it is
+        // what makes that mean anything: at this build's version those very
+        // same records are walked and counted.
+        //
+        // What it does NOT pin is the PLACEMENT. A gate that keeps the manifest
+        // decision and simply asks it AFTER the walk returns this identical
+        // error value, because no count rides the `Err` path for a caller to
+        // see. That is pinned by
+        // `the_record_format_gate_fires_before_a_single_record_is_opened`
+        // below, which reads what the walk leaves behind rather than what it
+        // returns.
         let malformed = vec![unreadable_record(), unreadable_record()];
         assert_eq!(
             craft_and_read(&manifest_json(Some("2"), 1), &malformed)
@@ -1129,6 +1214,76 @@ mod tests {
         assert_eq!(ok.malformed_records, 0, "and nothing malformed about them");
     }
 
+    /// The record format gate fires BEFORE a single record is opened, and the
+    /// witness is a report the walk cannot help leaving behind.
+    ///
+    /// The assertion above it pins the DERIVATION: the version decision is
+    /// taken from the manifest, so a reader that derived it from the record
+    /// stream fails there. It cannot pin the PLACEMENT, and that is a gap
+    /// rather than a quibble. A gate moved to the very end of the function,
+    /// walking every record first and asking the manifest afterwards, returns
+    /// the IDENTICAL error value: no count and no marker rides the `Err` path,
+    /// so the two placements cannot be told apart by what the reader RETURNS.
+    ///
+    /// They can be told apart by what the walk LEAVES BEHIND. Records whose
+    /// node index no manifest entry names are reported by name once they are
+    /// resolved against the index table, and that table is built one line
+    /// under the gate. So a reader that refused first cannot have written that
+    /// report, and a reader that walked first cannot have withheld it.
+    ///
+    /// A bag with NO records, or one whose message stream is unreadable, does
+    /// not separate them: the reader's unreadable-stream arm is the only early
+    /// exit under the gate, and it is not reachable from a bag a test can
+    /// craft, because building the message stream cannot fail and a bad stream
+    /// reports itself on its FIRST ITEM, which ends the walk at the same final
+    /// answer. The report is the seam that does separate them.
+    ///
+    /// The control runs SECOND on purpose: an absence proves nothing until the
+    /// same records under an admitted manifest do write the line looked for.
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_record_format_gate_fires_before_a_single_record_is_opened() {
+        // Records this build reads perfectly well, keyed to indices the
+        // manifest names nowhere. Under an admitted manifest each one is
+        // resolved, missed, and counted.
+        let orphans = vec![this_format_record(9), this_format_record(11)];
+        let refusal = craft_and_read(&manifest_json(Some("2"), 1), &orphans)
+            .expect_err("a later format is refused whatever its records hold");
+        assert_eq!(
+            refusal,
+            AnchorReadRefusal::StateRecordFormatTooNew {
+                carried: 2,
+                known: 1
+            },
+            "refused by name: {refusal:?}"
+        );
+        let text = refusal.to_string();
+        assert!(
+            text.contains("state record format version 2")
+                && text.contains("state record format version 1"),
+            "and the sentence names BOTH versions: {text}"
+        );
+        assert!(
+            !logs_contain("no manifest entry names"),
+            "the gate returned before the index table existed, so no record was \
+             resolved against it and the unattributable report cannot have been \
+             written"
+        );
+
+        // THE CONTROL: the same records under a manifest this build admits.
+        let read_them = craft_and_read(&manifest_json(Some("1"), 1), &orphans)
+            .expect("the same records at this build's version are read");
+        assert_eq!(
+            read_them.unattributable_records, 2,
+            "the walk really does resolve these records and miss: {read_them:?}"
+        );
+        assert!(
+            logs_contain("no manifest entry names"),
+            "so the absence above is this reader not walking, rather than this \
+             test not looking"
+        );
+    }
+
     /// The AMBIGUITY refusal still comes FIRST, so a k>1 bag reads the sentence
     /// its own capture manifest predicted rather than a version complaint.
     ///
@@ -1140,18 +1295,23 @@ mod tests {
     fn the_ambiguity_refusal_still_precedes_the_record_format_gate() {
         let two_rings = craft_and_read(&manifest_json(Some("1"), 2), &[])
             .expect_err("two rings is still refused");
-        assert!(
-            matches!(
-                two_rings,
-                AnchorReadRefusal::MultiRingAmbiguous { rings: 2 }
-            ),
+        assert_eq!(
+            two_rings,
+            AnchorReadRefusal::MultiRingAmbiguous {
+                rings: 2,
+                state_record_format: Some(1)
+            },
             "{two_rings:?}"
         );
         // And a two-ring bag that ALSO predates the format reads the ambiguity
         // sentence, because that gate is asked first.
         let both = craft_and_read(&manifest_json(None, 2), &[]).expect_err("still refused");
-        assert!(
-            matches!(both, AnchorReadRefusal::MultiRingAmbiguous { rings: 2 }),
+        assert_eq!(
+            both,
+            AnchorReadRefusal::MultiRingAmbiguous {
+                rings: 2,
+                state_record_format: None
+            },
             "the manifest property is asked before the format: {both:?}"
         );
         // And the arm this fix ADDED, which is the one whose placement was newly
@@ -1165,7 +1325,10 @@ mod tests {
             craft_and_read(&manifest_json(Some("2"), 2), &[]).expect_err("still refused");
         assert_eq!(
             newer_and_ambiguous,
-            AnchorReadRefusal::MultiRingAmbiguous { rings: 2 },
+            AnchorReadRefusal::MultiRingAmbiguous {
+                rings: 2,
+                state_record_format: Some(2)
+            },
             "the ring count is asked before the record format, so the capture's \
              own reason is the one served: {newer_and_ambiguous:?}"
         );

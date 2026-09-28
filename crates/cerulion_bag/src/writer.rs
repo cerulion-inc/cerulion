@@ -544,6 +544,22 @@ const USABLE_SCHEMA_IDS: usize = u16::MAX as usize;
 /// against [`CHANNEL_ID_SPACE`]. A literal in the second would go stale the
 /// next time a reserved channel is added — which is exactly the move that
 /// shifted the boundary when the fourth was added.
+///
+/// # The state channel's framing
+///
+/// `__cerulion/state` is the one reserved channel whose `wire_fixed_size` is a
+/// real record width rather than a stand-in, and this doc is where the framing
+/// behind that number is written down: every message on that channel is exactly
+/// one 512-byte state record, a 40-byte `StateRecordHeader` over a 472-byte
+/// payload region.
+///
+/// It is stated on the function that DECLARES the descriptor, and not only
+/// beside the descriptor's own line, because the framing sweep's control for
+/// this file rests on it. A count of framing sentences is satisfied by prose
+/// anywhere in the file; a doc block is tied by the language to the item it
+/// describes, so a control anchored here fails the moment the fact leaves the
+/// declaration that owns it rather than the moment the file runs out of
+/// sentences.
 fn reserved_channels() -> [(&'static str, &'static str, SchemaDescriptor); 4] {
     [
         (
