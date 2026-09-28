@@ -129,9 +129,12 @@ pub enum AnchorReadRefusal {
     ///
     /// COMPATIBILITY: this variant GAINED the `state_record_format` field.
     /// [`AnchorReadRefusal`] is public and is not `non_exhaustive`, so a struct
-    /// pattern on this variant written outside this crate must now name the new
-    /// field or end in `..`; a pattern that named only `rings` stops compiling.
-    /// Matching the variant by path, or binding it whole, is unaffected.
+    /// pattern on this variant written outside this crate must account for the
+    /// new field: a brace pattern ending in `..` is unaffected, and a pattern
+    /// naming only `rings` stops compiling. A struct variant has no path only
+    /// pattern form, so there is no third shape to exempt here, and an
+    /// identifier pattern that binds the refusal without destructuring it never
+    /// reads a field at all.
     #[error(
         "this recording drained {rings} state rings. From state record format version 1 a state \
          record carries its producer's rank and the coverage manifest carries the ring to rank \
@@ -1180,7 +1183,7 @@ mod tests {
         // decision and simply asks it AFTER the walk returns this identical
         // error value, because no count rides the `Err` path for a caller to
         // see. That is pinned by
-        // `the_record_format_gate_fires_before_a_single_record_is_opened`
+        // `the_record_format_gate_fires_before_any_record_is_opened_for_keying`
         // below, which reads what the walk leaves behind rather than what it
         // returns.
         let malformed = vec![unreadable_record(), unreadable_record()];
@@ -1220,8 +1223,12 @@ mod tests {
         assert_eq!(ok.malformed_records, 0, "and nothing malformed about them");
     }
 
-    /// The record format gate fires BEFORE a single record is opened, and the
-    /// witness is a line the walk writes as it opens its first one.
+    /// The record format gate fires BEFORE any record is opened for keying,
+    /// and the witness is the line the walk writes over the first record it
+    /// does open. The name says `for keying` because that is the seam the
+    /// witness sits on: the line is written where a record is resolved
+    /// against the index table or refused by the assembler, and a placement
+    /// earlier than that seam is the one case below says it cannot rule out.
     ///
     /// The assertion above it pins the DERIVATION: the version decision is
     /// taken from the manifest, so a reader that derived it from the record
@@ -1264,7 +1271,7 @@ mod tests {
     /// same records under an admitted manifest do write the lines looked for.
     #[test]
     #[tracing_test::traced_test]
-    fn the_record_format_gate_fires_before_a_single_record_is_opened() {
+    fn the_record_format_gate_fires_before_any_record_is_opened_for_keying() {
         // FIRST a record this build cannot key at any version, so a walk that
         // opens it must say so on the spot; THEN two records this build reads
         // perfectly well, keyed to indices the manifest names nowhere, which
