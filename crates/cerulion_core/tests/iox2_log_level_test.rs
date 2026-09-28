@@ -21,13 +21,28 @@
 //! — the same constraint (and the same self-re-exec shape) as
 //! `cdylib_tracing_stopgap_test.rs`.
 //!
-//! # Why the probe is the REAL production line
+//! # Why the probe is a REAL iceoryx2 line
 //!
-//! The child does not synthesize a log call. It reproduces the exact flood
-//! condition — a publisher notifying its own never-drained listener until the
-//! `AF_UNIX SOCK_DGRAM` event socket fills — so the string under test is the
-//! genuine `iceoryx2-0.9.1/src/port/notifier.rs:525` warning
-//! (`... due to FailedToDeliverSignal.`) that flooded the robot, not a stand-in.
+//! The child does not synthesize a log call: the string under test is emitted
+//! by iceoryx2 itself, from inside its own service builder, so what is being
+//! filtered is genuinely iceoryx2's logger and not a Cerulion stand-in.
+//!
+//! The line it drives CHANGED with iceoryx2 0.10, and the reason is the point.
+//! The original probe reproduced the flood itself: a publisher notifying its
+//! own never-drained listener until the `AF_UNIX SOCK_DGRAM` event socket
+//! filled, after which every notify failed and iceoryx2 logged
+//! `... due to FailedToDeliverSignal.` once per publish. 0.10 made that state
+//! unreachable (the doorbell carries one byte, a full doorbell is swallowed,
+//! and a notify into an already-notified listener skips the send), so the
+//! marker string does not occur and the condition cannot be built. Keeping that
+//! probe would have left five arms asserting the ABSENCE of a line nothing
+//! emits, which passes for the wrong reason.
+//!
+//! The probe is now iceoryx2's own `warn!` for an event service built with a
+//! zero port ceiling, which it clamps to one and complains about. It is
+//! deterministic, needs no timing and no saturation, and it is still a
+//! `warn`-level line from inside iceoryx2, which is what every arm below is
+//! about.
 //!
 //! # Arms
 //!
@@ -37,21 +52,24 @@
 //! | (unset) | ABSENT — Cerulion's default is `error` (NOT iceoryx2's crate default `Info`, which would print) |
 //! | `error` | ABSENT — the live-evidence value that did nothing |
 //! | `FATAL` | ABSENT — the other live-evidence value; also pins case-insensitivity |
-//! | `notalevel` | ABSENT + a LOUD one-line fallback message (a typo must never silently re-enable the flood) |
+//! | `notalevel` | ABSENT + a LOUD one-line fallback message (a typo must never silently re-enable iceoryx2's own logging) |
 
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use cerulion_core::transport::{TransportConfig, TransportManager};
-use cerulion_core::wire::MaxSliceLen;
 
 /// Set by the parent so the ignored child test body actually runs its probe.
 const CHILD_ENV: &str = "CER_IOX2_LOG_LEVEL_CHILD";
 
-/// The genuine iceoryx2 warning the Go2 flood consisted of
-/// (`iceoryx2-0.9.1/src/port/notifier.rs:525`).
-const IOX2_WARN_MARKER: &str = "FailedToDeliverSignal";
+/// A genuine `warn`-level line from inside iceoryx2's own service builder,
+/// emitted when an event service is built with a zero port ceiling
+/// (`adjust_attributes_to_meaningful_values`, which clamps it to one).
+///
+/// Deterministic and free of timing: it is a builder complaint, not a runtime
+/// failure, so the child can produce it in one call on any platform.
+const IOX2_WARN_MARKER: &str = "Setting the maximum amount of notifiers to 0 is not supported";
 
 /// Cerulion's loud fallback for an unparseable `IOX2_LOG_LEVEL`
 /// (`iceoryx_logger::init_iceoryx_log_level`).
@@ -60,11 +78,6 @@ const FALLBACK_MARKER: &str = "is not a valid iceoryx2 log level";
 /// Breadcrumb the child prints once its probe has run, so a child that died
 /// before probing cannot be mistaken for "the level suppressed everything".
 const CHILD_DONE_MARKER: &str = "CHILD_PROBE_DONE";
-
-/// Notifies the child issues without draining. Must exceed the platform's
-/// `AF_UNIX SOCK_DGRAM` capacity for 8-byte datagrams by a wide margin (macOS
-/// saturates after ~32, Linux after a few hundred).
-const CHILD_NOTIFIES: usize = 2_000;
 
 /// Bounded wait for the child — a hang must fail loudly, never wedge CI.
 const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -89,28 +102,40 @@ fn subprocess_child_iox2_probe() {
     cerulion_core::iceoryx_logger::init_iceoryx_log_level_from_env();
 
     let ix = cerulion_core::testing::iceoryx_test_config();
+    // A transport first, so the child exercises the same startup path a real
+    // binary does (this is what applies the level) before anything is logged.
     let transport = TransportManager::init_for_test(
         TransportConfig {
             node_name: "log_level_child".to_string(),
             ..Default::default()
         },
-        ix,
+        ix.clone(),
     )
     .expect("init_for_test");
-    let publisher = transport
-        .create_publisher("/loglevel/probe", MaxSliceLen::const_new(256), 0)
-        .expect("publisher");
+    drop(transport);
 
-    // Never drained ⇒ the publisher's own event socket fills ⇒ iceoryx2 emits
-    // its `FailedToDeliverSignal` warning once per notify from then on.
-    for _ in 0..CHILD_NOTIFIES {
-        let _ = publisher.notify_sent_sample();
-    }
-    // Prove — independent of any log level — that the condition really occurred
-    // in this child, so an "absent marker" assertion cannot pass vacuously.
-    assert!(
-        publisher.notify_undelivered_count() > 0,
-        "child precondition: the notify path must have saturated its own listener"
+    // The probe: an event service asked for zero notifiers. iceoryx2 clamps the
+    // value to one and warns about it, from inside its own builder.
+    let node = iceoryx2::node::NodeBuilder::new()
+        .config(&ix)
+        .create::<iceoryx2::service::ipc::Service>()
+        .expect("child node");
+    let name: iceoryx2::service::service_name::ServiceName =
+        "/loglevel/probe/event".try_into().expect("service name");
+    let service = node
+        .service_builder(&name)
+        .event()
+        .max_notifiers(0)
+        .create()
+        .expect("the zero ceiling is clamped, not refused");
+    // Prove — independent of any log level — that the clamp really happened in
+    // this child, so an "absent marker" assertion cannot pass vacuously.
+    use iceoryx2::service::port_factory::PortFactory as _;
+    assert_eq!(
+        service.static_config().max_notifiers(),
+        1,
+        "child precondition: iceoryx2 must have clamped the zero notifier ceiling to \
+         one, which is the act it warns about"
     );
     eprintln!("{CHILD_DONE_MARKER}");
 }
@@ -169,38 +194,38 @@ fn run_child(level: Option<&str>) -> String {
     stderr
 }
 
-/// ANTI-TAUTOLOGY CONTROL — run this first mentally: at `warn` the child's
-/// stderr DOES carry the real iceoryx2 flood line. Every "absent" assertion in
-/// this file is meaningful only because this one passes.
+/// ANTI-TAUTOLOGY CONTROL — read this one first: at `warn` the child's stderr
+/// DOES carry the real iceoryx2 line. Every "absent" assertion in this file is
+/// meaningful only because this one passes.
 #[test]
-fn warn_level_shows_the_real_iceoryx2_flood_line() {
+fn warn_level_shows_a_real_iceoryx2_warning() {
     let stderr = run_child(Some("warn"));
     assert!(
         stderr.contains(IOX2_WARN_MARKER),
-        "at IOX2_LOG_LEVEL=warn the genuine iceoryx2 notifier warning must be visible — \
+        "at IOX2_LOG_LEVEL=warn the genuine iceoryx2 builder warning must be visible — \
          without it every suppression arm in this file is vacuous; stderr:\n{stderr}"
     );
 }
 
 /// The DEFAULT: no `IOX2_LOG_LEVEL` ⇒ Cerulion's `error`, not iceoryx2's crate
-/// default `Info` (which would print the flood).
+/// default `Info` (which would print every warning).
 #[test]
-fn absent_level_defaults_to_error_and_suppresses_the_flood() {
+fn absent_level_defaults_to_error_and_suppresses_iceoryx2_warnings() {
     let stderr = run_child(None);
     assert!(
         !stderr.contains(IOX2_WARN_MARKER),
         "with IOX2_LOG_LEVEL unset the default must be `error`, suppressing iceoryx2's \
-         per-notify warning; stderr:\n{stderr}"
+         warn-level lines; stderr:\n{stderr}"
     );
 }
 
 /// The exact value the Go2 operator set that did nothing. It must work now.
 #[test]
-fn error_level_suppresses_the_flood() {
+fn error_level_suppresses_iceoryx2_warnings() {
     let stderr = run_child(Some("error"));
     assert!(
         !stderr.contains(IOX2_WARN_MARKER),
-        "IOX2_LOG_LEVEL=error must suppress iceoryx2's warn-level flood (this is the \
+        "IOX2_LOG_LEVEL=error must suppress iceoryx2's warn-level lines (this is the \
          live-evidence value that was inert); stderr:\n{stderr}"
     );
 }
@@ -208,11 +233,11 @@ fn error_level_suppresses_the_flood() {
 /// The other live-evidence value — UPPERCASE, so this also pins that the
 /// parser is case-insensitive rather than silently rejecting and defaulting.
 #[test]
-fn uppercase_fatal_level_suppresses_the_flood_without_a_parse_complaint() {
+fn uppercase_fatal_level_suppresses_warnings_without_a_parse_complaint() {
     let stderr = run_child(Some("FATAL"));
     assert!(
         !stderr.contains(IOX2_WARN_MARKER),
-        "IOX2_LOG_LEVEL=FATAL must suppress the flood; stderr:\n{stderr}"
+        "IOX2_LOG_LEVEL=FATAL must suppress iceoryx2's warn-level lines; stderr:\n{stderr}"
     );
     assert!(
         !stderr.contains(FALLBACK_MARKER),
@@ -222,7 +247,7 @@ fn uppercase_fatal_level_suppresses_the_flood_without_a_parse_complaint() {
 }
 
 /// A typo must fall back LOUDLY to `error` — never silently, and never to a
-/// level that re-enables the flood.
+/// level that re-enables iceoryx2's own logging.
 #[test]
 fn unparseable_level_falls_back_loudly_to_error() {
     let stderr = run_child(Some("notalevel"));
@@ -237,7 +262,7 @@ fn unparseable_level_falls_back_loudly_to_error() {
     );
     assert!(
         !stderr.contains(IOX2_WARN_MARKER),
-        "the fallback level must be `error` (suppressing the flood), not iceoryx2's \
-         crate default; stderr:\n{stderr}"
+        "the fallback level must be `error` (suppressing warn-level lines), not \
+         iceoryx2's crate default; stderr:\n{stderr}"
     );
 }

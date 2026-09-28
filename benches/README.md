@@ -44,7 +44,7 @@ python3 benches/latency/bench.py compile-csv && python3 benches/latency/bench.py
   recomputable from committed raw samples + the committed harness + the
   host spec: no number leaves the repo without its harness.
 - Prove delivery per run, never infer it; report floor/p50/p99/max.
-  Build invariants: the iceoryx2 exact pin `=0.9.1`, subprocess-only
+  Build invariants: the iceoryx2 exact pin `=0.10.0`, subprocess-only
   `graph run`, and isolated SHM configs for hermetic benches.
   [`latency/METHODOLOGY.md`](latency/METHODOLOGY.md) carries the run
   rules those numbers have to satisfy.

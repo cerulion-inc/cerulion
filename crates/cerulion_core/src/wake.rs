@@ -48,11 +48,14 @@
 //! connection to `sendto`. Two decisions bound that cost and the caller — not this
 //! module — is responsible for respecting them:
 //!
-//! * **The notify storm** was caused by a listener nobody DRAINED,
-//!   filling its `AF_UNIX SOCK_DGRAM` socket so every notify paid
-//!   `FailedToDeliverSignal`. A wake-driven consumer drains its listener on
-//!   every wake by construction (the reactor's callback clears the event queue),
-//!   so the discriminator is drained-vs-undrained, not present-vs-absent.
+//! * **An undrained listener** used to be the expensive case: under iceoryx2
+//!   0.9.1 it filled its `AF_UNIX SOCK_DGRAM` socket and every later notify to
+//!   it took a failure path that flooded the log. 0.10 removed that (a full
+//!   doorbell is swallowed, and a notify into an already-notified listener
+//!   skips the send), so an undrained listener now costs the producer LESS than
+//!   a drained one. A wake-driven consumer drains its listener on every wake by
+//!   construction, so what it costs the producer is one doorbell send per
+//!   publish — present-vs-absent, which is what the next point is about.
 //! * **Notify elision** means a GRAPH publisher with zero listeners
 //!   skips notify work entirely. Attaching here un-arms that for the topic.
 //!   Attach a wake only where the publisher is one you are willing to bill.

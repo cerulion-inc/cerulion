@@ -1879,9 +1879,9 @@ fn gen_cdylib(
                     // NOTHING for it and it stays at iceoryx2's crate default
                     // (`Info`), which lets every iceoryx2 `warn!` emitted by
                     // NODE-side transport code print regardless of
-                    // `IOX2_LOG_LEVEL`. That made a documented
-                    // knob inert while ~2500 `FailedToDeliverSignal` warnings/s
-                    // (~5 MB/s) filled the disk. Set this copy's level from the
+                    // `IOX2_LOG_LEVEL`. That made a documented knob inert
+                    // while a per-publish iceoryx2 warning ran at ~2500 lines/s
+                    // (~5 MB/s) and filled the disk. Set this copy's level from the
                     // FROZEN env snapshot (never live `std::env` — replay
                     // determinism, exactly like RUST_LOG above); empty ⇒ unset
                     // ⇒ the Cerulion default (`error`).

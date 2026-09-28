@@ -40,11 +40,11 @@
 1 crates/cerulion_bagd/src/trace_window.rs
 5 crates/cerulion_bagd/src/window.rs
 3 crates/cerulion_cli/src/cfg_symmetry_tests.rs
-13 crates/cerulion_cli/src/clean_diagnostic_tests.rs
+5 crates/cerulion_cli/src/clean_diagnostic_tests.rs
 9 crates/cerulion_cli/src/cli.rs
 1 crates/cerulion_cli/src/completion.rs
 3 crates/cerulion_cli/src/completion_wiring_tests.rs
-42 crates/cerulion_cli/src/main.rs
+37 crates/cerulion_cli/src/main.rs
 12 crates/cerulion_cli_engine/src/account_cmd.rs
 7 crates/cerulion_cli_engine/src/auth.rs
 153 crates/cerulion_cli_engine/src/bag_cmd.rs
@@ -63,7 +63,6 @@
 5 crates/cerulion_cli_engine/src/node_cmd.rs
 16 crates/cerulion_cli_engine/src/node_inspector.rs
 46 crates/cerulion_cli_engine/src/node_metadata.rs
-8 crates/cerulion_cli_engine/src/orphan_port_tags.rs
 6 crates/cerulion_cli_engine/src/pair_cmd.rs
 38 crates/cerulion_cli_engine/src/partition_emit.rs
 1 crates/cerulion_cli_engine/src/peer_cache.rs
@@ -161,11 +160,11 @@
 2 crates/cerulion_core/src/transport/input_view.rs
 60 crates/cerulion_core/src/transport/liveness.rs
 24 crates/cerulion_core/src/transport/mirror_registry.rs
-73 crates/cerulion_core/src/transport/mod.rs
+72 crates/cerulion_core/src/transport/mod.rs
 55 crates/cerulion_core/src/transport/network.rs
 2 crates/cerulion_core/src/transport/notify_delivery_latch.rs
 5 crates/cerulion_core/src/transport/output_proxy.rs
-14 crates/cerulion_core/src/transport/publisher.rs
+13 crates/cerulion_core/src/transport/publisher.rs
 20 crates/cerulion_core/src/transport/reg_channel.rs
 3 crates/cerulion_core/src/transport/run_artifacts.rs
 25 crates/cerulion_core/src/transport/run_registry.rs
