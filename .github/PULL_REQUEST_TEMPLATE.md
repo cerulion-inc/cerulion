@@ -30,8 +30,8 @@ after being its own head, rmw p50 and p99 per size.
 -->
 ## Latency before and after
 
-| path | p50 before | p50 after | p99 before | p99 after |
-|---|---|---|---|---|
+| path | size | p50 before | p50 after | p99 before | p99 after |
+|---|---|---|---|---|---|
 
 <!-- Closes #N on its own line, last; delete the line when no issue closes with this change. -->
 Closes #N

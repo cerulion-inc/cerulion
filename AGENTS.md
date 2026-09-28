@@ -8,11 +8,11 @@ Users build a WORKSPACE: ONE node type per `nodes/<type>/` crate, wiring ONLY in
 run by `cerulion` verbs. Examples, docs, rustdoc, README and the scaffold must show nothing else:
 multi-node files, `main`, in-code graphs, runtime-API construction (`GraphRuntime`) are for tests ONLY.
 
-## Critical invariants (bugs, not style; each has a gate)
+## Critical invariants (bugs, not style; gated)
 Code comments cite these as "Principle #N" (`docs/internals/core-scheduler-graph.md`).
 
 - **Zero-copy hot path**: no heap allocation on publish/receive paths. Enforced by
-  `zero_alloc_test`, `zero_copy_hot_path_test` and `check_hot_path_allocs.sh`;
+  `zero_alloc_test`, `zero_copy_hot_path_test` and `tools/scripts/check_hot_path_allocs.sh`;
   a justified cold-path alloc needs a `// hot-path-alloc-ok: <reason>` line.
 - **Replay = Live**: re-executing a recording is byte-identical to the live run. Never add
   wall-clock reads, hash-order iteration or randomness to execution paths - use
@@ -68,7 +68,7 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 - Tests: behavior names; a fire-count proves scheduling, not delivery; strong pins assert
   downstream DELIVERY. Five categories per new path: happy, edge, adversarial, determinism
   (two runs bit-identical), every error arm.
-- Six rules for tests and review threads: `testing-rules.md`.
+- Six rules for tests and review threads: `docs/internals/testing-rules.md`.
 - Mutation checks: PURE decision functions only (never live syscall/transport paths),
   against a COMMITTED baseline; each variant must fail a test.
 - Docs pinned by oracle tests (tutorial YAML, completion hints): a doc edit that fails a
@@ -81,14 +81,14 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 
 - Branches: `<type>/<kebab-slug>`, `type` from the PR-title set (`feat` `fix` `docs` `test`
   `refactor` `ci` `chore` `perf` `style` `build`); target `main`. NO personal prefix, NO tracker
-  id in the name (it goes in the PR body); gated by `check_pr_title.sh`.
+  id in the name (it goes in the PR body); gated by `tools/scripts/check_pr_title.sh`.
 - PR titles: `<type>(<scope>)!: <description>`. PRs are SQUASH-merged, so the title becomes
   the commit message. Commit bodies carry the WHY.
-- PR bodies (product voice, ~40 lines, ~450 prose words): a summary paragraph (bare or `## Summary`),
-  `## What changed`, `## How to verify` (real commands), a before/after latency section when the landing
-  rule requires one, `Closes #N` last on its own line. No questions, process narrative, HTML, em or en
-  dashes, internal ids, hostnames or paths. Diffs ~800 lines; breaking changes carry migration steps.
-- Stacked PRs (B depends on unmerged A): base B on A's branch; merge in dependency order
+- PR bodies (product voice, ~40 lines/450 words): a summary paragraph (bare or `## Summary`),
+  `## What changed`, `## How to verify` (commands), a latency section when the landing rule requires it,
+  `Closes #N` last on its own line (omit when no issue closes). No questions, process narrative,
+  HTML, em or en dashes, internal ids, hostnames or paths. Diffs ~800 lines; breaking changes carry migration steps.
+- Stacked PRs (B on unmerged A): base B on A's branch; merge in dependency order
   (deleting a merged base retargets B; a rename closes it).
 - Plan gate: read the issue in full, check dependencies (an unlanded one => confirm the base with
   the user), produce the plan (files, tests, risks, chunks) + its questions, get the go-ahead. Never skip it.
@@ -151,7 +151,7 @@ Unmarked crates have no scoped file: use this page plus the area dossier
 (`network-daemons.md`: `_discovery`/`_mdns`; `remote-access.md` + the
 `cerulion_remoted` file: the remote-access row; fixtures: `crates/cerulion_core/AGENTS.md`).
 
-## Shipped surface (`check_public_surface.sh` gates it; the calls a script cannot make)
+## Shipped surface (`check_public_surface.sh`; the calls a script cannot make)
 
 - A user-facing example is a WORKSPACE (the rule above); a single-file multi-node program or
   runtime-API construction belongs under `tests/` only, never in `examples/` or a doc.
@@ -175,7 +175,7 @@ Unmarked crates have no scoped file: use this page plus the area dossier
 - **Ask first**: new dependencies (license + real-time fit; `deny.toml` gates CI), any
   user-API surface change, anything `unsafe`.
 - **Never**: hand-edit generated sources (`native_ros2_messages` types come from `build.rs`;
-  vendored `.msg` edits via `refresh_upstream_msg_manifest.sh`); commit
+  vendored `.msg` edits via `tools/scripts/refresh_upstream_msg_manifest.sh`); commit
   credentials; name a machine, address, path, login or person (public;
   `docs/leak_guard.md`); fabricate data; leave dead code; add a cache save step without
   its gate and prune.
@@ -183,8 +183,8 @@ Unmarked crates have no scoped file: use this page plus the area dossier
 ## Deeper context
 
 - `docs/user-api.md` - the user API reference (CLI, macros, YAML, env vars).
-- `crates/<crate>/AGENTS.md` - scoped invariants, serial-test lists, gotchas.
+- `crates/<crate>/AGENTS.md` - scoped invariants, serial tests, gotchas.
 - `docs/internals/*.md` - contributor dossiers (test maps, module contracts); each crate
   names its own; `ci-and-gates.md`: the gates.
 - `docs/` - user guides (networking, multi-process, recording/replay, tutorials); hosted at
-  https://docs.cerulion.com (index `/llms.txt`).
+  https://docs.cerulion.com.
