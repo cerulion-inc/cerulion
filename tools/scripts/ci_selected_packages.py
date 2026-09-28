@@ -303,8 +303,15 @@ def selected_packages(document, touched, include_dev=True, observation_edges=())
     unknown = named - set(table)
     if unknown:
         raise UnknownPackages(unknown, table)
+    # The FINISHED cargo closure, snapshotted: an observer added below observes,
+    # it did not change, so it must not make a later edge fire. `all` means the
+    # observer watches every package, so it rides any NON-EMPTY closure and adds
+    # nothing to an empty one: a change that touched no package is nothing to
+    # observe, and handing it a run would be work for no reason.
+    closure = set(selected)
     for observing, observed in observation_edges:
-        if observed == EVERY_PACKAGE or observed in selected:
+        watched = bool(closure) if observed == EVERY_PACKAGE else observed in closure
+        if watched:
             selected.add(observing)
     return sorted(selected)
 

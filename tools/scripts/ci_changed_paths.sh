@@ -490,7 +490,7 @@ pull_request;;|false|false|
     # the SHAPE: a documentation tree touches at least one package and never
     # every package, and the package it touches is one whose marker names that
     # tree.
-    local tree root
+    local tree root markers
     for tree in docs benches examples; do
         got=$(printf '%s/guide.md\n' "$tree" \
               | GITHUB_EVENT_NAME=pull_request classify_touched | sed -n 's/^touched=//p')
@@ -499,12 +499,23 @@ pull_request;;|false|false|
                 "$tree" "${got:-<empty>}" "$tree" >&2
             fails=$((fails + 1))
         fi
+        # Read the markers ONCE and match without a pipe: `grep -q` closes the
+        # pipe on its first hit, `pipefail` then reports the producer's SIGPIPE,
+        # and every package that DID match was reported as a miss.
+        markers=$(marker_packages_for_root "$tree")
         for name in $got; do
-            if ! marker_packages_for_root "$tree" | grep -qx "$name"; then
-                printf 'ci_changed_paths self-test: %s/ touched %s, which no doc-pin marker names as reading %s\n' \
-                    "$tree" "$name" "$tree" >&2
-                fails=$((fails + 1))
-            fi
+            case "
+$markers
+" in
+                *"
+$name
+"*) ;;
+                *)
+                    printf 'ci_changed_paths self-test: %s/ touched %s, which no doc-pin marker names as reading %s\n' \
+                        "$tree" "$name" "$tree" >&2
+                    fails=$((fails + 1))
+                    ;;
+            esac
         done
     done
     # The other side: a tree with no marker at all touches nothing, so the rule

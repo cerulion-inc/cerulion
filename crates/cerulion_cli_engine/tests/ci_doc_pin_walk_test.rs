@@ -3362,7 +3362,7 @@ fn each_observation_edge_kind_is_derived_from_its_own_shape() {
     // (b) The same read spelled RELATIVE to the observing crate's directory,
     //     which is how this tree spells it.
     assert_eq!(
-        fixture_edges(&format!("let p = here.join(\"../beta/src/lib.rs\");\n")),
+        fixture_edges("let p = here.join(\"../beta/src/lib.rs\");\n"),
         edge("beta", EDGE_CRATE_PATH, 1)
     );
 
