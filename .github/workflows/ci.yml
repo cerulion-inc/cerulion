@@ -1434,6 +1434,14 @@ jobs:
       # `cerulion_core/tests/serial_discipline_test.rs`, so it cannot silently
       # lose a binary.
 
+      # The doc-pin markers below name the test binaries in this package that
+      # read a tree outside their own crate. The set is derived from the test
+      # sources by `ci_doc_pin_walk_test`, which fails on a missing or a stale
+      # line, so the path-to-step map can never lose one of these binaries.
+      # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
+      # doc-pin: cerulion_core::serial_discipline_test reads .github, tools
+      # doc-pin: cerulion_core::silent_trigger_validation_test reads USER_API.md
+      # doc-pin: cerulion_core::tracing_field_discipline_test reads benches
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
@@ -1705,9 +1713,17 @@ jobs:
       # together the three are 13.5 of the 28.6 min of package work in this
       # job, and all of it on one runner is what once put shard 1 at 45 min.
       # The placement is the measured packing in the map above, not family.
+      # doc-pin: cerulion_cli_engine::ci_doc_pin_walk_test reads .github
+      # doc-pin: cerulion_cli_engine::ci_test_coverage_test reads .github, tools
+      # doc-pin: cerulion_cli_engine::completions_test reads README.md
+      # doc-pin: cerulion_cli_engine::dependency_door_test reads examples, tools
+      # doc-pin: cerulion_cli_engine::library_print_ban_test reads examples
+      # doc-pin: cerulion_cli_engine::workspace_lints_manifest_test reads examples
       - name: CLI engine tests
         if: matrix.shard == 2
         run: cargo test -p cerulion_cli_engine
+      # doc-pin: cerulion_cli::graph_run_validate_gate_e2e_test reads docs
+      # doc-pin: cerulion_cli::ros2_migrate_cli_test reads tools
       - name: CLI binary tests
         if: matrix.shard == 1
         run: cargo test -p cerulion_cli
@@ -2348,8 +2364,13 @@ jobs:
       # names. Default profile and target dir, matching the `cargo test` below.
       - name: Build the cerulion_wsd --inspect-node fixture cdylib
         run: cargo build -p test_node_cdylib
+      # doc-pin: cerulion_wsd::doc_deference_test reads AGENTS.md
       - name: cerulion_wsd tests
         run: cargo test -p cerulion_wsd
+      # doc-pin: cerulion_hygiene::crate_license_texts_test reads docs
+      # doc-pin: cerulion_hygiene::dependency_rules_test reads examples
+      # doc-pin: cerulion_hygiene::shipped_surface_structure_test reads .github, AGENTS.md, CLAUDE.md, README.md, benches, docs, tools
+      # doc-pin: cerulion_hygiene::user_api_doc_test reads docs
       - name: cerulion_hygiene tests
         run: cargo test -p cerulion_hygiene
 

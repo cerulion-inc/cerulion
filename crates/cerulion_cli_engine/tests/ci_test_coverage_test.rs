@@ -63,6 +63,31 @@
 //! direction: a future condition that genuinely still runs on pull requests
 //! costs a maintainer one line here rather than costing everyone a silent hole.
 //!
+//! SELECTION CONDITIONS are the one widening of that rule, and there are
+//! exactly three, spelled as constants below:
+//! `needs.changes.outputs.code == 'true'`,
+//! `needs.changes.outputs.docs == 'true'`, and the per-package
+//! `contains(fromJSON(needs.changes.outputs.pkgs), '<pkg>')`. A step behind one
+//! of them runs on every pull request whose changed paths select it, so it can
+//! fail one and it credits the packages it names. Everything else keeps the old
+//! answer: `needs.changes.outputs.code == 'false'` and
+//! `needs.other.outputs.code == 'true'` are ordinary disqualified conditions,
+//! any `||` disqualifies, and a `&&` chain is sanctioned only when every term
+//! is.
+//!
+//! TOTALITY UNDER SELECTION is the second thing the walk now decides, because
+//! being NAMED in a sanctioned step stops being enough once a selector exists:
+//! the step also has to RUN on the pull request that touches that package
+//! alone. So the walk evaluates the workflows against a hypothetical selected
+//! set — a per-package condition is true iff its package is in the set, `code`
+//! iff the set is non-empty, `docs` iff the set holds the `docs` marker, and
+//! every other surviving condition is independent of the set and holds — and
+//! requires every package with tests to stay credited when the set is exactly
+//! itself. A workflow that carries no selection condition survives every set,
+//! so the arm passes on it and stands as the guard for the first condition
+//! added. Its own non-vacuity is pinned on synthetic input by
+//! `a_step_gated_on_another_packages_selection_loses_its_own`.
+//!
 //! SCOPE. This asserts that a package is NAMED in a PR-blocking step,
 //! not that its tests pass. Naming is the failure mode that has actually
 //! bitten.
@@ -213,6 +238,47 @@ fn jobs_of(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The member of a selection set that means "the doc classes changed".
+///
+/// It shares the set with package names, and no workspace member is named
+/// `docs`, so the two cannot collide.
+const SELECTION_DOCS_MARKER: &str = "docs";
+
+/// The step conditions a changed-path classifier sets, spelled exactly.
+///
+/// Exact, not parsed: the value of these constants is that a near miss reads as
+/// an ordinary unknown condition and fails closed. `== 'false'` inverts the
+/// gate, and a different job id (`needs.other.outputs.code`) is a different
+/// classifier whose rules this walk has never seen.
+const SELECTION_CODE_IF: &str = "needs.changes.outputs.code == 'true'";
+const SELECTION_DOCS_IF: &str = "needs.changes.outputs.docs == 'true'";
+
+/// The per-package selection condition, as its two literal halves around the
+/// package name: `contains(fromJSON(needs.changes.outputs.pkgs), '<pkg>')`.
+const SELECTION_PKG_IF_OPEN: &str = "contains(fromJSON(needs.changes.outputs.pkgs), '";
+const SELECTION_PKG_IF_CLOSE: &str = "')";
+
+/// The package a per-package selection condition names, or `None` if the term
+/// is not exactly that form around a cargo package name (ASCII alphanumeric,
+/// `_` and `-`).
+///
+/// The charset is what keeps the form from swallowing a nested expression: a
+/// term such as `contains(fromJSON(needs.changes.outputs.pkgs), 'a') ||
+/// github.event_name == 'push'` has already been refused by the `||` rule, and
+/// anything else that reaches here with a quote, a space or a dot inside is not
+/// a package name and is not sanctioned.
+fn selection_condition_package(term: &str) -> Option<&str> {
+    let inner = term
+        .trim()
+        .strip_prefix(SELECTION_PKG_IF_OPEN)?
+        .strip_suffix(SELECTION_PKG_IF_CLOSE)?;
+    let is_package_name = !inner.is_empty()
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    is_package_name.then_some(inner)
+}
+
 /// Can this step-level `if:` condition stop the step running on a pull
 /// request?
 ///
@@ -236,6 +302,14 @@ fn step_if_is_pr_blocking(cond: &str) -> bool {
         if t == "always()" || t == "success()" {
             return true;
         }
+        // A sanctioned selection condition runs the step on exactly the pull
+        // requests whose changed paths select it, so it can fail one.
+        if t == SELECTION_CODE_IF || t == SELECTION_DOCS_IF {
+            return true;
+        }
+        if selection_condition_package(t).is_some() {
+            return true;
+        }
         let Some(rest) = t.strip_prefix("matrix.") else {
             return false;
         };
@@ -250,11 +324,48 @@ fn step_if_is_pr_blocking(cond: &str) -> bool {
     })
 }
 
+/// Does this step-level `if:` hold when the classifier selected exactly
+/// `selected`?
+///
+/// Only the three sanctioned selection terms consult the set: the per-package
+/// form is true iff its package is in it, `code` iff the set is non-empty,
+/// `docs` iff the set holds [`SELECTION_DOCS_MARKER`]. Every other term a
+/// PR-blocking step can still carry — absent, `always()`, `success()`, a
+/// `matrix.<key>` leg selector — does not depend on the selection and holds.
+/// A condition this walk does not sanction never reaches here: its step was
+/// already dropped by [`pr_blocking_workflow_texts`].
+///
+/// `code` follows the set being NON-EMPTY, which is the permissive reading for
+/// a set whose only member is the `docs` marker. That shape is pinned by
+/// `the_selection_evaluator_reads_the_code_and_docs_markers` and is never the
+/// shape the totality arm evaluates, which is always one package name.
+fn step_if_holds_under_selection(cond: &str, selected: &BTreeSet<String>) -> bool {
+    cond.split("&&").all(|term| {
+        let t = term.trim();
+        if t == SELECTION_CODE_IF {
+            return !selected.is_empty();
+        }
+        if t == SELECTION_DOCS_IF {
+            return selected.contains(SELECTION_DOCS_MARKER);
+        }
+        match selection_condition_package(t) {
+            Some(pkg) => selected.contains(pkg),
+            None => true,
+        }
+    })
+}
+
 /// Drop every STEP of one job whose `if:` could stop it on a pull request.
+fn drop_gated_steps(job: &str) -> String {
+    retain_steps(job, step_if_is_pr_blocking)
+}
+
+/// Keep the steps of one job whose every `if:` satisfies `keep`, and drop the
+/// rest.
 ///
 /// Steps are list items under `steps:`; the item indent is read from the first
 /// one rather than hard-coded, and a step's own keys sit two spaces deeper.
-fn drop_gated_steps(job: &str) -> String {
+fn retain_steps<F: Fn(&str) -> bool>(job: &str, keep: F) -> String {
     let lines: Vec<&str> = job.lines().collect();
     let Some(steps_at) = lines.iter().position(|l| l.trim() == "steps:") else {
         return job.to_string();
@@ -296,7 +407,7 @@ fn drop_gated_steps(job: &str) -> String {
             None
         };
         if let Some(c) = cond {
-            if !step_if_is_pr_blocking(c) {
+            if !keep(c) {
                 gated = true;
             }
         }
@@ -478,6 +589,66 @@ fn workflows_name(texts: &BTreeMap<String, String>, pkg: &str) -> Option<String>
         .iter()
         .find(|(_, text)| text.lines().any(|l| line_names_package(l, pkg)))
         .map(|(file, _)| file.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Totality under a hypothetical selection.
+// ---------------------------------------------------------------------------
+
+/// One PR-blocking workflow's text, with every step dropped whose sanctioned
+/// condition is false when the classifier selected exactly `selected`.
+///
+/// Pure: it reads text and a set and returns text, so a caller can ask what any
+/// selection would run without a workflow run, a network call or a clock.
+fn workflow_under_selection(text: &str, selected: &BTreeSet<String>) -> String {
+    let keep = |cond: &str| step_if_holds_under_selection(cond, selected);
+    let jobs = jobs_of(text);
+    if jobs.is_empty() {
+        return retain_steps(text, keep);
+    }
+    jobs.iter()
+        .map(|(_, block)| retain_steps(block, keep))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Which of `packages` a PR-blocking step still names once the classifier has
+/// selected exactly `selected`.
+fn packages_credited_under_selection(
+    texts: &BTreeMap<String, String>,
+    selected: &BTreeSet<String>,
+    packages: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let under: BTreeMap<String, String> = texts
+        .iter()
+        .map(|(file, text)| (file.clone(), workflow_under_selection(text, selected)))
+        .collect();
+    packages
+        .iter()
+        .filter(|pkg| workflows_name(&under, pkg).is_some())
+        .cloned()
+        .collect()
+}
+
+/// The packages that stop being credited when the classifier selects exactly
+/// that one package, sorted, so the failure names every one of them.
+///
+/// This is the shape a selection rule breaks silently: the step that runs a
+/// package's tests gated on a selection the change to that package does not
+/// produce, so the pull request that most needs the test is the one that skips
+/// it, and every other pull request keeps it green.
+fn packages_lost_to_their_own_selection(
+    texts: &BTreeMap<String, String>,
+    packages: &BTreeSet<String>,
+) -> Vec<String> {
+    packages
+        .iter()
+        .filter(|pkg| {
+            let selected: BTreeSet<String> = [(*pkg).clone()].into_iter().collect();
+            !packages_credited_under_selection(texts, &selected, &selected).contains(*pkg)
+        })
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,6 +1391,13 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
         "matrix.shard != 0",
         "matrix.lane == 'viz'",
         "always() && matrix.shard == 3",
+        // The sanctioned selection conditions, and a `&&` chain of them.
+        "needs.changes.outputs.code == 'true'",
+        "needs.changes.outputs.docs == 'true'",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire')",
+        "needs.changes.outputs.code == 'true' && matrix.shard == 0",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf') && success()",
     ] {
         assert!(
             step_if_is_pr_blocking(ok),
@@ -1233,6 +1411,19 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
         "matrix.shard == 0 || github.event_name == 'push'",
         "failure()",
         "github.ref == 'refs/heads/main' && matrix.shard == 0",
+        // Near misses of the sanctioned forms. The inverted comparison gates
+        // the step on the classifier NOT selecting; a different job id is a
+        // different classifier; a `||` reaches an event test whatever the
+        // classifier said; a package name is not an expression.
+        "needs.changes.outputs.code == 'false'",
+        "needs.changes.outputs.docs == 'false'",
+        "needs.other.outputs.code == 'true'",
+        "needs.changes.outputs.pkgs == 'true'",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'pkg') || github.event_name == 'push'",
+        "contains(fromJSON(github.event.inputs.pkgs), 'cerulion_core')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), '')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'a b')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'a') && github.event_name == 'push'",
     ] {
         assert!(
             !step_if_is_pr_blocking(bad),
@@ -1264,6 +1455,41 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
         kept.contains("plain_pkg"),
         "an unconditional step must survive; got:\n{kept}"
     );
+
+    // ---- and the selection forms, end to end -----------------------------
+    let selection = "on:\n  pull_request:\njobs:\n  \
+                     j:\n    runs-on: ubuntu-latest\n    needs: [changes]\n    steps:\n      \
+                     - name: code\n        if: needs.changes.outputs.code == 'true'\n        \
+                     run: cargo test -p code_pkg\n      \
+                     - name: docs\n        if: needs.changes.outputs.docs == 'true'\n        \
+                     run: cargo test -p docs_pkg\n      \
+                     - name: one package\n        \
+                     if: contains(fromJSON(needs.changes.outputs.pkgs), 'sel_pkg')\n        \
+                     run: cargo test -p sel_pkg\n      \
+                     - name: wrong classifier\n        \
+                     if: needs.other.outputs.code == 'true'\n        \
+                     run: cargo test -p other_classifier_pkg\n      \
+                     - name: inverted\n        if: needs.changes.outputs.code == 'false'\n        \
+                     run: cargo test -p inverted_pkg\n      \
+                     - name: or an event test\n        \
+                     if: contains(fromJSON(needs.changes.outputs.pkgs), 'x') || \
+                     github.event_name == 'push'\n        run: cargo test -p or_push_pkg\n  \
+                     changes:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+    let kept = pr_blocking_jobs(selection);
+    for named in ["code_pkg", "docs_pkg", "sel_pkg"] {
+        assert!(
+            kept.contains(named),
+            "a step behind a sanctioned selection condition runs on the pull \
+             requests that select it and must credit `{named}`; got:\n{kept}"
+        );
+    }
+    for dropped in ["other_classifier_pkg", "inverted_pkg", "or_push_pkg"] {
+        assert!(
+            !kept.contains(dropped),
+            "a near miss of a sanctioned selection condition must stay \
+             disqualified, but `{dropped}` was credited; got:\n{kept}"
+        );
+    }
 }
 
 /// `cargo test -p a -p b` covers BOTH — the module docs said so and the
@@ -1367,4 +1593,188 @@ fn the_shard_matrix_is_read_in_both_yaml_forms_and_per_job() {
         "the push-allowlisted `test-latency` job was not dropped from the \
          PR-blocking view"
     );
+}
+
+/// Every package with tests must still be run by a PR-blocking step on the
+/// pull request that touches THAT PACKAGE ALONE.
+///
+/// Naming is the property the gate above asserts; running is this one, and the
+/// two come apart the moment a step carries a selection condition. A step that
+/// runs `cerulion_bag` gated on `cerulion_core` being selected is named in
+/// ci.yml, passes the gate above, and never runs on a bag-only change — which
+/// is the only change whose tests it was there to protect.
+///
+/// On a ci.yml with no selection condition every step survives every selected
+/// set, so this passes without asserting anything about gating; that is the
+/// point. It is the guard standing before the first condition is added, and
+/// its own non-vacuity is proven on synthetic input by
+/// `a_step_gated_on_another_packages_selection_loses_its_own`.
+#[test]
+fn every_package_with_tests_is_credited_when_it_alone_is_selected() {
+    let texts = pr_blocking_workflow_texts();
+    let exempt: BTreeSet<&str> = EXEMPT_PACKAGES.iter().map(|(pkg, _)| *pkg).collect();
+    let demanded: BTreeSet<String> = packages_with_tests()
+        .into_keys()
+        .filter(|pkg| !exempt.contains(pkg.as_str()))
+        .collect();
+
+    let lost = packages_lost_to_their_own_selection(&texts, &demanded);
+    assert!(
+        lost.is_empty(),
+        "these packages are named in a PR-blocking step, but every step that \
+         names them is gated on a selection that a pull request touching only \
+         that package does NOT produce, so their tests skip on exactly the \
+         change that needs them:\n  {}\n\
+         FIX: gate the step on \
+         `contains(fromJSON(needs.changes.outputs.pkgs), '<package>')` naming \
+         the package it runs, on `needs.changes.outputs.code == 'true'`, or \
+         leave it ungated.",
+        lost.join("\n  ")
+    );
+
+    // ---- anti-tautology ---------------------------------------------------
+    // An evaluator that dropped every step would report nothing lost only if
+    // the matcher stopped matching too, but one that KEPT every step whatever
+    // the set says is silently blind, and today's unconditional ci.yml cannot
+    // tell the two apart. So require the evaluator to reproduce the ungated
+    // coverage set when everything is selected, and require the set to be the
+    // real workspace.
+    let everything: BTreeSet<String> = demanded
+        .iter()
+        .cloned()
+        .chain([SELECTION_DOCS_MARKER.to_string()])
+        .collect();
+    assert_eq!(
+        packages_credited_under_selection(&texts, &everything, &demanded),
+        demanded,
+        "with every package selected the evaluator must credit exactly what the \
+         ungated walk credits"
+    );
+    assert!(
+        demanded.len() >= 20,
+        "only {} package(s) were evaluated under selection — the member walk is \
+         not reaching the tree and this arm would be vacuous",
+        demanded.len()
+    );
+}
+
+/// The totality arm is not vacuous: a package whose only step is gated on a
+/// DIFFERENT package's selection is reported lost, by name.
+///
+/// This is the mutant the arm exists to kill — the reviewer who moves a step
+/// under the neighbouring package's condition because the two crates are
+/// usually touched together.
+#[test]
+fn a_step_gated_on_another_packages_selection_loses_its_own() {
+    let texts: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "  j:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: alpha\n        \
+         if: contains(fromJSON(needs.changes.outputs.pkgs), 'alpha')\n        \
+         run: cargo test -p alpha\n      \
+         - name: beta\n        \
+         if: contains(fromJSON(needs.changes.outputs.pkgs), 'alpha')\n        \
+         run: cargo test -p beta\n"
+            .to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let packages: BTreeSet<String> = ["alpha", "beta"].into_iter().map(str::to_string).collect();
+
+    assert_eq!(
+        packages_lost_to_their_own_selection(&texts, &packages),
+        vec!["beta".to_string()],
+        "`beta` runs only when `alpha` is selected, so a pull request touching \
+         `beta` alone never runs its tests, and the arm must name it"
+    );
+
+    // Both sides of the set: `beta` IS credited when `alpha` rides along, and
+    // `alpha` is not credited when it is absent.
+    assert_eq!(
+        packages_credited_under_selection(&texts, &packages, &packages),
+        packages,
+        "selecting `alpha` runs both steps"
+    );
+    let only_beta: BTreeSet<String> = ["beta".to_string()].into_iter().collect();
+    assert_eq!(
+        packages_credited_under_selection(&texts, &only_beta, &packages),
+        BTreeSet::<String>::new(),
+        "selecting `beta` alone runs neither step, because both read `alpha`"
+    );
+}
+
+/// The `code` and `docs` selection markers, both sides, on synthetic input.
+///
+/// `code` follows the set being NON-EMPTY and `docs` follows the set holding
+/// the `docs` marker, so a set that holds nothing but the marker satisfies
+/// both. That is the permissive corner of the model and it is asserted here
+/// rather than left to a reader to infer.
+#[test]
+fn the_selection_evaluator_reads_the_code_and_docs_markers() {
+    let texts: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "  j:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - if: needs.changes.outputs.code == 'true'\n        \
+         run: cargo test -p code_pkg\n      \
+         - if: needs.changes.outputs.docs == 'true'\n        \
+         run: cargo test -p docs_pkg\n      \
+         - run: cargo test -p always_pkg\n"
+            .to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let packages: BTreeSet<String> = ["code_pkg", "docs_pkg", "always_pkg"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let set = |names: &[&str]| -> BTreeSet<String> {
+        names.iter().copied().map(str::to_string).collect()
+    };
+
+    assert_eq!(
+        packages_credited_under_selection(&texts, &set(&[]), &packages),
+        set(&["always_pkg"]),
+        "an empty selection runs neither the code step nor the doc step"
+    );
+    assert_eq!(
+        packages_credited_under_selection(&texts, &set(&["cerulion_core"]), &packages),
+        set(&["always_pkg", "code_pkg"]),
+        "a selected package makes the set non-empty, which is `code` and is not \
+         `docs`"
+    );
+    assert_eq!(
+        packages_credited_under_selection(&texts, &set(&[SELECTION_DOCS_MARKER]), &packages),
+        set(&["always_pkg", "code_pkg", "docs_pkg"]),
+        "the `docs` marker is `docs`, and a set holding it is non-empty"
+    );
+}
+
+/// The per-package condition is read as a whole form around a package name,
+/// not by substring — the same boundary rule the package matcher lives by.
+#[test]
+fn only_the_exact_per_package_selection_form_names_a_package() {
+    assert_eq!(
+        selection_condition_package(
+            "contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire')"
+        ),
+        Some("cerulion-wire")
+    );
+    assert_eq!(
+        selection_condition_package("  contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')  "),
+        Some("go2_tf")
+    );
+    for not_sanctioned in [
+        "contains(fromJSON(needs.other.outputs.pkgs), 'a')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), \"a\")",
+        "contains(fromJSON(needs.changes.outputs.pkgs), '')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'a.b')",
+        "!contains(fromJSON(needs.changes.outputs.pkgs), 'a')",
+        "needs.changes.outputs.pkgs",
+    ] {
+        assert_eq!(
+            selection_condition_package(not_sanctioned),
+            None,
+            "`{not_sanctioned}` is not the sanctioned per-package form"
+        );
+    }
 }

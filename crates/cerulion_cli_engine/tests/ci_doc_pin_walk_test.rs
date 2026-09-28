@@ -1,0 +1,1055 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Every integration test that reads a path OUTSIDE its own crate is PINNED in
+//! `.github/workflows/ci.yml`.
+//!
+//! WHY THIS FILE EXISTS. A CI run that decides which test steps to run from the
+//! set of changed paths has exactly one way to be wrong that matters: skipping a
+//! test the change could have broken. The population that a
+//! `crates/<package>/**` rule cannot see is small and identifiable — the test
+//! binaries that open the repository's SHARED trees (`docs`, `tools`,
+//! `.github`, `benches`, `examples`) or a markdown file at the repository root.
+//! Those binaries fail on an edit to a file their own crate does not contain.
+//!
+//! So the membership of that population is DERIVED here rather than listed. A
+//! hand list of "the tests that read the documentation tree" is stale the moment
+//! a test adds a path, and nothing tells anybody. This walk reads every
+//! workspace member's `tests/*.rs`, extracts the string literals its CODE
+//! carries, keeps the ones that name a shared tree or a root markdown file, and
+//! turns each hit into a `(package, test binary) -> roots` pin. Every pin must
+//! appear in `.github/workflows/ci.yml` as a marker line beside the step that
+//! runs that package:
+//!
+//! ```text
+//!       # doc-pin: <package>::<test binary> reads <root>, <root>
+//! ```
+//!
+//! The marker is a YAML comment, so it changes no behaviour and the coverage
+//! walk in `ci_test_coverage_test` (which strips comments before it scans)
+//! cannot be satisfied by one.
+//!
+//! TWO-SIDED SET EQUALITY, deliberately. A derived pin with no marker FAILS: the
+//! path-to-step map has no way to know the binary must run. A marker with no
+//! derived pin ALSO fails, as stale: a renamed or deleted test binary leaves
+//! exactly that shape behind, and a marker that describes nothing silently
+//! pre-authorises the next hole.
+//!
+//! # What counts as a path
+//!
+//! A literal is a doc-root read when it is rooted at one of the five shared
+//! directories — the directory name followed by `/` — or when the WHOLE literal
+//! is one of the root markdown file names. Three rules keep that from drowning
+//! in false hits, each one measured against the tree:
+//!
+//!   * a literal carrying WHITESPACE is prose, not a path. Assertion messages in
+//!     this workspace routinely open with a path and continue into a sentence
+//!     (`"docs/…​.md cites a 500 ms deadman window; update the doc if …"`), and a
+//!     message is not a read;
+//!   * a directory root needs the separator. A bare `"docs"` in the tree is a
+//!     JSON key, a step marker or a directory NAME — three real occurrences, no
+//!     reads. `"benches/"` is a read and `"benches"` is not;
+//!   * a root markdown name counts only as the whole literal. `"msg/README.md"`
+//!     names a file inside a crate.
+//!
+//! Comments are stripped and STRING LITERALS ARE MODELLED IN THE SAME PASS, not
+//! by a comment-only pre-pass. A pre-pass that does not know about literals cuts
+//! a line at the `//` of a URL inside one and takes every path literal after it
+//! on that line with it — a silent hole, in the one direction this file exists
+//! to close. Modelling literals is also what lets this file spell `/*` and `*/`
+//! plainly: the walk reads THIS source too, and a literal here is data, never a
+//! comment opener.
+//!
+//! A raw string is ONE literal, whitespace and all. That is why a manifest
+//! fixture written as `r#"include = ["src/", "README.md"]"#` is not a read of
+//! the root markdown file: the crate under test writes that text into a scratch
+//! directory.
+//!
+//! # Limits
+//!
+//! A path assembled at run time (`root.join(dir).join(name)`) is invisible here,
+//! and so is one reached through a helper in the crate's library. Both are
+//! stated limits, not oversights: the analysis that would see them is a
+//! data-flow analysis, and a wrong answer from one is a demand no maintainer can
+//! discharge. The pin is over-inclusive in the other direction on purpose — a
+//! literal that merely LOOKS like a path costs one extra test step, while a
+//! missed one costs a silent skip.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+/// The shared directory trees a test may read from outside its own crate.
+///
+/// Spelled without a trailing separator because that is how a marker names them;
+/// [`doc_root_of`] requires the separator on the LITERAL it is matching.
+const DOC_ROOT_DIRS: &[&str] = &[".github", "benches", "docs", "examples", "tools"];
+
+/// The root markdown files, by STEM.
+///
+/// The extension is appended rather than spelled because the walk below reads
+/// THIS file as well, and a bare `"README.md"` literal here would pin this
+/// binary to a file it never opens. A stem carries no separator and no
+/// extension, so it matches nothing.
+const ROOT_MARKDOWN_STEMS: &[&str] = &[
+    "AGENTS",
+    "CHANGELOG",
+    "CLAUDE",
+    "CONTRIBUTING",
+    "README",
+    "SECURITY",
+    "USER_API",
+];
+
+/// The extension every [`ROOT_MARKDOWN_STEMS`] entry carries on disk.
+const MARKDOWN_EXT: &str = ".md";
+
+/// The fixed opening of a marker line, comment character included.
+const MARKER_PREFIX: &str = "# doc-pin:";
+
+/// The word between the binary and its roots in a marker line.
+const MARKER_VERB: &str = " reads ";
+
+/// The hand scan of the tree this walk is checked against.
+///
+/// Each row is `(package, test binary, directory roots, root markdown stems)`,
+/// read out of the sources by hand rather than produced by the walk, so the walk
+/// is compared with something that cannot drift with it. Rows are asserted
+/// EXACTLY: a binary that gains or loses a root fails here and the row moves
+/// with the code. Pins the walk does not have a row for are additions, not
+/// errors — the gate below is what makes those land in the workflow.
+#[allow(clippy::type_complexity)]
+const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
+    (
+        "cerulion_cli",
+        "graph_run_validate_gate_e2e_test",
+        &["docs"],
+        &[],
+    ),
+    ("cerulion_cli", "ros2_migrate_cli_test", &["tools"], &[]),
+    (
+        "cerulion_cli_engine",
+        "ci_test_coverage_test",
+        &[".github", "tools"],
+        &[],
+    ),
+    ("cerulion_cli_engine", "completions_test", &[], &["README"]),
+    (
+        "cerulion_cli_engine",
+        "dependency_door_test",
+        &["examples", "tools"],
+        &[],
+    ),
+    (
+        "cerulion_cli_engine",
+        "library_print_ban_test",
+        &["examples"],
+        &[],
+    ),
+    (
+        "cerulion_cli_engine",
+        "workspace_lints_manifest_test",
+        &["examples"],
+        &[],
+    ),
+    (
+        "cerulion_core",
+        "doc_inventory_discipline_test",
+        &["docs"],
+        &[],
+    ),
+    (
+        "cerulion_core",
+        "serial_discipline_test",
+        &[".github", "tools"],
+        &[],
+    ),
+    (
+        "cerulion_core",
+        "silent_trigger_validation_test",
+        &[],
+        &["USER_API"],
+    ),
+    (
+        "cerulion_core",
+        "tracing_field_discipline_test",
+        &["benches"],
+        &[],
+    ),
+    (
+        "cerulion_hygiene",
+        "crate_license_texts_test",
+        &["docs"],
+        &[],
+    ),
+    (
+        "cerulion_hygiene",
+        "dependency_rules_test",
+        &["examples"],
+        &[],
+    ),
+    (
+        "cerulion_hygiene",
+        "shipped_surface_structure_test",
+        &[".github", "benches", "docs", "tools"],
+        &["AGENTS", "CLAUDE", "README"],
+    ),
+    ("cerulion_hygiene", "user_api_doc_test", &["docs"], &[]),
+    ("cerulion_wsd", "doc_deference_test", &[], &["AGENTS"]),
+];
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cerulion_cli_engine has a parent")
+        .parent()
+        .expect("crates/ has a parent (the repo root)")
+        .to_path_buf()
+}
+
+/// `<stem>` plus the markdown extension — the name a marker carries.
+fn root_markdown_name(stem: &str) -> String {
+    format!("{stem}{MARKDOWN_EXT}")
+}
+
+// ---------------------------------------------------------------------------
+// The literal extractor.
+// ---------------------------------------------------------------------------
+
+/// Every STRING LITERAL the code of `src` carries, comments excluded.
+///
+/// One pass over the source, tracking four states, because they interleave:
+/// line comments, block comments (which NEST in Rust), character literals and
+/// string literals. A character literal has to be recognised so `'"'` does not
+/// open a string, and a lifetime (`'a`) has to be distinguished from one.
+///
+/// Every literal form the workspace uses is read: `"…"`, the `b`/`c` prefixed
+/// forms, and raw strings with any number of hashes (`r"…"`, `br#"…"#`). A raw
+/// string yields its contents as ONE literal, which is the point — a manifest or
+/// workflow fixture embedded as a raw string is a document the test WRITES, not
+/// a set of paths it reads.
+///
+/// Escapes are not decoded. A path literal carries none, and decoding them would
+/// invent bytes the source does not have.
+///
+/// Fail-closed at the edges: an unterminated literal or block comment consumes
+/// the rest of the file, so the pins its tail would have produced go missing and
+/// the workflow marker for them reads as stale — a red, never a quiet pass.
+fn string_literals_in_code(src: &str) -> Vec<String> {
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut block_depth = 0usize;
+
+    while i < bytes.len() {
+        if block_depth > 0 {
+            if bytes[i..].starts_with(b"/*") {
+                block_depth += 1;
+                i += 2;
+            } else if bytes[i..].starts_with(b"*/") {
+                block_depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"//") {
+            i = match src[i..].find('\n') {
+                Some(nl) => i + nl + 1,
+                None => bytes.len(),
+            };
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            block_depth = 1;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            i = end_of_char_or_lifetime(bytes, i);
+            continue;
+        }
+        if let Some((literal, next)) = read_string_literal(src, i) {
+            out.push(literal);
+            i = next;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// One past a `'`-introduced token: a character literal, or a lifetime.
+///
+/// `'a'`, `'\n'` and `'\u{2a}'` are literals; `'a` and `'static` are lifetimes.
+/// The distinguishing feature is the CLOSING quote, so an escaped literal is
+/// scanned to it and a bare one is recognised by the quote two bytes on. Getting
+/// this wrong in the lifetime direction would open a string at the next `"` and
+/// swallow the file.
+fn end_of_char_or_lifetime(bytes: &[u8], at: usize) -> usize {
+    if bytes[at..].starts_with(b"'\\") {
+        // Step over the backslash AND the character it escapes before looking
+        // for the closing quote, or `'\''` ends on its own escaped quote and
+        // the scan walks into the code after it one byte out of phase.
+        let mut j = (at + 3).min(bytes.len());
+        while j < bytes.len() && bytes[j] != b'\'' {
+            j += 1;
+        }
+        return (j + 1).min(bytes.len());
+    }
+    // A one-character literal: the quote sits two bytes on. Anything else is a
+    // lifetime, whose name ends where the identifier ends.
+    if at + 2 < bytes.len() && bytes[at + 2] == b'\'' {
+        return at + 3;
+    }
+    at + 1
+}
+
+/// The string literal starting at `at`, and one past its closing delimiter.
+///
+/// Returns `None` when `at` does not open one. The `b` and `c` prefixes and any
+/// number of raw-string hashes are accepted; the prefix is consumed and the
+/// CONTENTS are returned.
+fn read_string_literal(src: &str, at: usize) -> Option<(String, usize)> {
+    let bytes = src.as_bytes();
+    // A prefix letter is a prefix only at the start of a token: the `b` of
+    // `verb` is not a byte-string opener, and reading it as one would consume
+    // the rest of the line.
+    if at > 0 && bytes[at] != b'"' {
+        let prev = bytes[at - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return None;
+        }
+    }
+    let mut i = at;
+    if matches!(bytes.get(i), Some(b'b' | b'c')) {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b'r') {
+        i += 1;
+        let hash_start = i;
+        while bytes.get(i) == Some(&b'#') {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        let hashes = i - hash_start;
+        let body_start = i + 1;
+        let mut close = String::with_capacity(hashes + 1);
+        close.push('"');
+        for _ in 0..hashes {
+            close.push('#');
+        }
+        let end = src[body_start..].find(&close).map(|o| body_start + o);
+        return match end {
+            Some(end) => Some((src[body_start..end].to_string(), end + close.len())),
+            // Unterminated: consume the rest, which loses the tail's pins and
+            // reds the gate rather than passing on text no compiler accepts.
+            None => Some((src[body_start..].to_string(), src.len())),
+        };
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let body_start = i + 1;
+    let mut j = body_start;
+    let mut body = String::new();
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => {
+                // Keep the escape as written; only the delimiter search cares.
+                body.push('\\');
+                match src[j + 1..].chars().next() {
+                    Some(ch) => {
+                        body.push(ch);
+                        j += 1 + ch.len_utf8();
+                    }
+                    None => j += 1,
+                }
+            }
+            b'"' => return Some((body, j + 1)),
+            _ => {
+                let ch = src[j..].chars().next()?;
+                body.push(ch);
+                j += ch.len_utf8();
+            }
+        }
+    }
+    Some((body, bytes.len()))
+}
+
+// ---------------------------------------------------------------------------
+// Literal -> doc root.
+// ---------------------------------------------------------------------------
+
+/// The shared root `literal` reads, if it reads one.
+///
+/// The three rules and the measurements behind them are in the module docs.
+fn doc_root_of(literal: &str) -> Option<String> {
+    if literal.chars().any(char::is_whitespace) {
+        return None;
+    }
+    for dir in DOC_ROOT_DIRS {
+        if let Some(rest) = literal.strip_prefix(*dir) {
+            if rest.starts_with('/') {
+                return Some((*dir).to_string());
+            }
+        }
+    }
+    for stem in ROOT_MARKDOWN_STEMS {
+        let name = root_markdown_name(stem);
+        if literal == name {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Every shared root the CODE of one test source reads.
+fn doc_roots_read_by_source(src: &str) -> BTreeSet<String> {
+    string_literals_in_code(src)
+        .iter()
+        .filter_map(|lit| doc_root_of(lit))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Workspace members, and their integration-test sources.
+// ---------------------------------------------------------------------------
+
+/// The `members = [ ... ]` array of the root manifest, globs expanded.
+///
+/// Hand-rolled rather than `cargo metadata` for the reason the coverage walk
+/// gives: the property under test is what the MANIFEST declares, and shelling
+/// out to cargo inherits its lock and its multi-second resolve.
+fn workspace_member_dirs() -> Vec<PathBuf> {
+    let root = repo_root();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("root Cargo.toml");
+    let start = manifest
+        .find("members = [")
+        .expect("root Cargo.toml declares `members = [`");
+    let rest = &manifest[start..];
+    let end = rest
+        .find("\n]")
+        .expect("the members array is closed by a `]`");
+    let body = &rest[..end];
+
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(open) = line.find('"') else { continue };
+        let Some(close_rel) = line[open + 1..].find('"') else {
+            continue;
+        };
+        let entry = &line[open + 1..open + 1 + close_rel];
+        if let Some(parent) = entry.strip_suffix("/*") {
+            let dir = root.join(parent);
+            let mut expanded: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("cannot expand glob {entry}: {e}"))
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.join("Cargo.toml").is_file())
+                .collect();
+            expanded.sort();
+            out.extend(expanded);
+        } else {
+            out.push(root.join(entry));
+        }
+    }
+    assert!(
+        out.len() > 20,
+        "the members walk found only {} entries — it is not parsing the root \
+         manifest",
+        out.len()
+    );
+    out
+}
+
+/// The `name = "..."` of a crate manifest.
+///
+/// Read from the manifest rather than inferred from the directory because they
+/// DIVERGE: `cerulion_wire/` publishes as `cerulion-wire`.
+fn package_name(dir: &Path) -> String {
+    let text = std::fs::read_to_string(dir.join("Cargo.toml"))
+        .unwrap_or_else(|e| panic!("cannot read {}/Cargo.toml: {e}", dir.display()));
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("name") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim();
+                if let Some(inner) = rest.strip_prefix('"') {
+                    if let Some(end) = inner.find('"') {
+                        return inner[..end].to_string();
+                    }
+                }
+            }
+        }
+        // Stop at the next table: a `name` under `[[bin]]` is not the package.
+        if line.starts_with('[') && !line.starts_with("[package]") {
+            break;
+        }
+    }
+    panic!("{}/Cargo.toml declares no package name", dir.display());
+}
+
+/// `(package, test binary) -> the shared roots that binary reads`.
+///
+/// Depth-1 `tests/*.rs` only, which is exactly the set cargo turns into test
+/// BINARIES: a `tests/common/mod.rs` helper or a `tests/ui/**` trybuild source
+/// is not a target of its own and cannot be named in a marker.
+fn derived_doc_pins() -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut out = BTreeMap::new();
+    let mut sources_read = 0usize;
+    for dir in workspace_member_dirs() {
+        let tests_dir = dir.join("tests");
+        let Ok(entries) = std::fs::read_dir(&tests_dir) else {
+            continue;
+        };
+        let package = package_name(&dir);
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "rs"))
+            .collect();
+        files.sort();
+        for file in files {
+            let binary = file
+                .file_stem()
+                .expect("a `.rs` file has a stem")
+                .to_string_lossy()
+                .into_owned();
+            let src = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
+            sources_read += 1;
+            let roots = doc_roots_read_by_source(&src);
+            if !roots.is_empty() {
+                out.insert((package.clone(), binary), roots);
+            }
+        }
+    }
+    assert!(
+        sources_read >= 200,
+        "the walk read only {sources_read} integration-test source(s) — it is \
+         not reaching the tree, and every pin it reports would be vacuous"
+    );
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The workflow side.
+// ---------------------------------------------------------------------------
+
+fn ci_workflow_path() -> PathBuf {
+    repo_root().join(".github/workflows/ci.yml")
+}
+
+/// The workflow as written — comments INCLUDED, because the markers are
+/// comments.
+fn ci_workflow_text() -> String {
+    let path = ci_workflow_path();
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+/// The marker line one pin demands, exactly as it must appear in the workflow.
+fn marker_line(package: &str, binary: &str, roots: &BTreeSet<String>) -> String {
+    let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
+    format!(
+        "{MARKER_PREFIX} {package}::{binary}{MARKER_VERB}{}",
+        roots.join(", ")
+    )
+}
+
+/// Every marker line the workflow carries, trimmed of its indent.
+fn marker_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| l.starts_with(MARKER_PREFIX))
+        .collect()
+}
+
+/// The package a marker line names, or `None` when the line is malformed.
+fn marker_package(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix(MARKER_PREFIX)?.trim_start();
+    let (pair, _) = rest.split_once(MARKER_VERB)?;
+    let (package, binary) = pair.split_once("::")?;
+    if package.is_empty() || binary.is_empty() {
+        return None;
+    }
+    Some(package)
+}
+
+/// Split the `jobs:` mapping into `(name, block)` pairs, in file order.
+fn jobs_of(text: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("jobs:"))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut out: Vec<(String, Vec<&str>)> = Vec::new();
+    for line in &lines[start..] {
+        if let Some(name) = job_key(line) {
+            out.push((name, Vec::new()));
+        }
+        if let Some(last) = out.last_mut() {
+            last.1.push(line);
+        }
+    }
+    out.into_iter()
+        .map(|(n, lines)| (n, lines.join("\n")))
+        .collect()
+}
+
+/// The job id `line` opens, if it opens one: two spaces, an identifier, a colon.
+///
+/// The identifier test is what keeps a COMMENT out. `ci.yml` carries rationale
+/// blocks at two-space indent, and one of them ending in a colon would otherwise
+/// start a job block that swallows the real job below it.
+fn job_key(line: &str) -> Option<String> {
+    let rest = line.trim_end().strip_prefix("  ")?;
+    if rest.starts_with(' ') {
+        return None;
+    }
+    let name = rest.strip_suffix(':')?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Does ONE workflow line name `package` as a package it runs tests for?
+///
+/// The two forms `ci.yml` uses, matched by WHOLE TOKEN so `cerulion_viz` and
+/// `cerulion_vizd` stay apart: `cargo test … -p <package>` in every spelling
+/// cargo accepts, and `ci_test_shard.sh <package> …`, which takes the name as
+/// its first argument precisely so the name stays literally in the workflow.
+fn line_names_package(line: &str, package: &str) -> bool {
+    if line.trim().starts_with(MARKER_PREFIX) {
+        return false;
+    }
+    if let Some(pos) = line.find("ci_test_shard.sh ") {
+        let tail = &line[pos + "ci_test_shard.sh ".len()..];
+        if tail.split_whitespace().next() == Some(package) {
+            return true;
+        }
+    }
+    let Some(pos) = line.find("cargo test") else {
+        return false;
+    };
+    let mut it = line[pos..].split_whitespace();
+    while let Some(tok) = it.next() {
+        let named = match tok {
+            "-p" | "--package" => it.next() == Some(package),
+            _ => tok
+                .strip_prefix("--package=")
+                .or_else(|| tok.strip_prefix("-p"))
+                .is_some_and(|rest| rest == package),
+        };
+        if named {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// THE GATE
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_doc_reading_test_binary_is_pinned_in_ci_yml() {
+    let pins = derived_doc_pins();
+    assert!(
+        !pins.is_empty(),
+        "the walk derived no doc-pin at all — the literal extractor or the \
+         root classifier is broken, and this gate would be vacuous"
+    );
+
+    let expected: BTreeSet<String> = pins
+        .iter()
+        .map(|((package, binary), roots)| marker_line(package, binary, roots))
+        .collect();
+    let found: BTreeSet<String> = marker_lines(&ci_workflow_text()).into_iter().collect();
+
+    let missing: Vec<&String> = expected.difference(&found).collect();
+    let stale: Vec<&String> = found.difference(&expected).collect();
+
+    assert_eq!(
+        found,
+        expected,
+        "the doc-pin markers in {} do not match the tests that read a shared \
+         root.\n\nMISSING — add each of these as a YAML comment beside the step \
+         that runs its package:\n{}\n\nSTALE — these markers describe no test \
+         that reads a shared root; delete them:\n{}\n\nA test binary is pinned \
+         when a literal in its code names `{}` or a root markdown file. The \
+         marker changes no behaviour: it is the line the path-to-step map reads \
+         to decide that this binary has to run when that root changes.",
+        ci_workflow_path().display(),
+        missing
+            .iter()
+            .map(|m| format!("  {m}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        stale
+            .iter()
+            .map(|m| format!("  {m}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        DOC_ROOT_DIRS.join(", "),
+    );
+}
+
+/// The walk, against the hand scan of the same tree.
+///
+/// The gate above compares the walk with the workflow, so a walk that lost its
+/// sight and a workflow that lost its markers agree with each other perfectly.
+/// This arm is the outside opinion: rows read out of the sources by hand.
+#[test]
+fn the_walk_reproduces_the_hand_scan_of_the_tree() {
+    let pins = derived_doc_pins();
+
+    let hand: BTreeMap<(String, String), BTreeSet<String>> = HAND_SCANNED_DOC_PINS
+        .iter()
+        .map(|(package, binary, dirs, stems)| {
+            let roots: BTreeSet<String> = dirs
+                .iter()
+                .map(|d| (*d).to_string())
+                .chain(stems.iter().map(|s| root_markdown_name(s)))
+                .collect();
+            (((*package).to_string(), (*binary).to_string()), roots)
+        })
+        .collect();
+
+    let walked: BTreeMap<(String, String), BTreeSet<String>> = hand
+        .keys()
+        .map(|key| (key.clone(), pins.get(key).cloned().unwrap_or_default()))
+        .collect();
+
+    assert_eq!(
+        walked, hand,
+        "the walk disagrees with the hand scan. An empty root set means the \
+         walk found NO shared-root literal in that binary: either the test \
+         stopped reading the path (delete its row and its marker) or the \
+         extractor stopped seeing it. A different root set means the binary \
+         gained or lost a read, and the row moves with the code."
+    );
+}
+
+/// A marker sits in the job that runs its package, not loose in the file.
+///
+/// Presence alone is satisfiable by a block of markers parked in the header,
+/// which reads as a pin and pins nothing to a step. Every marker is therefore
+/// required to live inside a job block that also carries a line running its
+/// package, and the count of markers found inside job blocks is required to
+/// equal the count in the file, so a marker outside every job cannot hide.
+#[test]
+fn every_doc_pin_marker_sits_in_the_job_that_runs_its_package() {
+    let text = ci_workflow_text();
+    let jobs = jobs_of(&text);
+    assert!(
+        jobs.len() >= 5,
+        "the job split found only {} job(s) in {} — it is not parsing the \
+         workflow",
+        jobs.len(),
+        ci_workflow_path().display()
+    );
+
+    let mut complaints: Vec<String> = Vec::new();
+    let mut seen_in_jobs = 0usize;
+    for (job, block) in &jobs {
+        for line in block.lines() {
+            let line = line.trim();
+            if !line.starts_with(MARKER_PREFIX) {
+                continue;
+            }
+            seen_in_jobs += 1;
+            let Some(package) = marker_package(line) else {
+                complaints.push(format!(
+                    "  {job}: malformed marker `{line}` — the shape is \
+                     `{MARKER_PREFIX} <package>::<test binary>{MARKER_VERB}<roots>`"
+                ));
+                continue;
+            };
+            if !block.lines().any(|l| line_names_package(l, package)) {
+                complaints.push(format!(
+                    "  {job}: `{line}` but no step in this job runs \
+                     `{package}` — move the marker beside the step that does"
+                ));
+            }
+        }
+    }
+
+    let total = marker_lines(&text).len();
+    assert_eq!(
+        seen_in_jobs,
+        total,
+        "{} of the {total} doc-pin marker(s) in {} sit outside every job block \
+         — a marker that is not beside a step pins nothing",
+        total - seen_in_jobs,
+        ci_workflow_path().display()
+    );
+    assert!(
+        complaints.is_empty(),
+        "doc-pin markers in the wrong place:\n{}",
+        complaints.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The extractor and the classifier, on hand-built input.
+// ---------------------------------------------------------------------------
+
+/// Assemble a path from a root and a tail.
+///
+/// Fixtures are composed rather than spelled for the reason
+/// [`ROOT_MARKDOWN_STEMS`] gives: the walk reads this file, and a fixture
+/// spelled as a whole rooted path would pin this binary to a tree it never
+/// opens. `"docs"` alone carries no separator and `"/guide.md"` no root, so
+/// neither half matches.
+fn doc_path(root: &str, tail: &str) -> String {
+    format!("{root}{tail}")
+}
+
+/// A path literal inside a comment is not a read — in either comment syntax,
+/// nested, and with the positive control beside it.
+///
+/// Without this, the guard is text matching: a paragraph explaining why a test
+/// no longer opens the documentation tree would keep the pin alive, and a read
+/// commented out would keep its marker.
+#[test]
+fn a_path_literal_inside_a_comment_is_not_a_doc_pin() {
+    let path = doc_path("docs", "/internals/cli.md");
+    let docs_only: BTreeSet<String> = [String::from("docs")].into_iter().collect();
+
+    // The positive control FIRST: the same literal in code is a read.
+    let code = format!("let p = root.join(\"{path}\");\n");
+    assert_eq!(doc_roots_read_by_source(&code), docs_only);
+
+    let line_comment = format!("// let p = root.join(\"{path}\");\nfn t() {{}}\n");
+    assert_eq!(
+        doc_roots_read_by_source(&line_comment),
+        BTreeSet::<String>::new()
+    );
+
+    let block_comment = format!("/* let p = \"{path}\"; */\nfn t() {{}}\n");
+    assert_eq!(
+        doc_roots_read_by_source(&block_comment),
+        BTreeSet::<String>::new()
+    );
+
+    // Rust block comments NEST: the inner closer must not end the outer one.
+    let nested = format!("/* outer /* inner */ let p = \"{path}\"; */\nfn t() {{}}\n");
+    assert_eq!(doc_roots_read_by_source(&nested), BTreeSet::<String>::new());
+
+    // A block opener inside a LINE comment opens nothing, so the code after it
+    // is still read.
+    let opener_in_line = format!("// /* note\nlet p = \"{path}\";\n");
+    assert_eq!(doc_roots_read_by_source(&opener_in_line), docs_only);
+}
+
+/// A path inside the crate's own directory is not a shared-root read, and a
+/// shared root that is not at the ROOT of the literal is not one either.
+///
+/// The classifier anchors at position zero on purpose. A substring rule would
+/// pin every test that keeps a fixture under a directory named after a shared
+/// tree, and those fixtures move with their crate.
+#[test]
+fn a_path_inside_the_crates_own_directory_is_not_a_doc_pin() {
+    for local in [
+        doc_path("tests", "/fixtures/graph.yaml"),
+        doc_path("src", "/lib.rs"),
+        // Contains a shared-root name, rooted at neither.
+        format!("tests/fixtures/{}/guide.md", "docs"),
+        format!("src/{}/render.rs", "examples"),
+        // The crate's own copy of a root markdown file, named through the tree.
+        format!(
+            "crates/cerulion_cli_engine/{}",
+            root_markdown_name("README")
+        ),
+    ] {
+        assert_eq!(
+            doc_root_of(&local),
+            None,
+            "`{local}` names a path inside a crate and must not pin anything"
+        );
+    }
+
+    // And the separator rule: a bare root NAME is a name, not a read.
+    for bare in DOC_ROOT_DIRS {
+        assert_eq!(
+            doc_root_of(bare),
+            None,
+            "`{bare}` with no separator is a directory name, a JSON key or a \
+             step marker in this tree — three real occurrences, no reads"
+        );
+    }
+    for root in DOC_ROOT_DIRS {
+        let read = doc_path(root, "/thing.txt");
+        assert_eq!(doc_root_of(&read).as_deref(), Some(*root));
+    }
+
+    // A root markdown file counts as the WHOLE literal and nowhere else.
+    for stem in ROOT_MARKDOWN_STEMS {
+        let name = root_markdown_name(stem);
+        assert_eq!(doc_root_of(&name).as_deref(), Some(name.as_str()));
+        assert_eq!(doc_root_of(&format!("msg/{name}")), None);
+    }
+}
+
+/// A format string rooted at a shared tree is a read, and a sentence that opens
+/// with a path is not.
+#[test]
+fn a_format_string_rooted_at_a_doc_root_is_a_doc_pin() {
+    let docs_only: BTreeSet<String> = [String::from("docs")].into_iter().collect();
+
+    let interpolated = format!(
+        "let p = root.join(format!(\"{}/internals/{{name}}.md\"));\n",
+        "docs"
+    );
+    assert_eq!(doc_roots_read_by_source(&interpolated), docs_only);
+
+    // An assertion message that opens with a path is prose: it carries spaces,
+    // and a message is not a read.
+    let message = format!(
+        "assert!(ok, \"{}/bag.md cites a 500 ms window; update the doc\");\n",
+        "docs"
+    );
+    assert_eq!(
+        doc_roots_read_by_source(&message),
+        BTreeSet::<String>::new()
+    );
+}
+
+/// A raw string is ONE literal, so a manifest fixture that lists a root markdown
+/// file inside an `include` array is not a read of that file.
+///
+/// The crate this shape comes from writes the manifest into a scratch directory
+/// and never opens the repository's own copy.
+#[test]
+fn a_raw_string_fixture_is_one_literal_and_not_a_path() {
+    let readme = root_markdown_name("README");
+    let fixture = format!(
+        "let manifest = r#\"\n[package]\nname = \"scratch\"\ninclude = [\"src/\", \"{readme}\"]\n\"#;\n"
+    );
+    assert_eq!(
+        doc_roots_read_by_source(&fixture),
+        BTreeSet::<String>::new()
+    );
+
+    // The same name as a literal of its own IS a read.
+    let direct = format!("let p = root.join(\"{readme}\");\n");
+    assert_eq!(
+        doc_roots_read_by_source(&direct),
+        [readme].into_iter().collect::<BTreeSet<String>>()
+    );
+}
+
+/// The one-pass design, pinned: a `//` inside a string literal must not cut the
+/// line, a `"` inside a character literal must not open a string, and a lifetime
+/// must not be mistaken for one.
+///
+/// Each of these, got wrong, silently drops every path literal after it on the
+/// line or in the file — the exact direction this file exists to close.
+#[test]
+fn comment_and_literal_markers_inside_literals_do_not_cut_the_scan() {
+    let tools_only: BTreeSet<String> = [String::from("tools")].into_iter().collect();
+    let script = doc_path("tools", "/scripts/build.sh");
+
+    let url_first = format!("let u = \"https://example.invalid\"; let p = \"{script}\";\n");
+    assert_eq!(doc_roots_read_by_source(&url_first), tools_only);
+
+    let quote_char = format!("let q = '\"'; let p = \"{script}\";\n");
+    assert_eq!(doc_roots_read_by_source(&quote_char), tools_only);
+
+    let lifetime = format!("fn f<'a>(s: &'a str) {{ let p = \"{script}\"; }}\n");
+    assert_eq!(doc_roots_read_by_source(&lifetime), tools_only);
+
+    let escaped_char = format!("let n = '\\n'; let p = \"{script}\";\n");
+    assert_eq!(doc_roots_read_by_source(&escaped_char), tools_only);
+
+    // A block-comment opener inside a literal is data.
+    let opener_literal = format!("let o = \"/*\"; let p = \"{script}\";\n");
+    assert_eq!(doc_roots_read_by_source(&opener_literal), tools_only);
+
+    // An escaped quote does not end the literal, so the path after it is seen.
+    let escaped_quote = format!("let s = \"a\\\"b\"; let p = \"{script}\";\n");
+    assert_eq!(doc_roots_read_by_source(&escaped_quote), tools_only);
+
+    // Multi-byte characters survive the byte scan.
+    let wide = format!("let s = \"é ü ø\"; let p = \"{script}\";\n");
+    assert_eq!(doc_roots_read_by_source(&wide), tools_only);
+}
+
+/// The marker text, both halves, against hand-written strings.
+///
+/// The gate compares whole marker LINES, so a formatter that drifted by one
+/// space would report every pin missing and every marker stale at once.
+#[test]
+fn a_marker_line_is_the_package_the_binary_and_the_sorted_roots() {
+    let roots: BTreeSet<String> = [".github", "tools"].iter().map(|s| s.to_string()).collect();
+    let line = marker_line("cerulion_core", "serial_discipline_test", &roots);
+    assert_eq!(
+        line,
+        "# doc-pin: cerulion_core::serial_discipline_test reads .github, tools"
+    );
+    assert_eq!(marker_package(&line), Some("cerulion_core"));
+
+    let one: BTreeSet<String> = [root_markdown_name("AGENTS")].into_iter().collect();
+    assert_eq!(
+        marker_line("cerulion_wsd", "doc_deference_test", &one),
+        "# doc-pin: cerulion_wsd::doc_deference_test reads AGENTS.md"
+    );
+
+    // Malformed markers are named rather than ignored.
+    assert_eq!(marker_package("# doc-pin: no separator here"), None);
+    assert_eq!(marker_package("# doc-pin: pkg::bin"), None);
+    assert_eq!(marker_package("# doc-pin: ::bin reads docs"), None);
+    assert_eq!(marker_package("# doc-pin: pkg:: reads docs"), None);
+}
+
+/// The workflow readers, on hand-written documents.
+///
+/// A job splitter that mistook a two-space comment for a job key would merge the
+/// real job that follows it into the comment's block, and every marker in that
+/// job would then be checked against the wrong steps.
+#[test]
+fn a_two_space_comment_does_not_open_a_job_and_a_marker_never_names_its_own_package() {
+    let doc = "on:\n  pull_request:\njobs:\n  \
+               # a rationale block that ends in a colon:\n  \
+               real-job:\n    runs-on: ubuntu-latest\n    steps:\n      \
+               # doc-pin: pkg::bin reads docs\n      - run: cargo test -p pkg\n  \
+               other-job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+    let jobs = jobs_of(doc);
+    assert_eq!(
+        jobs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["real-job", "other-job"]
+    );
+    assert!(jobs[0].1.contains("cargo test -p pkg"));
+
+    // The marker line itself must not vouch for the package it names.
+    assert!(!line_names_package(
+        "      # doc-pin: pkg::bin reads docs",
+        "pkg"
+    ));
+    assert!(line_names_package("      - run: cargo test -p pkg", "pkg"));
+    assert!(line_names_package(
+        "      - run: ./tools/scripts/ci_test_shard.sh pkg 0 4",
+        "pkg"
+    ));
+    // Whole-token matching, which is what keeps a name off its own prefix.
+    assert!(!line_names_package(
+        "      - run: cargo test -p pkgd",
+        "pkg"
+    ));
+    assert!(!line_names_package(
+        "      - run: cargo build -p pkg",
+        "pkg"
+    ));
+}
