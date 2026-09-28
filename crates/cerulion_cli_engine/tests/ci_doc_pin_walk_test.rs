@@ -667,7 +667,8 @@ fn const_items(code: &str) -> Vec<ConstItem> {
 /// Whole-token, so a name is not found inside a longer one. A const nobody
 /// reads is dead text, and dead text's paths are not reads.
 fn const_is_used_elsewhere(code: &str, item: &ConstItem) -> bool {
-    let boundary = |ch: Option<char>| ch.is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+    let boundary =
+        |ch: Option<char>| ch.is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
     let mut from = 0usize;
     while let Some(offset) = code[from..].find(&item.name) {
         let at = from + offset;
@@ -805,7 +806,9 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
             let Some(after) = after.trim_start().strip_prefix('"') else {
                 continue;
             };
-            let Some(close) = after.find('"') else { continue };
+            let Some(close) = after.find('"') else {
+                continue;
+            };
             out.push(normalised(&dir.join(&after[..close])));
         }
     }
@@ -1305,8 +1308,7 @@ fn a_path_literal_inside_a_comment_is_not_a_doc_pin() {
     );
 
     // Rust block comments NEST: the inner closer must not end the outer one.
-    let nested =
-        format!("/* outer /* inner */ let p = root.join(\"{path}\"); */\nfn t() {{}}\n");
+    let nested = format!("/* outer /* inner */ let p = root.join(\"{path}\"); */\nfn t() {{}}\n");
     assert_eq!(doc_roots_read_by_source(&nested), BTreeSet::<String>::new());
 
     // A block opener inside a LINE comment opens nothing, so the code after it
@@ -1601,8 +1603,7 @@ fn a_const_path_table_counts_only_when_the_const_is_read() {
     );
 
     // Whole-token matching: a longer name is not a read of the shorter one.
-    let prefix_only =
-        format!("const MAP: &str = \"{map}\";\nfn t() {{ let r = MAP_ROWS; }}\n");
+    let prefix_only = format!("const MAP: &str = \"{map}\";\nfn t() {{ let r = MAP_ROWS; }}\n");
     assert_eq!(
         doc_roots_read_by_source(&prefix_only),
         BTreeSet::<String>::new()

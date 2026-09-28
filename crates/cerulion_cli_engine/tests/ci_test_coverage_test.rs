@@ -1674,18 +1674,18 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
     let other_output = "    outputs:\n      packaging: ${{ steps.c.outputs.packaging }}\n";
 
     let credited = |text: &str| -> BTreeSet<String> {
-        let texts: BTreeMap<String, String> =
-            [("fake.yml".to_string(), pr_blocking_jobs(text))]
-                .into_iter()
-                .collect();
+        let texts: BTreeMap<String, String> = [("fake.yml".to_string(), pr_blocking_jobs(text))]
+            .into_iter()
+            .collect();
         ["code_pkg", "sel_pkg", "always_pkg"]
             .into_iter()
             .filter(|pkg| workflows_name(&texts, pkg).is_some())
             .map(str::to_string)
             .collect()
     };
-    let set =
-        |names: &[&str]| -> BTreeSet<String> { names.iter().copied().map(str::to_string).collect() };
+    let set = |names: &[&str]| -> BTreeSet<String> {
+        names.iter().copied().map(str::to_string).collect()
+    };
 
     // GROUNDED: the job needs the classifier and the classifier declares both
     // outputs, so both selection steps credit their package.
