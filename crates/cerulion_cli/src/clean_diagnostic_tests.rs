@@ -133,7 +133,7 @@ fn the_reclamation_stands_down_when_dead_nodes_are_still_registered() {
     // satisfied by that variant too, so it is pinned as a whole expression.
     let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        normalized.contains("let reclaim = !report_only && converged;"),
+        normalized.contains("let reclaim = mode.removes() && converged;"),
         "`cerulion clean` must reclaim only when the operator asked AND the sweep left no \
          dead nodes registered — an `||` would reclaim on a wedged desk; body was:\n{body}"
     );
@@ -205,7 +205,7 @@ fn the_diagnostic_reclaims_only_when_the_operator_did_not_ask_for_a_report() {
     // would delete on the one run whose whole point was not to.
     let src = code_only(&read_main());
     let body = fn_body(&src, "report_shm_state_population");
-    let (report_arm, reclaim_arm) = if_else_arms(&body, "report_only");
+    let (reclaim_arm, report_arm) = if_else_arms(&body, "mode.removes()");
 
     assert!(
         report_arm.contains("ScanMode::ReportOnly") && !report_arm.contains("ScanMode::Reclaim"),
@@ -267,9 +267,13 @@ fn the_walk_reads_the_code_it_claims_to_read() {
 // listing's own wiring is pinned by the source walk below.
 // ---------------------------------------------------------------------------
 
-use cerulion_cli_engine::ipc_cleanup::{classify_cleanup_failures, FailedNodeCleanup};
+use cerulion_cli_engine::ipc_cleanup::{
+    classify_cleanup_failures, sweep_one_node, DeadNodeIdentity, FailedNodeCleanup,
+    NodeSweepOutcome, SurveyedNode, SweepMode,
+};
 use cerulion_cli_engine::orphan_port_tags::{OrphanTagReclaim, ReclaimVerdict};
 use cerulion_core::iceoryx_logger::CapturedLog;
+use iceoryx2::node::NodeCleanupFailure;
 use iceoryx2::prelude::LogLevel;
 
 /// The node token exactly as iceoryx2 0.9.1 renders it — kept verbatim so a
@@ -345,7 +349,7 @@ fn absences_are_stated_never_fabricated() {
 
 #[test]
 fn the_listing_is_capped_and_says_how_many_it_folded() {
-    let cap = super::REFUSED_NODES_SHOWN;
+    let cap = super::NODES_SHOWN;
     let node = |i: usize| {
         format!("UniqueNodeId(UniqueSystemId {{ value: {i}, pid: 1, creation_time: 0 }})")
     };
@@ -386,7 +390,7 @@ fn the_listing_is_capped_and_says_how_many_it_folded() {
 #[test]
 fn the_cap_is_ten_nodes() {
     // The item's contract, pinned so a drift is a deliberate change.
-    assert_eq!(super::REFUSED_NODES_SHOWN, 10);
+    assert_eq!(super::NODES_SHOWN, 10);
 }
 
 #[test]
@@ -434,6 +438,33 @@ fn the_clean_verb_prints_the_listing_between_the_breakdown_and_the_unclassified_
         tail.contains("RAW_IOX2_LINES_HINT"),
         "the unclassified arm must keep the raw-lines hint; tail was:\n{tail}"
     );
+}
+
+/// One past the BALANCED closing paren of the first `<callee>(` in `body`.
+///
+/// Balanced, never the first `)`: an argument that is itself a call
+/// (`mode.reports_only()`) closes a paren of its own, and a scan that stopped
+/// there would hand the caller a slice starting inside the argument list.
+fn call_end(body: &str, callee: &str) -> usize {
+    let needle = format!("{callee}(");
+    let at = body
+        .find(&needle)
+        .unwrap_or_else(|| panic!("`{needle}` must be called; body was:\n{body}"));
+    let open = at + callee.len();
+    let mut depth = 0usize;
+    for (i, b) in body.as_bytes().iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{needle}` is not paren-balanced; body was:\n{body}");
 }
 
 /// The paren-balanced argument list of the FIRST `<callee>(` in `body`,
@@ -499,8 +530,9 @@ fn each_renderer_is_handed_the_reports_own_field_never_an_empty_slice() {
     let sig = &src[sig_start..sig_start + src[sig_start..].find('{').expect("body")];
     let sig = sig.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        sig.contains("(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport)"),
-        "the reporter takes the sweep report as `report`; signature was:\n{sig}"
+        sig.contains("(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport, mode: SweepMode)"),
+        "the reporter takes the sweep report as `report` and the verb's mode; signature \
+         was:\n{sig}"
     );
 
     // Same class, one function over: the reclaim renderer is handed the
@@ -508,8 +540,8 @@ fn each_renderer_is_handed_the_reports_own_field_never_an_empty_slice() {
     let verb = fn_body(&src, "clean_dead_nodes");
     assert_eq!(
         call_args(&verb, "render_orphan_tag_reclaims"),
-        "&reclaims, report_only",
-        "the reclaim listing must render the reclaim outcomes under the operator's flag; body \
+        "&reclaims, mode",
+        "the reclaim listing must render the reclaim outcomes under the operator's mode; body \
          was:\n{verb}"
     );
 }
@@ -554,13 +586,13 @@ fn an_already_empty_directory_renders_as_converged_pending_sweep_never_as_a_refu
         verdict: ReclaimVerdict::AlreadyEmpty,
         ..reclaim(4242, 77, &[], None)
     };
-    for report_only in [false, true] {
-        let lines = super::render_orphan_tag_reclaims(std::slice::from_ref(&empty), report_only);
+    for mode in [SweepMode::Remove, SweepMode::ReportOnly] {
+        let lines = super::render_orphan_tag_reclaims(std::slice::from_ref(&empty), mode);
         assert_eq!(
             lines[1],
             "node 4242 (pid 77, process gone): directory already empty — nothing to reclaim; the \
              next sweep removes it",
-            "report_only={report_only}"
+            "mode={mode:?}"
         );
         assert!(
             !lines[1].contains("not reclaimed") && !lines[1].contains("removed 0"),
@@ -571,7 +603,8 @@ fn an_already_empty_directory_renders_as_converged_pending_sweep_never_as_a_refu
 
 #[test]
 fn a_reclaimed_node_renders_its_pid_the_gone_verdict_and_every_removed_port_id() {
-    let lines = super::render_orphan_tag_reclaims(&[reclaim(4242, 77, &[1, 22], None)], false);
+    let lines =
+        super::render_orphan_tag_reclaims(&[reclaim(4242, 77, &[1, 22], None)], SweepMode::Remove);
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(
         lines[0].starts_with("Reclaiming orphan port tags"),
@@ -585,7 +618,8 @@ fn a_reclaimed_node_renders_its_pid_the_gone_verdict_and_every_removed_port_id()
 
 #[test]
 fn report_only_says_would_remove_and_closes_with_the_nothing_removed_line() {
-    let lines = super::render_orphan_tag_reclaims(&[reclaim(4242, 77, &[1], None)], true);
+    let lines =
+        super::render_orphan_tag_reclaims(&[reclaim(4242, 77, &[1], None)], SweepMode::ReportOnly);
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert!(
         lines[0].contains("report only") && lines[0].contains("nothing removed"),
@@ -606,7 +640,7 @@ fn report_only_says_would_remove_and_closes_with_the_nothing_removed_line() {
 fn a_refusal_renders_the_reason_and_never_claims_the_gone_verdict() {
     let lines = super::render_orphan_tag_reclaims(
         &[reclaim(4242, 77, &[], Some("process 77 is still alive"))],
-        false,
+        SweepMode::Remove,
     );
     assert_eq!(
         lines[1],
@@ -617,7 +651,7 @@ fn a_refusal_renders_the_reason_and_never_claims_the_gone_verdict() {
     // A mid-way failure states what WAS removed rather than hiding it.
     let lines = super::render_orphan_tag_reclaims(
         &[reclaim(4242, 77, &[5], Some("removing `x` failed: boom"))],
-        false,
+        SweepMode::Remove,
     );
     assert_eq!(
         lines[1],
@@ -629,11 +663,11 @@ fn a_refusal_renders_the_reason_and_never_claims_the_gone_verdict() {
 #[test]
 fn no_candidates_render_nothing_at_all() {
     assert_eq!(
-        super::render_orphan_tag_reclaims(&[], false),
+        super::render_orphan_tag_reclaims(&[], SweepMode::Remove),
         Vec::<String>::new()
     );
     assert_eq!(
-        super::render_orphan_tag_reclaims(&[], true),
+        super::render_orphan_tag_reclaims(&[], SweepMode::ReportOnly),
         Vec::<String>::new()
     );
 }
@@ -642,7 +676,7 @@ fn no_candidates_render_nothing_at_all() {
 fn the_clean_verb_reclaims_orphan_tags_between_exactly_two_sweeps() {
     let src = code_only(&read_main());
     let body = fn_body(&src, "clean_dead_nodes");
-    let sweep = "cleanup_dead_iceoryx2_nodes_with_diagnostics()";
+    let sweep = "sweep_dead_nodes(mode)";
     let sweeps: Vec<usize> = body.match_indices(sweep).map(|(i, _)| i).collect();
     assert_eq!(
         sweeps.len(),
@@ -668,16 +702,16 @@ fn the_clean_verb_reclaims_orphan_tags_between_exactly_two_sweeps() {
     // two `report_sweep(` calls alone is satisfied by printing the FIRST
     // report twice and never the second.
     let first_bind = body
-        .find("let report = ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics();")
+        .find("let report = ipc_cleanup::sweep_dead_nodes(mode);")
         .expect("the first sweep is bound to `report`");
     let first_report = body
-        .find("report_sweep(&report)")
+        .find("report_sweep(&report, mode)")
         .expect("the first sweep's report is printed");
     let second_bind = body
-        .find("let second = ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics();")
+        .find("let second = ipc_cleanup::sweep_dead_nodes(mode);")
         .expect("the second sweep is bound to `second`");
     let second_report = body
-        .find("report_sweep(&second)")
+        .find("report_sweep(&second, mode)")
         .expect("the second sweep's report is printed");
     assert!(
         first_bind < first_report
@@ -708,23 +742,24 @@ fn report_only_travels_as_the_dry_run_bit_and_gates_the_second_sweep() {
     // was not to; `report_only` in another slot and a literal in the dry-run
     // slot would pass a substring check just the same. The reclaim's
     // signature is `(candidates, config, dry_run, verdict)`, so the operator's
-    // flag must be the THIRD argument verbatim and `shm_state`'s one liveness
-    // verdict the FOURTH.
+    // mode must be the THIRD argument, spelled in its own polarity
+    // (`reports_only`, never a negation of `removes`), and `shm_state`'s one
+    // liveness verdict the FOURTH.
     let args = call_args(&body, "reclaim_orphan_port_tags");
     let args: Vec<&str> = args.split(", ").collect();
     assert_eq!(
         args,
-        vec!["&candidates", "config", "report_only", "&creator_verdict"],
-        "the reclaim's arguments, in order — the dry-run bit is the operator's flag itself, \
-         never its negation or a literal, and the verdict is `shm_state`'s; body was:\n{body}"
+        vec![
+            "&candidates",
+            "config",
+            "mode.reports_only()",
+            "&creator_verdict"
+        ],
+        "the reclaim's arguments, in order — the dry-run bit is the verb's own mode, never a \
+         negation and never a literal, and the verdict is `shm_state`'s; body was:\n{body}"
     );
-    let call = body
-        .find("reclaim_orphan_port_tags(")
-        .expect("reclaim call");
-    let args_end = body[call..].find(')').expect("call closes") + call;
-    let second = body
-        .rfind("cleanup_dead_iceoryx2_nodes_with_diagnostics()")
-        .expect("second sweep");
+    let args_end = call_end(&body, "reclaim_orphan_port_tags");
+    let second = body.rfind("sweep_dead_nodes(mode)").expect("second sweep");
     let between = &body[args_end..second];
     // The GUARD GOVERNS the second sweep, and nothing else does: the one
     // `if` between the reclaim and the second sweep forks on the operator's
@@ -735,7 +770,7 @@ fn report_only_travels_as_the_dry_run_bit_and_gates_the_second_sweep() {
     // also asked "did a tag come off?" would leave an already-empty
     // directory standing for one more run.
     let guard = between
-        .find("if report_only {")
+        .find("if mode.reports_only() {")
         .expect("the dry-run guard sits between the reclaim and the second sweep");
     let then = block_after(between, guard);
     assert_eq!(
@@ -763,9 +798,7 @@ fn report_only_travels_as_the_dry_run_bit_and_gates_the_second_sweep() {
 fn the_convergence_handed_to_the_state_file_gate_is_the_second_sweeps() {
     let src = code_only(&read_main());
     let body = fn_body(&src, "clean_dead_nodes");
-    let second = body
-        .rfind("cleanup_dead_iceoryx2_nodes_with_diagnostics()")
-        .expect("second sweep");
+    let second = body.rfind("sweep_dead_nodes(mode)").expect("second sweep");
     let tail = body[second..]
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -783,7 +816,7 @@ fn the_convergence_handed_to_the_state_file_gate_is_the_second_sweeps() {
         "the tail convergence is the second sweep's full conjunction; body was:\n{body}"
     );
     let reported = body
-        .rfind("report_sweep(&second)")
+        .rfind("report_sweep(&second, mode)")
         .expect("the second sweep is reported");
     let last_tuple = body.rfind("Ok(()),").expect("a convergence tuple");
     assert!(
@@ -1208,11 +1241,15 @@ fn the_renderers_are_bit_identical_across_runs_and_match_their_oracles() {
         reclaim(4242, 77, &[1, 22], None),
         reclaim(4243, 78, &[], Some("process 78 is still alive")),
     ];
-    for report_only in [false, true] {
-        let lines1 = super::render_orphan_tag_reclaims(&reclaims, report_only);
-        let lines2 = super::render_orphan_tag_reclaims(&reclaims, report_only);
-        assert_eq!(lines1.len(), if report_only { 4 } else { 3 }, "{lines1:?}");
-        assert_eq!(lines1, lines2, "report_only={report_only}");
+    for mode in [SweepMode::Remove, SweepMode::ReportOnly] {
+        let lines1 = super::render_orphan_tag_reclaims(&reclaims, mode);
+        let lines2 = super::render_orphan_tag_reclaims(&reclaims, mode);
+        assert_eq!(
+            lines1.len(),
+            if mode.reports_only() { 4 } else { 3 },
+            "{lines1:?}"
+        );
+        assert_eq!(lines1, lines2, "mode={mode:?}");
     }
 }
 
@@ -1276,5 +1313,309 @@ fn the_clean_verb_prints_the_registry_block_first_and_gates_convergence_on_it() 
     assert!(
         unscanned.contains("not evidence") && !unscanned.contains("No dead iceoryx2 nodes found"),
         "the unscanned arm must refuse the absence claim; arm was:\n{unscanned}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--report-only`: the whole report, and the proof nothing was removed.
+//
+// The listing renderer is PURE, so the whole would-remove report is pinned
+// against hand-written line vectors over a fixture-planted registry. The
+// "removed nothing" half is pinned at the SEAM the production sweep removes
+// through: `sweep_one_node` takes the removal as a parameter, so a counting
+// closure observes the same call the real path makes — no filesystem mock,
+// and no registry needed.
+// ---------------------------------------------------------------------------
+
+/// The registry directory a fixture report names back. A path, never a
+/// directory that exists: the renderer only prints it.
+const FIXTURE_NODE_DIR: &str = "/fixture/iox2-root/nodes";
+
+/// One planted dead node, named the two ways the walk names one: the entry
+/// name under the registry directory, and iceoryx2's `{:?}` token.
+fn planted(value: u128, pid: u32) -> DeadNodeIdentity {
+    DeadNodeIdentity {
+        name: value.to_string(),
+        token: format!(
+            "UniqueNodeId(UniqueSystemId {{ value: {value}, pid: {pid}, creation_time: Time {{ \
+             seconds: 7, nanoseconds: 0 }} }})"
+        ),
+    }
+}
+
+fn would_remove(dead: &[DeadNodeIdentity]) -> Vec<String> {
+    super::render_would_remove(dead, std::path::Path::new(FIXTURE_NODE_DIR))
+}
+
+#[test]
+fn the_report_only_listing_names_every_planted_node_and_claims_no_removal() {
+    let dead = [planted(1, 4242), planted(2, 4243)];
+    assert_eq!(
+        would_remove(&dead),
+        vec![
+            format!(
+                "Dead iceoryx2 node(s) `cerulion clean` would remove: 2 under \
+                 {FIXTURE_NODE_DIR} (report only; none was removed)"
+            ),
+            "  node 1".to_string(),
+            "  node 2".to_string(),
+            super::ORPHAN_TAGS_NOT_LISTED.to_string(),
+        ],
+        "the whole listing, line for line"
+    );
+    // Absence STATED: the orphan-tag section is a sentence, never an empty
+    // block a reader would take for "none".
+    assert!(
+        super::ORPHAN_TAGS_NOT_LISTED.contains("not listed by a report"),
+        "the orphan-tag absence must say it was not looked for: {}",
+        super::ORPHAN_TAGS_NOT_LISTED
+    );
+    // And no line may claim a removal happened.
+    assert!(
+        !would_remove(&dead)
+            .iter()
+            .any(|line| line.contains("Cleaned") || line.contains("removed 1")),
+        "a report must never render a removal"
+    );
+}
+
+#[test]
+fn a_registry_with_no_dead_node_renders_no_would_remove_listing_at_all() {
+    // Not even the heading: `report_sweep` falls through to the
+    // "nothing to clean" summary, which is the line that arm already pins.
+    assert_eq!(would_remove(&[]), Vec::<String>::new());
+}
+
+#[test]
+fn the_would_remove_listing_folds_at_the_cap_and_at_the_cap_plus_one() {
+    // Both sides of the bound, with the fixtures COMPUTED from the constant.
+    let cap = super::NODES_SHOWN;
+    let plant =
+        |n: usize| -> Vec<DeadNodeIdentity> { (0..n).map(|i| planted(i as u128, 1)).collect() };
+
+    let at = would_remove(&plant(cap));
+    assert_eq!(
+        at.iter().filter(|l| l.starts_with("  node ")).count(),
+        cap,
+        "{at:?}"
+    );
+    assert!(
+        !at.iter().any(|l| l.contains("more")),
+        "at the cap there is no remainder to fold: {at:?}"
+    );
+
+    let over = would_remove(&plant(cap + 1));
+    assert_eq!(
+        over.iter().filter(|l| l.starts_with("  node ")).count(),
+        cap,
+        "{over:?}"
+    );
+    assert_eq!(
+        over[over.len() - 2],
+        "  … and 1 more",
+        "one past the cap folds exactly one: {over:?}"
+    );
+    assert!(
+        !over.iter().any(|l| **l == format!("  node {cap}")),
+        "a folded node must not leak past the cap: {over:?}"
+    );
+    // The heading counts what was FOUND, never what was listed.
+    assert!(
+        over[0].contains(&format!(": {} under ", cap + 1)),
+        "the heading counts every dead node, not the shown ones: {over:?}"
+    );
+}
+
+/// Drive [`sweep_one_node`] over a hand-built survey and report what the
+/// seam saw: the outcomes, how many times the removal was called, and every
+/// line the sweep traced.
+fn drive(
+    nodes: Vec<SurveyedNode<Result<(), NodeCleanupFailure>>>,
+    mode: SweepMode,
+) -> (Vec<NodeSweepOutcome>, usize, Vec<(LogLevel, String)>) {
+    let mut calls = 0usize;
+    let mut traced = Vec::new();
+    let outcomes = nodes
+        .into_iter()
+        .map(|node| {
+            sweep_one_node(
+                node,
+                mode,
+                |result: Result<(), NodeCleanupFailure>| {
+                    calls += 1;
+                    result
+                },
+                |level, message| traced.push((level, message)),
+            )
+        })
+        .collect();
+    (outcomes, calls, traced)
+}
+
+#[test]
+fn a_report_only_sweep_classifies_every_dead_node_and_never_calls_the_removal() {
+    let (a, b) = (planted(1, 4242), planted(2, 4243));
+    let survey = vec![
+        SurveyedNode::Dead {
+            identity: a.clone(),
+            view: Ok(()),
+        },
+        SurveyedNode::NotDead,
+        SurveyedNode::Dead {
+            identity: b.clone(),
+            view: Ok(()),
+        },
+    ];
+
+    let (outcomes, calls, traced) = drive(survey, SweepMode::ReportOnly);
+
+    assert_eq!(
+        outcomes,
+        vec![
+            NodeSweepOutcome::WouldRemove(a.clone()),
+            NodeSweepOutcome::NotDead,
+            NodeSweepOutcome::WouldRemove(b.clone()),
+        ],
+        "every dead node is classified, and no live one is"
+    );
+    assert_eq!(
+        calls, 0,
+        "a report must not call the removal, not once, for any node"
+    );
+    // Only the detection lines, transcribed from iceoryx2 0.9.1's own sweep
+    // loop (`node/mod.rs:1225`): a report emits no removal line, because
+    // there was no removal to report.
+    assert_eq!(
+        traced,
+        vec![
+            (LogLevel::Debug, format!("Dead node ({}) detected", a.token)),
+            (LogLevel::Debug, format!("Dead node ({}) detected", b.token)),
+        ]
+    );
+}
+
+#[test]
+fn a_removing_sweep_is_the_same_classification_followed_by_the_removal() {
+    // The other side of the ONE decision: the same survey, the same
+    // classification, and the removal called exactly once per dead node.
+    // Oracles for both trace lines transcribed from iceoryx2 0.9.1
+    // (`node/mod.rs:1227` and `:1231`).
+    let (a, b) = (planted(1, 4242), planted(2, 4243));
+    let survey = vec![
+        SurveyedNode::Dead {
+            identity: a.clone(),
+            view: Ok(()),
+        },
+        SurveyedNode::NotDead,
+        SurveyedNode::Dead {
+            identity: b.clone(),
+            view: Err(NodeCleanupFailure::InsufficientPermissions),
+        },
+    ];
+
+    let (outcomes, calls, traced) = drive(survey, SweepMode::Remove);
+
+    assert_eq!(
+        outcomes,
+        vec![
+            NodeSweepOutcome::Removed(a.clone()),
+            NodeSweepOutcome::NotDead,
+            NodeSweepOutcome::Refused {
+                identity: b.clone(),
+                failure: "InsufficientPermissions".to_string(),
+            },
+        ]
+    );
+    assert_eq!(calls, 2, "one call per DEAD node, and none for a live one");
+    assert_eq!(
+        traced,
+        vec![
+            (LogLevel::Debug, format!("Dead node ({}) detected", a.token)),
+            (
+                LogLevel::Trace,
+                format!("The dead node ({}) was successfully removed.", a.token)
+            ),
+            (LogLevel::Debug, format!("Dead node ({}) detected", b.token)),
+            (
+                LogLevel::Trace,
+                format!(
+                    "Unable to remove dead node {} (InsufficientPermissions).",
+                    b.token
+                )
+            ),
+        ],
+        "the refusal line is the marker `classify_cleanup_failures` parses"
+    );
+}
+
+#[test]
+fn the_clean_verb_renders_the_would_remove_listing_from_the_sweeps_own_field() {
+    // The inert-shipping guard for the report-only half: every arm above
+    // stays green with the renderer unwired, and a `render_would_remove(&[])`
+    // would keep the call in place and print nothing on exactly the run the
+    // flag was given for.
+    let src = code_only(&read_main());
+    let body = fn_body(&src, "report_sweep");
+    assert_eq!(
+        call_args(&body, "render_would_remove"),
+        "&report.dead_nodes, &cerulion_cli_engine::shm_state::iceoryx2_node_dir()",
+        "the listing must render the sweep's own dead-node set, under the registry the sweep \
+         read; body was:\n{body}"
+    );
+    // The fork sits AFTER the registry-wide block (a global failure is still
+    // read as global) and BEFORE the summary line, whose 0/0 counters would
+    // otherwise render a report as a converged sweep.
+    let registry = body
+        .find("render_registry_errors(")
+        .expect("the registry block must still be rendered");
+    let fork = body
+        .find("if mode.reports_only() && !report.dead_nodes.is_empty() {")
+        .expect("the report-only fork must guard the listing");
+    let summary = body
+        .find("Cleaned {} dead iceoryx2 node(s)")
+        .expect("the summary line must still exist");
+    assert!(
+        registry < fork && fork < summary,
+        "registry block, then the report-only fork, then the summary; body was:\n{body}"
+    );
+    // And the fork RETURNS: a report that fell through would print
+    // "No dead iceoryx2 nodes found — nothing to clean." under a listing of
+    // the nodes it had just named.
+    let block = block_after(&body, fork);
+    assert!(
+        block.contains("return;"),
+        "the report-only fork must return rather than fall through to the summary; block \
+         was:\n{block}"
+    );
+}
+
+#[test]
+fn the_verb_closes_a_report_only_run_by_saying_nothing_was_removed() {
+    // The flag's whole promise, stated once, after BOTH halves have
+    // reported — so it covers the `.shm_state` population too, which the
+    // dead-node listing says nothing about.
+    let src = code_only(&read_main());
+    let body = fn_body(&src, "clean_iceoryx2_state");
+    let diagnostic = body
+        .find("report_shm_state_population(")
+        .expect("the diagnostic must still be called");
+    let closing = body
+        .find("NOTHING_WAS_REMOVED")
+        .expect("a report-only run must close by saying nothing was removed");
+    assert!(
+        diagnostic < closing,
+        "the closing claim comes after both halves have reported; body was:\n{body}"
+    );
+    let guard = body
+        .find("if mode.reports_only() {")
+        .expect("the closing line is printed only under the flag");
+    assert!(
+        guard < closing,
+        "the closing line is guarded by the mode; body was:\n{body}"
+    );
+    assert!(
+        super::NOTHING_WAS_REMOVED.contains("nothing was removed"),
+        "the sentence must say it: {}",
+        super::NOTHING_WAS_REMOVED
     );
 }

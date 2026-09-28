@@ -31,7 +31,7 @@
 //! and `process::exit(0)`s. The parent then drives the SAME engine path
 //! `cerulion clean` runs, over the isolated config:
 //!
-//! 1. the diagnostics sweep (`ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config`)
+//! 1. the diagnostics sweep (`ipc_cleanup::sweep_dead_nodes_with_config`)
 //!    refuses the node with `InternalError` and the four-line chain, and
 //!    `orphan_port_tags::orphan_port_tag_candidates` selects exactly that node;
 //! 2. `reclaim_orphan_port_tags` removes exactly the one tag;
@@ -97,7 +97,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::ipc_cleanup::{
-    cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config, CleanupReport, FailedNodeCleanup,
+    sweep_dead_nodes_with_config, CleanupReport, FailedNodeCleanup, SweepMode,
 };
 use cerulion_cli_engine::orphan_port_tags::{
     orphan_port_tag_candidates, reclaim_orphan_port_tags, OrphanTagNode, OrphanTagReclaim,
@@ -725,7 +725,7 @@ fn sweep(root: &IsolatedRoot) -> CleanupReport {
     let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
     // The explicit config equals the process's global one (see `IsolatedRoot::get`),
     // exactly as `cerulion clean` hands `Config::global_config()` to the same fn.
-    cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(&root.config())
+    sweep_dead_nodes_with_config(&root.config(), SweepMode::Remove)
 }
 
 /// `shm_state`'s one liveness verdict, exactly as `cerulion clean` hands it to
