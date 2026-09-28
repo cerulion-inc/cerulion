@@ -3452,12 +3452,24 @@ mod tests {
                 (performed, start.elapsed(), b.peers_waiting())
             })
         };
-        if armed_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        // NO WALL, and no safety net is needed: this receive CANNOT hang.
+        //
+        // Proof, and it is why a timeout must not be reintroduced here. The
+        // parker owns the only sender. It reaches `send` on its success path,
+        // and on every failure path the panic unwinds OUT of the closure, which
+        // drops the sender; the thread cannot end while holding it. So the
+        // channel either delivers or disconnects, and `recv` returns either way,
+        // with the disconnect arm below surfacing the parker's own message.
+        //
+        // A deadline would add nothing and would cost the property this file is
+        // repairing: a ceiling a descheduled machine trips with the barrier
+        // behaving correctly.
+        if armed_rx.recv().is_err() {
             // The sender is gone: the parker panicked before arming. Surface
-            // ITS message (the precondition) rather than a timeout.
+            // ITS message (the precondition) rather than a bare disconnect.
             match parker.join() {
                 Err(payload) => std::panic::resume_unwind(payload),
-                Ok(_) => panic!("the parker must arm within 5s"),
+                Ok(_) => panic!("the parker dropped its handshake without arming"),
             }
         }
         // ORDERING is the handshake's job; this pause only lets the armed
@@ -3515,12 +3527,17 @@ mod tests {
                 (performed, start.elapsed(), b.peers_waiting())
             })
         };
-        if armed_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        // NO WALL, same proof as the twin above: the parker owns the only
+        // sender, reaches `send` on its success path, and on any panic unwinds
+        // out of the closure and drops it, so the channel either delivers or
+        // disconnects and this receive always returns. Do not reintroduce a
+        // timeout as a safety net; there is nothing for it to catch.
+        if armed_rx.recv().is_err() {
             // The sender is gone: the parker panicked before arming. Surface
-            // ITS message rather than a timeout.
+            // ITS message rather than a bare disconnect.
             match parker.join() {
                 Err(payload) => std::panic::resume_unwind(payload),
-                Ok(_) => panic!("the parker must arm within 5s"),
+                Ok(_) => panic!("the parker dropped its handshake without arming"),
             }
         }
         // ORDERING is the handshake's job; this pause only lets the armed

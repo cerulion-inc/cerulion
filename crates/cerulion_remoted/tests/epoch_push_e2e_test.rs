@@ -813,10 +813,11 @@ async fn a_stale_epoch_push_is_a_noop_and_never_un_revokes() {
 /// revocation is durable (the robot's live access state flipped, and the sibling's
 /// did not), and the pusher ends evicted. The delivery branch is STAGED rather than
 /// hoped for: `Robot::hold` makes the sweep admit desk A every tick, so the response
-/// cannot be preempted, and the release is what lets the eviction land. The
-/// tolerance branch is not dead code either: the same predicate that would accept
-/// it, the connection's own close reason, is asserted after the release, so every
-/// run proves it reads true exactly when the robot evicted the desk.
+/// cannot be preempted, and the release is what lets the eviction land. Under that
+/// hold the delivered answer is REQUIRED, not merely accepted, because tolerating an
+/// eviction there would make the staging vacuous. The tolerance is where it belongs,
+/// on the push AFTER the release, which must observe the eviction and does so on
+/// every run, so neither outcome of `request_or_evicted` is dead code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_desk_pushing_its_own_revocation_is_evicted_and_the_revocation_stands() {
     let desk_ep = disabled_endpoint([0x42; 32]).await;
@@ -865,9 +866,16 @@ async fn a_desk_pushing_its_own_revocation_is_evicted_and_the_revocation_stands(
             },
             "a desk carrying its OWN revocation still delivers it, and is told it applied"
         ),
-        // Legal, and impossible while the hold is on: kept because the ordering is
-        // the robot's to choose, so a future sweep shape must not turn this arm red.
-        RequestOutcome::EvictedFirst => {}
+        // STRICT under the hold, and that is the point of the hold. Tolerating an
+        // eviction here would make the staging vacuous: a sweep that stopped
+        // honouring the authorizer would evict desk A mid push and this arm would
+        // still pass, which is the regression the hold exists to catch. The
+        // tolerance belongs to the UNHELD case, and it is exercised below on the
+        // push that follows the release.
+        RequestOutcome::EvictedFirst => panic!(
+            "the held key must keep the sweep from evicting desk A before its own \
+             response: the hold is what makes the delivered ordering deterministic"
+        ),
     }
 
     // Its own access state has flipped...
