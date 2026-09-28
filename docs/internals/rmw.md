@@ -159,13 +159,17 @@ build.rs layers three era probes on top of the source selection:
   decides the EXPORT set: an entry point whose parameter type a distro's headers do not
   declare is compiled out WHOLE under its capability cfg, never stubbed, because rcl
   resolves rmw symbols by name and a defined symbol is a claim the headers cannot back.
-  Ten exports sit behind such a cfg (the four listener callbacks and
-  `rmw_event_set_callback`, the two content filter calls and `rmw_feature_supported`
-  from Humble; `rmw_qos_profile_check_compatible` and the two network flow calls from
-  Galactic), as do the two `rmw_message_info_t` sequence numbers and the context's
-  `actual_domain_id`. Each distro lane audits the built library with `nm` against the
-  list its headers lack, with `rmw_init` as the positive control so an unreadable symbol
-  table cannot pass (`tools/ci/rmw-distros/gate.sh`).
+  Ten exports sit behind such a cfg: `rmw_event_set_callback`,
+  `rmw_subscription_set_on_new_message_callback`,
+  `rmw_service_set_on_new_request_callback` and
+  `rmw_client_set_on_new_response_callback`, the two content filter calls and
+  `rmw_feature_supported` from Humble; `rmw_qos_profile_check_compatible` and the two
+  network flow calls from Galactic. So do the two `rmw_message_info_t` sequence numbers
+  and the context's `actual_domain_id`. Each distro lane audits the built library with
+  `nm` against the list its headers lack, with `rmw_init` as the positive control so an
+  unreadable symbol table cannot pass (`tools/ci/rmw-distros/gate.sh`), and
+  `tests/rmw_absent_export_table_test.rs` derives each row's list from the guarded
+  exports and the era tables so a row can never lag a new guarded export.
 - **Capability cfgs**: the SELECTED bindings file (generated or vendored, one code
   path) is grepped for marker tokens (`fetch_function`, `is_key_`, `discovery_options`,
   `get_type_hash_func`, …; the table lives in build.rs) and a
@@ -1066,6 +1070,7 @@ with rmw-specific additions:
 | `tests/rmw_slice_ceiling_e2e_test.rs` | The per-type slice ceiling GOVERNS the negotiated iceoryx2 buffer on the rmw path: the oracle is the LOAN VERDICT (an over-ceiling `rmw_publish` fails, an under-ceiling one delivers), which the pre-ceiling blanket would have passed | yes; own binary (`#[traced_test]`) | none |
 | `tests/rmw_wait_pingpong_discriminator_test.rs` | The ping-pong discriminator for the event-driven wait: two wait sets on two threads in the bench's exact shape, spin ON and OFF, per-round wake-mode tally + RTT distribution | yes; `--test-threads=1` and `--nocapture`; the same-core Linux arm is `--ignored` | none |
 | `tests/rmw_wait_spin_test.rs` | `rmw_wait` spin behaviour with the shared spin knob set to `u64::MAX`: the clamped budget keeps zero-timeout waits immediate, mid-wait wakes landing, and no core pinned past the cap | yes; `#[serial]` + `--test-threads=1` (process env) | none |
+| `tests/rmw_absent_export_table_test.rs` | The per-distro absent-export table as a gate: every `extern "C"` `rmw_*` export guarded by a capability cfg is read out of `src/`, mapped to the era its capability arrived in through `era_check::CAPABILITY_MIN_ERA`, and the set a distro lacks is compared with that row's hand-typed `absent_symbols` in `tools/ci/rmw-distros/gate.sh` in BOTH directions, so a new guarded export fails until every older row names it and a stale row fails until it drops the name; both parsers are pinned by hand-written source and gate snippets with hand-written readings (a negated guard, a compound guard, a cfg whose reach a code line ends, the fallback arm), both comparison directions are pinned on a fixture era table, a guard shape the reader does not interpret is a REFUSAL naming the export and the attribute rather than an unguarded export (the comparison alone is blind to it, which the compound arm pins), the refusal is driven at the WALK level too over a source directory the test writes (one file with a compound guard one directory down from one with a recognised guard, against a recognised-only control), so an aggregation that dropped the refusal list cannot read as no finding, and the tree arm refuses a vacuous read (an export-count floor plus at least one non-empty derived set) | no (pure text, no transport) | none |
 
 Traced-suite conventions: `#[traced_test]` installs the process-global tracing
 subscriber, so any suite using it needs its own test binary (a sibling test that brings
