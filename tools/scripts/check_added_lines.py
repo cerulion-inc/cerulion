@@ -51,10 +51,13 @@ import subprocess
 import sys
 import tempfile
 
-# The two characters, by code point rather than by glyph, so this file carries
-# neither of them and can be read by its own gate.
-EM_DASH = "—"  # dash-ok: the character this gate refuses
-EN_DASH = "–"  # dash-ok: the character this gate refuses
+# The two characters, spelled by CODE POINT rather than by glyph, so this file
+# carries neither of them: the gate reads its own source like any other, and a
+# glyph here would need the per-line waiver to survive it. An escape needs
+# nothing, and the added-line count over a diff that touches this file reads
+# zero.
+EM_DASH = "\u2014"
+EN_DASH = "\u2013"
 # The two, by the name a refusal prints, so the report says WHICH character a
 # line carries rather than showing a glyph a terminal may not render.
 BANNED = (("U+2014", EM_DASH), ("U+2013", EN_DASH))
