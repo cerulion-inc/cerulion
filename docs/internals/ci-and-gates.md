@@ -573,10 +573,15 @@ Three rules inside the script keep a prune from deleting what another run still 
 * **The tip check.** On `refs/heads/main` the script reads the branch tip once and deletes
   nothing unless the tip is this run's own commit. Two runs on `main` overlap all the time, and
   the older one would otherwise delete the generation the newer one had just saved -- and then
-  skip its own save as an exact hit, leaving the namespace empty. The older run still saves; the
-  next tip run prunes what it left.
-* **The clock guard.** The prune records the UTC second it began before it lists, and deletes
-  only entries created strictly earlier than that. An entry that appeared while the prune was
+  skip its own save as an exact hit, leaving the namespace empty. A run behind the tip deletes
+  nothing and saves nothing: the prune step writes `proceed=false` to its `$GITHUB_OUTPUT` and
+  every save step tests `steps.cache-prune.outputs.proceed == 'true'`, because a run that skipped
+  the prune and uploaded anyway would leave two generations of its namespace resident (14.90 GB
+  across the two shard namespaces, over the allowance, with the next save refused). The next tip
+  run prunes what it left.
+* **The clock guard.** The prune records the UTC second it began -- before the tip check, which
+  is a network round trip a newer run can save during -- and deletes only entries created strictly
+  earlier than that. An entry that appeared while the prune was
   running belongs to a run ahead of this one; it is kept and named in the log.
 * **The scope rule.** A keep key scoped `-pr-` may delete only `-pr-` entries of its namespace:
   a pull-request prune must never take the `-main-` archive or the legacy unqualified entries,
@@ -606,9 +611,9 @@ contract -- the directory, not a hand list of the files known to cache, because 
 were writing into the same store with the combined `actions/cache` action while a two-file
 invocation reported clean. The rules: the gate names the key's namespace (R1); it carries the
 main-only clause with its fork condition (R2); the prune step directly precedes the save with
-the byte-identical key, an explicit sweep prefix is exactly the key text before the generation
-segment, and the save's condition is the prune's own plus the cache-hit test in front and the
-namespace gate behind (R3); the job permission is declared (R4); the default literal is
+the byte-identical key under `id: cache-prune`, an explicit sweep prefix is exactly the key text
+before the generation segment, and the save's condition is the prune's own plus the cache-hit test
+in front and the prune's `proceed` output and the namespace gate behind (R3); the job permission is declared (R4); the default literal is
 unchanged (R5); a save is never reachable from a merge-queue run (R6); the save is the job's
 last step (R7); every gate is a conjunction of clauses from a closed set, each at most once,
 with no top-level `||` (R8 -- which is what stops `... || true` from turning a gate off while

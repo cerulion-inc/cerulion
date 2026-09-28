@@ -198,6 +198,7 @@ jobs:
       # keeps its stale archives for ever (a pull request's restore refreshes an
       # entry's last-access time, so idle eviction never reclaims it).
       - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
         if: >-
           steps.present.outputs.present == 'true'
           && github.event_name != 'merge_group'
@@ -216,6 +217,7 @@ jobs:
           && steps.present.outputs.present == 'true'
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-replay-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:

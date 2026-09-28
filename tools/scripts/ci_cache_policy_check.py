@@ -583,6 +583,11 @@ PRUNE_RUN_RE = re.compile(
     r'^bash tools/scripts/ci_cache_prune\.sh "(?P<key>[^"]*)"(?: "(?P<prefix>[^"]*)")?$'
 )
 PRUNE_TOOLS_STEP_NAME = "Install the cache prune tools (gh, jq)"
+PRUNE_STEP_ID = "cache-prune"
+# What the prune step tells the save step after it. `false` on exactly one path:
+# a default-branch run behind the tip, which deletes nothing and must therefore
+# upload nothing -- two generations of one namespace do not fit the allowance.
+PROCEED_CLAUSE = "steps.%s.outputs.proceed == 'true'" % PRUNE_STEP_ID
 # The fork half is load-bearing: a pull request from a fork gets a read-only
 # token, so the prune's delete would fail the job outright.
 MAIN_ONLY_CLAUSE = (
@@ -799,6 +804,11 @@ def job_excludes_pull_request(cond):
 def classify_conjunct(part, ns_clauses):
     if CACHE_HIT_RE.match(part):
         return "cache-hit"
+    # Tested before the generic step-output guard below, which would also match
+    # it: the two are separate members of the closed set, so a save may carry
+    # both (examples-replay carries its own `present` guard beside this one).
+    if part == PROCEED_CLAUSE:
+        return "prune-proceed"
     if part == SHARD_CLAUSE:
         return "shard"
     if part == MERGE_GROUP_CLAUSE:
@@ -852,7 +862,13 @@ def _check_closed_conjunction(add, line, what, cond, allowed, ns_clauses):
 #   prune  = [matrix.shard == 0 &&] [a step-output guard &&]
 #            github.event_name != 'merge_group' && <main-only>
 #   save   = steps.<restore id>.outputs.cache-hit != 'true' && <the prune's if>
-#            && <namespace gate>
+#            && steps.cache-prune.outputs.proceed == 'true' && <namespace gate>
+#
+# The `proceed` conjunct is what keeps a default-branch run BEHIND THE TIP from
+# uploading. Such a run skips the prune (correctly: only the tip may delete) and
+# would otherwise still save, putting a second generation of its namespace in
+# the store beside the tip's -- 14.90 GB across the two shard namespaces, over
+# the allowance, and the next save refused.
 #
 # The prune deliberately does NOT carry the namespace gate. When it did, a
 # namespace the policy does not name was never pruned and its stale archives
@@ -861,7 +877,7 @@ def _check_closed_conjunction(add, line, what, cond, allowed, ns_clauses):
 # run of a job that has a prune step prunes, keeping exactly that job's current
 # key -- which empties a restore-only namespace, and that is the intent.
 PRUNE_ALLOWED = ("shard", "step-output guard", "merge-group", "main-only")
-SAVE_ALLOWED = ("cache-hit",) + PRUNE_ALLOWED + ("namespace",)
+SAVE_ALLOWED = ("cache-hit",) + PRUNE_ALLOWED + ("prune-proceed", "namespace")
 TOOL_CACHE_ALLOWED = ("cache-hit", "merge-group")
 
 
@@ -1204,6 +1220,13 @@ def _check_prune_before_save(add, steps, index, step, key):
             "save step %r is preceded by %r, not by a `%s` step" % (label, prune.label(), PRUNE_CMD),
         )
         return
+    if prune.step_id != PRUNE_STEP_ID:
+        add(
+            prune.line,
+            "R3_PRUNE_BEFORE_SAVE",
+            "prune step %r has id %r; the save after it reads %s, so the prune must carry "
+            "`id: %s`" % (prune.label(), prune.step_id, PROCEED_CLAUSE, PRUNE_STEP_ID),
+        )
     mo = PRUNE_RUN_RE.match((prune.run or "").strip())
     if mo is None:
         add(
@@ -1254,6 +1277,14 @@ def _check_prune_before_save(add, steps, index, step, key):
         )
     save_cond = norm(step.cond)
     prune_cond = norm(prune.cond)
+    if PROCEED_CLAUSE not in save_cond:
+        add(
+            step.cond_line,
+            "R3_PRUNE_BEFORE_SAVE",
+            "save step %r does not carry %s; without it a run behind the default-branch tip "
+            "skips the prune and uploads a second generation of the namespace anyway"
+            % (label, PROCEED_CLAUSE),
+        )
     if not save_cond.startswith("steps.") or CACHE_HIT_MARKER not in save_cond:
         add(
             step.cond_line,
@@ -1271,14 +1302,17 @@ def _check_prune_before_save(add, steps, index, step, key):
         )
         return
     # The save is the prune's own gate, plus the cache-hit test in front and the
-    # namespace gate behind: the save runs on a subset of the runs that prune.
-    expected = [head + prune_cond + " && " + clause for clause in namespace_clauses(key)]
+    # prune's verdict and the namespace gate behind: the save runs on a subset of
+    # the runs that prune, and only when the prune actually pruned.
+    tail = " && " + PROCEED_CLAUSE + " && "
+    expected = [head + prune_cond + tail + clause for clause in namespace_clauses(key)]
     if save_cond not in expected:
         add(
             step.cond_line,
             "R3_PRUNE_BEFORE_SAVE",
-            "save step %r is not the prune step's condition plus the cache-hit test and the "
-            "namespace gate: save %r, expected %r" % (label, save_cond, expected[0]),
+            "save step %r is not the prune step's condition plus the cache-hit test, the prune's "
+            "proceed output and the namespace gate: save %r, expected %r"
+            % (label, save_cond, expected[0]),
         )
 
 
@@ -1350,6 +1384,7 @@ jobs:
           cargo test --locked
 
       - name: Prune the cache namespace, Linux shard
+        id: cache-prune
         if: >-
           matrix.shard == 0
           && github.event_name != 'merge_group'
@@ -1364,6 +1399,7 @@ jobs:
           && matrix.shard == 0
           && github.event_name != 'merge_group'
           && <MAIN>
+          && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
         uses: actions/cache/save@v4
         with:
@@ -1389,6 +1425,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets
       - name: Prune the cache namespace, lint
+        id: cache-prune
         if: >-
           github.event_name != 'merge_group'
           && <MAIN>
@@ -1400,6 +1437,7 @@ jobs:
           steps.cache-restore-lint.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && <MAIN>
+          && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-lint ', runner.os)))
         uses: actions/cache/save@v4
         with:
@@ -1423,6 +1461,7 @@ jobs:
         run: |-
           cargo test -p cerulion_vizd --locked
       - name: Prune the cache namespace, viz
+        id: cache-prune
         if: >-
           github.event_name != 'merge_group'
           && <MAIN>
@@ -1434,6 +1473,7 @@ jobs:
           steps.cache-restore-viz.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && <MAIN>
+          && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' viz-{0}-{1} ', matrix.lane, runner.os)))
         uses: actions/cache/save@v4
         with:
@@ -1459,6 +1499,7 @@ jobs:
       - name: Cross build
         run: cargo build --locked --target aarch64-unknown-linux-gnu
       - name: Prune the cache namespace, cross
+        id: cache-prune
         if: >
           steps.present.outputs.present == 'true'
           && github.event_name != 'merge_group'
@@ -1472,6 +1513,7 @@ jobs:
           && steps.present.outputs.present == 'true'
           && github.event_name != 'merge_group'
           && <MAIN>
+          && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))
         uses: actions/cache/save@v4
         with:
@@ -1494,6 +1536,7 @@ jobs:
       - name: Measure
         run: cargo run --release -p bench
       - name: Prune the cache namespace, latency
+        id: cache-prune
         if: >-
           github.event_name != 'merge_group'
           && <MAIN>
@@ -1505,6 +1548,7 @@ jobs:
           steps.cache-restore-latency.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && <MAIN>
+          && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
         uses: actions/cache/save@v4
         with:
@@ -1540,6 +1584,7 @@ jobs:
           && <MAIN>
         run: apt-get install -y gh jq
       - name: Prune the cache namespace, rmw distro
+        id: cache-prune
         if: >-
           github.event_name != 'merge_group'
           && <MAIN>
@@ -1551,6 +1596,7 @@ jobs:
           steps.cache-restore-lane.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && <MAIN>
+          && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
         uses: actions/cache/save@v4
         with:
@@ -1640,6 +1686,7 @@ jobs:
 """
 
 STRAY_PRUNE_STEP = """      - name: Stray prune with nothing to guard
+        id: cache-prune
         if: >-
           matrix.shard == 0
           && github.event_name != 'merge_group'
@@ -2007,6 +2054,27 @@ def _mutants():
              "          path: target\n"
              "          key: cargo-machete-bin-${{ runner.os }}-v0.9.2\n"),
         {"TOOL_CACHE"},
+    ))
+    # R3: the save no longer asks whether the prune actually pruned. A run
+    # behind the default-branch tip then skips the prune and uploads anyway.
+    out.append((
+        "R3 save without the prune's proceed conjunct",
+        _mut(clean,
+             "          && steps.cache-prune.outputs.proceed == 'true'\n"
+             "          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
+             "env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))\n",
+             "          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', "
+             "env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))\n"),
+        {"R3_PRUNE_BEFORE_SAVE"},
+    ))
+    # R3: the prune drops the id the save's conjunct names, so `proceed` reads
+    # empty and every save is skipped in silence.
+    out.append((
+        "R3 prune without the id the save reads",
+        _mut(clean,
+             "      - name: Prune the cache namespace, Linux shard\n        id: cache-prune\n",
+             "      - name: Prune the cache namespace, Linux shard\n"),
+        {"R3_PRUNE_BEFORE_SAVE"},
     ))
     # R11: the unscoped key reachable from a pull request, three ways.
     out.append((

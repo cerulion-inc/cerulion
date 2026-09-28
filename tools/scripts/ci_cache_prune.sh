@@ -45,12 +45,28 @@
 # Only the run for the newest commit ever deletes; the others still save, and
 # the next tip run prunes what they left.
 #
-# THE CLOCK GUARD (every run). The prune records the UTC second it began before
-# it lists, and deletes only entries created STRICTLY EARLIER than that. An
-# entry that appeared while the prune was running belongs to a run that is
-# ahead of this one, so it is kept and named in the log. An entry whose
-# `createdAt` cannot be read as a timestamp stops the run: pruning blind is
-# worse than not pruning.
+# THE CLOCK GUARD (every run). The prune records the UTC second it began and
+# deletes only entries created STRICTLY EARLIER than that. An entry that
+# appeared while the prune was running belongs to a run that is ahead of this
+# one, so it is kept and named in the log. An entry whose `createdAt` cannot be
+# read as a timestamp stops the run: pruning blind is worse than not pruning.
+#
+# THE INSTANT IS TAKEN FIRST, before the tip check and before the listing. The
+# tip check is a network round trip, and a newer run that saves DURING it would
+# otherwise carry a `createdAt` earlier than the recorded instant and be deleted
+# as stale -- the exact race the tip check exists to close, reopened one call
+# later. Everything the guard can misjudge is on the safe side of that ordering:
+# it keeps too much, never too little.
+#
+# WHAT THE STEP TELLS THE SAVE. On the paths that exit 0 the script writes
+# `proceed=true` or `proceed=false` to `$GITHUB_OUTPUT`, and every save step
+# tests `steps.cache-prune.outputs.proceed == 'true'`. `false` is written on
+# exactly one path: a default-branch run that is behind the tip, which deletes
+# nothing. Without that test such a run would skip the prune and still UPLOAD,
+# putting a second generation of its namespace in the store beside the tip's --
+# 14.90 GB for the two shard namespaces, over the allowance, and the next save
+# refused. A run behind the tip now deletes nothing and saves nothing. A failing
+# exit writes no output at all, and the job is red on the step itself.
 #
 # THE SCOPE RULE. A keep key scoped `-pr-` may delete only `-pr-` scoped
 # entries of its namespace. A pull-request run (which only prunes at all when
@@ -104,19 +120,20 @@
 # 64-hex hash at all (the machete binary cache) is refused (exit 2): it has no
 # lockfile generation to prune by, and its save step carries no prune step.
 #
-# Environment: GH_TOKEN (the workflow step sets it from `github.token`),
-# GITHUB_REPOSITORY, GITHUB_REF and GITHUB_SHA (Actions sets all three). A
-# missing one is exit 2, never a prune that guesses. Uses `gh` and `jq`, both
-# preinstalled on hosted runner images; a job running in a `container:` installs
-# them in the step before the prune.
+# Environment: GH_TOKEN (the workflow step sets it from `github.token`), and
+# GITHUB_REPOSITORY, GITHUB_REF, GITHUB_SHA and GITHUB_OUTPUT (Actions sets all
+# four). A missing one is exit 2, never a prune that guesses or a `proceed` the
+# save step will read as empty and fail closed on in silence. Uses `gh` and
+# `jq`, both preinstalled on hosted runner images; a job running in a
+# `container:` installs them in the step before the prune.
 #
 # Exit 0 pruned (or skipped because this run is not the tip), 1 an API failure,
 # 2 a usage or key-shape failure.
 #
 # `--self-test` drives the whole script against a fake `gh` on PATH and asserts
 # the exact delete set, the exact `gh` invocations (including the listing's
-# `--key` prefix and `-L` limit) and the exit code of seventeen lettered cases,
-# (a) to (q). Every case that proves a rule is stated twice: the failing side
+# `--key` prefix and `-L` limit), the `$GITHUB_OUTPUT` line and the exit code of
+# nineteen lettered cases, (a) to (s). Every case that proves a rule is stated twice: the failing side
 # and a passing near-miss one step away from it, so a rule that stopped holding
 # cannot pass as a rule that never fired. The case count is printed. Entries
 # staged for the clock guard carry far-past (2020) and far-future (2999)
@@ -149,6 +166,12 @@ mb() {
 }
 
 sha8() { printf '%.8s' "$1"; }
+
+# The one thing this step tells the save step after it. Called on the two paths
+# that exit 0 and on neither failing path.
+emit_proceed() {
+    printf 'proceed=%s\n' "$1" >> "$GITHUB_OUTPUT"
+}
 
 # Escape every character that is not alphanumeric, `_` or `-` so the prefix is
 # matched literally inside an extended regular expression.
@@ -209,6 +232,13 @@ prune() {
         err "cache prune: GITHUB_SHA is unset; the prune needs the commit to compare against the tip"
         return 2
     fi
+    if [ -z "${GITHUB_OUTPUT:-}" ]; then
+        err "cache prune: GITHUB_OUTPUT is unset; the save step reads proceed from it and an unwritten value would skip every save in silence"
+        return 2
+    fi
+
+    # BEFORE the tip check, not after: see THE INSTANT IS TAKEN FIRST above.
+    started=$(date -u +%Y%m%d%H%M%S)
 
     esc=$(ere_quote "$prefix")
     if [ -n "$explicit_prefix" ]; then
@@ -235,13 +265,12 @@ prune() {
         if [ "$tip" != "$GITHUB_SHA" ]; then
             printf "cache prune: skipped, this run's commit %s is not the current default-branch tip %s\n" \
                 "$(sha8 "$GITHUB_SHA")" "$(sha8 "$tip")"
+            # The save step is gated on this: a run behind the tip deletes
+            # nothing, so it must not upload a second generation either.
+            emit_proceed false
             return 0
         fi
     fi
-
-    # Recorded BEFORE the listing, so an entry that appears between this instant
-    # and the listing is still classified as newer than the prune.
-    started=$(date -u +%Y%m%d%H%M%S)
 
     if ! json=$(gh_cache_list "$prefix" 2>&1); then
         err "cache prune: listing $prefix failed: $json"
@@ -341,6 +370,7 @@ prune() {
         summary="$summary; $out_of_scope kept by the pull-request scope rule"
     fi
     printf '%s\n' "$summary"
+    emit_proceed true
     return 0
 }
 
@@ -375,6 +405,7 @@ state="$FAKE_GH_STATE"
 
 if [ "${1:-}" = "api" ]; then
     printf 'API:%s\n' "${2:-}" >> "$log"
+    : > "$state/api"
     if [ -z "${FAKE_GH_TIP:-}" ]; then
         printf 'fake gh: no branch tip staged for this case\n' >&2
         exit 1
@@ -434,6 +465,27 @@ FAKE
     chmod +x "$ST_DIR/bin/gh"
 }
 
+st_write_fake_date() {
+    cat > "$ST_DIR/bin/date" <<'FAKEDATE'
+#!/usr/bin/env bash
+# Fake `date` for the ordering case. It answers with the EARLY instant while the
+# tip check has not run and with the LATE one afterwards, so a case can stage an
+# entry created BETWEEN the two and assert which side of it the prune's recorded
+# instant fell on -- the ordering, with no sleep and no clock injected into the
+# script. Unstaged (FAKE_DATE_EARLY empty) it is the real `date`.
+set -eu
+if [ -z "${FAKE_DATE_EARLY:-}" ]; then
+    exec /bin/date "$@"
+fi
+if [ -f "$FAKE_GH_STATE/api" ]; then
+    printf '%s\n' "$FAKE_DATE_LATE"
+else
+    printf '%s\n' "$FAKE_DATE_EARLY"
+fi
+FAKEDATE
+    chmod +x "$ST_DIR/bin/date"
+}
+
 # The run environment of one case. `st_reset` puts every knob back to the
 # ordinary shape — a default-branch run that IS the tip — so a case states only
 # what it changes and no setting can leak from the case above it.
@@ -446,6 +498,9 @@ st_reset() {
     ST_REF="refs/heads/main"
     ST_SHA="$ST_SHA_TIP"
     ST_TIP="$ST_SHA_TIP"
+    ST_DATE_EARLY="-"
+    ST_DATE_LATE="-"
+    ST_GHOUT="$ST_DIR/gh_output"
 }
 
 # st_run <case> <args...>. Reads the ST_* knobs above; sets ST_RC, ST_OUT and
@@ -457,6 +512,7 @@ st_run() {
     rm -rf "$ST_DIR/state"
     mkdir -p "$ST_DIR/state"
     : > "$ST_DIR/gh.log"
+    : > "$ST_DIR/gh_output"
     ST_CASES=$((ST_CASES + 1))
     ST_RC=0
     ST_OUT=$(
@@ -467,7 +523,10 @@ st_run() {
         GH_TOKEN="fake-token" \
         FAKE_GH_LOG="$ST_DIR/gh.log" \
         FAKE_GH_STATE="$ST_DIR/state" \
+        GITHUB_OUTPUT="$ST_GHOUT" \
         FAKE_GH_TIP="$ST_TIP" \
+        FAKE_DATE_EARLY="$([ "$ST_DATE_EARLY" = "-" ] || printf '%s' "$ST_DATE_EARLY")" \
+        FAKE_DATE_LATE="$([ "$ST_DATE_LATE" = "-" ] || printf '%s' "$ST_DATE_LATE")" \
         FAKE_GH_LIST_JSON="$ST_LIST" \
         FAKE_GH_RELIST_JSON="$([ "$ST_RELIST" = "-" ] || printf '%s' "$ST_RELIST")" \
         FAKE_GH_RELIST_RAW="$([ "$ST_RELIST_RAW" = "-" ] || printf '%s' "$ST_RELIST_RAW")" \
@@ -476,6 +535,7 @@ st_run() {
         bash "$SELF" "$@" 2>&1
     ) || ST_RC=$?
     ST_LOG=$(cat "$ST_DIR/gh.log")
+    ST_GHOUT_TEXT=$(cat "$ST_DIR/gh_output")
     ST_NAME="$name"
 }
 
@@ -485,6 +545,12 @@ st_expect_rc() {
 
 st_expect_log() {
     [ "$ST_LOG" = "$1" ] || st_fail "$ST_NAME" "gh log was [$ST_LOG], wanted [$1]"
+}
+
+# The whole of what the step handed the save step after it, never a substring.
+st_expect_output() {
+    [ "$ST_GHOUT_TEXT" = "$1" ] \
+        || st_fail "$ST_NAME" "GITHUB_OUTPUT was [$ST_GHOUT_TEXT], wanted [$1]"
 }
 
 st_expect_contains() {
@@ -522,6 +588,7 @@ self_test() {
     trap st_cleanup EXIT
     mkdir -p "$ST_DIR/bin"
     st_write_fake_gh
+    st_write_fake_date
 
     local H1 H2 H3 H4 H5 H6 H63
     H1=$(h64 11111111); H2=$(h64 22222222); H3=$(h64 33333333)
@@ -565,6 +632,7 @@ OK:3
 OK:4"
     st_expect_contains "cache prune: kept ${KEEP}; deleted 3 entries, 9.0 MB; ignored 2 other keys under ${P}"
     st_expect_contains "cache prune: deleted ${P}pr-${H3} (refs/pull/9/merge, 3.0 MB)"
+    st_expect_output 'proceed=true'
     st_expect_absent "${P}foo-main-${H5}"
     # Near-miss beside it: the sibling IS a well-formed keep key, and pruning
     # for it derives the narrower `${P}foo-` prefix, so it touches nothing in
@@ -651,6 +719,9 @@ FAIL:3
 ${LIST_P}"
     st_expect_contains "::error::cache prune: deleting ${P}pr-${H3} (3) failed and it is still listed"
     st_expect_absent "OK:4"
+    # A failing exit writes nothing: the job is red on this step, and a stale
+    # `proceed` would otherwise decide the save.
+    st_expect_output ''
 
     # ---- (g) explicit rmw prefix prunes across header generations -----------
     local RP="cargo-rmw-distros-jazzy-"
@@ -726,6 +797,7 @@ OK:3"
     st_expect_log "${API}"
     st_expect_contains "cache prune: skipped, this run's commit 99999999 is not the current default-branch tip aaaaaaaa"
     st_expect_absent "deleted"
+    st_expect_output 'proceed=false'
     # Passing near-miss: the same run one commit later, now the tip, prunes.
     st_reset; ST_LIST="$ST_DIR/a.json"
     st_run i-nearmiss "$KEEP"
@@ -837,6 +909,8 @@ OK:4"
     st_expect_contains "cache prune: ${P}main-${H2} (refs/heads/main) kept by the pull-request scope rule"
     st_expect_contains "cache prune: ${P}${H4} (refs/heads/main) kept by the pull-request scope rule"
     st_expect_contains "cache prune: kept ${P}pr-${H1}; deleted 1 entries, 3.0 MB; ignored 0 other keys under ${P}; 2 kept by the pull-request scope rule"
+    # A pull-request run has no tip check, so it always proceeds.
+    st_expect_output 'proceed=true'
     # Failing partner: the same listing under a `main` keep deletes all three,
     # so the scope rule is what spared them.
     st_reset; ST_LIST="$ST_DIR/m.json"
@@ -884,10 +958,16 @@ OK:2"
     st_expect_rc 2
     st_expect_log ''
     st_expect_contains "::error::cache prune: GITHUB_REF is unset; the prune needs the ref to know which entry is its own"
-    # Passing near-miss: both present is the ordinary run.
+    st_reset; ST_LIST="$ST_DIR/a.json"; ST_GHOUT=""
+    st_run o-output "$KEEP"
+    st_expect_rc 2
+    st_expect_log ''
+    st_expect_contains "::error::cache prune: GITHUB_OUTPUT is unset; the save step reads proceed from it and an unwritten value would skip every save in silence"
+    # Passing near-miss: all three present is the ordinary run.
     st_reset; ST_LIST="$ST_DIR/a.json"
     st_run o-nearmiss "$KEEP"
     st_expect_rc 0
+    st_expect_output 'proceed=true'
 
     # ---- (p) a listing that comes back at the limit is refused --------------
     st_gen_ignored_listing "$ST_DIR/p.json" 1000 "$P" "$H1" "$PAST"
@@ -926,6 +1006,63 @@ ${LIST_P}"
     st_run q-nearmiss "$KEEP"
     st_expect_rc 0
     st_expect_contains "::notice::cache prune: ${P}pr-${H3} vanished before delete (concurrent run)"
+
+    # ---- (r) the instant is recorded BEFORE the tip check -------------------
+    # The tip check is a network round trip. A newer run that saves DURING it
+    # carries a createdAt later than the moment this prune began but earlier
+    # than the moment the tip answer came back, and reading the clock after the
+    # check would classify it as stale and delete it -- the race the tip check
+    # exists to close, reopened one call later. The fake `date` answers EARLY
+    # until the tip check has run and LATE afterwards, so which of the two the
+    # prune recorded is visible in what survives.
+    local T_EARLY="20260101000000" T_LATE="20260101000200"
+    local T_BETWEEN="2026-01-01T00:01:00Z" T_BEFORE="2025-12-31T23:59:00Z"
+    cat > "$ST_DIR/r.json" <<JSON
+[
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${P}main-${H3}", "ref": "refs/heads/main", "sizeInBytes": 3145728, "createdAt": "${T_BETWEEN}"}
+]
+JSON
+    st_reset; ST_LIST="$ST_DIR/r.json"
+    ST_DATE_EARLY="$T_EARLY"; ST_DATE_LATE="$T_LATE"
+    st_run r "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}
+OK:2"
+    st_expect_contains "cache prune: ${P}main-${H3} (refs/heads/main) kept (created after this prune began)"
+    st_expect_output 'proceed=true'
+    # Passing near-miss one second the other side of the EARLY instant: an entry
+    # created before this prune began IS deleted, so it is the recorded instant
+    # that spared the one above and not the shape test.
+    cat > "$ST_DIR/r-before.json" <<JSON
+[
+  {"id": 1, "key": "${P}main-${H1}", "ref": "refs/heads/main", "sizeInBytes": 1048576, "createdAt": "${PAST}"},
+  {"id": 2, "key": "${P}main-${H2}", "ref": "refs/heads/main", "sizeInBytes": 2097152, "createdAt": "${PAST}"},
+  {"id": 3, "key": "${P}main-${H3}", "ref": "refs/heads/main", "sizeInBytes": 3145728, "createdAt": "${T_BEFORE}"}
+]
+JSON
+    st_reset; ST_LIST="$ST_DIR/r-before.json"
+    ST_DATE_EARLY="$T_EARLY"; ST_DATE_LATE="$T_LATE"
+    st_run r-nearmiss "$KEEP"
+    st_expect_rc 0
+    st_expect_log "${API}
+${LIST_P}
+OK:2
+OK:3"
+
+    # ---- (s) what the step hands the save after it --------------------------
+    st_reset; ST_LIST="$ST_DIR/a.json"
+    st_run s "$KEEP"
+    st_expect_rc 0
+    st_expect_output 'proceed=true'
+    # The failing side of the same rule: a run behind the tip prunes nothing, so
+    # it must not upload a second generation of its namespace either.
+    st_reset; ST_LIST="$ST_DIR/a.json"; ST_SHA="$OLD_SHA"
+    st_run s-behind-tip "$KEEP"
+    st_expect_rc 0
+    st_expect_output 'proceed=false'
 
     if [ "$ST_FAILS" -ne 0 ]; then
         printf 'ci_cache_prune: %d self-test case(s) failed\n' "$ST_FAILS" >&2
