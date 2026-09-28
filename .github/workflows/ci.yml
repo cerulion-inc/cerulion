@@ -932,7 +932,9 @@ jobs:
       # from a test, so a broken split is a local red as well; this step is what
       # makes it a red on a pull request that never runs that package, and the
       # walker's `the_shard_check_runs_in_a_named_lint_step` arm fails if this
-      # step is renamed or removed.
+      # step is renamed, removed, given an argument, moved into another job or
+      # another workflow, or given an `if:` of its own, and if `lint` stops
+      # running on a pull request.
       - name: Shard partition and selection check
         run: ./tools/scripts/ci_test_shard.sh --check
 

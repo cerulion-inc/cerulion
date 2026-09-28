@@ -3815,6 +3815,17 @@ fn the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blockin
 const SHARD_CHECK_STEP: &str = "Shard partition and selection check";
 const SHARD_CHECK_RUN: &str = "./tools/scripts/ci_test_shard.sh --check";
 
+/// The workflow and the job the step belongs to.
+///
+/// A step of the right name running the right script proves nothing about WHEN
+/// it runs. Six jobs of `ci.yml` sit behind `github.event_name != 'pull_request'
+/// && github.event_name != 'merge_group'` under a cost policy, and the other
+/// workflows run on their own events, so the same step moved into one of those
+/// keeps its name and its script and stops running on a pull request, which is
+/// the one property the step exists for.
+const SHARD_CHECK_WORKFLOW: &str = "ci.yml";
+const SHARD_CHECK_JOB: &str = "lint";
+
 /// Is this run script the shipped invocation, WHOLE?
 ///
 /// Equality, never `contains`. `./tools/scripts/ci_test_shard.sh --check
@@ -3826,21 +3837,83 @@ fn is_the_shard_check_run(script: &str) -> bool {
     script.trim() == SHARD_CHECK_RUN
 }
 
+/// Where a workflow runs the shard check, and what it runs there.
+struct ShardCheckStep {
+    /// The id of the job holding the step.
+    job: String,
+    /// The step's `run:` script, joined.
+    script: String,
+    /// The step's own `if:`, read in every scalar form. `Ok(None)` is a step
+    /// with no condition of its own, which is the only shape the rule accepts:
+    /// a step gated on an event runs nowhere else while its job still reports.
+    condition: Result<Option<String>, String>,
+}
+
 /// Does any step of this workflow run the shard check under its own name?
-fn shard_check_step_of(text: &str) -> Option<String> {
-    for (_, block) in jobs_of(text) {
+fn shard_check_step_of(text: &str) -> Option<ShardCheckStep> {
+    for (job, block) in jobs_of(text) {
         for step in step_blocks(&block) {
             if step_name_of(&step).as_deref() != Some(SHARD_CHECK_STEP) {
                 continue;
             }
-            return Some(run_script_of(&step).unwrap_or_default());
+            return Some(ShardCheckStep {
+                job,
+                script: run_script_of(&step).unwrap_or_default(),
+                condition: step_if_of(&step),
+            });
         }
     }
     None
 }
 
-/// The shard check runs in CI, under a named step, with the invocation the
-/// script documents.
+/// Everything wrong with the way one workflow runs the shard check, as the
+/// lines a failure prints. EMPTY is the shipped shape.
+///
+/// The rule is a function so the synthetic rows below judge the same thing the
+/// real workflow is judged on.
+fn shard_check_complaints(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(found) = shard_check_step_of(text) else {
+        out.push(format!("no job carries a step named `{SHARD_CHECK_STEP}`"));
+        return out;
+    };
+    if found.job != SHARD_CHECK_JOB {
+        out.push(format!(
+            "the step sits in the `{}` job, and the rule names `{SHARD_CHECK_JOB}`",
+            found.job
+        ));
+    }
+    if !is_the_shard_check_run(&found.script) {
+        out.push(format!(
+            "the step runs `{}`, and the rule names `{SHARD_CHECK_RUN}`",
+            found.script.trim()
+        ));
+    }
+    match &found.condition {
+        Ok(None) => {}
+        Ok(Some(cond)) => out.push(format!(
+            "the step carries its own condition `{cond}`, so it runs on fewer \
+             events than the job that holds it"
+        )),
+        Err(why) => out.push(format!(
+            "the step carries a condition this walk cannot read: {why}"
+        )),
+    }
+    if !jobs_of(&pr_blocking_jobs(text))
+        .iter()
+        .any(|(job, _)| *job == found.job)
+    {
+        out.push(format!(
+            "the `{}` job is not pull-request blocking, so the check does not \
+             run on a pull request",
+            found.job
+        ));
+    }
+    out
+}
+
+/// The shard check runs on every pull request, in the `lint` job of `ci.yml`,
+/// under a named step, with the invocation the script documents.
 ///
 /// WHY A TEST HOLDS A WORKFLOW STEP. `ci_test_shard.sh --check` carries the
 /// proof that the partition is total and disjoint AND the hand table its
@@ -3849,28 +3922,26 @@ fn shard_check_step_of(text: &str) -> Option<String> {
 /// file, which runs under `cargo test -p cerulion_cli_engine`. That is a gate
 /// whose CI invocation is one selection away from disappearing, and a gate
 /// nothing invokes is inert.
+///
+/// WHY THE PLACE IS PART OF THE RULE. The name and the script say what runs,
+/// never when. `ci.yml` alone is read, the job id is pinned, the job has to
+/// survive the pull-request view, and the step may carry no condition of its
+/// own: each of those is a way the step keeps its name and stops running where
+/// it matters.
 #[test]
 fn the_shard_check_runs_in_a_named_lint_step() {
     let texts = workflow_texts();
-    let script = texts
-        .values()
-        .find_map(|text| shard_check_step_of(text))
-        .unwrap_or_else(|| {
-            panic!(
-                "no workflow carries a step named `{SHARD_CHECK_STEP}`. \
-                 `{SHARD_CHECK_RUN}` proves the shard partition is total and \
-                 disjoint and holds the selection reader to its hand table; \
-                 without a step running it, the only caller is a test in this \
-                 crate."
-            )
-        });
+    let ci = texts.get(SHARD_CHECK_WORKFLOW).unwrap_or_else(|| {
+        panic!("the workflow walk found no `{SHARD_CHECK_WORKFLOW}`")
+    });
+    let complaints = shard_check_complaints(ci);
     assert!(
-        is_the_shard_check_run(&script),
-        "the `{SHARD_CHECK_STEP}` step does not run `{SHARD_CHECK_RUN}`; it runs \
-         `{}`. A bare `--check` is the shipped configuration: an invocation with \
-         arguments proves a partition the workflow does not run, and a trailing \
-         `|| true` reports success whatever the check says.",
-        script.trim()
+        complaints.is_empty(),
+        "`{SHARD_CHECK_WORKFLOW}` does not run `{SHARD_CHECK_RUN}` the way the \
+         rule names: {}. That invocation proves the shard partition is total \
+         and disjoint and holds the selection reader to its hand table, and it \
+         has to run on a pull request that never runs `cerulion_cli_engine`.",
+        complaints.join("; ")
     );
 }
 
@@ -3882,14 +3953,13 @@ fn a_renamed_or_rewritten_shard_check_step_is_not_found() {
     };
     assert_eq!(
         shard_check_step_of(&job(SHARD_CHECK_STEP, SHARD_CHECK_RUN))
-            .as_deref()
-            .map(str::trim),
+            .map(|found| found.script.trim().to_string())
+            .as_deref(),
         Some(SHARD_CHECK_RUN),
         "the named step running the documented invocation is found"
     );
-    assert_eq!(
-        shard_check_step_of(&job("Shard check", SHARD_CHECK_RUN)),
-        None,
+    assert!(
+        shard_check_step_of(&job("Shard check", SHARD_CHECK_RUN)).is_none(),
         "a renamed step is not found"
     );
     let wrong = job(
@@ -3899,6 +3969,7 @@ fn a_renamed_or_rewritten_shard_check_step_is_not_found() {
     assert!(
         !shard_check_step_of(&wrong)
             .expect("the step is named")
+            .script
             .contains(SHARD_CHECK_RUN),
         "a step of the right name running something else does not satisfy the rule"
     );
@@ -3910,7 +3981,9 @@ fn a_renamed_or_rewritten_shard_check_step_is_not_found() {
         "./tools/scripts/ci_test_shard.sh --check cerulion_core 2",
         "./tools/scripts/ci_test_shard.sh --check || true",
     ] {
-        let script = shard_check_step_of(&job(SHARD_CHECK_STEP, run)).expect("the step is named");
+        let script = shard_check_step_of(&job(SHARD_CHECK_STEP, run))
+            .expect("the step is named")
+            .script;
         assert!(
             script.contains(SHARD_CHECK_RUN),
             "`{run}` carries the bare invocation, so this row says something about \
@@ -3923,10 +3996,71 @@ fn a_renamed_or_rewritten_shard_check_step_is_not_found() {
         );
     }
     let bare = shard_check_step_of(&job(SHARD_CHECK_STEP, SHARD_CHECK_RUN))
-        .expect("the step is named");
+        .expect("the step is named")
+        .script;
     assert!(
         is_the_shard_check_run(&bare),
         "the bare invocation IS the shipped one, so the rule is not satisfied by \
          rejecting everything"
+    );
+}
+
+/// WHERE the shard check runs, both sides, on synthetic workflows.
+#[test]
+fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
+    let shipped = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    steps:\n      - name: {SHARD_CHECK_STEP}\n        \
+         run: {SHARD_CHECK_RUN}\n"
+    );
+    assert!(
+        shard_check_complaints(&shipped).is_empty(),
+        "the shipped shape draws no complaint: {:?}",
+        shard_check_complaints(&shipped)
+    );
+
+    // The cost-policy move: the same step, same name, same invocation, in a
+    // job that skips on a pull request. It is the wrong job AND the job is not
+    // pull-request blocking, and both are said.
+    let moved = format!(
+        "jobs:\n  msrv:\n    if: github.event_name != 'pull_request'\n    steps:\n      \
+         - name: {SHARD_CHECK_STEP}\n        run: {SHARD_CHECK_RUN}\n"
+    );
+    let complaints = shard_check_complaints(&moved);
+    assert!(
+        complaints.iter().any(|c| c.contains("`msrv` job")),
+        "a step in another job is named by its job: {complaints:?}"
+    );
+    assert!(
+        complaints.iter().any(|c| c.contains("pull-request blocking")),
+        "a step in a job that skips on a pull request is named for that: \
+         {complaints:?}"
+    );
+
+    // The job id alone is not the rule: `lint` behind an event test is still a
+    // job the check does not run in on a pull request.
+    let gated = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    if: github.event_name != 'pull_request'\n    \
+         steps:\n      - name: {SHARD_CHECK_STEP}\n        run: {SHARD_CHECK_RUN}\n"
+    );
+    let complaints = shard_check_complaints(&gated);
+    assert!(
+        complaints.iter().any(|c| c.contains("pull-request blocking")),
+        "the right job behind an event test is still named: {complaints:?}"
+    );
+    assert!(
+        !complaints.iter().any(|c| c.contains("job, and the rule names")),
+        "and it is not named for sitting in the wrong job: {complaints:?}"
+    );
+
+    // A step-level condition is the third way the step keeps its name and
+    // stops running: the job reports, the step does not.
+    let conditioned = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    steps:\n      - name: {SHARD_CHECK_STEP}\n        \
+         if: github.event_name == 'push'\n        run: {SHARD_CHECK_RUN}\n"
+    );
+    let complaints = shard_check_complaints(&conditioned);
+    assert!(
+        complaints.iter().any(|c| c.contains("its own condition")),
+        "a step with a condition of its own is named: {complaints:?}"
     );
 }
