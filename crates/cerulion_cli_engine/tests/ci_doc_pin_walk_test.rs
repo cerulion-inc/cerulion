@@ -136,6 +136,13 @@
 //! the root. That is the finest name the workflow carries: the step that runs
 //! them is `cargo test -p <package>`.
 //!
+//! A name bound to the crate's own directory is recognised by NAME across the
+//! whole file, so a name bound to it in one function suppresses a same-named
+//! binding in another.
+//!
+//! A package that carried an integration test binary named exactly like the
+//! package would have its pin merged with the library pin under one key.
+//!
 //! # What this pin covers, and what it does not
 //!
 //! It covers the SHARED trees: a test binary that opens `docs`, `tools`,
@@ -783,12 +790,126 @@ fn is_write_target(code_before: &str) -> bool {
     false
 }
 
+/// The two constructors that turn the manifest-directory string into a path.
+const CRATE_DIR_CONSTRUCTORS: &[&str] = &["Path::new", "PathBuf::from"];
+
+/// The one further call a crate-directory expression may carry: it COPIES the
+/// path, it does not move it.
+const TO_PATH_BUF: &str = ".to_path_buf()";
+
+/// The constructor's argument, with its literal blanked and its whitespace
+/// removed.
+const CRATE_DIR_ARGUMENT: &str = "(env!(\"\"))";
+
+/// Is `code[start..end]` EXACTLY the crate's own manifest directory?
+///
+/// `Path::new(env!("CARGO_MANIFEST_DIR"))` or
+/// `PathBuf::from(env!("CARGO_MANIFEST_DIR"))`, optionally through one
+/// [`TO_PATH_BUF`], and nothing else. A substring test for `parent(` was the
+/// whole rule before, and a source climbs out of its crate four ways —
+/// `parent()`, `pop()`, `join("..")`, `join("../..")` — so an expression
+/// carrying ANY other call answers NO here. That is the over-approximating
+/// side, deliberately: a receiver this reader cannot place is not the crate
+/// directory, so a shared-root literal joined onto it is COUNTED, and an extra
+/// pin costs a test step while a missing one is a silent skip.
+///
+/// Both views, for the reason everything here takes both: the SHAPE is read
+/// from the blanked code, so a call spelled inside a message is not a call, and
+/// the environment variable's name is then read from the same byte range of the
+/// view that kept its literals.
+fn is_crate_directory_expression(
+    code: &str,
+    code_with_literals: &str,
+    start: usize,
+    end: usize,
+) -> bool {
+    let text = &code[start..end];
+    let start = start + (text.len() - text.trim_start().len());
+    let end = start + code[start..end].trim_end().len();
+    let end = match code[start..end].strip_suffix(TO_PATH_BUF) {
+        Some(receiver) => start + receiver.trim_end().len(),
+        None => end,
+    };
+    let expr = &code[start..end];
+    let Some(open) = expr.find('(') else {
+        return false;
+    };
+    let callee = &expr[..open];
+    let is_constructor = CRATE_DIR_CONSTRUCTORS
+        .iter()
+        .any(|name| callee == *name || callee.ends_with(&format!("::{name}")));
+    let argument: String = expr[open..]
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    is_constructor
+        && argument == CRATE_DIR_ARGUMENT
+        && code_with_literals[start..end].contains(CRATE_DIR_ENV)
+}
+
+/// Where the call that ENDS at `end` begins: the `(` matching its final `)`,
+/// walked back over the callee path in front of it.
+///
+/// `None` when `code[..end]` does not end in a call at all. The parenthesis
+/// walk runs over the blanked view, so a parenthesis inside a literal closes
+/// nothing.
+fn call_expression_start(code: &str, end: usize) -> Option<usize> {
+    let head = &code[..end];
+    if !head.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, ch) in head.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(
+                        head[..i]
+                            .char_indices()
+                            .rev()
+                            .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_' || *c == ':'))
+                            .map_or(0, |(j, c)| j + c.len_utf8()),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Does the source climb out of `name` by MUTATING it in place?
+///
+/// `PathBuf::pop` is the one path mutation that climbs, and it is a statement
+/// of its own rather than part of the binding, so the initialiser rule cannot
+/// see it. Read on the blanked view at a token boundary, so `root.pop(` inside
+/// a message pops nothing and `newroot.pop(` is not `root`.
+fn is_popped(code: &str, name: &str) -> bool {
+    let needle = format!("{name}.pop(");
+    let mut from = 0usize;
+    while let Some(offset) = code[from..].find(&needle) {
+        let at = from + offset;
+        from = at + needle.len();
+        let opens_a_token = code[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+        if opens_a_token {
+            return true;
+        }
+    }
+    false
+}
+
 /// Names this source binds to the crate's OWN directory.
 ///
-/// A `let`, `const` or `static` whose initialiser names [`CRATE_DIR_ENV`] and
-/// does not climb out of it with `parent(`. ONE hop, and no further: a name
-/// assigned from another name is not followed, which is the same single hop the
-/// const-table rule takes.
+/// A `let`, `const` or `static` whose initialiser is EXACTLY the crate's
+/// manifest directory by [`is_crate_directory_expression`], and whose name the
+/// source never pops. ONE hop, and no further: a name assigned from another
+/// name is not followed, which is the same single hop the const-table rule
+/// takes.
 ///
 /// The STRUCTURE — where a binding starts and where its `;` is — is read from
 /// the blanked view, so a keyword or a semicolon inside a literal starts and
@@ -829,15 +950,20 @@ fn crate_directory_bindings(code: &str, code_with_literals: &str) -> BTreeSet<St
             // The env! is CODE and the variable name is a LITERAL, so the two
             // halves are asked of the two views. A name that appears only
             // inside a message binds nothing.
-            let initialiser = &code[start..end];
-            if initialiser.contains("env!(")
-                && !initialiser.contains("parent(")
-                && code_with_literals[start..end].contains(CRATE_DIR_ENV)
-            {
+            let Some(equals) = code[start..end].find('=') else {
+                continue;
+            };
+            if is_crate_directory_expression(code, code_with_literals, start + equals + 1, end) {
                 out.insert(name);
             }
         }
     }
+    // A name the source POPS is not the crate directory after that line, and
+    // this reader has no line order: `let mut root = PathBuf::from(env!(…));
+    // root.pop();` is how a source climbs to the workspace without ever naming
+    // `parent`. A popped name is dropped, so a shared-root literal joined onto
+    // it is COUNTED.
+    out.retain(|name| !is_popped(code, name));
     out
 }
 
@@ -875,21 +1001,17 @@ fn joined_onto_the_crate_directory(
     let head = &code[..head_end];
     if head.ends_with(')') {
         // An inline receiver: `Path::new(env!("CARGO_MANIFEST_DIR")).join(`.
-        let mut depth = 0i32;
-        for (i, ch) in head.char_indices().rev() {
-            match ch {
-                ')' => depth += 1,
-                '(' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let call = &code_with_literals[i..head_end];
-                        return call.contains(CRATE_DIR_ENV) && !call.contains("parent(");
-                    }
-                }
-                _ => {}
-            }
-        }
-        return false;
+        // The WHOLE receiver goes to the rule the bindings take, so a call this
+        // reader cannot place — `workspace_root(env!("CARGO_MANIFEST_DIR"))` —
+        // is not the crate directory and the literal on it is counted.
+        let receiver_end = match head.strip_suffix(TO_PATH_BUF) {
+            Some(receiver) => receiver.trim_end().len(),
+            None => head_end,
+        };
+        let Some(start) = call_expression_start(code, receiver_end) else {
+            return false;
+        };
+        return is_crate_directory_expression(code, code_with_literals, start, head_end);
     }
     let start = head
         .char_indices()
@@ -2182,6 +2304,59 @@ fn a_path_joined_onto_the_crates_own_directory_is_not_a_doc_pin() {
              let f = root.join(\"{agents}\");\n"
         )),
         agents_only
+    );
+    // And `parent(` is only ONE of the ways a real source climbs. The rule is
+    // that the initialiser is EXACTLY the manifest directory, so a `pop()`, a
+    // `join("..")`, a `join("../..")` and an `ancestors()` each take the
+    // binding out of the set and leave the literal COUNTED.
+    for climb in [
+        format!("let mut root = PathBuf::from(env!(\"{CRATE_DIR_ENV}\"));\nroot.pop();\n"),
+        format!("let root = PathBuf::from(env!(\"{CRATE_DIR_ENV}\")).join(\"..\");\n"),
+        format!("let root = PathBuf::from(env!(\"{CRATE_DIR_ENV}\")).join(\"../..\");\n"),
+        format!("let root = Path::new(env!(\"{CRATE_DIR_ENV}\")).ancestors().nth(1).unwrap();\n"),
+    ] {
+        assert_eq!(
+            doc_roots_read_by_source(&format!("{climb}let f = root.join(\"{agents}\");\n")),
+            agents_only,
+            "a binding that climbed out of the crate is not the crate \
+             directory:\n{climb}"
+        );
+    }
+
+    // The other side of the same rule: the plain manifest-directory binding
+    // still SUPPRESSES, in both constructors, with and without the copy, for
+    // both root-markdown names.
+    let readme = root_markdown_name("README");
+    for binding in [
+        format!("let crate_root = Path::new(env!(\"{CRATE_DIR_ENV}\"));\n"),
+        format!("let crate_root = PathBuf::from(env!(\"{CRATE_DIR_ENV}\"));\n"),
+        format!("let crate_root = Path::new(env!(\"{CRATE_DIR_ENV}\")).to_path_buf();\n"),
+    ] {
+        for name in [&agents, &readme] {
+            assert_eq!(
+                doc_roots_read_by_source(&format!(
+                    "{binding}let f = crate_root.join(\"{name}\");\n"
+                )),
+                nothing,
+                "the crate's own copy of `{name}` is not a doc pin:\n{binding}"
+            );
+        }
+    }
+
+    // An INLINE receiver this reader cannot place is not the crate directory
+    // either: only the two constructors are, so a helper call around the
+    // environment variable leaves the literal counted, and the copy does not.
+    assert_eq!(
+        doc_roots_read_by_source(&format!(
+            "let f = workspace_root(env!(\"{CRATE_DIR_ENV}\")).join(\"{agents}\");\n"
+        )),
+        agents_only
+    );
+    assert_eq!(
+        doc_roots_read_by_source(&format!(
+            "let f = Path::new(env!(\"{CRATE_DIR_ENV}\")).to_path_buf().join(\"{agents}\");\n"
+        )),
+        nothing
     );
 
     // The binding reader itself, both ways — and a `let` spelled inside a

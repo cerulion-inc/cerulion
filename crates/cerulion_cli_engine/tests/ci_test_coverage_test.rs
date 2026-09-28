@@ -332,6 +332,10 @@ fn is_name_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
 }
 
+/// The indent of a key in a job's `outputs:` mapping: two for the job, two for
+/// the key, two for the mapping under it.
+const OUTPUT_KEY_INDENT: &str = "      ";
+
 /// Which of the three selection outputs the classifier job of `jobs` declares
 /// AND produces.
 ///
@@ -345,6 +349,13 @@ fn is_name_char(ch: char) -> bool {
 /// exists — a step of that job, or a literal — because an output wired to a
 /// step id the job does not carry is the empty string on every event, exactly
 /// like an output nobody declared at all.
+///
+/// The value is READ with [`read_scalar_value`], the same reader the `if:`
+/// values go through, so an output written as a BLOCK scalar — `code: >-` with
+/// the expression on the line below, or `code: |` — is grounded on the
+/// EXPRESSION rather than on the `>-` header. On the header alone it grounded
+/// as a literal, and an output wired to a step id the classifier does not carry
+/// was credited. A value this reader cannot classify FAILS the walk.
 fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
     let mut out = BTreeSet::new();
     let Some((_, block)) = jobs.iter().find(|(name, _)| name == SELECTION_JOB) else {
@@ -355,28 +366,43 @@ fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
     let Some(at) = lines.iter().position(|l| l.trim_end() == "    outputs:") else {
         return out;
     };
-    for line in &lines[at + 1..] {
+    for (offset, line) in lines[at + 1..].iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let Some(rest) = line.strip_prefix("      ") else {
+        let Some(rest) = line.strip_prefix(OUTPUT_KEY_INDENT) else {
             break;
         };
         if rest.starts_with(' ') {
             continue;
         }
-        let Some((key, value)) = rest.split_once(':') else {
+        let Some((key, head)) = rest.split_once(':') else {
             break;
         };
         let key = key.trim();
-        if [
+        if ![
             SELECTION_CODE_OUTPUT,
             SELECTION_DOCS_OUTPUT,
             SELECTION_PKGS_OUTPUT,
         ]
         .contains(&key)
-            && output_is_produced(value, &ids)
         {
+            continue;
+        }
+        let value = read_scalar_value(key, head, &lines, at + 1 + offset, OUTPUT_KEY_INDENT.len())
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{why}\n\nThe walk cannot say where the `{key}` output's \
+                     value comes from, so it refuses to guess. Spell the value \
+                     as a NON-EMPTY plain, quoted or block scalar, or teach \
+                     `read_scalar_form` the form — never leave it unread: an \
+                     unread value reads as a literal that grounds itself, and \
+                     every step gated on \
+                     `needs.{SELECTION_JOB}.outputs.{key}` would then credit \
+                     coverage from an output nobody produces."
+                )
+            });
+        if output_is_produced(&value, &ids) {
             out.insert(key.to_string());
         }
     }
@@ -389,6 +415,10 @@ fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
 /// `steps.<id>.outputs.<name>`, and every step id it names has to be one this
 /// job's steps declare: an expression over anything else — a step renamed away,
 /// a `needs.` of a job that is not needed — is the empty string on every event.
+///
+/// `value` is the FOLDED scalar [`read_scalar_value`] returned, never the raw
+/// text after the `:`: a block scalar's header carries no expression at all, so
+/// asking this about `>-` asked it about a literal.
 fn output_is_produced(value: &str, step_ids: &BTreeSet<String>) -> bool {
     if !value.contains("${{") {
         return !value.trim().is_empty();
@@ -685,14 +715,15 @@ fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// One `if:` value, in every YAML scalar form the workflow tree uses, with runs
-/// of whitespace folded to single spaces.
+/// One `<key>:` value, in every YAML scalar form the workflow tree uses, with
+/// runs of whitespace folded to single spaces — and NEVER the empty string.
 ///
-/// `rest` is the text after the `if:` token on `lines[at]`, and `key_column` is
-/// the column that token starts at: a scalar CONTINUES on the following lines
-/// indented deeper than it, and stops at the first non-blank line that is not.
-/// A blank line does not stop it — comments are blanked before this walk sees
-/// the file.
+/// `key` is the key the value belongs to, spelled into the message an
+/// unreadable form carries. `rest` is the text after the `key:` token on
+/// `lines[at]`, and `key_column` is the column that token starts at: a scalar
+/// CONTINUES on the following lines indented deeper than it, and stops at the
+/// first non-blank line that is not. A blank line does not stop it — comments
+/// are blanked before this walk sees the file.
 ///
 /// The forms: a plain scalar on the key's own line, a single- or double-quoted
 /// one, a folded or literal block scalar (`>`, `>-`, `>+`, `|`, `|-`, `|+`),
@@ -700,10 +731,33 @@ fn indent_of(line: &str) -> usize {
 /// mean the same expression, and GitHub ignores the whitespace between its
 /// tokens, which is why the value comes back folded.
 ///
-/// FAIL CLOSED. An unreadable form is an `Err` its caller turns into a test
-/// failure, never an empty condition: an empty condition cannot stop a step, so
-/// reading one is exactly how a gated step gets credited.
-fn read_if_scalar(
+/// FAIL CLOSED, twice. An unreadable form is an `Err` its caller turns into a
+/// test failure, never an empty condition: an empty condition cannot stop a
+/// step, so reading one is exactly how a gated step gets credited. An EMPTY
+/// value is that same hole spelled in valid YAML — GitHub evaluates `if: ''` as
+/// false and skips the step on every event, and an empty `outputs:` value is
+/// the empty string every job that needs it reads — so it is an `Err` too.
+fn read_scalar_value(
+    key: &str,
+    rest: &str,
+    lines: &[&str],
+    at: usize,
+    key_column: usize,
+) -> Result<String, String> {
+    let value = read_scalar_form(key, rest, lines, at, key_column)?;
+    if value.is_empty() {
+        return Err(format!(
+            "an empty `{key}:` value: `{key}: ''` and `{key}: \"\"` are valid \
+             YAML and mean NOTHING at all"
+        ));
+    }
+    Ok(value)
+}
+
+/// The scalar FORM of one `<key>:` value, folded, before the empty-value rule
+/// [`read_scalar_value`] holds it to.
+fn read_scalar_form(
+    key: &str,
     rest: &str,
     lines: &[&str],
     at: usize,
@@ -731,34 +785,36 @@ fn read_if_scalar(
     if let Some(indicator) = head.strip_prefix(['>', '|']) {
         if !matches!(indicator, "" | "-" | "+") {
             return Err(format!(
-                "a block scalar header this reader cannot classify: `if: {head}`"
+                "a block scalar header this reader cannot classify: `{key}: {head}`"
             ));
         }
         if continuation.is_empty() {
-            return Err(String::from("a block `if:` with no value under it"));
+            return Err(format!("a block `{key}:` with no value under it"));
         }
         return Ok(folded(&continuation));
     }
     if head.is_empty() {
         if continuation.is_empty() {
-            return Err(String::from("an `if:` with no value at all"));
+            return Err(format!("an `{key}:` with no value at all"));
         }
         if continuation[0].starts_with("- ") {
-            return Err(String::from("an `if:` whose value is a sequence"));
+            return Err(format!("an `{key}:` whose value is a sequence"));
         }
         return Ok(folded(&continuation));
     }
     if head.starts_with(['\'', '"']) {
         let quote = head.chars().next().expect("the head is not empty");
         if !continuation.is_empty() {
-            return Err(format!("a quoted `if:` continued on another line: {head}"));
+            return Err(format!(
+                "a quoted `{key}:` continued on another line: {head}"
+            ));
         }
         let inner = head
             .strip_prefix(quote)
             .and_then(|h| h.strip_suffix(quote))
-            .ok_or_else(|| format!("an unterminated quoted `if:`: {head}"))?;
+            .ok_or_else(|| format!("an unterminated quoted `{key}:`: {head}"))?;
         if quote == '"' && inner.contains('\\') {
-            return Err(format!("an escaped double-quoted `if:`: {head}"));
+            return Err(format!("an escaped double-quoted `{key}:`: {head}"));
         }
         let inner = if quote == '\'' {
             inner.replace("''", "'")
@@ -768,7 +824,9 @@ fn read_if_scalar(
         return Ok(folded(&[inner.as_str()]));
     }
     if head.starts_with(['*', '&', '!']) {
-        return Err(format!("an anchor, alias or tag as an `if:`: {head}"));
+        return Err(format!(
+            "an anchor, alias or tag as an `{key}:` value: {head}"
+        ));
     }
     let mut parts = vec![head];
     parts.extend(continuation);
@@ -780,7 +838,7 @@ fn read_if_scalar(
 ///
 /// Steps are list items under `steps:`; the item indent is read from the first
 /// one rather than hard-coded, and a step's own keys sit two spaces deeper. The
-/// `if:` VALUE is read in every scalar form by [`read_if_scalar`], and a form
+/// `if:` VALUE is read in every scalar form by [`read_scalar_value`], and a form
 /// it cannot classify PANICS: this walk exists to decide whether a condition
 /// can stop a step, so a condition it cannot read is not one it may skip past.
 fn retain_steps<F: Fn(&str) -> bool>(job: &str, keep: F) -> String {
@@ -825,16 +883,18 @@ fn retain_steps<F: Fn(&str) -> bool>(job: &str, keep: F) -> String {
             None
         };
         if let Some(rest) = found {
-            let cond = read_if_scalar(rest, &body, i, step_indent + 2).unwrap_or_else(|why| {
-                panic!(
-                    "{why}\n\nThe walk cannot say whether this step runs on a \
-                     pull request, so it refuses to guess. Spell the `if:` as a \
-                     plain, quoted or block scalar, or teach `read_if_scalar` \
-                     the form — never leave it unread: an unread condition reads \
-                     as NO condition, and a step behind \
-                     `github.event_name == 'push'` would then credit coverage."
-                )
-            });
+            let cond =
+                read_scalar_value("if", rest, &body, i, step_indent + 2).unwrap_or_else(|why| {
+                    panic!(
+                        "{why}\n\nThe walk cannot say whether this step runs on \
+                         a pull request, so it refuses to guess. Spell the `if:` \
+                         as a NON-EMPTY plain, quoted or block scalar, or teach \
+                         `read_scalar_form` the form — never leave it unread: an \
+                         unread condition reads as NO condition, and a step \
+                         behind `github.event_name == 'push'` would then credit \
+                         coverage."
+                    )
+                });
             if !keep(&cond) {
                 gated = true;
             }
@@ -2058,6 +2118,26 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
          empty string on every event and grounds nothing"
     );
 
+    // BLOCK SCALARS, both ways. The value of `code: >-` is on the line BELOW
+    // the key, so reading the header alone read no expression at all and the
+    // output grounded as a literal — which credited a step wired to a step id
+    // the classifier does not carry.
+    let folded_gone = "    outputs:\n      code: >-\n        ${{ steps.gone.outputs.code }}\n";
+    let folded_there = "    outputs:\n      code: >-\n        ${{ steps.c.outputs.code }}\n";
+    let literal_there = "    outputs:\n      code: |\n        ${{ steps.c.outputs.code }}\n";
+    assert_eq!(
+        credited(&body(needs_changes, folded_gone)),
+        set(&["always_pkg"]),
+        "a block-scalar output wired to a step the classifier does not carry \
+         grounds nothing"
+    );
+    assert_eq!(
+        credited(&body(needs_changes, folded_there)),
+        set(&["always_pkg", "code_pkg"]),
+        "a block-scalar output wired to a step the classifier DOES carry \
+         grounds, and the step that reads it credits the package it names"
+    );
+
     // And the declaration reader itself, every way.
     assert_eq!(
         declared_selection_outputs(&jobs_of(&body(needs_changes, all_outputs))),
@@ -2070,6 +2150,18 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
     assert_eq!(
         declared_selection_outputs(&jobs_of(&body(needs_changes, unproduced))),
         BTreeSet::<String>::new()
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, folded_gone))),
+        BTreeSet::<String>::new()
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, folded_there))),
+        set(&["code"])
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, literal_there))),
+        set(&["code"])
     );
     // A literal value grounds itself: nothing has to produce it.
     assert_eq!(
@@ -2211,6 +2303,53 @@ fn a_step_condition_is_read_in_every_yaml_scalar_form() {
 #[should_panic(expected = "an anchor, alias or tag as an `if:`")]
 fn an_unreadable_step_condition_fails_the_walk() {
     retain_steps(&job_with_condition("if: *gate\n"), |_| true);
+}
+
+/// An output VALUE the reader cannot classify fails the walk too, rather than
+/// grounding the output on a form nobody read.
+///
+/// The other side is every arm of
+/// `a_selection_condition_credits_nothing_when_its_output_is_not_grounded`,
+/// where a readable value grounds, or does not, on its own merits.
+#[test]
+#[should_panic(expected = "an anchor, alias or tag as an `code:`")]
+fn an_unreadable_selection_output_fails_the_walk() {
+    let text = "on:\n  pull_request:\njobs:\n  changes:\n    runs-on: ubuntu-latest\n    \
+                outputs:\n      code: *anchor\n    steps:\n      - id: c\n        run: true\n";
+    declared_selection_outputs(&jobs_of(text));
+}
+
+/// An EMPTY condition is unreadable, and a non-empty quoted one still reads.
+///
+/// GitHub evaluates an empty `if:` as FALSE and skips the step on every event,
+/// so reading `if: ''` as the empty string reads a step that never runs as an
+/// unconditional one and credits its package. Both empty forms, and both
+/// non-empty ones.
+#[test]
+fn an_empty_condition_is_unreadable_and_a_non_empty_one_reads() {
+    let read = |head: &str| read_scalar_value("if", head, &[head], 0, 8);
+    let empty = String::from(
+        "an empty `if:` value: `if: ''` and `if: \"\"` are valid YAML and mean \
+         NOTHING at all",
+    );
+    assert_eq!(read("''"), Err(empty.clone()));
+    assert_eq!(read("\"\""), Err(empty));
+    assert_eq!(read("'always()'"), Ok(String::from("always()")));
+    assert_eq!(read("\"always()\""), Ok(String::from("always()")));
+}
+
+/// An empty single-quoted condition fails the WALK, not only the reader.
+#[test]
+#[should_panic(expected = "an empty `if:` value")]
+fn an_empty_single_quoted_condition_fails_the_walk() {
+    retain_steps(&job_with_condition("if: ''\n"), |_| true);
+}
+
+/// And the double-quoted spelling of the same empty condition.
+#[test]
+#[should_panic(expected = "an empty `if:` value")]
+fn an_empty_double_quoted_condition_fails_the_walk() {
+    retain_steps(&job_with_condition("if: \"\"\n"), |_| true);
 }
 
 /// A leg selector counts only against a leg the step's OWN job declares.
