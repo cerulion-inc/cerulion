@@ -53,6 +53,19 @@ pub struct StreamResolution {
     /// (`rerun+http://127.0.0.1:{port}/proxy` when hosting, the override URL when
     /// a client, `None` when viz is disabled).
     pub rerun_url: Option<String>,
+    /// The loopback port THIS daemon bound for its own gRPC proxy, or `None`
+    /// when it bound nothing.
+    ///
+    /// It is the daemon's own record of what it opened, which is the only part
+    /// of "is a proxy hosted" the daemon owns: whether some OTHER process is
+    /// listening on a port is a fact about the machine. CLIENT mode and the
+    /// disabled fallback both read `None`; HOST mode reads the port it handed to
+    /// `serve_grpc_opts`, which is the port in [`Self::rerun_url`].
+    ///
+    /// [`host_endpoint`] is the one function here that opens a listening socket,
+    /// and it is the one place this reads `Some`, so the equivalence holds by
+    /// construction. A second hosting path must set it too.
+    pub hosted_port: Option<u16>,
 }
 
 /// Resolve the daemon's viz stream: HOST a gRPC proxy by default, or connect as
@@ -76,6 +89,9 @@ fn connect_client(url: String) -> StreamResolution {
             StreamResolution {
                 rec,
                 rerun_url: Some(url),
+                // A client binds nothing: the endpoint belongs to whoever the
+                // operator pointed us at.
+                hosted_port: None,
             }
         }
         None => {
@@ -84,6 +100,7 @@ fn connect_client(url: String) -> StreamResolution {
             StreamResolution {
                 rec: RecordingStream::disabled(),
                 rerun_url: Some(url),
+                hosted_port: None,
             }
         }
     }
@@ -284,6 +301,9 @@ fn host_endpoint() -> StreamResolution {
             StreamResolution {
                 rec,
                 rerun_url: Some(url),
+                // The port this daemon bound, recorded at the one call that
+                // binds it.
+                hosted_port: Some(port),
             }
         }
         Err(e) => {
@@ -294,6 +314,7 @@ fn host_endpoint() -> StreamResolution {
             StreamResolution {
                 rec: RecordingStream::disabled(),
                 rerun_url: None,
+                hosted_port: None,
             }
         }
     }
