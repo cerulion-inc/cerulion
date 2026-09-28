@@ -13,12 +13,14 @@ commit range and the pull request title under the full hard set, and the pull re
 under the conversation hard set.
 
 A body is public the moment it is written and no check runs before it is, so that last
-job cannot block anything. It reads what PEOPLE write: a body whose author is a bot is
-skipped on every event, decided by the author of the body rather than the actor who
-triggered the run, because an app editing its own summary and a person editing theirs
-arrive as the same event. Review apps quote examples, restate diffs and rewrite their
-summaries on every push, and their text is machine written from a diff the other three jobs
-already gate.
+job cannot block anything. It reads EVERY author, bots included. A bot restates a diff and
+quotes what it found, so an address, a home path, a private name or a closed reference
+reaches a public thread through a bot exactly as it does through a person, and both of the
+genuine findings this guard has made were in text a review app wrote. What made bot text
+unbearable was style classes counting as hard on a conversation body, which the narrower
+hard set fixes for every author, so an author rule has nothing left to buy. The one body
+never read is the guard's OWN ask, matched on its account and its marker together, so it
+cannot read itself while a marker pasted by anyone else is scanned like any other text.
 
 A conversation body is also judged by a narrower hard set than a file or a commit message:
 only the identity classes and the two reference classes, the ones whose finding is a value
@@ -30,9 +32,11 @@ On a HARD finding, which on that surface means an identity class or a reference 
 job applies the `leak` label, asks the author once to edit the text (one ask per body, so
 an unchanged body is never asked twice), and goes red. A style class prints a `REPORT` line
 and does none of the three. The ask names what it found: a value asks to have that value
-taken out, a reference asks for a link anyone can follow in its place. The label tracks the THREAD: a clean body takes back the ask left for it,
-and the label comes off when the last outstanding ask on that thread is gone, so a clean
-comment cannot clear a label another body still deserves.
+taken out, a reference asks for a link anyone can follow in its place.
+
+The label tracks the THREAD: a clean body takes back the ask left for it, and the label
+comes off when the last outstanding ask on that thread is gone, so a clean comment cannot
+clear a label another body still deserves.
 
 ## What it checks
 

@@ -4797,10 +4797,17 @@ def self_test(out, base_env, argv0):
                     refenv, repo_ref)[0] == EXIT_USAGE
                 for extra in (['--range', 'HEAD~1..HEAD'], ['--message-file', pf],
                               ['--ident-from-git']))
-            and run(['messages', '--conversation', '--pr-title-env', 'T', '--pr-body-env', 'B',
-                     '--no-allow'] + mine,
-                    dict(refenv, T='a title ' + DASH_EM, B='a body ' + P_MAC + PLAIN_USER
-                         + '/x\n'), repo_ref)[0] == EXIT_HIT)
+            # ... and the two combinations the workflow SHIPS are accepted and
+            # behave: the pull request body run and the conversation job's run,
+            # each with the code-span exemption beside the flag. Pinning a
+            # combination nothing ships would pin nothing.
+            and run(['messages', '--conversation', '--skip-code', '--pr-body-env', 'B',
+                     '--hard', REF_UNVERIFIED, '--no-allow'] + mine,
+                    dict(refenv, B='a body ' + P_MAC + PLAIN_USER + '/x and ' + DASH_EM
+                         + '\n'), repo_ref)[0] == EXIT_HIT
+            and run(['messages', '--conversation', '--skip-code', '--body-env', 'B',
+                     '--body-label', 'comment-body', '--no-allow'] + mine,
+                    dict(refenv, B='a comment ' + DASH_EM + '\n'), repo_ref)[0] == EXIT_OK)
         # The one body the workflow never reads is the guard's own ask. That is
         # a condition in the shipped YAML, so it is read OUT of the shipped YAML
         # and evaluated, rather than restated here where it could drift.
