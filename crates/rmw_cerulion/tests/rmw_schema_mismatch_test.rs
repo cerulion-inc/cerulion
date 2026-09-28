@@ -36,7 +36,9 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rmw_cerulion::ffi::introspection_cpp::{CppMessageMember, CppMessageMembers};
+use rmw_cerulion::ffi::introspection_cpp::{
+    CppMessageMember, CppMessageMembers, CppServiceMembers, VecTriplet,
+};
 use rmw_cerulion::ffi::{self, RMW_RET_OK};
 use rmw_cerulion::*;
 // no-env-filter so the capture reaches the `cerulion_core` target (the
@@ -50,6 +52,8 @@ use tracing_test::traced_test;
 
 const ROS_TYPE_DOUBLE: u8 = 2;
 const ROS_TYPE_BOOLEAN: u8 = 6;
+const ROS_TYPE_UINT8: u8 = 8;
+const ROS_TYPE_MESSAGE: u8 = 18;
 
 fn cstr(s: &str) -> *const c_char {
     CString::new(s).expect("cstr").into_raw()
@@ -143,45 +147,253 @@ unsafe extern "C" fn vecbool_resize(field: *mut c_void, size: usize) {
 /// `std::vector<bool>` and leaves `get`/`get_const` null), and the shape a
 /// hand fixture reaches on any era by leaving the accessor unset.
 fn cpp_bool_seq_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
-    let members = Box::leak(Box::new([CppMessageMember {
-        name_: cstr("flags"),
-        type_id_: ROS_TYPE_BOOLEAN,
+    cpp_ts(cpp_members(
+        "rmw_mismatch::msg",
+        unique,
+        std::mem::size_of::<FakeVecBool>(),
+        vec![cpp_unwritable_bool_member()],
+        None,
+        None,
+    ))
+}
+
+/// A C++ introspection member with every accessor unset.
+fn cpp_member(name: &str, type_id: u8, offset: u32, is_array: bool) -> CppMessageMember {
+    CppMessageMember {
+        name_: cstr(name),
+        type_id_: type_id,
         string_upper_bound_: 0,
         members_: std::ptr::null(),
         #[cfg(cerulion_has_is_key)]
         is_key_: false,
-        is_array_: true,
+        is_array_: is_array,
         array_size_: 0,
         is_upper_bound_: false,
-        offset_: 0,
+        offset_: offset,
         default_value_: std::ptr::null(),
-        size_function: Some(vecbool_size),
+        size_function: None,
         get_const_function: None,
         get_function: None,
         #[cfg(cerulion_has_fetch_function)]
         fetch_function: None,
         #[cfg(cerulion_has_fetch_function)]
         assign_function: None,
-        resize_function: Some(vecbool_resize),
+        resize_function: None,
         #[cfg(cerulion_has_is_rosidl_buffer)]
         is_rosidl_buffer_: false,
-    }]));
-    let mm = Box::leak(Box::new(CppMessageMembers {
-        message_namespace_: cstr("rmw_mismatch::msg"),
-        message_name_: cstr(unique),
-        member_count_: 1,
-        size_of_: std::mem::size_of::<FakeVecBool>(),
+    }
+}
+
+fn cpp_members(
+    ns: &str,
+    name: &str,
+    size_of: usize,
+    members: Vec<CppMessageMember>,
+    init: Option<unsafe extern "C" fn(*mut c_void, u32)>,
+    fini: Option<unsafe extern "C" fn(*mut c_void)>,
+) -> *const CppMessageMembers {
+    let members = Box::leak(members.into_boxed_slice());
+    Box::leak(Box::new(CppMessageMembers {
+        message_namespace_: cstr(ns),
+        message_name_: cstr(name),
+        member_count_: members.len() as u32,
+        size_of_: size_of,
         #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
-        init_function: None,
-        fini_function: None,
-    }));
+        init_function: init,
+        fini_function: fini,
+    }))
+}
+
+fn cpp_ts(members: *const CppMessageMembers) -> *const ffi::rosidl_message_type_support_t {
     Box::leak(Box::new(ffi::rosidl_message_type_support_t {
         typesupport_identifier: cstr("rosidl_typesupport_introspection_cpp"),
-        data: mm as *const _ as *const c_void,
+        data: members as *const c_void,
         ..Default::default()
     }))
+}
+
+/// The pre-Humble `bool[]` member: the element COUNT is readable and the
+/// container resizes, and no element can be written, because the C++
+/// generator emits no `assign` for `std::vector<bool>`.
+fn cpp_unwritable_bool_member() -> CppMessageMember {
+    let mut flags = cpp_member("flags", ROS_TYPE_BOOLEAN, 0, true);
+    flags.size_function = Some(vecbool_size);
+    flags.resize_function = Some(vecbool_resize);
+    flags
+}
+
+/// `{ Inner inner }` over `Inner { bool[] flags }`: the unwritable member
+/// one level DOWN, where a census over top-level members alone never sees
+/// it. Every level holds one member at offset 0, so the C++ struct of both
+/// is a `FakeVecBool`.
+fn cpp_nested_bool_members(ns: &str, name: &str, inner_name: &str) -> *const CppMessageMembers {
+    let inner = cpp_members(
+        "rmw_mismatch::msg",
+        inner_name,
+        std::mem::size_of::<FakeVecBool>(),
+        vec![cpp_unwritable_bool_member()],
+        None,
+        None,
+    );
+    let mut nested = cpp_member("inner", ROS_TYPE_MESSAGE, 0, false);
+    nested.members_ = cpp_ts(inner);
+    cpp_members(
+        ns,
+        name,
+        std::mem::size_of::<FakeVecBool>(),
+        vec![nested],
+        None,
+        None,
+    )
+}
+
+fn cpp_nested_bool_seq_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
+    cpp_ts(cpp_nested_bool_members(
+        "rmw_mismatch::msg",
+        unique,
+        &format!("Inner{unique}"),
+    ))
+}
+
+/// The C++ SERVICE typesupport whose request hides its `bool[]` in a nested
+/// message. Its request schema is the twin of [`c_nested_service_ts`]'s, so
+/// a C-typesupport client (rclpy, or any C node) can put a frame carrying
+/// that member on the wire for this server to refuse.
+fn cpp_nested_service_ts(unique: &str) -> *const ffi::rosidl_service_type_support_t {
+    let request = cpp_nested_bool_members(
+        "rmw_mismatch::srv",
+        &format!("{unique}_Request"),
+        &format!("Inner{unique}"),
+    );
+    let response = cpp_members(
+        "rmw_mismatch::srv",
+        &format!("{unique}_Response"),
+        std::mem::size_of::<f64>(),
+        vec![cpp_member("ok", ROS_TYPE_DOUBLE, 0, false)],
+        None,
+        None,
+    );
+    let sm = Box::leak(Box::new(CppServiceMembers {
+        service_namespace_: cstr("rmw_mismatch::srv"),
+        service_name_: cstr(unique),
+        request_members_: request,
+        response_members_: response,
+        #[cfg(cerulion_has_event_members)]
+        event_members_: std::ptr::null(),
+    }));
+    Box::leak(Box::new(ffi::rosidl_service_type_support_t {
+        typesupport_identifier: cstr("rosidl_typesupport_introspection_cpp"),
+        data: sm as *const _ as *const c_void,
+        ..Default::default()
+    }))
+}
+
+/// rosidl's C `bool[]`: a plain pointer, size and capacity, which the C
+/// bridge reads and writes as bytes. No accessor exists or is needed, which
+/// is why this condition is a C++-only one.
+#[repr(C)]
+struct CBoolSeq {
+    data: *mut bool,
+    size: usize,
+    capacity: usize,
+}
+
+/// The C twin of [`cpp_nested_service_ts`]: the SAME package, type names,
+/// member names and field types, so the two bridges agree on the wire
+/// schema hash and a C client's frame reaches the C++ server's take.
+fn c_nested_service_ts(unique: &str) -> *const ffi::rosidl_service_type_support_t {
+    let mut flags = member("flags", ROS_TYPE_BOOLEAN, 0);
+    flags.is_array_ = true;
+    let inner = make_message_ts(
+        "rmw_mismatch__msg",
+        &format!("Inner{unique}"),
+        std::mem::size_of::<CBoolSeq>(),
+        vec![flags],
+    );
+    let mut nested = member("inner", ROS_TYPE_MESSAGE, 0);
+    nested.members_ = inner;
+    let request = make_message_ts(
+        "rmw_mismatch__srv",
+        &format!("{unique}_Request"),
+        std::mem::size_of::<CBoolSeq>(),
+        vec![nested],
+    );
+    let response = make_message_ts(
+        "rmw_mismatch__srv",
+        &format!("{unique}_Response"),
+        std::mem::size_of::<f64>(),
+        vec![member("ok", ROS_TYPE_DOUBLE, 0)],
+    );
+    let sm = Box::leak(Box::new(
+        ffi::rosidl_typesupport_introspection_c__ServiceMembers {
+            service_namespace_: cstr("rmw_mismatch__srv"),
+            service_name_: cstr(unique),
+            request_members_: unsafe { (*request).data }
+                as *const ffi::rosidl_typesupport_introspection_c__MessageMembers,
+            response_members_: unsafe { (*response).data }
+                as *const ffi::rosidl_typesupport_introspection_c__MessageMembers,
+            ..Default::default()
+        },
+    ));
+    Box::leak(Box::new(ffi::rosidl_service_type_support_t {
+        typesupport_identifier: cstr("rosidl_typesupport_introspection_c"),
+        data: sm as *const _ as *const c_void,
+        ..Default::default()
+    }))
+}
+
+/// A type the LOANED take serves: one FORGEABLE `uint8[]` (unbounded,
+/// primitive, never bool, so the forged take aims its `std::vector` triplet
+/// at the held sample) beside the nested `bool[]` no build before Humble can
+/// write. Without the forgeable member `can_loan_take` is false and the
+/// loaned take is never reached at all.
+#[repr(C)]
+struct CppLoanable {
+    data: VecTriplet,
+    inner: FakeVecBool,
+}
+
+unsafe extern "C" fn loanable_init(msg: *mut c_void, _all: u32) {
+    // Both members are empty containers: a zeroed triplet is the empty
+    // `std::vector` the forge overwrites, and the fixture's bit-packed
+    // `bool[]` is zero length. Nothing is allocated, so `fini` frees nothing.
+    std::ptr::write_bytes(msg as *mut u8, 0, std::mem::size_of::<CppLoanable>());
+}
+
+unsafe extern "C" fn loanable_fini(_msg: *mut c_void) {}
+
+fn cpp_loanable_nested_bool_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
+    let inner = cpp_members(
+        "rmw_mismatch::msg",
+        &format!("Inner{unique}"),
+        std::mem::size_of::<FakeVecBool>(),
+        vec![cpp_unwritable_bool_member()],
+        None,
+        None,
+    );
+    let data = cpp_member(
+        "data",
+        ROS_TYPE_UINT8,
+        std::mem::offset_of!(CppLoanable, data) as u32,
+        true,
+    );
+    let mut nested = cpp_member(
+        "inner",
+        ROS_TYPE_MESSAGE,
+        std::mem::offset_of!(CppLoanable, inner) as u32,
+        false,
+    );
+    nested.members_ = cpp_ts(inner);
+    cpp_ts(cpp_members(
+        "rmw_mismatch::msg",
+        unique,
+        std::mem::size_of::<CppLoanable>(),
+        vec![data, nested],
+        Some(loanable_init),
+        Some(loanable_fini),
+    ))
 }
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -250,6 +462,9 @@ const ENTRY_REFUSED_SUPPRESSED: &str = "frame refused before decoding (regime st
 /// Substring unique to the DECADE RE-ANNOUNCEMENT (`error!`) arm of the decode
 /// report — the arm that exists precisely to survive a filter hiding `debug!`.
 const DECODE_STILL: &str = "decode failures are STILL dropping every frame";
+/// Substring unique to `rmw_deserialize`'s own pre-write refusal, which has
+/// no latch and no entity: a one-shot call has no stream to flood.
+const DESERIALIZE_REFUSED: &str = "rmw_deserialize refused the buffer before writing anything";
 
 /// The value of a rendered field whose own value contains SPACES: everything
 /// between `<key>=` and the key that the emission declares NEXT. A
@@ -1057,5 +1272,414 @@ fn an_open_decode_regime_re_announces_at_the_decade_at_error() {
         drop(raw_pub);
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+// =====================================================================
+// The same refusal for a member one level DOWN. Every path that decodes
+// C++ typesupport reads the registration record BEFORE its first write, so
+// the nested member must be in that record or the decode writes half the
+// destination and then fails.
+// =====================================================================
+
+/// The WHOLE `reason=` value a user reads when the unwritable `bool[]` sits
+/// inside a nested message. Typed out here, never read back from the
+/// constant the bridge renders: the oracle is the message the user reads.
+/// The path is the outer member, a dot, the nested member, so the reader is
+/// sent to the field itself and not to the message that contains it.
+const NESTED_REASON: &str = "bool sequence member 'inner.flags' cannot be decoded: this build's \
+                             C++ typesupport has no fetch accessor for std::vector<bool>: its \
+                             generator emits no fetch or assign function and leaves get and \
+                             get_const null, so no element is reachable";
+
+/// Substring unique to the loud arm of the LOAN-refusal reporter, whose
+/// absence proves the loaned take put its shadow back instead of retiring
+/// it or leaking it.
+const LOAN_REFUSED: &str = "loaned take refused";
+
+/// Read a service server's decode-failure counter.
+///
+/// # Safety
+/// `service` must be a live service created by this implementation.
+unsafe fn service_decode_failure_count(service: *const ffi::rmw_service_t) -> u64 {
+    let data = &*((*service).data as *const rmw_cerulion::runtime::ServiceData);
+    data.decode_failures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .total_failures()
+}
+
+/// The one loud refusal line, with its `reason=` value checked against the
+/// hand oracle and its `var_idx=` against the top-level entry the member
+/// rides in.
+fn assert_one_refusal_naming(lines: &[&str], var_idx: usize) -> Result<(), String> {
+    let heads = count_at_exclusively(lines, "ERROR", &[ENTRY_REFUSED_LOUD])?;
+    if heads != 1 {
+        return Err(format!("expected exactly ONE loud refusal, got {heads}"));
+    }
+    let head = lines
+        .iter()
+        .find(|l| l.contains(ENTRY_REFUSED_LOUD))
+        .ok_or_else(|| "the loud refusal line is missing".to_string())?;
+    let reason = field_value_before(head, "reason", "total_failures")
+        .ok_or_else(|| format!("the refusal carries no reason= field: {head}"))?;
+    if reason != NESTED_REASON {
+        return Err(format!(
+            "the reason= value is not the one the user must read:\n  got:  {reason}\n  want: \
+             {NESTED_REASON}"
+        ));
+    }
+    if !head.contains(&format!("var_idx={var_idx}")) {
+        return Err(format!("the refusal must name WHICH entry: {head}"));
+    }
+    Ok(())
+}
+
+/// The COPYING subscription take refuses a frame whose unwritable `bool[]`
+/// is one level down, before writing anything.
+///
+/// Registration used to census the top-level members only, so this member
+/// was not in the record: the take started decoding, `unflatten` recursed
+/// into the nested body, resized the nested sequence and only then hit the
+/// missing accessor, leaving the caller's message part new and part old on
+/// a call that reports nothing taken.
+///
+/// Oracles, all hand-written here: the WHOLE `reason=` value including the
+/// PATH ([`NESTED_REASON`]); the side effect that must not have happened,
+/// the destination byte-identical to the poison it went in with and `taken`
+/// false; and the latch, one loud line for two frames with the
+/// unconditional counter at two.
+#[test]
+#[serial]
+#[traced_test]
+fn a_nested_bool_member_this_build_cannot_write_is_refused_with_its_path() {
+    const FRAMES: u64 = 2;
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = cpp_nested_bool_seq_ts(&format!("NestedUnwritable{suffix}"));
+        let (_, node, _opts) = setup_node(&format!("node_{suffix}"));
+        let topic = CString::new(format!("/rmw_mismatch/nested/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+
+        // Registration SUCCEEDS: the limit is per message, never per build.
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!subscription.is_null());
+        assert_eq!(decode_failure_count(subscription), 0);
+        let cer_topic = cerulion_topic(subscription);
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        let msl = cerulion_core::wire::MaxSliceLen::try_new(4096).expect("slice len");
+        let mut raw_pub = rt
+            .transport
+            .create_publisher_simple(&cer_topic, msl)
+            .expect("raw publisher on the subscription's topic");
+
+        let expected = expected_schema_hash(subscription);
+        // The caller's message, poisoned. The outer type holds one member at
+        // offset 0 and that member holds one, so the whole struct IS the
+        // nested bit-packed container.
+        let poison = FakeVecBool {
+            bits: 0xA5A5_A5A5_A5A5_A5A5u64 as *mut u8,
+            len: 0xA5A5_A5A5_A5A5_A5A5,
+        };
+        for i in 0..FRAMES {
+            raw_pub
+                .publish_raw(&raw_frame(expected, i as u32, 16))
+                .expect("publish the hand frame");
+            let mut out = FakeVecBool {
+                bits: poison.bits,
+                len: poison.len,
+            };
+            let mut taken = true;
+            assert_eq!(
+                rmw_take(
+                    subscription,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK,
+                "frame {i}: an undecodable member is a DROP, not a take failure"
+            );
+            assert!(
+                !taken,
+                "frame {i}: nothing was written, so nothing was taken"
+            );
+            assert_eq!(
+                out.bits as usize, poison.bits as usize,
+                "frame {i}: the refusal must not write the nested container's data pointer"
+            );
+            assert_eq!(
+                out.len, poison.len,
+                "frame {i}: nor its length, no resize, no assign, nothing"
+            );
+        }
+        assert_eq!(
+            decode_failure_count(subscription),
+            FRAMES,
+            "the counter is UNCONDITIONAL: it moves on the suppressed repeat too"
+        );
+        // `inner` is the first and only variable member, so the entry the
+        // refusal names is 0.
+        logs_assert(|lines: &[&str]| assert_one_refusal_naming(lines, 0));
+
+        drop(raw_pub);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// The LOANED take refuses the same frame before forging, and puts its
+/// shadow back.
+///
+/// This path writes into an rmw-owned shadow rather than the caller's
+/// message, so the partial write is not the caller's problem; what it
+/// reported instead was the generic malformed-entry line, which blames the
+/// WIRE for a limit of this build and sends an operator to redeploy both
+/// ends, and it retired a shadow per frame.
+///
+/// Oracles: the same hand-written `reason=` value, the entry index of the
+/// top-level member the nested one rides in (`data` is entry 0, `inner` is
+/// entry 1), the loaned pointer still NULL, and the absence of any
+/// loan-refusal line, which is what a retired or leaked shadow would
+/// eventually produce.
+#[test]
+#[serial]
+#[traced_test]
+fn the_loaned_take_refuses_a_nested_unwritable_member_and_keeps_its_shadow() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = cpp_loanable_nested_bool_ts(&format!("LoanNested{suffix}"));
+        let (_, node, _opts) = setup_node(&format!("node_{suffix}"));
+        let topic = CString::new(format!("/rmw_mismatch/nested_loan/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!subscription.is_null());
+        let cer_topic = cerulion_topic(subscription);
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        let msl = cerulion_core::wire::MaxSliceLen::try_new(4096).expect("slice len");
+        let mut raw_pub = rt
+            .transport
+            .create_publisher_simple(&cer_topic, msl)
+            .expect("raw publisher on the subscription's topic");
+        let expected = expected_schema_hash(subscription);
+        raw_pub
+            .publish_raw(&raw_frame(expected, 0, 32))
+            .expect("publish the hand frame");
+
+        let mut loaned: *mut c_void = std::ptr::null_mut();
+        let mut taken = true;
+        let ret =
+            rmw_take_loaned_message(subscription, &mut loaned, &mut taken, std::ptr::null_mut());
+        assert_ne!(
+            ret,
+            ffi::RMW_RET_UNSUPPORTED,
+            "the fixture must be served by the loaned take: its uint8[] member is forgeable, so \
+             can_loan_take holds"
+        );
+        assert_eq!(ret, RMW_RET_OK, "an undecodable member is a DROP");
+        assert!(!taken, "nothing was forged, so nothing was taken");
+        assert!(loaned.is_null(), "a refused loan hands out no pointer");
+        assert_eq!(decode_failure_count(subscription), 1);
+        logs_assert(|lines: &[&str]| {
+            assert_one_refusal_naming(lines, 1)?;
+            if lines.iter().any(|l| l.contains(LOAN_REFUSED)) {
+                return Err(
+                    "the shadow must go back to the pool UNUSED: no loan refusal belongs here"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        });
+
+        drop(raw_pub);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// A SERVICE server on such a request type refuses it before writing
+/// anything into the caller's request message.
+///
+/// The producer is a real client on the C typesupport, which writes a
+/// `bool[]` as plain bytes and needs no accessor: exactly the pair a user
+/// hits, an rclpy or C node calling a C++ server on a build before Humble.
+/// The two typesupports carry the same package, type names, member names
+/// and field types, so they agree on the wire schema hash and the frame
+/// reaches the server's take.
+///
+/// Oracles: the same hand-written `reason=` value; the request message
+/// byte-identical to its poison with `taken` false; and the refusal logged
+/// under `service=` with the server's own counter at one.
+#[test]
+#[serial]
+#[traced_test]
+fn a_service_request_with_a_nested_unwritable_member_is_refused_before_any_write() {
+    unsafe {
+        let suffix = unique_suffix();
+        let unique = format!("NestedSvc{suffix}");
+        let (_, node, _opts) = setup_node(&format!("svc_node_{suffix}"));
+        let service_name =
+            CString::new(format!("/rmw_mismatch/nested_svc/{suffix}")).expect("name");
+        let qos = default_qos();
+
+        let service = rmw_create_service(
+            node,
+            cpp_nested_service_ts(&unique),
+            service_name.as_ptr(),
+            &qos,
+        );
+        assert!(!service.is_null(), "service creation failed");
+        let client = rmw_create_client(
+            node,
+            c_nested_service_ts(&unique),
+            service_name.as_ptr(),
+            &qos,
+        );
+        assert!(!client.is_null(), "client creation failed");
+        let mut available = false;
+        assert_eq!(
+            rmw_service_server_is_available(node, client, &mut available),
+            RMW_RET_OK
+        );
+        assert!(available, "server must be visible to the client");
+
+        #[repr(C)]
+        struct CNestedRequest {
+            flags: CBoolSeq,
+        }
+        #[repr(C)]
+        struct CRequest {
+            inner: CNestedRequest,
+        }
+        let mut bools = [true, false, true];
+        let request = CRequest {
+            inner: CNestedRequest {
+                flags: CBoolSeq {
+                    data: bools.as_mut_ptr(),
+                    size: bools.len(),
+                    capacity: bools.len(),
+                },
+            },
+        };
+        let mut sequence_id: i64 = 0;
+        assert_eq!(
+            rmw_send_request(
+                client,
+                &request as *const _ as *const c_void,
+                &mut sequence_id
+            ),
+            RMW_RET_OK,
+            "the C bridge writes a bool[] as bytes, so the client can send it"
+        );
+        assert_eq!(sequence_id, 1);
+
+        let poison = FakeVecBool {
+            bits: 0xA5A5_A5A5_A5A5_A5A5u64 as *mut u8,
+            len: 0xA5A5_A5A5_A5A5_A5A5,
+        };
+        let mut out = FakeVecBool {
+            bits: poison.bits,
+            len: poison.len,
+        };
+        let mut header: ffi::rmw_service_info_t = std::mem::zeroed();
+        let mut taken = true;
+        assert_eq!(
+            rmw_take_request(
+                service,
+                &mut header,
+                &mut out as *mut _ as *mut c_void,
+                &mut taken
+            ),
+            RMW_RET_OK,
+            "an undecodable member is a DROP, not a take failure"
+        );
+        assert!(!taken, "nothing was written, so nothing was taken");
+        assert_eq!(
+            out.bits as usize, poison.bits as usize,
+            "the refusal must not write the nested container's data pointer"
+        );
+        assert_eq!(out.len, poison.len, "nor its length");
+        assert_eq!(
+            service_decode_failure_count(service),
+            1,
+            "the request reached the server and was counted, so the schemas agree"
+        );
+        let want_service = format!("service=/rmw_mismatch/nested_svc/{suffix}");
+        logs_assert(move |lines: &[&str]| {
+            assert_one_refusal_naming(lines, 0)?;
+            let head = lines
+                .iter()
+                .find(|l| l.contains(ENTRY_REFUSED_LOUD))
+                .ok_or_else(|| "the loud refusal line is missing".to_string())?;
+            if !head.contains(&want_service) {
+                return Err(format!("the refusal must log under `service=`: {head}"));
+            }
+            Ok(())
+        });
+
+        assert_eq!(rmw_destroy_client(node, client), RMW_RET_OK);
+        assert_eq!(rmw_destroy_service(node, service), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// `rmw_deserialize` refuses the buffer before writing anything.
+///
+/// It decodes into a CALLER-owned message exactly as a take does, with no
+/// entity to hang a latch on, so it answers a bare error code; before the
+/// refusal it answered that code over a message the caller had to treat as
+/// garbage. This is also the pin the crate's notes ask for on any change to
+/// this function.
+///
+/// Oracles: the hand-written `reason=` value, the caller's message
+/// byte-identical to its poison, and `RMW_RET_ERROR`. No node and no
+/// transport: this entry point owns nothing.
+#[test]
+#[serial]
+#[traced_test]
+fn rmw_deserialize_refuses_a_nested_unwritable_member_before_any_write() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = cpp_nested_bool_seq_ts(&format!("Deser{suffix}"));
+        // The schema hash in the header is never read: the refusal is taken
+        // before the bridge looks at one byte of the buffer.
+        let frame = raw_frame(0, 0, 16);
+        let mut input: ffi::rmw_serialized_message_t = std::mem::zeroed();
+        input.buffer = frame.as_ptr() as *mut u8;
+        input.buffer_length = frame.len();
+        input.buffer_capacity = frame.len();
+
+        let poison = FakeVecBool {
+            bits: 0xA5A5_A5A5_A5A5_A5A5u64 as *mut u8,
+            len: 0xA5A5_A5A5_A5A5_A5A5,
+        };
+        let mut out = FakeVecBool {
+            bits: poison.bits,
+            len: poison.len,
+        };
+        assert_eq!(
+            rmw_deserialize(&input, ts, &mut out as *mut _ as *mut c_void),
+            ffi::RMW_RET_ERROR
+        );
+        assert_eq!(out.bits as usize, poison.bits as usize);
+        assert_eq!(out.len, poison.len);
+        logs_assert(|lines: &[&str]| {
+            let head = lines
+                .iter()
+                .find(|l| l.contains(DESERIALIZE_REFUSED))
+                .ok_or_else(|| "rmw_deserialize logged no refusal".to_string())?;
+            let reason = field_value_before(head, "reason", "type")
+                .ok_or_else(|| format!("the refusal carries no reason= field: {head}"))?;
+            if reason != NESTED_REASON {
+                return Err(format!(
+                    "the reason= value is not the one the user must read:\n  got:  {reason}\n  \
+                     want: {NESTED_REASON}"
+                ));
+            }
+            Ok(())
+        });
     }
 }

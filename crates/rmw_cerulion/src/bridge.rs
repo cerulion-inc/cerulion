@@ -380,7 +380,8 @@ impl AnyBridge {
     }
 
     /// The first `bool[]` member this build cannot write, as
-    /// `(var_idx, member name)`; see
+    /// `(var_idx, member path)` over the whole type, nested members
+    /// included; see
     /// [`crate::type_bridge_cpp::CppBridgedMessage::unwritable_bool_seq`].
     /// Always `None` on the C arm: the C introspection path reads and writes
     /// a `bool[]` as plain bytes through the rosidl sequence struct and needs
