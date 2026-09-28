@@ -1768,6 +1768,7 @@ jobs:
       # Touches the iceoryx2 singleton — serial. Shard 3 after the
       # rebalance (see the map above); it runs BEFORE that shard's pre-wan
       # reclaim, which prunes its test executables.
+      # doc-pin: rmw_cerulion::rmw_absent_export_table_test reads tools
       - name: rmw_cerulion tests (serial)
         if: matrix.shard == 3
         # The runner has no ROS: a build that silently fell back to (or

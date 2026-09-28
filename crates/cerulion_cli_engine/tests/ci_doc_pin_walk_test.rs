@@ -323,6 +323,14 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &["tools"],
         &[],
     ),
+    // The per-distro gate table, joined onto the repository root: the test
+    // parses its rows and holds the absent-export derivation to them.
+    (
+        "rmw_cerulion",
+        "rmw_absent_export_table_test",
+        &["tools"],
+        &[],
+    ),
 ];
 
 fn repo_root() -> PathBuf {
