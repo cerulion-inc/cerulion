@@ -11,12 +11,12 @@ stage `RMW_IMPLEMENTATION`.
 - No `Box<dyn>`/`Arc<dyn>` across the cdylib seam - dispatch via `AnyBridge`.
 - Lock entity mutexes with `runtime::lock_unpoisoned` (poison wedges the entity - torn SHM bookkeeping risks use-after-free); `unsafe impl Send` newtypes hold under theirs.
 - Reject hostile/over-bound counts BEFORE any resize/alloc in a codec.
-- NEVER write a destination the build cannot fill: takes and `rmw_deserialize` read the nested-aware census first (`rmw_schema_mismatch_test`).
+- NEVER write a destination the build cannot fill: takes and `rmw_deserialize` read the nested census first (`rmw_schema_mismatch_test`).
 - Failure paths: unconditional counters + flood-latched logs + decade re-announcements.
 - ROS names are Cerulion names VERBATIM (`/chatter` ⇔ `/chatter/data`; relative refused, no alias); every publisher registers for egress (best-effort), never unregisters.
 - Windowed borrows: NEVER link `cerulion_heaphook` (2nd malloc interposer); dlsym per-symbol (`src/heaphook.rs`). Only a thread's FIRST borrow owns its window; a loan finished on the WRONG thread copies + HOLDS its slot till that thread borrows again (destroy/poisoned LEAKS slot + `PublisherData`: freeing it wedges the dead-node sweep); quarantine retires at slot REUSE, never publish. Every degrade = the copy path, never a failed publish.
 - NEVER export an entry point whose types a distro's headers lack: cfg the `extern "C"` fn out WHOLE, never stub it (`rmw_absent_export_table_test`, lane `nm` audit).
-- NEVER strip `ROS_DISTRO` around a fixture: a post-Jazzy `.so` refuses it (`every_ros_distro_strip_is_declared`).
+- NEVER strip `ROS_DISTRO` around a fixture: a Kilted-and-later `.so` refuses it (`every_ros_distro_strip_is_declared`).
 
 ## Testing
 

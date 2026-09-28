@@ -954,8 +954,10 @@ pub const UNSET_DISTRO_REFUSAL: &str = concat!(
 /// Pure unset-distro classifier (oracle-testable, no env access).
 ///
 /// `Some(refusal)` exactly when the runtime names NO distro and the baked
-/// claim is a generated one whose era is at or past
-/// [`crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA`]. Three claims pass
+/// claim is a generated one the size-aware
+/// [`crate::era_check::refuses_unnamed_runtime`] predicate refuses: the
+/// distros `{kilted, lyrical, rolling}`, an era past Jazzy or the Jazzy era
+/// with Kilted's 160-byte init-options layout. Three claims pass
 /// deliberately:
 /// - the VENDORED snapshot's unclaimed marker, whose whole purpose is a
 ///   development machine with no ROS environment (its C++ arm already
@@ -983,14 +985,21 @@ pub fn classify_unset_distro(baked: &str, runtime: Option<&str>) -> Option<Unset
     if baked.is_empty() || baked == VENDORED_DEV_DISTRO {
         return None;
     }
-    let (rank, remedy_distro) = match baked.strip_prefix(crate::era_check::ERA_CLAIM_PREFIX) {
-        Some(token) => (
-            crate::era_check::era_claim_token_rank(token)?,
-            (*crate::era_check::era_claim_members(token)?.first()?).to_string(),
-        ),
-        None => (crate::era_check::distro_era_rank(&baked)?, baked.clone()),
+    // Resolve the claim to a CONCRETE distro name: a literal claim names
+    // itself, an `era:<token>` label yields the first member of its era
+    // (the representative concrete distro a shell can source). The concrete
+    // name is what the size-aware predicate reads, and what the remedy
+    // renders; an unknown literal has no era and admits.
+    let remedy_distro = match baked.strip_prefix(crate::era_check::ERA_CLAIM_PREFIX) {
+        Some(token) => (*crate::era_check::era_claim_members(token)?.first()?).to_string(),
+        None => {
+            crate::era_check::distro_era_rank(&baked)?;
+            baked.clone()
+        }
     };
-    if rank < crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA {
+    // The product predicate: refuse EXACTLY {kilted, lyrical, rolling} (an
+    // era past Jazzy, or the Jazzy era with a non-Jazzy 160-byte layout).
+    if !crate::era_check::refuses_unnamed_runtime(&remedy_distro) {
         return None;
     }
     Some(UnsetDistroRefusal {
@@ -1651,168 +1660,178 @@ mod tests {
     "the distro this process runs.",
     );
 
-    /// The claim shapes build.rs can bake for a GENERATED build of a given
-    /// era rank, derived from the era tables rather than typed: the
-    /// concrete members of that era, plus the `era:<token>` label where the
-    /// era has one. Nothing here is a literal distro name, so extending
-    /// `DISTRO_ERAS` extends the matrix instead of leaving a gap.
-    fn generated_claims_at_rank(rank: usize) -> Vec<String> {
-        let mut claims: Vec<String> = crate::era_check::DISTRO_ERAS
+    #[test]
+    fn an_unnamed_runtime_refuses_exactly_kilted_lyrical_rolling() {
+        // The refused set, EXACTLY: a generated build baked for kilted,
+        // lyrical or rolling refuses an unnamed runtime; jazzy and every
+        // earlier distro (iron, humble, galactic, foxy) admit. The set is
+        // READ from the product predicate over every distro the era table
+        // knows, never typed here.
+        use std::collections::BTreeSet;
+        let want = BTreeSet::from(["kilted", "lyrical", "rolling"]);
+        let refusing: BTreeSet<&str> = crate::era_check::DISTRO_ERAS
             .iter()
-            .filter(|(_, r)| *r == rank)
-            .map(|(name, _)| (*name).to_string())
+            .map(|(name, _)| *name)
+            .filter(|name| crate::era_check::refuses_unnamed_runtime(name))
             .collect();
-        for (token, _) in crate::era_check::ERA_CLAIM_ADMITTED_MEMBERS {
-            if crate::era_check::era_claim_token_rank(token) == Some(rank) {
-                claims.push(format!("{}{token}", crate::era_check::ERA_CLAIM_PREFIX));
-            }
-        }
-        assert!(!claims.is_empty(), "no claim shape for era rank {rank}");
-        claims
-    }
-
-    #[test]
-    fn an_unnamed_runtime_refuses_at_the_boundary_era_and_admits_one_below_it() {
-        // BOTH SIDES of the bound, and the bound itself comes from the
-        // constant: the FIRST refusing era refuses every claim shape, the
-        // era one rank BELOW it admits every claim shape, and the fixtures
-        // are computed from the era tables rather than typed.
-        let refuse_from = crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA;
-        let admit_at = refuse_from
-            .checked_sub(1)
-            .expect("the refusing era has a rank below it");
+        assert_eq!(
+            refusing, want,
+            "the unset-distro refusing set must be exactly kilted, lyrical, rolling"
+        );
+        // Kilted and Jazzy share an era RANK, so the set cannot be a rank
+        // cut: only the init-options size (160 vs 168) separates them.
+        assert_eq!(
+            crate::era_check::distro_era_rank("kilted"),
+            crate::era_check::distro_era_rank("jazzy"),
+            "kilted and jazzy share a rank; the refusing set is not a bare rank cut"
+        );
+        // Through the REAL classifier, over every claim shape and every
+        // spelling of an unnamed runtime.
         for runtime in [None, Some(""), Some("   ")] {
-            for claim in generated_claims_at_rank(refuse_from) {
-                let refusal = classify_unset_distro(&claim, runtime).unwrap_or_else(|| {
-                    panic!("`{claim}` must refuse an unnamed runtime {runtime:?}")
-                });
-                // The WHOLE value, not a field of it: the baked claim as
-                // baked, the variable that was not set, and a remedy distro
-                // that is a real name the era tables know.
-                assert_eq!(refusal.baked(), claim, "{claim}");
-                assert_eq!(refusal.variable(), RUNTIME_DISTRO_ENV, "{claim}");
+            for (distro, _) in crate::era_check::DISTRO_ERAS {
                 assert_eq!(
-                    crate::era_check::distro_era_rank(refusal.remedy_distro()),
-                    Some(refuse_from),
-                    "`{claim}` must name a real distro of its own era in the remedy, got `{}`",
-                    refusal.remedy_distro()
-                );
-                assert_eq!(
-                    refusal.remedy(),
-                    format!("source /opt/ros/{}/setup.bash", refusal.remedy_distro()),
-                    "{claim}"
+                    classify_unset_distro(distro, runtime).is_some(),
+                    refusing.contains(distro),
+                    "literal `{distro}` runtime {runtime:?}"
                 );
             }
-            for claim in generated_claims_at_rank(admit_at) {
+            // An `era:<token>` label resolves to its representative concrete
+            // distro and follows that distro's verdict.
+            for (token, members) in crate::era_check::ERA_CLAIM_ADMITTED_MEMBERS {
+                let claim = format!("{}{token}", crate::era_check::ERA_CLAIM_PREFIX);
+                let representative = members.first().copied().expect("a token names a member");
                 assert_eq!(
-                    classify_unset_distro(&claim, runtime),
-                    None,
-                    "`{claim}` is one era below the bound and must admit an unnamed runtime"
+                    classify_unset_distro(&claim, runtime).is_some(),
+                    refusing.contains(representative),
+                    "`{claim}` (representative `{representative}`) runtime {runtime:?}"
                 );
             }
         }
-        // Every era at or above the bound refuses; every era below it
-        // admits. The loop is the closed statement the two arms above
-        // sample.
-        for rank in crate::era_check::ERA_FOXY..=crate::era_check::ERA_LYRICAL {
-            for claim in generated_claims_at_rank(rank) {
-                assert_eq!(
-                    classify_unset_distro(&claim, None).is_some(),
-                    rank >= refuse_from,
-                    "era rank {rank}, claim `{claim}`"
-                );
-            }
-        }
-    }
-
-    /// The introspection `MessageMember` stride per era, in bytes, TYPED
-    /// HERE from the upstream layouts `ffi/era_pins.rs` pins at compile time:
-    /// 96 before `fetch_function` (Foxy, Galactic), 112 once it arrives and
-    /// still 112 when `is_key_` takes a padding byte (Humble, Iron, Jazzy),
-    /// 120 when `is_rosidl_buffer_` is appended (Lyrical, Rolling). Indexed
-    /// by era rank, so the table and the rank constants are the same length.
-    const MEMBER_STRIDE_BY_ERA: [(usize, usize); 6] = [
-        (crate::era_check::ERA_FOXY, 96),
-        (crate::era_check::ERA_GALACTIC, 96),
-        (crate::era_check::ERA_HUMBLE, 112),
-        (crate::era_check::ERA_IRON, 112),
-        (crate::era_check::ERA_JAZZY, 112),
-        (crate::era_check::ERA_LYRICAL, 120),
-    ];
-
-    /// The stride the refusal paragraph names as the one that grew.
-    const GREW_TO_STRIDE: usize = 120;
-
-    /// The stride the paragraph names as the one it grew FROM.
-    const GREW_FROM_STRIDE: usize = 112;
-
-    #[test]
-    fn the_unset_distro_bound_is_the_era_whose_member_stride_is_120() {
-        // The SECOND DERIVATION of the bound, and the one that can disagree
-        // with it. The refusal exists because the introspection
-        // MessageMember stride went from 112 bytes to 120, so the first
-        // refusing era is the first era whose stride is 120, read from a
-        // byte-count table typed in this module, never from
-        // `UNSET_DISTRO_REFUSED_FROM_ERA` or from any era name it is defined
-        // as. The product keeps ONE source of the bound; this is the
-        // independent reading of it.
-        let first_grown = MEMBER_STRIDE_BY_ERA
-            .iter()
-            .find(|(_, stride)| *stride == GREW_TO_STRIDE)
-            .map(|(rank, _)| *rank)
-            .expect("no era in the stride table carries the grown stride");
-        assert_eq!(
-            crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA,
-            first_grown,
-            "the unset-distro bound is era rank {} but the first era whose MessageMember stride \
-             is {GREW_TO_STRIDE} bytes is rank {first_grown}. If upstream appended a field in a \
-             NEW era, move MEMBER_STRIDE_BY_ERA here and the pins in ffi/era_pins.rs; if the \
-             product bound moved on purpose, move era_check::UNSET_DISTRO_REFUSED_FROM_ERA. The \
-             two must name one era.",
-            crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA
-        );
-
-        // BOTH SIDES of the byte limit the paragraph rests on: the bound's
-        // own era carries the grown stride, the era one rank below carries
-        // the stride it grew from, and no earlier era carries the grown one
-        // (the bound is the FIRST, not merely one of them).
-        let stride_of = |rank: usize| {
-            MEMBER_STRIDE_BY_ERA
-                .iter()
-                .find(|(r, _)| *r == rank)
-                .map(|(_, stride)| *stride)
-                .unwrap_or_else(|| panic!("the stride table has no era rank {rank}"))
-        };
-        let bound = crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA;
-        assert_eq!(stride_of(bound), GREW_TO_STRIDE, "at the bound");
-        assert_eq!(
-            stride_of(bound - 1),
-            GREW_FROM_STRIDE,
-            "one era below the bound"
-        );
-        for (rank, stride) in MEMBER_STRIDE_BY_ERA {
+        // The WHOLE refusal for each refusing distro: baked as baked, the
+        // variable unset, and a remedy naming a real distro (Kilted included).
+        for distro in ["kilted", "lyrical", "rolling"] {
+            let refusal = classify_unset_distro(distro, None)
+                .unwrap_or_else(|| panic!("`{distro}` must refuse an unnamed runtime"));
+            assert_eq!(refusal.baked(), distro, "{distro}");
+            assert_eq!(refusal.variable(), RUNTIME_DISTRO_ENV, "{distro}");
             assert_eq!(
-                stride == GREW_TO_STRIDE,
-                rank >= bound,
-                "era rank {rank} carries stride {stride}"
+                refusal.remedy(),
+                format!("source /opt/ros/{distro}/setup.bash"),
+                "{distro}"
             );
         }
+    }
 
-        // And the typed table is not free-floating: for the era THIS build
-        // compiles against, its entry equals the real struct's size, the same
-        // number `ffi/era_pins.rs` asserts at compile time. A table typed
-        // wrongly fails here wherever that era is built.
-        let own_rank = match c_introspection_era() {
-            CIntrospectionEra::PreGalactic => crate::era_check::ERA_FOXY,
-            CIntrospectionEra::PreJazzy => crate::era_check::ERA_HUMBLE,
-            CIntrospectionEra::Jazzy => crate::era_check::ERA_JAZZY,
-            CIntrospectionEra::PostJazzy => crate::era_check::ERA_LYRICAL,
-        };
+    /// The `rmw_init_options_t` size each distro lays out, in bytes, TYPED
+    /// HERE from the LP64 arithmetic `ffi/era_pins.rs` pins: pre-Iron 104
+    /// (Foxy, Galactic, Humble), iron-jazzy 168 (Iron, Jazzy), and the
+    /// kilted-and-later 160 that dropped `localhost_only` (Kilted, Lyrical,
+    /// Rolling). Indexed by distro, because the size is what separates
+    /// Kilted from Jazzy at their shared era rank.
+    const INIT_OPTIONS_SIZE_BY_DISTRO: [(&str, usize); 8] = [
+        ("foxy", 104),
+        ("galactic", 104),
+        ("humble", 104),
+        ("iron", 168),
+        ("jazzy", 168),
+        ("kilted", 160),
+        ("lyrical", 160),
+        ("rolling", 160),
+    ];
+
+    /// The kilted-and-later layout, the one the refusal rests on.
+    const KILTED_AND_LATER_INIT_OPTIONS_SIZE: usize = 160;
+
+    #[test]
+    fn the_unset_distro_refusing_set_is_the_160_byte_init_options_layout() {
+        // DERIVATION 2, independent of the product and able to disagree with
+        // it. The refusing set is the distros whose `rmw_init_options_t` is
+        // the kilted-and-later 160-byte layout, read from the size table
+        // typed above (the `ffi/era_pins.rs` arithmetic), never from
+        // era_check's rank or its `CLAIM_INIT_OPTIONS_SIZE`. Member stride is
+        // NOT used: it is 112 for both Jazzy and Kilted, so it cannot carry
+        // Kilted; only the init-options size does.
+        use std::collections::BTreeSet;
+        let want = BTreeSet::from(["kilted", "lyrical", "rolling"]);
+        let by_size: BTreeSet<&str> = INIT_OPTIONS_SIZE_BY_DISTRO
+            .iter()
+            .filter(|(_, size)| *size == KILTED_AND_LATER_INIT_OPTIONS_SIZE)
+            .map(|(name, _)| *name)
+            .collect();
+        // DERIVATION 1, the product predicate over the same distros.
+        let by_predicate: BTreeSet<&str> = crate::era_check::DISTRO_ERAS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| crate::era_check::refuses_unnamed_runtime(name))
+            .collect();
         assert_eq!(
-            stride_of(own_rank),
-            std::mem::size_of::<crate::ffi::rosidl_typesupport_introspection_c__MessageMember>(),
-            "the stride typed for era rank {own_rank} is not what this build's MessageMember \
-             really lays out; the table above is wrong, or the bindings are mixed-era"
+            by_size, want,
+            "the 160-byte init-options layout is not {{kilted, lyrical, rolling}}; the size table \
+             here or the era_pins pins moved"
+        );
+        assert_eq!(
+            by_predicate, want,
+            "era_check::refuses_unnamed_runtime is not {{kilted, lyrical, rolling}}; DISTRO_ERAS \
+             or CLAIM_INIT_OPTIONS_SIZE moved"
+        );
+        // The two must AGREE; on a disagreement the message names which side
+        // moved so the fix is unambiguous.
+        assert_eq!(
+            by_size, by_predicate,
+            "the two derivations disagree: the era_pins size table gives {by_size:?} and the \
+             era_check predicate gives {by_predicate:?}; reconcile era_pins (this table) with \
+             era_check (rank + init-options size)"
+        );
+
+        // BOTH SIDES of the byte limit: the 160-byte layout refuses, the
+        // 168-byte one admits. Kilted (160) refuses and Jazzy (168) admits
+        // at the SAME era rank, which is the whole point of the size split.
+        for (distro, size) in INIT_OPTIONS_SIZE_BY_DISTRO {
+            assert_eq!(
+                crate::era_check::refuses_unnamed_runtime(distro),
+                size == KILTED_AND_LATER_INIT_OPTIONS_SIZE,
+                "`{distro}` lays out {size} bytes"
+            );
+        }
+        assert!(
+            crate::era_check::refuses_unnamed_runtime("kilted"),
+            "kilted (160) refuses"
+        );
+        assert!(
+            !crate::era_check::refuses_unnamed_runtime("jazzy"),
+            "jazzy (168) admits at the same rank"
+        );
+
+        // The typed table is not free-floating. For the jazzy/kilted pair
+        // `era_pins.rs` exposes a size, the typed size must equal it (a
+        // second source than era_check's own `CLAIM_INIT_OPTIONS_SIZE`).
+        let size_for = |distro: &str| {
+            INIT_OPTIONS_SIZE_BY_DISTRO
+                .iter()
+                .find(|(d, _)| *d == distro)
+                .map(|(_, size)| *size)
+                .unwrap_or_else(|| panic!("the size table has no distro `{distro}`"))
+        };
+        for distro in ["iron", "jazzy", "kilted"] {
+            assert_eq!(
+                crate::ffi::era_pins::init_options_size_for_claim(distro),
+                Some(size_for(distro)),
+                "era_pins and the typed table disagree on `{distro}`'s init-options size"
+            );
+        }
+        // And for the era THIS build compiles against, where a cfg makes the
+        // size unambiguous, the typed size equals the real struct.
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        assert_eq!(
+            std::mem::size_of::<crate::ffi::rmw_init_options_t>(),
+            KILTED_AND_LATER_INIT_OPTIONS_SIZE,
+            "a Lyrical/Rolling build must lay out the 160-byte init options"
+        );
+        #[cfg(not(cerulion_has_discovery_options))]
+        assert_eq!(
+            std::mem::size_of::<crate::ffi::rmw_init_options_t>(),
+            104,
+            "a pre-Iron build must lay out the 104-byte init options"
         );
     }
 
@@ -1845,10 +1864,17 @@ mod tests {
         // admitted, contradicting or unknown, is the mismatch
         // classifier's business, so `classify_load_refusal` can ask them in
         // either order.
-        for claim in generated_claims_at_rank(crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA) {
-            for runtime in ["lyrical", "rolling", "jazzy", "m_next", " Rolling "] {
+        for claim in ["kilted", "lyrical", "rolling", "era:lyrical"] {
+            for runtime in [
+                "lyrical",
+                "rolling",
+                "kilted",
+                "jazzy",
+                "m_next",
+                " Rolling ",
+            ] {
                 assert_eq!(
-                    classify_unset_distro(&claim, Some(runtime)),
+                    classify_unset_distro(claim, Some(runtime)),
                     None,
                     "claim `{claim}` runtime `{runtime}`"
                 );
@@ -1889,9 +1915,20 @@ mod tests {
                 remedy_distro: "lyrical".to_string(),
             }))
         );
+        // Kilted refuses an unnamed runtime although it shares Jazzy's era
+        // rank; Jazzy at the same rank admits, the size splitting the two.
+        assert_eq!(
+            classify_load_refusal("kilted", None),
+            Some(LoadRefusal::UnsetDistro(UnsetDistroRefusal {
+                baked: "kilted".to_string(),
+                variable: "ROS_DISTRO",
+                remedy_distro: "kilted".to_string(),
+            }))
+        );
         let claim = "lyrical";
         assert_eq!(classify_load_refusal(claim, Some("rolling")), None);
         assert_eq!(classify_load_refusal("jazzy", None), None);
+        assert_eq!(classify_load_refusal("iron", None), None);
         assert_eq!(classify_load_refusal(VENDORED_DEV_DISTRO, None), None);
     }
 

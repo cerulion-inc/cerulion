@@ -279,16 +279,20 @@ build.rs layers three era probes on top of the source selection:
   `rmw_init` refuses, loudly, naming both sides, when the baked distro contradicts
   the runtime `ROS_DISTRO`, turning the "wrong-distro `.so` dlopens fine, SIGSEGVs at
   the first typed operation" class into a one-line
-  refusal. An absent `ROS_DISTRO` passes for a Jazzy-era or earlier claim (the environment
-  makes no claim to contradict) and REFUSES for a GENERATED claim of a later era
-  (`classify_unset_distro`, the second arm of the one load-time verdict `classify_load_refusal`):
-  from Lyrical on the introspection `MessageMember` carries `is_rosidl_buffer_` and its stride is
-  120 bytes against Jazzy's 112, so a process that never said which distro it is would have its
-  member array walked at this build's stride and die at the first typed operation, and an
-  environment that names nothing is no evidence to the contrary. The bound is
-  `era_check::UNSET_DISTRO_REFUSED_FROM_ERA`, pinned to the minimum era of the
-  `is_rosidl_buffer` capability rather than restated, so an era that moves the marker moves the
-  bound. The refusal is a structured value (`era::UnsetDistroRefusal`): the baked claim, the
+  refusal. An absent `ROS_DISTRO` passes for a Jazzy or earlier claim (the environment
+  makes no claim to contradict) and REFUSES for a GENERATED claim of Kilted, Lyrical or Rolling
+  (`classify_unset_distro`, the second arm of the one load-time verdict `classify_load_refusal`,
+  which asks the size-aware predicate `era_check::refuses_unnamed_runtime`): these three lay out
+  `rmw_init_options_t` at 160 bytes where Jazzy is 168 (Kilted dropped `localhost_only`), and from
+  Lyrical on the introspection `MessageMember` stride is 120 bytes against Jazzy's 112, so a
+  process that never said which distro it is would have those structs written at this build's
+  offsets and die at the first typed operation, and an environment that names nothing is no
+  evidence to the contrary. The refusing set is exactly `{kilted, lyrical, rolling}` from two
+  inputs: an era at or past `era_check::UNSET_DISTRO_REFUSED_FROM_ERA` (Lyrical, Rolling),
+  or the Jazzy era with a non-Jazzy init-options size (Kilted's 160). It cannot be a bare rank
+  cut, because Kilted shares Jazzy's rank and its 112-byte member stride; only the init-options
+  size separates the two, which is why the predicate reads the size and not the stride. The
+  refusal is a structured value (`era::UnsetDistroRefusal`): the baked claim, the
   variable that was not set, and a remedy naming a REAL distro (`source
   /opt/ros/<distro>/setup.bash`, the distro taken from the claim itself, so an `era:<token>`
   label yields the first concrete member of its era rather than a label no shell can source).
