@@ -3121,3 +3121,288 @@ fn only_the_exact_per_package_selection_form_names_a_package() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// THE OFF SWITCH, AND THE SHAPE OF A STEP-LEVEL SELECTION GATE
+// ---------------------------------------------------------------------------
+
+/// The repository variable that stops the selection with no pull request.
+const SELECTION_SWITCH: &str = "CI_SELECTION";
+
+/// The one line `ci.yml` declares it on, default included.
+///
+/// Held whole rather than by prefix: the DEFAULT is the half that decides what
+/// a repository with no variable does, and a declaration without it reads as an
+/// empty switch, which the classifier treats as "not `on`" and answers by
+/// selecting everything. That is the safe direction and it is also a silent
+/// loss of the whole feature, so the line is pinned.
+const SELECTION_SWITCH_DECLARATION: &str = "  CI_SELECTION: ${{ vars.CI_SELECTION || 'on' }}";
+
+/// The job whose script has to READ the switch, and the step that reads it.
+const SELECTION_SWITCH_READER_STEP: &str = "classify";
+
+/// The prefix every selection skip line carries.
+const SELECTION_MARKER_PREFIX: &str = "selection:";
+
+/// Why this condition is not a legal step-level selection gate, if it is not.
+///
+/// THE RULE. The switch feeds the CLASSIFIER, and the classifier's three
+/// outputs are the only thing a step may be gated on. A step that read the
+/// variable itself would decide from a value the `changes` job never saw: the
+/// classifier could be answering `pkgs` for a narrow selection while the step
+/// reads `off` and runs, or the other way round, and the two would drift the
+/// first time somebody changed one of them. A step gated on some OTHER output
+/// of the classifier job is the same fault spelled differently: the walk has
+/// never seen that output's rules, and `step_if_is_pr_blocking_grounded`
+/// already refuses to credit it, so it would run on no event at all.
+///
+/// Returns `None` for a condition that is not a selection gate (a leg selector,
+/// `always()`, an ordinary event test): those are the coverage walk's business,
+/// not this rule's.
+fn selection_gate_violation(cond: &str) -> Option<String> {
+    if cond.contains(SELECTION_SWITCH) {
+        return Some(format!(
+            "reads the `{SELECTION_SWITCH}` switch directly. The switch feeds \
+             the `{SELECTION_JOB}` job; a step reads the classifier's output, \
+             never the variable"
+        ));
+    }
+    let needle = format!("needs.{SELECTION_JOB}.outputs.");
+    let mut from = 0usize;
+    while let Some(offset) = cond[from..].find(&needle) {
+        let at = from + offset + needle.len();
+        from = at;
+        let name: String = cond[at..]
+            .chars()
+            .take_while(|c| is_name_char(*c))
+            .collect();
+        if ![
+            SELECTION_CODE_OUTPUT,
+            SELECTION_DOCS_OUTPUT,
+            SELECTION_PKGS_OUTPUT,
+        ]
+        .contains(&name.as_str())
+        {
+            return Some(format!(
+                "reads `{needle}{name}`, which is not one of the three outputs \
+                 the switch feeds (`{SELECTION_CODE_OUTPUT}`, \
+                 `{SELECTION_DOCS_OUTPUT}`, `{SELECTION_PKGS_OUTPUT}`)"
+            ));
+        }
+    }
+    None
+}
+
+/// Every workflow's text with comments stripped, keyed by file name.
+///
+/// NOT [`pr_blocking_workflow_texts`]: that one DROPS the gated steps, which is
+/// exactly the population the rules below are about.
+fn workflow_texts() -> BTreeMap<String, String> {
+    let dir = repo_root().join(".github/workflows");
+    let mut out = BTreeMap::new();
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        out.insert(
+            name,
+            raw.lines()
+                .map(strip_yaml_comment)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    assert!(
+        out.len() >= 5,
+        "the workflow walk found only {} file(s) under {}: it is not reaching \
+         the workflows",
+        out.len(),
+        dir.display()
+    );
+    out
+}
+
+/// The `if:` value of one step block, read in every scalar form.
+///
+/// `Err` for a form [`read_scalar_form`] cannot classify, which every caller
+/// turns into a failure: a condition this walk cannot read is not one it may
+/// skip past.
+fn step_if_of(block: &[&str]) -> Result<Option<String>, String> {
+    let Some(first) = block.first() else {
+        return Ok(None);
+    };
+    let step_indent = indent_of(first);
+    for (i, line) in block.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let rest = if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix("if:")
+        } else if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix("if:"))
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            return read_scalar_value("if", rest, block, i, step_indent + 2).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The `name:` of one step block, or `None`.
+fn step_name_of(block: &[&str]) -> Option<String> {
+    let step_indent = indent_of(block.first()?);
+    for line in block {
+        let trimmed = line.trim_start();
+        let rest = if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix("name:"))
+        } else if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix("name:")
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// The switch is declared once, at workflow level, WITH its default, and it
+/// reaches the classifier.
+#[test]
+fn the_selection_switch_is_declared_once_and_read_by_the_classifier() {
+    let texts = workflow_texts();
+    let ci = texts
+        .get("ci.yml")
+        .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
+
+    let declarations = ci
+        .lines()
+        .filter(|l| l.trim_end() == SELECTION_SWITCH_DECLARATION)
+        .count();
+    assert_eq!(
+        declarations, 1,
+        "ci.yml declares `{SELECTION_SWITCH}` on {declarations} line(s) reading \
+         exactly `{SELECTION_SWITCH_DECLARATION}`; it is declared ONCE, at \
+         workflow level, and the default in the expression is what a repository \
+         with no variable set gets"
+    );
+
+    // The switch reaches the CLASSIFIER, and the classifier alone. A switch
+    // nothing reads is a switch that stops nothing.
+    let jobs = jobs_of(ci);
+    let (_, block) = jobs
+        .iter()
+        .find(|(name, _)| name == SELECTION_JOB)
+        .unwrap_or_else(|| panic!("ci.yml carries no `{SELECTION_JOB}` job"));
+    let reader = step_blocks(block)
+        .into_iter()
+        .find(|b| step_id_of(b).as_deref() == Some(SELECTION_SWITCH_READER_STEP))
+        .unwrap_or_else(|| {
+            panic!("the `{SELECTION_JOB}` job carries no step with id `{SELECTION_SWITCH_READER_STEP}`")
+        });
+    let script = run_script_of(&reader).unwrap_or_default();
+    assert!(
+        script.contains(SELECTION_SWITCH),
+        "the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job \
+         never names `{SELECTION_SWITCH}`: the switch would be declared and read \
+         by nothing, and turning it off would change no run"
+    );
+    assert!(
+        script.contains(SELECTION_MARKER_PREFIX),
+        "the `{SELECTION_SWITCH_READER_STEP}` step never prints a \
+         `{SELECTION_MARKER_PREFIX}` line, so a reader of the log cannot see \
+         which way the switch was set"
+    );
+}
+
+/// No step in any workflow is gated on the switch, or on an output the switch
+/// does not feed.
+#[test]
+fn a_step_selection_gate_reads_only_an_output_the_switch_feeds() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut steps_read = 0usize;
+    for (file, text) in workflow_texts() {
+        for (job, block) in jobs_of(&text) {
+            for step in step_blocks(&block) {
+                steps_read += 1;
+                let cond = match step_if_of(&step) {
+                    Ok(Some(cond)) => cond,
+                    Ok(None) => continue,
+                    Err(why) => {
+                        complaints.push(format!("  {file} / {job}: {why}"));
+                        continue;
+                    }
+                };
+                if let Some(why) = selection_gate_violation(&cond) {
+                    let name = step_name_of(&step).unwrap_or_else(|| "<unnamed>".to_string());
+                    complaints.push(format!("  {file} / {job} / `{name}`: {why}"));
+                }
+            }
+        }
+    }
+    assert!(
+        steps_read >= 100,
+        "the step walk read only {steps_read} step(s): it is not reaching the \
+         workflows and this rule would be vacuous"
+    );
+    assert!(
+        complaints.is_empty(),
+        "these step conditions are not legal selection gates:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The rule itself, both sides, on hand-written conditions.
+#[test]
+fn the_selection_gate_rule_names_the_switch_and_the_wrong_output() {
+    // Legal: the three sanctioned forms, and conditions that are no selection
+    // gate at all.
+    for allowed in [
+        SELECTION_CODE_IF,
+        SELECTION_DOCS_IF,
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')",
+        "matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')",
+        "matrix.shard == 0",
+        "always()",
+        "github.event_name == 'push'",
+    ] {
+        assert_eq!(
+            selection_gate_violation(allowed),
+            None,
+            "`{allowed}` is a legal step condition"
+        );
+    }
+    // The switch, in every spelling a step could reach it by.
+    for refused in [
+        "env.CI_SELECTION != 'off'",
+        "vars.CI_SELECTION == 'on'",
+        "matrix.shard == 3 && env.CI_SELECTION != 'off'",
+    ] {
+        let why = selection_gate_violation(refused)
+            .unwrap_or_else(|| panic!("`{refused}` reads the switch and must be refused"));
+        assert!(why.contains(SELECTION_SWITCH), "-> {why}");
+    }
+    // An output of the classifier job the switch does not feed.
+    for refused in [
+        "needs.changes.outputs.packaging == 'true'",
+        "needs.changes.outputs.selected == 'true'",
+        "matrix.shard == 3 && needs.changes.outputs.touched == 'true'",
+    ] {
+        let why = selection_gate_violation(refused).unwrap_or_else(|| {
+            panic!("`{refused}` reads an ungoverned output and must be refused")
+        });
+        assert!(why.contains("is not one of the three outputs"), "-> {why}");
+    }
+}
+
