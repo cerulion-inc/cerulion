@@ -85,9 +85,9 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 - PR titles: `<type>(<scope>)!: <description>`. PRs are SQUASH-merged, so the title becomes
   the commit message. Commit bodies carry the WHY.
 - PR bodies (product voice, ~40 lines/450 words): a summary paragraph (or `## Summary`),
-  `## What changed`, `## How to verify` (commands), a latency section when the landing rule requires it,
-  `Closes #N` last on its own line (omit when no issue closes). No questions, process narrative,
-  HTML, em or en dashes, internal ids, hostnames or paths. Diffs ~800 lines; breaking changes carry migration steps.
+  `## What changed`, `## How to verify` (commands), a latency section when the landing rule needs it,
+  `Closes #N` last (omit when no issue closes). No questions, process talk, HTML, em or en dashes,
+  internal ids, hostnames or machine paths. Diffs ~800 lines; breaking changes carry migration steps.
 - Stacked PRs (B on unmerged A): base B on A's branch; merge in dependency order
   (deleting a merged base retargets B; a rename closes it).
 - Plan gate: read the issue in full, check dependencies (an unlanded one => confirm the base with

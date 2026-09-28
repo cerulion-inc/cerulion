@@ -1,7 +1,8 @@
 <!--
 Write the body in product voice, as a stranger to the project will read it: at most about 40 lines
 and about 450 words of prose. State what changed and what was measured. No questions, no account of
-how the work was done, no HTML, no em or en dashes, no internal identifiers, no hostnames or paths.
+how the work was done, no HTML, no em or en dashes, no internal identifiers, no hostnames or machine
+paths (repository paths in commands are fine).
 Delete every comment before opening the pull request.
 -->
 
