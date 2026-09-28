@@ -553,6 +553,8 @@ class Job(object):
             )
         self.permissions = _get_map(node, "permissions", "job %s" % job_id)
         self.permissions_line = node.line_of("permissions") if node.has("permissions") else node.line
+        self.cond = _get_str(node, "if", "job %s" % job_id)
+        self.cond_line = node.line_of("if") if node.has("if") else node.line
         self.env = _get_map(node, "env", "job %s" % job_id)
         self.env_line = node.line_of("env") if node.has("env") else node.line
         self.container = node.has("container")
@@ -601,6 +603,8 @@ STEP_OUTPUT_GUARD_RE = re.compile(
     r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.[A-Za-z0-9_.\-]+ == '[A-Za-z0-9_.\-]+'$"
 )
 TOOL_CACHE_PATH_RE = re.compile(r"^~/\.cargo/bin/[A-Za-z0-9_.\-]+$")
+EVENT_NE_PULL_REQUEST = "github.event_name != 'pull_request'"
+EVENT_EQ_RE = re.compile(r"^github\.event_name == '([A-Za-z0-9_]+)'$")
 SCOPE_SUFFIX = "-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}"
 HASHFILES_RE = re.compile(r"-\$\{\{\s*hashFiles\(")
 STEPS_OUTPUT_SEG_RE = re.compile(r"-\$\{\{\s*steps\.[A-Za-z0-9_.\-]+\.outputs\.[A-Za-z0-9_.\-]+\s*\}\}")
@@ -669,20 +673,20 @@ def namespace_clauses(key):
     return [namespace_clause(token_fragment(t)) for t in namespace_templates(key)]
 
 
-def split_conjuncts(text):
-    """Split a normalised `if:` at every depth-0 `&&`.
+def _split_top(text, op, other):
+    """Split `text` at every depth-0 `op`, reporting whether `other` appears there.
 
-    Returns `(conjuncts, saw_or)`. `saw_or` is the whole point: `... || true`
-    appended to a gate keeps every required substring and every equality the
-    other rules test, and turns the gate off. A parenthesised alternative (the
-    main-only clause, the namespace gate) is inside one conjunct and is not a
-    depth-0 `||`.
+    Returns `(parts, saw_other)`. For `&&`, `saw_other` is the whole point:
+    `... || true` appended to a gate keeps every required substring and every
+    equality the other rules test, and turns the gate off. A parenthesised
+    alternative (the main-only clause, the namespace gate) is inside one
+    conjunct and is not a depth-0 `||`.
     """
     parts = []
     current = []
     depth = 0
     quote = None
-    saw_or = False
+    saw_other = False
     index = 0
     while index < len(text):
         ch = text[index]
@@ -707,17 +711,89 @@ def split_conjuncts(text):
             current.append(ch)
             index += 1
             continue
-        if depth == 0 and text[index:index + 2] == "&&":
+        if depth == 0 and text[index:index + 2] == op:
             parts.append("".join(current).strip())
             current = []
             index += 2
             continue
-        if depth == 0 and text[index:index + 2] == "||":
-            saw_or = True
+        if depth == 0 and text[index:index + 2] == other:
+            saw_other = True
         current.append(ch)
         index += 1
     parts.append("".join(current).strip())
-    return [part for part in parts if part], saw_or
+    return [part for part in parts if part], saw_other
+
+
+def split_conjuncts(text):
+    return _split_top(text, "&&", "||")
+
+
+def split_disjuncts(text):
+    return _split_top(text, "||", "&&")
+
+
+def _strip_outer_parens(text):
+    """`(a || b)` -> `a || b`, only when the first `(` closes on the last char."""
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        for index, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+        if index != len(text) - 1:
+            return text
+        text = text[1:-1].strip()
+    return text
+
+
+def is_unscoped_key(key):
+    """True when the key carries no `-<main|pr>-` scope segment before its hash.
+
+    Derived the same way `namespace_templates` finds the scope, so the two can
+    never disagree about which keys are scoped.
+    """
+    hits = list(HASHFILES_RE.finditer(key))
+    if not hits:
+        return False
+    head = key[: hits[-1].start()]
+    cut = head.rfind("-${{")
+    return not (cut >= 0 and norm(head[cut:]) == SCOPE_SUFFIX)
+
+
+def job_excludes_pull_request(cond):
+    """True when a job-level `if:` can never be true on a pull-request run.
+
+    Two shapes, both in ci.yml today: a depth-0 conjunct
+    `github.event_name != 'pull_request'` (fuzz, miri, msrv, cross-aarch64), and
+    an allowlist -- a disjunction of `github.event_name == '<event>'` terms
+    naming no pull request (the two latency jobs). The allowlist is accepted
+    inside any depth-0 conjunct, not only as the whole expression: a conjunct
+    can only narrow the job, so one that excludes pull requests excludes them
+    for the job.
+    """
+    cond = norm(cond)
+    if not cond:
+        return False
+    conjuncts, _ = split_conjuncts(cond)
+    for part in conjuncts:
+        if part == EVENT_NE_PULL_REQUEST:
+            return True
+        terms, saw_and = split_disjuncts(_strip_outer_parens(part))
+        if saw_and or not terms:
+            continue
+        events = []
+        for term in terms:
+            mo = EVENT_EQ_RE.match(_strip_outer_parens(term))
+            if mo is None:
+                events = None
+                break
+            events.append(mo.group(1))
+        if events and "pull_request" not in events:
+            return True
+    return False
 
 
 def classify_conjunct(part, ns_clauses):
@@ -1034,8 +1110,26 @@ def _check_namespace_gate(add, step, key):
 
 
 def _check_prune_step(add, job, steps, index, step):
-    """R3's orphan half, R2, R6, R8 and R9 for one prune step."""
+    """R3's orphan half, R2, R6, R8, R9 and R11 for one prune step."""
     label = step.label()
+    # R11. An unscoped keep key (`cargo-fuzz-<os>-<lockhash>`, the push-only
+    # namespaces) has no `-main-`/`-pr-` segment, so the prune's scope rule does
+    # not narrow it: it clears the WHOLE namespace, `main`'s archive included. A
+    # pull-request run must therefore never reach such a prune, and the only
+    # thing that can promise that is the job's own `if:`.
+    mo = PRUNE_RUN_RE.match((step.run or "").strip())
+    if mo is not None and is_unscoped_key(mo.group("key")) \
+            and not job_excludes_pull_request(job.cond):
+        add(
+            job.cond_line,
+            "R11_UNSCOPED_KEY_NEVER_ON_PULL_REQUEST",
+            "prune step %r keeps the unscoped key %r, which clears its whole namespace "
+            "(`main`'s archive included, since the scope rule cannot narrow a key with no "
+            "scope); job %s must then never run on a pull request, but its `if:` is %r. "
+            "Expected a `%s` conjunct, or an `if` that is a disjunction of "
+            "`github.event_name == '<event>'` terms naming no pull_request"
+            % (label, mo.group("key"), job.job_id, norm(job.cond) or None, EVENT_NE_PULL_REQUEST),
+        )
     nxt = steps[index + 1] if index + 1 < len(steps) else None
     if nxt is None or not nxt.is_save:
         add(
@@ -1347,6 +1441,9 @@ jobs:
 
   cross:
     runs-on: ubuntu-latest
+    # `cargo-cross-aarch64-<lockhash>` carries no scope segment, so its prune
+    # clears the whole namespace: R11 needs this job off pull requests.
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     permissions:
       contents: read
       actions: write
@@ -1379,6 +1476,39 @@ jobs:
         uses: actions/cache/save@v4
         with:
           key: cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}
+
+  latency:
+    runs-on: ubuntu-latest
+    # The other shape R11 accepts for an unscoped key: an allowlist of events,
+    # none of them a pull request.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Cache cargo (restore)
+        id: cache-restore-latency
+        uses: actions/cache/restore@v4
+        with:
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Measure
+        run: cargo run --release -p bench
+      - name: Prune the cache namespace, latency
+        if: >-
+          github.event_name != 'merge_group'
+          && <MAIN>
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+      - name: Cache cargo, latency (save)
+        if: >-
+          steps.cache-restore-latency.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && <MAIN>
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
+        uses: actions/cache/save@v4
+        with:
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
   lane:
     runs-on: ubuntu-latest
@@ -1878,6 +2008,31 @@ def _mutants():
              "          key: cargo-machete-bin-${{ runner.os }}-v0.9.2\n"),
         {"TOOL_CACHE"},
     ))
+    # R11: the unscoped key reachable from a pull request, three ways.
+    out.append((
+        "R11 the job condition removed",
+        _mut(clean,
+             "    # `cargo-cross-aarch64-<lockhash>` carries no scope segment, so its prune\n"
+             "    # clears the whole namespace: R11 needs this job off pull requests.\n"
+             "    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'\n",
+             ""),
+        {"R11_UNSCOPED_KEY_NEVER_ON_PULL_REQUEST"},
+    ))
+    out.append((
+        "R11 pull_request added to the allowlist",
+        _mut(clean,
+             "    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'\n",
+             "    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'"
+             " || github.event_name == 'pull_request'\n"),
+        {"R11_UNSCOPED_KEY_NEVER_ON_PULL_REQUEST"},
+    ))
+    out.append((
+        "R11 the pull_request conjunct narrowed to merge_group",
+        _mut(clean,
+             "    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'\n",
+             "    if: github.event_name != 'merge_group'\n"),
+        {"R11_UNSCOPED_KEY_NEVER_ON_PULL_REQUEST"},
+    ))
     # Removing every save leaves five prune steps guarding nothing, so this
     # mutation necessarily trips R3 beside NO_SAVE_STEPS.
     out.append((
@@ -1888,7 +2043,7 @@ def _mutants():
     out.append((
         "parse error: a YAML anchor",
         _mut(clean, "    runs-on: ubuntu-latest\n", "    runs-on: &ru ubuntu-latest\n",
-             total=6, occurrence=1),
+             total=7, occurrence=1),
         None,
     ))
     # The restore-only workflow and its two structural failures.
@@ -1913,8 +2068,8 @@ def self_test():
         fails.append("clean workflow reported %d violation(s): %s" % (len(problems), problems))
     # Guard against a fixture or reader that silently stopped seeing the steps:
     # every rule below would pass vacuously on an empty step list.
-    if stats != {"saves": 6, "prunes": 5, "policy": 1}:
-        fails.append("clean workflow parsed to %r, expected 6 saves and 5 prunes" % (stats,))
+    if stats != {"saves": 7, "prunes": 6, "policy": 1}:
+        fails.append("clean workflow parsed to %r, expected 7 saves and 6 prunes" % (stats,))
 
     cases += 1
     problems, stats = check_text("mem.yml", RESTORE_ONLY_WORKFLOW)

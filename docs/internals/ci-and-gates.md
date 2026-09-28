@@ -611,7 +611,11 @@ last step (R7); every gate is a conjunction of clauses from a closed set, each a
 with no top-level `||` (R8 -- which is what stops `... || true` from turning a gate off while
 every other rule still passes); a container job installs `gh` and `jq` in the step before its
 prune, under the prune's own condition (R9); nothing shadows the policy in a job- or step-level
-`env` (R10); a key with no lockfile hash is a tool cache or a violation (TOOL_CACHE); the
+`env` (R10); a prune whose keep key carries no `-main-`/`-pr-` scope segment -- one the scope rule
+cannot narrow, so it clears the whole namespace -- lives only in a job whose `if:` can never be
+true on a pull request, either a `github.event_name != 'pull_request'` conjunct or an allowlist of
+events naming none (R11); a key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
+the
 combined `actions/cache` action appears nowhere (NO_COMBINED_CACHE_ACTION); and a job whose
 steps the reader cannot enumerate -- a reusable-workflow call, or one carrying no `steps:` -- is
 refused rather than passed in silence. The `Lint` step "Cache save policy" runs the prune
