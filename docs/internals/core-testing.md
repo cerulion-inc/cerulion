@@ -245,6 +245,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `external_gating_replay_iox2_test.rs` | Polled path never queries `external_source()`; sticky aggregated launch refusal; replay firewall (source never touched). | `#[serial]` | none |
 | `waitset_fd_source_iox2_test.rs` | Mixed listener + raw-fd wake sources; declaration-order reporting; invalid/stale fd guards (host-side EBADF-abort protection). | `#[serial]` | none |
 | `waitset_capacity_test.rs` | WaitSet attachment-capacity guard boundary. | parallel | none |
+| `waitset_listener_source_discipline_test.rs` | Source walk: every `WaitSource::Listener` CONSTRUCTED in `crates/cerulion_core/src` takes its listener from a trigger subscriber, an external `Notified` doorbell, or a caller-owned `WakeSource`. Pins the premise that licenses the read path to stop draining the body subscriber's listener under 0.10: a wake source nothing drains keeps its fd readable and the live loop free runs. | parallel | none |
 | `waitset_busyspin_test.rs` | The live loop sleeps its heartbeat only when the WaitSet reported nothing (busy-spin guard). | `#[serial]` | none |
 | `waitset_reactor_iox2_test.rs` / `waitset_live_loop_iox2_test.rs` / `chunk25b_live_default_iox2_test.rs` | WaitSet reactor wake/dispatch; the live loop seam; live-default behavior. | `#[serial]` | none |
 | `wake_set_iox2_test.rs` | Public `WakeSource`/`WakeSet` over real iceoryx2 (data-service-gates-first; fired-index ordering). | `#[serial]` | none |

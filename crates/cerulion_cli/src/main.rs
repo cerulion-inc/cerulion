@@ -3000,10 +3000,7 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
                 "iceoryx2 internal error" => {
                     "iceoryx2 refused to remove the node's registry entry; \
                      the node ids of the refused nodes listed below name the \
-                     culprit and carry the sub-causes iceoryx2 logged. A directory \
-                     holding only orphan port tags (a publisher destroyed while a \
-                     loaned sample was leaked — the tag outlives the port) is \
-                     reclaimed by this verb right after this listing; any other \
+                     culprit and carry the sub-causes iceoryx2 logged. A \
                      stranded entry never converges on its own"
                 }
                 _ => "see iceoryx2 logs for details",

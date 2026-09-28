@@ -207,10 +207,19 @@ fn parent_publisher(tag: &str) -> (IsolatedRoot, Arc<TransportManager>, Cerulion
 
 /// Remove every dead node's stale resources from a namespace, which is what
 /// deregisters a killed consumer's listener. iceoryx2 carries the sweep on a
-/// node, so this mints one, exactly as `cerulion clean` does.
+/// node, so this mints one, exactly as `cerulion clean` does — INCLUDING the
+/// config those callers use.
+///
+/// `sweep_node_config` is not decoration here. It turns off
+/// `cleanup_dead_nodes_on_creation`, and without it `NodeBuilder::create`
+/// sweeps the namespace on the way in: the killed consumer is reaped by the
+/// line that builds the sweeper, the explicit call below then finds nothing,
+/// and `failed_cleanups == 0` passes for a sweep that never ran. Asserting a
+/// nonzero `cleanups` is what makes the assert above mean something.
 fn reap_dead_nodes(root: &IsolatedRoot) {
+    let sweep_config = cerulion_core::transport::dead_node_sweep::sweep_node_config(&root.config());
     let sweeper = iceoryx2::node::NodeBuilder::new()
-        .config(&root.config())
+        .config(&sweep_config)
         .create::<iceoryx2::service::ipc_threadsafe::Service>()
         .expect("a node in the namespace to sweep from");
     let state = sweeper.try_cleanup_dead_nodes();
@@ -218,6 +227,11 @@ fn reap_dead_nodes(root: &IsolatedRoot) {
         state.failed_cleanups, 0,
         "the sweep refused a dead node ({state:?}), so the stale registration is still \
          there and the recovery below would be testing nothing"
+    );
+    assert!(
+        state.cleanups > 0,
+        "the sweep reported no dead node cleaned ({state:?}): the killed consumer was \
+         already reaped before this call, so nothing below is measuring the recovery"
     );
 }
 
@@ -287,9 +301,11 @@ fn an_undrained_live_listener_is_never_a_shortfall() {
 /// the original flood: roughly ninety of these run inside one attached bridge,
 /// each publishing at line rate, and each auto-notifying from `publish_raw`.
 ///
-/// This arm is what would catch the gate on the publisher's self drain breaking
-/// delivery: it is a real loan, copy, send and notify per iteration, with
-/// nothing draining the publisher's own listener at any point.
+/// What this arm does NOT cover is the gate on the publisher's self drain: its
+/// oracle is `notify_undelivered_count`, which under 0.10 reads zero whether or
+/// not the publisher drains its own listener. The gate is pinned where it can be
+/// observed, on the arming budget and the idle deadline, in
+/// `pump_history_quiescent_test`.
 #[test]
 #[serial]
 fn an_ingress_publisher_reports_nothing_undelivered_across_a_long_run() {

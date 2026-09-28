@@ -11,6 +11,7 @@
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use iceoryx2::port::listener::Listener;
 use iceoryx2::port::notifier::Notifier;
@@ -101,6 +102,23 @@ enum NotifyListenerCount {
 /// trimmed: it is spent only when the listener count actually moves.
 const SELF_DRAIN_ARMED_CALLS: u8 = 64;
 
+/// How long a quiescent publisher may go without re-arming its self drain.
+///
+/// The call budget above is edge triggered on a listener COUNT, which is not
+/// monotonic: a subscriber leaving while another joins reads as no change, and
+/// the arming never fires. It is also spent in CALLS, so 64 idle passes can
+/// elapse before a cross process `SubscriberConnected` lands. Either way a late
+/// joiner on a quiescent publisher with history waits for the count to move
+/// again, which on a quiet topic may be never.
+///
+/// The repair is a deadline, and it is deliberately NOT on the publish path:
+/// the defect only exists while nothing publishes, so the wake has to come from
+/// whatever runs when nothing publishes. `pump_history` is that caller, driven
+/// once per `live_step`, and it is the only place this deadline is read. A
+/// clock read per loan would be a cost on the measured hot path buying nothing,
+/// since a publishing publisher already re-arms on its own events.
+const SELF_DRAIN_IDLE_REARM: Duration = Duration::from_millis(250);
+
 /// Zero-copy publisher for a single topic.
 ///
 /// Holds an iceoryx2 data publisher, an event notifier (to signal subscribers),
@@ -143,6 +161,9 @@ pub struct CerulionPublisher {
     /// transition clears it early. While zero, a publish costs one relaxed load
     /// instead of a listener drain.
     self_drains_armed: u8,
+    /// When the idle pass may next re-arm the self drain unconditionally. Read
+    /// and written ONLY by `pump_history`, never by the publish path.
+    next_self_drain_rearm: Option<Instant>,
     sequence: AtomicU32,
     /// The value `sequence` was CONSTRUCTED with — 0 on every
     /// live path, and the recorded stream's next sequence on a restored replay.
@@ -593,6 +614,7 @@ impl CerulionPublisher {
             // publish always drains and establishes the baseline.
             last_listener_count: usize::MAX,
             self_drains_armed: 0,
+            next_self_drain_rearm: None,
             sequence: AtomicU32::new(config.initial_sequence),
             initial_sequence: config.initial_sequence,
             clock: config.clock,
@@ -2323,7 +2345,37 @@ impl CerulionPublisher {
     /// when no `SubscriberConnected` is pending (a single non-blocking listener
     /// drain); never fatal (see `deliver_history`).
     pub fn pump_history(&mut self) {
+        // The deadline lives here and nowhere else. On the first idle pass it
+        // is armed; afterwards it re-arms the drain whenever the interval has
+        // elapsed, so a late joiner is picked up within one interval even when
+        // the listener count never moved (a net zero attach and detach swap) and
+        // even when the call budget was spent before the connect landed.
+        let now = Instant::now();
+        match self.next_self_drain_rearm {
+            Some(due) if now < due => {}
+            _ => {
+                self.self_drains_armed = SELF_DRAIN_ARMED_CALLS;
+                self.next_self_drain_rearm = Some(now + SELF_DRAIN_IDLE_REARM);
+            }
+        }
         self.check_subscriber_events();
+    }
+
+    /// Test seam: run one idle pass as if `SELF_DRAIN_IDLE_REARM` had elapsed,
+    /// without sleeping. Staging the interleaving this repairs needs the
+    /// deadline to be reachable; sleeping a quarter second per arm to reach it
+    /// would make the pin slow enough that somebody eventually deletes it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn pump_history_past_the_idle_deadline_for_test(&mut self) {
+        self.next_self_drain_rearm = None;
+        self.pump_history();
+    }
+
+    /// Test seam: the armed self drain count, so an arm can show the budget
+    /// being spent rather than assuming it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn self_drains_armed_for_test(&self) -> u8 {
+        self.self_drains_armed
     }
 
     /// Drive iceoryx2's NATIVE history delivery to a freshly-connected
@@ -2578,9 +2630,9 @@ impl Drop for CerulionPublisher {
 ///
 /// Alignment-safe: reads field bytes via `to_le_bytes`-style extraction,
 /// no `unsafe` and no alignment requirement on the input slice. (A loaned
-/// slot's `[u8]` payload IS 8-aligned on iceoryx2 0.9.1 — the per-sample
-/// header is 40 B @ align 8 (`IOX2_SAMPLE_HEADER_BYTES`), so the payload
-/// starts at chunk+40 of an 8-aligned chunk — but that is DE FACTO, not a
+/// slot's `[u8]` payload IS 8-aligned — the per-sample header is align 8
+/// and its size is a multiple of 8 (`IOX2_SAMPLE_HEADER_BYTES`, currently
+/// 48), so the payload starts 8-aligned — but that is DE FACTO, not a
 /// declared iceoryx2 contract: the rmw loan paths ASSERT it fail-closed
 /// before handing out a typed pointer, and this parser simply does not
 /// depend on it.)
@@ -2733,6 +2785,7 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
         listener,
         last_listener_count,
         self_drains_armed,
+        next_self_drain_rearm,
         sequence,
         initial_sequence,
         clock,

@@ -30,13 +30,32 @@
 //! `graph_run` continues to call this explicitly even though
 //! iceoryx2's `NodeBuilder::create` ALSO runs the same sweep when
 //! `cleanup_dead_nodes_on_creation: true` is set (the iceoryx2
-//! default — see `iceoryx2-0.8.1/src/config.rs:189-204`). The
+//! default — see that release's `config.rs`). The
 //! explicit call is the load-bearing line: it keeps the dead-node
 //! sweep happening regardless of any user-supplied
 //! `iceoryx2.toml` that flips the on-creation default to `false`.
 //! The double-call is correct: a second sweep on a freshly-cleaned
 //! registry finds no `Dead` entries and is a directory walk plus
-//! constant work.
+//! constant work. Every sweep here builds its node through
+//! `dead_node_sweep::sweep_node_config`, which turns the implicit
+//! cleanup OFF, so the explicit call is the one that does the work
+//! and the counts it reports describe a sweep that happened.
+//!
+//! # Why there is no orphan port tag reclaim any more
+//!
+//! A separate reclaim pass once ran for one shape iceoryx2 could not clear: a
+//! publisher destroyed while one of its loaned samples was leaked deregistered
+//! its port but left the port tag on disk, so the node directory failed its
+//! final removal on every sweep, forever.
+//!
+//! 0.10 removes a dead port's tag with the rest of its stale resources
+//! (`service/stale_resource_cleanup.rs`, the port tag arm), where 0.9.1's
+//! sweep did not, so the shape cannot arise and the pass was deleted. What did
+//! NOT motivate the deletion, though an earlier message in this branch said so:
+//! the node identity still exposes its process id and creation stamp, through
+//! `UniqueNodeId::pid` and `UniqueNodeId::creation_time` (`identifiers.rs`).
+//! What changed is the DERIVED DEBUG RENDERING, which no longer carries either,
+//! and that is why the hand fixtures in this module had to be re-derived.
 //!
 //! # Why the STARTUP sweep is BOUNDED and `cerulion clean` is not
 //!
@@ -165,8 +184,8 @@ pub struct CleanupReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedNodeCleanup {
     /// The node identity exactly as iceoryx2 rendered it in the
-    /// `Unable to remove dead node {id:?} (…)` line — for 0.9.1 that is
-    /// `UniqueNodeId(UniqueSystemId { value: …, pid: …, creation_time: … })`.
+    /// `Unable to remove dead node {id:?} (…)` line — on the pinned release
+    /// that is `UniqueNodeId(UniqueId { payload_value: …, unique_value: … })`.
     /// Kept verbatim: it is the token every other line about the node
     /// carries, and shortening it here would make a reader's grep against
     /// a raw trace miss.
@@ -324,16 +343,19 @@ fn is_sub_cause_line(log: &CapturedLog) -> bool {
         && (log.message.contains(" since ") || log.message.contains(" due to "))
 }
 
-/// The head of a node identity as iceoryx2 0.9.1 renders it under `{:?}`:
-/// `UniqueNodeId` is a tuple struct over `UniqueSystemId` with a derived
-/// `Debug` (`iceoryx2-0.9.1/src/identifiers.rs:163`), so every rendering —
-/// the refusal line's, a `DeadNodeView` origin's, a string origin's
-/// `{node_id:?}` — opens with this and closes at the paren that balances it.
+/// The head of a node identity as iceoryx2 renders it under `{:?}`:
+/// `UniqueNodeId` is a tuple struct with a derived `Debug`
+/// (`identifiers.rs`), so every rendering — the refusal line's, a
+/// `DeadNodeView` origin's, a string origin's `{node_id:?}` — opens with this
+/// and closes at the paren that balances it. The prefix is what the parser
+/// keys on, which is why it survived the inner type changing in 0.10; the
+/// live rendering is re-derived in
+/// `the_node_token_fixture_matches_the_live_rendering`.
 const NODE_TOKEN_PREFIX: &str = "UniqueNodeId(";
 
 /// Every node token embedded in `text`: each `UniqueNodeId(` … `)` span,
 /// closed at the paren that BALANCES its opener. The inner
-/// `UniqueSystemId { value, pid, creation_time: Time { … } }` carries braces
+/// `UniqueId { payload_value, unique_value }` carries braces
 /// but no parens, so balancing is what turns `Dead node (UniqueNodeId(…))
 /// detected` into the same token the refusal line prints. An unbalanced
 /// prefix (a truncated line) yields nothing rather than a guessed token.
@@ -370,7 +392,7 @@ fn carries_a_foreign_node_token(log: &CapturedLog, node: &str) -> bool {
 ///
 /// The variant is the LAST ` (…)` token — space-then-paren, because the node
 /// identity before it is itself full of parens and braces
-/// (`UniqueNodeId(UniqueSystemId { … })`) none of which follow a space, and
+/// (`UniqueNodeId(UniqueId { … })`) none of which follow a space, and
 /// every `NodeCleanupFailure` variant is a unit variant, so the token
 /// contains no parens of its own. A line with no such tail yields the whole
 /// remainder as the node and an EMPTY variant, never a guessed one.
@@ -600,9 +622,13 @@ pub fn classify_cleanup_failures(captured: &[CapturedLog]) -> ClassifiedFailures
 ///   by a different uid; user can't remove them. Run as the
 ///   owning user, or `chmod` the resources.
 /// - **version mismatch** — the dead node's on-disk state was
-///   produced by a different iceoryx2 version. Run
-///   `rm -rf /tmp/iceoryx2/` to recover (the live nodes will
-///   recreate their state).
+///   produced by a different iceoryx2 version, and only that
+///   version's tooling can reap it. Two versions sharing one root
+///   is a supported state (each keeps its own management
+///   segment), so removing the root would take a LIVE process's
+///   registry with it. Stop the older processes and reap their
+///   artifacts by prefix. `rm -rf /tmp/iceoryx2/` is safe only
+///   when no process of either version is running.
 /// - **lock contention** — another process is racing the same
 ///   cleanup. Retry; usually self-resolves on the next run.
 ///
@@ -1368,9 +1394,17 @@ pub(crate) mod tests {
     /// `the_node_token_fixture_matches_the_live_rendering` builds a REAL node
     /// and compares against it, so the next such rename fails a test instead of
     /// quietly making every oracle built on this fictional.
+    /// The payload half of the identity. Arbitrary: the shape comparison in
+    /// `the_node_token_fixture_matches_the_live_rendering` collapses digit
+    /// runs, so only the SHAPE of this number is ever checked and any digits
+    /// would do. A captured sample from one machine sitting here unexplained
+    /// reads as meaningful when it is not, so it is a round number with the
+    /// reason beside it.
+    const FIXTURE_PAYLOAD_VALUE: u128 = 1_000_000_000_000_000_000;
+
     pub(crate) fn node_token(value: u128) -> String {
         format!(
-            "UniqueNodeId(UniqueId {{ payload_value: 195704481599776682, unique_value: {value} }})"
+            "UniqueNodeId(UniqueId {{ payload_value: {FIXTURE_PAYLOAD_VALUE}, unique_value: {value} }})"
         )
     }
 
@@ -1388,7 +1422,8 @@ pub(crate) mod tests {
     ///
     /// The id half is the one that actually moved: `UniqueNodeId` wrapped
     /// `UniqueSystemId { value, pid, creation_time: Time { .. } }` and now
-    /// wraps `UniqueId { value }`. The parser survives it because it balances
+    /// wraps `UniqueId { payload_value, unique_value }`. The parser survives it
+    /// because it balances
     /// parens rather than matching the inner type, and this arm is what says
     /// so out loud.
     #[test]
@@ -2122,12 +2157,21 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every distinct PER-NODE sub-cause shape iceoryx2 0.9.1 can log on the
-    /// way to a refusal — read off `mod.rs` 540-835
+    /// Every distinct PER-NODE sub-cause shape the LINKED iceoryx2 can log on
+    /// the way to a refusal — read off `node/mod.rs`
     /// (`remove_stale_resources_impl`, `acquire_cleaner_lock`, `remove_node`,
-    /// `blocking_remove_stale_resources`) and 1299-1391 (the per-node walk
-    /// helpers) plus `service/stale_resource_cleanup.rs`. Placeholders (`0ns`,
-    /// port `9`, `(InternalError)`) stand in for the `{:?}` interpolations.
+    /// `blocking_remove_stale_resources`, the per-node walk helpers) plus
+    /// `service/stale_resource_cleanup.rs`. Placeholders (`0ns`, port `9`,
+    /// `(InternalError)`) stand in for the `{:?}` interpolations.
+    ///
+    /// Re-derived against 0.10, because a corpus is a description of a library
+    /// and descriptions rot silently: six rows described text 0.9.1 emitted and
+    /// 0.10 does not (the three corrupted-service-remainder rows, the
+    /// `ServiceRemoveNodeError` row whose wording changed, and the two rows
+    /// carrying upstream's `insufficent` typo, since fixed), and the arms
+    /// 0.10 added were untested. Production classification never depended on
+    /// the rows — `is_sub_cause_line` is a two-substring heuristic — so this is
+    /// a corpus that had stopped describing the library, not a live defect.
     const PER_NODE_SUB_CAUSE_SHAPES: &[&str] = &[
         // remove_stale_resources_impl / blocking_remove_stale_resources
         "Unable to block until the stale resources of the dead node are removed since the adaptive wait builder could not be initiated.",
@@ -2138,16 +2182,18 @@ pub(crate) mod tests {
         IN_CLEANUP_SECTION_LINE,
         "Unable to remove stale resources since the monitor cleaner lock could not be acquired.",
         "Unable to remove stale resources since the dead node was using a different iceoryx2 version.",
-        "Unable to remove stale resources since the service itself is corrupted. Trying to remove the corrupted remainders of the service.",
-        "Unable to remove stale resources since the corrupted service remainders to could not be removed due to insufficient permissions.",
-        "Unable to remove stale resources since the corrupted service remainders to could not be removed due to an internal error (InternalError).",
-        "Unable to remove stale resources due to an internal error while removing the node from the service (InternalError).",
-        "Unable to remove stale resources since the service tags could not be read due to insufficent permissions.",
+        // The `ServiceRemoveNodeError` ladder 0.10 put in place of the
+        // corrupted-remainder block. Upstream emits the SAME text for the
+        // interrupt and the permission arm, so one row covers both.
+        "Unable to remove stale resources since an interrupt signal was raised while removing the node from the service.",
+        "Unable to remove stale resources since an internal failure occurred while removing the node from the service.",
+        "Unable to remove stale resources since the service tags could not be read due to insufficient permissions.",
         "Unable to remove stale resources since the service tags could not be read due to an internal error.",
         "Unable to remove stale resources since the stale resources of the port 9 could not be removed due to insufficient permissions.",
         "Unable to remove stale resources since the stale resources of the port 9 could not be removed since the iceoryx2 version does not match.",
         "Unable to remove stale resources since the stale resources of the port 9 could not be removed due to an internal failure.",
-        "Unable to remove stale resources since the port tags could not be read due to insufficent permissions.",
+        "Unable to remove stale resources since the stale resources of the port 9 could not be removed due to an interrupt signal.",
+        "Unable to remove stale resources since the port tags could not be read due to insufficient permissions.",
         "Unable to remove stale resources since the port tags could not be read due to an internal error.",
         "Unable to remove stale resources since the node itself could not be removed.",
         // acquire_cleaner_lock
@@ -2185,6 +2231,13 @@ pub(crate) mod tests {
         "Failed to remove stale port resources due to insufficient permissions to remove the port from its connections.",
         "Failed to remove stale port resources since the port could not be removed from its connection since iceoryx2 version does not match.",
         "Failed to remove stale port resources due to an internal error while removing the port from its connection.",
+        "Failed to remove stale port resources since an interrupt signal was raised.",
+        // The port TAG arms, new in 0.10. They are why the orphan port tag
+        // reclaim this crate used to carry is unreachable: a dead port's tag
+        // now goes with the rest of its stale resources.
+        "Failed to remove stale port resources since the port tag could not be removed due to insufficient permissions.",
+        "Failed to remove stale port resources since an interrupt signal was received while removing the port tag.",
+        "Failed to remove stale port resources since an internal error occurred while removing the port tag.",
     ];
 
     /// The five REGISTRY-WIDE lines, one per row of [`REGISTRY_WIDE_LINE_HEADS`]'s
@@ -2221,7 +2274,7 @@ pub(crate) mod tests {
     /// the registry guard in the adjacency arm load-bearing rather than
     /// redundant.
     #[test]
-    fn the_sub_cause_predicate_covers_every_0_9_1_shape_and_only_those() {
+    fn the_sub_cause_predicate_covers_every_linked_library_shape_and_only_those() {
         let node = node_token(70);
         for shape in PER_NODE_SUB_CAUSE_SHAPES
             .iter()

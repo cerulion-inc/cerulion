@@ -1220,8 +1220,9 @@ fn test_wide_level_is_cerulion_side_zero_alloc() {
     // 16-wide: if a per-node / per-fire Cerulion alloc regressed, this ~doubles.
     let allocs_16 = measure_wide_step_allocs(16, MEASURE_STEPS);
     println!(
-        "wide_zero_alloc: 8-wide={allocs_8}, 16-wide={allocs_16} heap allocs over {MEASURE_STEPS} \
-         steady-state steps (only the node-count-INDEPENDENT crossbeam-injector residual is allowed)"
+        "wide_zero_alloc: 8-wide-raw={allocs_8}, 16-wide-raw={allocs_16} heap allocs over \
+         {MEASURE_STEPS} steady-state steps, BEFORE the upstream 2035 loan waiver is subtracted \
+         (only the node-count-INDEPENDENT crossbeam-injector residual is allowed after it)"
     );
 
     // (a) Far below the O(n) wide-body floor. A wide path that allocates
@@ -1239,15 +1240,26 @@ fn test_wide_level_is_cerulion_side_zero_alloc() {
     // REMAINING width-proportional allocation visible, which is the regression
     // the pin exists to catch. `upstream_waivers_test` fails closed when the
     // iceoryx2 pin moves off the version this waiver names.
-    let allocs_8 = allocs_8.saturating_sub(cerulion_core::testing::upstream_2035_publish_allocs(
-        8 * MEASURE_STEPS as u64,
-    ));
-    let allocs_16 = allocs_16.saturating_sub(cerulion_core::testing::upstream_2035_publish_allocs(
-        16 * MEASURE_STEPS as u64,
-    ));
+    let waived_8 = cerulion_core::testing::upstream_2035_publish_allocs(8 * MEASURE_STEPS as u64);
+    let waived_16 = cerulion_core::testing::upstream_2035_publish_allocs(16 * MEASURE_STEPS as u64);
+    // The subtraction must fail CLOSED, the way every other waived arm does.
+    // `saturating_sub` would hide up to 1,600 of OUR allocations behind the
+    // floor the moment the width stops loaning once per step: the residual
+    // would read 0 and the bounds below would pass on a graph that is no longer
+    // the one being measured. Asserting the waived loans actually happened is
+    // what makes the subtraction a subtraction rather than a clamp.
     assert!(
-        allocs_8 < OUR_SIDE_ZERO_BOUND && allocs_16 < OUR_SIDE_ZERO_BOUND,
-        "wide-path allocs (8-wide={allocs_8}, 16-wide={allocs_16}) must stay below {OUR_SIDE_ZERO_BOUND} \
+        allocs_8 >= waived_8 && allocs_16 >= waived_16,
+        "the waived loans did not happen (8-wide={allocs_8} raw against {waived_8} waived, \
+         16-wide={allocs_16} against {waived_16}), so this arm is measuring a different graph \
+         and subtracting the waiver would hide our own allocations under the floor"
+    );
+    let ours_8 = allocs_8 - waived_8;
+    let ours_16 = allocs_16 - waived_16;
+    assert!(
+        ours_8 < OUR_SIDE_ZERO_BOUND && ours_16 < OUR_SIDE_ZERO_BOUND,
+        "wide-path allocs after the waiver (8-wide={ours_8} of {allocs_8} raw, \
+         16-wide={ours_16} of {allocs_16} raw) must stay below {OUR_SIDE_ZERO_BOUND} \
          (only rayon's ~1/63 injector residual). A higher count means a per-step Cerulion alloc \
          (HashMap / task Vec / collect / per-node Vec) regressed onto the wide path."
     );
@@ -1258,8 +1270,9 @@ fn test_wide_level_is_cerulion_side_zero_alloc() {
     // at most injector/epoch jitter — NOT a width-proportional amount.
     const WIDTH_JITTER_TOLERANCE: u64 = 32;
     assert!(
-        allocs_16 <= allocs_8 + WIDTH_JITTER_TOLERANCE,
-        "doubling the level width (8 -> 16) raised wide-path allocs from {allocs_8} to {allocs_16} \
+        ours_16 <= ours_8 + WIDTH_JITTER_TOLERANCE,
+        "doubling the level width (8 -> 16) raised wide-path allocs after the waiver from \
+         {ours_8} to {ours_16} \
          (> {WIDTH_JITTER_TOLERANCE} jitter tolerance) — the wide path is allocating PER NODE, not just \
          the fixed injector residual; the par_values_mut/trace_fragment reuse regressed to an O(n) \
          per-step allocation (the wide-path 'our-side-zero' claim broken)."

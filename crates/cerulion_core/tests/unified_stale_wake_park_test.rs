@@ -104,6 +104,15 @@ impl ParkEnvGuard {
         std::env::set_var("CERULION_NOTIFY_ELISION", "off");
         Self
     }
+
+    /// The same spin knob, with elision left at its SHIPPED default. Used by
+    /// the control arm below, which exists to show that this graph does arm
+    /// elision when the knob is not pinned.
+    fn set_spin_only() -> Self {
+        std::env::set_var("CERULION_LIVE_SPIN_US", "0");
+        std::env::remove_var("CERULION_NOTIFY_ELISION");
+        Self
+    }
 }
 impl Drop for ParkEnvGuard {
     fn drop(&mut self) {
@@ -130,11 +139,12 @@ impl StaleWakeConsumer {
     }
 }
 
-#[test]
-#[serial]
-fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
-    let _park_env = ParkEnvGuard::set();
-
+/// Build the pinned graph: an External producer the harness paces by hand and a
+/// macro data-trigger consumer that binds Unified, on a forced-park policy with
+/// the doorbell off. Both arms below build the SAME graph, which is the point:
+/// the control arm's nonzero elision count is evidence about THIS graph rather
+/// than about some other file's.
+fn build_stale_wake_runtime() -> (GraphRuntime, Arc<AtomicU64>) {
     let last_read = Arc::new(AtomicU64::new(MISSING));
 
     // External-policy closure producer: publishes its fire count into
@@ -207,7 +217,7 @@ fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
     // Forced park policy (doorbell OFF — the doorbell counter must stay 0 so
     // listener/timeout attribution is unambiguous).
     let clock = Arc::new(VirtualClock::new());
-    let mut runtime = GraphRuntime::build_for_test_with_policy(
+    let runtime = GraphRuntime::build_for_test_with_policy(
         config,
         factories,
         clock,
@@ -215,6 +225,16 @@ fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
         MonitorWaitPolicy::new(true, false, "usw".into()),
     )
     .expect("build stale-wake graph");
+
+    (runtime, last_read)
+}
+
+#[test]
+#[serial]
+fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
+    let _park_env = ParkEnvGuard::set();
+
+    let (mut runtime, last_read) = build_stale_wake_runtime();
 
     assert_eq!(
         runtime.unified_binding_count_for_test(),
@@ -294,5 +314,37 @@ fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
         0,
         "the re-arm publish (consumed by its own step) must leave no stale \
          listener event either"
+    );
+}
+
+/// The control for the elision pin above.
+///
+/// `unified_binding_parks_between_paced_publishes_no_stale_listener_wakes`
+/// asserts the armed topic count is ZERO, and a counter that is always zero
+/// would satisfy that assert while proving nothing. The counter is shown to
+/// bite in `notify_elision_iox2_test`, but on a different graph in a different
+/// file, which is an argument by reference rather than evidence about the graph
+/// being pinned. This arm builds the SAME graph with the knob left at its
+/// shipped default and asserts the count is nonzero, so the zero next door is a
+/// fact about the guard taking.
+#[test]
+#[serial]
+fn the_same_graph_arms_elision_when_the_knob_is_not_pinned_off() {
+    let _park_env = ParkEnvGuard::set_spin_only();
+
+    let (runtime, _last_read) = build_stale_wake_runtime();
+
+    assert_eq!(
+        runtime.unified_binding_count_for_test(),
+        1,
+        "the macro data-trigger consumer must be wired Unified (same graph as the pin)"
+    );
+    assert_eq!(
+        runtime.notify_elision_armed_topic_count_for_test(),
+        1,
+        "with elision at its shipped default this single-process graph must ARM it \
+         on the producer's topic: every listener there is graph owned. A zero here \
+         would mean the `== 0` assert in the pin above is satisfied by a counter \
+         that never moves on this graph, whatever the knob says"
     );
 }

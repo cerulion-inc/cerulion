@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The shared memory transport moves to iceoryx2 0.10.0. Every event service is sized to the event
-  ids the transport actually mints rather than the library default, and the live loop asks all of
-  its wake sources at once instead of draining each one to find out whether anything arrived.
+  ids the transport actually mints rather than the library default, so a listener no longer walks
+  256 shared memory counters on every wait.
 
 ### Known issues
 - On macOS, a process can run one graph containing plugin nodes. After that graph, creating

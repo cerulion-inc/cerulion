@@ -425,6 +425,18 @@ fn the_clean_verb_prints_the_listing_between_the_breakdown_and_the_unclassified_
         arm.contains("refused nodes"),
         "the internal-error remediation must point the reader at the listing; arm was:\n{arm}"
     );
+    // The verb makes ONE sweep and reclaims nothing. This line survived the
+    // reclaim's removal once, still telling the operator that a directory of
+    // orphan port tags "is reclaimed by this verb right after this listing",
+    // so the pin is on the promise rather than on the wording around it: a
+    // remediation may not offer a pass the code no longer has.
+    for promise in ["reclaim", "right after this listing", "sweeps once more"] {
+        assert!(
+            !arm.contains(promise),
+            "the internal-error remediation says `{promise}`, promising work this verb no \
+             longer does; it makes one sweep. arm was:\n{arm}"
+        );
+    }
     // The unclassified arm keeps its hint — through the one shared constant.
     let tail = &body[unclassified..];
     assert!(

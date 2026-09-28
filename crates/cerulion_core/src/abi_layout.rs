@@ -350,6 +350,7 @@ static EXPECTED: &[Expected] = &[
             "listener",
             "last_listener_count",
             "self_drains_armed",
+            "next_self_drain_rearm",
             "sequence",
             "initial_sequence",
             "clock",

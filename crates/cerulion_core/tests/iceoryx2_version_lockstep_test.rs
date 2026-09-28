@@ -34,54 +34,106 @@ fn dep_version(line: &str) -> Option<&str> {
     rest.split('"').next()
 }
 
-/// Every `iceoryx2*` entry in `cerulion_core`'s `[dependencies]` table is an
-/// exact `=PIN` pin (so a sub-crate cannot float independently of the
-/// top-level crate). This is the mechanism that propagates the constraint to
-/// every dependent — the binary, the benches, and a user's scaffolded node
-/// workspace.
+/// Every `iceoryx2*` dependency declared by ANY workspace crate is an exact
+/// `=PIN` pin (so a sub-crate cannot float independently of the top-level
+/// crate). This is the mechanism that propagates the constraint to every
+/// dependent — the binary, the benches, and a user's scaffolded node workspace.
+///
+/// Workspace-rooted on purpose. `cerulion_cli_engine`, `cerulion_cli` and
+/// `rmw_cerulion` each declare `iceoryx2` themselves, and a loose `"0.10"` in
+/// one of those resolves identically today and stays invisible until a 0.10.1
+/// floats it, at which point the lockfile arms below catch it one patch release
+/// late. The pin is the thing that must be checked where it is written.
 #[test]
 fn all_iceoryx2_deps_are_exact_pinned() {
-    let toml =
-        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .expect("read cerulion_core/Cargo.toml");
-    // Force inline form: a `[...dependencies.iceoryx2-*]` TABLE header would
-    // sit outside the inline-`[dependencies]` slice below and escape the
-    // scanner (silently unpinned). Reject it so every iceoryx2 dep stays
-    // visible to the exact-pin check.
+    let crates_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/ is the parent of this manifest")
+        .to_path_buf();
+    let mut manifests: Vec<PathBuf> = std::fs::read_dir(&crates_dir)
+        .expect("read crates/")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join("Cargo.toml"))
+        .filter(|p| p.is_file())
+        .collect();
+    manifests.sort();
+    // A walk that stops finding manifests would pass every assert below
+    // vacuously; the workspace has well over ten crates.
     assert!(
-        !toml.contains("dependencies.iceoryx2"),
-        "iceoryx2 deps must be declared inline, not via a `[...dependencies.iceoryx2*]` \
-         table (it escapes the exact-pin scanner)"
+        manifests.len() >= 10,
+        "the manifest walk found only {} Cargo.toml files under {}, so this guard \
+         would pass without checking anything",
+        manifests.len(),
+        crates_dir.display()
     );
-    let deps = toml
-        .split("\n[dependencies]\n")
-        .nth(1)
-        .expect("[dependencies] section present")
-        .split("\n[")
-        .next()
-        .unwrap();
+
     let want = format!("={PIN}");
-    let mut count = 0usize;
-    for line in deps.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    let mut per_crate: BTreeMap<String, usize> = BTreeMap::new();
+    for manifest in &manifests {
+        let name = manifest
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let toml = std::fs::read_to_string(manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        // Force inline form: a `[...dependencies.iceoryx2-*]` TABLE header would
+        // declare the dep outside any line the scanner reads and escape the
+        // exact-pin check (silently unpinned). Reject it so every iceoryx2 dep
+        // stays visible.
+        assert!(
+            !toml.contains("dependencies.iceoryx2"),
+            "{name}: iceoryx2 deps must be declared inline, not via a \
+             `[...dependencies.iceoryx2*]` table (it escapes the exact-pin scanner)"
+        );
+        // Every dependency table counts, including `dev-dependencies`,
+        // `build-dependencies` and the target-gated forms: each of them pulls a
+        // version into the same lock.
+        let mut in_deps = false;
+        let mut count = 0usize;
+        for line in toml.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_deps = line.ends_with("dependencies]");
+                continue;
+            }
+            if !in_deps || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let dep = line.split([' ', '=']).next().unwrap_or("");
+            if dep.starts_with("iceoryx2") {
+                count += 1;
+                assert_eq!(
+                    dep_version(line),
+                    Some(want.as_str()),
+                    "{name}: iceoryx2 dep `{dep}` must be exact-pinned `{want}` \
+                     (version skew): `{line}`"
+                );
+            }
         }
-        let name = line.split([' ', '=']).next().unwrap_or("");
-        if name.starts_with("iceoryx2") {
-            count += 1;
-            assert_eq!(
-                dep_version(line),
-                Some(want.as_str()),
-                "iceoryx2 dep `{name}` must be exact-pinned `{want}` (version skew): `{line}`"
-            );
+        if count > 0 {
+            per_crate.insert(name, count);
         }
     }
+
     // iceoryx2 + iceoryx2-log + the 20-crate sub-family = 22
-    // (`iceoryx2-bb-flatbuffers` joined the family in 0.10.0).
+    // (`iceoryx2-bb-flatbuffers` joined the family in 0.10.0). `cerulion_core`
+    // is the crate that carries the whole family; the others declare the top
+    // level crate only.
+    let core = per_crate
+        .get("cerulion_core")
+        .copied()
+        .unwrap_or_else(|| panic!("cerulion_core declares no iceoryx2 dep; found {per_crate:?}"));
     assert!(
-        count >= 22,
-        "expected the full iceoryx2 family exact-pinned (>=22), found {count}"
+        core >= 22,
+        "expected the full iceoryx2 family exact-pinned in cerulion_core (>=22), found {core}"
+    );
+    // The other declaring crates are the reason this walk exists; losing them
+    // would quietly narrow the guard back to one manifest.
+    assert!(
+        per_crate.len() >= 2,
+        "only cerulion_core declares iceoryx2, which contradicts the workspace layout \
+         this guard was widened for; found {per_crate:?}"
     );
 }
 
@@ -109,32 +161,19 @@ fn iceoryx2_family_resolves_to_single_version() {
             panic!("workspace Cargo.lock unreadable in-repo (skew guard would be inert): {e}")
         }
     };
-    let mut versions: BTreeMap<String, String> = BTreeMap::new();
-    let mut pending: Option<String> = None;
-    for line in text.lines() {
-        let l = line.trim();
-        if let Some(n) = l.strip_prefix("name = \"") {
-            pending = Some(n.trim_end_matches('"').to_string());
-        } else if let Some(v) = l.strip_prefix("version = \"") {
-            if let Some(n) = pending.take() {
-                if n.starts_with("iceoryx2") {
-                    versions.insert(n, v.trim_end_matches('"').to_string());
-                }
-            }
-        }
-    }
+    let versions = iceoryx2_versions(&text);
     assert!(
         !versions.is_empty(),
         "no iceoryx2 packages found in lockfile"
     );
-    let distinct: BTreeSet<&String> = versions.values().collect();
+    let distinct: BTreeSet<&str> = versions.iter().map(|(_, v)| v.as_str()).collect();
     assert_eq!(
         distinct.len(),
         1,
         "iceoryx2 family must resolve to ONE version (skew guard); got {versions:?}"
     );
     assert_eq!(
-        versions.values().next().unwrap(),
+        *distinct.iter().next().unwrap(),
         PIN,
         "iceoryx2 family must be pinned at {PIN}"
     );
@@ -183,8 +222,8 @@ fn every_committed_lockfile_resolves_the_family_to_the_pin() {
             // A lockfile with no iceoryx2 at all is not a skew risk.
             continue;
         }
-        let distinct: BTreeSet<&String> = versions.values().collect();
-        if distinct.len() != 1 || versions.values().next().map(String::as_str) != Some(PIN) {
+        let distinct: BTreeSet<&str> = versions.iter().map(|(_, v)| v.as_str()).collect();
+        if distinct.len() != 1 || distinct.iter().next().copied() != Some(PIN) {
             offenders.push(format!("{}: {versions:?}", lock.display()));
         }
     }
@@ -218,9 +257,14 @@ fn collect_lockfiles(dir: &PathBuf, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every `iceoryx2*` package in a lockfile, as name to version.
-fn iceoryx2_versions(text: &str) -> BTreeMap<String, String> {
-    let mut versions = BTreeMap::new();
+/// Every `iceoryx2*` package in a lockfile, as `(name, version)` PAIRS.
+///
+/// A set of pairs rather than a map keyed by name, because a lockfile can carry
+/// the same package at two versions and that is exactly the skew this file
+/// guards: keyed by name, the second row overwrites the first and the split
+/// disappears from the very data the guard reads.
+fn iceoryx2_versions(text: &str) -> BTreeSet<(String, String)> {
+    let mut versions = BTreeSet::new();
     let mut pending: Option<String> = None;
     for line in text.lines() {
         let l = line.trim();
@@ -229,7 +273,7 @@ fn iceoryx2_versions(text: &str) -> BTreeMap<String, String> {
         } else if let Some(v) = l.strip_prefix("version = \"") {
             if let Some(n) = pending.take() {
                 if n.starts_with("iceoryx2") {
-                    versions.insert(n, v.trim_end_matches('"').to_string());
+                    versions.insert((n, v.trim_end_matches('"').to_string()));
                 }
             }
         }

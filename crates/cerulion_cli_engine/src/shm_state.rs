@@ -4428,8 +4428,8 @@ mod tests {
             offenders.is_empty(),
             "the `.shm_state` evidence rule lives in ONE module (`shm_state.rs`) and every \
              caller routes through `classify` / `scan` / `reclaim_at_exit` / `creator_verdict` \
-             (the last is the orphan port-tag reclaim's entry point: a (pid, creation) verdict \
-             by this module's own predicate, so that reclaim carries no copy). Found:\n  {}",
+             (the last hands out a (pid, creation) verdict by this module's own predicate, so a \
+             caller that needs one carries no copy of the rule). Found:\n  {}",
             offenders.join("\n  ")
         );
 

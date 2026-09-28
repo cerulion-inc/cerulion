@@ -155,3 +155,115 @@ fn pump_history_is_harmless_noop_when_history_disabled() {
         "history-disabled publisher must replay nothing on pump_history(); got {seqs:?}"
     );
 }
+
+// ============================================================
+// The gate that decides whether a pump drains at all
+// ============================================================
+
+/// A listener count change arms MORE THAN ONE drain.
+///
+/// The gate in `check_subscriber_events` is edge triggered on
+/// `number_of_listeners()`, and it deliberately arms a BUDGET rather than a
+/// single drain: the count rises when a subscriber's listener is created and
+/// the `SubscriberConnected` notify lands after it, so one gated drain could
+/// fall inside that window and see nothing. Nothing pinned the budget, so
+/// shrinking it to one, which removes exactly that behaviour, was green.
+///
+/// A publisher with no subscriber yet is the clean stage: the first pass sees
+/// the count move off its `usize::MAX` sentinel to one (the publisher's own
+/// listener) and arms, and no transition is pending to spend the arming early,
+/// so the budget is observable by counting the passes it survives.
+#[test]
+fn a_listener_count_change_arms_more_than_one_drain() {
+    let topic = unique_topic("arming_budget");
+
+    let tt = cerulion_core::testing::TestTransport::with_buffer_size(8);
+    let mut publisher = tt.publisher(&topic, MaxSliceLen::const_new(256), 3);
+
+    // One pass: the count moves off the sentinel, the budget is armed, and this
+    // pass spends one of it. No subscriber exists, so no transition is drained.
+    publisher.pump_history();
+    let after_first = publisher.self_drains_armed_for_test();
+    assert!(
+        after_first > 1,
+        "a listener count change must arm a BUDGET of drains, not one: after \
+         the pass that observed the change {after_first} remained armed"
+    );
+
+    // Spend it down and count the passes. A budget of one would be exhausted by
+    // the first pass above and this loop would run zero times.
+    let mut passes = 1_u32;
+    while publisher.self_drains_armed_for_test() > 0 {
+        publisher.pump_history();
+        passes += 1;
+        assert!(
+            passes < 10_000,
+            "the arming budget is not being spent: {passes} passes and \
+             {} still armed",
+            publisher.self_drains_armed_for_test()
+        );
+    }
+    assert!(
+        passes > 1,
+        "the budget must survive more than the pass that armed it; it was \
+         exhausted after {passes}"
+    );
+}
+
+/// A net zero listener swap on a quiescent publisher still delivers history.
+///
+/// This is the interleaving the call budget alone cannot cover, staged exactly:
+///
+/// 1. a subscriber attaches, is serviced, and the observed transition spends
+///    the whole arming budget (asserted below, so the stage is real);
+/// 2. that subscriber detaches and another attaches before the next pass, so
+///    the listener COUNT is unchanged and the edge triggered gate never fires;
+/// 3. the new subscriber's `SubscriberConnected` sits in the publisher's
+///    listener with nothing left to drain it.
+///
+/// On a publisher that still sends, iceoryx2 rescues this itself: `send_sample`
+/// calls `update_connections`, which delivers history to every newly connected
+/// subscriber. On a QUIESCENT publisher there is no send, so without a time
+/// bound the late joiner waits for the count to move again, which on a quiet
+/// topic may be never. The idle deadline is what closes it, and this arm fails
+/// the moment that deadline is removed from `pump_history`.
+#[test]
+fn a_net_zero_listener_swap_still_delivers_history_once_the_idle_deadline_passes() {
+    let topic = unique_topic("net_zero_swap");
+
+    let tt = cerulion_core::testing::TestTransport::with_buffer_size(8);
+    let mut publisher = tt.publisher(&topic, MaxSliceLen::const_new(256), 3);
+    for x in [10.0_f64, 20.0, 30.0] {
+        publish_vec3(&mut publisher, x);
+    }
+
+    // Stage 1: the first joiner is serviced, and that observed transition
+    // zeroes the budget. Every later pass is the cheap load until the count
+    // moves again.
+    let first = tt.subscriber(&topic);
+    publisher.pump_history();
+    assert_eq!(
+        publisher.self_drains_armed_for_test(),
+        0,
+        "servicing the first joiner must spend the arming, otherwise the swap \
+         below is covered by leftover budget and this arm proves nothing"
+    );
+
+    // Stage 2: the swap. The count returns to what the gate last recorded, so
+    // no arming fires, and stage 1 left nothing to spend.
+    drop(first);
+    let mut late = tt.subscriber(&topic);
+
+    // Stage 3: the idle pass, run as if the deadline had elapsed rather than
+    // sleeping for it. This is the ONLY thing that can drain the swap.
+    publisher.pump_history_past_the_idle_deadline_for_test();
+
+    let seqs = drain_all_sequences(&mut late);
+    for expected in [0u32, 1, 2] {
+        assert!(
+            seqs.contains(&expected),
+            "the idle deadline must deliver retained sequence {expected} to a \
+             late joiner that arrived on a net zero listener swap; got {seqs:?}"
+        );
+    }
+}

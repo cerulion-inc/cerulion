@@ -153,6 +153,12 @@ impl ConfigRoot for iceoryx2::config::Config {
     }
 }
 
+/// How long a child may take to print its ready marker before the parent kills
+/// it and fails. Generous, because it covers a cold test binary spawning and
+/// creating iceoryx2 ports under load; it exists to turn a WEDGED child
+/// into a failed job rather than a hung one, not to police normal timing.
+const CHILD_READY_DEADLINE: core::time::Duration = core::time::Duration::from_secs(60);
+
 /// Run an `#[ignore]`d test in THIS binary as a child process over `root`, wait
 /// for it to print `ready_marker`, then KILL it.
 ///
@@ -194,21 +200,51 @@ pub fn kill_child_holding_ports(
         .unwrap_or_else(|e| panic!("spawn the child test `{child_test_name}`: {e}"));
 
     let stdout = child.stdout.take().expect("child stdout is piped");
-    let mut reader = BufReader::new(stdout);
+    // The read runs on a worker so the WAIT can carry a deadline. A child that
+    // DIES before printing closes the pipe and ends the read at once; a child
+    // that stays LIVE and never prints (wedged creating a port, say) leaves
+    // `read_line` blocked forever, and a cap counted in LINES is never reached
+    // because no line ever arrives. The bound that matters here is time, so
+    // that a wedged child fails its job instead of hanging it.
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + CHILD_READY_DEADLINE;
     let mut seen = String::new();
     let mut ready = false;
-    // Bounded: a child that dies before printing closes the pipe, which ends
-    // the loop at once rather than hanging.
-    for _ in 0..4096 {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        seen.push_str(&line);
-        if line.contains(ready_marker) {
-            ready = true;
+    let mut timed_out = false;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            timed_out = true;
             break;
+        }
+        match lines_rx.recv_timeout(left) {
+            Ok(line) => {
+                seen.push_str(&line);
+                if line.contains(ready_marker) {
+                    ready = true;
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                break;
+            }
+            // The worker dropped its sender: the pipe closed, so the child is
+            // gone and no marker is coming.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     if !ready {
@@ -217,9 +253,15 @@ pub fn kill_child_holding_ports(
         let stderr = out
             .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
             .unwrap_or_default();
+        let why = if timed_out {
+            let secs = CHILD_READY_DEADLINE.as_secs();
+            format!("was still running {secs}s later without printing it")
+        } else {
+            "exited without printing it".to_string()
+        };
         panic!(
-            "the child test `{child_test_name}` never printed `{ready_marker}`, so the \
-             condition under test was never established.\n--- child stdout ---\n{seen}\n\
+            "the child test `{child_test_name}` never printed `{ready_marker}` ({why}), so \
+             the condition under test was never established.\n--- child stdout ---\n{seen}\n\
              --- child stderr ---\n{stderr}"
         );
     }

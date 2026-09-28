@@ -44,7 +44,7 @@
 9 crates/cerulion_cli/src/cli.rs
 1 crates/cerulion_cli/src/completion.rs
 3 crates/cerulion_cli/src/completion_wiring_tests.rs
-37 crates/cerulion_cli/src/main.rs
+36 crates/cerulion_cli/src/main.rs
 12 crates/cerulion_cli_engine/src/account_cmd.rs
 7 crates/cerulion_cli_engine/src/auth.rs
 153 crates/cerulion_cli_engine/src/bag_cmd.rs

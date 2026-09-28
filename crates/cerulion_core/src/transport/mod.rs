@@ -598,7 +598,7 @@ const _: () = assert!(
 /// power-of-two arm belongs to the RESIZABLE segment.
 ///
 /// Every Cerulion data service is `publish_subscribe::<[u8]>()` with the DEFAULT
-/// user header `()` (`iceoryx2-0.9.1/src/service/builder/mod.rs:150`), and
+/// user header `()` (`service/builder/mod.rs`, the `publish_subscribe` entry), and
 /// nothing in this repo calls `.payload_alignment()`, so two of the four terms
 /// vanish — `user_header.size + user_header.alignment - 1 == 0` and
 /// `payload.alignment - 1 == 0` for `u8` — leaving the closed form below.
@@ -606,15 +606,16 @@ const _: () = assert!(
 /// # The header size is READ, never written down
 ///
 /// `IOX2_SAMPLE_HEADER_BYTES` is `size_of::<iceoryx2 publish-subscribe Header>()`
-/// rather than a transcribed `40`, so an iceoryx2 bump that grows the header
-/// moves this rule with it instead of leaving a stale literal behind. (MEASURED
-/// on the pinned 0.9.1: 40 bytes, align 8.)
+/// rather than a transcribed number, so an iceoryx2 bump that grows the header
+/// moves this rule with it instead of leaving a stale literal behind. (The size
+/// the type reports on the pinned release, currently 48 bytes at align 8, is
+/// asserted against a hand value in this module's own tests.)
 ///
 /// # Scope, stated because the number is small
 ///
-/// The gap between this and the nominal slice is **40 bytes per slot** (plus at
+/// The gap between this and the nominal slice is one header per slot (plus at
 /// most 7 of tail padding), not a percentage — a 16 MiB slice really does cost
-/// 16 MiB + 40 B, and any figure claiming ~5 % for that class is a MiB/MB unit
+/// 16 MiB + 48 B, and any figure claiming ~5 % for that class is a MiB/MB unit
 /// confusion (16 MiB *is* 16.78 **MB**). It is nonetheless the difference
 /// between a budget that fits N slots and one that fits N−1: at a 64 MiB budget
 /// a 1 MiB slice admits **63** slots, not 64, and a 16 MiB slice admits **3**,
@@ -1871,6 +1872,13 @@ pub struct LivelinessCleaner {
     call_count: Arc<AtomicU64>,
 }
 
+/// Set the first time a liveliness sweep cannot mint its node, so the cause is
+/// reported loudly once per process and at `debug` afterwards. Process global
+/// rather than per cleaner: one line about a broken sweep is the useful number,
+/// and a cleaner is rebuilt per transport.
+static SWEEP_NODE_FAILURE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl LivelinessCleaner {
     /// Reclaim the stale system resources of all dead iceoryx2 nodes (a
     /// non-blocking `Duration::ZERO` registry scan — `try_cleanup_dead_nodes`).
@@ -1893,12 +1901,33 @@ impl LivelinessCleaner {
         // exists to forbid. A node that cannot be created is the same non-fatal
         // skip a failed cleanup already was.
         let sweep_config = dead_node_sweep::sweep_node_config(&self.config);
-        let Ok(node) = NodeBuilder::new()
+        let node = match NodeBuilder::new()
             .config(&sweep_config)
             .create::<CerService>()
-        else {
-            tracing::trace!("liveliness sweep: dead-node cleanup skipped (no node)");
-            return;
+        {
+            Ok(node) => node,
+            Err(e) => {
+                // Non-fatal, but not silent. A failed cleanup skips ONE dead
+                // node and the next sweep retries it; a node that cannot be
+                // created skips the whole sweep, and if the cause is permanent
+                // it skips every sweep for the life of the process with nothing
+                // to read. So the cause is always carried, and the first
+                // occurrence is loud enough to find.
+                if !SWEEP_NODE_FAILURE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        error = ?e,
+                        "liveliness sweep: could not create the node the dead-node cleanup runs \
+                         from, so no dead node will be reclaimed by this process until it can \
+                         (reported once; later attempts are at debug)"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = ?e,
+                        "liveliness sweep: dead-node cleanup skipped (no node)"
+                    );
+                }
+                return;
+            }
         };
         let state = node.try_cleanup_dead_nodes();
         tracing::trace!(
