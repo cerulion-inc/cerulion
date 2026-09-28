@@ -496,16 +496,43 @@ from its PR-blocking view, so none of the six can credit pull-request coverage i
 provide.
 
 The `changes` job classifies a pull request's changed paths (rules and a
-`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) and
-`deb-smoke` reads one class: a pull request that touches the packaging inputs
-themselves runs the 22-minute Debian and APT smoke instead of skipping it, because
-those are the only pull requests that can break it and "caught on the merge to main"
-means a revert rather than a red check. The direction is the safe one: a class only
-ever makes a job RUN that would otherwise skip, so no rule in that script can weaken a
-gate a pull request has today, and every class is `false` on `push`, `merge_group` and
-`workflow_dispatch`, where there is no pull request to diff. `deb-smoke` keeps its
-`push` run whatever the classifier did: the job is guarded with `!cancelled()`, because
-`needs:` alone would let a failed classifier skip a job that runs unconditionally today.
+`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) into four
+outputs. `packaging` only ever makes a job RUN that would otherwise skip: a pull request
+that touches the packaging inputs themselves runs the 22-minute Debian and APT smoke,
+because those are the only pull requests that can break it and "caught on the merge to
+main" means a revert rather than a red check. `deb-smoke` keeps its `push` run whatever
+the classifier did: the job is guarded with `!cancelled()`, because `needs:` alone would
+let a failed classifier skip a job that runs unconditionally today.
+
+`code`, `docs` and `pkgs` are the test-impact selection, and they run in the other
+direction: they SKIP test steps. Four rules bound them.
+
+* PULL REQUESTS ONLY. On `push`, `merge_group` and `workflow_dispatch` every package is
+  selected. The queue run is the last gate before `main` and the one place a miss has no
+  later catch.
+* ONE OFF SWITCH. The repository variable `CI_SELECTION` reaches the classifier through
+  the workflow-level `env:` block; `off`, and any value the classifier does not know,
+  selects every package. Nothing else may read it: a step is gated on the classifier's
+  OUTPUT, never on the variable, and `ci_test_coverage_test` refuses any other shape.
+* STEPS, NEVER JOBS. Every job still runs and still reports its own required context. A
+  gated step carries the one condition the coverage walk credits,
+  `contains(fromJSON(needs.changes.outputs.pkgs), '<package>')`, and a companion step
+  under the exact negation of that condition prints one line beginning `selection:`, so
+  the log says what was skipped and why.
+* THE SELECTION IS WIDER THAN CARGO. `pkgs` is the reverse cargo dependency closure over
+  normal, build and dev edges UNIONED with the observation edges in
+  `tools/ci/observation_edges.tsv`: a test that reads another package's tree, walks the
+  repository, or loads an artifact another package builds reaches it without a manifest
+  edge. That table is derived from the sources by
+  `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs`, which fails on a missing row
+  and on a stale one. A package the walk cannot attribute is recorded as observing `all`,
+  is selected on every change, and no step of it is gated: four packages are in that state
+  today, `cerulion_core` among them, which is why the `cerulion_core` shard steps carry no
+  condition at all.
+
+The supported subset, stated plainly: the selection narrows PER-PACKAGE test steps on pull
+requests. It does NOT narrow the workspace build, it does not gate a job, it does not apply
+to any event but `pull_request`, and it never removes a required status context.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.
