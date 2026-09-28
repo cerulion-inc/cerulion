@@ -84,15 +84,20 @@ def added_lines(diff_text):
     path = None
     line_number = 0
     in_hunk = False
+    in_header = False
     for raw in diff_text.splitlines():
-        if raw.startswith("+++ "):
+        if raw.startswith("diff --git "):
+            # A file's header opens here and runs to that file's first `@@`.
+            in_header = True
+            in_hunk = False
+            path = None
+            continue
+        if in_header and raw.startswith("+++ "):
             target = raw[4:].strip()
             # `+++ /dev/null` is a deletion; `+++ b/<path>` is everything else.
             path = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
-            in_hunk = False
             continue
-        if raw.startswith("--- "):
-            in_hunk = False
+        if in_header and raw.startswith("--- "):
             continue
         if raw.startswith("@@"):
             # `@@ -<old>,<n> +<new>,<m> @@ <heading>`; the heading is context
@@ -109,6 +114,7 @@ def added_lines(diff_text):
                 raise DiffError("check_added_lines: hunk header has no line number: %r" % raw)
             line_number = int(start)
             in_hunk = True
+            in_header = False
             continue
         if not in_hunk:
             continue
@@ -263,6 +269,43 @@ def self_test():
     plain = _hunk("docs/planted.md", ["+A well-formed sentence with a hyphen."])
     arm("a-hyphen-is-not-a-dash", offending_lines(plain) == [],
         "-> %r" % (offending_lines(plain),))
+
+    # A REMOVED LINE IS NOT A FILE HEADER, and this is the arm that matters. A
+    # line whose CONTENT begins `-- ` (a SQL or Lua comment, a signature
+    # separator, a `--` flag in a shell block) is spelled `--- ` in a unified
+    # diff, byte for byte a file header. Read as one it closed the hunk, and
+    # every added line after it in that file escaped the gate: a false green in
+    # the one direction this gate exists to close. MEASURED against the reader
+    # before the fix, on this exact fixture: it reported nothing.
+    removed_marker = _hunk("db/schema.sql",
+                           [" keep",
+                            "--- a comment the change removes",
+                            "+A sentence %s here." % EM_DASH])
+    got = offending_lines(removed_marker)
+    arm("a-removed-line-spelled-like-a-file-header-does-not-close-the-hunk",
+        [(p, n) for p, n, _, _ in got] == [("db/schema.sql", 2)], "-> %r" % (got,))
+    # The other side: the same hunk, same removed line, no dash on the added
+    # one, passes. Without this the arm above is satisfied by a reader that
+    # reports every line of every hunk.
+    clean = _hunk("db/schema.sql",
+                  [" keep", "--- a comment the change removes", "+A plain sentence."])
+    arm("the-same-hunk-without-a-dash-passes", offending_lines(clean) == [],
+        "-> %r" % (offending_lines(clean),))
+    # One hyphen fewer is content too.
+    two = _hunk("db/schema.sql",
+                [" keep", "-- a list item the change removes",
+                 "+A sentence %s here." % EM_DASH])
+    got = offending_lines(two)
+    arm("a-removed-line-opening-with-two-hyphens-does-not-close-the-hunk",
+        [(p, n) for p, n, _, _ in got] == [("db/schema.sql", 2)], "-> %r" % (got,))
+    # And an ADDED line beginning `++ ` is content too, for the same reason.
+    plus = _hunk("db/schema.sql",
+                 [" keep", "++ an added line %s that opens with two plus signs" % EN_DASH,
+                  "+A sentence %s here." % EM_DASH])
+    got = offending_lines(plus)
+    arm("an-added-line-opening-with-plus-signs-stays-in-the-file",
+        [(p, n) for p, n, _, _ in got] == [("db/schema.sql", 2), ("db/schema.sql", 3)],
+        "-> %r" % (got,))
 
     # A DELETED file's `+++ /dev/null` header contributes no added line, and a
     # hunk heading (the text after the second `@@`) is context, never a line.
