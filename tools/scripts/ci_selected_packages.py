@@ -705,11 +705,14 @@ def self_test():
         got = _run(['leaf'], document_with_watcher)
         arm('cli-without-the-flag-is-the-cargo-closure-alone',
             got == (0, '["leaf", "mid"]\n', ''), '-> %r' % (got,))
+        # Pinned WHOLE, and against the TABLE's path: a refusal that named the
+        # metadata document instead sent the reader to a file that was fine.
         absent_table = os.path.join(scratch, 'absent.tsv')
-        code, out, _ = _run(['--observation-edges', absent_table, 'leaf'],
-                            document_with_watcher)
-        arm('cli-absent-observation-table-refused', (code, out) == (2, ''),
-            '-> %s %r' % (code, out))
+        expected_absent_table = (2, '', 'ci_selected_packages: cannot read %s: %r\n'
+                                 % (absent_table, FileNotFoundError(2, 'No such file or directory')))
+        got = _run(['--observation-edges', absent_table, 'leaf'], document_with_watcher)
+        arm('cli-absent-observation-table-refused-in-full', got == expected_absent_table,
+            '-> %r, wanted %r' % (got, expected_absent_table))
 
         path = os.path.join(scratch, 'metadata.json')
         with open(path, 'w', encoding='utf-8') as handle:
@@ -851,11 +854,23 @@ def run(argv):
     if EVERY_PACKAGE in args.packages and len(args.packages) > 1:
         parser.error('`all` is the whole selection and takes no other package name')
 
+    edges = ()
+    if args.observation_edges:
+        # Read FIRST, and reported against its OWN path: folded into the block
+        # below it borrowed the metadata document's name, and a refusal that
+        # names the wrong file sends the reader to the wrong place.
+        try:
+            edges = read_observation_edges(args.observation_edges)
+        except SelectionError as error:
+            print(error, file=sys.stderr)
+            return 2
+        except OSError as error:
+            print('ci_selected_packages: cannot read %s: %r' % (args.observation_edges, error),
+                  file=sys.stderr)
+            return 2
+
     try:
         document = read_metadata(args.metadata)
-        # The whole workspace is already every observer, so the table is read
-        # only where it can change the answer.
-        edges = read_observation_edges(args.observation_edges) if args.observation_edges else ()
         # No validation call here: `workspace_members` validates, and BOTH
         # branches below reach it, `--all` directly and the closure through
         # `dependents`. A second call was an equivalent mutant, green when
