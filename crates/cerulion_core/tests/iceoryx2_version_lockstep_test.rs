@@ -254,7 +254,12 @@ fn collect_manifests(dir: &PathBuf, depth: usize, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if name == "target" || name == ".git" || name == "node_modules" {
+            // Every dot directory, not just `.git`, which is what the waiver
+            // walk in `upstream_waivers_test` already does. A manifest under
+            // `.cargo`, `.claude` or a tool's cache is not a workspace member,
+            // and the two walks disagreeing about that is how one of them
+            // quietly starts reading something the other never sees.
+            if name == "target" || name == "node_modules" || name.starts_with('.') {
                 continue;
             }
             collect_manifests(&path, depth + 1, out);
@@ -278,7 +283,8 @@ fn collect_lockfiles(dir: &PathBuf, depth: usize, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if name == "target" || name == ".git" || name == "node_modules" {
+            // Same rule as the manifest walk above: any dot directory is tooling.
+            if name == "target" || name == "node_modules" || name.starts_with('.') {
                 continue;
             }
             collect_lockfiles(&path, depth + 1, out);

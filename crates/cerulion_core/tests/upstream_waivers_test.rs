@@ -216,8 +216,15 @@ fn workspace_root() -> PathBuf {
 /// instead of disabling itself. The skip prints its reason, so a build that
 /// starts skipping cannot do it silently.
 fn skip_out_of_workspace() -> bool {
+    // `../../Cargo.toml`, not `../`. `CARGO_MANIFEST_DIR` is
+    // `<repo>/crates/cerulion_core`, so ONE level up is `crates/`, which holds
+    // no manifest at all: the probe then failed its read, judged every build out
+    // of workspace, and every arm gated on it returned immediately and passed.
+    // TWO levels up is the repository root, the manifest that declares
+    // `[workspace]`. The same correction main made to the sibling probe in
+    // `iceoryx2_version_lockstep_test`.
     let in_workspace =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml"))
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
             .map(|t| t.contains("[workspace]"))
             .unwrap_or(false);
     if !in_workspace {
@@ -858,6 +865,46 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
         "libtest list oracle: {checked_arms} waived arm(s) across {checked_binaries} \
          of {} binaries; not built here: {unbuilt:?}",
         by_binary.len()
+    );
+}
+
+/// The skip must NOT fire inside the repository, and this is the arm that makes
+/// a silent one impossible.
+///
+/// A gate that returns early is invisible to libtest: the `eprintln` explaining
+/// the skip is captured and shown only for a FAILING test, so an arm that checks
+/// nothing still prints `ok`. That is exactly what happened, and it took a
+/// `--nocapture` run to see it: the probe read `../Cargo.toml` where the root
+/// manifest is two levels up, so five inventory arms passed in 0.00s having
+/// inventoried nothing.
+///
+/// The anti-vacuity is the ASYMMETRY between two independent facts. One is the
+/// probe under test. The other is whether the repository root is findable at
+/// all, which the lockfile walk answers. A packaged crate has neither; the
+/// repository has both. They may not disagree.
+#[test]
+fn the_out_of_workspace_skip_does_not_fire_inside_the_repository() {
+    let root_is_findable = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .any(|a| a.join("Cargo.lock").exists());
+    if !root_is_findable {
+        eprintln!("skip: no lockfile in any ancestor, so this really is a packaged build");
+        return;
+    }
+    assert!(
+        !skip_out_of_workspace(),
+        "the workspace probe reports an out-of-workspace build while the repository \
+         root IS findable from {}. Every arm gated on that probe is returning early \
+         and passing without inventorying anything.",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    // And the thing the arms actually need: a file named relative to the root
+    // must read back. A probe that says yes while reads fail would be worse than
+    // one that says no.
+    assert!(
+        read_at("crates/cerulion_core/tests/upstream_waivers_test.rs").contains("WAIVED_2034"),
+        "the workspace root resolves but this very file cannot be read back through \
+         it, so every inventory arm would fail for the wrong reason"
     );
 }
 
