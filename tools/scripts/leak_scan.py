@@ -3180,10 +3180,11 @@ def _conversation_condition(path):
 
 
 def _eval_condition(cond, event, login, body):
-    """Evaluate that condition for one synthetic event. Only the operators the
-    condition uses are implemented, and an operator it grows that is not here
-    raises rather than guessing, so the arm fails loudly instead of passing on a
-    condition it did not understand."""
+    """Evaluate that condition for one synthetic event. Only the operators AND
+    the context fields the condition uses are implemented, and anything it grows
+    that is not here raises rather than guessing, so the arm fails loudly instead
+    of passing on a condition it did not understand: a new field read as empty
+    would quietly satisfy every case."""
     if cond is None:
         raise ValueError('no condition')
     ctx = {"github.event_name": event,
@@ -3196,8 +3197,6 @@ def _eval_condition(cond, event, login, body):
             return tok[1:-1]
         if tok in ctx:
             return ctx[tok]
-        if tok.startswith('github.'):
-            return ''
         raise ValueError('unknown token %r' % tok)
 
     def expr(t):
@@ -4816,6 +4815,8 @@ def self_test(out, base_env, argv0):
              True),
             ('an app whose login carries no suffix', 'issue_comment', 'someapp',
              'a summary ' + DASH_EM, True),
+            ('the guard on a body with no marker', 'issue_comment', 'github-actions[bot]',
+             'an ordinary comment ' + DASH_EM, True),
             ('a person quoting the marker', 'issue_comment', 'someone',
              'why did it say <!--leak-guard:issue_comment:1:abc-->', True),
             ('an issue body', 'issues', '', '', True),

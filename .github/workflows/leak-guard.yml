@@ -196,9 +196,6 @@ jobs:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
           REQUIRE: ${{ steps.mode.outputs.require }}
           EVENT_NAME: ${{ github.event_name }}
-          ACTION: ${{ github.event.action }}
-          SENDER_IS_BOT: ${{ endsWith(github.event.sender.login, '[bot]')
-                             || github.event.sender.type == 'Bot' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           BEFORE_SHA: ${{ github.event.before }}
@@ -206,35 +203,34 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          set -euo pipefail
+          # Two scans, and both always run. The COMMIT RANGE and the TITLE keep
+          # the full hard set: a commit message and a title are the author's own
+          # text, and nobody else rewrites them. The BODY is a conversation
+          # surface on every event, like an issue or a comment, because many
+          # hands edit it: a review app appends a summary, the author pushes, and
+          # the body that arrives on `synchronize` is no longer only the author's
+          # writing. Judging it by the full hard set reds a required check over a
+          # dash somebody else left there, which is the defect this workflow is
+          # named for. Under the conversation hard set an address, a home path, a
+          # private name or a closed reference in the body is still a finding and
+          # only the style class steps down.
+          #
+          # `set -e` would stop at the first scan, so both are run with their
+          # status captured and the results combined: a finding in a commit
+          # message must not hide one in the body until the next event.
+          set -uo pipefail
           flags=(--hard ref-unverified)
-          bot_text=no
           if [ "$REQUIRE" = yes ]; then flags+=(--require-private); fi
           case "$EVENT_NAME" in
             pull_request)
               git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
               range="$BASE_SHA..$HEAD_SHA"
-              flags+=(--require-commits)
-              # The title and the body are the AUTHOR's text on opened and on
-              # synchronize, and they stay hard there, dash rule included. An
-              # `edited` event whose sender is a bot is a review app appending to
-              # someone else's text, and reding a required check for a dash a
-              # machine wrote is the defect this workflow fixes on the comment
-              # surface. That text is still SCANNED, below, by the conversation
-              # hard set instead: an address, a home path, a private name or a
-              # closed reference in it is still a finding and only the style
-              # class steps down. Not scanning it at all would let a bot put a
-              # value in a pull request body and pass. A later human edit that
-              # leaves those dashes in place reds, which is right: by then it is
-              # the author's text.
-              if [ "$ACTION" = edited ] && [ "$SENDER_IS_BOT" = true ]; then
-                bot_text=yes
-              else
-                flags+=(--pr-title-env PR_TITLE --pr-body-env PR_BODY)
-              fi
+              flags+=(--require-commits --pr-title-env PR_TITLE)
+              body=yes
               ;;
             merge_group)
               range="$BASE_SHA..$HEAD_SHA"
+              body=no
               ;;
             push)
               if git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
@@ -242,23 +238,25 @@ jobs:
               else
                 range="$AFTER_SHA~1..$AFTER_SHA"
               fi
+              body=no
               ;;
             *)
               range="HEAD~1..HEAD"
+              body=no
               ;;
           esac
+          rc_msg=0
           python3 -B tools/scripts/leak_scan.py messages --range "$range" --format github \
-            ${flags[@]+"${flags[@]}"}
-          # The bot-edited title and body, in a run of their own, because
-          # --conversation is scanner wide and the commit range above keeps the
-          # full hard set. Same private tier, same reference classes; only the
-          # style class steps down.
-          if [ "$bot_text" = yes ]; then
-            pflags=(--conversation --pr-title-env PR_TITLE --pr-body-env PR_BODY
-                    --hard ref-unverified)
-            if [ "$REQUIRE" = yes ]; then pflags+=(--require-private); fi
-            python3 -B tools/scripts/leak_scan.py messages --format github "${pflags[@]}"
+            ${flags[@]+"${flags[@]}"} || rc_msg=$?
+          rc_body=0
+          if [ "$body" = yes ]; then
+            bflags=(--conversation --skip-code --pr-body-env PR_BODY --hard ref-unverified)
+            if [ "$REQUIRE" = yes ]; then bflags+=(--require-private); fi
+            python3 -B tools/scripts/leak_scan.py messages --format github "${bflags[@]}" \
+              || rc_body=$?
           fi
+          echo "commit range and title exited $rc_msg; pull request body exited $rc_body"
+          if [ "$rc_msg" != 0 ] || [ "$rc_body" != 0 ]; then exit 1; fi
 
   media:
     name: Leak guard (media)
@@ -350,7 +348,7 @@ jobs:
       (github.event_name == 'issues' || github.event_name == 'issue_comment'
       || github.event_name == 'pull_request_review_comment')
       && !(github.event.comment.user.login == 'github-actions[bot]'
-           && contains(github.event.comment.body, '<!--leak-guard:'))
+      && contains(github.event.comment.body, '<!--leak-guard:'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # One run at a time per BODY, newest wins. The workflow level group keys on

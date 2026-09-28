@@ -7,7 +7,10 @@ bodies, and the images and clips under `docs/media`. The leak guard is one scann
 names, addresses, home paths, logins, people and location metadata out of all of it.
 It runs in three places: the git hooks on your machine, the `lint` job of the main CI
 workflow, and the `Leak guard` workflow on every pull request, merge queue batch and
-push to `main`, and on every issue and comment body as it is written or edited.
+push to `main`, and on every issue and comment body as it is written or edited. The
+messages job scans in two runs that both always happen and whose results combine: the
+commit range and the pull request title under the full hard set, and the pull request body
+under the conversation hard set.
 
 A body is public the moment it is written and no check runs before it is, so that last
 job cannot block anything. It reads what PEOPLE write: a body whose author is a bot is
@@ -47,8 +50,13 @@ identity field (`uname`, `hostname`, `nodename` and friends) carrying a value; a
 overlay access control tag; the overlay product words in CI files; a reference nobody
 outside this project can open (below); and a style class, en and em
 dashes, whose severity the SURFACE decides: hard in a guard file, a commit message and a
-pull request title, a report on a conversation body. Placeholders such as `/Users/someone/`,
-`/home/ubuntu/` and `robot-a.local` are published vocabularies, never length rules.
+pull request title, a report on a CONVERSATION surface. The conversation surfaces are an
+issue body, an issue comment, a pull request review comment, and a pull request BODY. A
+body is there because many hands edit it: a review app appends a summary, the author
+pushes, and what arrives is no longer only the author's writing, so a dash somebody else
+left must not red a required check. A title is not there, because it is the author's own
+and nobody else rewrites it. Placeholders such as `/Users/someone/`, `/home/ubuntu/` and
+`robot-a.local` are published vocabularies, never length rules.
 
 **Private patterns** never ship. They hold the real names: machine hostnames and short
 names, overlay device names, real LAN addresses, logins, people, the private
