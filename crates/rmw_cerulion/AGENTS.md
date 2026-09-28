@@ -1,7 +1,6 @@
 # rmw_cerulion - agent notes
 
-Runs ROS 2/MoveIt 2 unmodified on zero-copy SHM (cdylib + rlib; tests call the C ABI in-process;
-only `rclpy_xproc_test` proves the `.so`). `cerulion ros2 run/launch` and `ros2:` graph entries
+Runs ROS 2/MoveIt 2 unmodified on zero-copy SHM (cdylib + rlib; tests call the C ABI in-process; only `rclpy_xproc_test` proves the `.so`). `cerulion ros2 run/launch` and `ros2:` graph entries
 stage `RMW_IMPLEMENTATION`.
 
 ## Invariants
@@ -16,19 +15,15 @@ stage `RMW_IMPLEMENTATION`.
 - ROS names are Cerulion names VERBATIM (`/chatter` ⇔ `/chatter/data`; relative refused, no alias); every publisher registers for egress (best-effort), never unregisters.
 - Windowed borrows: NEVER link `cerulion_heaphook` (a 2nd malloc interposer); dlsym per-symbol (`src/heaphook.rs`). Only a thread's FIRST outstanding borrow owns its window; a loan finished on the WRONG thread copies + HOLDS its slot till that thread borrows again (destroy/poisoned LEAKS slot + `PublisherData`: freeing it wedges the dead-node sweep); quarantine retires at slot REUSE, never at publish. Every degrade = the copy path, never a failed publish.
 - NEVER export an entry point whose types a distro's headers lack: cfg the `extern "C"` fn out WHOLE, never stub it (`rmw_absent_export_table_test`, lane `nm` audit).
-- NEVER leave a fixture's `ROS_DISTRO` unset: a post-Jazzy `.so` refuses it (`rmw_era_guard_test`).
+- NEVER strip `ROS_DISTRO` around a fixture: a post-Jazzy `.so` refuses it (`every_ros_distro_strip_is_declared`).
 
 ## Testing
 
-Default `-- --test-threads=1` (SHM singleton, global registries, the one `#[traced_test]`
-subscriber slot - a suite installing it needs its own binary); transport-free bridge/codec suites run
-parallel; the two `*_linux_test` binaries (real `LD_PRELOAD`) and `rclpy_xproc_test` (Jazzy container)
-are `--ignored`. Per-binary map - what each pins, why serial, its fixture prereqs - is the Test map in
-docs/internals/rmw.md; update THAT when a binary is added, not a list here.
+Default `-- --test-threads=1` (SHM singleton, global registries, the one `#[traced_test]` subscriber slot - a suite installing it needs its own binary); transport-free bridge/codec suites run parallel; the two `*_linux_test` binaries (real `LD_PRELOAD`) and `rclpy_xproc_test` (Jazzy container) are `--ignored`. Per-binary map - what each pins, why serial, its fixture prereqs - is the Test map in docs/internals/rmw.md; update THAT when a binary is added, not a list here.
 
 ## Gotchas
 
-- build.rs bindings: bindgen over ROS headers (`AMENT_PREFIX_PATH`/`CERULION_RMW_SYS_INCLUDE`), else vendored (headerless warns; a SET prefix var with no usable headers ERRORS); `RMW_RET_*` consts shadow bindgen's. Era gate: `wrapper.h` includes, `cerulion_has_*` cfgs + the claim derive from the SELECTED bindings; `era_check.rs` FAILS the build on a claim/fingerprint contradiction or the reserved `vendored-dev` marker; init exports refuse first.
+- build.rs bindings: bindgen over ROS headers (`AMENT_PREFIX_PATH`/`CERULION_RMW_SYS_INCLUDE`), else vendored (headerless warns; a SET prefix var with no usable headers ERRORS); `RMW_RET_*` consts shadow bindgen's. Era gate: `wrapper.h` includes, `cerulion_has_*` cfgs + the claim derive from the SELECTED bindings; `era_check.rs` FAILS the build on a claim/fingerprint contradiction or the reserved marker; init exports refuse first.
 - `install_tracing()` installs the stderr subscriber (`rmw_cerulion=warn,cerulion_core=warn`); never a 2nd.
 - Element-body framing has NO wire version signal: publisher + desk walker deploy TOGETHER; a skew degrades nested arrays to opaque text, never a wrong decode.
 - A forged take's shadow aims container headers INTO a held SHM sample - un-forge before release or `fini`. Only compiled C++: `shim/cppstring_shim.cpp`.

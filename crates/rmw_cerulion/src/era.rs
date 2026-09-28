@@ -1636,6 +1636,21 @@ mod tests {
         }
     }
 
+    /// The unset-distro refusal paragraph a user reads, TYPED HERE, word for
+    /// word, so the arms below judge the emitted text against something the
+    /// code under test cannot move. A deliberate rewrite updates this literal
+    /// and its twin in `tests/rmw_era_guard_test.rs` in the same commit.
+    const TYPED_UNSET_PARAGRAPH: &str = concat!(
+    "rmw_cerulion: this .so is built for a ROS distro whose introspection layout arrived after Jazzy, ",
+    "and this environment sets no ROS_DISTRO (see missing_env=), so nothing states which distro the ",
+    "process is. Refusing at the named entry point (see entry=) BEFORE touching the caller's memory. ",
+    "From Lyrical on, the introspection MessageMember carries is_rosidl_buffer_ and its stride is 120 ",
+    "bytes against Jazzy's 112, so a process that is really running an earlier distro would have its ",
+    "member array walked at this build's stride and crash at the first typed operation. Source the ",
+    "runtime distro's setup file (see remedy=) so ROS_DISTRO names it, or rebuild rmw_cerulion inside ",
+    "the distro this process runs.",
+    );
+
     /// The claim shapes build.rs can bake for a GENERATED build of a given
     /// era rank, derived from the era tables rather than typed: the
     /// concrete members of that era, plus the `era:<token>` label where the
@@ -1708,6 +1723,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The introspection `MessageMember` stride per era, in bytes, TYPED
+    /// HERE from the upstream layouts `ffi/era_pins.rs` pins at compile time:
+    /// 96 before `fetch_function` (Foxy, Galactic), 112 once it arrives and
+    /// still 112 when `is_key_` takes a padding byte (Humble, Iron, Jazzy),
+    /// 120 when `is_rosidl_buffer_` is appended (Lyrical, Rolling). Indexed
+    /// by era rank, so the table and the rank constants are the same length.
+    const MEMBER_STRIDE_BY_ERA: [(usize, usize); 6] = [
+        (crate::era_check::ERA_FOXY, 96),
+        (crate::era_check::ERA_GALACTIC, 96),
+        (crate::era_check::ERA_HUMBLE, 112),
+        (crate::era_check::ERA_IRON, 112),
+        (crate::era_check::ERA_JAZZY, 112),
+        (crate::era_check::ERA_LYRICAL, 120),
+    ];
+
+    /// The stride the refusal paragraph names as the one that grew.
+    const GREW_TO_STRIDE: usize = 120;
+
+    /// The stride the paragraph names as the one it grew FROM.
+    const GREW_FROM_STRIDE: usize = 112;
+
+    #[test]
+    fn the_unset_distro_bound_is_the_era_whose_member_stride_is_120() {
+        // The SECOND DERIVATION of the bound, and the one that can disagree
+        // with it. The refusal exists because the introspection
+        // MessageMember stride went from 112 bytes to 120, so the first
+        // refusing era is the first era whose stride is 120, read from a
+        // byte-count table typed in this module, never from
+        // `UNSET_DISTRO_REFUSED_FROM_ERA` or from any era name it is defined
+        // as. The product keeps ONE source of the bound; this is the
+        // independent reading of it.
+        let first_grown = MEMBER_STRIDE_BY_ERA
+            .iter()
+            .find(|(_, stride)| *stride == GREW_TO_STRIDE)
+            .map(|(rank, _)| *rank)
+            .expect("no era in the stride table carries the grown stride");
+        assert_eq!(
+            crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA,
+            first_grown,
+            "the unset-distro bound is era rank {} but the first era whose MessageMember stride \
+             is {GREW_TO_STRIDE} bytes is rank {first_grown}. If upstream appended a field in a \
+             NEW era, move MEMBER_STRIDE_BY_ERA here and the pins in ffi/era_pins.rs; if the \
+             product bound moved on purpose, move era_check::UNSET_DISTRO_REFUSED_FROM_ERA. The \
+             two must name one era.",
+            crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA
+        );
+
+        // BOTH SIDES of the byte limit the paragraph rests on: the bound's
+        // own era carries the grown stride, the era one rank below carries
+        // the stride it grew from, and no earlier era carries the grown one
+        // (the bound is the FIRST, not merely one of them).
+        let stride_of = |rank: usize| {
+            MEMBER_STRIDE_BY_ERA
+                .iter()
+                .find(|(r, _)| *r == rank)
+                .map(|(_, stride)| *stride)
+                .unwrap_or_else(|| panic!("the stride table has no era rank {rank}"))
+        };
+        let bound = crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA;
+        assert_eq!(stride_of(bound), GREW_TO_STRIDE, "at the bound");
+        assert_eq!(
+            stride_of(bound - 1),
+            GREW_FROM_STRIDE,
+            "one era below the bound"
+        );
+        for (rank, stride) in MEMBER_STRIDE_BY_ERA {
+            assert_eq!(
+                stride == GREW_TO_STRIDE,
+                rank >= bound,
+                "era rank {rank} carries stride {stride}"
+            );
+        }
+
+        // And the typed table is not free-floating: for the era THIS build
+        // compiles against, its entry equals the real struct's size, the same
+        // number `ffi/era_pins.rs` asserts at compile time. A table typed
+        // wrongly fails here wherever that era is built.
+        let own_rank = match c_introspection_era() {
+            CIntrospectionEra::PreGalactic => crate::era_check::ERA_FOXY,
+            CIntrospectionEra::PreJazzy => crate::era_check::ERA_HUMBLE,
+            CIntrospectionEra::Jazzy => crate::era_check::ERA_JAZZY,
+            CIntrospectionEra::PostJazzy => crate::era_check::ERA_LYRICAL,
+        };
+        assert_eq!(
+            stride_of(own_rank),
+            std::mem::size_of::<crate::ffi::rosidl_typesupport_introspection_c__MessageMember>(),
+            "the stride typed for era rank {own_rank} is not what this build's MessageMember \
+             really lays out; the table above is wrong, or the bindings are mixed-era"
+        );
     }
 
     #[test]
@@ -1791,16 +1897,26 @@ mod tests {
 
     #[test]
     fn the_unset_refusal_text_is_the_paragraph_plus_every_field() {
-        // The message an operator reads, as the WHOLE value: the constant
-        // paragraph and then each structured field, with a real distro name
-        // in the remedy and no placeholder anywhere.
+        // The message an operator reads, as the WHOLE value, BYTE FOR BYTE
+        // against the paragraph TYPED in this module plus each structured
+        // field: a real distro name in the remedy and no placeholder
+        // anywhere. Typed rather than read back from
+        // `UNSET_DISTRO_REFUSAL`, because an expectation built from the
+        // constant admits any rewrite of it.
         let refusal = classify_unset_distro("lyrical", None).expect("lyrical refuses");
         assert_eq!(
             refusal.rcl_error_message(),
             format!(
-                "{UNSET_DISTRO_REFUSAL} baked_ros_distro=lyrical missing_env=ROS_DISTRO \
+                "{TYPED_UNSET_PARAGRAPH} baked_ros_distro=lyrical missing_env=ROS_DISTRO \
                  remedy=source /opt/ros/lyrical/setup.bash"
             )
+        );
+        // The drift pin, stated on its own so a rewrite of the shipped
+        // paragraph names ITSELF rather than only failing the body compare.
+        assert_eq!(
+            UNSET_DISTRO_REFUSAL, TYPED_UNSET_PARAGRAPH,
+            "the shipped unset-distro paragraph changed; update the typed copy in this module \
+             and in tests/rmw_era_guard_test.rs in the same commit, or restore the paragraph"
         );
         // An `era:<token>` claim reports the label it baked and a remedy a
         // shell can run: the label itself is not a distro name.

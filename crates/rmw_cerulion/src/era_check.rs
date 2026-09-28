@@ -1757,11 +1757,13 @@ mod tests {
 
     #[test]
     fn the_unset_distro_bound_is_the_era_that_grew_the_introspection_stride() {
-        // The bound is stated INDEPENDENTLY of the constant: the refusal
-        // exists because the introspection MessageMember grew
-        // `is_rosidl_buffer_`, so the first refusing era must be that
-        // capability's own minimum era, read from the capability table. A
-        // future era that moves the marker moves the bound, or this fails.
+        // A SECOND READING of the bound, not a second derivation of it: this
+        // arm and the bound both resolve to `ERA_LYRICAL`, so what it catches
+        // is a hand edit of either declaration and a future era that moves
+        // the `is_rosidl_buffer` row. The derivation that can genuinely
+        // DISAGREE with the bound is the stride table in era.rs
+        // (`the_unset_distro_bound_is_the_era_whose_member_stride_is_120`),
+        // which reads the byte counts the refusal paragraph rests on.
         let stride_era = CAPABILITY_MIN_ERA
             .iter()
             .find(|(cap, _)| *cap == "is_rosidl_buffer")
