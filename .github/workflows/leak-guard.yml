@@ -203,17 +203,34 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          set -euo pipefail
+          # Two scans, and both always run. The COMMIT RANGE and the TITLE keep
+          # the full hard set: a commit message and a title are the author's own
+          # text, and nobody else rewrites them. The BODY is a conversation
+          # surface on every event, like an issue or a comment, because many
+          # hands edit it: a review app appends a summary, the author pushes, and
+          # the body that arrives on `synchronize` is no longer only the author's
+          # writing. Judging it by the full hard set reds a required check over a
+          # dash somebody else left there, which is the defect this workflow is
+          # named for. Under the conversation hard set an address, a home path, a
+          # private name or a closed reference in the body is still a finding and
+          # only the style class steps down.
+          #
+          # `set -e` would stop at the first scan, so both are run with their
+          # status captured and the results combined: a finding in a commit
+          # message must not hide one in the body until the next event.
+          set -uo pipefail
           flags=(--hard ref-unverified)
           if [ "$REQUIRE" = yes ]; then flags+=(--require-private); fi
           case "$EVENT_NAME" in
             pull_request)
               git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
               range="$BASE_SHA..$HEAD_SHA"
-              flags+=(--require-commits --pr-title-env PR_TITLE --pr-body-env PR_BODY)
+              flags+=(--require-commits --pr-title-env PR_TITLE)
+              body=yes
               ;;
             merge_group)
               range="$BASE_SHA..$HEAD_SHA"
+              body=no
               ;;
             push)
               if git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
@@ -221,13 +238,25 @@ jobs:
               else
                 range="$AFTER_SHA~1..$AFTER_SHA"
               fi
+              body=no
               ;;
             *)
               range="HEAD~1..HEAD"
+              body=no
               ;;
           esac
+          rc_msg=0
           python3 -B tools/scripts/leak_scan.py messages --range "$range" --format github \
-            ${flags[@]+"${flags[@]}"}
+            ${flags[@]+"${flags[@]}"} || rc_msg=$?
+          rc_body=0
+          if [ "$body" = yes ]; then
+            bflags=(--conversation --skip-code --pr-body-env PR_BODY --hard ref-unverified)
+            if [ "$REQUIRE" = yes ]; then bflags+=(--require-private); fi
+            python3 -B tools/scripts/leak_scan.py messages --format github "${bflags[@]}" \
+              || rc_body=$?
+          fi
+          echo "commit range and title exited $rc_msg; pull request body exited $rc_body"
+          if [ "$rc_msg" != 0 ] || [ "$rc_body" != 0 ]; then exit 1; fi
 
   media:
     name: Leak guard (media)
@@ -299,20 +328,27 @@ jobs:
     # in the context of this repository, so the private tier is always here and
     # is always required.
     #
-    # Only the guard's own ask is out of scope, because scanning it would be the
-    # guard reading itself. Every other author is in scope, bots included: a bot
-    # that posts an unopenable reference publishes it exactly as a person does,
-    # and no other job here sees an issue or a comment.
+    # Every author is in scope, bots included. A bot restates a diff and quotes
+    # what it found, so an address, a home path or a closed reference reaches a
+    # public thread through a bot exactly as it does through a person: the one
+    # genuine finding this guard has made was a home path inside a review app's
+    # comment. Skipping bots would give that class away on the surface where it
+    # is most likely to appear.
     #
-    # What keeps a reviewer's prose from reding this job is not who wrote it but
-    # WHERE it is: the scan of a conversation body skips fenced blocks and inline
-    # code spans (--skip-code), because the forge does not turn a reference
-    # inside them into a link either. A quoted example is a quotation; the
-    # reference this guard exists for is the one a reader can follow.
+    # What made bot text unbearable was not the author, it was style classes
+    # counting as hard on a conversation body, so a dash in a machine's prose
+    # bought a label, an ask and a red run. The conversation hard set fixes that
+    # for EVERY author (see CONVERSATION_HARD), which leaves nothing for an
+    # author rule to buy.
+    #
+    # The one body never read is the guard's OWN ask: its account and its marker
+    # together, so the guard cannot read itself, and so a marker pasted by
+    # anybody else is still scanned like any other text.
     if: >-
       (github.event_name == 'issues' || github.event_name == 'issue_comment'
       || github.event_name == 'pull_request_review_comment')
-      && github.actor != 'github-actions[bot]'
+      && !(github.event.comment.user.login == 'github-actions[bot]'
+      && contains(github.event.comment.body, '<!--leak-guard:'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # One run at a time per BODY, newest wins. The workflow level group keys on
@@ -367,7 +403,7 @@ jobs:
             echo "the body was deleted; treating it as clean"
           else
             python3 -B tools/scripts/leak_scan.py messages --require-private --format github \
-              --skip-code --body-env LG_BODY --body-label "$label" \
+              --conversation --skip-code --body-env LG_BODY --body-label "$label" \
               --hard-classes-file "$classes" || rc=$?
           fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
@@ -399,10 +435,16 @@ jobs:
           LG_BODY: ${{ github.event.comment.body || github.event.issue.body }}
         run: |
           set -euo pipefail
-          if [ "$RC" = 3 ]; then
-            echo "::error ::the leak guard could not run on this body"
-            exit 1
-          fi
+          # 0 is clean and 1 is a finding. Everything else, a usage error at 2, a
+          # missing interpreter at 127, a signal, is a scan that did not happen,
+          # and a scan that did not happen must never reach the label and the ask
+          # with an empty classes file and tell an author their text carries
+          # something it did not find.
+          case "$RC" in
+            0|1) ;;
+            *) echo "::error ::the leak guard could not run on this body (exit $RC)"
+               exit 1 ;;
+          esac
           # The marker names the surface and digests the text that was refused,
           # so one body is asked once however often it is rescanned, and an edit
           # that leaves the reference in place is a new ask.
