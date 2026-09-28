@@ -318,8 +318,11 @@ const CURRENT_DERIVED_COUNTS: &[&str] = &["1.11 M", "1_110_780", "139"];
 /// The claim is made of TWO parts, the range and the word, and this asks for both
 /// rather than for one spelling of the sentence that joins them. Every range
 /// spelling is bound against a number boundary on its LEADING edge, which is the
-/// edge that does the work here: it is what keeps `14+` and `240 and above`,
-/// which reserve a range nothing here mints, from being swept up with it. Three
+/// edge that does the work here: it is what keeps `14+` and `24 and above`,
+/// which reserve a range nothing here mints, from being swept up with it. Both
+/// examples are ones the bound actually saves, which the earlier `240 and above`
+/// was not: `4 and above` does not occur in that string at all, so a plain
+/// substring search already misses it and the bound is never consulted. Three
 /// of the four are bound on the trailing edge too; the `and above` spelling is
 /// bound in front only, because what follows it is a word rather than a digit
 /// and a bound there would buy nothing.
@@ -338,14 +341,15 @@ fn reserves_everything_from(line: &str, first: &str) -> bool {
 /// Does this lowercased line NAME the range running upward from `first`?
 ///
 /// Three spellings, the last written with and without its space. That is wider
-/// than one wording and NARROWER than the claim, which is the honest way to read
-/// it: `4 and up`, `4 or higher` and `4 onward` reserve the same range in the
-/// same breath and every one of them walks through. The first of those is not
-/// merely unread, it is deliberately ABSENT and that is a stated residual rather
-/// than an oversight: `state_ring.rs` says "its own doc already reserved 4 and
-/// up for" in the PAST tense, recording what the previous format's doc claimed,
-/// and a detector that reads that history as a live reservation reds a correct
-/// tree. The other two are unread and nothing here forces them to stay so.
+/// than one wording and NARROWER than the claim, and the doc says so because it
+/// is what is true of the detector: `4 and up`, `4 or higher` and `4 onward`
+/// reserve the same range in the same breath and every one of them walks
+/// through. The first of those is not merely unread, it is deliberately ABSENT,
+/// and that is a stated residual rather than an oversight: `state_ring.rs` says
+/// "its own doc already reserved 4 and up for" in the PAST tense, recording
+/// what the previous format's doc claimed, and a detector that reads that
+/// history as a live reservation reds a correct tree. The other two are unread
+/// and nothing here forces them to stay so.
 fn names_the_range_from(lower: &str, first: &str) -> bool {
     contains_token(lower, &format!("{first}+"), is_number_char)
         || starts_a_token(lower, &format!("{first} and above"), is_number_char)

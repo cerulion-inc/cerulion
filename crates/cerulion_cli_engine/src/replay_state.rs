@@ -126,6 +126,12 @@ pub enum AnchorReadRefusal {
     /// what the manifest proves. A manifest naming no state record format is a
     /// recording from before the key existed, and telling its operator that its
     /// records carry a rank is the same false sentence one bag population over.
+    ///
+    /// COMPATIBILITY: this variant GAINED the `state_record_format` field.
+    /// [`AnchorReadRefusal`] is public and is not `non_exhaustive`, so a struct
+    /// pattern on this variant written outside this crate must now name the new
+    /// field or end in `..`; a pattern that named only `rings` stops compiling.
+    /// Matching the variant by path, or binding it whole, is unaffected.
     #[error(
         "this recording drained {rings} state rings. From state record format version 1 a state \
          record carries its producer's rank and the coverage manifest carries the ring to rank \
@@ -1215,39 +1221,60 @@ mod tests {
     }
 
     /// The record format gate fires BEFORE a single record is opened, and the
-    /// witness is a report the walk cannot help leaving behind.
+    /// witness is a line the walk writes as it opens its first one.
     ///
     /// The assertion above it pins the DERIVATION: the version decision is
     /// taken from the manifest, so a reader that derived it from the record
     /// stream fails there. It cannot pin the PLACEMENT, and that is a gap
-    /// rather than a quibble. A gate moved to the very end of the function,
-    /// walking every record first and asking the manifest afterwards, returns
-    /// the IDENTICAL error value: no count and no marker rides the `Err` path,
-    /// so the two placements cannot be told apart by what the reader RETURNS.
+    /// rather than a quibble. A gate moved past the walk, asking the manifest
+    /// only once every record has been opened, returns the IDENTICAL error
+    /// value: no count and no marker rides the `Err` path, so the two
+    /// placements cannot be told apart by what the reader RETURNS.
     ///
-    /// They can be told apart by what the walk LEAVES BEHIND. Records whose
-    /// node index no manifest entry names are reported by name once they are
-    /// resolved against the index table, and that table is built one line
-    /// under the gate. So a reader that refused first cannot have written that
-    /// report, and a reader that walked first cannot have withheld it.
+    /// They are told apart by what the walk WRITES. The FIRST record this arm
+    /// hands the reader is one no format has minted, so the assembler
+    /// classifies it as malformed and the reader logs it BY RECORD, inside the
+    /// loop, on the first pass through it. A reader that refused first cannot
+    /// have written that line, and a reader that opened one record cannot have
+    /// withheld it, so no deferral past the first record survives it.
+    ///
+    /// The unattributable report is asserted beside it and is the WEAKER of the
+    /// two, which is said here rather than left to be found: that report is
+    /// written ONCE at the end of the walk out of a counter, so a gate deferred
+    /// to just above it withholds it exactly as the committed placement does
+    /// and would pass on that assertion alone.
+    ///
+    /// WHAT THIS DOES NOT DISTINGUISH, and the one deferral it does not: any
+    /// placement between the ambiguity refusal and the first record being
+    /// opened. A gate sitting under the index table, or immediately above the
+    /// walk, opens no record either and passes every assertion here. The
+    /// reader's own comment at the gate claims more than that, since it says
+    /// the gate fires before the index table is built and before the assembler
+    /// exists, and this test pins neither of those two halves.
     ///
     /// A bag with NO records, or one whose message stream is unreadable, does
-    /// not separate them: the reader's unreadable-stream arm is the only early
-    /// exit under the gate, and it is not reachable from a bag a test can
-    /// craft, because building the message stream cannot fail and a bad stream
-    /// reports itself on its FIRST ITEM, which ends the walk at the same final
-    /// answer. The report is the seam that does separate them.
+    /// not separate the placements at all: the reader's unreadable-stream arm
+    /// is the only early exit under the gate, and it is not reachable from a
+    /// bag a test can craft, because building the message stream cannot fail
+    /// and a bad stream reports itself on its FIRST ITEM, which ends the walk
+    /// at the same final answer. What the walk writes is the seam that does
+    /// separate them.
     ///
     /// The control runs SECOND on purpose: an absence proves nothing until the
-    /// same records under an admitted manifest do write the line looked for.
+    /// same records under an admitted manifest do write the lines looked for.
     #[test]
     #[tracing_test::traced_test]
     fn the_record_format_gate_fires_before_a_single_record_is_opened() {
-        // Records this build reads perfectly well, keyed to indices the
-        // manifest names nowhere. Under an admitted manifest each one is
-        // resolved, missed, and counted.
-        let orphans = vec![this_format_record(9), this_format_record(11)];
-        let refusal = craft_and_read(&manifest_json(Some("2"), 1), &orphans)
+        // FIRST a record this build cannot key at any version, so a walk that
+        // opens it must say so on the spot; THEN two records this build reads
+        // perfectly well, keyed to indices the manifest names nowhere, which
+        // under an admitted manifest are resolved, missed and counted.
+        let mixed = vec![
+            unreadable_record(),
+            this_format_record(9),
+            this_format_record(11),
+        ];
+        let refusal = craft_and_read(&manifest_json(Some("2"), 1), &mixed)
             .expect_err("a later format is refused whatever its records hold");
         assert_eq!(
             refusal,
@@ -1263,24 +1290,41 @@ mod tests {
                 && text.contains("state record format version 1"),
             "and the sentence names BOTH versions: {text}"
         );
+        // THE PLACEMENT ASSERTION, and it is the PER RECORD line: a reader that
+        // opened even its first record wrote this one, whatever it returned
+        // afterwards, so every deferral past that point is caught here.
+        assert!(
+            !logs_contain("could not be keyed"),
+            "the gate returned before the walk opened a single record, so the \
+             per record line for the unkeyable one cannot have been written"
+        );
+        // The weaker companion, and it is kept for the walk it describes rather
+        // than for the placement: a gate deferred to just above this report
+        // would withhold it too, so it does not stand on its own.
         assert!(
             !logs_contain("no manifest entry names"),
-            "the gate returned before the index table existed, so no record was \
-             resolved against it and the unattributable report cannot have been \
-             written"
+            "and no end of walk report either"
         );
 
         // THE CONTROL: the same records under a manifest this build admits.
-        let read_them = craft_and_read(&manifest_json(Some("1"), 1), &orphans)
+        let read_them = craft_and_read(&manifest_json(Some("1"), 1), &mixed)
             .expect("the same records at this build's version are read");
         assert_eq!(
+            read_them.malformed_records, 1,
+            "the walk really does open the unkeyable record: {read_them:?}"
+        );
+        assert_eq!(
             read_them.unattributable_records, 2,
-            "the walk really does resolve these records and miss: {read_them:?}"
+            "and really does resolve the other two and miss: {read_them:?}"
+        );
+        assert!(
+            logs_contain("could not be keyed"),
+            "so the per record absence above is this reader not walking, rather \
+             than this test not looking"
         );
         assert!(
             logs_contain("no manifest entry names"),
-            "so the absence above is this reader not walking, rather than this \
-             test not looking"
+            "and the same for the end of walk report"
         );
     }
 
