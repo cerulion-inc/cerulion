@@ -196,6 +196,23 @@ fn run_and_stop(
     }
     std::thread::sleep(Duration::from_secs(3));
 
+    // REAP FIRST, then signal. `signal_live_process` reads liveness with
+    // `kill`, and a run that exited during the sleep above is a ZOMBIE until
+    // its parent collects it: `kill` still lands on a zombie, so the liveness
+    // assert would pass on a run that was already over. `try_wait_noting`
+    // collects that child (and notes the live worker set while there is still
+    // one to note), which turns an early exit into the failure below instead
+    // of a silently vacuous signal.
+    assert!(
+        guard
+            .try_wait_noting()
+            .expect("polling the graph run for an early exit must not fail")
+            .is_none(),
+        "the graph run (mode={mode:?}, extra={extra:?}) exited on its own before the SIGINT, \
+         so nothing below exercises the signal path\nstdout:\n{}\nstderr:\n{}",
+        read_file(&stdout_path),
+        read_file(&stderr_path)
+    );
     // ALIVE, not merely signalled. A run that exited on its own before this
     // point satisfies `wait_bounded`, `status.success()` and every log assert
     // below without ever receiving the SIGINT, so the arm would be reporting a

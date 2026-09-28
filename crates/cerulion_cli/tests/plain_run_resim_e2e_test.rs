@@ -3221,15 +3221,26 @@ fn one_rank_capture_resims_and_verifies_under(
         // its first step rather than sleeping out a span that a loaded machine
         // would spend doing nothing.
         await_the_worker_has_published(&format!("/{prefix}/ticker/cmd"), FREE_RUN_MID_RUN_FRAMES);
-        // run.json's `gating` label follows the SAME predicate the
-        // worker keys its clock discipline on ("this run mints trace rings"),
-        // so a plain free-run run reads `recorded_wall` -- never `wall`, the
-        // read-only RealClock arm that is now `--no-rings` only -- and a
-        // lockstep run reads `quantum`. Read while the run is LIVE
-        // (`live_run_manifest`: the directory goes on exit). This is the one
-        // place the supervisor's call site is observable, so it is what kills
-        // a call site that hands the classifier `--record`, and what kills a
-        // default that resolved the wrong mode.
+        // run.json's `gating` label is not a second evaluation of the
+        // predicate the worker keys its clock discipline on. The descriptor
+        // is rendered BEFORE dispatch, when no ring exists and the only fact
+        // available is whether rings were asked for, so that first write
+        // carries the INTENT; the supervisor classifies again the moment its
+        // trace plane is decided, off the ring tags it really stamped into
+        // the worker plans, and RE-STAMPS the field (`restamp_run_gating`).
+        // That second read is the same plan field each rank resolves its own
+        // build path from, so the label and every rank's clock discipline
+        // come off ONE fact. A plain free-run run therefore reads
+        // `recorded_wall`, never `wall`, the read-only RealClock arm that is
+        // now `--no-rings` only, and a lockstep run reads `quantum`; a plane
+        // the `/dev/shm` free-space gate refused stamps no tags, every rank
+        // takes the ring-less shape, and the label truthfully reads `wall`.
+        // Read after the mid-run rendezvous above, so the re-stamp has
+        // landed, and while the run is LIVE (`live_run_manifest`: the
+        // directory goes on exit). This is the one place the supervisor's
+        // call site is observable, so it is what kills a call site that hands
+        // the classifier `--record`, and what kills a default that resolved
+        // the wrong mode.
         let run_json = live_run_manifest(&home);
         assert_eq!(
             run_json["gating"],
