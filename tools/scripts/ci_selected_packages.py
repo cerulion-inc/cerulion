@@ -38,20 +38,34 @@ own closure). A package that appears in `packages` without being in
 `workspace_members` is never selected, whatever it depends on, so a document
 produced with or without `--no-deps` gives the same answer.
 
-WHAT THIS CLOSURE PROVES, AND WHAT IT DOES NOT. It is the reverse CARGO
-DEPENDENCY closure over normal, build and dev edges: a package whose tests can
-observe a change through a dependency edge is in the output. A test can also
+WHAT THIS CLOSURE PROVES, AND WHAT IT DOES NOT. On its own it is the reverse
+CARGO DEPENDENCY closure over normal, build and dev edges: a package whose tests
+can observe a change through a dependency edge is in the output. A test can also
 observe another package WITHOUT an edge to it, by opening a path literal into
 that package's tree, by walking the whole repository, or by loading an artifact
-built from it at run time (`dlopen`), and NONE of those classes is covered
-here. One of them is covered elsewhere: the doc-pin walk in
-`crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` pins every test
-binary that opens the shared documentation and tool trees. Cross-crate source
-literals and dlopen fixtures are an OPEN class, and they have to be pinned
-before any CI step is gated on this selection.
+built from it at run time (`dlopen`). Those three classes are derived from the
+test sources by `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` into
+`tools/ci/observation_edges.tsv`, and `--observation-edges` unions them in.
+
+THE UNION IS ONE HOP, and that is the whole of its meaning. An observation edge
+says "run THIS package's tests when that package changes", never "this package
+changed". So an observer is added to the selection and its own dependents are
+NOT: propagating would put every dependent of a whole-tree walker into every
+selection and the answer would be the full workspace on every change. The
+observers are read off the FINISHED cargo closure, not off the touched set, so
+an artifact that changed because one of its dependencies did still pulls in the
+test that loads it.
+
+`all` in the observed column means the observer reached something this walk
+could not attribute to one package: it is selected on every change, and no step
+of it may be gated.
+
+WITHOUT `--observation-edges` the answer is the cargo closure alone. That is what
+the flag's absence means, and it is what the self-test's live rows compare
+against: the two answers differ, which is the proof the edges are live.
 
 Usage:
-  ci_selected_packages.py [--metadata FILE] PACKAGE...
+  ci_selected_packages.py [--metadata FILE] [--observation-edges FILE] PACKAGE...
   ci_selected_packages.py [--metadata FILE] all
   ci_selected_packages.py [--metadata FILE] --all
   ci_selected_packages.py --self-test
@@ -92,6 +106,19 @@ import sys
 import tempfile
 
 METADATA_FORMAT_VERSION = 1
+
+# The observed-column spelling that means EVERY workspace member, and the
+# command-line spelling of the whole selection. One word, one meaning.
+EVERY_PACKAGE = 'all'
+
+# The number of tab-separated fields one row of the observation-edge table
+# carries: observing package, observed package, kind, and the source line that
+# witnesses it.
+OBSERVATION_EDGE_FIELDS = 4
+
+# The committed table, relative to the repository root. Read by the live arm of
+# the self-test; every other caller names its own file.
+OBSERVATION_EDGES_PATH = os.path.join('tools', 'ci', 'observation_edges.tsv')
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -122,6 +149,29 @@ class UnknownPackages(SelectionError):
 
     def __hash__(self):
         return hash((type(self).__name__, self.names, self.members))
+
+
+class MalformedObservationEdges(SelectionError):
+    """A row of the observation-edge table this script cannot read."""
+
+    def __init__(self, path, line_number, found):
+        self.path = path
+        self.line_number = line_number
+        self.found = found
+        super().__init__(str(self))
+
+    def __str__(self):
+        return ('ci_selected_packages: malformed observation edge at %s:%d: %r; every row is '
+                '`observing_package<TAB>observed_package<TAB>kind<TAB>source_file:line`, and '
+                '`%s` in the observed column means the whole workspace'
+                % (self.path, self.line_number, self.found, EVERY_PACKAGE))
+
+    def __eq__(self, other):
+        return type(other) is type(self) and (
+            other.path, other.line_number, other.found) == (self.path, self.line_number, self.found)
+
+    def __hash__(self):
+        return hash((type(self).__name__, self.path, self.line_number, self.found))
 
 
 class UnsupportedMetadata(SelectionError):
@@ -228,8 +278,14 @@ def dependents(document, include_dev=True):
     return table
 
 
-def selected_packages(document, touched, include_dev=True):
-    """The touched packages plus their reverse-dependency closure, sorted."""
+def selected_packages(document, touched, include_dev=True, observation_edges=()):
+    """The touched packages, their reverse-dependency closure, and the observers.
+
+    `observation_edges` is a sequence of `(observing, observed)` pairs, the
+    `observed` half being a package name or `EVERY_PACKAGE`. Each one is read
+    ONCE, against the finished cargo closure, and adds only the observing
+    package: see the module docstring for why the union does not propagate.
+    """
     table = dependents(document, include_dev)
     unknown = set(touched) - set(table)
     if unknown:
@@ -242,7 +298,38 @@ def selected_packages(document, touched, include_dev=True):
             continue
         selected.add(name)
         pending.extend(table[name])
+
+    named = {name for pair in observation_edges for name in pair} - {EVERY_PACKAGE}
+    unknown = named - set(table)
+    if unknown:
+        raise UnknownPackages(unknown, table)
+    for observing, observed in observation_edges:
+        if observed == EVERY_PACKAGE or observed in selected:
+            selected.add(observing)
     return sorted(selected)
+
+
+def read_observation_edges(path):
+    """The `(observing, observed)` pairs of a committed observation-edge table.
+
+    The file is the derived table
+    `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` writes: one row
+    per edge, four tab-separated fields, blank lines and `#` comments skipped.
+    A row this reader cannot parse is a REFUSAL, never a skipped row: a table
+    read as shorter than it is selects fewer packages than the tree demands,
+    which is the silent skip every rule here exists to refuse.
+    """
+    out = []
+    with open(path, encoding='utf-8') as handle:
+        for number, line in enumerate(handle, start=1):
+            line = line.rstrip('\n')
+            if not line.strip() or line.startswith('#'):
+                continue
+            fields = line.split('\t')
+            if len(fields) != OBSERVATION_EDGE_FIELDS or not all(f.strip() for f in fields):
+                raise MalformedObservationEdges(path, number, line)
+            out.append((fields[0], fields[1]))
+    return out
 
 
 def read_metadata(source):
@@ -345,6 +432,91 @@ LOOPS = _document({'solo': ['solo:dev'], 'ping': ['pong:dev'], 'pong': ['ping']}
 # package name, which is what the docstring above claims and nothing exercised.
 RENAMED = _document({'base': [], 'user': ['base=alias']})
 
+# OBSERVATION-EDGE FIXTURES. `watcher` has no cargo edge to anything, and
+# `watcher_user` depends on `watcher`: the pair is what proves the union adds
+# the OBSERVER and stops there. `mid` sits one hop above `leaf`, so an edge onto
+# `mid` proves the observers are read off the finished closure rather than off
+# the touched set.
+OBSERVED = _document({'leaf': [], 'mid': ['leaf'], 'watcher': [], 'watcher_user': ['watcher']})
+
+# One row per KIND the walk derives, written out as the committed table spells
+# them. The selector reads the first two columns; the kind and the witness are
+# carried so a table that grew a column, or lost one, is a refusal rather than a
+# silently shorter selection.
+OBSERVATION_TABLE = '\n'.join([
+    '# a comment, and the blank line below it, are skipped',
+    '',
+    'watcher\tleaf\tcrate-path\tcrates/watcher/tests/a.rs:1',
+    'watcher\tmid\tdlopen\tcrates/watcher/tests/b.rs:2',
+]) + '\n'
+
+# `name | document | touched | edges | expected closure`.
+OBSERVATION_CASES = [
+    # A crate-path edge selects the observer, and NOT the observer's own
+    # dependents: the observer did not change, its tests merely watch.
+    ('observation-edge-selects-the-observer', OBSERVED, ['leaf'],
+     [('watcher', 'leaf')], ['leaf', 'mid', 'watcher']),
+    # The same table WITHOUT the edge, which is the mutant: the observer's
+    # tests do not run, and nothing else says so.
+    ('without-the-edge-the-observer-is-not-selected', OBSERVED, ['leaf'], [],
+     ['leaf', 'mid']),
+    # The edge is read against the FINISHED closure: `mid` is selected because
+    # `leaf` changed, and the test that watches `mid` has to run.
+    ('observation-edge-reads-the-whole-closure', OBSERVED, ['leaf'],
+     [('watcher', 'mid')], ['leaf', 'mid', 'watcher']),
+    # An edge onto a package the closure does not reach adds nothing.
+    ('observation-edge-onto-an-unselected-package-adds-nothing', OBSERVED,
+     ['watcher'], [('mid', 'leaf')], ['watcher', 'watcher_user']),
+    # `all` is every package: the observer rides on any non-empty selection.
+    ('observes-everything-rides-any-selection', OBSERVED, ['leaf'],
+     [('watcher', EVERY_PACKAGE)], ['leaf', 'mid', 'watcher']),
+    ('observes-everything-rides-a-one-package-selection', OBSERVED, ['mid'],
+     [('watcher', EVERY_PACKAGE)], ['mid', 'watcher']),
+    # ...and an EMPTY selection is nothing to observe, so it stays empty. A
+    # classifier that touched no package must not be handed a run.
+    ('observes-everything-adds-nothing-to-an-empty-selection', OBSERVED, [],
+     [('watcher', EVERY_PACKAGE)], []),
+    # Two observers of one package, and an observer of itself (which the walk
+    # never emits, and which must not change the answer either way).
+    ('two-observers-of-one-package', OBSERVED, ['leaf'],
+     [('watcher', 'leaf'), ('watcher_user', 'leaf')],
+     ['leaf', 'mid', 'watcher', 'watcher_user']),
+    ('a-self-edge-adds-nothing', OBSERVED, ['leaf'], [('leaf', 'leaf')],
+     ['leaf', 'mid']),
+]
+
+# `name | document | edges | expected error`. A name the workspace does not
+# carry is a REFUSAL, exactly as it is on the command line: the table and the
+# manifests disagree, and an empty answer would hide it.
+OBSERVATION_ERROR_CASES = [
+    ('observing-package-is-not-a-member', OBSERVED, [('nope', 'leaf')],
+     UnknownPackages(['nope'], ['leaf', 'mid', 'watcher', 'watcher_user'])),
+    ('observed-package-is-not-a-member', OBSERVED, [('watcher', 'gone')],
+     UnknownPackages(['gone'], ['leaf', 'mid', 'watcher', 'watcher_user'])),
+]
+
+# LIVE OBSERVATION ORACLE. Each row is
+# `package: (closure size with the observation edges, closure size without)`,
+# and the two numbers are transcribed BY HAND from an independent measurement
+# run whose log is named below. The two packages are the ones the edges move
+# furthest, which is what makes the row able to fail: a package whose closure
+# already holds every observer would report the same number either way.
+#
+# MEASURED 2026-09-28 on this workspace at 9735bf27fed4930bcb5199106775e198a20f04c1,
+# every one of the 66 members measured both ways in one run, the two largest
+# movers transcribed here by hand from its log:
+# notes/post-launch-2026-09-23/ga-logs/pr-b/selection-measure-20260928T165406Z.log
+#
+#   cerulion_heaphook  with=6 without=1   (three packages name its `.so`)
+#   go2_tf             with=8 without=4
+#
+# Dropping the union from the closure shrinks both, which is the mutant these
+# rows exist to kill.
+LIVE_OBSERVATION_ORACLE = {
+    'cerulion_heaphook': (6, 1),
+    'go2_tf': (8, 4),
+}
+
 # `name | document | touched | dev edges followed | expected closure`.
 CLOSURE_CASES = [
     ('dev-edge-followed', DEV_ONLY, ['leaf'], True, ['leaf', 'user']),
@@ -420,6 +592,18 @@ def self_test():
         got = selected_packages(document, touched, include_dev)
         arm(name, got == expected, '-> %s, wanted %s' % (got, expected))
 
+    for name, document, touched, edges, expected in OBSERVATION_CASES:
+        got = selected_packages(document, touched, observation_edges=edges)
+        arm(name, got == expected, '-> %s, wanted %s' % (got, expected))
+
+    for name, document, edges, expected in OBSERVATION_ERROR_CASES:
+        try:
+            got = selected_packages(document, ['leaf'], observation_edges=edges)
+        except SelectionError as error:
+            arm(name, error == expected, '-> %s, wanted %s' % (error, expected))
+        else:
+            arm(name, False, '-> %s, wanted a refusal' % (got,))
+
     for name, document, touched, expected in ERROR_CASES:
         try:
             got = selected_packages(document, touched)
@@ -480,6 +664,46 @@ def self_test():
         arm(name, (code, out) == (2, ''), '-> %s %r' % (code, out))
 
     with tempfile.TemporaryDirectory() as scratch:
+        # THE TABLE READER, on a file written here: the rows it keeps, and the
+        # rows it refuses. A malformed row is a refusal and never a skip; a
+        # table read as shorter than it is selects fewer packages than the tree
+        # demands.
+        table = os.path.join(scratch, 'observation_edges.tsv')
+        with open(table, 'w', encoding='utf-8') as handle:
+            handle.write(OBSERVATION_TABLE)
+        got = read_observation_edges(table)
+        arm('table-reader-keeps-the-rows-and-skips-comments',
+            got == [('watcher', 'leaf'), ('watcher', 'mid')], '-> %r' % (got,))
+        for case, row in (('too-few-fields', 'watcher\tleaf\tcrate-path\n'),
+                          ('too-many-fields', 'a\tb\tc\td\te\n'),
+                          ('empty-field', 'watcher\t\tcrate-path\tsrc.rs:1\n')):
+            bad = os.path.join(scratch, 'bad.tsv')
+            with open(bad, 'w', encoding='utf-8') as handle:
+                handle.write(row)
+            expected_error = MalformedObservationEdges(bad, 1, row.rstrip('\n'))
+            try:
+                read_observation_edges(bad)
+            except SelectionError as error:
+                arm('table-reader-refuses-%s' % case, error == expected_error,
+                    '-> %s, wanted %s' % (error, expected_error))
+            else:
+                arm('table-reader-refuses-%s' % case, False, '-> no refusal')
+
+        # THE COMMAND LINE, with and without the flag, over the same document:
+        # the two answers differ, which is the proof the flag is wired.
+        document_with_watcher = json.dumps(OBSERVED)
+        got = _run(['--observation-edges', table, 'leaf'], document_with_watcher)
+        arm('cli-unions-the-observation-edges',
+            got == (0, '["leaf", "mid", "watcher"]\n', ''), '-> %r' % (got,))
+        got = _run(['leaf'], document_with_watcher)
+        arm('cli-without-the-flag-is-the-cargo-closure-alone',
+            got == (0, '["leaf", "mid"]\n', ''), '-> %r' % (got,))
+        absent_table = os.path.join(scratch, 'absent.tsv')
+        code, out, _ = _run(['--observation-edges', absent_table, 'leaf'],
+                            document_with_watcher)
+        arm('cli-absent-observation-table-refused', (code, out) == (2, ''),
+            '-> %s %r' % (code, out))
+
         path = os.path.join(scratch, 'metadata.json')
         with open(path, 'w', encoding='utf-8') as handle:
             handle.write(document_text)
@@ -560,6 +784,29 @@ def self_test():
         arm('live-every-member-is-in-its-own-closure',
             all(name in selected_packages(document, [name]) for name in sorted(members)))
 
+        # THE LIVE OBSERVATION ROWS. The fixtures above prove the union does
+        # what it says on documents built by hand; these prove it changes the
+        # answer on THIS workspace, which is the only arm a walk that derived an
+        # empty table could fail.
+        arm('live-observation-oracle-measured', bool(LIVE_OBSERVATION_ORACLE),
+            'LIVE_OBSERVATION_ORACLE is empty: measure the workspace and fill '
+            'it in from the log named beside it')
+        edges = read_observation_edges(os.path.join(REPO_ROOT, OBSERVATION_EDGES_PATH))
+        arm('live-observation-table-is-not-empty', bool(edges),
+            'the committed observation-edge table holds no row, so every row '
+            'below would compare the closure with itself')
+        for name in sorted(LIVE_OBSERVATION_ORACLE):
+            with_edges, without = LIVE_OBSERVATION_ORACLE[name]
+            arm('live-observation-row-moves-%s' % name, with_edges != without,
+                'the row for %s pins the same size with and without the edges, '
+                'so dropping the union would not fail it' % name)
+            got = len(selected_packages(document, [name], observation_edges=edges))
+            arm('live-observation-%s' % name, got == with_edges,
+                '-> %d, wanted %d' % (got, with_edges))
+            got = len(selected_packages(document, [name]))
+            arm('live-observation-%s-without-the-edges' % name, got == without,
+                '-> %d, wanted %d' % (got, without))
+
     for failure in failures:
         print('SELF-TEST FAILED: ' + failure, file=sys.stderr)
     if failures:
@@ -577,6 +824,8 @@ def run(argv):
         description='Print the touched workspace packages plus their reverse-dependency closure.')
     parser.add_argument('--metadata', default='-', metavar='FILE',
                         help='a `cargo metadata --format-version 1` document (default: stdin)')
+    parser.add_argument('--observation-edges', metavar='FILE', dest='observation_edges',
+                        help='a derived observation-edge table to union into the closure')
     parser.add_argument('--all', action='store_true', help='print every workspace member')
     parser.add_argument('--self-test', action='store_true', help='run the self-test and exit')
     parser.add_argument('packages', nargs='*', metavar='PACKAGE',
@@ -584,7 +833,7 @@ def run(argv):
     args = parser.parse_args(argv)
 
     if args.self_test:
-        if args.packages or args.all or args.metadata != '-':
+        if args.packages or args.all or args.metadata != '-' or args.observation_edges:
             parser.error('--self-test takes no other argument')
         return self_test()
 
@@ -592,19 +841,22 @@ def run(argv):
         parser.error('name at least one touched package, or `all`, or pass --all')
     if args.all and args.packages:
         parser.error('--all is the whole selection and takes no package name')
-    if 'all' in args.packages and len(args.packages) > 1:
+    if EVERY_PACKAGE in args.packages and len(args.packages) > 1:
         parser.error('`all` is the whole selection and takes no other package name')
 
     try:
         document = read_metadata(args.metadata)
+        # The whole workspace is already every observer, so the table is read
+        # only where it can change the answer.
+        edges = read_observation_edges(args.observation_edges) if args.observation_edges else ()
         # No validation call here: `workspace_members` validates, and BOTH
         # branches below reach it, `--all` directly and the closure through
         # `dependents`. A second call was an equivalent mutant, green when
         # deleted, which is a check that proves nothing.
-        if args.all or args.packages == ['all']:
+        if args.all or args.packages == [EVERY_PACKAGE]:
             selected = sorted(workspace_members(document))
         else:
-            selected = selected_packages(document, args.packages)
+            selected = selected_packages(document, args.packages, observation_edges=edges)
     except SelectionError as error:
         print(error, file=sys.stderr)
         return 2

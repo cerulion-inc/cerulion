@@ -236,11 +236,12 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &["examples", "tools"],
         &[],
     ),
-    // This walk's own read of the workflow it gates.
+    // This walk's own read of the workflow it gates, and of the committed
+    // observation-edge table it holds to the sources.
     (
         "cerulion_cli_engine",
         "ci_doc_pin_walk_test",
-        &[".github"],
+        &[".github", "tools"],
         &[],
     ),
     // The workflow directory, and the shard runner it names.
@@ -2381,4 +2382,1117 @@ fn a_path_joined_onto_the_crates_own_directory_is_not_a_doc_pin() {
             .into_iter()
             .collect::<BTreeSet<String>>()
     );
+}
+
+// ---------------------------------------------------------------------------
+// OBSERVATION EDGES: what a test observes WITHOUT a cargo dependency edge.
+// ---------------------------------------------------------------------------
+//
+// THE POPULATION. The cargo reverse-dependency closure
+// (`tools/scripts/ci_selected_packages.py`) carries every package whose tests
+// reach another package through a manifest edge. Three classes reach one
+// WITHOUT an edge, and a selection that gates a step without them skips a test
+// the change could have broken:
+//
+//   * a path literal into another member's directory, opened or joined
+//     (`crate-path`);
+//   * a walk over a tree that holds more than one member, or over the
+//     repository root itself (`whole-tree`), which observes EVERY package;
+//   * a `dlopen` of an artifact another member builds, named by its
+//     `lib<name>.so` / `lib<name>.dylib` file name (`dlopen`).
+//
+// FAIL CLOSED. A literal this walk cannot attribute to one package, a path
+// whose package segment is built at run time or an artifact name built at run
+// time, records the observing package as observing `all`: the selector then
+// selects it on every change and no step of it is ever gated. That is the
+// fourth kind, `unattributable`.
+//
+// The rules reuse the doc-pin classifier above, literal for literal: the same
+// blanked views, the same `is_path_position`, the same write-target refusal and
+// the same crate-directory suppression. What differs is only what a literal is
+// compared AGAINST: the workspace member directories rather than the shared
+// trees.
+
+/// The kind column of one row of the committed table.
+const EDGE_CRATE_PATH: &str = "crate-path";
+const EDGE_DLOPEN: &str = "dlopen";
+const EDGE_WHOLE_TREE: &str = "whole-tree";
+const EDGE_UNATTRIBUTABLE: &str = "unattributable";
+
+/// The observed-package spelling that means EVERY workspace member.
+const OBSERVES_EVERYTHING: &str = "all";
+
+/// The committed derived table, relative to the repository root.
+///
+/// Spelled in halves for the reason [`ROOT_MARKDOWN_STEMS`] gives: this walk
+/// reads its own source, and a whole `tools/`-rooted literal here would pin
+/// this binary to a read it does not perform.
+const OBSERVATION_EDGES_DIR: &str = "tools/ci";
+const OBSERVATION_EDGES_NAME: &str = "observation_edges.tsv";
+
+/// The path of the committed table, from the repository root.
+fn observation_edges_path() -> PathBuf {
+    repo_root()
+        .join(OBSERVATION_EDGES_DIR)
+        .join(OBSERVATION_EDGES_NAME)
+}
+
+/// The 1-based line `offset` sits on.
+fn line_at(src: &str, offset: usize) -> usize {
+    src[..offset].matches('\n').count() + 1
+}
+
+/// Every workspace member as `(directory relative to the repository root,
+/// package name)`, longest directory first so a nested member wins over its
+/// parent.
+fn member_directories() -> Vec<(String, String)> {
+    let root = normalised(&repo_root());
+    let mut out: Vec<(String, String)> = workspace_member_dirs()
+        .into_iter()
+        .map(|dir| {
+            let rel = dir
+                .strip_prefix(&root)
+                .unwrap_or_else(|_| panic!("{} is outside the repository", dir.display()))
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, package_name(&dir))
+        })
+        .collect();
+    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// `<artifact stem> -> package name` for every member that builds a `cdylib`.
+///
+/// The stem is the package name with `-` replaced by `_`, which is the name
+/// cargo gives the shared object (`libcerulion_heaphook.so`). Read from the
+/// manifests rather than from `cargo metadata` for the reason
+/// [`workspace_member_dirs`] gives.
+fn cdylib_artifact_stems() -> BTreeMap<String, String> {
+    let root = normalised(&repo_root());
+    let mut out = BTreeMap::new();
+    for (rel, package) in member_directories() {
+        let manifest = root.join(&rel).join("Cargo.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap_or_default();
+        if !manifest_declares_cdylib(&text) {
+            continue;
+        }
+        out.insert(package.replace('-', "_"), package);
+    }
+    out
+}
+
+/// Does this manifest declare a `cdylib` crate type?
+///
+/// The `crate-type` key of any target table, in either TOML list spelling. A
+/// `#` comment line is skipped, so a commented-out crate type declares nothing.
+fn manifest_declares_cdylib(text: &str) -> bool {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("crate-type") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        if rest.contains("cdylib") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is `path` inside, or equal to, the directory `dir`?
+fn is_inside(path: &str, dir: &str) -> bool {
+    if dir.is_empty() {
+        return true;
+    }
+    path == dir || path.starts_with(&format!("{dir}/"))
+}
+
+/// The directories that hold MORE THAN ONE member, plus the repository root.
+///
+/// A literal naming one of these is a walk over a tree that holds several
+/// packages, so the observing package observes all of them.
+fn multi_member_directories(members: &[(String, String)]) -> BTreeSet<String> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (rel, _) in members {
+        let mut parts: Vec<&str> = rel.split('/').collect();
+        while parts.pop().is_some() {
+            *counts.entry(parts.join("/")).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(dir, count)| *count > 1 && !dir.is_empty())
+        .map(|(dir, _)| dir)
+        .collect()
+}
+
+/// `path` with `.` and `..` resolved textually, as a `/`-joined string.
+///
+/// `None` when the path climbs above its base, which names something outside
+/// the repository and is nothing this walk has an opinion about.
+fn normalised_relative(path: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop()?;
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out.join("/"))
+}
+
+/// The artifact stem of a `lib<name>.so` / `lib<name>.dylib` file name.
+fn dlopen_artifact_stem(name: &str) -> Option<&str> {
+    let stem = name
+        .strip_suffix(".so")
+        .or_else(|| name.strip_suffix(".dylib"))?;
+    let stem = stem.strip_prefix("lib")?;
+    (!stem.is_empty()
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    .then_some(stem)
+}
+
+/// One derived edge: what is observed, how, and on which line.
+type SourceEdge = (String, &'static str, usize);
+
+/// Does a literal carrying an interpolation name a member tree or an artifact?
+///
+/// A `{` in a literal means a segment is built at run time. That is only this
+/// walk's business where the literal would otherwise have been attributable:
+/// a segment naming a directory that holds members (`crates/{pkg}/...`), or a
+/// file name shaped like a shared object (`lib{name}.so`). Anything else is an
+/// ordinary run-time path, almost always inside a scratch directory, and is a
+/// stated limit rather than a refusal.
+fn interpolated_literal_is_unattributable(literal: &str, multi: &BTreeSet<String>) -> bool {
+    if !literal.contains('{') {
+        return false;
+    }
+    let last = literal.rsplit('/').next().unwrap_or(literal);
+    if last.starts_with("lib") && (last.ends_with(".so") || last.ends_with(".dylib")) {
+        return true;
+    }
+    literal
+        .split('/')
+        .any(|segment| !segment.is_empty() && multi.contains(segment))
+}
+
+/// The literal texts a chain of `.join("...")` calls carries in FRONT of the
+/// literal that opens at `at`.
+///
+/// `root.join("crates").join("cerulion_core").join("tests")` reaches this walk
+/// as three separate literals, and the LAST of them is the only one whose
+/// classification can see the whole path. Without the chain the first literal
+/// reads as a walk over the whole `crates` tree and the package is never
+/// attributed.
+///
+/// Read from the view that KEPT literal bodies, because the previous link's
+/// text is a literal; comments are blanked there, so a chain spelled inside one
+/// joins nothing. A chain this reader cannot follow yields the links it did
+/// follow, which classifies a SHORTER path: the over-inclusive direction.
+fn join_chain_prefix(code_with_literals: &str, at: usize) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut end = code_with_literals[..at].trim_end().len();
+    while parts.len() < 16 {
+        let head = &code_with_literals[..end];
+        let Some(head) = head.strip_suffix(".join(") else {
+            break;
+        };
+        let head = head.trim_end();
+        let Some(head) = head.strip_suffix(')') else {
+            break;
+        };
+        let head = head.trim_end();
+        let Some(head) = head.strip_suffix('"') else {
+            break;
+        };
+        let Some(open) = head.rfind('"') else {
+            break;
+        };
+        // The text in FRONT of the literal has to be the link's own `.join(`.
+        // Without this the walk steps straight past a receiver that merely ENDS
+        // in a call carrying a literal, `Path::new(env!("CARGO_MANIFEST_DIR"))`
+        // above all, and splices the environment variable's NAME onto the front
+        // of the path.
+        if !head[..open].ends_with(".join(") {
+            break;
+        }
+        parts.push(head[open + 1..].to_string());
+        end = open;
+    }
+    parts.reverse();
+    parts
+}
+
+/// The calls whose argument a repository-root path can be WITHOUT the source
+/// walking the tree.
+///
+/// Each of these reads the root as a VALUE (a prefix to strip, a string to
+/// print), never as a directory to enumerate. Anything else that takes the
+/// repository root as an argument can read any file under it, so it counts.
+const BENIGN_ROOT_ARGUMENT_CALLS: &[&str] = &[
+    "assert!",
+    "assert_eq!",
+    "assert_ne!",
+    "contains",
+    "display",
+    "ends_with",
+    "eprintln!",
+    "eq",
+    "expect",
+    "format!",
+    "panic!",
+    "println!",
+    "push_str",
+    "starts_with",
+    "strip_prefix",
+    "to_string",
+    "unwrap_or",
+    "write!",
+    "writeln!",
+];
+
+/// The call names this walk reads as "the repository root", spelled without
+/// their parentheses.
+const REPO_ROOT_CALLS: &[&str] = &["repo_root", "workspace_root"];
+
+/// Is this initialiser text the REPOSITORY ROOT?
+///
+/// Two shapes, and no others. A call to one of [`REPO_ROOT_CALLS`] with no
+/// argument, which is this workspace's universal spelling; or the crate's own
+/// manifest directory followed by a climb out of it (`parent`, `ancestors`, a
+/// `..` join), which is what a source writes when it has no helper.
+fn is_repo_root_expression(code: &str, code_with_literals: &str, start: usize, end: usize) -> bool {
+    let expr = code[start..end].trim();
+    for name in REPO_ROOT_CALLS {
+        let call = format!("{name}()");
+        if expr == call || expr.ends_with(&format!("::{call}")) {
+            return true;
+        }
+    }
+    if !code_with_literals[start..end].contains(CRATE_DIR_ENV) {
+        return false;
+    }
+    if ![".parent(", ".ancestors(", ".join(\"..", ".join(\"../"]
+        .iter()
+        .any(|climb| expr.contains(climb))
+    {
+        return false;
+    }
+    // A climb that ENDS in a named join is not the root: it is one file, and
+    // the literal that names it is what classifies the read. Only a climb whose
+    // last step is a `..` (or nothing at all) leaves the binding pointing at the
+    // tree, and a climb joined with a value this walk cannot see
+    // (`root.join(crate_rel)`) is the root as far as it can tell.
+    if !expr.ends_with("\")") {
+        return true;
+    }
+    match last_literal_in(&code_with_literals[start..end]) {
+        Some(text) => text.chars().all(|ch| ch == '.' || ch == '/'),
+        None => true,
+    }
+}
+
+/// The contents of the LAST double-quoted literal in `text`, if it has one.
+fn last_literal_in(text: &str) -> Option<&str> {
+    let close = text.rfind('"')?;
+    let open = text[..close].rfind('"')?;
+    Some(&text[open + 1..close])
+}
+
+/// Names this source binds to the REPOSITORY ROOT.
+///
+/// The same one-hop `let` / `const` / `static` scan
+/// [`crate_directory_bindings`] runs, with the repository-root predicate, plus
+/// the names bound to the crate directory that the source later POPS: a
+/// popped manifest directory is the workspace, which is how a source climbs out
+/// without ever naming `parent`.
+fn repo_root_bindings(code: &str, code_with_literals: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let name_of = |text: &str| -> String {
+        text.chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect()
+    };
+    for keyword in ["let ", "const ", "static "] {
+        let mut from = 0usize;
+        while let Some(offset) = code[from..].find(keyword) {
+            let at = from + offset;
+            from = at + keyword.len();
+            let opens_a_token = code[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+            if !opens_a_token {
+                continue;
+            }
+            let mut start = from;
+            let skip_blanks = |text: &str| text.len() - text.trim_start().len();
+            start += skip_blanks(&code[start..]);
+            if let Some(rest) = code[start..].strip_prefix("mut ") {
+                start += "mut ".len() + skip_blanks(rest);
+            }
+            let name = name_of(&code[start..]);
+            if name.is_empty() {
+                continue;
+            }
+            let end = code[start..]
+                .find(';')
+                .map_or(code.len(), |semicolon| start + semicolon);
+            let Some(equals) = code[start..end].find('=') else {
+                continue;
+            };
+            let value_at = start + equals + 1;
+            if is_repo_root_expression(code, code_with_literals, value_at, end)
+                || (is_crate_directory_expression(code, code_with_literals, value_at, end)
+                    && is_popped(code, &name))
+            {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
+/// Every offset at which this source hands the REPOSITORY ROOT to a call that
+/// can read the tree under it.
+///
+/// A root path used as a call ARGUMENT can be enumerated by that call, so it
+/// counts; a root path used as the RECEIVER of `.join(` is classified by the
+/// literal it joins, and every other receiver use (`.display()`) reads the
+/// value rather than the tree. [`BENIGN_ROOT_ARGUMENT_CALLS`] carries the
+/// argument positions that are values too.
+fn whole_tree_walk_offsets(code: &str, root_names: &BTreeSet<String>) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut needles: Vec<String> = root_names.iter().cloned().collect();
+    for name in REPO_ROOT_CALLS {
+        needles.push(format!("{name}()"));
+    }
+    for needle in needles {
+        let mut from = 0usize;
+        while let Some(offset) = code[from..].find(&needle) {
+            let at = from + offset;
+            from = at + needle.len();
+            let opens = code[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+            let after = code[at + needle.len()..].trim_start();
+            let closes = !after.starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_');
+            if !opens || !closes {
+                continue;
+            }
+            // A `.join(` receiver is classified by its literal, never here.
+            if after.starts_with(".join(") {
+                continue;
+            }
+            // A DECLARATION is not a use. `fn publishable_members(root: &Path)`
+            // puts the name in argument position, after a `(`, in every source
+            // that also binds a name of its own to the root, and reading a
+            // parameter list as a walk made two packages observe everything.
+            if after.starts_with(':') {
+                continue;
+            }
+            // An argument opens after `(`, `,` or a borrow of either.
+            let before = code[..at].trim_end();
+            let before = before.strip_suffix("mut").unwrap_or(before).trim_end();
+            let before = before.strip_suffix('&').unwrap_or(before).trim_end();
+            if !(before.ends_with('(') || before.ends_with(',')) {
+                continue;
+            }
+            let innermost = enclosing_calls(&code[..at])
+                .into_iter()
+                .map(|(name, _)| name)
+                .find(|name| !name.is_empty());
+            if innermost
+                .as_deref()
+                .is_some_and(|name| BENIGN_ROOT_ARGUMENT_CALLS.contains(&name))
+            {
+                continue;
+            }
+            out.push(at);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Every observation edge one source carries.
+///
+/// `observing` is the package the source belongs to and `source_dir` is that
+/// package's directory relative to the repository root, which is the base a
+/// relative literal is resolved against. An edge to the observing package
+/// itself is not an edge: a package always observes its own tree.
+fn observation_edges_of_source(
+    src: &str,
+    observing: &str,
+    source_dir: &str,
+    members: &[(String, String)],
+    multi: &BTreeSet<String>,
+    cdylibs: &BTreeMap<String, String>,
+) -> BTreeSet<SourceEdge> {
+    let views = scan_code(src);
+    let mut out: BTreeSet<SourceEdge> = BTreeSet::new();
+
+    let root_names = repo_root_bindings(&views.code, &views.code_with_literals);
+    for at in whole_tree_walk_offsets(&views.code, &root_names) {
+        out.insert((
+            OBSERVES_EVERYTHING.to_string(),
+            EDGE_WHOLE_TREE,
+            line_at(src, at),
+        ));
+    }
+
+    if views.literals.is_empty() {
+        return out;
+    }
+    let read_tables: Vec<ConstItem> = const_items(&views.code)
+        .into_iter()
+        .filter(|item| const_is_used_elsewhere(&views.code, item))
+        .collect();
+    let crate_dir_names = crate_directory_bindings(&views.code, &views.code_with_literals);
+
+    for literal in &views.literals {
+        // PROSE IS NOT A PATH, the rule `doc_root_of` lives by and for the same
+        // measured reason: this workspace spells refusals that OPEN with a
+        // crate path and continue into a sentence, and one of them was read as
+        // a read of that crate.
+        if literal.text.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let before = &views.code[..literal.at];
+        let in_a_read_table = read_tables
+            .iter()
+            .any(|item| (item.start..item.end).contains(&literal.at));
+        // A CONST TABLE entry has to LOOK like a path, because the table rule is
+        // the weak half of the two: it credits a literal nobody opens on this
+        // line. A bare directory NAME in one is a classification key (`examples`
+        // beside the sentence explaining what that directory holds), and reading
+        // one as a path attributed a whole example workspace to the package that
+        // merely names it. A literal in a real path position needs no separator:
+        // `root.join("crates")` is a walk of the crates tree however it is
+        // spelled.
+        // The shape is read AFTER the climb: `../../../examples` is a bare
+        // directory NAME reached from a crate directory, and a table row that
+        // carries one is a classification key rather than a read. Reading the
+        // climb's own separators as path structure attributed a whole example
+        // workspace to a package that only names the directory.
+        let table_shape = strip_relative_prefix(&literal.text).contains('/')
+            || dlopen_artifact_stem(&literal.text).is_some();
+        let used_as_a_path = is_path_position(before) || (in_a_read_table && table_shape);
+        if !used_as_a_path || is_write_target(before) {
+            continue;
+        }
+        if !climbs_out_of_its_directory(&literal.text)
+            && joined_onto_the_crate_directory(
+                &views.code,
+                &views.code_with_literals,
+                literal.at,
+                &crate_dir_names,
+            )
+        {
+            continue;
+        }
+        // A link that is NOT the last of its chain is classified with the rest
+        // of the path, never on its own: `root.join("crates").join("beta")`
+        // reads as a walk of the whole crates tree at its first link and as one
+        // package at its second, and only the second is what the code opens.
+        // A chain that continues with something this walk cannot read
+        // (`.join(pkg)`) is a different case and stays classified here, which
+        // is the fail-closed answer.
+        if let Some(read) = read_string_literal(&views.code, literal.at) {
+            if views.code[read.next..]
+                .trim_start()
+                .starts_with(").join(\"")
+            {
+                continue;
+            }
+        }
+        let mut chain = join_chain_prefix(&views.code_with_literals, literal.at);
+        chain.push(literal.text.clone());
+        let whole = chain.join("/");
+        let line = line_at(src, literal.at);
+
+        if interpolated_literal_is_unattributable(&whole, multi) {
+            out.insert((OBSERVES_EVERYTHING.to_string(), EDGE_UNATTRIBUTABLE, line));
+            continue;
+        }
+        if whole.contains('{') {
+            continue;
+        }
+        // BOTH readings of a relative literal, because both are how this tree
+        // spells one: joined onto the crate directory, and joined onto the
+        // repository root. The union is the over-inclusive direction.
+        let mut candidates: Vec<String> = Vec::new();
+        if whole.starts_with("./") || whole.starts_with("../") {
+            if let Some(resolved) = normalised_relative(&format!("{source_dir}/{whole}")) {
+                candidates.push(resolved);
+            }
+            if let Some(resolved) = normalised_relative(strip_relative_prefix(&whole)) {
+                candidates.push(resolved);
+            }
+        } else if let Some(resolved) = normalised_relative(&whole) {
+            candidates.push(resolved);
+        }
+
+        for candidate in candidates {
+            // A literal that normalises to NOTHING is a separator or a `.`,
+            // never a walk of the repository root: `parts.join("/")` and
+            // `Path::new(".")` both land here, and reading them as the root
+            // made five packages observe the whole workspace. A walk that has
+            // no literal at all is what `whole_tree_walk_offsets` is for.
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Some((_, package)) = members.iter().find(|(dir, _)| is_inside(&candidate, dir)) {
+                if package != observing {
+                    out.insert((package.clone(), EDGE_CRATE_PATH, line));
+                }
+                continue;
+            }
+            if multi.contains(&candidate) {
+                out.insert((OBSERVES_EVERYTHING.to_string(), EDGE_WHOLE_TREE, line));
+                continue;
+            }
+            let held: Vec<&(String, String)> = members
+                .iter()
+                .filter(|(dir, _)| is_inside(dir, &candidate))
+                .collect();
+            if held.len() == 1 && held[0].1 != observing {
+                out.insert((held[0].1.clone(), EDGE_CRATE_PATH, line));
+                continue;
+            }
+            let name = candidate.rsplit('/').next().unwrap_or(&candidate);
+            if let Some(stem) = dlopen_artifact_stem(name) {
+                if let Some(package) = cdylibs.get(stem) {
+                    if package != observing {
+                        out.insert((package.clone(), EDGE_DLOPEN, line));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One row of the committed table.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct ObservationEdge {
+    observing: String,
+    observed: String,
+    kind: String,
+    witness: String,
+}
+
+impl ObservationEdge {
+    fn line(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}",
+            self.observing, self.observed, self.kind, self.witness
+        )
+    }
+}
+
+/// The observation edges this tree carries, one row per
+/// `(observing, observed, kind)` with the FIRST source line that witnesses it.
+///
+/// One row per FACT, not one per occurrence: a package that walks the whole
+/// tree from forty sources owes one row, and the row names the source a reader
+/// opens to redetermine it. The table stays proportional to the number of
+/// edges, which is what makes a hand scan of it possible at all.
+fn derived_observation_edges() -> Vec<ObservationEdge> {
+    let root = normalised(&repo_root());
+    let members = member_directories();
+    let multi = multi_member_directories(&members);
+    let cdylibs = cdylib_artifact_stems();
+
+    let mut best: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    let mut sources_read = 0usize;
+    for (rel, package) in &members {
+        let dir = root.join(rel);
+        let mut files = rust_sources_under(&dir.join("tests"));
+        files.extend(rust_sources_under(&dir.join("src")));
+        files.sort();
+        for file in files {
+            let src = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
+            sources_read += 1;
+            let source_rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (observed, kind, line) in
+                observation_edges_of_source(&src, package, rel, &members, &multi, &cdylibs)
+            {
+                let witness = format!("{source_rel}:{line}");
+                let key = (package.clone(), observed, kind.to_string());
+                best.entry(key)
+                    .and_modify(|held| {
+                        if witness < *held {
+                            *held = witness.clone();
+                        }
+                    })
+                    .or_insert(witness);
+            }
+        }
+    }
+    assert!(
+        sources_read >= 600,
+        "the observation walk read only {sources_read} source(s): it is not \
+         reaching the tree, and every edge it reports would be vacuous"
+    );
+    best.into_iter()
+        .map(|((observing, observed, kind), witness)| ObservationEdge {
+            observing,
+            observed,
+            kind,
+            witness,
+        })
+        .collect()
+}
+
+/// The committed table, parsed.
+fn committed_observation_edges() -> Vec<ObservationEdge> {
+    let path = observation_edges_path();
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}\n\nThe derived observation-edge table is \
+             committed so the selector can read it without compiling this \
+             test. Run this test with the file absent to see the rows it \
+             demands.",
+            path.display()
+        )
+    });
+    let mut out = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            4,
+            "{}:{} has {} tab-separated field(s), not 4: `{line}`",
+            path.display(),
+            index + 1,
+            fields.len()
+        );
+        out.push(ObservationEdge {
+            observing: fields[0].to_string(),
+            observed: fields[1].to_string(),
+            kind: fields[2].to_string(),
+            witness: fields[3].to_string(),
+        });
+    }
+    out
+}
+
+/// The hand scan of the observation edges this tree carries.
+///
+/// Each row is `(observing package, observed package, kind)`, and every row was
+/// produced by OPENING the source the committed table names and reading the
+/// call that takes the literal, not by running the walk and copying what it
+/// said. The comment above each row names that source.
+///
+/// The WITNESS column is deliberately not here. This file is one of the sources
+/// the walk reads, and a whole `crates/`-rooted path literal in a const table
+/// it reads is an observation edge of its own: the hand rows would manufacture
+/// the very edges they are meant to check. The witness is pinned in the
+/// committed table instead, which is data rather than source, and
+/// `the_committed_observation_edge_table_matches_the_walk` compares that table
+/// whole.
+///
+/// Compared as a SET against a set after the rows are proven unique, for the
+/// reason [`HAND_SCANNED_DOC_PINS`] gives: a row written twice makes a length
+/// add up while hiding a derived edge nobody wrote down.
+const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
+    // mp_supervisor_box_test loads three node libraries whose file names it
+    // builds at run time: `debug_dir.join(format!("lib{id}.so"))`. The walk
+    // cannot say which package builds them.
+    ("cerulion_cli", "all", "unattributable"),
+    // replay_cli_test copies a fixture source out of the crates tree by a
+    // relative path chosen at run time: the manifest directory's parent joined
+    // with `src_rel`, handed to `std::fs::copy`.
+    ("cerulion_cli", "all", "whole-tree"),
+    // ros2_run_e2e_test names the preload the launcher injects,
+    // `libcerulion_heaphook.so`, which is the artifact cerulion_heaphook builds.
+    ("cerulion_cli", "cerulion_heaphook", "dlopen"),
+    // ros2_graph_e2e_test names `librmw_cerulion.so`, the artifact rmw_cerulion
+    // builds, under the sandbox library directory.
+    ("cerulion_cli", "rmw_cerulion", "dlopen"),
+    // block_colocation_adoption_test's `read_src` reads the manifest directory's
+    // parent joined with a crate-relative path its callers choose.
+    ("cerulion_cli_engine", "all", "whole-tree"),
+    // shm_state's own unit test scans `here.join("../cerulion_cli/src")` beside
+    // its own source tree.
+    ("cerulion_cli_engine", "cerulion_cli", "crate-path"),
+    // replay_engine's unit test opens the manifest directory joined with
+    // `..`, `cerulion_core`, `src`.
+    ("cerulion_cli_engine", "cerulion_core", "crate-path"),
+    // ros2_cmd holds the preload's file name in a const the launcher joins:
+    // `HEAPHOOK_FILENAME`.
+    ("cerulion_cli_engine", "cerulion_heaphook", "dlopen"),
+    // dependency_door_test checks the members of the `examples/go2` workspace,
+    // which holds one workspace member of its own: the demo's tf source node.
+    ("cerulion_cli_engine", "go2_tf_source", "crate-path"),
+    // workspace_lock_verb_adoption_test reads
+    // `engine.join("../cerulion_wsd/src/protocol.rs")`.
+    ("cerulion_cli_engine", "cerulion_wsd", "crate-path"),
+    // workspace resolves `base.join("crates/native_ros2_messages")`.
+    ("cerulion_cli_engine", "native_ros2_messages", "crate-path"),
+    // ros2_cmd holds `RMW_LIB_FILENAME`, `librmw_cerulion.so`, the artifact
+    // rmw_cerulion builds.
+    ("cerulion_cli_engine", "rmw_cerulion", "dlopen"),
+    // cdylib_iox2_log_level_test's EXCLUSIONS table names `crates/test_fixtures/`,
+    // a tree that holds many members, and the same package's
+    // serial_discipline_test walks the repository root itself
+    // (`collect_rs(&root, &root, &mut all_rs)`).
+    ("cerulion_core", "all", "whole-tree"),
+    // doc_attachment_discipline_test's table reads `../cerulion_bagd/src/lib.rs`.
+    ("cerulion_core", "cerulion_bagd", "crate-path"),
+    // cdylib_iox2_log_level_test reads
+    // `crates/cerulion_cli_engine/src/templates.rs`.
+    ("cerulion_core", "cerulion_cli_engine", "crate-path"),
+    // the same test's EXCLUSIONS table names
+    // `crates/cerulion_macros/src/codegen.rs`.
+    ("cerulion_core", "cerulion_macros", "crate-path"),
+    // crate_license_texts_test hands the workspace root to `publishable_members`,
+    // which enumerates every member.
+    ("cerulion_hygiene", "all", "whole-tree"),
+    // shipped_surface_structure_test reads
+    // `crates/cerulion_cli/src/main.rs`.
+    ("cerulion_hygiene", "cerulion_cli", "crate-path"),
+    // dependency_rules_test walks `crates/cerulion_viz/lib/go2_tf`.
+    ("cerulion_hygiene", "go2_tf", "crate-path"),
+    // the same test walks `examples/go2`, which holds that member.
+    ("cerulion_hygiene", "go2_tf_source", "crate-path"),
+    // crate_license_texts_test reads `crates/native_ros2_messages`.
+    ("cerulion_hygiene", "native_ros2_messages", "crate-path"),
+    // heaphook's own unit test reads `../cerulion_heaphook/src`.
+    ("rmw_cerulion", "cerulion_heaphook", "crate-path"),
+    // rmw_adopt_take_linux_test loads `libcerulion_heaphook.so` out of the
+    // profile directory.
+    ("rmw_cerulion", "cerulion_heaphook", "dlopen"),
+];
+
+/// The walk, against the hand scan of the same tree.
+#[test]
+fn the_observation_edge_walk_reproduces_the_hand_scan() {
+    let rows: Vec<(String, String, String)> = HAND_SCANNED_OBSERVATION_EDGES
+        .iter()
+        .map(|(a, b, c)| ((*a).to_string(), (*b).to_string(), (*c).to_string()))
+        .collect();
+    let hand: BTreeSet<(String, String, String)> = rows.iter().cloned().collect();
+    assert_eq!(
+        hand.len(),
+        rows.len(),
+        "HAND_SCANNED_OBSERVATION_EDGES names one (observing, observed, kind) \
+         twice. Two rows for one edge collapse into one set member, so a \
+         derived edge with no row of its own would ride along unnoticed."
+    );
+
+    let derived: BTreeSet<(String, String, String)> = derived_observation_edges()
+        .into_iter()
+        .map(|edge| (edge.observing, edge.observed, edge.kind))
+        .collect();
+    let derived_only: Vec<String> = derived
+        .difference(&hand)
+        .map(|(a, b, c)| format!("  (\"{a}\", \"{b}\", \"{c}\"),"))
+        .collect();
+    let hand_only: Vec<String> = hand
+        .difference(&derived)
+        .map(|(a, b, c)| format!("  (\"{a}\", \"{b}\", \"{c}\"),"))
+        .collect();
+    assert_eq!(
+        derived,
+        hand,
+        "the observation walk disagrees with the hand scan.\n\nDERIVED WITH NO \
+         ROW: open the source the committed table names, read the call that \
+         takes the literal, and add the row:\n{}\n\nA ROW THE WALK DOES NOT \
+         DERIVE: either the source stopped observing that package (delete the \
+         row) or the walk stopped seeing it:\n{}",
+        derived_only.join("\n"),
+        hand_only.join("\n"),
+    );
+    assert!(
+        !derived.is_empty(),
+        "the walk derived no observation edge at all: this workspace has \
+         cross-crate reads and dlopen fixtures, so an empty answer means the \
+         classifier is broken and every gate built on it would be vacuous"
+    );
+}
+
+/// The committed table against the walk, both directions.
+///
+/// MISSING is an edge the walk derives and the file does not carry: the
+/// selector would then gate a step on a closure that cannot see it. STALE is a
+/// row for a read that no longer exists: it pre-authorises the next hole
+/// exactly as a stale doc-pin marker does.
+#[test]
+fn the_committed_observation_edge_table_matches_the_walk() {
+    let derived = derived_observation_edges();
+    let committed = committed_observation_edges();
+
+    let unique: BTreeSet<(String, String, String)> = committed
+        .iter()
+        .map(|e| (e.observing.clone(), e.observed.clone(), e.kind.clone()))
+        .collect();
+    assert_eq!(
+        unique.len(),
+        committed.len(),
+        "{} names one (observing, observed, kind) twice; the table carries one \
+         row per edge",
+        observation_edges_path().display()
+    );
+    let mut sorted = committed.clone();
+    sorted.sort();
+    assert_eq!(
+        committed,
+        sorted,
+        "{} is not sorted; the walk writes it sorted so a diff of the file is \
+         a diff of the edges",
+        observation_edges_path().display()
+    );
+
+    let derived_lines: BTreeSet<String> = derived.iter().map(ObservationEdge::line).collect();
+    let committed_lines: BTreeSet<String> = committed.iter().map(ObservationEdge::line).collect();
+    let missing: Vec<&String> = derived_lines.difference(&committed_lines).collect();
+    let stale: Vec<&String> = committed_lines.difference(&derived_lines).collect();
+    assert_eq!(
+        committed_lines,
+        derived_lines,
+        "{} does not match the observation edges the sources carry.\n\nMISSING \
+         (add each line to the file):\n{}\n\nSTALE (delete each line):\n{}\n\nThe \
+         file is read by `tools/scripts/ci_selected_packages.py \
+         --observation-edges`, so a MISSING row is a package the selection can \
+         skip while a test of it observes the change.",
+        observation_edges_path().display(),
+        missing
+            .iter()
+            .map(|m| format!("  {m}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        stale
+            .iter()
+            .map(|m| format!("  {m}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The observation classifier, on hand-built input.
+// ---------------------------------------------------------------------------
+
+/// A hand-built workspace: four members, one of them nested, one of them under
+/// the examples tree, and one that builds a `cdylib`.
+///
+/// Spelled in HALVES wherever a fixture would otherwise carry a whole rooted
+/// path, for the reason [`ROOT_MARKDOWN_STEMS`] gives: this walk reads its own
+/// source, and a literal here that looked like a path into another member's
+/// tree would manufacture an observation edge of its own.
+fn fixture_members() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = [
+        (format!("crates{}alpha", "/"), "alpha"),
+        (format!("crates{}beta", "/"), "beta"),
+        (format!("crates{}nest{}gamma", "/", "/"), "gamma"),
+        (format!("examples{}demo{}delta", "/", "/"), "delta"),
+    ]
+    .into_iter()
+    .map(|(dir, name)| (dir, name.to_string()))
+    .collect();
+    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// `observation_edges_of_source` over [`fixture_members`], observed from
+/// `alpha`.
+fn fixture_edges(src: &str) -> BTreeSet<SourceEdge> {
+    let members = fixture_members();
+    let multi = multi_member_directories(&members);
+    let cdylibs: BTreeMap<String, String> = [("gamma".to_string(), "gamma".to_string())]
+        .into_iter()
+        .collect();
+    let source_dir = format!("crates{}alpha", "/");
+    observation_edges_of_source(src, "alpha", &source_dir, &members, &multi, &cdylibs)
+}
+
+fn edge(observed: &str, kind: &'static str, line: usize) -> BTreeSet<SourceEdge> {
+    [(observed.to_string(), kind, line)].into_iter().collect()
+}
+
+/// The directory that holds more than one member is the one a walk of it
+/// observes everything through, and no other.
+#[test]
+fn the_multi_member_directory_set_is_exactly_the_shared_parents() {
+    let multi = multi_member_directories(&fixture_members());
+    assert_eq!(
+        multi,
+        ["crates".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<String>>(),
+        "only `crates` holds more than one member of the fixture workspace; the \
+         repository root is excluded because a literal that normalises to \
+         nothing is a separator, not a walk"
+    );
+}
+
+/// Each kind of edge, derived from the shape that produces it.
+#[test]
+fn each_observation_edge_kind_is_derived_from_its_own_shape() {
+    let beta_src = format!("crates{}beta{}src{}lib.rs", "/", "/", "/");
+
+    // (a) A path literal into another member's tree.
+    assert_eq!(
+        fixture_edges(&format!("let p = root.join(\"{beta_src}\");\n")),
+        edge("beta", EDGE_CRATE_PATH, 1)
+    );
+
+    // (b) The same read spelled RELATIVE to the observing crate's directory,
+    //     which is how this tree spells it.
+    assert_eq!(
+        fixture_edges(&format!("let p = here.join(\"../beta/src/lib.rs\");\n")),
+        edge("beta", EDGE_CRATE_PATH, 1)
+    );
+
+    // (c) A CHAIN of joins is one path. Without the chain the first link reads
+    //     as a walk of the whole crates tree and the package is never
+    //     attributed, which is the difference between selecting one package and
+    //     selecting all of them.
+    assert_eq!(
+        fixture_edges("let p = root.join(\"crates\").join(\"beta\").join(\"src\");\n"),
+        edge("beta", EDGE_CRATE_PATH, 1)
+    );
+
+    // (d) A walk of a tree that holds more than one member.
+    assert_eq!(
+        fixture_edges("let p = root.join(\"crates\");\n"),
+        edge(OBSERVES_EVERYTHING, EDGE_WHOLE_TREE, 1)
+    );
+
+    // (e) A `dlopen` of an artifact another member builds.
+    assert_eq!(
+        fixture_edges("let p = dir.join(\"libgamma.so\");\n"),
+        edge("gamma", EDGE_DLOPEN, 1)
+    );
+    assert_eq!(
+        fixture_edges("let p = dir.join(\"libgamma.dylib\");\n"),
+        edge("gamma", EDGE_DLOPEN, 1)
+    );
+
+    // (f) An artifact name built at RUN TIME cannot be attributed.
+    assert_eq!(
+        fixture_edges("let p = dir.join(format!(\"lib{name}.so\"));\n"),
+        edge(OBSERVES_EVERYTHING, EDGE_UNATTRIBUTABLE, 1)
+    );
+
+    // (g) A package segment built at run time cannot be attributed either.
+    assert_eq!(
+        fixture_edges("let p = root.join(format!(\"crates/{pkg}/Cargo.toml\"));\n"),
+        edge(OBSERVES_EVERYTHING, EDGE_UNATTRIBUTABLE, 1)
+    );
+
+    // (h) The repository root handed to a call that can read the tree under it,
+    //     with no literal anywhere: the shape a whole-tree walk actually has.
+    assert_eq!(
+        fixture_edges("let root = repo_root();\ncollect_rs(&root, &mut out);\n"),
+        edge(OBSERVES_EVERYTHING, EDGE_WHOLE_TREE, 2)
+    );
+
+    // (i) A tree that holds EXACTLY ONE member is that member.
+    assert_eq!(
+        fixture_edges("let p = root.join(\"examples/demo\");\n"),
+        edge("delta", EDGE_CRATE_PATH, 1)
+    );
+}
+
+/// The other side of every rule above: the shapes that must derive NOTHING.
+#[test]
+fn a_shape_that_is_not_an_observation_derives_no_edge() {
+    let beta_src = format!("crates{}beta{}src{}lib.rs", "/", "/", "/");
+    let alpha_src = format!("crates{}alpha{}src{}lib.rs", "/", "/", "/");
+    let nothing = BTreeSet::<SourceEdge>::new();
+
+    for (why, source) in [
+        // A path the code only NAMES.
+        ("a refusal's wording", format!("assert!(msg.contains(\"{beta_src}\"));\n")),
+        // The observing package's OWN tree is not an observation.
+        ("the package's own tree", format!("let p = root.join(\"{alpha_src}\");\n")),
+        // A path the code WRITES.
+        ("a write target", format!("std::fs::write(root.join(\"{beta_src}\"), body).unwrap();\n")),
+        // A path joined onto the crate's own directory never leaves the crate.
+        (
+            "the crate's own directory",
+            format!(
+                "let crate_root = Path::new(env!(\"{CRATE_DIR_ENV}\"));\n\
+                 let p = crate_root.join(\"tests/fixtures/graph.yaml\");\n"
+            ),
+        ),
+        // A separator handed to `[String]::join`, which is not a path join at
+        // all: reading it as the repository root made five packages observe
+        // everything.
+        ("a separator", "let s = parts.join(\"/\");\n".to_string()),
+        ("a dot", "let p = Path::new(\".\");\n".to_string()),
+        // Prose that opens with a path.
+        (
+            "prose",
+            format!("let why = \"{beta_src} is stale; regenerate it\";\nfn t() {{}}\n"),
+        ),
+        // The repository root as a `.join(` RECEIVER is classified by the
+        // literal it joins, never as a walk.
+        (
+            "a root receiver",
+            "let root = repo_root();\nlet p = root.join(\"docs/guide.md\");\n".to_string(),
+        ),
+        // A DECLARATION is not a use, even in a source that binds the root.
+        (
+            "a parameter list",
+            "let root = repo_root();\nfn helper(root: &Path) -> usize { 0 }\n".to_string(),
+        ),
+        // The root printed rather than walked.
+        (
+            "a message",
+            "let root = repo_root();\npanic!(\"missing under {}\", root.display());\n".to_string(),
+        ),
+        // An interpolated path that names no member tree and no artifact is an
+        // ordinary run-time path, almost always inside a scratch directory.
+        (
+            "a scratch path",
+            "let p = tmp.join(format!(\"{name}/graph.yaml\"));\n".to_string(),
+        ),
+        // A shared object no member of this workspace builds.
+        ("a foreign artifact", "let p = dir.join(\"libsomething_else.so\");\n".to_string()),
+        // A const table entry that is a bare NAME rather than a path: a
+        // classification key, not a read.
+        (
+            "a bare directory name in a table",
+            "const ROWS: &[(&str, &str)] = &[(\"examples\", \"why\")];\nfn t() { use_rows(ROWS); }\n"
+                .to_string(),
+        ),
+    ] {
+        assert_eq!(
+            fixture_edges(&source),
+            nothing,
+            "{why} must derive no observation edge:\n{source}"
+        );
+    }
+
+    // The positive control for the last row: the SAME table with a real path in
+    // it does derive one, so the rule refuses bare names and nothing else.
+    let table = format!(
+        "const ROWS: &[&str] = &[\"crates{}beta{}src{}lib.rs\"];\nfn t() {{ use_rows(ROWS); }}\n",
+        "/", "/", "/"
+    );
+    assert_eq!(fixture_edges(&table), edge("beta", EDGE_CRATE_PATH, 1));
 }

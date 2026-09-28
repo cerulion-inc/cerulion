@@ -141,6 +141,17 @@ env:
   # gated on the variable itself would read a value the `changes` job never
   # saw, and `cerulion_cli_engine::ci_test_coverage_test` refuses that shape.
   CI_SELECTION: ${{ vars.CI_SELECTION || 'on' }}
+  # THE SELECTION OFF SWITCH. `ci_changed_paths.sh` narrows a pull request's
+  # test steps to the packages the change can reach; this variable stops that
+  # with no pull request, no deploy and no review. Unset or `on` applies the
+  # selection; `off`, and any value the classifier does not know, selects every
+  # package and runs every step. The default lives HERE, in the expression, so a
+  # repository with no variable behaves exactly as this file reads.
+  #
+  # The switch reaches a step ONLY through the classifier's outputs. A step
+  # gated on the variable itself would read a value the `changes` job never
+  # saw, and `cerulion_cli_engine::ci_test_coverage_test` refuses that shape.
+  CI_SELECTION: ${{ vars.CI_SELECTION || 'on' }}
   RUST_BACKTRACE: 1
   # Suppress iceoryx2 log noise
   IOX2_LOG_LEVEL: error
@@ -2018,7 +2029,7 @@ jobs:
       # The placement is the measured packing in the map above, not family.
       # doc-pin: cerulion_cli_engine::bag_record_run_attach_test reads docs
       # doc-pin: cerulion_cli_engine::cerulion_cli_engine reads examples, tools
-      # doc-pin: cerulion_cli_engine::ci_doc_pin_walk_test reads .github
+      # doc-pin: cerulion_cli_engine::ci_doc_pin_walk_test reads .github, tools
       # doc-pin: cerulion_cli_engine::ci_test_coverage_test reads .github, tools
       # doc-pin: cerulion_cli_engine::dependency_door_test reads examples, tools
       # doc-pin: cerulion_cli_engine::library_print_ban_test reads examples
