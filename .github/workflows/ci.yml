@@ -1489,6 +1489,9 @@ jobs:
   test-linux:
     name: Test (Linux) shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
+    # `needs: [changes]` for the per-package selection only. The job itself is
+    # never gated: every leg still runs and still reports its own context.
+    needs: [changes]
     # `actions: write` is for the cache prune step only (it deletes stale
     # entries of this job's cache namespace). Every other step needs read.
     permissions:
@@ -1774,9 +1777,18 @@ jobs:
       # line, so a path-to-step map cannot lose one of these binaries.
       # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
       # doc-pin: cerulion_core::serial_discipline_test reads .github
+      # NOT gated by an `if:`, deliberately. `cerulion_core`'s
+      # `serial_discipline_test` walks every `.rs` file under the repository
+      # root, so `tools/ci/observation_edges.tsv` records the package as
+      # observing `all` and it is selected on every change: an `if:` here could
+      # never be false, and a gate that cannot fire is not a gate. The shard
+      # runner intersects its own package with the selection instead, and prints
+      # one `selection:` line when the intersection is empty.
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
@@ -1985,7 +1997,7 @@ jobs:
       # reclaim, which prunes its test executables.
       # doc-pin: rmw_cerulion::rmw_absent_export_table_test reads tools
       - name: rmw_cerulion tests (serial)
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
         # The runner has no ROS: a build that silently fell back to (or
         # away from) the vendored bindings could not otherwise be told —
         # every claim test is a disjunction over both sources.
@@ -2004,12 +2016,12 @@ jobs:
       # it needs — so it rides shard 2, the tail shard, beside `macros` and
       # `discovery`, and it is named in that job's package map above.
       - name: cerulion_heaphook tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_heaphook')
         run: cargo test -p cerulion_heaphook
 
       # doc-pin: native_ros2_messages::upstream_drift_test reads tools
       - name: native_ros2_messages tests
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
         run: cargo test -p native_ros2_messages
 
       # BOTH bag crates are named explicitly — every job here names its
@@ -2030,17 +2042,17 @@ jobs:
       # level shard 3. See the table above before pairing them up on cosmetic
       # grounds.
       - name: cerulion_bag tests
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')
         run: cargo test -p cerulion_bag
       - name: cerulion_bagd tests (serial, process-global panic hook)
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
         run: cargo test -p cerulion_bagd -- --test-threads=1
 
       # cerulion_macros is a proc-macro crate compiled into the host
       # toolchain — its own unit tests (parse + determinism) are NOT
       # exercised transitively by `-p cerulion_core`, so name it explicitly.
       - name: cerulion_macros tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros')
         run: cargo test -p cerulion_macros
 
       # The CLI crates are named here too. Their 160+ tests
@@ -2067,7 +2079,7 @@ jobs:
         if: matrix.shard == 1
         run: cargo test -p cerulion_cli
       - name: CLI TUI tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
         run: cargo test -p cerulion_cli_tui
 
       # `cerulion_discovery` — the LAN peer-discovery substrate extracted
@@ -2079,7 +2091,7 @@ jobs:
       # is named here. Same reason as the wireclient/connectd
       # steps below. Leaf crate (std + serde + dirs + tracing) — ~3 s, no transport.
       - name: cerulion_discovery tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery')
         run: cargo test -p cerulion_discovery
 
       # The test jobs enumerate packages explicitly: there is NO blanket
@@ -2090,7 +2102,7 @@ jobs:
       # `--workspace` overrides default-members — but we run no such step for tests.)
       # The iroh tree it compiles is shared with the connectd + netd steps below.
       - name: cerulion_wireclient tests
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient')
         run: cargo test -p cerulion_wireclient
 
       # cerulion_connectd is a workspace member excluded from
@@ -2102,7 +2114,7 @@ jobs:
       # SHM roots ⇒ parallel-safe; shares the iroh tree the wireclient/netd steps
       # compile (no extra cold cost).
       - name: cerulion_connectd tests
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd')
         run: cargo test -p cerulion_connectd
 
       # The wan step below is where all four of the red PRs ran the
@@ -2141,7 +2153,7 @@ jobs:
       # the loopback-iroh WAN-plane e2e (real iceoryx2 + loopback iroh, per-test SHM
       # roots + per-test iroh identities ⇒ parallel-safe).
       - name: cerulion_netd tests (--features wan)
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: cargo test -p cerulion_netd --features wan
 
       # The terminal reading, and the one every post-mortem so far has
@@ -2229,6 +2241,9 @@ jobs:
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
+    # `needs: [changes]` for the per-package selection only. The job itself is
+    # never gated: every leg still runs and still reports its own context.
+    needs: [changes]
     # `actions: write` is for the cache prune step only (it deletes stale
     # entries of this job's cache namespace). Every other step needs read.
     permissions:
@@ -2443,7 +2458,11 @@ jobs:
       # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
       # on shard 2, which is why shard 2 gets the lightest package set below).
       # ---------------------------------------------------------------
+      # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
+      # observes the whole tree, so the shard runner does the intersection.
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
@@ -2474,7 +2493,7 @@ jobs:
       # WHAT runs changed and both nightly mirrors still cover the job; only
       # which leg runs it did. Touches the iceoryx2 singleton — serial.
       - name: rmw_cerulion tests (serial)
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
         # The runner has no ROS: a build that silently fell back to (or
         # away from) the vendored bindings could not otherwise be told —
         # every claim test is a disjunction over both sources.
@@ -2483,24 +2502,24 @@ jobs:
         run: cargo test -p rmw_cerulion -- --test-threads=1
 
       - name: native_ros2_messages tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
         run: cargo test -p native_ros2_messages
 
       # See the Linux job's note — neither bag crate was in ANY job's
       # `-p` list, so both suites compiled and never ran. bagd is serial for the
       # process-global panic hook, not for iceoryx2.
       - name: cerulion_bag tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')
         run: cargo test -p cerulion_bag
       - name: cerulion_bagd tests (serial, process-global panic hook)
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
         run: cargo test -p cerulion_bagd -- --test-threads=1
 
       # cerulion_macros is a proc-macro crate compiled into the host
       # toolchain — its own unit tests (parse + determinism) are NOT
       # exercised transitively by `-p cerulion_core`, so name it explicitly.
       - name: cerulion_macros tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros')
         run: cargo test -p cerulion_macros
 
       # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
@@ -2514,7 +2533,7 @@ jobs:
         if: matrix.shard == 0
         run: cargo test -p cerulion_cli
       - name: CLI TUI tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
         run: cargo test -p cerulion_cli_tui
 
       # `cerulion_discovery` — the LAN peer-discovery substrate extracted
@@ -2526,7 +2545,7 @@ jobs:
       # is named here. Same reason as the wireclient/connectd
       # steps below. Leaf crate (std + serde + dirs + tracing) — ~3 s, no transport.
       - name: cerulion_discovery tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery')
         run: cargo test -p cerulion_discovery
 
       # The test jobs enumerate packages explicitly: there is NO blanket
@@ -2537,7 +2556,7 @@ jobs:
       # `--workspace` overrides default-members — but we run no such step for tests.)
       # The iroh tree it compiles is shared with the connectd + netd steps below.
       - name: cerulion_wireclient tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient')
         run: cargo test -p cerulion_wireclient
 
       # cerulion_connectd is a workspace member excluded from
@@ -2548,7 +2567,7 @@ jobs:
       # reader loop, and this is the only CI step that runs it. The tests are OS-portable
       # (loopback iroh + iceoryx2 both work on macOS), so they gate on both runners.
       - name: cerulion_connectd tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd')
         run: cargo test -p cerulion_connectd
 
       # The wan step is where the Linux leg ran out of disk on all four of
@@ -2563,7 +2582,7 @@ jobs:
       # on macOS — the cerulion_connectd reinject e2e this cribs runs on macOS too),
       # so it gates on both runners.
       - name: cerulion_netd tests (--features wan)
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: cargo test -p cerulion_netd --features wan
 
       # THE macOS HALF OF `viz-tests`, folded in here rather than run as two
@@ -2580,22 +2599,22 @@ jobs:
       # for a REQUIRED check on the slower runner is the riskier error. The job
       # ceiling still bounds it.
       - name: cerulion_viz tests (whole suite, parallel)
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --no-fail-fast
       - name: cerulion_vizd tests (whole suite, serial)
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd')
         run: cargo test -p cerulion_vizd --no-fail-fast -- --test-threads=1
       - name: go2_tf tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')
         run: cargo test -p go2_tf
       - name: cargo test -p cerulion_viz --lib openh264_fetch
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --lib openh264_fetch
       - name: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
       - name: cargo test -p cerulion_viz --test video_decode_test
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test video_decode_test -- --test-threads=1
 
   # ==========================================================================
@@ -2701,7 +2720,7 @@ jobs:
           key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   crate-tests:
     name: Crate tests (${{ matrix.os }})
-    needs: [lint]
+    needs: [lint, changes]
     strategy:
       fail-fast: false
       matrix:
@@ -2781,20 +2800,28 @@ jobs:
       # `cerulion_link` and `cerulion_pairing`, including two `compile_fail`
       # pins that assert a misuse does NOT compile).
       - name: cerulion_pairing tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
         run: cargo test -p cerulion_pairing
       - name: cerud tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerud')
         run: cargo test -p cerud
       - name: cerulion_remoted tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
         run: cargo test -p cerulion_remoted
       - name: cerulion_accountd tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_accountd')
         run: cargo test -p cerulion_accountd
       - name: cerulion_dds tests (default features, jazzy/live)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_dds')
         run: cargo test -p cerulion_dds
       - name: cerulion_link tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_link')
         run: cargo test -p cerulion_link
       - name: cerulion-wire tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire')
         run: cargo test -p cerulion-wire
       - name: cerulion_mdns tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_mdns')
         run: cargo test -p cerulion_mdns
       # The ONE non-`cargo test` step here, and it is load-bearing.
       # `cerulion_wsd`'s two production `--inspect-node` arms run the SHIPPED
@@ -2809,8 +2836,10 @@ jobs:
       # "a pin that cannot fail a PR is not a gate" class this job's header
       # names. Default profile and target dir, matching the `cargo test` below.
       - name: Build the cerulion_wsd --inspect-node fixture cdylib
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
         run: cargo build -p test_node_cdylib
       - name: cerulion_wsd tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
         run: cargo test -p cerulion_wsd
       # doc-pin: cerulion_hygiene::crate_license_texts_test reads docs
       # doc-pin: cerulion_hygiene::dependency_rules_test reads examples
@@ -3722,7 +3751,7 @@ jobs:
           key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
-    needs: [lint]
+    needs: [lint, changes]
     strategy:
       fail-fast: false
       matrix:
@@ -3886,7 +3915,7 @@ jobs:
       # the opposite of what a whole-suite lane is for. With the flag, every
       # binary runs and the step still fails.
       - name: cerulion_viz tests (whole suite, parallel)
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --no-fail-fast
 
       # SERIAL by design — see (a)/(b)/(c) in the job comment. Whole package,
@@ -3906,7 +3935,7 @@ jobs:
       # test step alone — no healthy run comes near it — while turning a hang
       # into an attributable step failure in well under half the job ceiling.
       - name: cerulion_vizd tests (whole suite, serial)
-        if: matrix.lane == 'vizd'
+        if: matrix.lane == 'vizd' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd')
         timeout-minutes: 30
         run: cargo test -p cerulion_vizd --no-fail-fast -- --test-threads=1
 
@@ -3916,7 +3945,7 @@ jobs:
       # (std + thiserror, no transport, no rerun), runs in ~0.0 s. Parallel: it
       # has no globals to share and no `tests/` dir.
       - name: go2_tf tests
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')
         run: cargo test -p go2_tf
 
       # The OpenH264 fetcher's own suite. SAME argument as the two
@@ -3931,14 +3960,14 @@ jobs:
       # network-only, in `openh264_live_fetch_test.rs`). The marginal cost is seconds
       # — the expensive part, building the rerun SDK tree, is already paid above.
       - name: cargo test -p cerulion_viz --lib openh264_fetch
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --lib openh264_fetch
 
       # Its OWN binary on purpose: the wiring pin counts a process-global
       # consultation counter and asserts it starts at zero, which only holds when
       # nothing else in the process has driven a decoder-less pool.
       - name: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
 
       # `--test-threads=1`: two arms drive the process-global cache generation
@@ -3946,7 +3975,7 @@ jobs:
       # but the surrounding decode arms share a Rerun stream, so serial is the
       # cheap correct answer here.
       - name: cargo test -p cerulion_viz --test video_decode_test
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test video_decode_test -- --test-threads=1
 
   # Unused-dependency audit (cargo-machete).
