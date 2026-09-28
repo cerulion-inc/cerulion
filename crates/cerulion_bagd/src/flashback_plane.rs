@@ -2152,7 +2152,11 @@ pub(crate) fn build_per_rank_block(
 ) -> Result<std::collections::BTreeMap<u32, RankAnchor>, String> {
     let mut per_rank: std::collections::BTreeMap<u32, RankAnchor> =
         std::collections::BTreeMap::new();
-    let mut ring_of_rank: std::collections::BTreeMap<u32, String> =
+    // The ring that claimed each rank, and WHETHER it holds a restore point.
+    // The bit is carried rather than derived at the refusal, because the two
+    // collisions are different facts and a message that states the wrong one
+    // sends an operator looking for a restore point that does not exist.
+    let mut ring_of_rank: std::collections::BTreeMap<u32, (String, bool)> =
         std::collections::BTreeMap::new();
     for m in members {
         let ring = m.checkpoint.ring.clone();
@@ -2164,7 +2168,7 @@ pub(crate) fn build_per_rank_block(
                  the current state record format"
             ));
         };
-        if let Some(first) = ring_of_rank.insert(rank, ring.clone()) {
+        if let Some((first, _)) = ring_of_rank.insert(rank, (ring.clone(), true)) {
             return Err(format!(
                 "state rings {first} and {ring} both report rank {rank}, so this capture's \
                  per-rank restore points would collapse into one and it was NOT written. Fix: \
@@ -2197,12 +2201,26 @@ pub(crate) fn build_per_rank_block(
         let Some(rank) = missing.rank else {
             continue;
         };
-        if let Some(first) = ring_of_rank.insert(rank, ring.clone()) {
-            return Err(format!(
-                "state rings {first} and {ring} both report rank {rank}, so this capture would \
-                 publish that rank as holding a restore point and as holding none at once, and \
-                 it was NOT written. Fix: give every worker of a run its own rank"
-            ));
+        if let Some((first, first_has_anchor)) = ring_of_rank.insert(rank, (ring.clone(), false)) {
+            // WHICH collision this is decides what is true of it. Against a
+            // SELECTED ring the rank would be published as holding a restore
+            // point and as holding none at once. Against another SHORTFALL ring
+            // neither holds one, so that sentence would be false: what the
+            // capture cannot do is say whose hole the rank's is.
+            return Err(if first_has_anchor {
+                format!(
+                    "state rings {first} and {ring} both report rank {rank}, so this capture \
+                     would publish that rank as holding a restore point and as holding none at \
+                     once, and it was NOT written. Fix: give every worker of a run its own rank"
+                )
+            } else {
+                format!(
+                    "state rings {first} and {ring} both report rank {rank} and NEITHER holds a \
+                     restore point, so this capture could not say which of them the rank's hole \
+                     belongs to and it was NOT written. Fix: give every worker of a run its own \
+                     rank"
+                )
+            });
         }
     }
     Ok(per_rank)
@@ -3548,6 +3566,72 @@ mod tests {
         ] {
             assert!(err.contains(needle), "missing {needle:?} in: {err}");
         }
+    }
+
+    /// TWO SHORTFALL rings colliding at one rank state the TRUE fact.
+    ///
+    /// The sentence the member collision carries says the capture would
+    /// publish the rank as holding a restore point and as holding none at
+    /// once. When BOTH colliding rings come from the shortfall neither holds
+    /// one, so that sentence is false about the shape it is printed on, and a
+    /// message that names a restore point sends an operator looking for it in
+    /// a capture that has none. What is true is narrower: the capture cannot
+    /// say which of the two rings the rank's hole belongs to.
+    ///
+    /// The MEMBER collision is re-asserted beside it as the control, so an
+    /// implementation that answered the new sentence on both shapes fails
+    /// here rather than reading as a pass.
+    #[test]
+    fn two_shortfall_rings_at_one_rank_refuse_without_claiming_a_restore_point() {
+        let member = crate::anchor_window::selected_anchor_for_test(
+            "worker-a",
+            7,
+            41,
+            10_000_000_000,
+            CAPTURE_SEQ,
+            AnchorFit::CoversTheClaimedWindow,
+            vec![crate::anchor_window::ranked_records_for_test(
+                7, 41, 0, 2, &[1; 64],
+            )],
+        );
+
+        // BOTH colliding rings come from the shortfall, at a rank the member
+        // does not hold, so the member cannot be either half of the pair.
+        let err = build_per_rank_block(
+            &[&member],
+            Some(0),
+            &shortfall_of(&[("worker-b", Some(5)), ("worker-c", Some(5))]),
+        )
+        .expect_err("two shortfall rings at one rank must refuse the capture");
+        for needle in [
+            "worker-b",
+            "worker-c",
+            "both report rank 5",
+            "NEITHER holds a restore point",
+            "which of them the rank's hole belongs to",
+            "was NOT written",
+            "Fix:",
+        ] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+        assert!(
+            !err.contains("as holding none at once"),
+            "the member collision's sentence is false here: {err}"
+        );
+
+        // THE CONTROL: a shortfall ring colliding with the MEMBER still reads
+        // the member sentence, so the two are told apart rather than merged.
+        let against_member =
+            build_per_rank_block(&[&member], Some(0), &shortfall_of(&[("worker-b", Some(2))]))
+                .expect_err("a shortfall rank colliding with a member still refuses");
+        assert!(
+            against_member.contains("as holding none at once"),
+            "{against_member}"
+        );
+        assert!(
+            !against_member.contains("NEITHER holds a restore point"),
+            "{against_member}"
+        );
     }
 
     /// ORACLE 6, the MANIFEST half, RESTATED EXACTLY: a k=1 capture's manifest

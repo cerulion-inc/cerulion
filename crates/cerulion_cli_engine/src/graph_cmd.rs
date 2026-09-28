@@ -7261,8 +7261,12 @@ pub fn graph_run_worker(
                     "this worker is ARMED for checkpoints but its rank cannot name a \
                      state ring, so it captures NOTHING and every anchor of this run LACKS \
                      the records of the rank this event names. A resim of a capture from this \
-                     run is refused as not replay-grade and exits 2 with no verdict, unless \
-                     that capture's window reaches step 0 and needs no anchor"
+                     run exits 2 with no verdict in two ways: with more than one state ring \
+                     left it refuses the recording outright as ambiguous, and with one ring \
+                     left it resumes from that ring and refuses by name every node of the \
+                     missing rank the replay executes, none of which has an anchor. It reaches \
+                     a verdict of its own only when no node of that rank runs in the capture's \
+                     window, or when that window reaches step 0 and needs no anchor"
                 );
                 return None;
             }

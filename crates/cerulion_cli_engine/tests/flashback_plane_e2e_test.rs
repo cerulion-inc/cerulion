@@ -525,9 +525,18 @@ fn a_worker_over_the_ceiling_declines_for_itself_and_says_which_rank() {
          anchor of the run lacks THIS rank's records"
     );
     assert!(
-        logs_contain("refused as not replay-grade and exits 2"),
+        logs_contain("exits 2 with no verdict in two ways"),
         "…and the consequence a reader will meet downstream, named with the exit code the \
-         resim really returns"
+         resim really returns and split by the case it lands in"
+    );
+    assert!(
+        logs_contain("refuses by name every node of the missing rank the replay executes"),
+        "…including what the operator SEES on the one-surviving-ring case, which is the \
+         common one and the one a blanket refusal claim got wrong"
+    );
+    assert!(
+        !logs_contain("is refused as not replay-grade and exits 2 with no verdict, unless"),
+        "…and NOT the blanket claim, which was true of only one of the three cases"
     );
     assert!(
         !logs_contain("exits 8"),

@@ -107,6 +107,27 @@ impl BagAnchors {
     }
 }
 
+/// The one clause that names the ranks a recording's manifest stamps as having
+/// published no state ring at all.
+///
+/// EMPTY when the manifest stamps none, so a multi-ring recording without a
+/// hole reads exactly as it did before this clause existed. The ranks are
+/// rendered in the manifest's own ascending order rather than re-sorted here:
+/// the writer already keeps them ascending, and a second sort would be a
+/// second rule about an order that has one owner.
+fn render_ranks_missing(ranks: &[u32]) -> String {
+    if ranks.is_empty() {
+        return String::new();
+    }
+    let list = ranks
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if ranks.len() == 1 { "rank" } else { "ranks" };
+    format!(" ({noun} {list} published none, which is the hole you were warned about)")
+}
+
 /// Why a bag's anchors cannot be read.
 ///
 /// Deliberately a small closed set: everything else about an anchor is a
@@ -127,18 +148,19 @@ pub enum AnchorReadRefusal {
     /// recording from before the key existed, and telling its operator that its
     /// records carry a rank is the same false sentence one bag population over.
     ///
-    /// COMPATIBILITY: this variant GAINED the `state_record_format` field.
-    /// [`AnchorReadRefusal`] is public and is not `non_exhaustive`, so a struct
-    /// pattern on this variant written outside this crate must account for the
-    /// new field: a brace pattern ending in `..` is unaffected, and a pattern
+    /// COMPATIBILITY: this variant GAINED the `state_record_format` and
+    /// `ranks_missing` fields. [`AnchorReadRefusal`] is public and is not
+    /// `non_exhaustive`, so a struct pattern on this variant written outside
+    /// this crate must account for the new fields: a brace pattern ending in
+    /// `..` is unaffected, and a pattern
     /// naming only `rings` stops compiling. A struct variant has no path only
     /// pattern form, so there is no third shape to exempt here, and an
     /// identifier pattern that binds the refusal without destructuring it never
     /// reads a field at all.
     #[error(
-        "this recording drained {rings} state rings. From state record format version 1 a state \
-         record carries its producer's rank and the coverage manifest carries the ring to rank \
-         join, so a recording of that format does say which ring each record came from; {}. \
+        "this recording drained {rings} state rings{}. From state record format version 1 a \
+         state record carries its producer's rank and the coverage manifest carries the ring to \
+         rank join, so a recording of that format does say which ring each record came from; {}. \
          What is rankless in either case is this READER: its index table is keyed by node index \
          alone, and its assembler groups parts by run, step and node index, and neither of those \
          keys carries a rank. Every ring numbers its own nodes from 0, so two producers' first \
@@ -146,6 +168,7 @@ pub enum AnchorReadRefusal {
          state to another would produce a confident divergence report about an execution that \
          never happened. Fix: replay a recording of a single rank (`cerulion graph run --record \
          --single-process`)",
+        render_ranks_missing(ranks_missing),
         match state_record_format {
             Some(v) => format!("this recording's manifest names state record format version {v}"),
             None => "this recording's manifest names no state record format at all, so it makes \
@@ -159,6 +182,16 @@ pub enum AnchorReadRefusal {
         /// The state record format the manifest names, or `None` when it names
         /// none, which is every recording from before the key existed.
         state_record_format: Option<u32>,
+        /// Ranks the manifest stamps as having published no state ring at all.
+        ///
+        /// Carried so the refusal answers the WARN that sent the operator to
+        /// it. On a run of three or more ranks a rank hole and a multi-ring
+        /// recording are ONE event: the gap publishes nothing and the ranks
+        /// above it each publish a ring, so the operator is warned about a RANK
+        /// and then met by a refusal about RINGS, with nothing joining the two.
+        /// EMPTY on a multi-ring recording with no hole, where the clause
+        /// renders nothing and the sentence is the one it always was.
+        ranks_missing: Vec<u32>,
     },
 
     /// The anchors at the resume step belong to more than one run.
@@ -542,6 +575,9 @@ pub fn read_bag_anchors(reader: &BagReader) -> Result<BagAnchors, AnchorReadRefu
         return Err(AnchorReadRefusal::MultiRingAmbiguous {
             rings: coverage.rings_declared,
             state_record_format: coverage.state_record_format_version,
+            // Read off the SAME manifest the ring count is, so the refusal and
+            // the recorder's rank warn cannot name different holes.
+            ranks_missing: coverage.ranks_missing.clone(),
         });
     }
     // The version gate, BOTH WAYS, and it lives HERE rather than in the parse.
@@ -864,6 +900,7 @@ mod tests {
         let refusal = AnchorReadRefusal::MultiRingAmbiguous {
             rings: cov.rings_declared,
             state_record_format: cov.state_record_format_version,
+            ranks_missing: cov.ranks_missing.clone(),
         };
         let text = refusal.to_string();
         assert!(text.contains("2 state rings"), "{text}");
@@ -911,6 +948,7 @@ mod tests {
         let pre_rank = AnchorReadRefusal::MultiRingAmbiguous {
             rings: 2,
             state_record_format: None,
+            ranks_missing: Vec::new(),
         }
         .to_string();
         assert!(
@@ -934,6 +972,7 @@ mod tests {
         let named = AnchorReadRefusal::MultiRingAmbiguous {
             rings: 2,
             state_record_format: Some(1),
+            ranks_missing: Vec::new(),
         }
         .to_string();
         assert!(
@@ -944,6 +983,64 @@ mod tests {
             !named.contains("names no state record format at all"),
             "and not the other arm: {named}"
         );
+    }
+
+    /// The refusal answers the WARN that sent the operator to it.
+    ///
+    /// A rank hole on a run of three or more ranks IS a multi-ring recording:
+    /// the gap publishes nothing and every rank above it publishes a ring. The
+    /// operator was told a RANK published none and then met a refusal about
+    /// RINGS, and with no clause joining the two those read as separate faults.
+    ///
+    /// Two legs, because the clause is worth nothing without the shape it must
+    /// stay silent on: a hole names its rank, and a multi-ring recording with
+    /// no hole renders the sentence it always did.
+    #[test]
+    fn the_ambiguity_refusal_names_the_rank_that_published_no_ring() {
+        let mut holed = coverage(&[("alpha", Some(0))], 2);
+        holed.ranks_discovered = vec![0, 2];
+        holed.ranks_missing = vec![1];
+        let named = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: holed.rings_declared,
+            state_record_format: holed.state_record_format_version,
+            ranks_missing: holed.ranks_missing.clone(),
+        }
+        .to_string();
+        assert!(named.contains("2 state rings"), "{named}");
+        assert!(
+            named.contains("rank 1 published none"),
+            "the rank the operator was warned about is in the refusal: {named}"
+        );
+        assert!(!named.contains("ranks 1"), "one rank is singular: {named}");
+
+        // THE CONTROL: two rings and no hole. The clause renders nothing, so
+        // this arm fails on a change that made the rank text unconditional.
+        let plain = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: Some(1),
+            ranks_missing: Vec::new(),
+        }
+        .to_string();
+        assert!(
+            !plain.contains("published none"),
+            "no hole, no clause: {plain}"
+        );
+        assert!(
+            plain.contains(
+                "drained 2 state rings. From state record format version 1 a state record"
+            ),
+            "with no hole the ring count runs straight into the format clause, with no \
+             empty parenthesis between them: {plain}"
+        );
+
+        // TWO holes read as a list, and plural.
+        let two = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: Some(1),
+            ranks_missing: vec![1, 3],
+        }
+        .to_string();
+        assert!(two.contains("ranks 1, 3 published none"), "{two}");
     }
 
     #[test]
@@ -1382,7 +1479,8 @@ mod tests {
             multi_ring,
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
-                state_record_format: Some(1)
+                state_record_format: Some(1),
+                ranks_missing: Vec::new()
             }
         );
 
@@ -1738,7 +1836,8 @@ mod tests {
             two_rings,
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
-                state_record_format: Some(1)
+                state_record_format: Some(1),
+                ranks_missing: Vec::new()
             },
             "{two_rings:?}"
         );
@@ -1749,7 +1848,8 @@ mod tests {
             both,
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
-                state_record_format: None
+                state_record_format: None,
+                ranks_missing: Vec::new()
             },
             "the manifest property is asked before the format: {both:?}"
         );
@@ -1766,7 +1866,8 @@ mod tests {
             newer_and_ambiguous,
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
-                state_record_format: Some(2)
+                state_record_format: Some(2),
+                ranks_missing: Vec::new()
             },
             "the ring count is asked before the record format, so the capture's \
              own reason is the one served: {newer_and_ambiguous:?}"
