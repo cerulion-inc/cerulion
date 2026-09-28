@@ -3542,12 +3542,16 @@ fn each_observation_edge_kind_is_derived_from_its_own_shape() {
         BTreeSet::<SourceEdge>::new(),
         "a package always observes its own tree, however the path is reached"
     );
-    // And a name this walk cannot place is not the parent either: a literal
-    // joined onto an ordinary scratch directory still resolves nowhere.
+    // And the parent reading is NOT blanket: the SAME member name joined onto
+    // an ORDINARY receiver derives nothing. The literal resolves under the
+    // observing crate's own directory, which is no member, so the walk places
+    // it nowhere. Read against the parent it would name `crates/beta` and
+    // derive a `beta` edge, which is the reading this row rules out; a literal
+    // no member could match rules out nothing.
     assert_eq!(
-        fixture_edges("let p = tmp.join(\"beta_fixture/src/lib.rs\");\n"),
+        fixture_edges("let p = tmp.join(\"beta/src/lib.rs\");\n"),
         BTreeSet::<SourceEdge>::new(),
-        "a directory that is no member's is no edge"
+        "a member's name joined onto an ordinary receiver is no edge"
     );
 }
 
