@@ -54,14 +54,28 @@
 //!     package covered only there is covered by nothing;
 //!   * a STEP counts only if its `if:` cannot stop it running on a pull
 //!     request. Absent, `always()` and `success()` obviously cannot; nor can a
-//!     `matrix.<key> == <literal>` LEG SELECTOR, because every leg of a
-//!     PR-blocking job's matrix runs on every pull request, so the step runs on
-//!     exactly one of them. Everything else — `github.event_name == 'push'`
-//!     most of all — disqualifies the step.
+//!     `matrix.<key> == <literal>` LEG SELECTOR whose key the job's own matrix
+//!     DECLARES and whose literal is one of that key's legs, because every leg
+//!     of a PR-blocking job's matrix runs on every pull request, so the step
+//!     runs on exactly one of them. A selector naming a key or a leg the matrix
+//!     does not carry matches no leg at all: it runs on NO pull request while
+//!     reading as an ordinary leg-selected step, so it credits nothing.
+//!     Everything else — `github.event_name == 'push'` most of all —
+//!     disqualifies the step.
 //!
 //! Both job rules and the step rule are deliberately blunt in the FAIL-CLOSED
 //! direction: a future condition that genuinely still runs on pull requests
 //! costs a maintainer one line here rather than costing everyone a silent hole.
+//!
+//! THE `if:` VALUE IS READ IN EVERY YAML SCALAR FORM the workflow tree uses: a
+//! plain scalar on the key's own line, a single- or double-quoted one, a folded
+//! or literal block scalar (`>`, `>-`, `|`, `|-`, chomping included), and a
+//! plain scalar written on the following more-indented lines. They all mean the
+//! same expression. Reading one of them as an EMPTY condition is the whole
+//! failure mode: an empty condition cannot stop a step, so a step behind
+//! `github.event_name == 'push'` written on the line after its `if:` would
+//! credit coverage. A form the reader cannot classify FAILS this test rather
+//! than reading as no condition at all.
 //!
 //! SELECTION CONDITIONS are the one widening of that rule, and there are
 //! exactly three, spelled as constants below:
@@ -77,11 +91,13 @@
 //!
 //! GROUNDED, not merely well spelled. A condition is an expression over a value
 //! another job produced, so each of the three counts only where that value
-//! exists: the job carrying the step must `needs:` the `changes` job, and
-//! `changes` must declare the output the condition reads. Either one missing
-//! means the expression evaluates to the empty string on every event — the step
-//! runs NOWHERE while reading as a selected step — so the walk fails closed and
-//! drops it. Both halves are asserted on synthetic workflows by
+//! exists: the job carrying the step must `needs:` the `changes` job, `changes`
+//! must declare the output the condition reads, and that declaration must take
+//! its value from a STEP of that job (`steps.<id>.outputs.<name>` for an `id:`
+//! the job carries) or be a literal. Any one of the three missing means the
+//! expression evaluates to the empty string on every event — the step runs
+//! NOWHERE while reading as a selected step — so the walk fails closed and
+//! drops it. All three are asserted on synthetic workflows by
 //! `a_selection_condition_credits_nothing_when_its_output_is_not_grounded`.
 //!
 //! TOTALITY UNDER SELECTION is the second thing the walk now decides, because
@@ -304,30 +320,52 @@ fn selection_condition_package(term: &str) -> Option<&str> {
 }
 
 /// The selection outputs a step's condition may read: the ones the classifier
-/// declares, available to a job that needs the classifier.
+/// declares AND produces, available to a job that needs the classifier.
 type GroundedOutputs = BTreeSet<String>;
 
-/// Which of the three selection outputs the classifier job of `jobs` declares.
+/// The legs a job's `strategy: matrix:` declares, `key -> {leg, ...}`.
+type MatrixLegs = BTreeMap<String, BTreeSet<String>>;
+
+/// The identifier charset a workflow uses for job ids, step ids, matrix keys
+/// and package names.
+fn is_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+/// Which of the three selection outputs the classifier job of `jobs` declares
+/// AND produces.
 ///
 /// Read from that job's `outputs:` mapping — the keys at six-space indent under
-/// it — so an output nobody publishes can ground nothing.
+/// it — so an output nobody publishes can ground nothing. A BLANK line does not
+/// end the mapping: comments are blanked to empty strings before this walk sees
+/// the file, and reading one as the end truncated the map at the first comment
+/// between two keys.
+///
+/// Declaring the key is half of it. The VALUE has to come from somewhere that
+/// exists — a step of that job, or a literal — because an output wired to a
+/// step id the job does not carry is the empty string on every event, exactly
+/// like an output nobody declared at all.
 fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
     let mut out = BTreeSet::new();
     let Some((_, block)) = jobs.iter().find(|(name, _)| name == SELECTION_JOB) else {
         return out;
     };
+    let ids = step_ids(block);
     let lines: Vec<&str> = block.lines().collect();
     let Some(at) = lines.iter().position(|l| l.trim_end() == "    outputs:") else {
         return out;
     };
     for line in &lines[at + 1..] {
+        if line.trim().is_empty() {
+            continue;
+        }
         let Some(rest) = line.strip_prefix("      ") else {
             break;
         };
         if rest.starts_with(' ') {
             continue;
         }
-        let Some((key, _)) = rest.split_once(':') else {
+        let Some((key, value)) = rest.split_once(':') else {
             break;
         };
         let key = key.trim();
@@ -337,9 +375,151 @@ fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
             SELECTION_PKGS_OUTPUT,
         ]
         .contains(&key)
+            && output_is_produced(value, &ids)
         {
             out.insert(key.to_string());
         }
+    }
+    out
+}
+
+/// Does a declared output's VALUE come from somewhere that exists?
+///
+/// A non-empty literal grounds itself. An expression has to read
+/// `steps.<id>.outputs.<name>`, and every step id it names has to be one this
+/// job's steps declare: an expression over anything else — a step renamed away,
+/// a `needs.` of a job that is not needed — is the empty string on every event.
+fn output_is_produced(value: &str, step_ids: &BTreeSet<String>) -> bool {
+    if !value.contains("${{") {
+        return !value.trim().is_empty();
+    }
+    let referenced = step_output_references(value);
+    !referenced.is_empty() && referenced.iter().all(|id| step_ids.contains(id))
+}
+
+/// Every step id an expression reads an output of.
+fn step_output_references(value: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut rest = value;
+    while let Some(at) = rest.find("steps.") {
+        rest = &rest[at + "steps.".len()..];
+        let id: String = rest.chars().take_while(|c| is_name_char(*c)).collect();
+        let Some(tail) = rest[id.len()..].strip_prefix(".outputs.") else {
+            continue;
+        };
+        if !id.is_empty() && tail.starts_with(is_name_char) {
+            out.insert(id);
+        }
+    }
+    out
+}
+
+/// The `id:` of every step of one job block.
+///
+/// Read at the step's own indent — the item line's `- id:`, or a key two
+/// deeper — so a line inside a `run:` script cannot invent one.
+fn step_ids(block: &str) -> BTreeSet<String> {
+    let lines: Vec<&str> = block.lines().collect();
+    let mut out = BTreeSet::new();
+    let Some(steps_at) = lines.iter().position(|l| l.trim() == "steps:") else {
+        return out;
+    };
+    let body = &lines[steps_at + 1..];
+    let Some(step_indent) = body
+        .iter()
+        .find(|l| l.trim_start().starts_with("- "))
+        .map(|l| indent_of(l))
+    else {
+        return out;
+    };
+    for line in body {
+        let trimmed = line.trim_start();
+        let value = if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix("id:"))
+        } else if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix("id:")
+        } else {
+            None
+        };
+        if let Some(id) = value {
+            let id = id.trim().trim_matches(['\'', '"']);
+            if !id.is_empty() {
+                out.insert(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The legs a job's matrix declares, `key -> {leg, ...}`, in both YAML list
+/// forms.
+///
+/// A matrix carrying `include:` or `exclude:` adds or removes legs this reader
+/// does not model, so it reports NO legs at all and every `matrix.<key>`
+/// condition in that job fails closed.
+fn job_matrix_legs(block: &str) -> MatrixLegs {
+    let lines: Vec<&str> = block.lines().collect();
+    let mut out = MatrixLegs::new();
+    let Some(at) = lines.iter().position(|l| l.trim() == "matrix:") else {
+        return out;
+    };
+    let matrix_indent = indent_of(lines[at]);
+    let mut i = at + 1;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        if indent_of(line) <= matrix_indent {
+            break;
+        }
+        let key_indent = indent_of(line);
+        let Some((key, value)) = line.trim().split_once(':') else {
+            i += 1;
+            continue;
+        };
+        let key = key.trim().to_string();
+        if key == "include" || key == "exclude" {
+            return MatrixLegs::new();
+        }
+        let value = value.trim();
+        if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            out.insert(
+                key,
+                inner
+                    .split(',')
+                    .map(|t| t.trim().trim_matches(['\'', '"']).to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect(),
+            );
+            i += 1;
+            continue;
+        }
+        if !value.is_empty() {
+            i += 1;
+            continue;
+        }
+        let mut legs = BTreeSet::new();
+        i += 1;
+        while i < lines.len() {
+            let l = lines[i];
+            if l.trim().is_empty() {
+                i += 1;
+                continue;
+            }
+            if indent_of(l) <= key_indent {
+                break;
+            }
+            let Some(item) = l.trim().strip_prefix("- ") else {
+                break;
+            };
+            legs.insert(item.trim().trim_matches(['\'', '"']).to_string());
+            i += 1;
+        }
+        out.insert(key, legs);
     }
     out
 }
@@ -349,9 +529,10 @@ fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
 ///
 /// FAIL-CLOSED: anything not recognised as harmless disqualifies the step.
 /// Recognised as harmless are `always()`, `success()`, and a
-/// `matrix.<key> == <literal>` / `!= <literal>` LEG SELECTOR — every leg of a
-/// PR-blocking job's matrix runs on every pull request, so a leg-selected step
-/// runs on at least one of them and can therefore fail one.
+/// `matrix.<key> == <literal>` / `!= <literal>` LEG SELECTOR the job's own
+/// matrix can satisfy — every leg of a PR-blocking job's matrix runs on every
+/// pull request, so a step selected onto a leg that EXISTS runs on at least one
+/// of them and can therefore fail one.
 /// `github.event_name == 'push'`, `runner.os == 'Linux'` and anything with a
 /// `||` do not qualify.
 ///
@@ -359,7 +540,18 @@ fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
 /// selection condition over anything else is an expression over the empty
 /// string: false on every event, so the step runs nowhere and is not
 /// sanctioned.
-fn step_if_is_pr_blocking_grounded(cond: &str, grounded: &GroundedOutputs) -> bool {
+///
+/// `matrix` names the legs the step's own job declares. A selector whose key
+/// the matrix does not carry, or whose literal is not one of that key's legs,
+/// matches no leg at all: the step runs on no pull request while reading as an
+/// ordinary leg-selected step, so it credits nothing. `!=` asks the same
+/// question the other way round — some leg has to differ from the literal, or
+/// the step is excluded from every leg there is.
+fn step_if_is_pr_blocking_grounded(
+    cond: &str,
+    grounded: &GroundedOutputs,
+    matrix: &MatrixLegs,
+) -> bool {
     let cond = cond.trim();
     if cond.is_empty() {
         return true;
@@ -387,14 +579,22 @@ fn step_if_is_pr_blocking_grounded(cond: &str, grounded: &GroundedOutputs) -> bo
         let Some(rest) = t.strip_prefix("matrix.") else {
             return false;
         };
-        let Some((key, _)) = rest.split_once("==").or_else(|| rest.split_once("!=")) else {
+        let (key, literal, negated) = if let Some((key, literal)) = rest.split_once("==") {
+            (key.trim(), literal.trim(), false)
+        } else if let Some((key, literal)) = rest.split_once("!=") {
+            (key.trim(), literal.trim(), true)
+        } else {
             return false;
         };
-        let key = key.trim().trim_end_matches('!');
-        !key.is_empty()
-            && key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        let literal = literal.trim_matches(['\'', '"']);
+        let Some(legs) = matrix.get(key) else {
+            return false;
+        };
+        if negated {
+            legs.iter().any(|leg| leg != literal)
+        } else {
+            legs.contains(literal)
+        }
     })
 }
 
@@ -411,11 +611,30 @@ fn every_selection_output() -> GroundedOutputs {
     .collect()
 }
 
-/// [`step_if_is_pr_blocking_grounded`] with every selection output available:
-/// the question "is this CONDITION one of the sanctioned shapes?", with
-/// grounding set aside.
+/// Every leg `ci.yml`'s matrix jobs declare — for the arms that ask about a
+/// CONDITION rather than about a step in a job. An arm about the RESOLUTION of
+/// a selector against a matrix builds its own.
+fn every_matrix_leg() -> MatrixLegs {
+    [
+        ("shard", &["0", "1", "2", "3"][..]),
+        ("lane", &["viz", "vizd"][..]),
+        ("os", &["ubuntu-latest", "macos-latest"][..]),
+    ]
+    .into_iter()
+    .map(|(key, legs)| {
+        (
+            key.to_string(),
+            legs.iter().map(|leg| (*leg).to_string()).collect(),
+        )
+    })
+    .collect()
+}
+
+/// [`step_if_is_pr_blocking_grounded`] with every selection output available
+/// and every leg `ci.yml` declares: the question "is this CONDITION one of the
+/// sanctioned shapes?", with grounding and leg resolution set aside.
 fn step_if_is_pr_blocking(cond: &str) -> bool {
-    step_if_is_pr_blocking_grounded(cond, &every_selection_output())
+    step_if_is_pr_blocking_grounded(cond, &every_selection_output(), &every_matrix_leg())
 }
 
 /// Does this step-level `if:` hold when the classifier selected exactly
@@ -453,38 +672,138 @@ fn step_if_holds_under_selection(cond: &str, selected: &BTreeSet<String>) -> boo
 ///
 /// `grounded` is the set of selection outputs THIS job can read — empty for a
 /// job that does not need the classifier, so a selection condition there is not
-/// sanctioned and its step goes.
-fn drop_gated_steps(job: &str, grounded: &GroundedOutputs) -> String {
-    retain_steps(job, |cond| step_if_is_pr_blocking_grounded(cond, grounded))
+/// sanctioned and its step goes. `matrix` is the legs THIS job declares, so a
+/// leg selector is resolved against the matrix that would have to run it.
+fn drop_gated_steps(job: &str, grounded: &GroundedOutputs, matrix: &MatrixLegs) -> String {
+    retain_steps(job, |cond| {
+        step_if_is_pr_blocking_grounded(cond, grounded, matrix)
+    })
+}
+
+/// The indentation of one line.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// One `if:` value, in every YAML scalar form the workflow tree uses, with runs
+/// of whitespace folded to single spaces.
+///
+/// `rest` is the text after the `if:` token on `lines[at]`, and `key_column` is
+/// the column that token starts at: a scalar CONTINUES on the following lines
+/// indented deeper than it, and stops at the first non-blank line that is not.
+/// A blank line does not stop it — comments are blanked before this walk sees
+/// the file.
+///
+/// The forms: a plain scalar on the key's own line, a single- or double-quoted
+/// one, a folded or literal block scalar (`>`, `>-`, `>+`, `|`, `|-`, `|+`),
+/// and a plain scalar whose value begins on the following line. All of them
+/// mean the same expression, and GitHub ignores the whitespace between its
+/// tokens, which is why the value comes back folded.
+///
+/// FAIL CLOSED. An unreadable form is an `Err` its caller turns into a test
+/// failure, never an empty condition: an empty condition cannot stop a step, so
+/// reading one is exactly how a gated step gets credited.
+fn read_if_scalar(
+    rest: &str,
+    lines: &[&str],
+    at: usize,
+    key_column: usize,
+) -> Result<String, String> {
+    let head = rest.trim();
+    let mut continuation: Vec<&str> = Vec::new();
+    for line in &lines[at + 1..] {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if indent_of(line) <= key_column {
+            break;
+        }
+        continuation.push(line.trim());
+    }
+    let folded = |parts: &[&str]| -> String {
+        parts
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    if let Some(indicator) = head.strip_prefix(['>', '|']) {
+        if !matches!(indicator, "" | "-" | "+") {
+            return Err(format!(
+                "a block scalar header this reader cannot classify: `if: {head}`"
+            ));
+        }
+        if continuation.is_empty() {
+            return Err(String::from("a block `if:` with no value under it"));
+        }
+        return Ok(folded(&continuation));
+    }
+    if head.is_empty() {
+        if continuation.is_empty() {
+            return Err(String::from("an `if:` with no value at all"));
+        }
+        if continuation[0].starts_with("- ") {
+            return Err(String::from("an `if:` whose value is a sequence"));
+        }
+        return Ok(folded(&continuation));
+    }
+    if head.starts_with(['\'', '"']) {
+        let quote = head.chars().next().expect("the head is not empty");
+        if !continuation.is_empty() {
+            return Err(format!("a quoted `if:` continued on another line: {head}"));
+        }
+        let inner = head
+            .strip_prefix(quote)
+            .and_then(|h| h.strip_suffix(quote))
+            .ok_or_else(|| format!("an unterminated quoted `if:`: {head}"))?;
+        if quote == '"' && inner.contains('\\') {
+            return Err(format!("an escaped double-quoted `if:`: {head}"));
+        }
+        let inner = if quote == '\'' {
+            inner.replace("''", "'")
+        } else {
+            inner.to_string()
+        };
+        return Ok(folded(&[inner.as_str()]));
+    }
+    if head.starts_with(['*', '&', '!']) {
+        return Err(format!("an anchor, alias or tag as an `if:`: {head}"));
+    }
+    let mut parts = vec![head];
+    parts.extend(continuation);
+    Ok(folded(&parts))
 }
 
 /// Keep the steps of one job whose every `if:` satisfies `keep`, and drop the
 /// rest.
 ///
 /// Steps are list items under `steps:`; the item indent is read from the first
-/// one rather than hard-coded, and a step's own keys sit two spaces deeper.
+/// one rather than hard-coded, and a step's own keys sit two spaces deeper. The
+/// `if:` VALUE is read in every scalar form by [`read_if_scalar`], and a form
+/// it cannot classify PANICS: this walk exists to decide whether a condition
+/// can stop a step, so a condition it cannot read is not one it may skip past.
 fn retain_steps<F: Fn(&str) -> bool>(job: &str, keep: F) -> String {
     let lines: Vec<&str> = job.lines().collect();
     let Some(steps_at) = lines.iter().position(|l| l.trim() == "steps:") else {
         return job.to_string();
     };
     let mut out: Vec<&str> = lines[..=steps_at].to_vec();
-    let body = &lines[steps_at + 1..];
+    let body: Vec<&str> = lines[steps_at + 1..].to_vec();
 
-    let indent_of = |l: &str| l.len() - l.trim_start().len();
     let Some(step_indent) = body
         .iter()
         .find(|l| l.trim_start().starts_with("- "))
         .map(|l| indent_of(l))
     else {
-        out.extend_from_slice(body);
+        out.extend_from_slice(&body);
         return out.join("\n");
     };
     let is_step_start = |l: &str| indent_of(l) == step_indent && l.trim_start().starts_with("- ");
 
     let mut cur: Vec<&str> = Vec::new();
     let mut gated = false;
-    for line in body {
+    for (i, &line) in body.iter().enumerate() {
         if is_step_start(line) {
             if !gated {
                 out.append(&mut cur);
@@ -494,8 +813,9 @@ fn retain_steps<F: Fn(&str) -> bool>(job: &str, keep: F) -> String {
         }
         let trimmed = line.trim_start();
         // A step's `if:` is either its own key (two deeper than the item) or
-        // the first key on the `- if: …` item line itself.
-        let cond = if indent_of(line) == step_indent + 2 {
+        // the first key on the `- if: …` item line itself. Either way the value
+        // may continue on the lines below it.
+        let found = if indent_of(line) == step_indent + 2 {
             trimmed.strip_prefix("if:")
         } else if is_step_start(line) {
             trimmed
@@ -504,8 +824,18 @@ fn retain_steps<F: Fn(&str) -> bool>(job: &str, keep: F) -> String {
         } else {
             None
         };
-        if let Some(c) = cond {
-            if !keep(c) {
+        if let Some(rest) = found {
+            let cond = read_if_scalar(rest, &body, i, step_indent + 2).unwrap_or_else(|why| {
+                panic!(
+                    "{why}\n\nThe walk cannot say whether this step runs on a \
+                     pull request, so it refuses to guess. Spell the `if:` as a \
+                     plain, quoted or block scalar, or teach `read_if_scalar` \
+                     the form — never leave it unread: an unread condition reads \
+                     as NO condition, and a step behind \
+                     `github.event_name == 'push'` would then credit coverage."
+                )
+            });
+            if !keep(&cond) {
                 gated = true;
             }
         }
@@ -576,7 +906,7 @@ fn pr_blocking_jobs(text: &str) -> String {
             } else {
                 &no_outputs
             };
-            drop_gated_steps(block, grounded)
+            drop_gated_steps(block, grounded, &job_matrix_legs(block))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1291,7 +1621,6 @@ fn a_shard_matrix_shorter_than_the_count_is_refused() {
 fn shard_matrices(job: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let lines: Vec<&str> = job.lines().collect();
-    let indent_of = |l: &str| l.len() - l.trim_start().len();
 
     let mut i = 0usize;
     while i < lines.len() {
@@ -1592,7 +1921,8 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
                      changes:\n    runs-on: ubuntu-latest\n    outputs:\n      \
                      code: ${{ steps.classify.outputs.code }}\n      \
                      docs: ${{ steps.classify.outputs.docs }}\n      \
-                     pkgs: ${{ steps.classify.outputs.pkgs }}\n    steps:\n      - run: true\n";
+                     pkgs: ${{ steps.classify.outputs.pkgs }}\n    steps:\n      \
+                     - id: classify\n        run: true\n";
     let candidates: BTreeSet<String> = [
         "code_pkg",
         "docs_pkg",
@@ -1665,13 +1995,18 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
              - if: contains(fromJSON(needs.changes.outputs.pkgs), 'sel_pkg')\n        \
              run: cargo test -p sel_pkg\n      \
              - run: cargo test -p always_pkg\n  \
-             changes:\n    runs-on: ubuntu-latest\n{outputs}    steps:\n      - run: true\n"
+             changes:\n    runs-on: ubuntu-latest\n{outputs}    steps:\n      \
+             - id: c\n        run: true\n"
         )
     };
     let needs_changes = "    needs: [changes]\n";
     let all_outputs = "    outputs:\n      code: ${{ steps.c.outputs.code }}\n      \
                        pkgs: ${{ steps.c.outputs.pkgs }}\n";
     let other_output = "    outputs:\n      packaging: ${{ steps.c.outputs.packaging }}\n";
+    // Declared, and wired to a step this job does not carry: the value is the
+    // empty string on every event, exactly like an output nobody declared.
+    let unproduced = "    outputs:\n      code: ${{ steps.gone.outputs.code }}\n      \
+                      pkgs: ${{ steps.gone.outputs.pkgs }}\n";
 
     let credited = |text: &str| -> BTreeSet<String> {
         let texts: BTreeMap<String, String> = [("fake.yml".to_string(), pr_blocking_jobs(text))]
@@ -1713,7 +2048,17 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
         "an output the classifier does not declare grounds nothing"
     );
 
-    // And the declaration reader itself, both ways.
+    // NOT GROUNDED, half three: the outputs are DECLARED, and no step of the
+    // classifier produces them. A declaration is a promise about a value; the
+    // value still has to come from somewhere.
+    assert_eq!(
+        credited(&body(needs_changes, unproduced)),
+        set(&["always_pkg"]),
+        "an output wired to a step id the classifier does not carry is the \
+         empty string on every event and grounds nothing"
+    );
+
+    // And the declaration reader itself, every way.
     assert_eq!(
         declared_selection_outputs(&jobs_of(&body(needs_changes, all_outputs))),
         set(&["code", "pkgs"])
@@ -1721,6 +2066,251 @@ fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
     assert_eq!(
         declared_selection_outputs(&jobs_of(&body(needs_changes, other_output))),
         BTreeSet::<String>::new()
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, unproduced))),
+        BTreeSet::<String>::new()
+    );
+    // A literal value grounds itself: nothing has to produce it.
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(
+            needs_changes,
+            "    outputs:\n      code: 'true'\n"
+        ))),
+        set(&["code"])
+    );
+    // A comment between two output keys does not end the mapping. Comments are
+    // blanked to empty strings before this walk reads a workflow, so a blank
+    // line is what it sees, and reading one as the end truncated the map.
+    let commented = body(needs_changes, all_outputs).replace(
+        "      pkgs: ",
+        "      # the package list the per-package condition reads\n      pkgs: ",
+    );
+    let stripped: String = commented
+        .lines()
+        .map(strip_yaml_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&stripped)),
+        set(&["code", "pkgs"]),
+        "a comment between two output keys must not truncate the map"
+    );
+}
+
+/// Every `if:` [`retain_steps`] read out of one job block, in file order.
+fn conditions_read(job: &str) -> Vec<String> {
+    let seen = std::cell::RefCell::new(Vec::new());
+    retain_steps(job, |cond| {
+        seen.borrow_mut().push(cond.to_string());
+        true
+    });
+    seen.into_inner()
+}
+
+/// One job with one conditional step, so an arm can vary the `if:` alone.
+fn job_with_condition(if_block: &str) -> String {
+    format!(
+        "  j:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        \
+         shard: [0, 1]\n    steps:\n      \
+         - name: conditional\n        {if_block}        run: cargo test -p gated_pkg\n      \
+         - run: cargo test -p plain_pkg\n"
+    )
+}
+
+/// The step condition is read in every YAML scalar form, and every form means
+/// the same expression.
+///
+/// The oracle is the expression itself, typed once: each form below spells
+/// `github.event_name == 'push'` in a different YAML shape, and the reader has
+/// to return that one string from all of them. Reading a form as the EMPTY
+/// condition is what this arm exists for — an empty condition cannot stop a
+/// step, so the push-allowlisted step would credit coverage.
+#[test]
+fn a_step_condition_is_read_in_every_yaml_scalar_form() {
+    let gate = "github.event_name == 'push'";
+    let forms: [(&str, String); 9] = [
+        ("plain, on the key's own line", format!("if: {gate}\n")),
+        ("double quoted", format!("if: \"{gate}\"\n")),
+        (
+            "single quoted, inner quotes doubled",
+            String::from("if: 'github.event_name == ''push'''\n"),
+        ),
+        ("folded, chomped", format!("if: >-\n          {gate}\n")),
+        ("folded", format!("if: >\n          {gate}\n")),
+        ("literal", format!("if: |\n          {gate}\n")),
+        ("literal, chomped", format!("if: |-\n          {gate}\n")),
+        (
+            "plain, written on the following line",
+            format!("if:\n          {gate}\n"),
+        ),
+        (
+            "plain, continued on the following line",
+            String::from("if: github.event_name\n          == 'push'\n"),
+        ),
+    ];
+
+    for (name, if_block) in &forms {
+        let job = job_with_condition(if_block);
+        assert_eq!(
+            conditions_read(&job),
+            vec![gate.to_string()],
+            "the `{name}` form must read as the expression it spells"
+        );
+        let kept = pr_blocking_jobs(&format!("on:\n  pull_request:\njobs:\n{job}"));
+        assert!(
+            !kept.contains("gated_pkg"),
+            "the `{name}` form gates the step off pull requests and must not \
+             credit coverage; got:\n{kept}"
+        );
+        assert!(
+            kept.contains("plain_pkg"),
+            "the step after a `{name}` condition must survive; got:\n{kept}"
+        );
+    }
+
+    // The other side of each form: a condition that cannot stop the step keeps
+    // it, so no form disqualifies a step by its shape alone.
+    for (name, if_block) in [
+        ("plain", String::from("if: always()\n")),
+        ("double quoted", String::from("if: \"always()\"\n")),
+        ("single quoted", String::from("if: 'always()'\n")),
+        (
+            "folded, chomped",
+            String::from("if: >-\n          always()\n"),
+        ),
+        (
+            "literal, chomped",
+            String::from("if: |-\n          always()\n"),
+        ),
+        (
+            "on the following line",
+            String::from("if:\n          always()\n"),
+        ),
+    ] {
+        let job = job_with_condition(&if_block);
+        assert_eq!(conditions_read(&job), vec![String::from("always()")]);
+        let kept = pr_blocking_jobs(&format!("on:\n  pull_request:\njobs:\n{job}"));
+        assert!(
+            kept.contains("gated_pkg"),
+            "`always()` in the `{name}` form cannot stop the step; got:\n{kept}"
+        );
+    }
+
+    // A step's own keys END the scalar: the `run:` below sits at the `if:`
+    // column, so it is never swallowed as a continuation line.
+    assert_eq!(
+        conditions_read(&job_with_condition("if: matrix.shard == 0\n")),
+        vec![String::from("matrix.shard == 0")]
+    );
+}
+
+/// A condition form the reader cannot classify FAILS the walk rather than
+/// reading as no condition at all.
+#[test]
+#[should_panic(expected = "an anchor, alias or tag as an `if:`")]
+fn an_unreadable_step_condition_fails_the_walk() {
+    retain_steps(&job_with_condition("if: *gate\n"), |_| true);
+}
+
+/// A leg selector counts only against a leg the step's OWN job declares.
+///
+/// Both halves: a selector naming a key the matrix does not carry, and one
+/// naming a value that is not a leg of that key, select NO leg — the step runs
+/// on no pull request at all while reading as an ordinary leg-selected step.
+#[test]
+fn a_leg_selector_counts_only_against_a_leg_the_job_declares() {
+    let legs = |rows: &[(&str, &[&str])]| -> MatrixLegs {
+        rows.iter()
+            .map(|(key, legs)| {
+                (
+                    (*key).to_string(),
+                    legs.iter().map(|leg| (*leg).to_string()).collect(),
+                )
+            })
+            .collect()
+    };
+    let shards = legs(&[("shard", &["0", "1", "2", "3"])]);
+    let one_shard = legs(&[("shard", &["0"])]);
+    let lanes = legs(&[("lane", &["viz", "vizd"])]);
+    let grounded = every_selection_output();
+
+    for (cond, matrix) in [
+        ("matrix.shard == 0", &shards),
+        ("matrix.shard == 3", &shards),
+        ("matrix.shard != 0", &shards),
+        ("matrix.lane == 'viz'", &lanes),
+        ("matrix.lane != 'viz'", &lanes),
+    ] {
+        assert!(
+            step_if_is_pr_blocking_grounded(cond, &grounded, matrix),
+            "`{cond}` selects a leg this job declares and must count"
+        );
+    }
+    for (cond, matrix) in [
+        // A leg the matrix does not carry: shard 4 of a four-way split.
+        ("matrix.shard == 4", &shards),
+        // A key the matrix does not declare at all, in both directions.
+        ("matrix.lane == 'viz'", &shards),
+        ("matrix.shard == 0", &lanes),
+        // The only leg there is, excluded: the step runs on nothing.
+        ("matrix.shard != 0", &one_shard),
+    ] {
+        assert!(
+            !step_if_is_pr_blocking_grounded(cond, &grounded, matrix),
+            "`{cond}` selects no leg of this job's matrix and must credit nothing"
+        );
+    }
+
+    // The matrix reader itself: both list forms, no matrix at all, and the one
+    // shape it refuses to model.
+    assert_eq!(
+        job_matrix_legs(
+            "  j:\n    strategy:\n      matrix:\n        shard: [0, 1]\n        \
+             lane: [viz, vizd]\n    steps:\n      - run: true\n"
+        ),
+        legs(&[("lane", &["viz", "vizd"]), ("shard", &["0", "1"])])
+    );
+    assert_eq!(
+        job_matrix_legs(
+            "  j:\n    strategy:\n      matrix:\n        shard:\n          - 0\n          \
+             - 1\n    steps:\n      - run: true\n"
+        ),
+        legs(&[("shard", &["0", "1"])]),
+        "a block-style leg list must be seen"
+    );
+    assert_eq!(
+        job_matrix_legs(
+            "  j:\n    strategy:\n      matrix:\n        shard: [0, 1]\n        \
+             include:\n          - shard: 9\n    steps:\n      - run: true\n"
+        ),
+        MatrixLegs::new(),
+        "`include:` adds legs this reader does not model, so it reports none and \
+         every leg selector in that job fails closed"
+    );
+    assert_eq!(
+        job_matrix_legs("  j:\n    steps:\n      - run: true\n"),
+        MatrixLegs::new()
+    );
+
+    // End to end: the same step, once on a leg the job has and once on a leg it
+    // does not.
+    let doc = |leg: &str| {
+        format!(
+            "on:\n  pull_request:\njobs:\n  j:\n    runs-on: ubuntu-latest\n    \
+             strategy:\n      matrix:\n        shard: [0, 1]\n    steps:\n      \
+             - name: leg\n        if: matrix.shard == {leg}\n        \
+             run: cargo test -p leg_pkg\n"
+        )
+    };
+    assert!(
+        pr_blocking_jobs(&doc("1")).contains("leg_pkg"),
+        "a step selected onto a declared leg runs on every pull request, on that leg"
+    );
+    assert!(
+        !pr_blocking_jobs(&doc("2")).contains("leg_pkg"),
+        "a step selected onto a leg the matrix does not carry runs on no pull \
+         request and must not credit coverage"
     );
 }
 

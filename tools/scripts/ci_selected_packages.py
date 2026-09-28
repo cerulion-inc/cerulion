@@ -31,11 +31,24 @@ below therefore errs towards selecting more:
 
 A dependency is resolved to a workspace member BY NAME, and `dependencies[].name`
 is the real package name rather than the local alias, so a renamed dependency
-still resolves. A dependency whose name no member carries is a registry crate
-and is ignored, and so is a self-edge (a crate may dev-depend on itself, and it
-adds nothing to its own closure). A package that appears in `packages` without
-being in `workspace_members` is never selected, whatever it depends on, so a
-document produced with or without `--no-deps` gives the same answer.
+still resolves; the alias is not a member and naming it is a refusal. A
+dependency whose name no member carries is a registry crate and is ignored, and
+so is a self-edge (a crate may dev-depend on itself, and it adds nothing to its
+own closure). A package that appears in `packages` without being in
+`workspace_members` is never selected, whatever it depends on, so a document
+produced with or without `--no-deps` gives the same answer.
+
+WHAT THIS CLOSURE PROVES, AND WHAT IT DOES NOT. It is the reverse CARGO
+DEPENDENCY closure over normal, build and dev edges: a package whose tests can
+observe a change through a dependency edge is in the output. A test can also
+observe another package WITHOUT an edge to it — by opening a path literal into
+that package's tree, by walking the whole repository, or by loading an artifact
+built from it at run time (`dlopen`) — and NONE of those classes is covered
+here. One of them is covered elsewhere: the doc-pin walk in
+`crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` pins every test
+binary that opens the shared documentation and tool trees. Cross-crate source
+literals and dlopen fixtures are an OPEN class, and they have to be pinned
+before any CI step is gated on this selection.
 
 Usage:
   ci_selected_packages.py [--metadata FILE] PACKAGE...
@@ -211,9 +224,18 @@ LIVE_ORACLE = {
 
 
 def _dependency(entry):
-    """One `dependencies` entry: `name`, or `name:dev` / `name:build`."""
+    """One `dependencies` entry.
+
+    `name`, `name:dev` / `name:build` for a kind, and `name=alias` for a
+    dependency RENAMED in the manifest: `cargo metadata` reports the real
+    package name in `name` and the local alias in `rename`.
+    """
+    entry, _, rename = entry.partition('=')
     name, _, kind = entry.partition(':')
-    return {'name': name, 'req': '*', 'kind': kind or None}
+    out = {'name': name, 'req': '*', 'kind': kind or None}
+    if rename:
+        out['rename'] = rename
+    return out
 
 
 def _document(members, outsiders=None):
@@ -249,6 +271,9 @@ OUTSIDE = _document({'core': [], 'app': ['serde', 'core']},
 DIAMOND = _document({'base': [], 'left': ['base'], 'right': ['base:dev'], 'top': ['left', 'right']})
 # A crate that dev-depends on itself, and a pair that depend on each other.
 LOOPS = _document({'solo': ['solo:dev'], 'ping': ['pong:dev'], 'pong': ['ping']})
+# `user` depends on `base` under a local alias. The edge is keyed by the real
+# package name, which is what the docstring above claims and nothing exercised.
+RENAMED = _document({'base': [], 'user': ['base=alias']})
 
 # `name | document | touched | dev edges followed | expected closure`.
 CLOSURE_CASES = [
@@ -268,6 +293,8 @@ CLOSURE_CASES = [
     ('cycle-terminates', LOOPS, ['ping'], True, ['ping', 'pong']),
     ('cycle-terminates-from-the-other-end', LOOPS, ['pong'], True, ['ping', 'pong']),
     ('repeated-name-selects-once', DIAMOND, ['top', 'top'], True, ['top']),
+    ('renamed-dependency-edge-is-keyed-by-the-package-name', RENAMED, ['base'], True,
+     ['base', 'user']),
 ]
 
 # `name | document | touched | expected error`.
@@ -278,6 +305,11 @@ ERROR_CASES = [
      UnknownPackages(['downstream'], ['app', 'core'])),
     ('several-unknown-names-are-all-named', DIAMOND, ['nope', 'base', 'gone'],
      UnknownPackages(['gone', 'nope'], ['base', 'left', 'right', 'top'])),
+    # The other side of the renamed edge: the ALIAS is nobody's package name,
+    # so a caller that reaches it from a changed path is refused rather than
+    # handed an empty selection.
+    ('renamed-dependency-alias-is-not-a-member', RENAMED, ['alias'],
+     UnknownPackages(['alias'], ['base', 'user'])),
 ]
 
 def _run(argv, stdin_text=''):
@@ -385,11 +417,13 @@ def self_test():
         arm('cli-reads-a-path', got == (0, '["left", "top"]\n', ''), '-> %r' % (got,))
         with open(path, 'w', encoding='utf-8') as handle:
             handle.write('{"version": 1, "packages": [{"name": "base"}]}')
+        # Pinned WHOLE, like its sibling below: the line a caller reads has to
+        # name the document it could not read AND the field that was missing.
+        expected_field = (2, '', 'ci_selected_packages: cannot read %s: %r\n'
+                          % (path, KeyError('id')))
         got = _run(['--metadata', path, 'base'])
-        arm('cli-document-missing-a-field-exits-2',
-            (got[0], got[1]) == (2, '')
-            and got[2].startswith('ci_selected_packages: cannot read'),
-            '-> %r' % (got,))
+        arm('cli-document-missing-a-field-refused-in-full', got == expected_field,
+            '-> %r, wanted %r' % (got, expected_field))
         # The absent-file refusal is pinned WHOLE, not by a prefix: the line a
         # caller reads has to name the path it could not open and why.
         absent = os.path.join(scratch, 'absent.json')

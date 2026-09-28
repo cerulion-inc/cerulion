@@ -13,11 +13,16 @@
 //! So the membership of that population is DERIVED here rather than listed. A
 //! hand list of "the tests that read the documentation tree" is stale the moment
 //! a test adds a path, and nothing tells anybody. This walk reads every
-//! workspace member's `tests/*.rs`, extracts the string literals its CODE
-//! carries, keeps the ones that name a shared tree or a root markdown file, and
-//! turns each hit into a `(package, test binary) -> roots` pin. Every pin must
-//! appear in `.github/workflows/ci.yml` as a marker line beside the step that
-//! runs that package:
+//! workspace member's `tests/*.rs` AND every `src/**/*.rs`, extracts the string
+//! literals its CODE carries, keeps the ones that name a shared tree or a root
+//! markdown file, and turns each hit into a `(package, test binary) -> roots`
+//! pin. `src/` is in the walk because a `#[cfg(test)]` unit test opens a shared
+//! tree exactly as an integration test does and was invisible here: two of them
+//! in this crate alone. Those reads all compile into the ONE library test
+//! binary, so they are pooled and attributed to a binary named after the
+//! package (`<package>::<package>`) — the name the step that runs them carries.
+//! Every pin must appear in `.github/workflows/ci.yml` as a marker line beside
+//! the step that runs that package:
 //!
 //! ```text
 //!       # doc-pin: <package>::<test binary> reads <root>, <root>
@@ -72,6 +77,23 @@
 //!     does not trace where the use leads: following a name into a crate-local
 //!     helper is the data-flow analysis this file declines to do.
 //!
+//! Two uses that pass both halves are still not reads, and each one had a row
+//! recording a read that does not happen:
+//!
+//!   * a path the code WRITES. `completions_test` writes a `README.md` fixture
+//!     into a temporary directory to prove the completion skips a FILE under
+//!     `nodes/`; the repository's own README is never opened. The destination
+//!     of a write is the first argument of a write call, so the walk reads
+//!     outward past the path openers the literal is spelled inside and asks
+//!     what the literal is an argument OF;
+//!   * a path joined onto the crate's OWN directory. `cerulion_wsd`'s
+//!     `doc_deference_test` opens its crate's `AGENTS.md`, which is
+//!     `crates/cerulion_wsd/AGENTS.md` and not the repository root's file of
+//!     that name. A literal that does not climb out with `../` names something
+//!     inside the crate, so it counts only where the receiver is not the
+//!     crate's manifest directory — resolved one hop, through a binding in the
+//!     same source, the same single hop the const rule takes.
+//!
 //! The code around a literal is read from a VIEW of the source with every
 //! comment body and every literal body blanked to spaces, so a call spelled
 //! inside a comment or inside another literal vouches for nothing.
@@ -108,6 +130,25 @@
 //! In the other direction the pin is deliberately over-inclusive: a literal that
 //! merely LOOKS like a path and is handed to one of the calls above costs one
 //! extra test step, while a missed one costs a silent skip.
+//!
+//! A `src/` read is attributed to the library test binary as a whole, so the
+//! marker names the package twice and says nothing about WHICH unit test opens
+//! the root. That is the finest name the workflow carries: the step that runs
+//! them is `cargo test -p <package>`.
+//!
+//! # What this pin covers, and what it does not
+//!
+//! It covers the SHARED trees: a test binary that opens `docs`, `tools`,
+//! `.github`, `benches`, `examples` or a root markdown file. That is one of the
+//! ways a test observes something no `crates/<package>/**` rule attributes to
+//! it. The other is a cargo dependency edge, and
+//! `tools/scripts/ci_selected_packages.py` closes over those — normal, build
+//! and dev.
+//!
+//! Neither covers a test that reaches into ANOTHER crate's tree through a
+//! source path literal, a walk over the whole repository, or a `dlopen` of an
+//! artifact built from another package. Those are an OPEN class, and they have
+//! to be pinned before any CI step is gated on the selection.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -145,10 +186,12 @@ const MARKER_VERB: &str = " reads ";
 /// Each row is `(package, test binary, directory roots, root markdown stems)`,
 /// and every row was produced by OPENING the named source and reading the call
 /// that takes the literal — not by running the walk and copying what it said.
-/// Three rows an earlier revision carried recorded reads that do not happen at
-/// all: a refusal's wording, a tree a walk asserts it stayed OUT of, and a set
-/// of file names asserted to be ABSENT from a package. Those rows are gone
-/// rather than tolerated.
+/// Five rows earlier revisions carried recorded reads that do not happen at
+/// all: a refusal's wording, a tree a walk asserts it stayed OUT of, a set of
+/// file names asserted to be ABSENT from a package, a root markdown file a test
+/// WRITES into a temporary directory, and a crate's own copy of one. Those rows
+/// are gone rather than tolerated, and the classifier refuses the last two
+/// shapes outright.
 ///
 /// So the rows say what a reader of the sources determines, which is the only
 /// thing that makes this an outside opinion: the walk cannot move a row by
@@ -157,9 +200,10 @@ const MARKER_VERB: &str = " reads ";
 /// "Limits") has no row either, because a row the walk cannot reproduce fails
 /// this arm without saying anything true about the tree.
 ///
-/// Rows are asserted EXACTLY and the derived set is asserted to be the same
-/// SIZE, so a binary that gains or loses a root fails here, and a derived pin
-/// with no row fails too.
+/// The rows are compared to the derived pins as a whole MAP against a whole
+/// map, after asserting the rows name each binary once: a binary that gains or
+/// loses a root fails here, a derived pin with no row fails here, and a
+/// duplicated row cannot hide either of them behind a length that still adds up.
 #[allow(clippy::type_complexity)]
 const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
     // The user-facing reference page, joined onto the repository root.
@@ -176,6 +220,15 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &["docs"],
         &[],
     ),
+    // The crate's own unit tests, which cargo compiles into ONE library test
+    // binary: `src/auth.rs` joins the login-seed script under the tools tree,
+    // and `src/system_deps.rs` joins the example node manifest.
+    (
+        "cerulion_cli_engine",
+        "cerulion_cli_engine",
+        &["examples", "tools"],
+        &[],
+    ),
     // This walk's own read of the workflow it gates.
     (
         "cerulion_cli_engine",
@@ -190,8 +243,6 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &[".github", "tools"],
         &[],
     ),
-    // The repository README, compared against the rendered help.
-    ("cerulion_cli_engine", "completions_test", &[], &["README"]),
     // The robot example workspace (a checked-workspace entry that becomes a
     // metadata invocation), and the dependency-ban configuration.
     (
@@ -258,8 +309,6 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
     ),
     // The user-facing reference page.
     ("cerulion_hygiene", "user_api_doc_test", &["docs"], &[]),
-    // The agent-docs file at the repository root.
-    ("cerulion_wsd", "doc_deference_test", &[], &["AGENTS"]),
     // The refresh script, reached from the crate manifest directory.
     (
         "native_ros2_messages",
@@ -309,6 +358,19 @@ fn blank(view: &mut [u8], from: usize, to: usize) {
     }
 }
 
+/// The two VIEWS of one source, and every string literal its code carries.
+struct SourceViews {
+    /// `src` with every comment body AND every literal body blanked to spaces.
+    code: String,
+    /// `src` with every comment body blanked and literal bodies KEPT.
+    ///
+    /// The crate-directory rule has to read `env!("CARGO_MANIFEST_DIR")`, and
+    /// that name is a literal: in the blanked view it is spaces.
+    code_with_literals: String,
+    /// Every string literal the CODE carries, in file order.
+    literals: Vec<CodeLiteral>,
+}
+
 /// The CODE view of `src`, and every STRING LITERAL its code carries.
 ///
 /// The view is `src` with every comment and every literal BODY blanked to
@@ -334,9 +396,10 @@ fn blank(view: &mut [u8], from: usize, to: usize) {
 /// Fail-closed at the edges: an unterminated literal or block comment consumes
 /// the rest of the file, so the pins its tail would have produced go missing and
 /// the workflow marker for them reads as stale — a red, never a quiet pass.
-fn scan_code(src: &str) -> (String, Vec<CodeLiteral>) {
+fn scan_code(src: &str) -> SourceViews {
     let bytes = src.as_bytes();
     let mut view = bytes.to_vec();
+    let mut kept = bytes.to_vec();
     let mut out = Vec::new();
     let mut i = 0usize;
     let mut block_depth = 0usize;
@@ -346,13 +409,16 @@ fn scan_code(src: &str) -> (String, Vec<CodeLiteral>) {
             if bytes[i..].starts_with(b"/*") {
                 block_depth += 1;
                 blank(&mut view, i, i + 2);
+                blank(&mut kept, i, i + 2);
                 i += 2;
             } else if bytes[i..].starts_with(b"*/") {
                 block_depth -= 1;
                 blank(&mut view, i, i + 2);
+                blank(&mut kept, i, i + 2);
                 i += 2;
             } else {
                 blank(&mut view, i, i + 1);
+                blank(&mut kept, i, i + 1);
                 i += 1;
             }
             continue;
@@ -363,12 +429,14 @@ fn scan_code(src: &str) -> (String, Vec<CodeLiteral>) {
                 None => bytes.len(),
             };
             blank(&mut view, i, end);
+            blank(&mut kept, i, end);
             i = end;
             continue;
         }
         if bytes[i..].starts_with(b"/*") {
             block_depth = 1;
             blank(&mut view, i, i + 2);
+            blank(&mut kept, i, i + 2);
             i += 2;
             continue;
         }
@@ -387,9 +455,12 @@ fn scan_code(src: &str) -> (String, Vec<CodeLiteral>) {
         }
         i += 1;
     }
-    let code = String::from_utf8(view)
-        .expect("blanking writes ASCII spaces, so the view stays valid UTF-8");
-    (code, out)
+    let expect = "blanking writes ASCII spaces, so the view stays valid UTF-8";
+    SourceViews {
+        code: String::from_utf8(view).expect(expect),
+        code_with_literals: String::from_utf8(kept).expect(expect),
+        literals: out,
+    }
 }
 
 /// One past a `'`-introduced token: a character literal, or a lifetime.
@@ -558,6 +629,43 @@ const PATH_WRAPPERS: &[&str] = &["format!(", "&"];
 /// The module every filesystem call this walk credits is reached through.
 const FS_MODULE: &str = "fs::";
 
+/// The call NAMES [`PATH_OPENERS`] spells, without the parenthesis and without
+/// a receiver's dot — what [`enclosing_calls`] reports.
+const PATH_OPENER_NAMES: &[&str] = &[
+    "Path::new",
+    "PathBuf::from",
+    "join",
+    "read_to_string",
+    "read_dir",
+    "File::open",
+    "include_str!",
+    "include_bytes!",
+];
+
+/// Calls whose FIRST argument is a path they WRITE.
+///
+/// Matched on the last `::` segment, so `write`, `fs::write` and
+/// `std::fs::write` are one entry. A write is not a read: `completions_test`
+/// writes a `README.md` fixture into a temporary directory, and reading that as
+/// a read pinned the binary to a repository file it never opens. Calls whose
+/// SECOND argument is the destination (`copy`, `rename`) are deliberately
+/// absent — crediting their source argument is the over-inclusive direction,
+/// which costs one test step rather than a silent skip.
+const WRITE_CALLS: &[&str] = &[
+    "write",
+    "create",
+    "create_new",
+    "create_dir",
+    "create_dir_all",
+    "remove_file",
+    "remove_dir",
+    "remove_dir_all",
+    "set_permissions",
+];
+
+/// The environment variable that names the crate's own directory.
+const CRATE_DIR_ENV: &str = "CARGO_MANIFEST_DIR";
+
 /// Does `code_before` — the code immediately preceding a literal — use it as a
 /// path?
 ///
@@ -587,6 +695,209 @@ fn is_path_position(code_before: &str) -> bool {
         };
         head = head[..head.len() - wrapper.len()].trim_end();
     }
+}
+
+/// The calls that enclose a literal, innermost first: the call's NAME and
+/// whether the literal sits in that call's FIRST argument.
+///
+/// Read right-to-left over the blanked code view, so a parenthesis inside a
+/// comment or another literal is a space. It stops at the statement boundary
+/// and after a handful of calls: the question is what the literal is an
+/// argument OF, not what the whole expression eventually does.
+fn enclosing_calls(code_before: &str) -> Vec<(String, bool)> {
+    let bytes = code_before.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut saw_comma = false;
+    let mut i = code_before.len();
+    while i > 0 && out.len() < 8 {
+        i -= 1;
+        match bytes[i] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' if depth == 0 => {
+                out.push((call_name_before(code_before, i), !saw_comma));
+                saw_comma = false;
+            }
+            b'[' | b'{' if depth == 0 => saw_comma = false,
+            b'(' | b'[' | b'{' => depth -= 1,
+            b',' if depth == 0 => saw_comma = true,
+            b';' if depth == 0 => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The name of the call whose opening parenthesis sits at `at`.
+///
+/// The identifier run before the parenthesis, a `!` for a macro, and any
+/// `::`-qualified path in front of it. A method's receiver dot is NOT part of
+/// the name: `nodes.join(` is `join`.
+fn call_name_before(code: &str, at: usize) -> String {
+    let head = &code[..at];
+    let bang = head.ends_with('!');
+    let head = if bang { &head[..head.len() - 1] } else { head };
+    let ident_start = |text: &str| {
+        text.char_indices()
+            .rev()
+            .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '_'))
+            .map_or(0, |(i, ch)| i + ch.len_utf8())
+    };
+    let mut start = ident_start(head);
+    while let Some(rest) = head[..start].strip_suffix("::") {
+        let segment = ident_start(rest);
+        if segment == rest.len() {
+            break;
+        }
+        start = segment;
+    }
+    let mut name = head[start..].to_string();
+    if bang {
+        name.push('!');
+    }
+    name
+}
+
+/// Is the literal the DESTINATION of a write?
+///
+/// The enclosing calls are read outward past the path openers and wrappers the
+/// literal may be spelled inside; the first call that is neither decides. A
+/// read nested in a write's LATER argument
+/// (`fs::write(&out, fs::read_to_string(root.join(P))?)`) is still a read: the
+/// destination is the FIRST argument, and that is what this asks about.
+fn is_write_target(code_before: &str) -> bool {
+    for (name, first_argument) in enclosing_calls(code_before) {
+        let last = name.rsplit("::").next().unwrap_or("");
+        if WRITE_CALLS.contains(&last) {
+            return first_argument;
+        }
+        let is_opener = PATH_OPENER_NAMES.contains(&name.as_str())
+            || name.starts_with(FS_MODULE)
+            || name.contains(&format!("::{FS_MODULE}"))
+            || name == "format!"
+            || name.is_empty();
+        if !is_opener {
+            return false;
+        }
+    }
+    false
+}
+
+/// Names this source binds to the crate's OWN directory.
+///
+/// A `let`, `const` or `static` whose initialiser names [`CRATE_DIR_ENV`] and
+/// does not climb out of it with `parent(`. ONE hop, and no further: a name
+/// assigned from another name is not followed, which is the same single hop the
+/// const-table rule takes.
+///
+/// The STRUCTURE — where a binding starts and where its `;` is — is read from
+/// the blanked view, so a keyword or a semicolon inside a literal starts and
+/// ends nothing; the CONTENT is then read from the same byte range of the view
+/// that kept its literals, because the name it is looking for is one.
+fn crate_directory_bindings(code: &str, code_with_literals: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let name_of = |text: &str| -> String {
+        text.chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect()
+    };
+    for keyword in ["let ", "const ", "static "] {
+        let mut from = 0usize;
+        while let Some(offset) = code[from..].find(keyword) {
+            let at = from + offset;
+            from = at + keyword.len();
+            let opens_a_token = code[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+            if !opens_a_token {
+                continue;
+            }
+            let mut start = from;
+            let skip_blanks = |text: &str| text.len() - text.trim_start().len();
+            start += skip_blanks(&code[start..]);
+            if let Some(rest) = code[start..].strip_prefix("mut ") {
+                start += "mut ".len() + skip_blanks(rest);
+            }
+            let name = name_of(&code[start..]);
+            if name.is_empty() {
+                continue;
+            }
+            let end = code[start..]
+                .find(';')
+                .map_or(code.len(), |semicolon| start + semicolon);
+            // The env! is CODE and the variable name is a LITERAL, so the two
+            // halves are asked of the two views. A name that appears only
+            // inside a message binds nothing.
+            let initialiser = &code[start..end];
+            if initialiser.contains("env!(")
+                && !initialiser.contains("parent(")
+                && code_with_literals[start..end].contains(CRATE_DIR_ENV)
+            {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
+/// Does `literal` climb OUT of the directory it is joined onto?
+fn climbs_out_of_its_directory(literal: &str) -> bool {
+    let mut rest = literal;
+    while let Some(next) = rest.strip_prefix("./") {
+        rest = next;
+    }
+    rest.starts_with("../")
+}
+
+/// Is this literal joined onto the crate's OWN manifest directory?
+///
+/// `<crate dir>/AGENTS.md` is `crates/<crate>/AGENTS.md`: the crate's own copy
+/// of a root-markdown NAME, not the repository's, and a literal that does not
+/// climb out names something inside the crate whatever it is called. The
+/// receiver is resolved one hop, through [`crate_directory_bindings`] or from
+/// the inline expression itself.
+/// Both views again, and for the same reason [`crate_directory_bindings`]
+/// takes both: the receiver's parentheses are matched on the BLANKED view, so a
+/// parenthesis inside a message never closes a call, and the text is then read
+/// from the same byte range of the view that kept its literals.
+fn joined_onto_the_crate_directory(
+    code: &str,
+    code_with_literals: &str,
+    at: usize,
+    crate_dir_names: &BTreeSet<String>,
+) -> bool {
+    let trimmed = code[..at].trim_end().len();
+    let Some(without_join) = code[..trimmed].strip_suffix(".join(") else {
+        return false;
+    };
+    let head_end = without_join.trim_end().len();
+    let head = &code[..head_end];
+    if head.ends_with(')') {
+        // An inline receiver: `Path::new(env!("CARGO_MANIFEST_DIR")).join(`.
+        let mut depth = 0i32;
+        for (i, ch) in head.char_indices().rev() {
+            match ch {
+                ')' => depth += 1,
+                '(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let call = &code_with_literals[i..head_end];
+                        return call.contains(CRATE_DIR_ENV) && !call.contains("parent(");
+                    }
+                }
+                _ => {}
+            }
+        }
+        return false;
+    }
+    let start = head
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '_'))
+        .map_or(0, |(i, ch)| i + ch.len_utf8());
+    let name = &head[start..];
+    !name.is_empty() && crate_dir_names.contains(name)
 }
 
 /// A `const` or `static` item: its name, and the byte range of the whole item.
@@ -736,29 +1047,54 @@ fn doc_root_of(literal: &str) -> Option<String> {
     None
 }
 
-/// Every shared root the CODE of one test source reads.
+/// Every shared root the CODE of one source READS.
 ///
 /// A literal counts when it is rooted at a shared tree AND the code uses it as
 /// a path: directly, or through a `const` / `static` item something else in the
-/// file reads.
+/// file reads. Two uses that LOOK like reads are not: a path the code WRITES,
+/// and a path joined onto the crate's own directory, which never leaves the
+/// crate however it is spelled.
+///
+/// Sources with no rooted literal at all — almost every file under `src/` —
+/// leave here before the const and binding scans run.
 fn doc_roots_read_by_source(src: &str) -> BTreeSet<String> {
-    let (code, literals) = scan_code(src);
-    let read_tables: Vec<ConstItem> = const_items(&code)
-        .into_iter()
-        .filter(|item| const_is_used_elsewhere(&code, item))
+    let views = scan_code(src);
+    let candidates: Vec<(&CodeLiteral, String)> = views
+        .literals
+        .iter()
+        .filter_map(|literal| doc_root_of(&literal.text).map(|root| (literal, root)))
         .collect();
+    if candidates.is_empty() {
+        return BTreeSet::new();
+    }
+
+    let read_tables: Vec<ConstItem> = const_items(&views.code)
+        .into_iter()
+        .filter(|item| const_is_used_elsewhere(&views.code, item))
+        .collect();
+    let crate_dir_names = crate_directory_bindings(&views.code, &views.code_with_literals);
+
     let mut roots = BTreeSet::new();
-    for literal in &literals {
-        let Some(root) = doc_root_of(&literal.text) else {
-            continue;
-        };
-        let used_as_a_path = is_path_position(&code[..literal.at])
+    for (literal, root) in candidates {
+        let before = &views.code[..literal.at];
+        let used_as_a_path = is_path_position(before)
             || read_tables
                 .iter()
                 .any(|item| (item.start..item.end).contains(&literal.at));
-        if used_as_a_path {
-            roots.insert(root);
+        if !used_as_a_path || is_write_target(before) {
+            continue;
         }
+        if !climbs_out_of_its_directory(&literal.text)
+            && joined_onto_the_crate_directory(
+                &views.code,
+                &views.code_with_literals,
+                literal.at,
+                &crate_dir_names,
+            )
+        {
+            continue;
+        }
+        roots.insert(root);
     }
     roots
 }
@@ -942,45 +1278,91 @@ fn package_name(dir: &Path) -> String {
     panic!("{}/Cargo.toml declares no package name", dir.display());
 }
 
-/// `(package, test binary) -> the shared roots that binary reads`.
-///
-/// Depth-1 `tests/*.rs` only, which is exactly the set cargo turns into test
-/// BINARIES: a `tests/common/mod.rs` helper or a `tests/ui/**` trybuild source
-/// is not a target of its own and cannot be named in a marker.
-fn derived_doc_pins() -> BTreeMap<(String, String), BTreeSet<String>> {
-    let mut out = BTreeMap::new();
-    let mut sources_read = 0usize;
-    for dir in workspace_member_dirs() {
-        let tests_dir = dir.join("tests");
-        let Ok(entries) = std::fs::read_dir(&tests_dir) else {
+/// Every `.rs` file under `dir`, at any depth, sorted.
+fn rust_sources_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
             continue;
         };
-        let package = package_name(&dir);
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "rs"))
-            .collect();
-        files.sort();
-        for file in files {
-            let binary = file
-                .file_stem()
-                .expect("a `.rs` file has a stem")
-                .to_string_lossy()
-                .into_owned();
-            let src = std::fs::read_to_string(&file)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
-            sources_read += 1;
-            let roots = doc_roots_read_by_source(&src);
-            if !roots.is_empty() {
-                out.insert((package.clone(), binary), roots);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
             }
         }
     }
+    out.sort();
+    out
+}
+
+/// `(package, test binary) -> the shared roots that binary reads`.
+///
+/// TWO populations, because cargo builds two kinds of test binary out of a
+/// crate:
+///
+///   * depth-1 `tests/*.rs`, one binary each, named by the file stem — a
+///     `tests/common/mod.rs` helper or a `tests/ui/**` trybuild source is not a
+///     target of its own and cannot be named in a marker;
+///   * every `src/**/*.rs`, whose `#[cfg(test)]` units all compile into the ONE
+///     library test binary. Their reads are pooled and attributed to a binary
+///     named after the PACKAGE (`<package>::<package>`), because the step that
+///     runs them is the package's own `cargo test -p <package>`, and no finer
+///     name survives into the workflow.
+fn derived_doc_pins() -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut out = BTreeMap::new();
+    let mut integration_sources = 0usize;
+    let mut library_sources = 0usize;
+    for dir in workspace_member_dirs() {
+        let package = package_name(&dir);
+
+        if let Ok(entries) = std::fs::read_dir(dir.join("tests")) {
+            let mut files: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "rs"))
+                .collect();
+            files.sort();
+            for file in files {
+                let binary = file
+                    .file_stem()
+                    .expect("a `.rs` file has a stem")
+                    .to_string_lossy()
+                    .into_owned();
+                let src = std::fs::read_to_string(&file)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
+                integration_sources += 1;
+                let roots = doc_roots_read_by_source(&src);
+                if !roots.is_empty() {
+                    out.insert((package.clone(), binary), roots);
+                }
+            }
+        }
+
+        let mut library_roots = BTreeSet::new();
+        for file in rust_sources_under(&dir.join("src")) {
+            let src = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
+            library_sources += 1;
+            library_roots.extend(doc_roots_read_by_source(&src));
+        }
+        if !library_roots.is_empty() {
+            out.insert((package.clone(), package.clone()), library_roots);
+        }
+    }
     assert!(
-        sources_read >= 200,
-        "the walk read only {sources_read} integration-test source(s) — it is \
-         not reaching the tree, and every pin it reports would be vacuous"
+        integration_sources >= 200,
+        "the walk read only {integration_sources} integration-test source(s) — \
+         it is not reaching the tree, and every pin it reports would be vacuous"
+    );
+    assert!(
+        library_sources >= 400,
+        "the walk read only {library_sources} library source(s) — the `src/` \
+         half is not reaching the tree, and a unit test that opens a shared \
+         root would be invisible again"
     );
     out
 }
@@ -1159,23 +1541,24 @@ fn every_doc_reading_test_binary_is_pinned_in_ci_yml() {
 /// sight and a workflow that lost its markers agree with each other perfectly.
 /// This arm is the outside opinion: rows read out of the sources by hand.
 ///
-/// The SIZES are compared first, so a pin the hand scan has no row for is a
-/// failure rather than a silent addition: a row-keyed comparison alone asks the
-/// walk only about the binaries somebody already thought of.
+/// SET AGAINST SET, after the rows are proven unique. A length comparison plus
+/// a row-keyed lookup asks the walk only about binaries somebody already
+/// thought of, and a row written twice makes the length add up while hiding a
+/// derived pin nobody wrote down: the map keyed by `(package, binary)` collapses
+/// the duplicate, and the length that matched counted it twice.
 #[test]
 fn the_walk_reproduces_the_hand_scan_of_the_tree() {
-    let pins = derived_doc_pins();
+    let rows: Vec<(String, String)> = HAND_SCANNED_DOC_PINS
+        .iter()
+        .map(|(package, binary, _, _)| ((*package).to_string(), (*binary).to_string()))
+        .collect();
+    let unique: BTreeSet<&(String, String)> = rows.iter().collect();
     assert_eq!(
-        pins.len(),
-        HAND_SCANNED_DOC_PINS.len(),
-        "the walk derived {} pin(s) and the hand scan has {} row(s). Every \
-         derived pin needs a row, read out of the source it names:\n  {}",
-        pins.len(),
-        HAND_SCANNED_DOC_PINS.len(),
-        pins.keys()
-            .map(|(package, binary)| format!("{package}::{binary}"))
-            .collect::<Vec<_>>()
-            .join("\n  "),
+        unique.len(),
+        rows.len(),
+        "HAND_SCANNED_DOC_PINS names one (package, binary) twice. Two rows for \
+         one binary collapse into one map entry, so a derived pin with no row \
+         of its own would ride along unnoticed."
     );
 
     let hand: BTreeMap<(String, String), BTreeSet<String>> = HAND_SCANNED_DOC_PINS
@@ -1190,18 +1573,29 @@ fn the_walk_reproduces_the_hand_scan_of_the_tree() {
         })
         .collect();
 
-    let walked: BTreeMap<(String, String), BTreeSet<String>> = hand
+    let pins = derived_doc_pins();
+    let derived_only: Vec<String> = pins
         .keys()
-        .map(|key| (key.clone(), pins.get(key).cloned().unwrap_or_default()))
+        .filter(|key| !hand.contains_key(*key))
+        .map(|(package, binary)| format!("  {package}::{binary}"))
+        .collect();
+    let hand_only: Vec<String> = hand
+        .keys()
+        .filter(|key| !pins.contains_key(*key))
+        .map(|(package, binary)| format!("  {package}::{binary}"))
         .collect();
 
     assert_eq!(
-        walked, hand,
-        "the walk disagrees with the hand scan. An empty root set means the \
-         walk found NO shared-root literal in that binary: either the test \
-         stopped reading the path (delete its row and its marker) or the \
-         extractor stopped seeing it. A different root set means the binary \
-         gained or lost a read, and the row moves with the code."
+        pins,
+        hand,
+        "the walk disagrees with the hand scan.\n\nDERIVED WITH NO ROW — open \
+         each source, read the call that takes the literal, and add the \
+         row:\n{}\n\nA ROW THE WALK DOES NOT DERIVE — either the test stopped \
+         reading the path (delete its row and its marker) or the extractor \
+         stopped seeing it:\n{}\n\nA row whose ROOTS differ means the binary \
+         gained or lost a read, and the row moves with the code.",
+        derived_only.join("\n"),
+        hand_only.join("\n"),
     );
 }
 
@@ -1682,4 +2076,126 @@ fn a_two_space_comment_does_not_open_a_job_and_a_marker_never_names_its_own_pack
         "      - run: cargo build -p pkg",
         "pkg"
     ));
+}
+
+/// A path the code WRITES is not a path it reads.
+///
+/// The row this kills is real: `completions_test` writes a root-markdown NAME
+/// into a temporary directory to prove a FILE under `nodes/` is not a node
+/// type, and the pin said it opened the repository's own copy. The read beside
+/// it — a read nested in a write's LATER argument — still counts, because the
+/// destination is the write's FIRST argument.
+#[test]
+fn a_path_the_code_writes_is_not_a_doc_pin() {
+    let page = doc_path("docs", "/internals/cli.md");
+    let readme = root_markdown_name("README");
+    let docs_only: BTreeSet<String> = [String::from("docs")].into_iter().collect();
+    let nothing = BTreeSet::<String>::new();
+
+    for written in [
+        format!("write(&nodes.join(\"{readme}\"), \"notes\\n\");\n"),
+        format!("std::fs::write(root.join(\"{page}\"), body).unwrap();\n"),
+        format!("fs::create_dir_all(root.join(\"{page}\")).unwrap();\n"),
+        format!("fs::remove_file(Path::new(\"{page}\")).unwrap();\n"),
+    ] {
+        assert_eq!(
+            doc_roots_read_by_source(&written),
+            nothing,
+            "this code writes the path and must pin nothing:\n{written}"
+        );
+    }
+
+    // The positive controls: the same paths, opened.
+    assert_eq!(
+        doc_roots_read_by_source(&format!(
+            "let t = std::fs::read_to_string(root.join(\"{page}\")).unwrap();\n"
+        )),
+        docs_only
+    );
+    assert_eq!(
+        doc_roots_read_by_source(&format!("let p = root.join(\"{readme}\");\n")),
+        [readme].into_iter().collect::<BTreeSet<String>>()
+    );
+    // A read inside a write's SECOND argument is still a read: the destination
+    // is the first one.
+    assert_eq!(
+        doc_roots_read_by_source(&format!(
+            "fs::write(&out, fs::read_to_string(root.join(\"{page}\")).unwrap()).unwrap();\n"
+        )),
+        docs_only
+    );
+}
+
+/// A path joined onto the crate's OWN directory is inside the crate, whatever
+/// it is called.
+///
+/// `cerulion_wsd`'s doc-deference pin recorded a read of the repository's root
+/// agent-docs file; what it opens is its own crate's copy. The receiver is
+/// resolved one hop, so the same literal joined onto the repository root is
+/// still a read — and a literal that climbs OUT with `../` is one however it is
+/// reached, which is the shape three real rows have.
+#[test]
+fn a_path_joined_onto_the_crates_own_directory_is_not_a_doc_pin() {
+    let agents = root_markdown_name("AGENTS");
+    let page = doc_path("docs", "/user-api.md");
+    let climb = doc_path("../../docs", "/user-api.md");
+    let agents_only: BTreeSet<String> = [agents.clone()].into_iter().collect();
+    let docs_only: BTreeSet<String> = [String::from("docs")].into_iter().collect();
+    let nothing = BTreeSet::<String>::new();
+    let bind = format!("let crate_root = Path::new(env!(\"{CRATE_DIR_ENV}\"));\n");
+
+    // The crate's own copy, through a binding and inline.
+    assert_eq!(
+        doc_roots_read_by_source(&format!("{bind}let f = crate_root.join(\"{agents}\");\n")),
+        nothing
+    );
+    assert_eq!(
+        doc_roots_read_by_source(&format!(
+            "let f = Path::new(env!(\"{CRATE_DIR_ENV}\")).join(\"{agents}\");\n"
+        )),
+        nothing
+    );
+    // A directory inside the crate that happens to be named after a shared
+    // tree is inside the crate too.
+    assert_eq!(
+        doc_roots_read_by_source(&format!("{bind}let f = crate_root.join(\"{page}\");\n")),
+        nothing
+    );
+
+    // The same literal reached from the repository root IS a read.
+    assert_eq!(
+        doc_roots_read_by_source(&format!(
+            "let root = repo_root();\nlet f = root.join(\"{agents}\");\n"
+        )),
+        agents_only
+    );
+    // And so is one that climbs out of the crate, which is how the real rows
+    // reach the tree from their manifest directory.
+    assert_eq!(
+        doc_roots_read_by_source(&format!("{bind}let f = crate_root.join(\"{climb}\");\n")),
+        docs_only
+    );
+    // A receiver that climbed out with `parent()` is not the crate directory.
+    assert_eq!(
+        doc_roots_read_by_source(&format!(
+            "let root = Path::new(env!(\"{CRATE_DIR_ENV}\")).parent().unwrap();\n\
+             let f = root.join(\"{agents}\");\n"
+        )),
+        agents_only
+    );
+
+    // The binding reader itself, both ways — and a `let` spelled inside a
+    // MESSAGE binds nothing, because the structure is read from the blanked
+    // view.
+    let views = scan_code(&format!(
+        "{bind}let root = crate_root.parent().unwrap();\nlet other = repo_root();\n\
+         let msg = \"let planted = env!(CARGO_MANIFEST_DIR)\";\n"
+    ));
+    let bindings = crate_directory_bindings(&views.code, &views.code_with_literals);
+    assert_eq!(
+        bindings,
+        ["crate_root".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<String>>()
+    );
 }
