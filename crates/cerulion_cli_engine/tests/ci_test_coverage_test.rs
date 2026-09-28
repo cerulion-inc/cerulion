@@ -60,7 +60,7 @@
 //!     runs on exactly one of them. A selector naming a key or a leg the matrix
 //!     does not carry matches no leg at all: it runs on NO pull request while
 //!     reading as an ordinary leg-selected step, so it credits nothing.
-//!     Everything else — `github.event_name == 'push'` most of all —
+//!     Everything else, `github.event_name == 'push'` most of all,
 //!     disqualifies the step.
 //!
 //! Both job rules and the step rule are deliberately blunt in the FAIL-CLOSED
@@ -110,9 +110,9 @@
 //! being NAMED in a sanctioned step stops being enough once a selector exists:
 //! the step also has to RUN on the pull request that touches that package
 //! alone. So the walk evaluates the workflows against a hypothetical selected
-//! set — a per-package condition is true iff its package is in the set, `code`
+//! set: a per-package condition is true iff its package is in the set, `code`
 //! iff the set is non-empty, `docs` iff the set holds the `docs` marker, and
-//! every other surviving condition is independent of the set and holds — and
+//! every other surviving condition is independent of the set and holds, and
 //! requires every package with tests to stay credited when the set is exactly
 //! itself. A workflow that carries no selection condition survives every set,
 //! so the arm passes on it and stands as the guard for the first condition
@@ -345,8 +345,8 @@ const OUTPUT_KEY_INDENT: &str = "      ";
 /// Which of the three selection outputs the classifier job of `jobs` declares
 /// AND produces.
 ///
-/// Read from that job's `outputs:` mapping — the keys at six-space indent under
-/// it — so an output nobody publishes can ground nothing. A BLANK line does not
+/// Read from that job's `outputs:` mapping, the keys at six-space indent under
+/// it, so an output nobody publishes can ground nothing. A BLANK line does not
 /// end the mapping: comments are blanked to empty strings before this walk sees
 /// the file, and reading one as the end truncated the map at the first comment
 /// between two keys.
@@ -715,7 +715,7 @@ fn job_matrix_legs(block: &str) -> MatrixLegs {
 /// FAIL-CLOSED: anything not recognised as harmless disqualifies the step.
 /// Recognised as harmless are `always()`, `success()`, and a
 /// `matrix.<key> == <literal>` / `!= <literal>` LEG SELECTOR the job's own
-/// matrix can satisfy — every leg of a PR-blocking job's matrix runs on every
+/// matrix can satisfy: every leg of a PR-blocking job's matrix runs on every
 /// pull request, so a step selected onto a leg that EXISTS runs on at least one
 /// of them and can therefore fail one.
 /// `github.event_name == 'push'`, `runner.os == 'Linux'` and anything with a
@@ -730,7 +730,7 @@ fn job_matrix_legs(block: &str) -> MatrixLegs {
 /// the matrix does not carry, or whose literal is not one of that key's legs,
 /// matches no leg at all: the step runs on no pull request while reading as an
 /// ordinary leg-selected step, so it credits nothing. `!=` asks the same
-/// question the other way round — some leg has to differ from the literal, or
+/// question the other way round: some leg has to differ from the literal, or
 /// the step is excluded from every leg there is.
 fn step_if_is_pr_blocking_grounded(
     cond: &str,
@@ -750,7 +750,7 @@ fn step_if_is_pr_blocking_grounded(
             return true;
         }
         // A sanctioned selection condition runs the step on exactly the pull
-        // requests whose changed paths select it, so it can fail one — but
+        // requests whose changed paths select it, so it can fail one, but
         // only where the value it reads exists.
         if t == SELECTION_CODE_IF {
             return grounded.contains(SELECTION_CODE_OUTPUT);
@@ -783,7 +783,7 @@ fn step_if_is_pr_blocking_grounded(
     })
 }
 
-/// Every selection output — for the arms that ask about a CONDITION rather
+/// Every selection output, for the arms that ask about a CONDITION rather
 /// than about a step in a workflow.
 fn every_selection_output() -> GroundedOutputs {
     [
@@ -796,7 +796,7 @@ fn every_selection_output() -> GroundedOutputs {
     .collect()
 }
 
-/// Every leg `ci.yml`'s matrix jobs declare — for the arms that ask about a
+/// Every leg `ci.yml`'s matrix jobs declare, for the arms that ask about a
 /// CONDITION rather than about a step in a job. An arm about the RESOLUTION of
 /// a selector against a matrix builds its own.
 fn every_matrix_leg() -> MatrixLegs {
@@ -828,8 +828,8 @@ fn step_if_is_pr_blocking(cond: &str) -> bool {
 /// Only the three sanctioned selection terms consult the set: the per-package
 /// form is true iff its package is in it, `code` iff the set is non-empty,
 /// `docs` iff the set holds [`SELECTION_DOCS_MARKER`]. Every other term a
-/// PR-blocking step can still carry — absent, `always()`, `success()`, a
-/// `matrix.<key>` leg selector — does not depend on the selection and holds.
+/// PR-blocking step can still carry (absent, `always()`, `success()`, a
+/// `matrix.<key>` leg selector) does not depend on the selection and holds.
 /// A condition this walk does not sanction never reaches here: its step was
 /// already dropped by [`pr_blocking_workflow_texts`].
 ///
@@ -855,7 +855,7 @@ fn step_if_holds_under_selection(cond: &str, selected: &BTreeSet<String>) -> boo
 
 /// Drop every STEP of one job whose `if:` could stop it on a pull request.
 ///
-/// `grounded` is the set of selection outputs THIS job can read — empty for a
+/// `grounded` is the set of selection outputs THIS job can read, empty for a
 /// job that does not need the classifier, so a selection condition there is not
 /// sanctioned and its step goes. `matrix` is the legs THIS job declares, so a
 /// leg selector is resolved against the matrix that would have to run it.
@@ -2198,7 +2198,7 @@ fn the_sanctioned_conditions_are_spelled_from_the_job_and_output_names() {
 /// Both are silent failures in the same direction. A step gated on a
 /// classifier output in a job that does not need that classifier reads the
 /// empty string, so the condition is false on every event and the step runs
-/// nowhere — while the coverage walk reads it as a selected step and credits
+/// nowhere, while the coverage walk reads it as a selected step and credits
 /// the package it names. An output the classifier never declares does the
 /// same. Each half is asserted against the workflow that has it and the
 /// workflow that does not.
@@ -2521,7 +2521,7 @@ fn job_with_condition(if_block: &str) -> String {
 /// The oracle is the expression itself, typed once: each form below spells
 /// `github.event_name == 'push'` in a different YAML shape, and the reader has
 /// to return that one string from all of them. Reading a form as the EMPTY
-/// condition is what this arm exists for — an empty condition cannot stop a
+/// condition is what this arm exists for: an empty condition cannot stop a
 /// step, so the push-allowlisted step would credit coverage.
 #[test]
 fn a_step_condition_is_read_in_every_yaml_scalar_form() {
@@ -2660,7 +2660,7 @@ fn an_empty_double_quoted_condition_fails_the_walk() {
 /// A leg selector counts only against a leg the step's OWN job declares.
 ///
 /// Both halves: a selector naming a key the matrix does not carry, and one
-/// naming a value that is not a leg of that key, select NO leg — the step runs
+/// naming a value that is not a leg of that key, select NO leg: the step runs
 /// on no pull request at all while reading as an ordinary leg-selected step.
 #[test]
 fn a_leg_selector_counts_only_against_a_leg_the_job_declares() {
@@ -2867,7 +2867,7 @@ fn the_shard_matrix_is_read_in_both_yaml_forms_and_per_job() {
 /// Naming is the property the gate above asserts; running is this one, and the
 /// two come apart the moment a step carries a selection condition. A step that
 /// runs `cerulion_bag` gated on `cerulion_core` being selected is named in
-/// ci.yml, passes the gate above, and never runs on a bag-only change — which
+/// ci.yml, passes the gate above, and never runs on a bag-only change, which
 /// is the only change whose tests it was there to protect.
 ///
 /// On a ci.yml with no selection condition every step survives every selected
@@ -2928,7 +2928,7 @@ fn every_package_with_tests_is_credited_when_it_alone_is_selected() {
     );
     assert!(
         demanded.len() >= 20,
-        "only {} package(s) were evaluated under selection — the member walk is \
+        "only {} package(s) were evaluated under selection: the member walk is \
          not reaching the tree and this arm would be vacuous",
         demanded.len()
     );
@@ -2937,7 +2937,7 @@ fn every_package_with_tests_is_credited_when_it_alone_is_selected() {
 /// The totality arm is not vacuous: a package whose only step is gated on a
 /// DIFFERENT package's selection is reported lost, by name.
 ///
-/// This is the mutant the arm exists to kill — the reviewer who moves a step
+/// This is the mutant the arm exists to kill: the reviewer who moves a step
 /// under the neighbouring package's condition because the two crates are
 /// usually touched together.
 #[test]
@@ -3026,7 +3026,7 @@ fn the_selection_evaluator_reads_the_code_and_docs_markers() {
 }
 
 /// The per-package condition is read as a whole form around a package name,
-/// not by substring — the same boundary rule the package matcher lives by.
+/// not by substring, the same boundary rule the package matcher lives by.
 #[test]
 fn only_the_exact_per_package_selection_form_names_a_package() {
     assert_eq!(

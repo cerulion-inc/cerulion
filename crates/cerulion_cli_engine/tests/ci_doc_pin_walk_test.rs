@@ -5,7 +5,7 @@
 //! WHY THIS FILE EXISTS. A CI run that decides which test steps to run from the
 //! set of changed paths has exactly one way to be wrong that matters: skipping a
 //! test the change could have broken. The population that a
-//! `crates/<package>/**` rule cannot see is small and identifiable — the test
+//! `crates/<package>/**` rule cannot see is small and identifiable: the test
 //! binaries that open the repository's SHARED trees (`docs`, `tools`,
 //! `.github`, `benches`, `examples`) or a markdown file at the repository root.
 //! Those binaries fail on an edit to a file their own crate does not contain.
@@ -20,7 +20,7 @@
 //! tree exactly as an integration test does and was invisible here: two of them
 //! in this crate alone. Those reads all compile into the ONE library test
 //! binary, so they are pooled and attributed to a binary named after the
-//! package (`<package>::<package>`) — the name the step that runs them carries.
+//! package (`<package>::<package>`), the name the step that runs them carries.
 //! Every pin must appear in `.github/workflows/ci.yml` as a marker line beside
 //! the step that runs that package:
 //!
@@ -72,8 +72,8 @@
 //!     `include_bytes!(`, or any `fs::` call, optionally inside a `format!(` or
 //!     behind a `&`; or
 //!   * it sits in a `const` or `static` item whose name is used elsewhere in the
-//!     same source. Path tables are the ordinary shape here — a const holding
-//!     the path, joined onto the repository root somewhere else — and the walk
+//!     same source. Path tables are the ordinary shape here: a const holding
+//!     the path, joined onto the repository root somewhere else, and the walk
 //!     does not trace where the use leads: following a name into a crate-local
 //!     helper is the data-flow analysis this file declines to do.
 //!
@@ -91,7 +91,7 @@
 //!     `crates/cerulion_wsd/AGENTS.md` and not the repository root's file of
 //!     that name. A literal that does not climb out with `../` names something
 //!     inside the crate, so it counts only where the receiver is not the
-//!     crate's manifest directory — resolved one hop, through a binding in the
+//!     crate's manifest directory, resolved one hop, through a binding in the
 //!     same source, the same single hop the const rule takes.
 //!
 //! The code around a literal is read from a VIEW of the source with every
@@ -101,7 +101,7 @@
 //! Comments are stripped and STRING LITERALS ARE MODELLED IN THE SAME PASS, not
 //! by a comment-only pre-pass. A pre-pass that does not know about literals cuts
 //! a line at the `//` of a URL inside one and takes every path literal after it
-//! on that line with it — a silent hole, in the one direction this file exists
+//! on that line with it: a silent hole, in the one direction this file exists
 //! to close. Modelling literals is also what lets this file spell `/*` and `*/`
 //! plainly: the walk reads THIS source too, and a literal here is data, never a
 //! comment opener.
@@ -149,7 +149,7 @@
 //! `.github`, `benches`, `examples` or a root markdown file. That is one of the
 //! ways a test observes something no `crates/<package>/**` rule attributes to
 //! it. The other is a cargo dependency edge, and
-//! `tools/scripts/ci_selected_packages.py` closes over those — normal, build
+//! `tools/scripts/ci_selected_packages.py` closes over those: normal, build
 //! and dev.
 //!
 //! Neither covers a test that reaches into ANOTHER crate's tree through a
@@ -170,7 +170,7 @@ const DOC_ROOT_DIRS: &[&str] = &[".github", "benches", "docs", "examples", "tool
 ///
 /// Exactly the four `git ls-files` reports for `*.md` with no directory in the
 /// path. A name that is NOT at the repository root has no business here: it
-/// pre-authorises a pin no test can produce, and it produced one — a
+/// pre-authorises a pin no test can produce, and it produced one: a
 /// documentation file named only in a refusal's wording was read as a read.
 ///
 /// The extension is appended rather than spelled because the walk below reads
@@ -192,7 +192,7 @@ const MARKER_VERB: &str = " reads ";
 ///
 /// Each row is `(package, test binary, directory roots, root markdown stems)`,
 /// and every row was produced by OPENING the named source and reading the call
-/// that takes the literal — not by running the walk and copying what it said.
+/// that takes the literal, not by running the walk and copying what it said.
 /// Five rows earlier revisions carried recorded reads that do not happen at
 /// all: a refusal's wording, a tree a walk asserts it stayed OUT of, a set of
 /// file names asserted to be ABSENT from a package, a root markdown file a test
@@ -203,7 +203,7 @@ const MARKER_VERB: &str = " reads ";
 /// So the rows say what a reader of the sources determines, which is the only
 /// thing that makes this an outside opinion: the walk cannot move a row by
 /// changing its mind. What the rows do NOT claim is completeness against every
-/// path a test opens — a path the walk is documented not to see (module docs,
+/// path a test opens, a path the walk is documented not to see (module docs,
 /// "Limits") has no row either, because a row the walk cannot reproduce fails
 /// this arm without saying anything true about the tree.
 ///
@@ -289,7 +289,7 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &[],
     ),
     // The workflow directory. It also opens shell scripts under the tools
-    // tree, but builds those paths from the workflow text at run time — the
+    // tree, but builds those paths from the workflow text at run time, the
     // miss the module docs name.
     ("cerulion_core", "serial_discipline_test", &[".github"], &[]),
     // The license texts the crates copy.
@@ -342,7 +342,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// `<stem>` plus the markdown extension — the name a marker carries.
+/// `<stem>` plus the markdown extension: the name a marker carries.
 fn root_markdown_name(stem: &str) -> String {
     format!("{stem}{MARKDOWN_EXT}")
 }
@@ -401,7 +401,7 @@ struct SourceViews {
 ///
 /// Every literal form the workspace uses is read: `"…"`, the `b`/`c` prefixed
 /// forms, and raw strings with any number of hashes (`r"…"`, `br#"…"#`). A raw
-/// string yields its contents as ONE literal, which is the point — a manifest or
+/// string yields its contents as ONE literal, which is the point: a manifest or
 /// workflow fixture embedded as a raw string is a document the test WRITES, not
 /// a set of paths it reads.
 ///
@@ -410,7 +410,7 @@ struct SourceViews {
 ///
 /// Fail-closed at the edges: an unterminated literal or block comment consumes
 /// the rest of the file, so the pins its tail would have produced go missing and
-/// the workflow marker for them reads as stale — a red, never a quiet pass.
+/// the workflow marker for them reads as stale: a red, never a quiet pass.
 fn scan_code(src: &str) -> SourceViews {
     let bytes = src.as_bytes();
     let mut view = bytes.to_vec();
@@ -637,15 +637,15 @@ const PATH_OPENERS: &[&str] = &[
 ///
 /// `format!(` is the interpolated path and `&` is the borrow a `&Path`
 /// argument takes. Both are stripped and the code before them is asked again,
-/// so a `format!` that is NOT inside one of [`PATH_OPENERS`] — an assertion
-/// message, say — still answers no.
+/// so a `format!` that is NOT inside one of [`PATH_OPENERS`], an assertion
+/// message, say, still answers no.
 const PATH_WRAPPERS: &[&str] = &["format!(", "&"];
 
 /// The module every filesystem call this walk credits is reached through.
 const FS_MODULE: &str = "fs::";
 
 /// The call NAMES [`PATH_OPENERS`] spells, without the parenthesis and without
-/// a receiver's dot — what [`enclosing_calls`] reports.
+/// a receiver's dot: what [`enclosing_calls`] reports.
 const PATH_OPENER_NAMES: &[&str] = &[
     "Path::new",
     "PathBuf::from",
@@ -664,7 +664,7 @@ const PATH_OPENER_NAMES: &[&str] = &[
 /// writes a `README.md` fixture into a temporary directory, and reading that as
 /// a read pinned the binary to a repository file it never opens. Calls whose
 /// SECOND argument is the destination (`copy`, `rename`) are deliberately
-/// absent — crediting their source argument is the over-inclusive direction,
+/// absent: crediting their source argument is the over-inclusive direction,
 /// which costs one test step rather than a silent skip.
 const WRITE_CALLS: &[&str] = &[
     "write",
@@ -681,7 +681,7 @@ const WRITE_CALLS: &[&str] = &[
 /// The environment variable that names the crate's own directory.
 const CRATE_DIR_ENV: &str = "CARGO_MANIFEST_DIR";
 
-/// Does `code_before` — the code immediately preceding a literal — use it as a
+/// Does `code_before` (the code immediately preceding a literal) use it as a
 /// path?
 ///
 /// The rule, and why it is not "looks like a path", are in the module docs.
@@ -814,8 +814,8 @@ const CRATE_DIR_ARGUMENT: &str = "(env!(\"\"))";
 /// `Path::new(env!("CARGO_MANIFEST_DIR"))` or
 /// `PathBuf::from(env!("CARGO_MANIFEST_DIR"))`, optionally through one
 /// [`TO_PATH_BUF`], and nothing else. A substring test for `parent(` was the
-/// whole rule before, and a source climbs out of its crate four ways —
-/// `parent()`, `pop()`, `join("..")`, `join("../..")` — so an expression
+/// whole rule before, and a source climbs out of its crate four ways:
+/// `parent()`, `pop()`, `join("..")`, `join("../..")`, so an expression
 /// carrying ANY other call answers NO here. That is the over-approximating
 /// side, deliberately: a receiver this reader cannot place is not the crate
 /// directory, so a shared-root literal joined onto it is COUNTED, and an extra
@@ -919,7 +919,7 @@ fn is_popped(code: &str, name: &str) -> bool {
 /// name is not followed, which is the same single hop the const-table rule
 /// takes.
 ///
-/// The STRUCTURE — where a binding starts and where its `;` is — is read from
+/// The STRUCTURE (where a binding starts and where its `;` is) is read from
 /// the blanked view, so a keyword or a semicolon inside a literal starts and
 /// ends nothing; the CONTENT is then read from the same byte range of the view
 /// that kept its literals, because the name it is looking for is one.
@@ -1010,7 +1010,7 @@ fn joined_onto_the_crate_directory(
     if head.ends_with(')') {
         // An inline receiver: `Path::new(env!("CARGO_MANIFEST_DIR")).join(`.
         // The WHOLE receiver goes to the rule the bindings take, so a call this
-        // reader cannot place — `workspace_root(env!("CARGO_MANIFEST_DIR"))` —
+        // reader cannot place, `workspace_root(env!("CARGO_MANIFEST_DIR"))`,
         // is not the crate directory and the literal on it is counted.
         let receiver_end = match head.strip_suffix(TO_PATH_BUF) {
             Some(receiver) => receiver.trim_end().len(),
@@ -1185,7 +1185,7 @@ fn doc_root_of(literal: &str) -> Option<String> {
 /// and a path joined onto the crate's own directory, which never leaves the
 /// crate however it is spelled.
 ///
-/// Sources with no rooted literal at all — almost every file under `src/` —
+/// Sources with no rooted literal at all (almost every file under `src/`)
 /// leave here before the const and binding scans run.
 fn doc_roots_read_by_source(src: &str) -> BTreeSet<String> {
     let views = scan_code(src);
@@ -1302,7 +1302,7 @@ const WORKSPACE_MEMBER_COUNT: usize = 66;
 /// gives: the property under test is what the MANIFEST declares, and shelling
 /// out to cargo inherits its lock and its multi-second resolve. The closure over
 /// path dependencies is what keeps that cheap reading from being a SMALLER
-/// reading — see [`WORKSPACE_MEMBER_COUNT`].
+/// reading. See [`WORKSPACE_MEMBER_COUNT`].
 fn workspace_member_dirs() -> Vec<PathBuf> {
     let root = normalised(&repo_root());
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("root Cargo.toml");
@@ -1343,7 +1343,7 @@ fn workspace_member_dirs() -> Vec<PathBuf> {
     let declared = out.len();
     assert!(
         declared > 20,
-        "the members walk found only {declared} entries — it is not parsing the \
+        "the members walk found only {declared} entries: it is not parsing the \
          root manifest"
     );
 
@@ -1367,8 +1367,8 @@ fn workspace_member_dirs() -> Vec<PathBuf> {
     assert_eq!(
         out.len(),
         WORKSPACE_MEMBER_COUNT,
-        "the member walk reached {} director(ies) — {declared} declared in the \
-         root manifest and {} added through in-workspace path dependencies — \
+        "the member walk reached {} director(ies): {declared} declared in the \
+         root manifest and {} added through in-workspace path dependencies, \
          but cargo resolves {WORKSPACE_MEMBER_COUNT}. A member the walk cannot \
          see has its test sources unscanned and every pin they owe missing; a \
          member it invents scans a directory cargo never builds. Re-measure \
@@ -1434,7 +1434,7 @@ fn rust_sources_under(dir: &Path) -> Vec<PathBuf> {
 /// TWO populations, because cargo builds two kinds of test binary out of a
 /// crate:
 ///
-///   * depth-1 `tests/*.rs`, one binary each, named by the file stem — a
+///   * depth-1 `tests/*.rs`, one binary each, named by the file stem, and a
 ///     `tests/common/mod.rs` helper or a `tests/ui/**` trybuild source is not a
 ///     target of its own and cannot be named in a marker;
 ///   * every `src/**/*.rs`, whose `#[cfg(test)]` units all compile into the ONE
@@ -1485,12 +1485,12 @@ fn derived_doc_pins() -> BTreeMap<(String, String), BTreeSet<String>> {
     }
     assert!(
         integration_sources >= 200,
-        "the walk read only {integration_sources} integration-test source(s) — \
+        "the walk read only {integration_sources} integration-test source(s): \
          it is not reaching the tree, and every pin it reports would be vacuous"
     );
     assert!(
         library_sources >= 400,
-        "the walk read only {library_sources} library source(s) — the `src/` \
+        "the walk read only {library_sources} library source(s): the `src/` \
          half is not reaching the tree, and a unit test that opens a shared \
          root would be invisible again"
     );
@@ -1505,7 +1505,7 @@ fn ci_workflow_path() -> PathBuf {
     repo_root().join(".github/workflows/ci.yml")
 }
 
-/// The workflow as written — comments INCLUDED, because the markers are
+/// The workflow as written, comments INCLUDED, because the markers are
 /// comments.
 fn ci_workflow_text() -> String {
     let path = ci_workflow_path();
@@ -1627,7 +1627,7 @@ fn every_doc_reading_test_binary_is_pinned_in_ci_yml() {
     let pins = derived_doc_pins();
     assert!(
         !pins.is_empty(),
-        "the walk derived no doc-pin at all — the literal extractor or the \
+        "the walk derived no doc-pin at all: the literal extractor or the \
          root classifier is broken, and this gate would be vacuous"
     );
 
@@ -1644,8 +1644,8 @@ fn every_doc_reading_test_binary_is_pinned_in_ci_yml() {
         found,
         expected,
         "the doc-pin markers in {} do not match the tests that read a shared \
-         root.\n\nMISSING — add each of these as a YAML comment beside the step \
-         that runs its package:\n{}\n\nSTALE — these markers describe no test \
+         root.\n\nMISSING: add each of these as a YAML comment beside the step \
+         that runs its package:\n{}\n\nSTALE: these markers describe no test \
          that reads a shared root; delete them:\n{}\n\nA test binary is pinned \
          when a literal in its code names `{}` or a root markdown file. The \
          marker changes no behaviour: it is the line a path-to-step map will \
@@ -1718,9 +1718,9 @@ fn the_walk_reproduces_the_hand_scan_of_the_tree() {
     assert_eq!(
         pins,
         hand,
-        "the walk disagrees with the hand scan.\n\nDERIVED WITH NO ROW — open \
+        "the walk disagrees with the hand scan.\n\nDERIVED WITH NO ROW: open \
          each source, read the call that takes the literal, and add the \
-         row:\n{}\n\nA ROW THE WALK DOES NOT DERIVE — either the test stopped \
+         row:\n{}\n\nA ROW THE WALK DOES NOT DERIVE: either the test stopped \
          reading the path (delete its row and its marker) or the extractor \
          stopped seeing it:\n{}\n\nA row whose ROOTS differ means the binary \
          gained or lost a read, and the row moves with the code.",
@@ -1742,7 +1742,7 @@ fn every_doc_pin_marker_sits_in_the_job_that_runs_its_package() {
     let jobs = jobs_of(&text);
     assert!(
         jobs.len() >= 5,
-        "the job split found only {} job(s) in {} — it is not parsing the \
+        "the job split found only {} job(s) in {}: it is not parsing the \
          workflow",
         jobs.len(),
         ci_workflow_path().display()
@@ -1759,7 +1759,7 @@ fn every_doc_pin_marker_sits_in_the_job_that_runs_its_package() {
             seen_in_jobs += 1;
             let Some(package) = marker_package(line) else {
                 complaints.push(format!(
-                    "  {job}: malformed marker `{line}` — the shape is \
+                    "  {job}: malformed marker `{line}`, the shape is \
                      `{MARKER_PREFIX} <package>::<test binary>{MARKER_VERB}<roots>`"
                 ));
                 continue;
@@ -1767,7 +1767,7 @@ fn every_doc_pin_marker_sits_in_the_job_that_runs_its_package() {
             if !block.lines().any(|l| line_names_package(l, package)) {
                 complaints.push(format!(
                     "  {job}: `{line}` but no step in this job runs \
-                     `{package}` — move the marker beside the step that does"
+                     `{package}`; move the marker beside the step that does"
                 ));
             }
         }
@@ -1778,7 +1778,7 @@ fn every_doc_pin_marker_sits_in_the_job_that_runs_its_package() {
         seen_in_jobs,
         total,
         "{} of the {total} doc-pin marker(s) in {} sit outside every job block \
-         — a marker that is not beside a step pins nothing",
+         (a marker that is not beside a step pins nothing)",
         total - seen_in_jobs,
         ci_workflow_path().display()
     );
@@ -1804,7 +1804,7 @@ fn doc_path(root: &str, tail: &str) -> String {
     format!("{root}{tail}")
 }
 
-/// A path literal inside a comment is not a read — in either comment syntax,
+/// A path literal inside a comment is not a read, in either comment syntax,
 /// nested, and with the positive control beside it.
 ///
 /// Without this, the guard is text matching: a paragraph explaining why a test
@@ -1879,8 +1879,8 @@ fn a_path_inside_the_crates_own_directory_is_not_a_doc_pin() {
 /// and an edit that broke the rule while editing the constant would keep
 /// passing. These rows say what the answer is.
 ///
-/// Each row is spelled in HALVES — `(head, tail, expected directory root,
-/// expected root markdown stem)` — for the reason [`ROOT_MARKDOWN_STEMS`]
+/// Each row is spelled in HALVES, `(head, tail, expected directory root,
+/// expected root markdown stem)`, for the reason [`ROOT_MARKDOWN_STEMS`]
 /// gives: the walk reads this file, and a whole rooted path or a whole root
 /// markdown NAME spelled here would pin this binary to a tree it never opens.
 /// At most one expectation is `Some`; both `None` means the literal names no
@@ -1941,7 +1941,7 @@ fn hand_typed_classifier_rows() {
             CLASSIFIER_ORACLE
                 .iter()
                 .any(|(_, _, root, _)| *root == Some(*dir)),
-            "no hand-typed row expects `{dir}` — add one before adding the root"
+            "no hand-typed row expects `{dir}`; add one before adding the root"
         );
     }
     for stem in ROOT_MARKDOWN_STEMS {
@@ -1949,7 +1949,7 @@ fn hand_typed_classifier_rows() {
             CLASSIFIER_ORACLE
                 .iter()
                 .any(|(_, _, _, expected)| *expected == Some(*stem)),
-            "no hand-typed row expects `{stem}` — add one before adding the file"
+            "no hand-typed row expects `{stem}`; add one before adding the file"
         );
     }
 }
@@ -2007,7 +2007,7 @@ fn a_raw_string_fixture_is_one_literal_and_not_a_path() {
 /// must not be mistaken for one.
 ///
 /// Each of these, got wrong, silently drops every path literal after it on the
-/// line or in the file — the exact direction this file exists to close.
+/// line or in the file: the exact direction this file exists to close.
 #[test]
 fn comment_and_literal_markers_inside_literals_do_not_cut_the_scan() {
     let tools_only: BTreeSet<String> = [String::from("tools")].into_iter().collect();
@@ -2213,7 +2213,7 @@ fn a_two_space_comment_does_not_open_a_job_and_a_marker_never_names_its_own_pack
 /// The row this kills is real: `completions_test` writes a root-markdown NAME
 /// into a temporary directory to prove a FILE under `nodes/` is not a node
 /// type, and the pin said it opened the repository's own copy. The read beside
-/// it — a read nested in a write's LATER argument — still counts, because the
+/// it (a read nested in a write's LATER argument) still counts, because the
 /// destination is the write's FIRST argument.
 #[test]
 fn a_path_the_code_writes_is_not_a_doc_pin() {
@@ -2262,7 +2262,7 @@ fn a_path_the_code_writes_is_not_a_doc_pin() {
 /// `cerulion_wsd`'s doc-deference pin recorded a read of the repository's root
 /// agent-docs file; what it opens is its own crate's copy. The receiver is
 /// resolved one hop, so the same literal joined onto the repository root is
-/// still a read — and a literal that climbs OUT with `../` is one however it is
+/// still a read, and a literal that climbs OUT with `../` is one however it is
 /// reached, which is the shape three real rows have.
 #[test]
 fn a_path_joined_onto_the_crates_own_directory_is_not_a_doc_pin() {
@@ -2367,7 +2367,7 @@ fn a_path_joined_onto_the_crates_own_directory_is_not_a_doc_pin() {
         nothing
     );
 
-    // The binding reader itself, both ways — and a `let` spelled inside a
+    // The binding reader itself, both ways, and a `let` spelled inside a
     // MESSAGE binds nothing, because the structure is read from the blanked
     // view.
     let views = scan_code(&format!(
