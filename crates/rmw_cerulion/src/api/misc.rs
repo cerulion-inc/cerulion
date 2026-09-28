@@ -180,6 +180,22 @@ pub unsafe extern "C" fn rmw_deserialize(
             return RMW_RET_INVALID_ARGUMENT;
         }
         let payload = &bytes[cerulion_core::wire::WireHeader::SIZE..];
+        // A member this build's C++ typesupport gives no way to WRITE (a
+        // `bool[]` before Humble, at the top level or inside a nested
+        // message) is refused HERE, before `unflatten` writes the first
+        // field: this function decodes into a CALLER-owned message, so a
+        // decode that walked half of it and then failed would hand back
+        // `RMW_RET_ERROR` over a message the caller must now treat as
+        // garbage. No latch, for the reason the arm below gives: one-shot
+        // call, no entity, no stream to flood.
+        if let Some((_, path)) = bridge.unwritable_bool_seq() {
+            tracing::error!(
+                reason = %crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+                r#type = %bridge.qualified_name(),
+                "rmw_deserialize refused the buffer before writing anything"
+            );
+            return RMW_RET_ERROR;
+        }
         if bridge.unflatten(payload, ros_message) {
             RMW_RET_OK
         } else {

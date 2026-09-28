@@ -282,6 +282,13 @@ unsafe fn serialize(msg: &CPoint, ts: *const ffi::rosidl_message_type_support_t)
 /// where `rmw_message_info_t` carries one (Humble and later), `None` before
 /// that, where the struct has no such field and the datum rides the wire
 /// header alone.
+///
+/// On a build with no such field this expectation is VACUOUS on its own,
+/// because the helper it is compared against returns `None` too: a publish
+/// site that left every frame at sequence 0 would satisfy it. The wire
+/// witness below is what actually holds the publish site to the restamp on
+/// every build, and this stays as the extra assertion where the field
+/// exists.
 fn expected_publication_sequence(n: u64) -> Option<u64> {
     #[cfg(cerulion_has_message_info_sequence_numbers)]
     let want = Some(n);
@@ -291,6 +298,33 @@ fn expected_publication_sequence(n: u64) -> Option<u64> {
         None
     };
     want
+}
+
+/// The Cerulion topic behind an rmw subscription (the fully-qualified ROS
+/// name itself, the mapping being the identity), so a raw subscriber can
+/// read the very frames the rmw publisher puts on the wire.
+///
+/// # Safety
+/// `subscription` must be a live subscription created by this implementation.
+unsafe fn cerulion_topic(subscription: *const ffi::rmw_subscription_t) -> String {
+    let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
+    data.topic.clone()
+}
+
+/// The wire header sequence of the next frame on the topic, read straight
+/// off the transport rather than through `rmw_message_info_t`.
+///
+/// This is the build-independent witness for the RE-STAMP: the datum rides
+/// the wire header on every era, while the rmw message-info field only
+/// exists from Humble on.
+fn wire_sequence(
+    witness: &mut cerulion_core::transport::subscriber::CerulionSubscriber,
+) -> Option<u32> {
+    let mut seq = None;
+    witness
+        .try_receive_one(|msg| seq = Some(msg.header().sequence))
+        .expect("the raw witness must receive");
+    seq
 }
 
 /// Take one message, returning `(taken, value, publication_sequence_number)`;
@@ -436,6 +470,13 @@ fn serialized_publish_round_trips_and_restamps_the_sequence() {
         assert!(!subscription.is_null());
         let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
         assert!(!publisher.is_null());
+        // The witness rides the same topic as the rmw subscription and must
+        // exist before the first publish, so it sees every frame.
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        let mut witness = rt
+            .transport
+            .create_subscriber_open_only(&cerulion_topic(subscription))
+            .expect("raw witness on the published topic");
 
         let oracle = [
             CPoint {
@@ -467,17 +508,28 @@ fn serialized_publish_round_trips_and_restamps_the_sequence() {
                 rmw_publish_serialized_message(publisher, frame.as_ptr(), std::ptr::null_mut()),
                 RMW_RET_OK
             );
+            // The wire header the publish site actually wrote, on every
+            // build: a publisher that left the serialized frame's seq 0
+            // fails here even where `rmw_message_info_t` has no sequence
+            // field to carry the datum back.
+            assert_eq!(
+                wire_sequence(&mut witness),
+                Some(i as u32),
+                "the publish site must RE-STAMP the wire sequence: a bag \
+                 replayed through here would otherwise publish seq 0 forever"
+            );
             let (taken, got, seq) = take_one(subscription);
             assert!(taken, "a well-formed frame must be delivered");
             assert_eq!(got, *expected, "the payload must survive the round trip");
             assert_eq!(
                 seq,
                 expected_publication_sequence(i as u64),
-                "the publish site must RE-STAMP the wire sequence — a bag \
-                 replayed through here would otherwise publish seq 0 forever"
+                "and where rmw_message_info_t carries the sequence, it carries \
+                 the same one"
             );
         }
 
+        drop(witness);
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
