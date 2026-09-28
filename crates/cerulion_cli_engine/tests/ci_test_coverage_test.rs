@@ -4052,6 +4052,27 @@ fn shard_check_complaints(text: &str) -> Vec<String> {
     out
 }
 
+/// The same rule over a WHOLE workflow tree, keyed by file name.
+///
+/// THE CHOICE OF FILE IS PART OF THE RULE, so it lives here and not in a test
+/// body. Reading every workflow and taking the first hit passes on the shipped
+/// tree for an accident: `ci.yml` is the only file carrying the step today, so
+/// a walk over all of them lands on the same text and nothing reds. This reads
+/// `{SHARD_CHECK_WORKFLOW}` and no other file, and a tree without it is itself
+/// a complaint rather than a silent pass.
+fn shard_check_complaints_in(texts: &BTreeMap<String, String>) -> Vec<String> {
+    let Some(text) = texts.get(SHARD_CHECK_WORKFLOW) else {
+        return vec![format!(
+            "the workflow walk found no `{SHARD_CHECK_WORKFLOW}`, which is the \
+             one file this rule reads"
+        )];
+    };
+    shard_check_complaints(text)
+        .into_iter()
+        .map(|why| format!("`{SHARD_CHECK_WORKFLOW}`: {why}"))
+        .collect()
+}
+
 /// The shard check runs on every pull request, in the `lint` job of `ci.yml`,
 /// under a named step, with the invocation the script documents.
 ///
@@ -4064,24 +4085,69 @@ fn shard_check_complaints(text: &str) -> Vec<String> {
 /// nothing invokes is inert.
 ///
 /// WHY THE PLACE IS PART OF THE RULE. The name and the script say what runs,
-/// never when. `ci.yml` alone is read, the job id is pinned, the job has to
-/// survive the pull-request view, and the step may carry no condition of its
-/// own: each of those is a way the step keeps its name and stops running where
-/// it matters.
+/// never when. [`shard_check_complaints_in`] reads `ci.yml` and no other file,
+/// the job id is pinned, the job has to survive the pull-request view, and the
+/// step may carry no condition of its own: each of those is a way the step
+/// keeps its name and stops running where it matters.
 #[test]
 fn the_shard_check_runs_in_a_named_lint_step() {
-    let texts = workflow_texts();
-    let ci = texts
-        .get(SHARD_CHECK_WORKFLOW)
-        .unwrap_or_else(|| panic!("the workflow walk found no `{SHARD_CHECK_WORKFLOW}`"));
-    let complaints = shard_check_complaints(ci);
+    let complaints = shard_check_complaints_in(&workflow_texts());
     assert!(
         complaints.is_empty(),
-        "`{SHARD_CHECK_WORKFLOW}` does not run `{SHARD_CHECK_RUN}` the way the \
-         rule names: {}. That invocation proves the shard partition is total \
-         and disjoint and holds the selection reader to its hand table, and it \
-         has to run on a pull request that never runs `cerulion_cli_engine`.",
+        "the workflow tree does not run `{SHARD_CHECK_RUN}` the way the rule \
+         names: {}. That invocation proves the shard partition is total and \
+         disjoint and holds the selection reader to its hand table, and it has \
+         to run on a pull request that never runs `cerulion_cli_engine`.",
         complaints.join("; ")
+    );
+}
+
+/// The rule reads `ci.yml`, both sides, on synthetic workflow trees.
+#[test]
+fn the_shard_check_rule_reads_the_main_workflow_and_no_other() {
+    let carrying = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    steps:\n      - name: {SHARD_CHECK_STEP}\n        \
+         run: {SHARD_CHECK_RUN}\n"
+    );
+    let bare = "jobs:\n  build:\n    steps:\n      - name: build\n        run: cargo build\n";
+    let tree = |ci: Option<&str>, release: &str| {
+        let mut out = BTreeMap::new();
+        if let Some(ci) = ci {
+            out.insert(SHARD_CHECK_WORKFLOW.to_string(), ci.to_string());
+        }
+        out.insert("release.yml".to_string(), release.to_string());
+        out
+    };
+
+    // (a) THE STEP IN ANOTHER WORKFLOW COVERS NOTHING. `release.yml` carries
+    //     it in a job named `lint` with the shipped shape, so a rule that
+    //     searched every file would read it and pass; the file this rule reads
+    //     carries no such step, and that is what is said.
+    let elsewhere = tree(Some(bare), &carrying);
+    let complaints = shard_check_complaints_in(&elsewhere);
+    assert!(
+        complaints
+            .iter()
+            .any(|why| why.contains(SHARD_CHECK_WORKFLOW) && why.contains("no job carries a step")),
+        "the step living only in another workflow is named against \
+         `{SHARD_CHECK_WORKFLOW}`: {complaints:?}"
+    );
+
+    // (b) The same step in the same shape under `ci.yml` is clean, so the row
+    //     above is not satisfied by a rule that complains about everything.
+    assert!(
+        shard_check_complaints_in(&tree(Some(&carrying), bare)).is_empty(),
+        "the shipped shape under `{SHARD_CHECK_WORKFLOW}` draws no complaint: {:?}",
+        shard_check_complaints_in(&tree(Some(&carrying), bare))
+    );
+
+    // (c) And a tree with no `ci.yml` at all is a complaint, never an empty
+    //     verdict: a walk that stopped finding the file would otherwise report
+    //     a pass.
+    let missing = tree(None, &carrying);
+    assert!(
+        !shard_check_complaints_in(&missing).is_empty(),
+        "a tree carrying no `{SHARD_CHECK_WORKFLOW}` is a complaint"
     );
 }
 
