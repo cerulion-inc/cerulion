@@ -2999,6 +2999,27 @@ fn every_package_with_tests_is_credited_when_it_alone_is_selected() {
          not reaching the tree and this arm would be vacuous",
         demanded.len()
     );
+
+    // REAL GATES, not a hypothetical. Until PR B nothing in this tree carried a
+    // selection condition, so every set this arm evaluated ran every step and
+    // the arm could not have failed whatever the evaluator did. It holds a live
+    // population now, and a workflow that lost every gate has to say so here
+    // rather than go quietly green.
+    let gated: usize = texts
+        .values()
+        .map(|text| {
+            text.lines()
+                .filter(|l| l.contains(SELECTION_PKG_IF_OPEN))
+                .count()
+        })
+        .sum();
+    assert!(
+        gated >= 20,
+        "only {gated} per-package selection condition(s) survive into the \
+         PR-blocking text: either the gates were removed or the step filter is \
+         dropping them, and this arm is then evaluating a workflow that runs \
+         everything under every selection"
+    );
 }
 
 /// The totality arm is not vacuous: a package whose only step is gated on a
