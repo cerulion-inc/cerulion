@@ -368,7 +368,14 @@ self_test() {
     # private-dirty.md included, so it is removed on any exit and not only on
     # the straight-line path at the end: an interrupt, or any early exit from
     # an arm below, would otherwise leave it behind.
-    trap 'rm -rf "$st_dir"' EXIT INT TERM
+    trap 'rm -rf "$st_dir"' EXIT   # removes the fixture directory and every file in it
+    # A signal has to END the run, which is why these exit rather than clean up
+    # in place. A handler that only removed the directory would return to the
+    # arm after the interrupted command, and every arm below would then read a
+    # fixture that is gone, find nothing, and pass: a deleted fixture reads
+    # exactly like a clean one. Exiting hands the EXIT trap above the removal.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     # THE DIRTY FIXTURE, and how it is built is the point.
     #

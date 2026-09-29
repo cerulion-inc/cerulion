@@ -29,9 +29,10 @@ pub struct CerulionWorkspace {
 
 /// The dependency source `workspace create` chose for the generated root
 /// manifest. The decision keys on where the running `cerulion` BINARY lives
-/// (or was built), never on the current directory — see the crate-private
-/// `find_cerulion_root` — and the CLI prints it beside the created path so a
-/// miss on a checkout-built binary is never silent.
+/// (or was built), never on the current directory: the crate-private
+/// `find_cerulion_root` finds the source checkout the binary came from, and the
+/// CLI prints the chosen source beside the created path so a miss on a
+/// checkout-built binary is never silent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencySource {
     /// Exact-pinned published crates (`cerulion_core = "=X.Y.Z"`).
