@@ -250,6 +250,36 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   deployment, never from the config's own flag (the config may not reflect an in-memory
   derived partition).
 
+### Engine library migration from 1.0.0
+
+The published `cerulion_cli_engine` 1.0.0 package exposes the graph-run partition
+APIs in [`partition_emit`](https://github.com/cerulion-inc/cerulion/blob/36135c33a10a09aa0dc6e7e7317c7f93c4f63ef8/crates/cerulion_cli_engine/src/partition_emit.rs#L1515).
+Removing their public fields, lifetime parameter, function argument and outcome
+variant breaks Rust callers. Publish the changed engine under a new major version,
+with the workspace version and internal dependency pins updated together under the
+lockstep release policy in `Cargo.toml`. Migration guidance alone does not make a
+1.x library update source compatible.
+
+| 1.0.0 API | Migration |
+|---|---|
+| `PartitionConsent<'a>` with `auto_partition`, `assume_yes`, `is_tty` and `confirm` | Use `PartitionConsent` without a lifetime and initialize only `auto_partition` and `assume_yes`. Remove the terminal probe and confirmation provider. |
+| `PreflightOptions` with `re_derive`, `lenient_costs`, `assume_yes` and `is_tty` | Initialize only `lenient_costs` and `assume_yes`. |
+| `run_auto_partition_preflight(root, name, config, raw, opts, confirm)` | Remove the final confirmation argument. The helper derives groups and adopts them in memory unless `assume_yes` requests persistence. |
+| `RunPartitionOutcome::KeptExisting` | Remove this match arm. To keep declared groups, skip re-derivation and retain the original config through the declared-layout path. |
+
+`graph_run` accepts `Option<PartitionConsent>` with the same two choices. A caller
+that wants to respect an existing `process_groups:` block passes
+`auto_partition: false`. When the resolved intent derives groups, the derivation
+becomes the runtime layout even when the file stays unchanged. Direct preflight callers
+that want to retain the original layout must make that decision before invoking the
+helper, because it no longer has a declined-confirmation result.
+
+`assume_yes: false` leaves the graph file and backup untouched on terminal and
+non-terminal runs. Set `assume_yes: true` only for an explicit save decision; it uses
+the atomic writer and backup. For detailed inspection and interactive saving, use
+`cerulion graph partition <NAME>` or the engine's `graph_partition` API. Its separate
+inspection and confirmation contract remains available.
+
 ### `ros2:` graph entries (spawn + supervise only)
 
 A graph entry with a `ros2:` block instead of `type:` is a stock ROS 2 process the run
