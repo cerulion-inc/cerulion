@@ -1238,10 +1238,15 @@ pub enum NodeAction {
         /// other targets, where the loop blocks normally.
         #[arg(long = "no-monitor-wait")]
         no_monitor_wait: bool,
+        /// Keep this run on this machine: no network gateway, session,
+        /// egress or ingress. Equivalent to `--network off`; the environment
+        /// kill-switch remains honored with or without this flag.
+        #[arg(long)]
+        local: bool,
         /// Network kill-switch, the same as `graph run --network off`. The only
         /// accepted value is `off`: run LOCAL-ONLY, with no network gateway
-        /// and no topic visible on the network. When the flag is absent, a
-        /// real-clock `node run` starts the network gateway and every produced
+        /// and no topic visible on the network. Without a CLI or environment
+        /// kill-switch, a real-clock `node run` starts the network gateway and every produced
         /// topic is announced on the LAN, viewable by any peer without pairing.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
@@ -1427,10 +1432,15 @@ pub enum GraphAction {
         /// derived and nothing is asked. Conflicts with `--auto-partition`.
         #[arg(long = "single-process")]
         single_process: bool,
+        /// Keep this run on this machine: no network gateway, session,
+        /// egress or ingress. Equivalent to `--network off`; the environment
+        /// kill-switch remains honored with or without this flag.
+        #[arg(long)]
+        local: bool,
         /// Network kill-switch. The only accepted value is `off`: run
         /// LOCAL-ONLY. No network gateway is started, no network session opens
         /// and nothing crosses the machine boundary (a loud notice says so).
-        /// When the flag is absent, a graph with an enabled `network:` block
+        /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
         /// announces every produced topic on the LAN, viewable by any peer
@@ -1679,7 +1689,7 @@ pub enum TopicAction {
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
     /// Pass `--connect` or `--listen` locators to reach
-    /// peers scouting cannot find; pass `--no-network` to skip the remote
+    /// peers scouting cannot find; pass `--local` to skip the remote
     /// network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
@@ -1690,11 +1700,12 @@ pub enum TopicAction {
         #[arg(long)]
         all: bool,
         /// Skip the REMOTE network discovery query (scripts, CI, offline).
-        /// Without it, remote discovery runs automatically. Locally mirrored
+        /// Without a CLI or environment kill-switch, remote discovery runs
+        /// automatically. Locally mirrored
         /// remote topics are still listed as REMOTE streaming rows: that
         /// information is read from local shared memory, not the network, so
         /// this flag skips only the network query.
-        #[arg(long = "no-network")]
+        #[arg(long = "local", visible_alias = "no-network")]
         no_network: bool,
         /// Additional zenoh locator to connect to for discovery (repeatable),
         /// for example `tcp/192.0.2.10:7683` (7683 is the default gateway
@@ -1721,9 +1732,14 @@ pub enum TopicAction {
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Set
-    /// CERULION_NETWORK=off to disable remote discovery (local-only).
+    /// automatically and released when the command exits. Pass `--local`
+    /// to read genuine local producers without remote discovery or demand.
     Info {
+        /// Read genuine local shared-memory producers only. No remote
+        /// discovery, schema query or network-daemon startup. A remote mirror
+        /// is refused even when its bytes already exist locally.
+        #[arg(long)]
+        local: bool,
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
@@ -1732,9 +1748,14 @@ pub enum TopicAction {
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Set
-    /// CERULION_NETWORK=off to disable remote discovery (local-only).
+    /// automatically and released when the command exits. Pass `--local`
+    /// to read genuine local producers without remote discovery or demand.
     Echo {
+        /// Read genuine local shared-memory producers only. No remote
+        /// discovery, schema query or network-daemon startup. A remote mirror
+        /// is refused even when its bytes already exist locally.
+        #[arg(long)]
+        local: bool,
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
@@ -1754,9 +1775,14 @@ pub enum TopicAction {
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Set
-    /// CERULION_NETWORK=off to disable remote discovery (local-only).
+    /// automatically and released when the command exits. Pass `--local`
+    /// to read genuine local producers without remote discovery or demand.
     Hz {
+        /// Read genuine local shared-memory producers only. No remote
+        /// discovery, schema query or network-daemon startup. A remote mirror
+        /// is refused even when its bytes already exist locally.
+        #[arg(long)]
+        local: bool,
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
@@ -4699,6 +4725,129 @@ mod ros2_run_dispatch_tests {
         assert!(
             Cli::try_parse_from(["cerulion", "ros2"]).is_err(),
             "ros2 requires an action"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_scope_flag_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn local_scope_is_explicit_across_run_and_inspection_verbs() {
+        for args in [
+            vec!["node", "run", "example", "--local"],
+            vec!["graph", "run", "example", "--local"],
+            vec!["topic", "list", "--local"],
+            vec!["topic", "echo", "/example/value", "--local"],
+            vec!["topic", "hz", "/example/value", "--local"],
+            vec!["topic", "info", "/example/value", "--local"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("cerulion").chain(args))
+                .expect("the unified local switch must parse");
+            let selected = match cli.command {
+                Commands::Node {
+                    action: NodeAction::Run { local, .. },
+                }
+                | Commands::Graph {
+                    action: GraphAction::Run { local, .. },
+                }
+                | Commands::Topic {
+                    action: TopicAction::Echo { local, .. },
+                }
+                | Commands::Topic {
+                    action: TopicAction::Hz { local, .. },
+                }
+                | Commands::Topic {
+                    action: TopicAction::Info { local, .. },
+                } => local,
+                Commands::Topic {
+                    action: TopicAction::List { no_network, .. },
+                } => no_network,
+                _ => panic!("unexpected verb"),
+            };
+            assert!(selected);
+        }
+    }
+
+    #[test]
+    fn local_scope_combines_with_legacy_run_switch() {
+        for verb in ["node", "graph"] {
+            let cli = Cli::try_parse_from([
+                "cerulion",
+                verb,
+                "run",
+                "example",
+                "--local",
+                "--network",
+                "off",
+            ])
+            .expect("equivalent switches remain compatible");
+            match cli.command {
+                Commands::Node {
+                    action: NodeAction::Run { local, network, .. },
+                }
+                | Commands::Graph {
+                    action: GraphAction::Run { local, network, .. },
+                } => {
+                    assert!(local);
+                    assert_eq!(network.as_deref(), Some("off"));
+                }
+                _ => panic!("unexpected verb"),
+            }
+            assert!(Cli::try_parse_from([
+                "cerulion",
+                verb,
+                "run",
+                "example",
+                "--local",
+                "--network",
+                "on"
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn local_help_and_legacy_help_describe_their_own_arguments() {
+        for verb in ["node", "graph"] {
+            let mut command = Cli::command();
+            let run = command
+                .find_subcommand_mut(verb)
+                .unwrap()
+                .find_subcommand_mut("run")
+                .unwrap();
+            let local = run
+                .get_arguments()
+                .find(|arg| arg.get_id() == "local")
+                .unwrap()
+                .get_help()
+                .unwrap()
+                .to_string();
+            let legacy = run
+                .get_arguments()
+                .find(|arg| arg.get_id() == "network")
+                .unwrap()
+                .get_help()
+                .unwrap()
+                .to_string();
+            assert!(local.contains("Keep this run on this machine"), "{local}");
+            assert!(!local.contains("only accepted value"), "{local}");
+            assert!(legacy.contains("only accepted value"), "{legacy}");
+            assert!(run.render_long_help().to_string().contains("--local"));
+        }
+        let mut command = Cli::command();
+        let list = command
+            .find_subcommand_mut("topic")
+            .unwrap()
+            .find_subcommand_mut("list")
+            .unwrap();
+        let help = list.render_long_help().to_string();
+        assert!(help.contains("--local"));
+        assert!(
+            help.contains("--no-network"),
+            "the compatibility spelling must remain discoverable: {help}"
         );
     }
 }

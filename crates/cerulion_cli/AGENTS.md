@@ -54,6 +54,5 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   that ASSERT call `#[must_use]` `finish().assert_clean()`. A walk enforces constructor shape
   and flags bare reaps it can see; await GO (`deployment live`) before a kill, else ABORT path.
 
-Deep reference: docs/internals/cli.md - command contracts (replay exit codes,
-completions design rules, discovery ladder, graph run/profile/partition) and the test
-map for both crates.
+Read `docs/internals/cli.md` before changing topics/local scope, starters,
+replay, completions, or graph run/profile/partition.

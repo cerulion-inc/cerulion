@@ -3418,7 +3418,7 @@ fn collect_entry_infos_from_cache(
 /// kill-switch ACTED (warn-level — the docs promise a loud kill-switch
 /// notice). `pub` so tests pin the exact text.
 pub const NETWORK_OFF_LOCAL_ONLY_NOTICE: &str =
-    "--network off: this run is LOCAL-ONLY — the permissive open-by-default network exposure \
+    "local execution selected: this run is LOCAL-ONLY; the permissive open-by-default network exposure \
      is suppressed; no gateway is spawned and no zenoh session opens";
 
 /// Kill-switch, replay-class arm: the one arm where `--network off`
@@ -3427,8 +3427,8 @@ pub const NETWORK_OFF_LOCAL_ONLY_NOTICE: &str =
 /// Info-level (the loud-inference rule for an inert explicit
 /// flag). `pub` so tests pin the exact text.
 pub const NETWORK_OFF_REDUNDANT_NOTICE: &str =
-    "--network off is redundant on a virtual/external-clock run: replay-class runs are \
-     network-inert by design (no gateway is spawned either way); the flag is honored";
+    "network suppression is redundant on a virtual/external-clock run: replay-class runs are \
+     network-inert by design (no gateway is spawned either way); local execution is honored";
 
 /// The belt-and-suspenders network kill-switch env knob — the
 /// engine-level equivalent of `--network off` for callers that cannot pass
@@ -3692,7 +3692,7 @@ pub fn resolve_run_network(
                 graph = %config.identity(),
                 egress = net.egress.len(),
                 ingress = net.ingress.len(),
-                "network disabled by --network off: the graph's declared egress/ingress \
+                "local execution selected: the graph's declared egress/ingress \
                  topics will NOT cross the machine boundary for this run"
             );
         } else if time_source == TimeSource::Real {
