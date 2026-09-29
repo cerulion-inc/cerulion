@@ -758,9 +758,11 @@ def legal_name(root):
     for c in lines[0]:
         if c not in LEGAL_NAME_CHARS:
             raise CannotRun("%s declares a name holding %s, which is outside the characters a declared name may "
-                            "hold (letters A to Z, digits, space, and & . , - ' /): a character a reader cannot "
-                            "see, or cannot tell from another, would leave every mention unmatched and the class "
-                            "green over an unchecked tree" % (ENTITY_FILE, "U+%04X" % ord(c)))
+                            "hold (letters, digits, space, and %s): a character a reader cannot see, or cannot "
+                            "tell from another, would leave every mention unmatched and the class green over an "
+                            "unchecked tree"
+                            % (ENTITY_FILE, "U+%04X" % ord(c),
+                               " ".join(sorted(x for x in LEGAL_NAME_CHARS if not x.isalnum() and x != " "))))
     return lines[0]
 
 
@@ -2008,6 +2010,28 @@ def self_test(out=sys.stdout):
     arm("a-head-with-a-regex-character-is-a-literal",
         legal_name_mentions("A.B Inc.").search("AxB Inc.") is None
         and legal_name_mentions("A.B Inc.").search("A.B Inc.") is not None)
+    arm("an-interior-word-with-a-regex-character-is-a-literal",
+        legal_name_mentions("Acme S.T Inc.").search("Acme SxT Inc.") is None
+        and legal_name_mentions("Acme S.T Inc.").search("Acme S.T Inc.") is not None)
+    # 9: a comma inside the declared name is a separator, so the comma-less
+    # spelling, the likeliest defect, is still a mention.
+    arm("a-comma-in-the-declared-name-is-a-separator",
+        legal_name_mentions("Acme, Systems Inc.").search("Acme Systems Inc.") is not None
+        and legal_name_mentions("Acme, Systems Inc.").search("Acme, Systems Inc.") is not None)
+    # 1: the per-suffix arms below are GENERATED from this list, so a member that
+    # is deleted deletes its own arm. This second copy is deliberate: it is the
+    # only thing that makes a deletion loud.
+    arm("the-suffix-family-is-the-list-it-is-meant-to-be",
+        LEGAL_SUFFIX_WORDS == ("Inc", "Inc.", "Incorporated", "Corp", "Corp.", "Corporation", "Co.",
+                               "LLC", "LLP", "Ltd", "Ltd.", "Limited", "PLC", "GmbH", "AG",
+                               "S.A.", "B.V.", "AB", "Oy", "A/S"), repr(LEGAL_SUFFIX_WORDS))
+    # 6a: the same for the punctuation the set permits, which the loop below
+    # iterates over and therefore cannot notice losing.
+    arm("the-character-set-holds-the-punctuation-a-name-takes",
+        frozenset("&.,-'/()") <= LEGAL_NAME_CHARS, repr(sorted(LEGAL_NAME_CHARS)))
+    # 8: the refusal names the family, rather than a copy of it that can drift.
+    arm("the-refusal-message-names-every-suffix",
+        all(w in ", ".join(LEGAL_SUFFIX_WORDS) for w in LEGAL_SUFFIX_WORDS))
     # GREEDY: the longest run of the name's own words before a suffix.
     arm("the-longest-run-of-name-words-is-the-mention",
         [x.group(0) for x in legal_name_mentions("Acme Robotics Co., Ltd.").finditer("Acme Robotics Co., Ltd.")]
@@ -2093,6 +2117,20 @@ def self_test(out=sys.stdout):
         buf2 = io.StringIO()
         rc2 = run_tree(clean, buf2)
         arm("clean-tree-exit-0", rc2 == 0 and buf2.getvalue().startswith("check_public_surface: OK ("), buf2.getvalue())
+        # The summary has to SAY what the legal-name rule judged. A tail nobody
+        # reads is a tail that can report the wrong name, or none.
+        arm("the-summary-names-what-the-legal-name-rule-judged",
+            "legal-name=`Acme Systems Inc.` in 2 mention(s)" in buf2.getvalue(), buf2.getvalue())
+        # And the floor FIRES: a tree that never writes the declared name is not
+        # a clean tree, it is a rule that found nothing.
+        named = open(os.path.join(clean, "README.md"), encoding="utf-8").read()
+        _put(clean, "README.md", "# clean\n\nRun `cerulion graph run demo`.\n")
+        buf2c = io.StringIO()
+        rc2c = run_tree(clean, buf2c)
+        arm("a-tree-that-never-writes-the-name-is-a-finding",
+            rc2c == 1 and "is written nowhere in shipped text" in buf2c.getvalue()
+            and "in 0 mention(s)" in buf2c.getvalue(), buf2c.getvalue())
+        _put(clean, "README.md", named)
         # The text cache is keyed by (root, path) for the life of the process, so a
         # SECOND pass over this tree has to read each file as it is NOW. Each of the
         # three entry points that fills the cache gets an arm: a run, and both
