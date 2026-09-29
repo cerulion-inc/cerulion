@@ -65,6 +65,18 @@
 #                         (d) no phrase from `public_surface_phrases.txt`, a
 #                             data file of claims the README contradicts (it
 #                             grows the day the README changes a fact).
+#                         (e) no pictograph from the emoji planes on a `.md`
+#                             page: prose says what the product does in words.
+#                             The check mark and cross mark a support table
+#                             draws with are typography and stay.
+#                         (f) ONE legal entity spelling across NOTICE,
+#                             CITATION.cff, README.md and the contributor
+#                             agreements: two spellings leave a reader asking
+#                             which company the agreement binds. LICENSE is the
+#                             verbatim licence text and carries the licence
+#                             author's own holder line, so it is outside the
+#                             set. The rarer spelling is the finding and the
+#                             message names both sides.
 #   work-state            Shipped text describes the product to its user: what
 #                         works, what is experimental, what is not supported,
 #                         what to do. It never reports how the project was

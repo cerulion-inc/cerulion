@@ -27,6 +27,15 @@ DASH_RE = re.compile("[" + DASHES + "]")
 # its own scan (the same trick the sibling gates use for their banned tokens).
 TRACKER_RE = re.compile(r"\b[C]ER-[0-9]+\b")
 TODO_OWNER_RE = re.compile(r"\b(TODO|FIXME)\(([A-Za-z][A-Za-z0-9_.]*)\)")
+# A pictograph from the emoji planes on a shipped page. The check mark and the
+# cross mark a support table draws with (U+2713, U+2717) are typography and
+# stay; a rocket is not typography.
+PICTOGRAPH_RE = re.compile("[\U0001F000-\U0001FAFF]")
+# The legal entity, which reads the same wherever a shipped file names it.
+# LICENSE is the verbatim licence text and carries the licence author's own
+# holder line, so it is not in the set.
+ENTITY_FILES_RE = re.compile(r"^(?:NOTICE|CITATION\.cff|README\.md|\.github/CLA/[^/]+\.md)$")
+ENTITY_RE = re.compile(r"\b([A-Z][A-Za-z0-9&]*(?: [A-Z][A-Za-z0-9&]*)*,? (?:Inc|LLC|Ltd|GmbH|Limited)\b\.?)")
 
 ALLOW_FILE = "tools/scripts/public_surface_allow.txt"
 PHRASES_FILE = "tools/scripts/public_surface_phrases.txt"
@@ -34,11 +43,7 @@ LEDGER_FILE = "tools/scripts/public_surface_dash_ledger.txt"
 WORKSTATE_FILE = "tools/scripts/public_surface_workstate.txt"
 WORKSTATE_LEDGER_FILE = "tools/scripts/public_surface_workstate_ledger.txt"
 CLI_FILE = "crates/cerulion_cli/src/cli.rs"
-# The semantic review's prompt: a pattern file written in prose. It has to SPELL
-# the wording it teaches the reviewer to refuse, exactly as this gate's own data
-# files do, so it is read by neither text class.
-REVIEW_PROMPT_FILE = "tools/review/public-surface-review.md"
-DATA_FILES = (ALLOW_FILE, PHRASES_FILE, LEDGER_FILE, WORKSTATE_FILE, WORKSTATE_LEDGER_FILE, REVIEW_PROMPT_FILE)
+DATA_FILES = (ALLOW_FILE, PHRASES_FILE, LEDGER_FILE, WORKSTATE_FILE, WORKSTATE_LEDGER_FILE)
 
 CLASSES = (
     "examples-shape",
@@ -664,6 +669,35 @@ def compute_dash_counts(root, files):
     return counts
 
 
+def entity_findings(root, files):
+    """One legal entity spelling across NOTICE, CITATION.cff, README.md and the
+    contributor agreements. Two spellings is a reader asking which company the
+    agreement binds, so the rarer one is the finding and the message names both
+    sides."""
+    seen = {}
+    for f in sorted(files):
+        if not ENTITY_FILES_RE.match(f):
+            continue
+        txt = read_text(root, f)
+        if txt is None:
+            continue
+        for m in ENTITY_RE.finditer(txt):
+            name = m.group(1).rstrip(".")
+            count, where = seen.get(name, (0, None))
+            seen[name] = (count + 1, where or (f, line_of(txt, m.start())))
+    if len(seen) < 2:
+        return []
+    ranked = sorted(seen, key=lambda n: (-seen[n][0], n))
+    canonical = ranked[0]
+    findings = []
+    for name in ranked[1:]:
+        f, line = seen[name][1]
+        findings.append(Finding("shipped-text", f, line,
+                                "the legal entity reads `%s` here and `%s` in %s: one spelling across the agreements, NOTICE and CITATION.cff"
+                                % (name, canonical, seen[canonical][1][0])))
+    return findings
+
+
 def check_shipped_text(root, files, phrases, ledger):
     findings = []
     phrase_res = [(p, re.compile(re.escape(p), re.I)) for p in phrases]
@@ -686,6 +720,10 @@ def check_shipped_text(root, files, phrases, ledger):
         for phrase, rx in phrase_res:
             for m in rx.finditer(txt):
                 findings.append(Finding("shipped-text", f, line_of(txt, m.start()), "`%s` is a claim the README contradicts (listed in %s)" % (phrase, PHRASES_FILE)))
+        if f.endswith(".md"):
+            for m in PICTOGRAPH_RE.finditer(txt):
+                findings.append(Finding("shipped-text", f, line_of(txt, m.start()), "a pictograph on a shipped page: prose says what the product does in words"))
+    findings.extend(entity_findings(root, files))
     for path in sorted(ledger):
         if path not in files or is_test_path(path):
             findings.append(Finding("shipped-text", LEDGER_FILE, 1, "the dash ledger names %s, which is not a shipped file: delete its line" % path))
@@ -706,7 +744,6 @@ WORKSTATE_EXCLUDE_RE = re.compile(
     r"|crates/native_ros2_messages/(?:msg/|upstream_msg_manifest\.txt$)"
     r"|crates/rmw_cerulion/src/ffi/vendored_bindings\.rs$"
     r"|tools/scripts/(?:check_public_surface\.(?:py|sh)|leak_scan\.py|leak_scan_allow\.txt|public_surface_[a-z_]+\.txt|publish_preflight\.sh)$"
-    r"|tools/review/public-surface-review\.md$"
     r")|(?:^|/)(?:Cargo\.lock|LICENSE(?:-[A-Z0-9]+)?)$"
 )
 WORKSTATE_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
@@ -1353,7 +1390,9 @@ Paths: `crates/cerulion_core/src/wire.rs` is fine, `cerulion_core/src/wire.rs` i
 `scripts/x.sh` is stale, and USER_API.md moved to docs/user-api.md.
 
 RUSTFLOOR is a claim the README contradicts; this page is still UNPUBLISHED. A dash here: a \u2014 b.
-""".replace("RUSTFLOOR", "Rust 1." + "88").replace("UNPUBLISHED", "not yet published" + " to crates.io")
+
+Support: yes \u2713 and no \u2717 are typography and stay; a rocket \U0001F680 is not. Join the WAITWORD today.
+""".replace("WAITWORD", "wait" + "list").replace("RUSTFLOOR", "Rust 1." + "88").replace("UNPUBLISHED", "not yet published" + " to crates.io")
 
 FIXTURE_DAMAGED = '''fn topics() {
     let prefix = "pos";
@@ -1390,23 +1429,48 @@ WORKSTATE_CAUGHT = [
     ("promise-voice", "the Windows port is coming soon", "coming soon"),
     ("approval-voice", "the verb is one-shot by decision", "by decision"),
     ("review-actor", "REVIEW ITEM 7: a corrupt value must not be adopted", "REVIEW ITEM"),
+    ("plan-step", "the sprint after this one widens the window", "sprint"),
+    ("plan-label", "milestone M2 closes the encoder", "milestone M2"),
+    ("plan-label", "the A0 era shipped without the guard", "A0 era"),
+    ("change-ref", "the encoder change closes #482", "closes #482"),
+    ("review-actor", "a subagent reads the page before an edit", "subagent"),
+    ("review-actor", "As an AI a model cannot open the file", "As an AI"),
+    ("review-actor", "Let me walk through the frame layout", "Let me"),
+    ("approval-voice", "we agreed to keep the flag", "we agreed"),
+    ("deferred-work", "XXX: the parser drops a byte", "XXX:"),
+    ("deferred-work", "HACK: reach through the mutex", "HACK:"),
+    ("deferred-work", "the launch branch carries the encoder", "launch branch"),
+    ("deferred-work", "WIP: the encoder", "WIP"),
+    ("deferred-work", "the wire size is to be confirmed", "to be confirmed"),
+    ("our-machines", "our robot carries the driver", "our robot"),
+    ("our-machines", "the publisher role is arn:aws:iam", "arn:aws:"),
+    ("our-machines", "account 123456789012 owns the archive", "account 123456789012"),
+    ("our-machines", "the bucket id is in the deploy notes", "bucket id"),
+    ("proof-tag", "every mutant RUN under the cap", "mutant RUN"),
+    ("history-voice", "it bit us twice before the guard landed", "bit us"),
+    ("history-voice", "the flag was renamed from an older spelling", "was renamed from"),
+    ("history-voice", "the old version dropped a byte", "the old version"),
+    ("history-voice", "this commit renames the flag", "this commit"),
+    ("history-voice", "in this change the flag is renamed", "in this change"),
+    ("candour-voice", "we found the parser dropped a byte", "we found"),
+    ("candour-voice", "I measured the round trip", "I measured"),
 ]
 WORKSTATE_NEIGHBOURS = [
     ("hardware-status", "gated on a feature flag, and the hardware gate stays shut"),
     ("who-decided", "ruled out by the type system; a removal is a maintainer ruling"),
-    ("plan-step", "two chunks of 4 MiB each, then stage 2 of the pipeline"),
+    ("plan-step", "two chunks of 4 MiB each, then stage 2 of the pipeline, and a sprinting counter"),
     ("review-round", "ground 3 of the pin header, the bypass-2 valve, a wave-shaped plot"),
     ("session-id", "the opt3 preset and a 12 pt font"),
-    ("deferred-work", "follow the link, look up the value, keep a TODO list"),
-    ("proof-tag", "UNVERIFIED coverage is reported as such"),
-    ("our-machines", "the desk, a bounding box, a Box<dyn Trait> value"),
-    ("candour-voice", "a dishonest peer is refused"),
-    ("change-ref", "colour #2196f3, issue number 12 upstream, a PRNG seed"),
-    ("history-voice", "a prefix match, a fixed point, postfix notation"),
+    ("deferred-work", "follow the link, look up the value, keep a TODO list, WIPE the ring, an XXX redaction"),
+    ("proof-tag", "UNVERIFIED coverage is reported as such, and every mutant runs under the cap"),
+    ("our-machines", "the desk, a bounding box, a Box<dyn Trait> value, our own account 12345 and a bucket of tokens"),
+    ("candour-voice", "a dishonest peer is refused; we find the parser sound and I run the suite"),
+    ("change-ref", "colour #2196f3, issue number 12 upstream, a PRNG seed, and the writer closes 482 handles"),
+    ("history-voice", "a prefix match, a fixed point, postfix notation, this committed value, the oldest version"),
     ("design-ref", "the designated section 3 of this page"),
-    ("plan-label", "a C1 processor state, a NEL (C1) control character, and WS1 as a shell variable"),
+    ("plan-label", "a C1 processor state, a NEL (C1) control character, WS1 as a shell variable, the A0 error code and milestone tracking"),
     ("promise-voice", "the soonest deadline wins, and the gap is acknowledged in the limits table"),
-    ("approval-voice", "the merge re-sorts by decision position before publishing"),
+    ("approval-voice", "the merge re-sorts by decision position before publishing, and we agree on the wire format"),
     ("review-actor", "each Kahn peel wave is one level, a tolerant compare waves it through, and a \
 false alarm would train an operator to skim the line"),
 ]
@@ -1468,7 +1532,8 @@ def build_fixture(root):
     _put(root, "crates/test_fixtures/fx/src/lib.rs", 'pub const S: &str = "fixture \u2014 exempt";\n')
     _put(root, ".github/workflows/ci.yml", "name: CI \u2014 dashed\non: push\njobs:\n  a:\n    steps:\n      - name: plain step\n        run: echo hi # a \u2014 comment\n")
     _put(root, "CHANGELOG.md", "## 0.2.0\n- C" + "ER-999 may be cited here\n")
-    _put(root, "README.md", FIXTURE_README)
+    _put(root, "README.md", FIXTURE_README + "\nPublished by Acme Inc.\n")
+    _put(root, "CITATION.cff", 'cff-version: 1.2.0\nauthors:\n  - name: "Beta Systems Inc. and contributors"\n')
     _put(root, "docs/page.md", FIXTURE_PAGE)
     _put(root, "docs/PERFORMANCE.md", "# Performance\n\nThe 64 B p50 is 4.08 µs.\n")
     _put(root, "docs/media/used.svg", "<svg/>\n")
@@ -1544,6 +1609,9 @@ EXPECTED = [
     ("shipped-text", "crates/lib_clean/src/id.rs", "tracker id"),
     ("shipped-text", "docs/page.md", "`Rust 1." + "88` is a claim"),
     ("shipped-text", "docs/page.md", "`not yet published" + " to crates.io` is a claim"),
+    ("shipped-text", "docs/page.md", "`" + "wait" + "list` is a claim"),
+    ("shipped-text", "docs/page.md", "a pictograph on a shipped page"),
+    ("shipped-text", "CITATION.cff", "the legal entity reads `Beta Systems Inc` here and `Acme Inc` in README.md"),
     ("work-state", "crates/ws/tests/it.rs", "`plan-step` wording `Phase 4`"),
     ("work-state", "crates/ws_ledger/src/above.rs", "`plan-step` wording `chunk 1`: `// chunk 1 wired the seam` (2 such lines in the file, the ledger allows 1)"),
     ("work-state", "crates/ws_ledger/src/above.rs", "`plan-step` wording `chunk 2`: `// chunk 2 wired the drain` (2 such lines in the file, the ledger allows 1)"),
@@ -1592,7 +1660,6 @@ def self_test(out=sys.stdout):
         all(WORKSTATE_EXCLUDE_RE.search(f) for f in ("docs/benchmarks/results/pkg/run.log", "Cargo.lock", "examples/go2/Cargo.lock", "docs/legal/HISTORY.md",
                                                      ".github/CLA/individual.md", "LICENSE", "tools/scripts/check_public_surface.py",
                                                      "tools/scripts/check_public_surface.sh", "tools/scripts/leak_scan.py", WORKSTATE_FILE,
-                                                     REVIEW_PROMPT_FILE,
                                                      WORKSTATE_LEDGER_FILE, ALLOW_FILE, "crates/native_ros2_messages/msg/std_msgs/String.msg",
                                                      "crates/rmw_cerulion/src/ffi/vendored_bindings.rs"))
         and not any(WORKSTATE_EXCLUDE_RE.search(f) for f in ("crates/cerulion_core/src/lib.rs", "tools/scripts/check_agents_md.sh", "docs/benchmarks/README.md",
@@ -1624,7 +1691,7 @@ def self_test(out=sys.stdout):
             arm("control:" + path, not any(l.startswith(path + ":") for l in findings), "\n" + text)
         for sub in ("`cerulion graph run`", "`cerulion graph validate`", "`cerulion graph run-worker`", "`cerulion ros`", "`cerulion viz`",
                     "`cerulion make-it-so`", "`cerulion account devices list`", "graph bogus", "figure 4.08", "figure 5.54", "figure 15.89",
-                    "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`"):
+                    "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
         # its own key, and the legitimate neighbour fires no key at all.
@@ -1737,14 +1804,16 @@ def self_test(out=sys.stdout):
         ws_after = [l for l in buf4.getvalue().split("\n") if ": work-state: " in l and not l.startswith(("note:", "remedy:"))]
         # What a regenerated ledger CANNOT silence: the user-facing page, and the
         # key that may never be ledgered at all.
+        never_ledgered_rows = sum(1 for key, _l, _m in WORKSTATE_CAUGHT if key in WORKSTATE_NEVER_LEDGERED)
         arm("regenerated-work-state-ledger-leaves-the-user-facing-page-and-the-never-ledgered-key",
-            len(ws_after) == 2 and any(l.startswith("docs/ws_page.md:3: ") for l in ws_after)
+            len(ws_after) == never_ledgered_rows + 1 and any(l.startswith("docs/ws_page.md:3: ") for l in ws_after)
             and any("`approval-voice` wording" in l for l in ws_after), "\n".join(ws_after))
         arm("regenerated-work-state-ledger-never-writes-a-never-ledgered-key",
             not any(" %s " % key in regenerated for key in WORKSTATE_NEVER_LEDGERED), regenerated)
         arm("regenerated-work-state-ledger-rows",
             "\n2 plan-step crates/ws_ledger/src/at.rs\n" in regenerated and "\n2 plan-step crates/ws_ledger/src/above.rs\n" in regenerated
-            and "\n1 plan-step crates/ws_ledger/src/below.rs\n" in regenerated and "\n1 plan-step crates/ws/src/caught.rs\n" in regenerated
+            and "\n1 plan-step crates/ws_ledger/src/below.rs\n" in regenerated
+            and "\n%d plan-step crates/ws/src/caught.rs\n" % sum(1 for key, _l, _m in WORKSTATE_CAUGHT if key == "plan-step") in regenerated
             and "docs/" not in regenerated.split("#")[-1] and "ws_gone" not in regenerated, regenerated)
     out.write("check_public_surface --self-test: OK (%d arms: %d expected findings, the negative controls, the verb-tree oracle, the lexer, the fail-closed and ledger arms, "
               "and for work-state every key caught and their neighbours silent, the ledger at, above and below its count, the user-facing page nobody may ledger, "

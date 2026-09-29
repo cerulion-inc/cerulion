@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """leak_scan.py: the in-tree leak guard.
 
-Keeps machine names, addresses, home paths, logins, people and location
-metadata out of everything this repository publishes: file contents, file and
-branch names, commit messages and identities, pull request text, and media
-containers.
+Keeps machine names, addresses, home paths, logins, people, co-author trailers
+and location metadata out of everything this repository publishes: file
+contents, file and branch names, commit messages and identities, pull request
+text, and media containers.
 
 Two tiers:
   GENERIC classes ship here. They are SHAPES only (a home path, an address in
@@ -596,6 +596,13 @@ def build_classes(neuter=None):
         [DASH_EN, DASH_EM, DASH_ESCAPE], None,
         {'tree': _sev_dash, 'diff': _sev_dash, 'messages': 'HARD', 'names': 'REPORT'},
         'range 3' + DASH_EN + '5', what='an en dash or an em dash')
+    # A co-author trailer names a second author on a commit this repository
+    # publishes under one identity, and a squash concatenates every message it
+    # folds, so one trailer reaches main as text on a commit nobody can attach
+    # it to. The shape is assembled from fragments, like every literal here.
+    add('attribution-trailer', '(?<![A-Za-z])co-?' + 'authored-by' + r'\s*:',
+        ['authored-by'], None, CONTENT_HARD,
+        'Co-' + 'authored-by' + ': A Contributor', what='a co-author trailer')
     return out
 
 
