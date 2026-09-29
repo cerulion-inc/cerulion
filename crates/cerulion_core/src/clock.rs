@@ -429,35 +429,47 @@ impl VirtualClock {
         self.advance(ms * 1_000_000)
     }
 
-    /// Advance the controlled (gating) clock by a
-    /// run-INDEPENDENT logical quantum, returning the new time. Mechanically
-    /// identical to `advance` (atomic add with `Release` ordering), but named
-    /// for the canonical determinism contract — it names the run-independence
-    /// contract for BOTH intended feeds (the live-polled feed is wired today;
-    /// the replay feed lands with the record-exec-time model):
+    /// Advance the controlled (gating) clock by ONE step's delta, returning
+    /// the new time. Mechanically identical to `advance` (atomic add with
+    /// `Release` ordering), but named for the determinism contract it carries:
+    /// this is the SOLE seam through which a gating clock ever moves, so every
+    /// `fire_time_ns` a run stamps is a pure function of the deltas handed
+    /// here. THREE feeds are wired today:
     ///
-    /// - **Live-polled gating (wired today):** the poll loop's FIXED delta (its
-    ///   run-independent tick quantum) — the only feed routed here at present.
-    /// - **Replay (future record-exec-time wiring — not yet fed):** a
-    ///   replay-bag RECORDED execution duration (Basis-Robotics model — logical
-    ///   time advances by exactly the work that was done). The method is NAMED
-    ///   for this feed; no caller supplies a recorded-duration delta yet.
+    /// - **Live-polled gating (deterministic-live, and the
+    ///   `CERULION_EXECUTION_MODE=lockstep` opt-out):** the poll loop's FIXED
+    ///   delta, its run-INDEPENDENT tick quantum.
+    /// - **Recording (the free-run multi-process DEFAULT, and a
+    ///   `--record` monolith):** the step's MEASURED wall elapsed. See
+    ///   `GraphRuntime::live_step`'s `gating_follows_wall` arm, which hands
+    ///   `GatingDelta(elapsed)` to `step_live`. This feed is run-DEPENDENT by
+    ///   design: jitter is the thing being recorded, and two independent
+    ///   recorded runs legitimately differ.
+    /// - **Replay:** the difference between two consecutive RECORDED
+    ///   step-boundary targets read out of the bag, handed to `runtime.step`
+    ///   by `replay_engine`'s pass loop.
     ///
-    /// Both are run-independent — they do NOT depend on measuring the current
-    /// run's wall-clock — which is precisely what makes a replay bit-for-bit
-    /// identical to the polled gating run (Principle #7).
+    /// WHAT STAYS INVARIANT, therefore, is NOT run-to-run equality: only the
+    /// first feed buys that. It is that a run is REPRODUCIBLE FROM ITS OWN
+    /// RECORD: `Scheduler::begin_step` pushes one `StepBoundary` per step whose
+    /// `fire_time_ns` is exactly the value this method just returned, so
+    /// whatever delta was handed here is recoverable from the bag as a target
+    /// difference and the replay feed hands back the same sequence (Principle
+    /// #7).
     ///
-    /// GUARDRAIL: wall-clock / telemetry durations (live elapsed, a
-    /// `max(measured peer durations)` agreement value, etc.) MUST NOT be passed
-    /// here as a gating input — those are bag/telemetry-only and would break
-    /// replay = live. (The one documented exception is the `build_for_test`
-    /// virtual-LIVE seam, which advances by wall-clock `elapsed`; that
-    /// difference is `fire_time_ns`-EXCLUDED — see `polled_vs_live_iox2_test`.)
+    /// GUARDRAIL, restated around that: a gating delta must be either
+    /// run-independent OR recorded as this step's boundary target. A value that
+    /// is neither (a `max(measured peer durations)` agreement word, a
+    /// telemetry duration sampled off the step seam) MUST NOT be passed here:
+    /// nothing writes it to the bag, so replay has nothing to hand back and
+    /// re-execution silently diverges. (The `build_for_test` virtual-LIVE seam
+    /// advances by wall-clock `elapsed` outside any recording; that difference
+    /// is `fire_time_ns`-EXCLUDED, see `polled_vs_live_iox2_test`.)
     ///
     /// This is wired into `Scheduler::begin_step` via
     /// `ClockInner::advance` (the single per-step gating-clock seam). The
-    /// dedicated name keeps the run-independence intent explicit at the call
-    /// site (vs. a bare `advance`).
+    /// dedicated name keeps that contract explicit at the call site (vs. a bare
+    /// `advance`).
     pub fn advance_by_recorded(&self, duration_ns: u64) -> u64 {
         self.time_ns.fetch_add(duration_ns, Ordering::Release) + duration_ns
     }

@@ -614,6 +614,25 @@ const ERA_CLAIM_TOKENS: &[&str] = &["foxy", "galactic", "humble", "iron", "jazzy
 const _: () = assert!(ERA_NAMES.len() == ERA_LYRICAL + 1);
 const _: () = assert!(ERA_CLAIM_TOKENS.len() == ERA_LYRICAL + 1);
 
+// Every `ERA_CLAIM_ADMITTED_MEMBERS` row must name at least one distro, and the
+// table must have at least one row. An empty row would let
+// `era::classify_unset_distro` build an empty `remedy_distros`, whose `.first()`
+// is `None` (silently ADMITTING a build the guard exists to refuse) and whose
+// `remedy()` would render a command that sources nothing; an empty TABLE would
+// make the per-row check below pass vacuously, the same silent-admit path.
+// Both are held unreachable at compile time rather than checked on the load path.
+const _: () = assert!(!ERA_CLAIM_ADMITTED_MEMBERS.is_empty());
+const _: () = {
+    let mut i = 0;
+    while i < ERA_CLAIM_ADMITTED_MEMBERS.len() {
+        assert!(
+            !ERA_CLAIM_ADMITTED_MEMBERS[i].1.is_empty(),
+            "every era-claim admitted-members row must name at least one distro"
+        );
+        i += 1;
+    }
+};
+
 /// The `rmw_init_options_t` size the bindings actually lay out, read
 /// from bindgen's OWN layout test — the discriminator the capability
 /// fingerprint lacks (jazzy and kilted share

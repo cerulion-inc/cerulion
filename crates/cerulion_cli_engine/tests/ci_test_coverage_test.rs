@@ -106,6 +106,27 @@
 //! workflows by
 //! `a_selection_condition_credits_nothing_when_its_output_is_not_grounded`.
 //!
+//! THE GUARD, OWED BY EVERY DEPENDANT OF THE CLASSIFIER. A job that `needs:`
+//! the `changes` job is SKIPPED when that job fails, and branch protection
+//! counts a skipped required context as SATISFIED, so the pull request merges
+//! with that job's contexts never run. Every dependant therefore carries a
+//! job-level `if:` that OPENS with `!cancelled()`: `${{ !cancelled() }}` on the
+//! four test jobs, and `!cancelled() && ...` where the job keeps a gate of its
+//! own. The population is the dependency, never the spelling of one step: a job
+//! reading the selection only through `env:`, and a job whose gate is a folded
+//! block scalar, owe the guard exactly as much as a job with a one-line `if:`.
+//! Whether a guarded job is PR-blocking is a separate question, decided by
+//! `job_is_gated` and pinned by
+//! `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+//!
+//! THE BASE, PROBED BEFORE THE DIFF READS IT. The classifier's step resolves a
+//! base, then diffs `$BASE...HEAD` for the changed paths. An empty base turns
+//! that range into `...HEAD`, which git reads as HEAD against HEAD: no path,
+//! `pkgs=[]`, every gated step skipped and nothing red. The step probes
+//! `$BASE^{commit}` first and fails the job with the value printed; the walk
+//! pins the probe, its refusal and their order ahead of the diff in the script
+//! text: `the_selection_job_probes_the_base_before_the_diff_reads_it`.
+//!
 //! The producing rule reads the script TEXT, so `ci.yml`'s own `changes` job
 //! grounds today only because its non-pull-request branch spells
 //! `packaging=false` literally, its pull-request branch piping
@@ -272,6 +293,59 @@ fn jobs_of(text: &str) -> Vec<(String, String)> {
     out.into_iter()
         .map(|(n, lines)| (n, lines.join("\n")))
         .collect()
+}
+
+/// The ONE job-level condition this walk sanctions, spelled whole.
+///
+/// A job-level `if:` normally disqualifies a job outright: it can stop the job
+/// on a pull request, and a package covered only there is covered by nothing.
+/// `!cancelled()` is the exception and it is the exception for the OPPOSITE
+/// reason: it exists so the job runs when a job it `needs:` FAILED. GitHub
+/// skips a dependant of a failed job, a skipped required context counts as
+/// satisfied, and a pull request would then merge with that job's contexts
+/// never run. So a job carrying exactly this condition runs on every pull
+/// request that is not cancelled, and a cancelled run is not a pass.
+///
+/// EXACT, not a substring: `!cancelled() && github.event_name != 'pull_request'`
+/// is a different condition and stays disqualified, which is why `deb-smoke`
+/// (whose `if:` opens with the same call) is still dropped from this view.
+const JOB_IF_NOT_CANCELLED: &str = "${{ !cancelled() }}";
+
+/// The indent a job's own keys sit at: two for the job id, two more for the key.
+const JOB_KEY_INDENT: &str = "    ";
+
+/// The job-level `if:` value of one job block, read in every scalar form.
+///
+/// `None` when the job carries none. `Err` for a form the scalar reader cannot
+/// classify, which the caller turns into a failure rather than into "no
+/// condition": an unread job condition reads as an ungated job, and a job
+/// behind `github.event_name == 'push'` would then credit coverage.
+fn job_if_of(block: &str) -> Option<Result<String, String>> {
+    let lines: Vec<&str> = block.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("    if:"))?;
+    let rest = &lines[at]["    if:".len()..];
+    Some(read_scalar_value(
+        "if",
+        rest,
+        &lines,
+        at,
+        JOB_KEY_INDENT.len(),
+    ))
+}
+
+/// Does this job carry a job-level condition that can stop it on a pull
+/// request?
+fn job_is_gated(block: &str) -> bool {
+    match job_if_of(block) {
+        None => false,
+        Some(Ok(cond)) => cond.trim() != JOB_IF_NOT_CANCELLED,
+        Some(Err(why)) => panic!(
+            "{why}\n\nThe walk cannot say whether this JOB runs on a pull \
+             request, so it refuses to guess. Spell the job's `if:` as a \
+             NON-EMPTY plain, quoted or block scalar, or teach \
+             `read_scalar_form` the form."
+        ),
+    }
 }
 
 /// The member of a selection set that means "the doc classes changed".
@@ -1102,7 +1176,7 @@ fn retain_steps<F: Fn(&str) -> bool>(job: &str, keep: F) -> String {
 /// a package named only there is named in nothing that gates anything.
 fn pr_blocking_jobs(text: &str) -> String {
     let jobs = jobs_of(text);
-    let has_job_if = |block: &str| block.lines().any(|l| l.starts_with("    if:"));
+    let has_job_if = job_is_gated;
     let is_soft = |block: &str| {
         block.lines().any(|l| {
             l.starts_with("    continue-on-error:")
@@ -2999,6 +3073,26 @@ fn every_package_with_tests_is_credited_when_it_alone_is_selected() {
          not reaching the tree and this arm would be vacuous",
         demanded.len()
     );
+
+    // REAL GATES, not a hypothetical. A workflow that carries no selection
+    // condition runs every step under every set, so this arm cannot fail on one
+    // whatever the evaluator does. It holds a live population, and a workflow
+    // that lost every gate has to say so here rather than go quietly green.
+    let gated: usize = texts
+        .values()
+        .map(|text| {
+            text.lines()
+                .filter(|l| l.contains(SELECTION_PKG_IF_OPEN))
+                .count()
+        })
+        .sum();
+    assert!(
+        gated >= 20,
+        "only {gated} per-package selection condition(s) survive into the \
+         PR-blocking text: either the gates were removed or the step filter is \
+         dropping them, and this arm is then evaluating a workflow that runs \
+         everything under every selection"
+    );
 }
 
 /// The totality arm is not vacuous: a package whose only step is gated on a
@@ -3120,4 +3214,1178 @@ fn only_the_exact_per_package_selection_form_names_a_package() {
             "`{not_sanctioned}` is not the sanctioned per-package form"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// THE OFF SWITCH, AND THE SHAPE OF A STEP-LEVEL SELECTION GATE
+// ---------------------------------------------------------------------------
+
+/// The repository variable that stops the selection with no pull request.
+const SELECTION_SWITCH: &str = "CI_SELECTION";
+
+/// The one line `ci.yml` declares it on, default included.
+///
+/// Held whole rather than by prefix: the DEFAULT is the half that decides what
+/// a repository with no variable does, and a declaration without it reads as an
+/// empty switch, which the classifier treats as "not `on`" and answers by
+/// selecting everything. That is the safe direction and it is also a silent
+/// loss of the whole feature, so the line is pinned.
+const SELECTION_SWITCH_DECLARATION: &str = "  CI_SELECTION: ${{ vars.CI_SELECTION || 'on' }}";
+
+/// The job whose script has to READ the switch, and the step that reads it.
+const SELECTION_SWITCH_READER_STEP: &str = "classify";
+
+/// The probe the `classify` step runs on the base it resolved, before the diff.
+const SELECTION_BASE_PROBE: &str = "git rev-parse --verify -q \"$BASE^{commit}\"";
+
+/// The probe's refusal: a `selection:` marker line carrying the value, then a
+/// failing exit.
+const SELECTION_BASE_REFUSAL: &str =
+    "|| { echo \"selection: base '$BASE' does not name a commit\"; exit 1; }";
+
+/// The diff that lists the changed paths from that base.
+const SELECTION_BASE_DIFF: &str = "git diff --name-only --no-renames \"$BASE...HEAD\"";
+
+/// Whether `script` carries the probe, then its refusal VERBATIM, then the
+/// diff, in the script TEXT; `Err` names what is missing or out of order.
+///
+/// An empty base turns `$BASE...HEAD` into `...HEAD`, a range git reads as
+/// HEAD against HEAD, so a diff that runs first lists no path and the
+/// classifier selects nothing. A probe whose `||` branch does not exit lets the
+/// same base through, so the refusal text is pinned with the probe; a reworded
+/// refusal re-pins here on purpose.
+fn base_probe_guards_diff(script: &str) -> Result<(), String> {
+    let probe = script
+        .find(SELECTION_BASE_PROBE)
+        .ok_or_else(|| format!("no `{SELECTION_BASE_PROBE}`"))?;
+    let diff = script
+        .find(SELECTION_BASE_DIFF)
+        .ok_or_else(|| format!("no `{SELECTION_BASE_DIFF}`"))?;
+    if probe >= diff {
+        return Err(format!(
+            "the probe follows the diff, so an empty base reaches `{SELECTION_BASE_DIFF}` first"
+        ));
+    }
+    if !script[probe..diff].contains(SELECTION_BASE_REFUSAL) {
+        return Err(format!(
+            "no `{SELECTION_BASE_REFUSAL}` between the probe and the diff; the refusal is \
+             pinned verbatim"
+        ));
+    }
+    Ok(())
+}
+
+/// The `run:` script of the `classify` step of the `changes` job in ci.yml.
+fn selection_classifier_script(texts: &BTreeMap<String, String>) -> String {
+    let ci = texts
+        .get("ci.yml")
+        .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
+    let jobs = jobs_of(ci);
+    let (_, block) = jobs
+        .iter()
+        .find(|(name, _)| name == SELECTION_JOB)
+        .unwrap_or_else(|| panic!("ci.yml carries no `{SELECTION_JOB}` job"));
+    let reader = step_blocks(block)
+        .into_iter()
+        .find(|b| step_id_of(b).as_deref() == Some(SELECTION_SWITCH_READER_STEP))
+        .unwrap_or_else(|| {
+            panic!(
+                "the `{SELECTION_JOB}` job carries no step with id `{SELECTION_SWITCH_READER_STEP}`"
+            )
+        });
+    run_script_of(&reader).unwrap_or_else(|| {
+        panic!(
+            "the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job carries no \
+             `run:` script"
+        )
+    })
+}
+
+/// The prefix every selection skip line carries.
+const SELECTION_MARKER_PREFIX: &str = "selection:";
+
+/// The whole opening of the line a gated step's skip branch prints.
+const SELECTION_SKIPPED_PREFIX: &str = "selection: skipped ";
+
+/// Why this condition is not a legal step-level selection gate, if it is not.
+///
+/// THE RULE. The switch feeds the CLASSIFIER, and the classifier's three
+/// outputs are the only thing a step may be gated on. A step that read the
+/// variable itself would decide from a value the `changes` job never saw: the
+/// classifier could be answering `pkgs` for a narrow selection while the step
+/// reads `off` and runs, or the other way round, and the two would drift the
+/// first time somebody changed one of them. A step gated on some OTHER output
+/// of the classifier job is the same fault spelled differently: the walk has
+/// never seen that output's rules, and `step_if_is_pr_blocking_grounded`
+/// already refuses to credit it, so it would run on no event at all.
+///
+/// Returns `None` for a condition that is not a selection gate (a leg selector,
+/// `always()`, an ordinary event test): those are the coverage walk's business,
+/// not this rule's.
+fn selection_gate_violation(cond: &str) -> Option<String> {
+    if cond.contains(SELECTION_SWITCH) {
+        return Some(format!(
+            "reads the `{SELECTION_SWITCH}` switch directly. The switch feeds \
+             the `{SELECTION_JOB}` job; a step reads the classifier's output, \
+             never the variable"
+        ));
+    }
+    let needle = format!("needs.{SELECTION_JOB}.outputs.");
+    let mut from = 0usize;
+    while let Some(offset) = cond[from..].find(&needle) {
+        let at = from + offset + needle.len();
+        from = at;
+        let name: String = cond[at..]
+            .chars()
+            .take_while(|c| is_name_char(*c))
+            .collect();
+        if ![
+            SELECTION_CODE_OUTPUT,
+            SELECTION_DOCS_OUTPUT,
+            SELECTION_PKGS_OUTPUT,
+        ]
+        .contains(&name.as_str())
+        {
+            return Some(format!(
+                "reads `{needle}{name}`, which is not one of the three outputs \
+                 the switch feeds (`{SELECTION_CODE_OUTPUT}`, \
+                 `{SELECTION_DOCS_OUTPUT}`, `{SELECTION_PKGS_OUTPUT}`)"
+            ));
+        }
+    }
+    None
+}
+
+/// Every workflow's text with comments stripped, keyed by file name.
+///
+/// NOT [`pr_blocking_workflow_texts`]: that one DROPS the gated steps, which is
+/// exactly the population the rules below are about.
+fn workflow_texts() -> BTreeMap<String, String> {
+    let dir = repo_root().join(".github/workflows");
+    let mut out = BTreeMap::new();
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        out.insert(
+            name,
+            raw.lines()
+                .map(strip_yaml_comment)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    assert!(
+        out.len() >= 5,
+        "the workflow walk found only {} file(s) under {}: it is not reaching \
+         the workflows",
+        out.len(),
+        dir.display()
+    );
+    out
+}
+
+/// The `if:` value of one step block, read in every scalar form.
+///
+/// `Err` for a form [`read_scalar_form`] cannot classify, which every caller
+/// turns into a failure: a condition this walk cannot read is not one it may
+/// skip past.
+fn step_if_of(block: &[&str]) -> Result<Option<String>, String> {
+    let Some(first) = block.first() else {
+        return Ok(None);
+    };
+    let step_indent = indent_of(first);
+    for (i, line) in block.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let rest = if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix("if:")
+        } else if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix("if:"))
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            return read_scalar_value("if", rest, block, i, step_indent + 2).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The `name:` of one step block, or `None`.
+fn step_name_of(block: &[&str]) -> Option<String> {
+    let step_indent = indent_of(block.first()?);
+    for line in block {
+        let trimmed = line.trim_start();
+        let rest = if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix("name:"))
+        } else if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix("name:")
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// The exact condition a gated step's SKIP-BRANCH marker carries: the negation
+/// of the per-package gate, wrapped so YAML reads the `!` as an expression
+/// rather than as a tag.
+fn selection_marker_condition(package: &str) -> String {
+    format!("${{{{ !{SELECTION_PKG_IF_OPEN}{package}{SELECTION_PKG_IF_CLOSE} }}}}")
+}
+
+/// The one line that marker prints, up to the selection it names.
+fn selection_marker_line(package: &str) -> String {
+    format!("{SELECTION_SKIPPED_PREFIX}{package} (selected: ")
+}
+
+/// Every package a step of this job is gated on, and the packages its marker
+/// steps cover.
+fn selection_gates_and_markers(job: &str) -> (BTreeSet<String>, BTreeSet<String>, Vec<String>) {
+    let mut gated: BTreeSet<String> = BTreeSet::new();
+    let mut marked: BTreeSet<String> = BTreeSet::new();
+    let mut complaints: Vec<String> = Vec::new();
+    for block in step_blocks(job) {
+        let cond = match step_if_of(&block) {
+            Ok(Some(cond)) => cond,
+            Ok(None) => continue,
+            Err(why) => {
+                complaints.push(format!("  {why}"));
+                continue;
+            }
+        };
+        for term in cond.split("&&") {
+            if let Some(package) = selection_condition_package(term) {
+                gated.insert(package.to_string());
+            }
+        }
+        // A marker step is recognised by its CONDITION, which is the exact
+        // negation of one gate, and then held to its print. Recognised by the
+        // condition rather than by the name, so a step called "selection
+        // marker" that gates on something else covers nothing.
+        for package in marked_candidates(&cond) {
+            if cond.trim() != selection_marker_condition(&package) {
+                continue;
+            }
+            let script = run_script_of(&block).unwrap_or_default();
+            let printed: Vec<&str> = script
+                .lines()
+                .filter(|l| l.contains(SELECTION_MARKER_PREFIX))
+                .collect();
+            let name = step_name_of(&block).unwrap_or_default();
+            if printed.len() != 1 {
+                complaints.push(format!(
+                    "  `{name}` is the skip branch of the `{package}` gate and \
+                     prints {} line(s) carrying `{SELECTION_MARKER_PREFIX}`; \
+                     exactly one is the rule",
+                    printed.len()
+                ));
+                continue;
+            }
+            if !printed[0].contains(&selection_marker_line(&package)) {
+                complaints.push(format!(
+                    "  `{name}` prints `{}` rather than a line opening \
+                     `{}`",
+                    printed[0].trim(),
+                    selection_marker_line(&package)
+                ));
+                continue;
+            }
+            marked.insert(package);
+        }
+    }
+    (gated, marked, complaints)
+}
+
+/// The packages a marker CONDITION could be about: the negated per-package form
+/// names exactly one.
+fn marked_candidates(cond: &str) -> Vec<String> {
+    let cond = cond.trim();
+    let Some(inner) = cond.strip_prefix("${{").and_then(|c| c.strip_suffix("}}")) else {
+        return Vec::new();
+    };
+    let Some(term) = inner.trim().strip_prefix('!') else {
+        return Vec::new();
+    };
+    selection_condition_package(term.trim())
+        .map(|p| vec![p.to_string()])
+        .unwrap_or_default()
+}
+
+/// The switch is declared once, at workflow level, WITH its default, and it
+/// reaches the classifier.
+#[test]
+fn the_selection_switch_is_declared_once_and_read_by_the_classifier() {
+    let texts = workflow_texts();
+    let ci = texts
+        .get("ci.yml")
+        .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
+
+    let declarations = ci
+        .lines()
+        .filter(|l| l.trim_end() == SELECTION_SWITCH_DECLARATION)
+        .count();
+    assert_eq!(
+        declarations, 1,
+        "ci.yml declares `{SELECTION_SWITCH}` on {declarations} line(s) reading \
+         exactly `{SELECTION_SWITCH_DECLARATION}`; it is declared ONCE, at \
+         workflow level, and the default in the expression is what a repository \
+         with no variable set gets"
+    );
+
+    // The switch reaches the CLASSIFIER, and the classifier alone. A switch
+    // nothing reads is a switch that stops nothing.
+    let script = selection_classifier_script(&texts);
+    assert!(
+        script.contains(SELECTION_SWITCH),
+        "the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job \
+         never names `{SELECTION_SWITCH}`: the switch would be declared and read \
+         by nothing, and turning it off would change no run"
+    );
+    assert!(
+        script.contains(SELECTION_MARKER_PREFIX),
+        "the `{SELECTION_SWITCH_READER_STEP}` step never prints a \
+         `{SELECTION_MARKER_PREFIX}` line, so a reader of the log cannot see \
+         which way the switch was set"
+    );
+}
+
+/// The `changes` job probes the base it resolved, refuses one that names no
+/// commit, and does both before the diff reads it.
+#[test]
+fn the_selection_job_probes_the_base_before_the_diff_reads_it() {
+    let script = selection_classifier_script(&workflow_texts());
+    if let Err(why) = base_probe_guards_diff(&script) {
+        panic!("the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job: {why}");
+    }
+}
+
+/// The probe counts only with its refusal verbatim, both ahead of the diff; a
+/// refusal in other words, or one that follows the diff, does not count.
+#[test]
+fn a_base_probe_counts_only_with_its_refusal_ahead_of_the_diff() {
+    let probe = format!("{SELECTION_BASE_PROBE} > /dev/null");
+    let diff = format!("{SELECTION_BASE_DIFF} > changed.txt");
+    let no_refusal = format!(
+        "no `{SELECTION_BASE_REFUSAL}` between the probe and the diff; the refusal is pinned \
+         verbatim"
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n{SELECTION_BASE_REFUSAL}\n{diff}\n")),
+        Ok(())
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{diff}\n{probe}\n{SELECTION_BASE_REFUSAL}\n"))
+            .unwrap_err(),
+        format!(
+            "the probe follows the diff, so an empty base reaches `{SELECTION_BASE_DIFF}` first"
+        )
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n|| echo refused\n{diff}\n")).unwrap_err(),
+        no_refusal,
+        "a refusal in other words"
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n{diff}\n{SELECTION_BASE_REFUSAL}\n"))
+            .unwrap_err(),
+        no_refusal,
+        "a refusal after the diff"
+    );
+    assert_eq!(
+        base_probe_guards_diff(&diff).unwrap_err(),
+        format!("no `{SELECTION_BASE_PROBE}`")
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n{SELECTION_BASE_REFUSAL}\n")).unwrap_err(),
+        format!("no `{SELECTION_BASE_DIFF}`")
+    );
+}
+
+/// No step in any workflow is gated on the switch, or on an output the switch
+/// does not feed.
+#[test]
+fn a_step_selection_gate_reads_only_an_output_the_switch_feeds() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut steps_read = 0usize;
+    for (file, text) in workflow_texts() {
+        for (job, block) in jobs_of(&text) {
+            for step in step_blocks(&block) {
+                steps_read += 1;
+                let cond = match step_if_of(&step) {
+                    Ok(Some(cond)) => cond,
+                    Ok(None) => continue,
+                    Err(why) => {
+                        complaints.push(format!("  {file} / {job}: {why}"));
+                        continue;
+                    }
+                };
+                if let Some(why) = selection_gate_violation(&cond) {
+                    let name = step_name_of(&step).unwrap_or_else(|| "<unnamed>".to_string());
+                    complaints.push(format!("  {file} / {job} / `{name}`: {why}"));
+                }
+            }
+        }
+    }
+    assert!(
+        steps_read >= 100,
+        "the step walk read only {steps_read} step(s): it is not reaching the \
+         workflows and this rule would be vacuous"
+    );
+    assert!(
+        complaints.is_empty(),
+        "these step conditions are not legal selection gates:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The rule itself, both sides, on hand-written conditions.
+#[test]
+fn the_selection_gate_rule_names_the_switch_and_the_wrong_output() {
+    // Legal: the three sanctioned forms, and conditions that are no selection
+    // gate at all.
+    for allowed in [
+        SELECTION_CODE_IF,
+        SELECTION_DOCS_IF,
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')",
+        "matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')",
+        "matrix.shard == 0",
+        "always()",
+        "github.event_name == 'push'",
+    ] {
+        assert_eq!(
+            selection_gate_violation(allowed),
+            None,
+            "`{allowed}` is a legal step condition"
+        );
+    }
+    // The switch, in every spelling a step could reach it by.
+    for refused in [
+        "env.CI_SELECTION != 'off'",
+        "vars.CI_SELECTION == 'on'",
+        "matrix.shard == 3 && env.CI_SELECTION != 'off'",
+    ] {
+        let why = selection_gate_violation(refused)
+            .unwrap_or_else(|| panic!("`{refused}` reads the switch and must be refused"));
+        assert!(why.contains(SELECTION_SWITCH), "-> {why}");
+    }
+    // An output of the classifier job the switch does not feed.
+    for refused in [
+        "needs.changes.outputs.packaging == 'true'",
+        "needs.changes.outputs.selected == 'true'",
+        "matrix.shard == 3 && needs.changes.outputs.touched == 'true'",
+    ] {
+        let why = selection_gate_violation(refused).unwrap_or_else(|| {
+            panic!("`{refused}` reads an ungoverned output and must be refused")
+        });
+        assert!(why.contains("is not one of the three outputs"), "-> {why}");
+    }
+}
+
+/// Every gated step's job carries the skip-branch marker for its package.
+#[test]
+fn every_gated_step_has_a_selection_marker_in_its_job() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut gated_total = 0usize;
+    for (file, text) in workflow_texts() {
+        for (job, block) in jobs_of(&text) {
+            let (gated, marked, mut trouble) = selection_gates_and_markers(&block);
+            complaints.append(&mut trouble);
+            gated_total += gated.len();
+            for package in gated.difference(&marked) {
+                complaints.push(format!(
+                    "  {file} / {job}: a step is gated on `{package}` and the \
+                     job carries no marker step for it. Add a step with \
+                     `if: {}` whose script prints \
+                     `{}<the selection>)`",
+                    selection_marker_condition(package),
+                    selection_marker_line(package)
+                ));
+            }
+            for package in marked.difference(&gated) {
+                complaints.push(format!(
+                    "  {file} / {job}: a marker step names `{package}` and no \
+                     step of this job is gated on it; a marker that describes \
+                     nothing pre-authorises the next hole"
+                ));
+            }
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "selection markers do not match the gates:\n{}",
+        complaints.join("\n")
+    );
+    // Non-vacuity. A workflow whose steps are all ungated satisfies this arm
+    // and the totality arm without either one looking at anything, so the live
+    // population is required to be real.
+    assert!(
+        gated_total >= 20,
+        "only {gated_total} step gate(s) were found across the workflows: the \
+         gate reader is broken, or the selection was removed, and this arm and \
+         the totality arm below would both be vacuous"
+    );
+}
+
+/// The marker rule, both sides, on synthetic jobs.
+#[test]
+fn a_gated_step_without_its_marker_is_a_red_walker() {
+    let gate = format!(
+        "        if: {}\n",
+        SELECTION_PKG_IF_OPEN.to_string() + "alpha" + SELECTION_PKG_IF_CLOSE
+    );
+    let step = format!("      - name: alpha tests\n{gate}        run: cargo test -p alpha\n");
+    let marker = format!(
+        "      - name: selection marker, alpha\n        if: {}\n        run: |\n          echo \"{}$SELECTED)\"\n",
+        selection_marker_condition("alpha"),
+        selection_marker_line("alpha")
+    );
+    let job = |steps: &str| format!("  j:\n    runs-on: ubuntu-latest\n    steps:\n{steps}");
+
+    let (gated, marked, trouble) = selection_gates_and_markers(&job(&format!("{step}{marker}")));
+    assert!(trouble.is_empty(), "-> {trouble:?}");
+    assert_eq!(gated, marked, "a gated step WITH its marker is covered");
+    assert_eq!(gated, ["alpha".to_string()].into_iter().collect());
+
+    let (gated, marked, trouble) = selection_gates_and_markers(&job(&step));
+    assert!(trouble.is_empty(), "-> {trouble:?}");
+    assert!(
+        marked.is_empty() && gated.len() == 1,
+        "a gated step with NO marker leaves its package uncovered: gated \
+         {gated:?}, marked {marked:?}"
+    );
+
+    // An UNGATED step needs no marker, and produces none.
+    let plain = "      - name: alpha tests\n        run: cargo test -p alpha\n";
+    let (gated, marked, trouble) = selection_gates_and_markers(&job(plain));
+    assert!(trouble.is_empty(), "-> {trouble:?}");
+    assert!(gated.is_empty() && marked.is_empty());
+
+    // A marker that prints nothing, and one that prints the wrong line, are
+    // both complaints rather than silent passes.
+    let silent = format!(
+        "      - name: selection marker, alpha\n        if: {}\n        run: true\n",
+        selection_marker_condition("alpha")
+    );
+    let (_, marked, trouble) = selection_gates_and_markers(&job(&format!("{step}{silent}")));
+    assert!(marked.is_empty(), "a silent marker covers nothing");
+    assert_eq!(trouble.len(), 1, "-> {trouble:?}");
+    let wrong = format!(
+        "      - name: selection marker, alpha\n        if: {}\n        run: |\n          echo \"selection: something else\"\n",
+        selection_marker_condition("alpha")
+    );
+    let (_, marked, trouble) = selection_gates_and_markers(&job(&format!("{step}{wrong}")));
+    assert!(
+        marked.is_empty(),
+        "a marker printing the wrong line covers nothing"
+    );
+    assert_eq!(trouble.len(), 1, "-> {trouble:?}");
+}
+
+/// The call every dependant of the classifier has to open its job condition
+/// with, and the separator that follows it when the job keeps a gate of its
+/// own.
+const GUARD_CALL: &str = "!cancelled()";
+const GUARD_CALL_AND: &str = "!cancelled() && ";
+
+/// One condition as a single normalised expression: the `${{ }}` wrapper off,
+/// runs of whitespace down to one space.
+///
+/// A job condition means the same thing spelled `${{ expr }}` on one line and
+/// spelled `expr` in a folded block scalar, and `ci.yml` uses both.
+fn condition_expression(cond: &str) -> String {
+    let trimmed = cond.trim();
+    let inner = trimmed
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .unwrap_or(trimmed);
+    inner.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Does this job condition keep the job running when a job it `needs:` FAILED?
+///
+/// Exactly `!cancelled()`, or `!cancelled()` as the FIRST term of an `&&`
+/// chain, which is `deb-smoke`'s shape. Nothing else: `success() &&
+/// !cancelled()` carries the call and still skips on a failed dependency,
+/// which is the whole fault.
+fn condition_survives_a_failed_dependency(cond: &str) -> bool {
+    let expr = condition_expression(cond);
+    expr == GUARD_CALL || expr.starts_with(GUARD_CALL_AND)
+}
+
+/// Every dependant of the classifier that does NOT guard itself against the
+/// classifier failing.
+///
+/// WHY THIS IS THE SEVEREST ARM IN THE FILE. GitHub SKIPS a dependant when its
+/// dependency fails, and branch protection counts a SKIPPED required context as
+/// SATISFIED: a classifier that failed for any reason, a checkout, a resolve, a
+/// typo in the script, would skip four jobs carrying eleven of the twenty
+/// required contexts and the pull request would merge with none of them run. A
+/// condition opening with `!cancelled()` makes the job run anyway; `pkgs` is
+/// then the empty string, `fromJSON('')` is an expression error, the step fails
+/// and the job reds.
+///
+/// THE POPULATION IS EVERY DEPENDANT, not every job with a one-line gate. A job
+/// that `needs:` the classifier is skipped by a classifier failure however it
+/// consumes the outputs, and `ci.yml` already passes the selection as a plain
+/// `env:` value on two steps. The step gates are read too, through
+/// [`step_if_of`], so a gate spelled as a folded block scalar counts like any
+/// other; a form that reader cannot classify counts as a gate as well, so an
+/// unreadable condition makes the job owe the guard instead of escaping it.
+///
+/// The other direction is checked too: a job that neither needs the classifier
+/// nor gates on the selection owes no guard, so the rule cannot be satisfied by
+/// pasting `!cancelled()` everywhere.
+fn jobs_missing_the_not_cancelled_guard(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (job, block) in jobs_of(text) {
+        let depends = job_needs(&block).iter().any(|n| n == SELECTION_JOB);
+        let gates = step_blocks(&block)
+            .iter()
+            .any(|step| match step_if_of(step) {
+                Ok(Some(cond)) => cond.contains(SELECTION_PKG_IF_OPEN),
+                Ok(None) => false,
+                Err(_) => true,
+            });
+        if !(depends || gates) {
+            continue;
+        }
+        let guarded = matches!(
+            job_if_of(&block),
+            Some(Ok(cond)) if condition_survives_a_failed_dependency(&cond)
+        );
+        if !guarded {
+            out.push(job);
+        }
+    }
+    out
+}
+
+#[test]
+fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut guarded = 0usize;
+    for (file, text) in workflow_texts() {
+        for job in jobs_missing_the_not_cancelled_guard(&text) {
+            complaints.push(format!("  {file} / {job}"));
+        }
+        guarded += jobs_of(&text)
+            .iter()
+            .filter(|(_, block)| {
+                matches!(job_if_of(block), Some(Ok(cond)) if cond.trim() == JOB_IF_NOT_CANCELLED)
+            })
+            .count();
+    }
+    assert!(
+        complaints.is_empty(),
+        "these jobs depend on the `{SELECTION_JOB}` job, or gate a step on the \
+         selection, and their job-level `if:` does not open with \
+         `{GUARD_CALL}`:\n{}\n\nGitHub skips a dependant of a FAILED job and a \
+         skipped required context reads as satisfied, so without the guard a \
+         classifier failure is a silent green around every context these jobs \
+         report. `{JOB_IF_NOT_CANCELLED}` is the shape a job with no gate of its \
+         own carries; a job keeping its own gate spells it \
+         `{GUARD_CALL_AND}<the rest>`.",
+        complaints.join("\n")
+    );
+    assert!(
+        guarded >= 4,
+        "only {guarded} job(s) carry the guard: the four jobs that gate steps on \
+         the selection each need it, so either the reader is broken or the \
+         guards were removed"
+    );
+    // The population is not empty, so an emptied reader is not a pass. Five
+    // jobs of `ci.yml` need the classifier today.
+    let dependants: usize = workflow_texts()
+        .values()
+        .map(|text| {
+            jobs_of(text)
+                .iter()
+                .filter(|(_, block)| job_needs(block).iter().any(|n| n == SELECTION_JOB))
+                .count()
+        })
+        .sum();
+    assert!(
+        dependants >= 5,
+        "only {dependants} job(s) name `{SELECTION_JOB}` in `needs:`: the rule \
+         above is judging a population the reader is no longer finding"
+    );
+}
+
+/// The guard rule, both sides, on synthetic jobs.
+#[test]
+fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
+    let gate = format!("{SELECTION_PKG_IF_OPEN}alpha{SELECTION_PKG_IF_CLOSE}");
+    let body = format!(
+        "    needs: [changes]\n{{guard}}    steps:\n      - name: alpha tests\n        \
+         if: {gate}\n        run: cargo test -p alpha\n"
+    );
+    let job = |guard: &str| format!("  j:\n{}", body.replace("{guard}", guard));
+
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job("")),
+        vec!["j".to_string()],
+        "a job that gates a step and carries no job-level condition is named"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(&format!("    if: {JOB_IF_NOT_CANCELLED}\n"))),
+        Vec::<String>::new(),
+        "the guard satisfies the rule"
+    );
+    // A condition that OPENS with the call keeps the job running when the
+    // classifier failed, so it satisfies THIS rule; whether such a job is
+    // PR-blocking is the separate question `job_is_gated` decides, pinned by
+    // `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(
+            "    if: ${{ !cancelled() && github.event_name != 'pull_request' }}\n"
+        )),
+        Vec::<String>::new(),
+        "a condition opening with the call still runs on a failed dependency"
+    );
+    // Carrying the call somewhere else is not opening with it: `success()` is
+    // false the moment the classifier fails, so this job skips exactly when the
+    // guard is meant to save it.
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job("    if: ${{ success() && !cancelled() }}\n")),
+        vec!["j".to_string()],
+        "the call has to OPEN the condition"
+    );
+    // And a condition with no such call at all is named.
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(
+            "    if: ${{ github.event_name != 'pull_request' }}\n"
+        )),
+        vec!["j".to_string()],
+        "an ordinary event test is not the guard"
+    );
+    // The other side: a job that neither needs the classifier nor gates on the
+    // selection owes nothing.
+    let ungated = "  j:\n    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(ungated),
+        Vec::<String>::new(),
+        "a job that is no dependant and carries no selection gate owes no guard"
+    );
+    // A gate spelled inside a COMMENT gates nothing, so it demands no guard.
+    let commented = format!(
+        "  j:\n    steps:\n      - name: alpha tests\n        # if: {gate}\n        \
+         run: cargo test -p alpha\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&commented),
+        Vec::<String>::new(),
+        "a gate inside a comment gates nothing"
+    );
+
+    // A DEPENDANT THAT CARRIES NO GATE AT ALL. `ci.yml` already hands the
+    // selection to two steps as a plain `env:` value, and the shard runner
+    // intersects it script-side, so a job built that way has no `if:` naming
+    // the selection and is skipped by a classifier failure just the same.
+    let env_only = format!(
+        "  j:\n    needs: [{SELECTION_JOB}]\n    env:\n      CI_SELECTED_PACKAGES: ${{{{ \
+         needs.{SELECTION_JOB}.outputs.pkgs }}}}\n    steps:\n      - name: alpha tests\n        \
+         run: ./tools/scripts/ci_test_shard.sh alpha\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&env_only),
+        vec!["j".to_string()],
+        "a dependant consuming the selection through `env:` still owes the guard"
+    );
+
+    // A GATE SPELLED AS A FOLDED BLOCK SCALAR. The workflows spell compound
+    // conditions this way throughout, and the marker rule beside this one
+    // already reads every scalar form; a reader that needs both halves on one
+    // line drops the job out of the population.
+    let folded = format!(
+        "  j:\n    steps:\n      - name: alpha tests\n        if: >-\n          {gate}\n        \
+         run: cargo test -p alpha\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&folded),
+        vec!["j".to_string()],
+        "a gate spelled as a folded block scalar is still a gate"
+    );
+
+    // THE PACKAGING JOB'S SHAPE, accepted: it needs the classifier, it keeps a
+    // gate of its own, and it opens with the call, so a classifier failure
+    // leaves it running with an empty `packaging` and it skips on its own
+    // terms rather than on GitHub's.
+    let packaging = format!(
+        "  deb-smoke:\n    needs: [{SELECTION_JOB}]\n    if: >-\n      !cancelled()\n      \
+         && ((github.event_name != 'pull_request' && github.event_name != 'merge_group')\n      \
+         || (github.event_name == 'pull_request' && needs.{SELECTION_JOB}.outputs.packaging == \
+         'true'))\n    steps:\n      - name: smoke\n        run: ./tools/scripts/build_deb.sh\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&packaging),
+        Vec::<String>::new(),
+        "a dependant whose own gate follows the call is guarded"
+    );
+}
+
+/// A job carrying exactly `!cancelled()` still credits its packages, and one
+/// carrying any other job-level condition still does not.
+#[test]
+fn the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking() {
+    let body = "    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
+    let with = format!("  j:\n    if: {JOB_IF_NOT_CANCELLED}\n{body}");
+    let without = format!("  j:\n{body}");
+    let other = format!("  j:\n    if: github.event_name == 'push'\n{body}");
+
+    for (name, text) in [("guarded", &with), ("ungated", &without)] {
+        assert!(
+            pr_blocking_jobs(text).contains("cargo test -p alpha"),
+            "the {name} job must stay in the PR-blocking view"
+        );
+    }
+    assert!(
+        !pr_blocking_jobs(&other).contains("cargo test -p alpha"),
+        "a job behind an ordinary event test is still dropped"
+    );
+}
+
+/// The name of the Lint step that must run the shard check, and the invocation
+/// it must carry.
+///
+/// Spelled whole, because a renamed step is a step nobody can find in a log and
+/// a step with a different argument is a different check: `--check` with no
+/// argument is the SHIPPED configuration (the script's own defaults), and
+/// `--check cerulion_core 3` proves a partition the workflow does not run.
+const SHARD_CHECK_STEP: &str = "Shard partition and selection check";
+const SHARD_CHECK_RUN: &str = "./tools/scripts/ci_test_shard.sh --check";
+
+/// The workflow and the job the step belongs to.
+///
+/// A step of the right name running the right script proves nothing about WHEN
+/// it runs. Six jobs of `ci.yml` sit behind `github.event_name != 'pull_request'
+/// && github.event_name != 'merge_group'` under a cost policy, and the other
+/// workflows run on their own events, so the same step moved into one of those
+/// keeps its name and its script and stops running on a pull request, which is
+/// the one property the step exists for.
+const SHARD_CHECK_WORKFLOW: &str = "ci.yml";
+const SHARD_CHECK_JOB: &str = "lint";
+
+/// Is this run script the shipped invocation, WHOLE?
+///
+/// Equality, never `contains`. `./tools/scripts/ci_test_shard.sh --check
+/// cerulion_core 2` and `./tools/scripts/ci_test_shard.sh --check || true` both
+/// carry the bare form as a prefix: the first proves a two-shard partition the
+/// workflow does not run, and the second reports success whatever the check
+/// says. The reader's own both-sides test compares for equality already.
+fn is_the_shard_check_run(script: &str) -> bool {
+    script.trim() == SHARD_CHECK_RUN
+}
+
+/// Where a workflow runs the shard check, and what it runs there.
+struct ShardCheckStep {
+    /// The id of the job holding the step.
+    job: String,
+    /// The step's `run:` script, joined.
+    script: String,
+    /// The step's own `if:`, read in every scalar form. `Ok(None)` is a step
+    /// with no condition of its own, which is the only shape the rule accepts:
+    /// a step gated on an event runs nowhere else while its job still reports.
+    condition: Result<Option<String>, String>,
+}
+
+/// Does any step of this workflow run the shard check under its own name?
+fn shard_check_step_of(text: &str) -> Option<ShardCheckStep> {
+    for (job, block) in jobs_of(text) {
+        for step in step_blocks(&block) {
+            if step_name_of(&step).as_deref() != Some(SHARD_CHECK_STEP) {
+                continue;
+            }
+            return Some(ShardCheckStep {
+                job,
+                script: run_script_of(&step).unwrap_or_default(),
+                condition: step_if_of(&step),
+            });
+        }
+    }
+    None
+}
+
+/// Everything wrong with the way one workflow runs the shard check, as the
+/// lines a failure prints. EMPTY is the shipped shape.
+///
+/// The rule is a function so the synthetic rows below judge the same thing the
+/// real workflow is judged on.
+fn shard_check_complaints(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(found) = shard_check_step_of(text) else {
+        out.push(format!("no job carries a step named `{SHARD_CHECK_STEP}`"));
+        return out;
+    };
+    if found.job != SHARD_CHECK_JOB {
+        out.push(format!(
+            "the step sits in the `{}` job, and the rule names `{SHARD_CHECK_JOB}`",
+            found.job
+        ));
+    }
+    if !is_the_shard_check_run(&found.script) {
+        out.push(format!(
+            "the step runs `{}`, and the rule names `{SHARD_CHECK_RUN}`",
+            found.script.trim()
+        ));
+    }
+    match &found.condition {
+        Ok(None) => {}
+        Ok(Some(cond)) => out.push(format!(
+            "the step carries its own condition `{cond}`, so it runs on fewer \
+             events than the job that holds it"
+        )),
+        Err(why) => out.push(format!(
+            "the step carries a condition this walk cannot read: {why}"
+        )),
+    }
+    if !jobs_of(&pr_blocking_jobs(text))
+        .iter()
+        .any(|(job, _)| *job == found.job)
+    {
+        out.push(format!(
+            "the `{}` job is not pull-request blocking, so the check does not \
+             run on a pull request",
+            found.job
+        ));
+    }
+    out
+}
+
+/// The same rule over a WHOLE workflow tree, keyed by file name.
+///
+/// THE CHOICE OF FILE IS PART OF THE RULE, so it lives here and not in a test
+/// body. Reading every workflow and taking the first hit passes on the shipped
+/// tree for an accident: `ci.yml` is the only file carrying the step today, so
+/// a walk over all of them lands on the same text and nothing reds. This reads
+/// `{SHARD_CHECK_WORKFLOW}` and no other file, and a tree without it is itself
+/// a complaint rather than a silent pass.
+fn shard_check_complaints_in(texts: &BTreeMap<String, String>) -> Vec<String> {
+    let Some(text) = texts.get(SHARD_CHECK_WORKFLOW) else {
+        return vec![format!(
+            "the workflow walk found no `{SHARD_CHECK_WORKFLOW}`, which is the \
+             one file this rule reads"
+        )];
+    };
+    shard_check_complaints(text)
+        .into_iter()
+        .map(|why| format!("`{SHARD_CHECK_WORKFLOW}`: {why}"))
+        .collect()
+}
+
+/// The shard check runs on every pull request, in the `lint` job of `ci.yml`,
+/// under a named step, with the invocation the script documents.
+///
+/// WHY A TEST HOLDS A WORKFLOW STEP. `ci_test_shard.sh --check` carries the
+/// proof that the partition is total and disjoint AND the hand table its
+/// selection reader is held to. Nothing in the workflow ran it: the only
+/// caller was `the_ci_test_shard_partition_is_total_and_disjoint` in this
+/// file, which runs under `cargo test -p cerulion_cli_engine`. That is a gate
+/// whose CI invocation is one selection away from disappearing, and a gate
+/// nothing invokes is inert.
+///
+/// WHY THE PLACE IS PART OF THE RULE. The name and the script say what runs,
+/// never when. [`shard_check_complaints_in`] reads `ci.yml` and no other file,
+/// the job id is pinned, the job has to survive the pull-request view, and the
+/// step may carry no condition of its own: each of those is a way the step
+/// keeps its name and stops running where it matters.
+#[test]
+fn the_shard_check_runs_in_a_named_lint_step() {
+    let complaints = shard_check_complaints_in(&workflow_texts());
+    assert!(
+        complaints.is_empty(),
+        "the workflow tree does not run `{SHARD_CHECK_RUN}` the way the rule \
+         names: {}. That invocation proves the shard partition is total and \
+         disjoint and holds the selection reader to its hand table, and it has \
+         to run on a pull request that never runs `cerulion_cli_engine`.",
+        complaints.join("; ")
+    );
+}
+
+/// The rule reads `ci.yml`, both sides, on synthetic workflow trees.
+#[test]
+fn the_shard_check_rule_reads_the_main_workflow_and_no_other() {
+    let carrying = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    steps:\n      - name: {SHARD_CHECK_STEP}\n        \
+         run: {SHARD_CHECK_RUN}\n"
+    );
+    let bare = "jobs:\n  build:\n    steps:\n      - name: build\n        run: cargo build\n";
+    let tree = |ci: Option<&str>, release: &str| {
+        let mut out = BTreeMap::new();
+        if let Some(ci) = ci {
+            out.insert(SHARD_CHECK_WORKFLOW.to_string(), ci.to_string());
+        }
+        out.insert("release.yml".to_string(), release.to_string());
+        out
+    };
+
+    // (a) THE STEP IN ANOTHER WORKFLOW COVERS NOTHING. `release.yml` carries
+    //     it in a job named `lint` with the shipped shape, so a rule that
+    //     searched every file would read it and pass; the file this rule reads
+    //     carries no such step, and that is what is said.
+    let elsewhere = tree(Some(bare), &carrying);
+    let complaints = shard_check_complaints_in(&elsewhere);
+    assert!(
+        complaints
+            .iter()
+            .any(|why| why.contains(SHARD_CHECK_WORKFLOW) && why.contains("no job carries a step")),
+        "the step living only in another workflow is named against \
+         `{SHARD_CHECK_WORKFLOW}`: {complaints:?}"
+    );
+
+    // (b) The same step in the same shape under `ci.yml` is clean, so the row
+    //     above is not satisfied by a rule that complains about everything.
+    assert!(
+        shard_check_complaints_in(&tree(Some(&carrying), bare)).is_empty(),
+        "the shipped shape under `{SHARD_CHECK_WORKFLOW}` draws no complaint: {:?}",
+        shard_check_complaints_in(&tree(Some(&carrying), bare))
+    );
+
+    // (c) And a tree with no `ci.yml` at all is a complaint, never an empty
+    //     verdict: a walk that stopped finding the file would otherwise report
+    //     a pass.
+    let missing = tree(None, &carrying);
+    assert!(
+        !shard_check_complaints_in(&missing).is_empty(),
+        "a tree carrying no `{SHARD_CHECK_WORKFLOW}` is a complaint"
+    );
+}
+
+/// The reader, both sides, on synthetic workflows.
+#[test]
+fn a_renamed_or_rewritten_shard_check_step_is_not_found() {
+    let job = |name: &str, run: &str| {
+        format!("  lint:\n    steps:\n      - name: {name}\n        run: {run}\n")
+    };
+    assert_eq!(
+        shard_check_step_of(&job(SHARD_CHECK_STEP, SHARD_CHECK_RUN))
+            .map(|found| found.script.trim().to_string())
+            .as_deref(),
+        Some(SHARD_CHECK_RUN),
+        "the named step running the documented invocation is found"
+    );
+    assert!(
+        shard_check_step_of(&job("Shard check", SHARD_CHECK_RUN)).is_none(),
+        "a renamed step is not found"
+    );
+    let wrong = job(
+        SHARD_CHECK_STEP,
+        "./tools/scripts/ci_test_shard.sh --list cerulion_core 0 4",
+    );
+    assert!(
+        !shard_check_step_of(&wrong)
+            .expect("the step is named")
+            .script
+            .contains(SHARD_CHECK_RUN),
+        "a step of the right name running something else does not satisfy the rule"
+    );
+    // THE SAME PREDICATE THE ARM ABOVE USES, on the two shapes its message
+    // names. Both carry the bare invocation as a prefix, so a `contains`
+    // reading accepts them: the first runs a two-shard partition the workflow
+    // does not run, and the second passes the step whatever the check reports.
+    for run in [
+        "./tools/scripts/ci_test_shard.sh --check cerulion_core 2",
+        "./tools/scripts/ci_test_shard.sh --check || true",
+    ] {
+        let script = shard_check_step_of(&job(SHARD_CHECK_STEP, run))
+            .expect("the step is named")
+            .script;
+        assert!(
+            script.contains(SHARD_CHECK_RUN),
+            "`{run}` carries the bare invocation, so this row says something about \
+             the predicate and not about the reader; it read back `{}`",
+            script.trim()
+        );
+        assert!(
+            !is_the_shard_check_run(&script),
+            "`{run}` is not the shipped invocation, and the rule rejects it"
+        );
+    }
+    let bare = shard_check_step_of(&job(SHARD_CHECK_STEP, SHARD_CHECK_RUN))
+        .expect("the step is named")
+        .script;
+    assert!(
+        is_the_shard_check_run(&bare),
+        "the bare invocation IS the shipped one, so the rule is not satisfied by \
+         rejecting everything"
+    );
+}
+
+/// WHERE the shard check runs, both sides, on synthetic workflows.
+#[test]
+fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
+    let shipped = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    steps:\n      - name: {SHARD_CHECK_STEP}\n        \
+         run: {SHARD_CHECK_RUN}\n"
+    );
+    assert!(
+        shard_check_complaints(&shipped).is_empty(),
+        "the shipped shape draws no complaint: {:?}",
+        shard_check_complaints(&shipped)
+    );
+
+    // The cost-policy move: the same step, same name, same invocation, in a
+    // job that skips on a pull request. It is the wrong job AND the job is not
+    // pull-request blocking, and both are said.
+    let moved = format!(
+        "jobs:\n  msrv:\n    if: github.event_name != 'pull_request'\n    steps:\n      \
+         - name: {SHARD_CHECK_STEP}\n        run: {SHARD_CHECK_RUN}\n"
+    );
+    let complaints = shard_check_complaints(&moved);
+    assert!(
+        complaints.iter().any(|c| c.contains("`msrv` job")),
+        "a step in another job is named by its job: {complaints:?}"
+    );
+    assert!(
+        complaints
+            .iter()
+            .any(|c| c.contains("pull-request blocking")),
+        "a step in a job that skips on a pull request is named for that: \
+         {complaints:?}"
+    );
+
+    // The job id alone is not the rule: `lint` behind an event test is still a
+    // job the check does not run in on a pull request.
+    let gated = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    if: github.event_name != 'pull_request'\n    \
+         steps:\n      - name: {SHARD_CHECK_STEP}\n        run: {SHARD_CHECK_RUN}\n"
+    );
+    let complaints = shard_check_complaints(&gated);
+    assert!(
+        complaints
+            .iter()
+            .any(|c| c.contains("pull-request blocking")),
+        "the right job behind an event test is still named: {complaints:?}"
+    );
+    assert!(
+        !complaints
+            .iter()
+            .any(|c| c.contains("job, and the rule names")),
+        "and it is not named for sitting in the wrong job: {complaints:?}"
+    );
+
+    // A step-level condition is the third way the step keeps its name and
+    // stops running: the job reports, the step does not.
+    let conditioned = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    steps:\n      - name: {SHARD_CHECK_STEP}\n        \
+         if: github.event_name == 'push'\n        run: {SHARD_CHECK_RUN}\n"
+    );
+    let complaints = shard_check_complaints(&conditioned);
+    assert!(
+        complaints.iter().any(|c| c.contains("its own condition")),
+        "a step with a condition of its own is named: {complaints:?}"
+    );
 }

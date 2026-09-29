@@ -25979,8 +25979,8 @@ fn write_sy_bag_mixed_regime(
 /// the two-rank free-run read-log oracle below stamps no rims at all, so
 /// `per_edge` is `None` there and the block does not run.
 ///
-/// REACHABLE on a real run, not latent: `CERULION_EXECUTION_MODE=free_run` resolves
-/// through `resolve_run_execution_mode` on the live `graph run` path and stamps
+/// REACHABLE on a real run, not latent: a multi-process `graph run` resolves free-run
+/// through `resolve_run_execution_mode` BY DEFAULT and stamps
 /// the coordination key, and bagd writes `read_log_capacities` whenever any rows
 /// exist. The production recorder DOES stamp free_run.
 ///

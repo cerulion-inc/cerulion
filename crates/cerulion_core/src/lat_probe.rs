@@ -10,10 +10,18 @@
 //! # What can and cannot be measured
 //!
 //! **Not measurable: robot → desk.** A frame's wire `timestamp_ns` is stamped by
-//! the PRODUCER's clock, and a `graph run-worker`'s gating clock advances by a fixed
-//! logical quantum — its seconds are not wall seconds and its epoch is not
-//! ours. Subtracting a desk wall clock from a wire stamp compares two unrelated
-//! number lines (the lesson, learned the expensive way). This module
+//! the PRODUCER's clock, and WHICH clock that is depends on how the producing
+//! `graph run-worker` was launched. Under the `CERULION_EXECUTION_MODE=lockstep`
+//! opt-out its gating clock advances by a fixed logical quantum, so its seconds
+//! are not wall seconds at all. Under the free-run default with its trace ring
+//! (the always-on ring, and `--record`) the gating clock advances once per step
+//! by the step's measured wall elapsed from an epoch placed on the robot, so its
+//! seconds are wall seconds but its epoch is not ours. On the ring-less free-run
+//! arm (`--no-rings`) the producer is on its own machine's boot-monotonic
+//! `RealClock`, whose epoch is again not ours. No shape makes a wire stamp
+//! subtractable from a desk wall clock, and nothing on the wire says which shape
+//! produced it: subtracting a desk wall clock from a wire stamp compares two
+//! unrelated number lines (the lesson, learned the expensive way). This module
 //! therefore NEVER touches wire stamps for timing; it uses them only as the frame
 //! IDENTITY (`sequence`).
 //!

@@ -1,8 +1,9 @@
 # SPLIT leg graph — the IDENTICAL 3-node round-trip chain, split into two
 # OS processes by `process_groups`: g1 = {ping} at global level 0,
-# g2 = {pong, latency} at levels 1-2 (contiguous bands — the barrier
-# requires contiguous splits). The `ping -> pong` edge becomes a REAL
-# cross-process iceoryx2 hop under barrier lockstep; the pong -> latency
+# g2 = {pong, latency} at levels 1-2 (contiguous bands: a group owns a
+# contiguous band of global levels in every execution mode, since each
+# rank re-levelizes its own subgraph onto that band). The `ping -> pong`
+# edge becomes a REAL cross-process iceoryx2 hop; the pong -> latency
 # echo hop stays in-process in g2, so the split-vs-mono delta is ONE
 # explicit cross-process hop (the same 2-group shape as
 # benches/mp_latency/graphs/mplat_split.yaml). Declaration order = rank
