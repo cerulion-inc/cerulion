@@ -111,10 +111,13 @@
 #                             its period, because a bare `Co` matches the first
 #                             half of a hyphenated word. A mention whose raw
 #                             text is not the declared spelling is a finding.
-#                             A FINAL FULL STOP is punctuation either way,
-#                             declared with it or without it, because at the end
-#                             of a sentence the two cannot be told apart;
-#                             everything else is exact, the letters, their case,
+#                             A FINAL FULL STOP is asymmetric: one the page
+#                             ADDED is punctuation, since a declared `Ltd` at a
+#                             sentence end cannot be told from the same name
+#                             plus a stop; one the page DROPPED is a finding,
+#                             since the family matches longest first and so
+#                             carries the stop whenever the page wrote one.
+#                             Everything else is exact, the letters, their case,
 #                             the comma before the suffix, and which word of the
 #                             family the suffix is. and a SECOND suffix behind a correct
 #                             mention is a finding of its own: one form of the

@@ -735,16 +735,17 @@ TRAILING_SUFFIX_RE = re.compile(LEGAL_SPACE + r"+" + LEGAL_SUFFIX)
 
 
 def mention_is_the_declared_spelling(text, canonical):
-    """Whether a mention reads as the declaration. A FINAL FULL STOP is
-    punctuation in BOTH directions, declared with it or without it, because at
-    the end of a sentence the two are indistinguishable. Everything else is
-    exact: the letters, their case, the comma before the suffix, and which word
-    of the family the suffix is."""
-    return _without_final_stop(text) == _without_final_stop(canonical)
-
-
-def _without_final_stop(text):
-    return text[:-1] if text.endswith(".") else text
+    """Whether a mention reads as the declaration. A final full stop is ASYMMETRIC:
+    one the page ADDED is punctuation, because a declared `Ltd` at the end of a
+    sentence and the same name plus a stop cannot be told apart; one the page
+    DROPPED is a finding, because the family is matched longest first and so
+    carries the stop whenever the page wrote one, which means a match without it
+    is a page that left it out somewhere the two CAN be told apart. Everything
+    else is exact: the letters, their case, the comma before the suffix, and
+    which word of the family the suffix is."""
+    if text == canonical:
+        return True
+    return not canonical.endswith(".") and text.endswith(".") and text[:-1] == canonical
 
 
 def legal_name(root):
@@ -1928,6 +1929,7 @@ EXPECTED = [
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Limited` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems GmbH` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Co.` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Inc` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme\\u00a0Systems Inc.` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme\\n> Systems Ltd.` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme\\n# Systems Corp.` here"),
@@ -2058,8 +2060,8 @@ def self_test(out=sys.stdout):
         all(mention_is_the_declared_spelling(
                 legal_name_mentions_checked(d).search("Shipped by %s. Next." % d).group(0), d)
             for d in ("Acme Systems Ltd", "Acme Systems Inc", "Acme Systems Corp")))
-    arm("a-final-stop-is-punctuation-when-the-declaration-carries-it",
-        mention_is_the_declared_spelling("Acme Systems Inc", "Acme Systems Inc.")
+    arm("a-stop-the-page-dropped-is-a-finding",
+        not mention_is_the_declared_spelling("Acme Systems Inc", "Acme Systems Inc.")
         and mention_is_the_declared_spelling("Acme Systems Inc.", "Acme Systems Inc"))
     arm("everything-but-the-final-stop-is-exact",
         not mention_is_the_declared_spelling("ACME SYSTEMS INC.", "Acme Systems Inc.")
@@ -2133,7 +2135,6 @@ def self_test(out=sys.stdout):
                     "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717",
                     "Eclipse Foundation", "Willow Garage", "MyAcme", "Incidentally", "Acme Systems Corp.",
                     "Co-operative", "works with Foo", "Acme Robotics Systems", "Acme Robotics Inc.",
-                    "reads `Acme Systems Inc`", "reads `Acme Systems Inc.` here and",
                     "git revert <this commit>", "does not reverse this commit"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
