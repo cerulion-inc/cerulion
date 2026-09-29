@@ -2404,8 +2404,8 @@ fn a_path_joined_onto_the_crates_own_directory_is_not_a_doc_pin() {
 // FAIL CLOSED. A literal this walk cannot attribute to one package, a path
 // whose package segment is built at run time or an artifact name built at run
 // time, records the observing package as observing `all`: the selector then
-// selects it on every change and no step of it is ever gated. That is the
-// fourth kind, `unattributable`.
+// adds it to every selection that names a package, and no step of it may be
+// gated. That is the fourth kind, `unattributable`.
 //
 // The rules reuse the doc-pin classifier above, literal for literal: the same
 // blanked views, the same `is_path_position`, the same write-target refusal and
