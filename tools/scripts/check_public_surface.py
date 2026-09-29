@@ -51,20 +51,32 @@ PICTOGRAPH_RE = re.compile(
 # reordering, a translated line or a deleted line hands it a vendor's name and
 # it goes on policing that, green. Declared inputs, parsed outputs.
 ENTITY_FILE = "tools/scripts/public_surface_entity.txt"
-# Widening this set by adding CHARACTERS is safe. Widening it by admitting a
-# unicode CATEGORY is not: that is how the invisible characters got in, and a
-# category always holds more than the letters it was reached for.
-LEGAL_NAME_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 &.,-'/()")
 # The suffix family. `Co.` carries its period, because a bare `Co` matches the
 # first half of a hyphenated word. The trailing guard is what keeps `Inc` out of
 # `Incidentally`; the order of the alternatives is cosmetic, since the guard
 # forces the backtrack either way.
-LEGAL_SUFFIX_WORDS = ("Incorporated", "Inc.", "Corporation", "Corp.", "Limited", "Ltd.", "LLC", "GmbH", "Co.")
-# Built FROM the list above, so the family a message names is the family the
-# pattern matches. A period is optional wherever the short form takes one.
-LEGAL_SUFFIX = (r"(?:" + "|".join(re.escape(w).replace(r"\.", r"\.?") if w.endswith(".") and w != "Co."
-                                  else re.escape(w) for w in LEGAL_SUFFIX_WORDS) + r")(?![A-Za-z])")
+# THE ONE LIST. The family a mention may end in, the family a refusal names, and
+# the characters a declared name may hold all come from here, so the three can
+# never disagree again. `Co.` is spelled only with its period, because a bare
+# `Co` matches the first half of a hyphenated word.
+LEGAL_SUFFIX_WORDS = (
+    "Inc", "Inc.", "Incorporated", "Corp", "Corp.", "Corporation", "Co.",
+    "LLC", "LLP", "Ltd", "Ltd.", "Limited", "PLC", "GmbH", "AG",
+    "S.A.", "B.V.", "AB", "Oy", "A/S")
+# LONGEST FIRST, so `Inc.` wins over `Inc` and the match carries the period a
+# page actually wrote. Without that order the pattern would read a correct
+# `<name> Inc.` as `<name> Inc` and report the right spelling as wrong.
+LEGAL_SUFFIX = (r"(?:" + "|".join(re.escape(w) for w in sorted(LEGAL_SUFFIX_WORDS, key=len, reverse=True))
+                + r")(?![A-Za-z])")
+
+# Widening this set by adding CHARACTERS is safe. Widening it by admitting a
+# unicode CATEGORY is not: that is how the invisible characters got in, and a
+# category always holds more than the letters it was reached for.
+# Every character the suffix family needs is folded in from the list above, so a
+# suffix the rule accepts can never be a suffix a declaration may not spell.
+LEGAL_NAME_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 &.,-'/()"
+) | frozenset("".join(LEGAL_SUFFIX_WORDS))
 # What may stand between the words of a mention: spaces (a no-break space among
 # them, which a typesetter inserts and a reader cannot see), a comma, or ONE
 # line break with the prefix a wrapped line carries. The prefix set is every
@@ -1973,6 +1985,25 @@ def self_test(out=sys.stdout):
         "one of the permitted characters cannot appear in a declared name")
     arm("the-refusal-names-the-suffixes-the-pattern-holds",
         all(re.compile(LEGAL_SUFFIX).fullmatch(w) for w in LEGAL_SUFFIX_WORDS), repr(LEGAL_SUFFIX_WORDS))
+    arm("the-character-set-holds-every-suffix-the-family-names",
+        all(c in LEGAL_NAME_CHARS for w in LEGAL_SUFFIX_WORDS for c in w), repr(LEGAL_SUFFIX_WORDS))
+    # One per suffix: a name DECLARED with it is found whole, a variant of that
+    # name is found and is not the declaration, and the near miss stays silent.
+    for _w in LEGAL_SUFFIX_WORDS:
+        _name = "Acme Systems " + _w
+        try:
+            _rx = legal_name_mentions_checked(_name)
+        except CannotRun as _exc:
+            arm("suffix:" + _w, False, str(_exc))
+            continue
+        _whole = _rx.search(_name)
+        _variant = _rx.search(_name.upper())
+        _near = _rx.search("MyAcme Systems " + _w)
+        arm("suffix:" + _w,
+            _whole is not None and _whole.group(0) == _name
+            and _variant is not None and _variant.group(0) != _name
+            and _near is None,
+            repr([_whole and _whole.group(0), _variant and _variant.group(0), _near and _near.group(0)]))
     # A name whose head carries a regex character is a literal, not a pattern.
     arm("a-head-with-a-regex-character-is-a-literal",
         legal_name_mentions("A.B Inc.").search("AxB Inc.") is None

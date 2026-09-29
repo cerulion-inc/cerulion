@@ -99,11 +99,14 @@
 #                             with the comment or quote prefix a wrapped line
 #                             carries (a blank line ends the sentence and is
 #                             not a wrap), and over the suffix family
-#                             (Incorporated, Inc., Corporation, Corp.,
-#                             Limited, Ltd., LLC, GmbH, Co., each short form
-#                             with its period optional except `Co.`, whose
-#                             period is what keeps a bare `Co` out of the first
-#                             half of a hyphenated word). A mention whose raw
+#                             (Inc, Inc., Incorporated, Corp, Corp.,
+#                             Corporation, Co., LLC, LLP, Ltd, Ltd., Limited,
+#                             PLC, GmbH, AG, S.A., B.V., AB, Oy, A/S). That one
+#                             list also decides which characters a declared name
+#                             may hold, so a suffix the rule accepts can never
+#                             be one a declaration may not spell. `Co.` carries
+#                             its period, because a bare `Co` matches the first
+#                             half of a hyphenated word. A mention whose raw
 #                             text is not the declared spelling BYTE FOR BYTE
 #                             is a finding, and a SECOND suffix behind a correct
 #                             mention is a finding of its own: one form of the
