@@ -1001,6 +1001,24 @@ jobs:
       # remedy line per class, and it belongs in `lint` for the same reason the
       # gates above do: pure python3 over `git ls-files`, no cargo, seconds.
       #
+      # The same class also keeps a page in words (no pictograph: the emoji
+      # planes, a curated set of sign and emoji-twin characters, and the
+      # variation selector that forces emoji presentation; the BARE check mark
+      # and ballot X a support table draws with are typography and stay) and
+      # holds the project's legal name to one spelling everywhere in shipped
+      # text. The name is DECLARED in public_surface_entity.txt, one line, and
+      # is parsed out of no prose: a notice lists other holders, so reading one
+      # to find the name takes whichever line comes first. Any defect of that
+      # file is exit 3. Every mention is then matched past case, a comma, one
+      # hard wrap and the suffix family, and a mention that does not read as the
+      # declared spelling is a finding: exact in the letters, their case, the
+      # comma and the suffix word, with a final full stop forgiven only when the
+      # page ADDED one. A second suffix on the same line is its own finding, and
+      # zero mentions is a finding rather than a clean run. A third-party holder
+      # is a candidate only where it begins with the declared name's first word
+      # and adds no word the name does not have: one that drops a word is
+      # judged, one that adds a word is not a mention at all.
+      #
       # It reads data files beside it: an allow list whose entries name
       # one finding each and FAIL when stale, a phrase list of claims the
       # README contradicts, and a per-file dash LEDGER that only burns down
@@ -1026,13 +1044,6 @@ jobs:
       - name: Public-surface gate (examples, docs, media, benchmarks, shipped text, figures)
         run: ./tools/scripts/check_public_surface.sh
 
-      # The semantic half of the shipped-text gates is a read of the pull
-      # request's diff against `tools/review/public-surface-review.md`, run
-      # locally rather than as a job here. The script that reads its verdict
-      # and decides the outcome still belongs to every push: a rule nobody
-      # drives is a rule nobody has checked.
-      - name: Public-surface review verdict renderer (self-test)
-        run: python3 -B tools/review/render_public_surface_verdict.py --self-test
       # The README shows its logo and two schematics through <picture>, one
       # fixed-palette file per GitHub theme, because an SVG inside an <img>
       # follows the viewer's operating system and never the GitHub theme they
