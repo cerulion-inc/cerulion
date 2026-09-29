@@ -36,6 +36,8 @@ Usage:
           --offline (resolve no reference, report every candidate unverified)
           --skip-code (blank fenced blocks and inline code spans first; the
           conversation surfaces only, where a quoted example is not a link)
+          --conversation (someone else's issue or comment: only the identity and
+          reference classes are HARD there; a style class reports and no more)
           --self-repo OWNER/REPO (the repository being scanned; else the forge
           environment, else the origin remote)
 
@@ -156,6 +158,14 @@ IDENTITY_CLASSES = frozenset((
     'login-at-host', 'mdns-local', 'host-field', 'overlay-dns', 'email-personal', 'acl-tag',
     'ref-unopenable', 'ref-unverified'))
 MASK_RX = re.compile(r'[^\W_]')
+# What is HARD on a CONVERSATION surface: an issue body, an issue comment, a
+# review comment. Exactly the classes whose finding is a value a reader should
+# not have been shown, which is the identity classes and, inside them, the two
+# reference classes. A typographic class is not one of them: a dash in someone's
+# prose is a house style note about text WE write, and turning it into a label,
+# an ask and a red run on a contributor's thread is the guard crying wolf on a
+# page that leaks nothing. The private tier stays hard here as everywhere.
+CONVERSATION_HARD = IDENTITY_CLASSES
 
 # Published placeholder vocabularies. Explicit sets, never a length rule.
 PH_USER = frozenset((
@@ -1406,8 +1416,11 @@ class Scanner(object):
     """One scan. The sweep and the self-test both go through this class."""
 
     def __init__(self, mode, classes, private, allow, out, fmt='text', hard=(), quiet=False,
-                 refs=None, skip_code=False):
+                 refs=None, skip_code=False, conversation=False):
         self.mode = mode
+        # A conversation surface: someone else's issue or comment. See
+        # CONVERSATION_HARD for what may be hard there and why.
+        self.conversation = conversation
         # Conversation surfaces only: a fenced block or an inline code span is
         # blanked before any class reads the unit. See blank_code.
         self.skip_code = skip_code
@@ -1457,6 +1470,9 @@ class Scanner(object):
 
     def add(self, cid, sev, path, line, text, where='', private=None, raw_line='',
             ctx=None):
+        if (self.conversation and sev == 'HARD' and private is None
+                and cid not in CONVERSATION_HARD):
+            sev = 'REPORT'
         if cid in self.hard:
             sev = 'HARD'
         if private is not None:
@@ -2846,6 +2862,7 @@ def build_parser():
     # Spelling it anywhere else is a usage error rather than a silent no-op.
     m.add_argument('--skip-code', action='store_true')
     m.add_argument('--hard-classes-file')
+    m.add_argument('--conversation', action='store_true')
     m.add_argument('--allow-email-file')
     m.add_argument('--ident-from-git', action='store_true')
     m.add_argument('--require-commits', action='store_true')
@@ -2890,6 +2907,22 @@ def parse_args(argv):
         raise Usage('--ref and --staged are exclusive')
     if args.mode == 'hook' and args.which == 'commit-msg' and not args.message_file:
         raise Usage('hook commit-msg needs the message file')
+    if getattr(args, 'conversation', False):
+        # The flag is scanner wide, not per unit, so a run that mixes a
+        # conversation body with a commit message or a pull request title would
+        # quietly demote the dash and identity rules on those too. Refusing is
+        # the same call --skip-code makes for the same reason.
+        # The COMMIT surfaces only. A pull request title and body are text on a
+        # public thread like an issue or a comment, and when somebody else has
+        # edited them they are judged the same way, so those stay combinable. A
+        # commit message and an author identity are this project's own record
+        # and keep the full hard set, so mixing them in would demote them by a
+        # flag meant for somebody else's prose.
+        for name, opt in (('range', '--range'), ('message_file', '--message-file'),
+                          ('ident_from_git', '--ident-from-git')):
+            if getattr(args, name, None):
+                raise Usage('--conversation is the conversation surface alone and cannot be '
+                            'combined with ' + opt)
     return args
 
 
@@ -2922,7 +2955,8 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
         return run_hook(args, root, env, out, classes, private, kind, refs)
     allow = load_allow(args, root, classes)
     sc = Scanner(args.mode, classes, private, allow, out, args.format, args.hard, args.quiet,
-                 refs=refs, skip_code=bool(getattr(args, 'skip_code', False)))
+                 refs=refs, skip_code=bool(getattr(args, 'skip_code', False)),
+                 conversation=bool(getattr(args, 'conversation', False)))
     t0 = time.time()
     if args.mode == 'messages':
         full_mode = run_messages(sc, git, args, env)
@@ -3127,7 +3161,91 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 226
+EXPECTED_ARMS = 236
+
+
+COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
+
+
+def _conversation_condition(path):
+    """The conversation job's `if:` as one line, read out of the shipped
+    workflow. Restating it in the test would let the two drift apart, which is
+    the whole point of reading it."""
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            m = COND_RX.search(fh.read())
+    except OSError:
+        return None
+    return ' '.join(m.group(1).split()) if m else None
+
+
+def _eval_condition(cond, event, login, body):
+    """Evaluate that condition for one synthetic event. Only the operators AND
+    the context fields the condition uses are implemented, and anything it grows
+    that is not here raises rather than guessing, so the arm fails loudly instead
+    of passing on a condition it did not understand: a new field read as empty
+    would quietly satisfy every case."""
+    if cond is None:
+        raise ValueError('no condition')
+    ctx = {"github.event_name": event,
+           "github.event.comment.user.login": login,
+           "github.event.comment.body": body}
+
+    def atom(tok):
+        tok = tok.strip()
+        if tok.startswith("'") and tok.endswith("'"):
+            return tok[1:-1]
+        if tok in ctx:
+            return ctx[tok]
+        raise ValueError('unknown token %r' % tok)
+
+    def expr(t):
+        t = t.strip()
+        while t.startswith('(') and _matching(t) == len(t) - 1:
+            t = t[1:-1].strip()
+        for op, fn in (('||', any), ('&&', all)):
+            parts = _split_top(t, op)
+            if len(parts) > 1:
+                return fn(expr(p) for p in parts)
+        if t.startswith('!'):
+            return not expr(t[1:])
+        if t.startswith('contains(') and t.endswith(')'):
+            a, b = _split_top(t[len('contains('):-1], ',')
+            return atom(b) in atom(a)
+        for op in ('==', '!='):
+            parts = _split_top(t, op)
+            if len(parts) == 2:
+                eq = atom(parts[0]) == atom(parts[1])
+                return eq if op == '==' else not eq
+        raise ValueError('unsupported expression %r' % t)
+    return expr(cond)
+
+
+def _matching(t):
+    depth = 0
+    for i, ch in enumerate(t):
+        depth += (ch == '(') - (ch == ')')
+        if depth == 0 and ch == ')':
+            return i
+    return -1
+
+
+def _split_top(t, op):
+    out, depth, start, quote, i = [], 0, 0, False, 0
+    while i < len(t):
+        ch = t[i]
+        if ch == "'":
+            quote = not quote
+        elif not quote:
+            depth += (ch == '(') - (ch == ')')
+            if depth == 0 and t.startswith(op, i):
+                out.append(t[start:i])
+                i += len(op)
+                start = i
+                continue
+        i += 1
+    out.append(t[start:])
+    return [o for o in out]
 
 
 def _png(chunks):
@@ -4595,6 +4713,134 @@ def self_test(out, base_env, argv0):
             rc == EXIT_HIT and body is not None and fired == {'home-mac', REF_DEFECT}
             and PLAIN_USER not in body and R_GONE not in body,
             'written=%s fired=%s' % (body is not None, sorted(fired)))
+        # The CONVERSATION surface. A body of nothing but dashes must produce no
+        # finding at all, because a label, an ask and a red run on a
+        # contributor's thread over house style is the guard crying wolf. The
+        # same body still reports, so nothing is hidden, and the same run still
+        # goes hard on a value a reader should not have been shown. The commit
+        # and pull request surfaces are NOT conversation surfaces and keep the
+        # dash rule, which the control below pins.
+        dash_body = 'a range 3' + DASH_EN + '5 and an aside ' + DASH_EM + ' here\n'
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--conversation', '--no-allow'] + mine,
+                        dict(refenv, LG_BODY=dash_body), repo_ref)
+        hcf2 = os.path.join(tmp, 'hard-classes-dash')
+        rc2, lines2 = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                           '--conversation', '--hard-classes-file', hcf2, '--no-allow'] + mine,
+                          dict(refenv, LG_BODY=dash_body), repo_ref)
+        with open(hcf2) as fh:
+            dash_fired = [l.strip() for l in fh if l.strip()]
+        arm('conversation-a-dash-only-body-is-no-finding-no-label-no-ask',
+            rc == EXIT_OK and rc2 == EXIT_OK and not hits(lines)
+            and dash_fired == []
+            and any(ln.startswith('REPORT style-dash issue-body') for ln in lines),
+            'rc=%d fired=%s' % (rc, dash_fired))
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--no-allow'] + mine, dict(refenv, LG_BODY=dash_body), repo_ref)
+        arm('conversation-the-same-body-is-still-hard-on-a-commit-surface',
+            rc == EXIT_HIT and any(c == 'style-dash' for c, p, n in hits(lines)),
+            'rc=%d' % rc)
+        # ... and a value in the same body is still hard WITH --conversation
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
+                         '--conversation', '--no-allow'] + mine,
+                        dict(refenv, LG_BODY=dash_body + 'b ' + P_MAC + PLAIN_USER + '/x\n'
+                             + 'c ' + RO + '/' + R_GONE + '#9\n'), repo_ref)
+        got = set(c for c, p, n in hits(lines))
+        arm('conversation-keeps-the-identity-and-reference-classes-hard',
+            rc == EXIT_HIT and {'home-mac', REF_DEFECT} <= got and 'style-dash' not in got,
+            str(sorted(got)))
+        arm('conversation-hard-set-is-the-identity-classes',
+            CONVERSATION_HARD == IDENTITY_CLASSES
+            and 'style-dash' not in CONVERSATION_HARD
+            and 'overlay-word' not in CONVERSATION_HARD
+            and REF_DEFECT in CONVERSATION_HARD and REF_UNVERIFIED in CONVERSATION_HARD)
+        # Who wrote a conversation body changes nothing about what the scan
+        # finds in it: the scanner is handed text and has no author input at
+        # all, which is the property the workflow relies on when it stopped
+        # skipping bots. These plant the four bodies that decide the surface.
+        home_in_bot = 'a review app wrote this\n' + P_MAC + PLAIN_USER + '/x\n'
+        rc_b, lines_b = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'comment-body',
+                             '--conversation', '--skip-code', '--no-allow'] + mine,
+                            dict(refenv, LG_BODY=home_in_bot), repo_ref)
+        rc_d, lines_d = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'comment-body',
+                             '--conversation', '--skip-code', '--no-allow'] + mine,
+                            dict(refenv, LG_BODY='a review app wrote this ' + DASH_EM + ' twice '
+                                 + DASH_EN + '\n'), repo_ref)
+        rc_h, lines_h = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'comment-body',
+                             '--conversation', '--skip-code', '--no-allow'] + mine,
+                            dict(refenv, LG_BODY='a person wrote ' + RO + '/' + R_GONE + '#9 and '
+                                 + DASH_EM + '\n'), repo_ref)
+        arm('conversation-a-home-path-is-hard-whoever-wrote-the-body',
+            rc_b == EXIT_HIT and any(c == 'home-mac' for c, p, n in hits(lines_b)),
+            'rc=%d' % rc_b)
+        arm('conversation-a-dash-only-body-is-nothing-whoever-wrote-it',
+            rc_d == EXIT_OK and not hits(lines_d), 'rc=%d' % rc_d)
+        arm('conversation-a-reference-beside-dashes-is-hard-and-the-dash-is-not',
+            rc_h == EXIT_HIT and REF_DEFECT in set(c for c, p, n in hits(lines_h))
+            and 'style-dash' not in set(c for c, p, n in hits(lines_h)),
+            str(sorted(set(c for c, p, n in hits(lines_h)))))
+        # The private tier is the highest value tier and the conversation job
+        # always loads it, so the one condition that keeps it hard on a
+        # conversation body gets an arm of its own: without it every private hit
+        # on an issue or a comment demotes to REPORT and the run goes green.
+        rc_p, lines_p = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'comment-body',
+                             '--conversation', '--require-private', '--no-allow'] + mine,
+                            dict(refenv, LG_BODY='seen on ' + PW + ' today\n'), repo_ref)
+        arm('conversation-keeps-the-private-tier-hard',
+            rc_p == EXIT_HIT and any(c.startswith('private#') for c, p, n in hits(lines_p))
+            and not any(PW.lower() in ln.lower() for ln in lines_p),
+            'rc=%d %s' % (rc_p, sorted(set(c for c, p, n in hits(lines_p)))))
+        # The flag is scanner wide, so a run that mixes the conversation surface
+        # with a commit message or a title must refuse rather than demote both.
+        arm('conversation-cannot-be-mixed-with-another-surface',
+            all(run(['messages', '--conversation'] + extra + ['--no-allow'],
+                    refenv, repo_ref)[0] == EXIT_USAGE
+                for extra in (['--range', 'HEAD~1..HEAD'], ['--message-file', pf],
+                              ['--ident-from-git']))
+            # ... and the two combinations the workflow SHIPS are accepted and
+            # behave: the pull request body run and the conversation job's run,
+            # each with the code-span exemption beside the flag. Pinning a
+            # combination nothing ships would pin nothing.
+            and run(['messages', '--conversation', '--skip-code', '--pr-body-env', 'B',
+                     '--hard', REF_UNVERIFIED, '--no-allow'] + mine,
+                    dict(refenv, B='a body ' + P_MAC + PLAIN_USER + '/x and ' + DASH_EM
+                         + '\n'), repo_ref)[0] == EXIT_HIT
+            and run(['messages', '--conversation', '--skip-code', '--body-env', 'B',
+                     '--body-label', 'comment-body', '--no-allow'] + mine,
+                    dict(refenv, B='a comment ' + DASH_EM + '\n'), repo_ref)[0] == EXIT_OK)
+        # The one body the workflow never reads is the guard's own ask. That is
+        # a condition in the shipped YAML, so it is read OUT of the shipped YAML
+        # and evaluated, rather than restated here where it could drift.
+        wf = os.path.join(os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(argv0)), '..', '..')),
+            '.github', 'workflows', 'leak-guard.yml')
+        cond = _conversation_condition(wf) if os.path.isfile(wf) else None
+        cases = [
+            ('the guard reading its own ask', 'issue_comment', 'github-actions[bot]',
+             'please edit\n<!--leak-guard:issue_comment:1:abc-->', False),
+            ('a review app comment', 'issue_comment', 'someapp[bot]', 'a summary ' + DASH_EM,
+             True),
+            ('an app whose login carries no suffix', 'issue_comment', 'someapp',
+             'a summary ' + DASH_EM, True),
+            ('the guard on a body with no marker', 'issue_comment', 'github-actions[bot]',
+             'an ordinary comment ' + DASH_EM, True),
+            ('a person quoting the marker', 'issue_comment', 'someone',
+             'why did it say <!--leak-guard:issue_comment:1:abc-->', True),
+            ('an issue body', 'issues', '', '', True),
+            ('a push', 'push', '', '', False),
+        ]
+        try:
+            got = [(n, _eval_condition(cond, ev, lg, b)) for n, ev, lg, b, _ in cases]
+            why = ''
+        except Exception as exc:
+            # An operator the evaluator does not implement is a condition this
+            # arm cannot vouch for, so it fails and says which, rather than
+            # passing on a reading it did not make or killing the whole suite.
+            got, why = [], 'the condition uses something this arm cannot evaluate: %s' % exc
+        arm('conversation-the-workflow-reads-every-author-but-never-its-own-ask',
+            cond is not None and not why
+            and got == [(n, want) for n, ev, lg, b, want in cases],
+            why or str(got))
         # The code-span exemption is the REFERENCE classes' alone. A host, a
         # login, an address or a private-tier name is as visible to a reader in
         # backticks as in prose, so every other class still reads the body whole.

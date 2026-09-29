@@ -7,17 +7,36 @@ bodies, and the images and clips under `docs/media`. The leak guard is one scann
 names, addresses, home paths, logins, people and location metadata out of all of it.
 It runs in three places: the git hooks on your machine, the `lint` job of the main CI
 workflow, and the `Leak guard` workflow on every pull request, merge queue batch and
-push to `main`, and on every issue and comment body as it is written or edited.
+push to `main`, and on every issue and comment body as it is written or edited. The
+messages job scans in two runs that both always happen and whose results combine: the
+commit range and the pull request title under the full hard set, and the pull request body
+under the conversation hard set.
 
 A body is public the moment it is written and no check runs before it is, so that last
-job cannot block anything. It reads what people write and skips what bots write: a review
-bot quotes example references in its findings, an example has the shape of the thing it is
-an example of, and its text is machine written from a diff the other three jobs already
-gate. On a finding it applies the `leak` label, asks the author once
-to edit the reference out (one ask per body, so an unchanged body is never asked twice),
-and goes red. The label tracks the THREAD: a clean body takes back the ask left for it,
-and the label comes off when the last outstanding ask on that thread is gone, so a clean
-comment cannot clear a label another body still deserves.
+job cannot block anything. It reads EVERY author, bots included. A bot restates a diff and
+quotes what it found, so an address, a home path, a private name or a closed reference
+reaches a public thread through a bot exactly as it does through a person, and both of the
+genuine findings this guard has made were in text a review app wrote. What made bot text
+unbearable was style classes counting as hard on a conversation body, which the narrower
+hard set fixes for every author, so an author rule has nothing left to buy. The one body
+never read is the guard's OWN ask, matched on its account and its marker together, so it
+cannot read itself while a marker pasted by anyone else is scanned like any other text.
+
+A conversation body is also judged by a narrower hard set than a file or a commit message:
+only the identity classes and the two reference classes, the ones whose finding is a value
+a reader should not have been shown. A style class reports there and no more. House style
+is a rule about text this project writes, and a label, an ask and a red run on someone
+else's thread over a dash is the guard crying wolf on a page that leaks nothing.
+
+On a HARD finding, which on that surface means an identity class or a reference class, the
+job applies the `leak` label, asks the author once to edit the text (one ask per body, so
+an unchanged body is never asked twice), and goes red. A style class prints a `REPORT` line
+and does none of the three. The ask names what it found: a value asks to have that value
+taken out, a reference asks for a link anyone can follow in its place.
+
+The label tracks the THREAD: a clean body takes back the ask left for it, and the label
+comes off when the last outstanding ask on that thread is gone, so a clean comment cannot
+clear a label another body still deserves.
 
 ## What it checks
 
@@ -33,9 +52,15 @@ in the tree (new text reuses one of those or a documentation range such as
 name; a personal mail address, or a non-role address at the project domain; a host
 identity field (`uname`, `hostname`, `nodename` and friends) carrying a value; an
 overlay access control tag; the overlay product words in CI files; a reference nobody
-outside this project can open (below); and, as a report-only style class, en and em
-dashes. Placeholders such as `/Users/someone/`, `/home/ubuntu/` and `robot-a.local` are
-published vocabularies, never length rules.
+outside this project can open (below); and a style class, en and em
+dashes, whose severity the SURFACE decides: hard in a guard file, a commit message and a
+pull request title, a report on a CONVERSATION surface. The conversation surfaces are an
+issue body, an issue comment, a pull request review comment, and a pull request BODY. A
+body is there because many hands edit it: a review app appends a summary, the author
+pushes, and what arrives is no longer only the author's writing, so a dash somebody else
+left must not red a required check. A title is not there, because it is the author's own
+and nobody else rewrites it. Placeholders such as `/Users/someone/`, `/home/ubuntu/` and
+`robot-a.local` are published vocabularies, never length rules.
 
 **Private patterns** never ship. They hold the real names: machine hostnames and short
 names, overlay device names, real LAN addresses, logins, people, the private
