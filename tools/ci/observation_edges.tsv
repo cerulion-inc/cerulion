@@ -3,8 +3,9 @@
 # DERIVED: `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` walks
 # every workspace member's `tests/**` and `src/**` and demands this table row
 # for row; `the_committed_observation_edge_table_matches_the_walk` fails on a
-# MISSING row and on a STALE one, printing the rows to add and to delete. `tools/scripts/ci_selected_packages.py
-# --observation-edges` unions the edges into the reverse cargo closure.
+# MISSING row and on a STALE one, printing the rows to add and to delete.
+# `tools/scripts/ci_selected_packages.py --observation-edges` unions the edges
+# into the reverse cargo closure.
 #
 # Columns, tab separated: observing package, observed package, kind, and the
 # source FILE that witnesses the edge. One row per edge; the witness is the

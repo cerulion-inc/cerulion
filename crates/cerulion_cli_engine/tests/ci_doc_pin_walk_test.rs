@@ -3150,7 +3150,7 @@ fn derived_observation_edges() -> Vec<ObservationEdge> {
                 // The witness is the FIRST source, and `first` is decided on
                 // the (path, LINE NUMBER) pair, so line 9 precedes line 10. The
                 // ROW carries the path alone; the line rides along and reaches
-                // the failure message, where a reader opens it.
+                // a MISSING row in the failure message, where a reader opens it.
                 let witness = (source_rel.clone(), line);
                 let key = (package.clone(), observed, kind.to_string());
                 best.entry(key)
@@ -3202,7 +3202,8 @@ fn committed_observation_edges() -> Vec<ObservationEdge> {
 /// count other than four, a field with surrounding whitespace (the failure
 /// message indents the rows it prints by two spaces) or a witness ending in
 /// `:digits` (the line the table does not carry) stops the parse and names the
-/// row. Blank lines and lines opening with `#` are skipped. An empty field
+/// file, the line and the value refused. Blank lines and lines opening with `#`
+/// are skipped. An empty field
 /// passes through to the table comparison, where no derived row matches it;
 /// `ci_selected_packages.py` refuses it outright.
 fn parse_observation_edges(text: &str, path: &Path) -> Vec<ObservationEdge> {
