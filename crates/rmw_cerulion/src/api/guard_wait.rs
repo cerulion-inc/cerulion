@@ -78,8 +78,8 @@
 //! hardware-instantly on the primary topic and within one slice on the
 //! rest; guard/service/client fds wake within one slice. The ladder rung
 //! still bounds every park, so the pump cadence and the idle backoff are
-//! tier-independent. Off Linux the doorbell is a no-op stub
-//! ([`DOORBELL_REAL`]): the park tier never engages and the fd block
+//! tier-independent. Off Linux no ring wakes this park
+//! ([`RING_WAKES_THE_PARK`]): the park tier never engages and the fd block
 //! serves everything — same observable behavior, µs-tier wakes via the
 //! fd instead of ns-tier via the line. rmw publishers open the bell
 //! UNOWNED and never unlink it (a ROS topic is provisioned at two
@@ -1259,11 +1259,15 @@ fn park_horizon_from_env() -> ParkHorizon {
     resolve_park(flag, park_policy())
 }
 
-/// The topic doorbell is REAL only on Linux (`cerulion_core::doorbell` is
-/// a no-op stub elsewhere) — the park tier is gated on it, because a park
-/// whose doorbell can never ring would trade the fd block's instant wake
-/// for a 100 µs recheck cadence and buy nothing.
-const DOORBELL_REAL: bool = cfg!(target_os = "linux");
+/// Does a ring WAKE this wait's park on this target? Only on Linux, where the
+/// CPU monitor-wait primitive the park arms is watching the doorbell line the
+/// ring stores into. macOS maps a real doorbell page and a real wake word, but
+/// this wait has no kernel block on that word, so a park here would trade the
+/// fd block's instant wake for a 100 µs recheck cadence and buy nothing; the
+/// macOS wake-word block is the native live loop's rung
+/// (`cerulion_core::doorbell::wake_word_block_primitive_available`). Every
+/// other target has neither.
+const RING_WAKES_THE_PARK: bool = cfg!(target_os = "linux");
 
 /// The doorbell namespace both sides agree on: the SAME
 /// `default_namespace()` (`$USER`) on the arming side
@@ -2101,10 +2105,10 @@ pub unsafe extern "C" fn rmw_wait(
         // consults it, so the kill-switch path still touches no ladder state.
         let ladder = BLOCK_LADDER;
         // The park tier: the SHARED monitor-wait flag (auto = ON for the
-        // event path), the Linux-real doorbell, and at least one mapped
-        // bell (resolved after the fd/topic snapshot below).
+        // event path), a ring that wakes this park (Linux only), and at least
+        // one mapped bell (resolved after the fd/topic snapshot below).
         let park_policy = park_horizon_from_env();
-        let use_park_cfg = event_wait && DOORBELL_REAL && park_policy != ParkHorizon::NoPark;
+        let use_park_cfg = event_wait && RING_WAKES_THE_PARK && park_policy != ParkHorizon::NoPark;
         // The spin runs ONCE per call, on entry — data is most likely
         // imminent right after the executor finished a callback — and at
         // most ONE recovery spin after an fd wake whose probe found nothing
