@@ -433,10 +433,12 @@ runner minutes of the ones that carry no job-level condition. `crate-tests` and
 `success()` over the whole `needs:` set, GitHub offers no per-dependency form, so both run
 and report through a red `lint` and the dependency buys the ordering alone. It does NOT
 gate the two that set the wall: `test-linux` and
-`test-macos`. Both start at t=0. `test-linux` has no `needs:` at all: each shard builds the
-`cerulion_core` test binaries it runs, so nothing in front of it is a data dependency. A
-`lint` verdict was never a data dependency for either, and while it gated them the wall was
-`lint` plus the longest test job instead of the longest test job.
+`test-macos`. Both are `needs: [changes]` and nothing else, so both start after the
+classifier, which is a checkout and a path classification, about a minute, and no build. No
+REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so nothing
+in front of either job is a data dependency for compilation. A `lint` verdict was never one
+either, and while it gated them the wall was `lint` plus the longest test job instead of the
+longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
 3-way (`[0,1,2]`); both `fail-fast: false`. The macOS count is set from per-step

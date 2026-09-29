@@ -3655,22 +3655,23 @@ fn line_gates_package(line: &str, package: &str) -> bool {
     line.contains(&format!("{SELECTION_GATE_OPEN}{package}'"))
 }
 
-/// Every complaint about a doc-pin marker that does not abut the GATED step it
-/// pins.
+/// The line index of every step a job block opens, at the `steps:` indent.
 ///
-/// A marker beside another step of the same job is enough while nothing is
-/// gated: the job runs the package either way. Once a step is gated on the
-/// selection, the marker is what a path-to-step map reads to decide that THIS
-/// step has to run, and a marker parked beside a different step of the same job
-/// points at the wrong condition.
-///
-/// A marker for a package no step of the job gates is left alone, which is the
-/// state every marker in `ci.yml` was in before the gates existed.
-fn doc_pin_adjacency_complaints(job: &str, block: &str) -> Vec<String> {
-    let lines: Vec<&str> = block.lines().collect();
-    let step_at: Vec<usize> = (0..lines.len())
+/// Spelled once and shared, because the step index is what decides whether this
+/// rule has anything to judge: a block whose steps this reader cannot find has
+/// no gated marker, so every marker passes and the live arm reports a clean
+/// tree it never looked at. The count of gated markers below is read off the
+/// SAME index for that reason.
+fn step_starts_of(lines: &[&str]) -> Vec<usize> {
+    (0..lines.len())
         .filter(|i| lines[*i].starts_with("      - ") && !lines[*i].starts_with("       "))
-        .collect();
+        .collect()
+}
+
+/// Every doc-pin marker of this block whose package is GATED on the selection
+/// by a step of the same job, as `(line index, the marker line, the package)`.
+fn gated_doc_pin_markers(lines: &[&str]) -> Vec<(usize, String, String)> {
+    let step_at = step_starts_of(lines);
     let step_end = |k: usize| -> usize {
         step_at
             .iter()
@@ -3678,7 +3679,6 @@ fn doc_pin_adjacency_complaints(job: &str, block: &str) -> Vec<String> {
             .find(|&j| j > step_at[k])
             .unwrap_or(lines.len())
     };
-
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -3693,9 +3693,37 @@ fn doc_pin_adjacency_complaints(job: &str, block: &str) -> Vec<String> {
             body.iter().any(|l| line_names_package(l, package))
                 && body.iter().any(|l| line_gates_package(l, package))
         });
-        if !gated {
-            continue;
+        if gated {
+            out.push((i, trimmed.to_string(), package.to_string()));
         }
+    }
+    out
+}
+
+/// Every complaint about a doc-pin marker that does not abut the GATED step it
+/// pins.
+///
+/// A marker beside another step of the same job is enough while nothing is
+/// gated: the job runs the package either way. Once a step is gated on the
+/// selection, the marker is what a path-to-step map reads to decide that THIS
+/// step has to run, and a marker parked beside a different step of the same job
+/// points at the wrong condition.
+///
+/// A marker for a package no step of the job gates is left alone, which is the
+/// state every marker in `ci.yml` was in before the gates existed.
+fn doc_pin_adjacency_complaints(job: &str, block: &str) -> Vec<String> {
+    let lines: Vec<&str> = block.lines().collect();
+    let step_at = step_starts_of(&lines);
+    let step_end = |k: usize| -> usize {
+        step_at
+            .iter()
+            .copied()
+            .find(|&j| j > step_at[k])
+            .unwrap_or(lines.len())
+    };
+
+    let mut out = Vec::new();
+    for (i, trimmed, package) in gated_doc_pin_markers(&lines) {
         let abutting = step_at.iter().copied().find(|&j| j > i).filter(|&j| {
             lines[i + 1..j]
                 .iter()
@@ -3708,7 +3736,7 @@ fn doc_pin_adjacency_complaints(job: &str, block: &str) -> Vec<String> {
                 .expect("j is a step start");
             lines[j..step_end(k)]
                 .iter()
-                .any(|l| line_names_package(l, package))
+                .any(|l| line_names_package(l, &package))
         });
         if !names_it {
             out.push(format!(
@@ -3721,18 +3749,45 @@ fn doc_pin_adjacency_complaints(job: &str, block: &str) -> Vec<String> {
     out
 }
 
+/// The floor of gated doc-pin markers the shipped workflow carries.
+///
+/// The rule is satisfied by finding nothing, so the count is asserted beside
+/// it. The step reader keys on the `steps:` indent, so a reindent of the
+/// workflow, or a marker prefix that stops matching, leaves the walk with no
+/// gated marker to judge and every complaint list empty: a clean verdict over a
+/// tree nothing read. A floor turns that into a red.
+///
+/// TWO, derived from the tree rather than guessed: `ci.yml` carries eighteen
+/// doc-pin markers and two of them pin a step gated on the selection,
+/// `rmw_cerulion` and `native_ros2_messages`, both in `test-linux`. Every other
+/// marker pins a step gated on `matrix.shard` alone, or on nothing, and owes no
+/// adjacency.
+const GATED_DOC_PIN_MARKER_FLOOR: usize = 2;
+
 /// The live workflow: every gated step's doc-pin marker abuts it.
 #[test]
 fn a_gated_steps_doc_pin_marker_abuts_the_step_it_pins() {
     let text = ci_workflow_text();
     let mut complaints = Vec::new();
+    let mut judged = 0usize;
     for (job, block) in jobs_of(&text) {
+        let lines: Vec<&str> = block.lines().collect();
+        judged += gated_doc_pin_markers(&lines).len();
         complaints.extend(doc_pin_adjacency_complaints(&job, &block));
     }
     assert!(
         complaints.is_empty(),
         "doc-pin markers beside gated steps are in the wrong place:\n{}",
         complaints.join("\n")
+    );
+    assert!(
+        judged >= GATED_DOC_PIN_MARKER_FLOOR,
+        "the walk judged {judged} gated doc-pin marker(s) and the workflow \
+         carries at least {GATED_DOC_PIN_MARKER_FLOOR}. An EMPTY set is not a \
+         clean tree: this reader finds a step by its `steps:` indent and a \
+         marker by its prefix, so a reindent or a renamed prefix leaves it \
+         nothing to judge and every complaint list empty. Re-derive the floor \
+         only when the workflow really loses gated steps."
     );
 }
 

@@ -19,7 +19,10 @@ THE ESCAPE HATCH. A line that legitimately needs one, a code span quoting text
 that carries a dash or a test fixture that must contain one, carries the marker
 `dash-ok` on that same line, spelled as a comment in whatever syntax the file
 uses (`# dash-ok`, `// dash-ok`, `<!-- dash-ok -->`). Per LINE, never per file:
-a file-level waiver would exempt every line added to it afterwards.
+a file-level waiver would exempt every line added to it afterwards. INSIDE the
+comment, and enforced: the marker in a string literal, a data column or a
+heading is text the change ships rather than a decision its author recorded, and
+a file type with no comment syntax at all (`.json`) has no waiver.
 
 WHAT IT READS. `git diff <base>...HEAD` with the three-dot spelling, which
 diffs against the MERGE BASE of `<base>` and HEAD. Two dots would report every
@@ -66,6 +69,76 @@ BANNED = (("U+2014", EM_DASH), ("U+2013", EN_DASH))
 # The per-line waiver. Spelled once so the self-test and the scanner cannot
 # drift apart.
 DASH_OK_MARKER = "dash-ok"
+
+# THE COMMENT SYNTAX THE WAIVER HAS TO SIT IN, by file extension.
+#
+# The marker is a decision its author RECORDED, so it belongs in a comment. As a
+# bare substring of the line it also fired from a string literal, a data column
+# or a heading, which is shipped text rather than a decision: a `.tsv` row or a
+# Rust string carrying the words `dash-ok` waived a dash nobody had ruled on.
+#
+# An extension this table does not name has NO waiver: a `.json` line that needs
+# a dash has nowhere to put a comment, and accepting the token anywhere is the
+# rule this replaces. A path with NO extension is read as shell, which is what
+# the extensionless hooks under `tools/hooks` are.
+#
+# The reader does not tokenise strings, so an opener spelled EARLIER in a string
+# literal on the same line is read as opening a comment. That is a named
+# limitation and it is strictly narrower than accepting the token anywhere: the
+# author has to write a comment opener in front of the marker either way.
+COMMENT_OPENERS = {
+    "py": ("#",),
+    "sh": ("#",),
+    "bash": ("#",),
+    "zsh": ("#",),
+    "yml": ("#",),
+    "yaml": ("#",),
+    "toml": ("#",),
+    "txt": ("#",),
+    "tsv": ("#",),
+    "rs": ("//", "/*"),
+    "c": ("//", "/*"),
+    "h": ("//", "/*"),
+    "cpp": ("//", "/*"),
+    "hpp": ("//", "/*"),
+    "js": ("//", "/*"),
+    "ts": ("//", "/*"),
+    "md": ("<!--",),
+    "html": ("<!--",),
+    "xml": ("<!--",),
+    "sql": ("--",),
+    "lua": ("--",),
+    "ini": (";",),
+    "cfg": (";",),
+}
+
+# What a path with no extension is read as.
+SHELL_OPENERS = ("#",)
+
+
+def comment_openers_for(path):
+    """The comment openers this path's file type uses, empty for no waiver."""
+    name = path.rsplit("/", 1)[-1]
+    if "." not in name:
+        return SHELL_OPENERS
+    return COMMENT_OPENERS.get(name.rsplit(".", 1)[-1].lower(), ())
+
+
+def waived(path, text):
+    """Does this added line carry the waiver INSIDE a comment?
+
+    The marker has to follow a comment opener the file type uses. The first
+    opener on the line is the one that counts: everything after it is comment as
+    far as this reader can tell.
+    """
+    at = text.find(DASH_OK_MARKER)
+    if at < 0:
+        return False
+    for opener in comment_openers_for(path):
+        opened = text.find(opener)
+        if 0 <= opened < at:
+            return True
+    return False
 
 DEFAULT_BASE = "origin/main"
 
@@ -151,7 +224,7 @@ def offending_lines(diff_text):
     """Every added line carrying a banned dash without the per-line waiver."""
     out = []
     for path, number, text in added_lines(diff_text):
-        if DASH_OK_MARKER in text:
+        if waived(path, text):
             continue
         found = [name for name, ch in BANNED if ch in text]
         if found:
@@ -159,20 +232,35 @@ def offending_lines(diff_text):
     return out
 
 
+def decode_diff(raw):
+    """A diff's bytes as text, whatever bytes they are.
+
+    BYTES, DECODED HERE, never `text=True`. A diff can carry a line that is not
+    valid UTF-8: a source file in another encoding, a binary hunk git spelled as
+    text, a pasted byte. `text=True` decodes with the locale codec and raises
+    `UnicodeDecodeError`, which is neither `DiffError` nor `OSError`, so the gate
+    died with a traceback instead of reporting. `surrogateescape` keeps every
+    byte, so the scan still reads every other line and still names the dash on
+    it: an undecodable byte on one line is not a reason to stop reading the
+    diff, and it is not a pass either.
+    """
+    return raw.decode("utf-8", errors="surrogateescape")
+
+
 def git_diff(base, repo):
     """`git diff <base>...HEAD` in `repo`, as text."""
     command = ["git", "diff", "--no-color", "%s...HEAD" % base]
     try:
-        completed = subprocess.run(
-            command, cwd=repo, capture_output=True, text=True, check=False)
+        completed = subprocess.run(command, cwd=repo, capture_output=True, check=False)
     except OSError as error:
         raise DiffError("check_added_lines: cannot run git: %r" % error)
     if completed.returncode != 0:
         raise DiffError(
             "check_added_lines: `%s` failed in %s (exit %d): %s; fetch the base "
             "ref before running this gate"
-            % (" ".join(command), repo, completed.returncode, completed.stderr.strip()))
-    return completed.stdout
+            % (" ".join(command), repo, completed.returncode,
+               decode_diff(completed.stderr).strip()))
+    return decode_diff(completed.stdout)
 
 
 def report(offenders, where):
@@ -224,6 +312,17 @@ def self_test():
         if not ok:
             failures.append("%s %s" % (name, detail))
 
+    def silently(thunk):
+        """Run `thunk` with both streams parked, and return what it returned."""
+        parked = open(os.devnull, "w", encoding="utf-8")
+        out, err = sys.stdout, sys.stderr
+        try:
+            sys.stdout, sys.stderr = parked, parked
+            return thunk()
+        finally:
+            sys.stdout, sys.stderr = out, err
+            parked.close()
+
     # A planted dash on an ADDED line fails, in every file type the tree
     # carries, and each type is spelled with its own comment syntax so the
     # rows say what the answer is rather than sharing one fixture.
@@ -268,6 +367,51 @@ def self_test():
     got = offending_lines(neighbour)
     arm("a-waiver-covers-only-its-own-line", len(got) == 1 and got[0][1] == 2,
         "-> %r" % (got,))
+
+    # THE WAIVER HAS TO SIT IN A COMMENT, in the syntax the file type uses. Each
+    # row is the same sentence twice: once with the marker behind that type's
+    # comment opener, once with the same token in a string literal or a data
+    # column, where it records no decision and waives nothing.
+    for path, commented, in_content in (
+        ("docs/planted.md",
+         "+A span `a %s b` <!-- %s -->",
+         "+A heading about the %s and the word %s"),
+        ("crates/cerulion_core/src/planted.rs",
+         "+let s = \"plain\"; // a span a %s b, %s",
+         "+let s = \"a span a %s b, %s\";"),
+        ("tools/scripts/planted.py",
+         "+VALUE = 1  # a span a %s b, %s",
+         "+VALUE = \"a span a %s b, %s\""),
+        ("tools/ci/planted.tsv",
+         "+# a span a %s b, %s",
+         "+column\ta span a %s b\t%s"),
+        ("db/planted.sql",
+         "+SELECT 1; -- a span a %s b, %s",
+         "+INSERT INTO t VALUES ('a span a %s b, %s');"),
+        ("tools/planted.cfg",
+         "+key = 1  ; a span a %s b, %s",
+         "+key = a span a %s b, %s"),
+    ):
+        kind = path.rsplit(".", 1)[-1]
+        inside = _hunk(path, [commented % (EM_DASH, DASH_OK_MARKER)])
+        arm("a-%s-waiver-inside-a-comment-passes" % kind,
+            offending_lines(inside) == [], "-> %r" % (offending_lines(inside),))
+        outside = _hunk(path, [in_content % (EM_DASH, DASH_OK_MARKER)])
+        arm("a-%s-marker-outside-a-comment-waives-nothing" % kind,
+            len(offending_lines(outside)) == 1, "-> %r" % (offending_lines(outside),))
+
+    # A FILE TYPE WITH NO COMMENT SYNTAX HAS NO WAIVER: there is nowhere to put
+    # the marker, so accepting it anywhere on the line is the rule this replaces.
+    json_line = _hunk("tools/ci/planted.json",
+                      ["+  \"note\": \"a span a %s b, %s\"" % (EM_DASH, DASH_OK_MARKER)])
+    arm("a-file-type-with-no-comment-syntax-has-no-waiver",
+        len(offending_lines(json_line)) == 1, "-> %r" % (offending_lines(json_line),))
+    # And a path with NO extension is read as shell, which is what the
+    # extensionless hooks are.
+    hook = _hunk("tools/hooks/pre-commit",
+                 ["+true  # a span a %s b, %s" % (EM_DASH, DASH_OK_MARKER)])
+    arm("an-extensionless-path-waives-behind-a-hash",
+        offending_lines(hook) == [], "-> %r" % (offending_lines(hook),))
 
     # Both dashes, named separately, so a rule that lost one is not hidden by
     # the other.
@@ -410,6 +554,40 @@ def self_test():
     arm("a-deletion-only-diff-is-clean-and-not-a-refusal",
         offending_lines(deletion) == [], "-> %r" % (offending_lines(deletion),))
 
+    # AN UNDECODABLE BYTE IS NOT A REASON TO STOP READING. A diff can carry a
+    # line that is not valid UTF-8, and `text=True` raised `UnicodeDecodeError`
+    # out of the reader, past a handler that catches only `DiffError` and
+    # `OSError`: the gate died with a traceback rather than reporting. The bytes
+    # are decoded with `surrogateescape` instead, so the dash on ANOTHER line is
+    # still found and `report()` still returns an exit code.
+    raw = _hunk("docs/planted.md",
+                [" keep",
+                 "+A latin-1 byte: BYTE here.",
+                 "+A sentence %s here." % EM_DASH]).encode("utf-8")
+    planted = raw.replace(b"BYTE", b"\xe9")
+    try:
+        got = offending_lines(decode_diff(planted))
+    except UnicodeDecodeError as error:
+        arm("an-undecodable-byte-on-another-line-still-reports-the-dash", False,
+            "-> the reader raised %r instead of reading the diff" % (error,))
+    else:
+        arm("an-undecodable-byte-on-another-line-still-reports-the-dash",
+            [(p, n, w) for p, n, w, _ in got] == [("docs/planted.md", 3, "U+2014")],
+            "-> %r" % (got,))
+    # And the WHOLE command line over that diff returns an exit code rather
+    # than raising: the handler in `run()` catches `DiffError` and `OSError`, so
+    # a decode that raised anything else came out as a traceback.
+    with tempfile.TemporaryDirectory() as scratch:
+        undecodable = os.path.join(scratch, "undecodable.diff")
+        with open(undecodable, "wb") as handle:
+            handle.write(planted)
+        try:
+            code = silently(lambda: run(["--diff", undecodable]))
+        except UnicodeDecodeError as error:
+            code = "raised %r" % (error,)
+    arm("the-command-line-over-an-undecodable-diff-returns-an-exit-code",
+        code == 1, "-> %r" % (code,))
+
     # THE REAL GIT ARM. Everything above is a hand-written diff; this one
     # proves the parser reads the format git actually writes, and that the
     # three-dot spelling reports only what THIS branch added.
@@ -484,8 +662,9 @@ def run(argv):
 
     try:
         if args.diff:
-            text = sys.stdin.read() if args.diff == "-" else open(
-                args.diff, encoding="utf-8").read()
+            raw = (sys.stdin.buffer.read() if args.diff == "-"
+                   else open(args.diff, "rb").read())
+            text = decode_diff(raw)
             where = args.diff
         else:
             text = git_diff(args.base, args.repo)

@@ -299,6 +299,13 @@ shard_filterset_terms() {
 # WHOLE TOKEN, quotes included, which is what keeps `cerulion_viz` and
 # `cerulion_vizd` apart: a bare substring test would report `cerulion_viz`
 # selected by an array holding only `cerulion_vizd`.
+#
+# READABLE MEANS A JSON ARRAY OF QUOTED NAMES, not merely a bracketed string.
+# `[cerulion_bag]` reads as a selection under a brackets-only test and holds no
+# quoted name, so the shard SKIPPED on a value no producer emits and no reader
+# can parse, which is the one direction this function is documented never to
+# take. Every shape below that is not `[]` or `["a"]` or `["a","b"]` is
+# unreadable and RUNS.
 selection_holds() {
     # $1 is the package this shard runs, $2 the selection.
     case "$2" in
@@ -306,10 +313,40 @@ selection_holds() {
         \[*\]) ;;
         *) return 0 ;;
     esac
-    case "$2" in
-        *"\"$1\""*) return 0 ;;
-    esac
-    return 1
+    _sel_inner=${2#\[}
+    _sel_inner=${_sel_inner%\]}
+    _sel_found=1
+    _sel_rest=$_sel_inner
+    while [ -n "$_sel_rest" ]; do
+        _sel_tok=${_sel_rest%%,*}
+        case "$_sel_rest" in
+            *,*) _sel_rest=${_sel_rest#*,} ;;
+            *)   _sel_rest= ;;
+        esac
+        # JSON puts optional whitespace around a value, so the token is trimmed
+        # before it is judged: a producer that starts writing `["a", "b"]` must
+        # not silently stop being readable.
+        while :; do
+            case "$_sel_tok" in
+                " "*)  _sel_tok=${_sel_tok# } ;;
+                *" ")  _sel_tok=${_sel_tok% } ;;
+                *)     break ;;
+            esac
+        done
+        # A QUOTED NAME, and nothing else: opening and closing quote, at least
+        # one character between them, and no quote inside.
+        case "$_sel_tok" in
+            '"'*'"') ;;
+            *) return 0 ;;
+        esac
+        _sel_name=${_sel_tok#\"}
+        _sel_name=${_sel_name%\"}
+        case "$_sel_name" in
+            ''|*'"'*) return 0 ;;
+        esac
+        [ "$_sel_name" != "$1" ] || _sel_found=0
+    done
+    return "$_sel_found"
 }
 
 # The hand table `--check` holds `selection_holds` to.
@@ -317,6 +354,13 @@ selection_holds() {
 # `<package>|<selection>|<runs>`. Written out rather than generated: the rows
 # say what the answer IS, so a reader that changed its mind fails here instead
 # of agreeing with itself.
+#
+# THE MALFORMED ROWS PAIR WITH A WELL-FORMED SKIP, and the pair differs only in
+# the quoting: `["cerulion_bag"]` is readable and skips `cerulion_core`, while
+# `[cerulion_bag]` is not a JSON array of quoted names, so it is unreadable and
+# RUNS. `[cerulion_core]` is the same shape naming the package itself, so the
+# answer cannot come from a match. The spaced rows say the trimming is real in
+# both directions.
 SELECTION_CASES='
 cerulion_core|["cerulion_core"]|yes
 cerulion_core|["cerulion_bag","cerulion_core"]|yes
@@ -325,6 +369,13 @@ cerulion_core|[]|no
 cerulion_core||yes
 cerulion_core|all|yes
 cerulion_core|not json|yes
+cerulion_core|[cerulion_bag]|yes
+cerulion_core|[cerulion_core]|yes
+cerulion_core|["cerulion_bag]|yes
+cerulion_core|[cerulion_bag,"cerulion_core"]|yes
+cerulion_core|[""]|yes
+cerulion_core|["cerulion_bag", "cerulion_viz"]|no
+cerulion_core|["cerulion_bag", "cerulion_core"]|yes
 cerulion_viz|["cerulion_viz"]|yes
 cerulion_viz|["cerulion_vizd"]|no
 cerulion_vizd|["cerulion_viz"]|no
