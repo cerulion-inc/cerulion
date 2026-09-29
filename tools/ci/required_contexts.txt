@@ -9,7 +9,8 @@
 # crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs reads this file and
 # holds every job that reports one of these names to the rules that stop a
 # skipped run from reading as a satisfied context. Comparing this file against
-# what the forge holds is the enqueue waiter's job, not that test's.
+# those two settings on GitHub happens outside that test, before a pull request
+# enters the merge queue.
 Crate tests (macos-latest)
 Crate tests (ubuntu-latest)
 Demo workspace (examples/go2)

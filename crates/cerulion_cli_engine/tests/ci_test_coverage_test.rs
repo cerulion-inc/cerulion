@@ -4316,8 +4316,9 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
 ///
 /// The file mirrors two settings, the branch protection of `main` and the merge
 /// queue ruleset, and its own header carries the command that regenerates it.
-/// Comparing it against what the forge holds is the enqueue waiter's job; this
-/// walk reads the file and holds the workflows to it.
+/// Comparing this file against those two settings on GitHub happens outside
+/// this test, before a pull request enters the merge queue; this walk reads the
+/// file and holds the workflows to it.
 const REQUIRED_CONTEXTS_FILE: &str = "tools/ci/required_contexts.txt";
 
 /// How many names that export carries.
@@ -4679,8 +4680,9 @@ fn event_name_equality(term: &str) -> Result<String, String> {
 /// `github.event_name == '<event>'` admits those events, and an `&&` chain of
 /// such disjunctions admits their intersection. EVERYTHING ELSE is an `Err` and
 /// the caller treats it as admitting no event, which is the fail-closed
-/// direction: `github.actor != 'nobody'` is false on any event whatever the
-/// workflow triggers on. A condition this reader has not been taught costs a
+/// direction: nothing in `github.actor != 'nobody'` tells this walk that the
+/// job runs on a given event, so it proves none of them. A condition this
+/// reader has not been taught costs a
 /// maintainer one line here rather than costing a required context its meaning,
 /// and the complaint says which of the two it is.
 fn events_a_condition_allows(expr: &str) -> Result<BTreeSet<String>, String> {

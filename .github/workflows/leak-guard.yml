@@ -221,8 +221,10 @@ jobs:
               # event's base is an ancestor of the first parent. Both hold or
               # the fetched pair is what the scan reads. Either spelling reaches
               # the scanner as the pair A and B and walks the commits reachable
-              # from B and not from A, so the fallback names the same commits
-              # the fast path does.
+              # from B and not from A: the fast path walks what the head carries
+              # and the merge ref's first parent does not, the fallback what the
+              # head carries and the event's base does not, and the two are the
+              # same commits where that first parent IS the event's base.
               h1=$(git rev-parse -q --verify 'HEAD^1' || echo none)
               h2=$(git rev-parse -q --verify 'HEAD^2' || echo none)
               echo "merge ref parents: $h1 $h2; head sha: $HEAD_SHA"

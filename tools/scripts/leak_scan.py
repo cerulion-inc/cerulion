@@ -4856,11 +4856,16 @@ def self_test(out, base_env, argv0):
             # arm cannot vouch for, so it fails and says which, rather than
             # passing on a reading it did not make or killing the whole suite.
             got, why = [], 'the condition uses something this arm cannot evaluate: %s' % exc
+        if triggers is None:
+            detail = 'the `on:` block of %s could not be read' % os.path.basename(wf)
+        elif triggers != want_triggers:
+            detail = 'triggers %s' % sorted(triggers)
+        else:
+            detail = why or str(got)
         arm('conversation-the-workflow-reads-every-author-but-never-its-own-ask',
             cond is not None and not why and triggers == want_triggers
             and got == [(n, want) for n, ev, lg, b, want in cases],
-            why or ('triggers %s' % sorted(triggers) if triggers != want_triggers
-                    else str(got)))
+            detail)
         # The code-span exemption is the REFERENCE classes' alone. A host, a
         # login, an address or a private-tier name is as visible to a reader in
         # backticks as in prose, so every other class still reads the body whole.
