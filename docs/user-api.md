@@ -67,7 +67,16 @@ not create one.
 | Command | Effect |
 |---|---|
 | `workspace create <NAME>` | New workspace under `./<NAME>/` (Cargo workspace + `graphs/`, `nodes/`, `schemas/`, `.cargo/config.toml`). |
+| `workspace create <NAME> --starter obstacle_avoidance` | Complete bundled scanner/controller workspace for this CLI version, including source tests and a graph. Atomic installation on Linux and macOS refuses every existing path, including symlinks. |
 | `workspace init [LOCATION]` | Initialize the current (or given) directory as a workspace in place. |
+
+The starter option is absent from the public 1.0.0 binaries; inspect
+`cerulion workspace create --help` before using it. Starter sources are embedded
+in the CLI, so acquisition works offline without GitHub access. Dependencies
+follow the same checkout-or-exact-registry selection as an empty workspace.
+`starter.toml` records the selected source name, CLI version and full compiler
+fingerprint. The generated README shows both the included graph and explicit
+create/stage/wire commands. The name must be a single directory name.
 
 For a CLI built with a stable Rust release, both commands write
 `rust-toolchain.toml` naming that release and the minimal profile, but only when

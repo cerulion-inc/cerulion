@@ -987,6 +987,26 @@ including filesystems without hard-link support; never fall back to overwriting.
 selection, including environment and project configuration overrides. The built
 cdylib must match the host's full compiler fingerprint, checked at load before init.
 
+### Bundled starters
+
+`workspace create NAME --starter obstacle_avoidance` calls `starter.rs`.
+Its source payload lives under the engine's `src/starters/` so registry packages
+carry every embedded file. Node manifests use a `.txt` suffix in the payload to
+avoid nested-package exclusions; installed files retain their Cargo names.
+The source-sync test compares every node and graph file with the canonical
+example. `starter.toml` records the CLI version and full compiler requirements;
+normal workspace dependency/toolchain selection still applies.
+
+Stage a complete sibling directory with private permissions, then publish with
+rustix `RenameFlags::NOREPLACE`: Linux `renameat2` or macOS `renameatx_np`.
+Never replace an empty directory or dangling symlink. Construct the cleanup
+guard only after mkdir succeeds and disarm it immediately after rename succeeds.
+Population or publication errors clean up only this call's staging tree and
+leave no partial destination. Other platforms refuse atomic publication.
+The engine tests pin collisions, racing destinations, staging ownership,
+source determinism and both error paths; `starter_cli_test` pins the command,
+unknown-value refusal and unchanged manual creation through the real binary.
+
 ## 12. The login gate
 
 Every command runs under a logged-in-ever identity. `command_needs_identity` in
