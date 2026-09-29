@@ -861,7 +861,8 @@ jobs:
       # to find the name takes whichever line comes first. Any defect of that
       # file is exit 3. Every mention is then matched past case, a comma, one
       # hard wrap and the suffix family, and anything not byte identical is a
-      # finding; a third-party holder never carries the name.
+      # finding; a third-party holder is a candidate only where it shares the
+      # name's first word.
       #
       # It reads data files beside it: an allow list whose entries name
       # one finding each and FAIL when stale, a phrase list of claims the

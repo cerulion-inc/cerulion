@@ -51,11 +51,17 @@ PICTOGRAPH_RE = re.compile(
 # reordering, a translated line or a deleted line hands it a vendor's name and
 # it goes on policing that, green. Declared inputs, parsed outputs.
 ENTITY_FILE = "tools/scripts/public_surface_entity.txt"
+LEGAL_NAME_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 &.,-'/")
 # The suffix family. `Co.` carries its period, because a bare `Co` matches the
 # first half of a hyphenated word. The trailing guard is what keeps `Inc` out of
 # `Incidentally`; the order of the alternatives is cosmetic, since the guard
 # forces the backtrack either way.
-LEGAL_SUFFIX = r"(?:Incorporated|Inc\.?|Corporation|Corp\.?|Limited|Ltd\.?|LLC|GmbH|Co\.)(?![A-Za-z])"
+LEGAL_SUFFIX_WORDS = ("Incorporated", "Inc.", "Corporation", "Corp.", "Limited", "Ltd.", "LLC", "GmbH", "Co.")
+# Built FROM the list above, so the family a message names is the family the
+# pattern matches. A period is optional wherever the short form takes one.
+LEGAL_SUFFIX = (r"(?:" + "|".join(re.escape(w).replace(r"\.", r"\.?") if w.endswith(".") and w != "Co."
+                                  else re.escape(w) for w in LEGAL_SUFFIX_WORDS) + r")(?![A-Za-z])")
 # What may stand between the words of a mention: spaces (a no-break space among
 # them, which a typesetter inserts and a reader cannot see), a comma, or ONE
 # line break with the prefix a wrapped line carries. The prefix set is every
@@ -66,7 +72,7 @@ LEGAL_SUFFIX = r"(?:Incorporated|Inc\.?|Corporation|Corp\.?|Limited|Ltd\.?|LLC|G
 # one mention.
 LEGAL_SPACE = r"[ \t\u00a0\u202f]"
 LEGAL_GAP = (r"(?:" + LEGAL_SPACE + r"+|" + LEGAL_SPACE + r"*," + LEGAL_SPACE + r"*|"
-             + LEGAL_SPACE + r"*,?" + LEGAL_SPACE + r"*\r?\n" + LEGAL_SPACE + r"*(?:[>#*/!|;%-]+" + LEGAL_SPACE + r"*)?)")
+             + LEGAL_SPACE + r"*,?" + LEGAL_SPACE + r"*\r?\n" + LEGAL_SPACE + r"*(?:[>#*/!;%]+" + LEGAL_SPACE + r"*)?)")
 
 ALLOW_FILE = "tools/scripts/public_surface_allow.txt"
 PHRASES_FILE = "tools/scripts/public_surface_phrases.txt"
@@ -719,17 +725,25 @@ def legal_name(root):
         raise CannotRun("%s declares no name: one line holding the legal name, and comments" % ENTITY_FILE)
     if len(lines) > 1:
         raise CannotRun("%s declares %d names: the legal name is ONE line, so a second is a name nobody chose between" % (ENTITY_FILE, len(lines)))
+    if not lines[0]:
+        raise CannotRun("%s declares an empty name" % ENTITY_FILE)
     if lines[0] != lines[0].strip():
         raise CannotRun("%s declares a name with leading or trailing whitespace: the comparison is byte for byte, so the spelling must be exact" % ENTITY_FILE)
-    # A character a reader cannot see is the one defect the matchability check
-    # below cannot catch: the declaration matches ITSELF, and every mention
-    # written the visible way then fails to match at all, so the class reads
-    # green over a tree where nothing is checked.
+    # WHAT A NAME MAY HOLD, listed positively. A character a reader cannot see
+    # is the one defect the matchability check below cannot catch: the
+    # declaration matches ITSELF, and every mention written the visible way then
+    # fails to match, so the class reads green over an unchecked tree. Listing
+    # the invisible characters to refuse is unbounded (a combining mark, a
+    # variation selector, a filler letter and a homoglyph are all invisible or
+    # indistinguishable and live in four different categories), so this lists
+    # what a name MAY hold instead. A name outside it is refused loudly, and a
+    # project whose name needs more can widen this line deliberately.
     for c in lines[0]:
-        if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") or (unicodedata.category(c) == "Zs" and c != " "):
-            raise CannotRun("%s declares a name holding %s, which a reader cannot see: every mention written the "
-                            "visible way would stop matching and the class would read green over an unchecked tree"
-                            % (ENTITY_FILE, "U+%04X" % ord(c)))
+        if c not in LEGAL_NAME_CHARS:
+            raise CannotRun("%s declares a name holding %s, which is outside the characters a declared name may "
+                            "hold (letters A to Z, digits, space, and & . , - ' /): a character a reader cannot "
+                            "see, or cannot tell from another, would leave every mention unmatched and the class "
+                            "green over an unchecked tree" % (ENTITY_FILE, "U+%04X" % ord(c)))
     return lines[0]
 
 
@@ -750,16 +764,25 @@ def legal_name_mentions(canonical):
     head = re.escape(words[0])
     interior = ""
     if len(words) > 1:
-        interior = (r"(?:" + LEGAL_GAP + r"(?:" + "|".join(re.escape(w) for w in words[1:]) + r")){0,%d}?" % len(words[1:]))
+        # GREEDY: the longest run of the name's own words before a suffix is the
+        # mention. Lazy would stop at the first word that happens to be a suffix,
+        # so a name of the `Acme Robotics Co., Ltd.` shape would match its own
+        # head and report its own correct spelling as wrong.
+        interior = (r"(?:" + LEGAL_GAP + r"(?:" + "|".join(re.escape(w) for w in words[1:]) + r")){0,%d}" % len(words[1:]))
     return re.compile(r"(?i)\b" + head + interior + LEGAL_GAP + LEGAL_SUFFIX)
 
 
 def visible(text):
     """`text` with every character a reader cannot see written out, so a message
-    never prints two strings that differ and look identical."""
+    never prints two strings that differ and look identical. The declared name
+    is printable ASCII by LEGAL_NAME_CHARS, so passing IT through here is
+    provably the identity today; it stays because the set is one line and a
+    project that widens it should not have to remember this call site."""
     out = []
     for c in text:
-        if " " <= c <= "~":
+        if c == "\\":
+            out.append("\\\\")
+        elif " " <= c <= "~":
             out.append(c)
         elif c == "\n":
             out.append("\\n")
@@ -767,6 +790,8 @@ def visible(text):
             out.append("\\t")
         elif c == "\r":
             out.append("\\r")
+        elif ord(c) > 0xFFFF:
+            out.append("\\U%08x" % ord(c))
         else:
             out.append("\\u%04x" % ord(c))
     return "".join(out)
@@ -780,10 +805,17 @@ def legal_name_mentions_checked(canonical):
     inside the name, a byte-order mark, a name with no suffix the family knows,
     and a name longer than the pattern can span all land here."""
     rx = legal_name_mentions(canonical)
-    if not rx.fullmatch(canonical):
-        raise CannotRun("%s declares `%s`, which the rule that looks for it cannot match: check it for an invisible "
-                        "character and for a suffix the rule knows (%s)"
-                        % (ENTITY_FILE, canonical, "Incorporated, Inc, Corporation, Corp, Limited, Ltd, LLC, GmbH, Co."))
+    # Proved with the operation the rule PERFORMS. `fullmatch` would accept a
+    # declaration whose own text the scan reads as a SHORTER mention, and the
+    # class would then report the declared spelling as wrong on every page.
+    found = [m.group(0) for m in rx.finditer(canonical)]
+    if found != [canonical]:
+        raise CannotRun("%s declares `%s`, which the rule that looks for it reads as %s: a name the rule cannot find "
+                        "whole would make the class refuse its own spelling. Check it for a suffix inside the name "
+                        "and for a suffix the rule knows (%s)"
+                        % (ENTITY_FILE, visible(canonical),
+                           ("nothing" if not found else ", ".join("`%s`" % visible(f) for f in found)),
+                           ", ".join(LEGAL_SUFFIX_WORDS)))
     return rx
 
 
@@ -801,6 +833,11 @@ def legal_name_findings(root, files, canonical):
             continue
         for m in rx.finditer(txt):
             if m.group(0) == canonical:
+                continue
+            # ONE line break to a mention. Two means the words came off separate
+            # lines of a list or a table, which is several mentions of nothing
+            # rather than one wrapped mention.
+            if m.group(0).count("\n") > 1:
                 continue
             findings.append(Finding("shipped-text", f, line_of(txt, m.start()),
                                     "the legal name reads `%s` here and `%s` in %s: one spelling everywhere"
@@ -1676,7 +1713,9 @@ def build_fixture(root):
     _put(root, "README.md", FIXTURE_README
          + "\nPublished by Acme Systems Inc., and by The Acme Systems Inc., the same name with a word in front.\n"
          + "ACME SYSTEMS INC. shouts it, while MyAcme Systems, Inc. and Acme Systems Incidentally are other words.\n"
-         + "\nAcme Systems\n\nIncorporated feedback shaped the API: a blank line ends the sentence.\n")
+         + "\nAcme Systems\n\nIncorporated feedback shaped the API: a blank line ends the sentence.\n"
+         + "Acme Systems Co-operative is another word, Acme works with Foo Inc. is two companies,\n"
+         + "and Acme Robotics Systems Inc. adds a word the name does not have.\n")
     _put(root, "CITATION.cff",
          'cff-version: 1.2.0\nauthors:\n  - name: "Acme Systems, Inc. and contributors"\n')
     # OUTSIDE the four files the old rule read: the scan is the shipped set now.
@@ -1688,7 +1727,13 @@ def build_fixture(root):
     # The suffixes no other fixture reaches, one per line.
     _put(root, "docs/legal/AUTHORS",
          "Acme Systems Incorporated\nAcme Systems Corporation\nAcme Systems Limited\n"
-         "Acme Systems GmbH\nAcme Systems Co.\n")
+         "Acme Systems GmbH\nAcme Systems Co.\n"
+         # the short forms without their period, and a no-break space no reader sees
+         "Acme Systems Inc\nAcme\u00a0Systems Inc.\n"
+         # a wrap behind a quote marker and behind a hash, the two prefixes no
+         # other fixture reaches
+         "> Acme\n> Systems Ltd.\n"
+         "# Acme\n# Systems Corp.\n")
     # A HARD WRAP inside the NAME, which a pattern joining the name words with a
     # plain space would not see.
     _put(root, ".github/CLA/individual.md", "# Agreement\n\nThis agreement is with Acme\nSystems Inc. and nobody else.\n")
@@ -1795,6 +1840,10 @@ EXPECTED = [
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Limited` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems GmbH` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Co.` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Inc` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme\\u00a0Systems Inc.` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme\\n> Systems Ltd.` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme\\n# Systems Corp.` here"),
     ("work-state", "crates/ws_allowed/src/lib.rs", "`history-voice` wording `this commit`: `// this commit renames the flag with nothing excusing it`"),
     ("work-state", "crates/ws/tests/it.rs", "`plan-step` wording `Phase 4`"),
     ("work-state", "crates/ws_ledger/src/above.rs", "`plan-step` wording `chunk 1`: `// chunk 1 wired the seam` (2 such lines in the file, the ledger allows 1)"),
@@ -1849,19 +1898,17 @@ def self_test(out=sys.stdout):
         and not any(WORKSTATE_EXCLUDE_RE.search(f) for f in ("crates/cerulion_core/src/lib.rs", "tools/scripts/check_agents_md.sh", "docs/benchmarks/README.md",
                                                              "crates/native_ros2_messages/src/lib.rs", "docs/page.md", "AGENTS.md", "benches/latency/bench.py")))
     # The fixture writes its own declaration, so nothing above proves the SHIPPED
-    # one parses. This reads the real file and the real pattern built from it.
-    here = os.path.dirname(os.path.abspath(__file__))
-    shipped_entity = os.path.join(here, os.path.basename(ENTITY_FILE))
+    # one parses. This drives the REAL functions over the real file: a copy of
+    # their parsing here would pass while the run against the tree exits 3.
+    here_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    shipped_name, shipped_err = None, None
     try:
-        shipped_lines = [l for l in open(shipped_entity, encoding="utf-8-sig").read().split("\n")
-                         if l.strip() and not l.lstrip().startswith("#")]
-        shipped_name = shipped_lines[0] if len(shipped_lines) == 1 else None
-        shipped_ok = bool(shipped_name) and shipped_name == shipped_name.strip() \
-            and legal_name_mentions(shipped_name).fullmatch(shipped_name) is not None
-    except (OSError, CannotRun, IndexError):
-        shipped_ok = False
-        shipped_name = None
-    arm("the-shipped-declaration-parses-and-is-matchable", shipped_ok, repr(shipped_name))
+        shipped_name = legal_name(here_root)
+        legal_name_mentions_checked(shipped_name)
+    except CannotRun as exc:
+        shipped_err = str(exc)
+    arm("the-shipped-declaration-parses-and-is-matchable", shipped_err is None,
+        shipped_err or repr(shipped_name))
     # Not scanned by the text classes, and not read by work-state: the file
     # spells the name in order to refuse every other spelling of it.
     arm("the-declaration-is-a-data-file",
@@ -1894,10 +1941,24 @@ def self_test(out=sys.stdout):
                      "crates/test_fixtures/fx/src/lib.rs", "crates/lib_new/Cargo.toml", "CHANGELOG.md", "docs/media/used.svg",
                      "docs/benchmarks/results/pkg-cited", "benches/latency", "docs/PERFORMANCE.md", "examples/good_ws/README.md"):
             arm("control:" + path, not any(l.startswith(path + ":") for l in findings), "\n" + text)
+        # A control is a substring that must NOT appear in the findings. Deleting
+        # the fixture text it controls would make it pass while proving nothing,
+        # so each control's text is asserted PRESENT in the tree first.
+        for text, rel in ((" Acme Systems Co-operative ", "README.md"),
+                          (" Acme works with Foo Inc. ", "README.md"),
+                          (" Acme Robotics Systems Inc. ", "README.md"),
+                          ("MyAcme Systems, Inc.", "README.md"),
+                          ("The Acme Systems Inc.", "README.md"),
+                          ("Acme Systems Incidentally", "README.md"),
+                          ("Acme Systems\n\nIncorporated feedback", "README.md"),
+                          ("Acme Systems Corp.", "crates/lib_clean/tests/it.rs")):
+            body = open(os.path.join(root, rel), encoding="utf-8").read()
+            arm("control-text-is-in-the-fixture:" + text.strip()[:34], text.strip() in body, rel)
         for sub in ("`cerulion graph run`", "`cerulion graph validate`", "`cerulion graph run-worker`", "`cerulion ros`", "`cerulion viz`",
                     "`cerulion make-it-so`", "`cerulion account devices list`", "graph bogus", "figure 4.08", "figure 5.54", "figure 15.89",
                     "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717",
                     "Eclipse Foundation", "Willow Garage", "MyAcme", "Incidentally", "Acme Systems Corp.",
+                    "Co-operative", "works with Foo", "Acme Robotics Systems",
                     "git revert <this commit>", "does not reverse this commit"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
@@ -1978,12 +2039,33 @@ def self_test(out=sys.stdout):
                 ("legal-name-file-leading-whitespace-stops-the-run", "  Acme Systems Inc.\n", "leading or trailing whitespace"),
                 ("legal-name-file-trailing-whitespace-stops-the-run", "Acme Systems Inc.  \n", "leading or trailing whitespace"),
                 ("legal-name-that-is-only-a-suffix-stops-the-run", "LLC\n", "a suffix and no name"),
-                ("legal-name-with-no-known-suffix-stops-the-run", "Acme Systems Robotics\n", "cannot match"),
-                ("legal-name-with-an-invisible-character-stops-the-run", "Acme\u200bSystems Inc.\n", "which a reader cannot see"),
-                ("legal-name-with-a-no-break-space-stops-the-run", "Acme\u00a0Systems Inc.\n", "which a reader cannot see")):
+                ("legal-name-with-no-known-suffix-stops-the-run", "Acme Systems Robotics\n", "reads as nothing"),
+                ("legal-name-the-rule-reads-as-shorter-stops-the-run", "Acme Inc. of Delaware\n", "reads as `Acme Inc.`"),
+                ("legal-name-with-an-invisible-character-stops-the-run", "Acme\u200bSystems Inc.\n", "U+200B, which is outside"),
+                ("legal-name-with-a-no-break-space-stops-the-run", "Acme\u00a0Systems Inc.\n", "U+00A0, which is outside"),
+                ("legal-name-with-a-combining-mark-stops-the-run", "Acme\u034fSystems Inc.\n", "U+034F, which is outside"),
+                ("legal-name-with-a-variation-selector-stops-the-run", "Acme\ufe0fSystems Inc.\n", "U+FE0F, which is outside"),
+                ("legal-name-with-a-homoglyph-stops-the-run", "Acme Systems \u0406nc.\n", "U+0406, which is outside")):
             _put(clean, ENTITY_FILE, body)
             cannot_run(name, needle, lambda: run_tree(clean, io.StringIO()))
-        os.remove(os.path.join(clean, ENTITY_FILE))
+        # Unreadable is the branch a hardcoded fallback would hide: it is the one
+        # defect of this file that does not change the file's TEXT.
+        _put(clean, ENTITY_FILE, entity_body)
+        entity_path = os.path.join(clean, ENTITY_FILE)
+        os.chmod(entity_path, 0)
+        readable = True
+        try:
+            with open(entity_path):
+                pass
+        except OSError:
+            readable = False
+        if readable:            # running as a user no mode keeps out
+            arm("legal-name-file-unreadable-stops-the-run", True, "skipped: the mode does not keep this user out")
+        else:
+            cannot_run("legal-name-file-unreadable-stops-the-run", "cannot read",
+                       lambda: run_tree(clean, io.StringIO()))
+        os.chmod(entity_path, 0o644)
+        os.remove(entity_path)
         cannot_run("legal-name-file-missing-stops-the-run", "it declares the legal name",
                    lambda: run_tree(clean, io.StringIO()))
         _put(clean, ENTITY_FILE, entity_body)

@@ -92,17 +92,23 @@
 #                             line carrying leading or trailing whitespace is
 #                             exit 3. Every mention of the declared name is
 #                             then found case-insensitively, keyed on its first
-#                             word so a mention that drops or adds a word is
-#                             still judged, across a comma and ONE line break
+#                             word and the name's OWN other words, so a mention
+#                             that drops one of them is still judged (a mention
+#                             that ADDS a word the name does not have is not a
+#                             mention of it), across a comma and ONE line break
 #                             with the comment or quote prefix a wrapped line
 #                             carries (a blank line ends the sentence and is
 #                             not a wrap), and over the suffix family
 #                             (Incorporated, Inc, Corporation, Corp, Limited,
 #                             Ltd, LLC, GmbH, Co.). A mention whose raw text is
 #                             not the declared spelling BYTE FOR BYTE is a
-#                             finding. A third-party holder does not carry the
-#                             name, so it is never a candidate, and a word in
-#                             front of the name is not one either.
+#                             finding. A word in front of the name is not part
+#                             of a mention, because the scan starts at the name.
+#                             A third-party holder is a candidate only where it
+#                             SHARES the name's first word, which the allow list
+#                             carries when it happens. `Co.` keeps its period,
+#                             so a bare `Co` is the one suffix spelling this
+#                             does not see.
 #   work-state            Shipped text describes the product to its user: what
 #                         works, what is experimental, what is not supported,
 #                         what to do. It never reports how the project was
