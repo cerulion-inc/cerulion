@@ -1007,11 +1007,13 @@ registry config explicitly and never reaches the state-file pass, so
 
 ## 11. Workspace dependencies and compiler compatibility
 
-`workspace create` writes root `[workspace.dependencies]` by the BINARY's location
-(see `find_cerulion_base` in `crates/cerulion_cli_engine/src/workspace.rs`), never the
-cwd: checkout builds use absolute `path` deps, others exact registry pins. Exposed
-as `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
-user overrides rewritten on recreation.
+`workspace create` writes root `[workspace.dependencies]` from a checkout found by
+walking up from the CLI executable. If that finds none, it checks the checkout
+recorded at build time. If neither is usable, it writes exact registry pins.
+The current directory never selects dependencies. Checkout dependencies use
+absolute `path` entries. The result is exposed as
+`CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
+and user overrides are rewritten on recreation.
 
 New workspaces pin the CLI's stable `RUSTC_RELEASE` in `rust-toolchain.toml`
 with the minimal profile only after installed-only `rustup run` verifies its
