@@ -4,7 +4,6 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 `cerulion_cli_engine` - read that crate's AGENTS.md first; behavior changes go there.
 
 ## Invariants
-
 - `clap_complete::CompleteEnv::with_factory(Cli::command).complete()` is the FIRST
   statement of `main()` - it owns stdout for a completion invocation. Nothing may print
   before it, and completion output must stay bare candidates with zero stderr bytes
@@ -37,7 +36,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   - `replay_cli_test`: `cargo build -p test_node_macro_period_cdylib -p
     test_node_macro_period_perturbed_cdylib -p test_node_macro_period_panic_cdylib -p test_node_nondeterministic_cdylib`
   - `mp_record_e2e_test`, `mp_auto_partition_e2e_test`, `network_gateway{,_mp}_e2e_test`:
-    `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`
+    `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib -p test_node_macro_trigger_block_cdylib`
   - `signal_matrix_e2e_test`: `cargo build -p test_node_macro_period_cdylib`. `credit_death_e2e_test`: + `..._trigger_block_cdylib`.
     `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`
 

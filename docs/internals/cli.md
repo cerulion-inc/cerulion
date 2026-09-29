@@ -221,11 +221,13 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   derives a partition (cost-fused via `graphs/<name>.costs.yaml` when present, else
   process-per-node) and runs supervisor + one worker per group. A `process_groups:`
   block is respected as written. Non-Unix falls back to the monolith with a loud notice.
-- **Consent ladder (the never-mutate floor)**: persisting a derived partition into the
-  YAML needs consent. `--yes` writes it (with a `.bak`); a TTY previews and asks y/N
-  (N = run the derived groups in-memory, file untouched); no-TTY runs in-memory with a
-  loud notice naming `--yes` and `--single-process`. A refused/failed run never mutates
-  the graph file and never leaves a `.bak`.
+- **Explicit save only**: terminal and non-terminal runs adopt derived groups in
+  memory without a prompt or a partition preview. `--yes` writes the groups with a
+  `.bak` backup; `graph partition` retains the detailed preview and interactive
+  confirmation. `--auto-partition` uses the same policy over an existing block.
+  Partition refusals leave the graph file and its backup untouched. The real CLI
+  tests exercise empty PTY stdin and non-terminal stdin, verify both nodes' recorded
+  output against hand-written bytes, and assert the owned workers disappear on Ctrl-C.
 - `--single-process` opts out entirely; `--auto-partition` re-derives over an existing
   block and conflicts with `--single-process`; virtual/external clocks keep the monolith
   routing. The in-memory derived plan and the written plan must be equal, pinned by a
@@ -247,6 +249,36 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   before deployment dispatch, and the recorded `process_groups` comes from the RESOLVED
   deployment, never from the config's own flag (the config may not reflect an in-memory
   derived partition).
+
+### Engine library migration from 1.0.0
+
+The published `cerulion_cli_engine` 1.0.0 package exposes the graph-run partition
+APIs in [`partition_emit`](https://github.com/cerulion-inc/cerulion/blob/36135c33a10a09aa0dc6e7e7317c7f93c4f63ef8/crates/cerulion_cli_engine/src/partition_emit.rs#L1515).
+Removing their public fields, lifetime parameter, function argument and outcome
+variant breaks Rust callers. Publish the changed engine under a new major version,
+with the workspace version and internal dependency pins updated together under the
+lockstep release policy in `Cargo.toml`. Migration guidance alone does not make a
+1.x library update source compatible.
+
+| 1.0.0 API | Migration |
+|---|---|
+| `PartitionConsent<'a>` with `auto_partition`, `assume_yes`, `is_tty` and `confirm` | Use `PartitionConsent` without a lifetime and initialize only `auto_partition` and `assume_yes`. Remove the terminal probe and confirmation provider. |
+| `PreflightOptions` with `re_derive`, `lenient_costs`, `assume_yes` and `is_tty` | Initialize only `lenient_costs` and `assume_yes`. |
+| `run_auto_partition_preflight(root, name, config, raw, opts, confirm)` | Remove the final confirmation argument. The helper derives groups and adopts them in memory unless `assume_yes` requests persistence. |
+| `RunPartitionOutcome::KeptExisting` | Remove this match arm. To keep declared groups, skip re-derivation and retain the original config through the declared-layout path. |
+
+`graph_run` accepts `Option<PartitionConsent>` with the same two choices. A caller
+that wants to respect an existing `process_groups:` block passes
+`auto_partition: false`. When the resolved intent derives groups, the derivation
+becomes the runtime layout even when the file stays unchanged. Direct preflight callers
+that want to retain the original layout must make that decision before invoking the
+helper, because it no longer has a declined-confirmation result.
+
+`assume_yes: false` leaves the graph file and backup untouched on terminal and
+non-terminal runs. Set `assume_yes: true` only for an explicit save decision; it uses
+the atomic writer and backup. For detailed inspection and interactive saving, use
+`cerulion graph partition <NAME>` or the engine's `graph_partition` API. Its separate
+inspection and confirmation contract remains available.
 
 ### `ros2:` graph entries (spawn + supervise only)
 
@@ -891,7 +923,7 @@ own binary.
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `partition_emit_test.rs` | Surgical `process_groups:` splice, block scanner, `process_group_order` removal, atomic write + `.bak`; `node stage` over the untouched `graph create` scaffold takes no `.bak` and no warn, any other byte keeps both | no | none |
 | `graph_partition_test.rs` | `graph partition` verb: cost-mode selection, consent ladder, replace-scoped validation | no | none |
-| `graph_run_preflight_test.rs` | `resolve_partition_intent` matrix, consent ladder, lenient-costs degrade, in-memory==written plan equality | no | none |
+| `graph_run_preflight_test.rs` | `resolve_partition_intent` matrix, explicit save and ephemeral adoption, lenient-costs degrade, in-memory==written plan equality | no | none |
 | `network_run_gate_test.rs` | `resolve_run_network` decision matrix + gateway-port parse (env-mutating; file-local mutex inside) | no | none |
 | `completions_test.rs` | Completion value sources vs hand-written candidate lists; wire-safety filter; structural no-side-effect walk | no | none |
 | `discovery_ladder_test.rs` | Hermetic injected-rung ladder pins | no | none |
@@ -918,7 +950,7 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 |---|---|---|---|
 | `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib) | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib` |
 | `tests/mp_record_e2e_test.rs` | Multi-process `--record` bag contracts (one bag, per-rank manifests, departure sentinel, ring sweep) | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
-| `tests/mp_auto_partition_e2e_test.rs` | Multi-process-by-default consent ladder over the real binary (no-TTY floor, persist, opt-out, refusal never mutates the file) | yes | same two |
+| `tests/mp_auto_partition_e2e_test.rs` | Unix nonrecording and refusal arms; Linux/macOS recording and orphan cleanup. Ephemeral multi-process default over PTY and non-TTY stdin, real two-node output and clean worker shutdown; explicit persist, opt-out, refusal never mutates the file | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib`, `test_node_macro_trigger_block_cdylib` |
 | `tests/mp_split_pair_e2e_test.rs` | The mid-level barrier's PLUMBING over the real binary: classify -> stamp -> serialise -> install, read off each worker's own build line. Deliberately NOT the ordering discriminator (that is deterministic only in-process); what it buys is that the extra generation neither desynchronises a real deployment nor loses frames, and that two live runs record byte-identical frames. | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_input_cdylib` |
 | `tests/network_gateway_e2e_test.rs` | Permissive gateway lifecycle: notice exactly once, child reaped on SIGINT/SIGTERM, graceful-forward discriminator (the gateway's own shutdown line, not just exit 0 + reap) | yes | same two |
 | `tests/network_gateway_mp_e2e_test.rs` | Strict networked multi-process acceptance (worker → SHM → gateway → zenoh → external) | yes | same two |
