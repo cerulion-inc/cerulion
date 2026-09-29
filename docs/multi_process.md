@@ -829,8 +829,12 @@ or a `--single-process` monolith) gets a live-loop park via the
 **degraded sleep-recheck tier**, on by default for live runs. The park
 falls back to a chunked ~100 µs bounded sleep loop (never a busy-spin).
 Measured on macOS: a stable and lower median wake latency than the
-plain blocking wait, whose median was unstable from run to run. Opt out with
-`CERULION_MONITOR_WAIT=0` or `--no-monitor-wait`; see "Live-loop tuning" under
+plain blocking wait, whose median was unstable from run to run.
+On macOS 14.4 and later the park also kernel-blocks on the data doorbell's wake
+word, so a producer's publish wakes a consuming worker directly instead of at the
+next recheck. Opt out with
+`CERULION_MONITOR_WAIT=0` or `--no-monitor-wait` (or drop just the data wake with
+`CERULION_DOORBELL_OS_SYNC=0`); see "Live-loop tuning" under
 "Environment variables" in [`docs/user-api.md`](user-api.md).
 
 ## Flags
