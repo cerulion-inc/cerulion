@@ -153,10 +153,13 @@ TAGS = ('host', 'device', 'person', 'login', 'lan', 'nickname', 'slug', 'hygiene
 # The reference classes are here too: when a reference is unopenable BECAUSE the
 # repository is closed, the slug it names is itself the secret, and a CI log
 # outlives the force-push that scrubs the branch.
+# The attribution trailer is here for the same reason: its match CARRIES the
+# co-author's name, so printing the matched text in a CI log publishes the very
+# thing the class exists to keep out of one.
 IDENTITY_CLASSES = frozenset((
     'lan-addr', 'cgnat-addr', 'home-mac', 'home-linux', 'home-win', 'home-tilde', 'temp-root',
     'login-at-host', 'mdns-local', 'host-field', 'overlay-dns', 'email-personal', 'acl-tag',
-    'ref-unopenable', 'ref-unverified'))
+    'ref-unopenable', 'ref-unverified', 'attribution-trailer'))
 MASK_RX = re.compile(r'[^\W_]')
 # What is HARD on a CONVERSATION surface: an issue body, an issue comment, a
 # review comment. Exactly the classes whose finding is a value a reader should
@@ -165,11 +168,10 @@ MASK_RX = re.compile(r'[^\W_]')
 # prose is a house style note about text WE write, and turning it into a label,
 # an ask and a red run on a contributor's thread is the guard crying wolf on a
 # page that leaks nothing. The private tier stays hard here as everywhere.
-# The one addition is the attribution trailer. A pull request BODY is scanned as
-# a conversation, and a trailer there names a second author on this repository's
-# own record, which is an identity statement rather than a house style note: a
-# squash folds the body's text into a commit nobody can attach that author to.
-CONVERSATION_HARD = IDENTITY_CLASSES | frozenset(('attribution-trailer',))
+# The attribution trailer is one of them: a pull request BODY is scanned as a
+# conversation, and a trailer there names a second author on this repository's
+# own record, which is an identity statement rather than a house style note.
+CONVERSATION_HARD = IDENTITY_CLASSES
 
 # Published placeholder vocabularies. Explicit sets, never a length rule.
 PH_USER = frozenset((
@@ -4781,7 +4783,8 @@ def self_test(out, base_env, argv0):
             rc == EXIT_HIT and {'home-mac', REF_DEFECT} <= got and 'style-dash' not in got,
             str(sorted(got)))
         arm('conversation-hard-set-is-the-identity-classes-and-the-trailer',
-            CONVERSATION_HARD == IDENTITY_CLASSES | frozenset(('attribution-trailer',))
+            CONVERSATION_HARD == IDENTITY_CLASSES
+            and 'attribution-trailer' in CONVERSATION_HARD
             and 'style-dash' not in CONVERSATION_HARD
             and 'overlay-word' not in CONVERSATION_HARD
             and REF_DEFECT in CONVERSATION_HARD and REF_UNVERIFIED in CONVERSATION_HARD)
