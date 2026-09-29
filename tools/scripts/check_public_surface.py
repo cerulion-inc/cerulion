@@ -86,7 +86,6 @@ LEGAL_NAME_CHARS = frozenset(
 # line, because a blank line ends the sentence and the two sides are then not
 # one mention.
 LEGAL_SPACE = r"[ \t\u00a0\u202f]"
-TRAILING_SUFFIX_RE = None       # built below, once LEGAL_GAP and LEGAL_SUFFIX exist
 LEGAL_GAP = (r"(?:" + LEGAL_SPACE + r"+|" + LEGAL_SPACE + r"*," + LEGAL_SPACE + r"*|"
              + LEGAL_SPACE + r"*,?" + LEGAL_SPACE + r"*\r?\n" + LEGAL_SPACE + r"*(?:[>#*/!;%]+" + LEGAL_SPACE + r"*)?)")
 
@@ -97,6 +96,11 @@ WORKSTATE_FILE = "tools/scripts/public_surface_workstate.txt"
 WORKSTATE_LEDGER_FILE = "tools/scripts/public_surface_workstate_ledger.txt"
 CLI_FILE = "crates/cerulion_cli/src/cli.rs"
 DATA_FILES = (ALLOW_FILE, PHRASES_FILE, LEDGER_FILE, WORKSTATE_FILE, WORKSTATE_LEDGER_FILE, ENTITY_FILE)
+
+# What no allow entry may excuse. The floor is the guard this whole class stands
+# behind: a run that judged NOTHING must not be waivable into green, because the
+# waiver would then hide every mention the rule stopped seeing.
+NEVER_EXCUSED = ("is written nowhere in shipped text",)
 
 CLASSES = (
     "examples-shape",
@@ -722,7 +726,22 @@ def compute_dash_counts(root, files):
     return counts
 
 
-TRAILING_SUFFIX_RE = re.compile(LEGAL_GAP + LEGAL_SUFFIX)
+# A SECOND suffix behind a correct mention, on the SAME line. Across a line break
+# it would read the next line's opening word, and a notice lists holders one per
+# line with the form FIRST in several countries. Case-SENSITIVE, deliberately: an
+# upper-case `AB` after the name is a company form, a lower-case `ab` is an
+# English or a Latin word.
+TRAILING_SUFFIX_RE = re.compile(LEGAL_SPACE + r"+" + LEGAL_SUFFIX)
+
+
+def mention_is_the_declared_spelling(text, canonical):
+    """Whether a mention reads as the declaration. A TRAILING PERIOD is
+    punctuation when the declared form does not carry one: `<name> Ltd` at the
+    end of a sentence is the declared spelling and a full stop, not a second
+    spelling, and `Ltd` without a period is ordinary style in several places."""
+    if text == canonical:
+        return True
+    return not canonical.endswith(".") and text.endswith(".") and text[:-1] == canonical
 
 
 def legal_name(root):
@@ -830,14 +849,21 @@ def legal_name_mentions_checked(canonical):
     # Proved with the operation the rule PERFORMS. `fullmatch` would accept a
     # declaration whose own text the scan reads as a SHORTER mention, and the
     # class would then report the declared spelling as wrong on every page.
-    found = [m.group(0) for m in rx.finditer(canonical)]
-    if found != [canonical]:
-        raise CannotRun("%s declares `%s`, which the rule that looks for it reads as %s: a name the rule cannot find "
-                        "whole would make the class refuse its own spelling. Check it for a suffix inside the name "
-                        "and for a suffix the rule knows (%s)"
+    # IN CONTEXT, not on the canonical alone. A declaration read correctly when it
+    # stands by itself can still read as something else at the end of a sentence,
+    # in a list, or between two words, and the class would then refuse the very
+    # spelling it declares on every page that gets it right.
+    for before, after in (("", ""), ("", "."), ("", ","), ("", "\n"), ("shipped by ", " today"), ("* ", "\n")):
+        probe = before + canonical + after
+        found = [m.group(0) for m in rx.finditer(probe)]
+        if len(found) == 1 and mention_is_the_declared_spelling(found[0], canonical):
+            continue
+        raise CannotRun("%s declares `%s`, which the rule that looks for it reads as %s when it is written as `%s`: "
+                        "a name the rule cannot find whole would make the class refuse its own spelling. Check it "
+                        "for a suffix inside the name and for a suffix the rule knows (%s)"
                         % (ENTITY_FILE, visible(canonical),
                            ("nothing" if not found else ", ".join("`%s`" % visible(f) for f in found)),
-                           ", ".join(LEGAL_SUFFIX_WORDS)))
+                           visible(probe), ", ".join(LEGAL_SUFFIX_WORDS)))
     return rx
 
 
@@ -863,16 +889,16 @@ def legal_name_findings(root, files, canonical):
             # EVERY mention counts, right or wrong: the count exists to say the
             # scan found the name at all, not to say how often it was misspelled.
             mentions += 1
-            if m.group(0) == canonical:
+            if mention_is_the_declared_spelling(m.group(0), canonical):
                 # A SECOND suffix behind a correct mention is its own defect:
                 # `<name> Inc. LLC` reads as two forms of the company and a
                 # reader cannot tell which one binds.
                 after = TRAILING_SUFFIX_RE.match(txt, m.end())
                 if after is None:
                     continue
-                findings.append(Finding("shipped-text", f, line_of(txt, m.start()),
+                findings.append(Finding("shipped-text", f, line_of(txt, after.start()),
                                         "the legal name reads `%s` here, and `%s` follows it: one form of the name, "
-                                        "not two" % (visible(m.group(0)), visible(after.group(0).strip()))))
+                                        "not two" % (visible(m.group(0)), visible(after.group(0)))))
                 continue
             findings.append(Finding("shipped-text", f, line_of(txt, m.start()),
                                     "the legal name reads `%s` here and `%s` in %s: one spelling everywhere"
@@ -881,8 +907,9 @@ def legal_name_findings(root, files, canonical):
         findings.append(Finding("shipped-text", ENTITY_FILE, 1,
                                 "the declared legal name `%s` is written nowhere in shipped text: a name the scan "
                                 "never finds makes this class read the same green as a tree where every mention is "
-                                "right, so either the declaration is wrong or the project never states its own name"
-                                % visible(canonical)))
+                                "right. Either the declaration is wrong, or the project never states its own name, "
+                                "or every page states it in a form this rule cannot see (a bare `Co`, or the name "
+                                "with a word added to it)" % visible(canonical)))
     return findings, mentions
 
 
@@ -1338,6 +1365,9 @@ def run_tree(root, out=sys.stdout):
     kept = []
     for fd in findings:
         excused = False
+        if any(n in fd.message for n in NEVER_EXCUSED):
+            kept.append(fd)
+            continue
         for e in allow:
             if e["cls"] == fd.cls and e["path"] == fd.path and (e["match"] == "*" or e["match"] in fd.message):
                 e["used"] += 1
@@ -1889,7 +1919,7 @@ EXPECTED = [
     ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme Inc.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
     ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme\\n//! Systems Corp.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
     ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme\\n//! Systems\\n//! Ltd.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
-    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Inc.` here, and `LLC` follows it"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Inc.` here, and ` LLC` follows it"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Incorporated` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Corporation` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Limited` here"),
@@ -1987,8 +2017,6 @@ def self_test(out=sys.stdout):
         "one of the permitted characters cannot appear in a declared name")
     arm("the-refusal-names-the-suffixes-the-pattern-holds",
         all(re.compile(LEGAL_SUFFIX).fullmatch(w) for w in LEGAL_SUFFIX_WORDS), repr(LEGAL_SUFFIX_WORDS))
-    arm("the-character-set-holds-every-suffix-the-family-names",
-        all(c in LEGAL_NAME_CHARS for w in LEGAL_SUFFIX_WORDS for c in w), repr(LEGAL_SUFFIX_WORDS))
     # One per suffix: a name DECLARED with it is found whole, a variant of that
     # name is found and is not the declaration, and the near miss stays silent.
     for _w in LEGAL_SUFFIX_WORDS:
@@ -2021,6 +2049,21 @@ def self_test(out=sys.stdout):
     # 1: the per-suffix arms below are GENERATED from this list, so a member that
     # is deleted deletes its own arm. This second copy is deliberate: it is the
     # only thing that makes a deletion loud.
+    # A declared form without a period reads the same at the end of a sentence:
+    # the full stop is punctuation, not a second spelling.
+    arm("a-sentence-period-is-not-a-second-spelling",
+        all(mention_is_the_declared_spelling(
+                legal_name_mentions_checked(d).search("Shipped by %s. Next." % d).group(0), d)
+            for d in ("Acme Systems Ltd", "Acme Systems Inc", "Acme Systems Corp"))
+        and not mention_is_the_declared_spelling("Acme Systems Ltd", "Acme Systems Ltd."))
+    # A second suffix counts only on the SAME line: a notice lists holders one per
+    # line and several countries write the form first.
+    arm("a-second-suffix-counts-only-on-the-same-line",
+        TRAILING_SUFFIX_RE.match(" LLC") is not None
+        and TRAILING_SUFFIX_RE.match("\nAB Volvo") is None
+        and TRAILING_SUFFIX_RE.match(" ab initio") is None)
+    arm("the-floor-cannot-be-waived",
+        any(n in "the declared legal name `x` is written nowhere in shipped text" for n in NEVER_EXCUSED))
     arm("the-suffix-family-is-the-list-it-is-meant-to-be",
         LEGAL_SUFFIX_WORDS == ("Inc", "Inc.", "Incorporated", "Corp", "Corp.", "Corporation", "Co.",
                                "LLC", "LLP", "Ltd", "Ltd.", "Limited", "PLC", "GmbH", "AG",

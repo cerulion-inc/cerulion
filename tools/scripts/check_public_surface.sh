@@ -95,7 +95,10 @@
 #                             word and the name's OWN other words, so a mention
 #                             that drops one of them is still judged (a mention
 #                             that ADDS a word the name does not have is not a
-#                             mention of it), across a comma and ONE line break
+#                             mention of it), across a comma and one line break
+#                             PER GAP, so a name written down a list of items
+#                             is a finding to waive: a wrapped name in a narrow
+#                             comment column is worth more than the noise
 #                             with the comment or quote prefix a wrapped line
 #                             carries (a blank line ends the sentence and is
 #                             not a wrap), and over the suffix family
