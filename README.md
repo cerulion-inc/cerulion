@@ -111,13 +111,38 @@ Guides: [Execution](https://docs.cerulion.com/cerulion/execution-order) · [Mult
 
 This example connects a synthetic laser scanner to a safety controller. The controller publishes a forward velocity of `0.3` when the path is clear and `0.0` when an obstacle is within half a meter.
 
-```bash
-git clone https://github.com/cerulion-inc/cerulion
-```
+Choose the acquisition route for your installed CLI.
+
+### Released CLI 1.0.0
+
+The public 1.0.0 binaries do not include the starter option. Obtain the matching
+source tag and enter its complete example workspace:
 
 ```bash
-cd cerulion/examples/obstacle_avoidance
+git clone --depth 1 --branch v1.0.0 https://github.com/cerulion-inc/cerulion cerulion-starter-source
+cd cerulion-starter-source/examples/obstacle_avoidance
 ```
+
+Continue with the sign-in, build and run commands below. The
+[example runbook](examples/obstacle_avoidance/README.md) describes the source.
+
+### CLI builds with --starter
+
+Use this route only when `cerulion workspace create --help` lists `--starter`:
+
+```bash
+cerulion workspace create safety_demo --starter obstacle_avoidance
+cd safety_demo
+```
+
+This obtains complete source bundled with your CLI, including tests and all
+variable-length scan fields, without GitHub credentials or a source download.
+Exact release dependencies are selected and `starter.toml` records compiler
+requirements. Existing paths are refused; failed installation leaves no partial
+workspace. The generated README also shows explicit graph creation, staging and
+wiring. To write nodes from scratch, start with
+`cerulion workspace create my_robot` and the
+[getting-started tutorial](docs/tutorials/01-getting-started.md).
 
 Sign in once per machine. Cerulion commands run under an account, and the result is read locally from then on, so later commands keep working offline.
 

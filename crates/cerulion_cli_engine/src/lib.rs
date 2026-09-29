@@ -324,3 +324,6 @@ pub(crate) mod test_env {
         env_mutex().lock().unwrap_or_else(|p| p.into_inner())
     }
 }
+
+/// Bundled, release-matched workspace starters.
+pub mod starter;

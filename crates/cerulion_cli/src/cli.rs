@@ -1038,12 +1038,30 @@ fn parse_at_least_one(s: &str) -> Result<u64, String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum WorkspaceStarter {
+    /// Complete synthetic scanner and safety controller source for this CLI
+    #[value(name = "obstacle_avoidance")]
+    ObstacleAvoidance,
+}
+
+impl From<WorkspaceStarter> for cerulion_cli_engine::starter::Starter {
+    fn from(value: WorkspaceStarter) -> Self {
+        match value {
+            WorkspaceStarter::ObstacleAvoidance => Self::ObstacleAvoidance,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum WorkspaceAction {
     /// Create a new workspace
     Create {
         /// Workspace name
         name: String,
+        /// Include complete example sources bundled with this CLI version
+        #[arg(long, value_enum)]
+        starter: Option<WorkspaceStarter>,
     },
     /// Initialize a workspace at the current directory
     Init {
