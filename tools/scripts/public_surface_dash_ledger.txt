@@ -92,7 +92,7 @@
 8 crates/cerulion_cli_engine/src/system_deps.rs
 20 crates/cerulion_cli_engine/src/templates.rs
 1 crates/cerulion_cli_engine/src/tolerance.rs
-80 crates/cerulion_cli_engine/src/topic_cmd.rs
+78 crates/cerulion_cli_engine/src/topic_cmd.rs
 4 crates/cerulion_cli_engine/src/viz_client.rs
 3 crates/cerulion_cli_engine/src/wedge_alarm.rs
 1 crates/cerulion_cli_engine/src/workspace.rs
