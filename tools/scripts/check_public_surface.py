@@ -46,8 +46,10 @@ PICTOGRAPH_RE = re.compile(
     "]")
 # The legal entity, which reads the same wherever a shipped file names it.
 # LICENSE is the verbatim licence text and carries the licence author's own
-# holder line, so it is not in the set.
-ENTITY_FILES_RE = re.compile(r"^(?:NOTICE|CITATION\.cff|README\.md|\.github/CLA/[^/]+\.md)$")
+# holder line, so it is not in the set. A NOTICE is matched at ANY depth: this
+# tree keeps its notices under docs/legal/ and beside a vendored crate, and a
+# rule that only looked at the root would name NOTICE and never read one.
+ENTITY_FILES_RE = re.compile(r"^(?:(?:[^/]+/)*NOTICE|CITATION\.cff|README\.md|\.github/CLA/[^/]+\.md)$")
 ENTITY_RE = re.compile(r"\b([A-Z][A-Za-z0-9&]*(?: [A-Z][A-Za-z0-9&]*)*,? (?:Inc|LLC|Ltd|GmbH|Limited)\b\.?)")
 
 ALLOW_FILE = "tools/scripts/public_surface_allow.txt"
@@ -1567,9 +1569,14 @@ def build_fixture(root):
     _put(root, "CHANGELOG.md", "## 0.2.0\n- C" + "ER-999 may be cited here\n")
     _put(root, "README.md", FIXTURE_README + "\nPublished by Acme Inc.\n")
     _put(root, "CITATION.cff",
-         'cff-version: 1.2.0\nauthors:\n  - name: "Acme, Inc. and contributors"\n'
-         '# a third-party holder a NOTICE exists to list is its own group and passes\n'
-         'notice: "portions copyright Eclipse Foundation Inc."\n')
+         'cff-version: 1.2.0\nauthors:\n  - name: "Acme, Inc. and contributors"\n')
+    # A NOTICE lives under docs/legal/ in this tree, so the class has to reach a
+    # NESTED one: a third spelling of the same group here must be reported, and
+    # the third-party holders a notice exists to list must pass.
+    _put(root, "docs/legal/NOTICE",
+         "Copyright (c) Acme LLC and the Acme Contributors\n"
+         "Portions copyright Eclipse Foundation Inc.\n"
+         "Portions copyright Willow Garage, Inc.\n")
     _put(root, "docs/page.md", FIXTURE_PAGE)
     _put(root, "docs/PERFORMANCE.md", "# Performance\n\nThe 64 B p50 is 4.08 µs.\n")
     _put(root, "docs/media/used.svg", "<svg/>\n")
@@ -1650,6 +1657,7 @@ EXPECTED = [
     ("shipped-text", "docs/page.md", "a pictograph on a shipped page (U+26A0)"),
     ("shipped-text", "docs/page.md", "a pictograph on a shipped page (U+FE0F)"),
     ("shipped-text", "CITATION.cff", "the entity reads `Acme, Inc.` here and `Acme Inc.` in README.md"),
+    ("shipped-text", "docs/legal/NOTICE", "the entity reads `Acme LLC` here and `Acme Inc.` in README.md"),
     ("work-state", "crates/ws_allowed/src/lib.rs", "`history-voice` wording `this commit`: `// this commit renames the flag with nothing excusing it`"),
     ("work-state", "crates/ws/tests/it.rs", "`plan-step` wording `Phase 4`"),
     ("work-state", "crates/ws_ledger/src/above.rs", "`plan-step` wording `chunk 1`: `// chunk 1 wired the seam` (2 such lines in the file, the ledger allows 1)"),
@@ -1731,7 +1739,7 @@ def self_test(out=sys.stdout):
         for sub in ("`cerulion graph run`", "`cerulion graph validate`", "`cerulion graph run-worker`", "`cerulion ros`", "`cerulion viz`",
                     "`cerulion make-it-so`", "`cerulion account devices list`", "graph bogus", "figure 4.08", "figure 5.54", "figure 15.89",
                     "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717",
-                    "Eclipse Foundation", "git revert <this commit>", "does not reverse this commit"):
+                    "Eclipse Foundation", "Willow Garage", "git revert <this commit>", "does not reverse this commit"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
         # its own key, and the legitimate neighbour fires no key at all.
