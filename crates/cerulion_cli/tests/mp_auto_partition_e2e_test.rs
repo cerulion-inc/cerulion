@@ -2186,7 +2186,10 @@ fn recorder_guard_rejects_children_of_a_different_supervisor_identity() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recorder_spawn_fixture() {
     use std::os::unix::process::CommandExt as _;
-    let log = std::env::var_os("CERULION_TEST_RECORDER_LOG").expect("fixture log path");
+    let Some(log) = std::env::var_os("CERULION_TEST_RECORDER_LOG") else {
+        // A direct --ignored run has no parent that owns an intentional orphan.
+        return;
+    };
     let child = mp_support::ChildGuard::single_process(
         Command::new("sleep")
             .arg0("bagd --out recordings/apdemo_owned.mcap")
