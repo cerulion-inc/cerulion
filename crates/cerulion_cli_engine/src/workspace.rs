@@ -101,7 +101,9 @@ pub fn workspace_create(parent_dir: &Path, name: &str) -> CliResult<CerulionWork
             path: root.display().to_string(),
         });
     }
-    scaffold_workspace(&root, name)
+    let ws = scaffold_workspace(&root)?;
+    tracing::info!(workspace = %name, path = %ws.root.display(), "workspace created");
+    Ok(ws)
 }
 
 /// Initialize a workspace at the given path (default: current directory).
@@ -119,7 +121,9 @@ pub fn workspace_init(location: &Path) -> CliResult<CerulionWorkspace> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("cerulion_ws");
-    scaffold_workspace(location, name)
+    let ws = scaffold_workspace(location)?;
+    tracing::info!(workspace = %name, path = %ws.root.display(), "workspace created");
+    Ok(ws)
 }
 
 /// Locate the Cerulion source checkout root. Three tiers, in order:
@@ -202,7 +206,7 @@ fn base_candidate_if_repo(candidate: &Path) -> Option<PathBuf> {
 }
 
 /// Create the workspace directory structure and files.
-fn scaffold_workspace(root: &Path, name: &str) -> CliResult<CerulionWorkspace> {
+pub(crate) fn scaffold_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
     let graphs_dir = root.join("graphs");
     let nodes_dir = root.join("nodes");
     let schemas_dir = root.join("schemas");
@@ -258,8 +262,6 @@ IOX2_LOG_LEVEL = "error"
 RUST_LOG = { value = "warn", force = false }
 "#,
     )?;
-
-    tracing::info!(workspace = %name, path = %root.display(), "workspace created");
 
     Ok(CerulionWorkspace {
         root: root.to_path_buf(),
