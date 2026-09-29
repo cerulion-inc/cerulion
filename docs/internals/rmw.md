@@ -293,9 +293,9 @@ build.rs layers three era probes on top of the source selection:
   cut, because Kilted shares Jazzy's rank and its 112-byte member stride; only the init-options
   size separates the two, which is why the predicate reads the size and not the stride. The
   refusal is a structured value (`era::UnsetDistroRefusal`): the baked claim, the
-  variable that was not set, and a remedy naming a REAL distro (`source
-  /opt/ros/<distro>/setup.bash`, the distro taken from the claim itself, so an `era:<token>`
-  label yields the first concrete member of its era rather than a label no shell can source).
+  variable that was not set, and a remedy naming REAL distros the shell can source (`source
+  /opt/ros/<distro>/setup.bash`), taken from the claim itself: a literal claim names only
+  itself, and an `era:<token>` label names EVERY layout-identical member of its era.
   Its rcl text is rendered ONCE for this library's own claim and handed to rcl by pointer; the
   cache is keyed on that claim, never on the verdict alone, because the `test-seams` override
   makes the baked side vary within one process and a verdict-keyed cell would report the first
