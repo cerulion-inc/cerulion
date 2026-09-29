@@ -2069,18 +2069,31 @@ jobs:
             df -h /
           fi
 
-      - name: Report the open-file limit
-        # iceoryx2 0.10 keeps one extra open file descriptor per shared-memory
-        # segment on macOS: it holds the segment's `.shm_state` handle for the
-        # life of the segment, where 0.9.1 closed it as soon as it had read the
-        # name. Whether this runner's limit is near that cost is a fact about the
-        # runner, and a service creation that fails for it would surface as an
-        # InternalFailure carrying no errno, so the limit is recorded on every run
-        # instead of being reconstructed from a red afterwards.
+      - name: Raise the open-file limits
+        # iceoryx2 0.10 keeps TWO descriptors per macOS shared-memory segment for
+        # the life of the segment: the segment itself and its `.shm_state` mapping
+        # file, which 0.9.1 closed as soon as it had read the real name. One
+        # multi-process deployment in this suite creates 17 segments on its
+        # planning namespace alone. The table that filled is the SYSTEM-WIDE one,
+        # 30,720 on this runner, which counts every open descriptor the job holds
+        # at once rather than any single process's: `shm_open` returned ENFILE and
+        # iceoryx2 reported "the system-wide file handle limit was reached", which
+        # reaches a caller as a service creation that failed with no errno. The
+        # per-process limit was never the binding one (10,240 against a
+        # deployment's tens), so `kern.maxfilesperproc` and `launchctl limit` are
+        # headroom for later steps rather than the fix. The sysctl is deliberately
+        # NOT tolerant: a runner that refuses it cannot run this suite, and saying
+        # so here is better than the opaque failure it would become. `launchctl`
+        # is tolerated because the sysctl above is what the errno named.
         run: |
-          echo "ulimit -n soft: $(ulimit -Sn)"
-          echo "ulimit -n hard: $(ulimit -Hn)"
+          echo "before:"
           sysctl kern.maxfiles kern.maxfilesperproc || true
+          echo "ulimit -n soft: $(ulimit -Sn) hard: $(ulimit -Hn)"
+          sudo sysctl -w kern.maxfiles=131072 kern.maxfilesperproc=65536
+          sudo launchctl limit maxfiles 65536 131072 || true
+          echo "after:"
+          sysctl kern.maxfiles kern.maxfilesperproc
+          echo "ulimit -n soft: $(ulimit -Sn) hard: $(ulimit -Hn)"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
