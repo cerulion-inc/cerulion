@@ -4461,7 +4461,17 @@ fn required_contexts() -> Vec<String> {
     let path = repo_root().join(REQUIRED_CONTEXTS_FILE);
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    required_contexts_of(&path.display().to_string(), &raw)
+}
+
+/// The rows of one export text, refusing a row that is not a bare name and a
+/// name that appears twice.
+///
+/// A duplicate passes every count this walk keeps while standing for one context
+/// only, so the length floor reads satisfied over nineteen names.
+fn required_contexts_of(where_from: &str, raw: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     for (n, line) in raw.lines().enumerate() {
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
@@ -4469,8 +4479,12 @@ fn required_contexts() -> Vec<String> {
         assert_eq!(
             line,
             line.trim(),
-            "{}:{}: a row that is not a bare context name",
-            path.display(),
+            "{where_from}:{}: a row that is not a bare context name",
+            n + 1
+        );
+        assert!(
+            seen.insert(line),
+            "{where_from} names `{line}` twice, at row {}",
             n + 1
         );
         out.push(line.to_string());
@@ -4610,7 +4624,10 @@ fn name_parts(name: &str) -> Option<Vec<NamePart<'_>>> {
 /// placeholders stand for. Reading a placeholder as "any text at all" would let
 /// `Test (Linux) shard ${{ matrix.shard }}` claim a shard the matrix does not
 /// run, and a required context nothing reports is a context nothing can red.
-fn names_the_matrix_expands(parts: &[NamePart<'_>], legs: &MatrixLegs) -> Option<Vec<String>> {
+fn names_the_matrix_expands(
+    parts: &[NamePart<'_>],
+    legs: &MatrixLegs,
+) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = vec![String::new()];
     for part in parts {
         match part {
@@ -4620,10 +4637,11 @@ fn names_the_matrix_expands(parts: &[NamePart<'_>], legs: &MatrixLegs) -> Option
                 }
             }
             NamePart::Hole(expr) => {
-                let key = expr.strip_prefix("matrix.")?;
-                let values = legs.get(key)?;
+                let unread = || format!("${{{{ {expr} }}}}");
+                let key = expr.strip_prefix("matrix.").ok_or_else(unread)?;
+                let values = legs.get(key).ok_or_else(unread)?;
                 if values.is_empty() || out.len() * values.len() > 256 {
-                    return None;
+                    return Err(unread());
                 }
                 out = out
                     .iter()
@@ -4632,22 +4650,68 @@ fn names_the_matrix_expands(parts: &[NamePart<'_>], legs: &MatrixLegs) -> Option
             }
         }
     }
-    Some(out)
+    Ok(out)
 }
 
-/// Does this job `name:` produce `context`, and over how many LITERAL pieces?
+/// Does this job `name:` produce `context`?
 ///
-/// `None` is no match. `Some(0)` is a match by placeholders alone: such a name
-/// pairs with every context of the right shape, so the job is judged by the
-/// rules below and credits the context list with nothing, or one name spelled
-/// `${{ matrix.job }}` would report every context as reported.
+/// EVERY MATCH IS EXACT. A name with no placeholder is compared whole. A name
+/// with placeholders is EXPANDED over the legs the job's matrix declares, one
+/// name per leg, and each is compared whole, because a matrix job reports one
+/// context per leg and nothing else.
 ///
-/// Where the job's matrix declares every placeholder's key the name is EXPANDED
-/// over the declared legs and compared whole. Otherwise the literal pieces have
-/// to appear in the context in order, anchored at whichever end carries no
-/// placeholder.
-fn name_produces_context(name: &str, context: &str, legs: &MatrixLegs) -> Option<usize> {
-    let parts = name_parts(name)?;
+/// AND AN EXPANSION THIS WALK CANNOT MAKE IS AN `Err`, never a looser match. A
+/// placeholder reading a key the matrix does not declare, a matrix carrying
+/// `include:` or `exclude:`, which [`job_matrix_legs`] does not model and
+/// reports as no legs at all, and a placeholder reading anything but
+/// `matrix.<key>` all land here. Matching the literal pieces instead would
+/// credit a context this job may never report: a shard an `exclude:` removed
+/// reads as reported, the export's own floor reads satisfied, and the required
+/// context waits for a run nothing creates. The `Err` names the placeholder and
+/// the name, the caller names the file and the job, and the walk fails there.
+///
+/// A name whose literal text cannot reach the context at all is `Ok(false)`
+/// whatever its placeholders hold: it is some other job's name, so an expansion
+/// this walk cannot make is no concern of the required list.
+fn name_produces_context(name: &str, context: &str, legs: &MatrixLegs) -> Result<bool, String> {
+    let Some(parts) = name_parts(name) else {
+        // A placeholder that never closes: the name is unreadable, so it can
+        // only be judged where its literal text could reach this context.
+        return if literal_shape_reaches(name, context) {
+            Err(format!("a `${{{{` that never closes in `{name}`"))
+        } else {
+            Ok(false)
+        };
+    };
+    if parts.iter().all(|p| matches!(p, NamePart::Literal(_))) {
+        return Ok(name == context);
+    }
+    match names_the_matrix_expands(&parts, legs) {
+        Ok(expanded) => Ok(expanded.iter().any(|n| n == context)),
+        Err(hole) => {
+            if literal_shape_reaches(name, context) {
+                Err(format!("this walk cannot expand `{hole}` in `{name}`"))
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// Could this name's literal text reach `context` with SOMETHING in place of its
+/// placeholders?
+///
+/// Only a question about relevance. A name whose literals cannot reach the
+/// context reports some other job's name whatever its placeholders hold, so an
+/// expansion this walk cannot make is no concern of the required list; one whose
+/// literals do reach it is a name that may or may not report the context, and
+/// the caller refuses rather than guessing.
+fn literal_shape_reaches(name: &str, context: &str) -> bool {
+    let Some(parts) = name_parts(name) else {
+        // Everything up to the unterminated placeholder is what is readable.
+        let head = name.split("${{").next().unwrap_or("");
+        return context.starts_with(head);
+    };
     let literals: Vec<&str> = parts
         .iter()
         .filter_map(|p| match p {
@@ -4655,32 +4719,27 @@ fn name_produces_context(name: &str, context: &str, legs: &MatrixLegs) -> Option
             NamePart::Hole(_) => None,
         })
         .collect();
-    if let Some(expanded) = names_the_matrix_expands(&parts, legs) {
-        return expanded
-            .iter()
-            .any(|n| n == context)
-            .then_some(literals.len());
+    if literals.is_empty() {
+        return true;
     }
     let opens_open = matches!(parts.first(), Some(NamePart::Hole(_)));
     let ends_open = matches!(parts.last(), Some(NamePart::Hole(_)));
-    if literals.is_empty() {
-        // Nothing but placeholders, and no matrix to expand them: the name can
-        // be any context at all, so the job is judged and credits nothing.
-        return Some(0);
-    }
     let mut cursor = context;
     for (i, piece) in literals.iter().enumerate() {
         let at = if i == 0 && !opens_open {
             if !cursor.starts_with(piece) {
-                return None;
+                return false;
             }
             0
         } else {
-            cursor.find(piece)?
+            match cursor.find(piece) {
+                Some(at) => at,
+                None => return false,
+            }
         };
         cursor = &cursor[at + piece.len()..];
     }
-    (ends_open || cursor.is_empty()).then_some(literals.len())
+    ends_open || cursor.is_empty()
 }
 
 /// Split an expression on `op` at paren depth zero, outside single quotes.
@@ -5057,13 +5116,20 @@ fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> Re
         let legs = job_matrix_legs(&block);
         let mut paired = false;
         for context in contexts {
-            let Some(literals) = name_produces_context(&name, context, &legs) else {
+            let produces = name_produces_context(&name, context, &legs).unwrap_or_else(|why| {
+                panic!(
+                    "{file} / {job} (\"{name}\"): {why}\n\nThis name could \
+                     report the required context `{context}`, and the walk will \
+                     not guess whether it does: a credited context nothing \
+                     reports blocks every pull request. Declare the matrix key, \
+                     or teach `job_matrix_legs` the matrix form."
+                )
+            });
+            if !produces {
                 continue;
-            };
-            paired = true;
-            if literals > 0 {
-                walk.produced.insert(context.clone());
             }
+            paired = true;
+            walk.produced.insert(context.clone());
         }
         if !paired {
             continue;
@@ -5273,9 +5339,9 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         missing.is_empty(),
         "no job in any workflow reports these required contexts by name: \
          {missing:?}\n\nA required context nothing reports blocks every pull \
-         request until somebody takes it off the protection lists. A name a job \
-         matches only through a `${{{{ }}}}` placeholder does not count as \
-         reported, so a matrix leg that stopped running shows up here."
+         request until somebody takes it off the protection lists. Every pairing \
+         here is an exact name, a matrix name expanded over the legs its own \
+         matrix declares, so a leg that stopped running shows up in this list."
     );
 }
 
@@ -5743,18 +5809,6 @@ fn a_required_job_that_can_skip_is_named_and_one_matched_to_its_triggers_is_not(
         "a workflow producing no required name triggers on anything"
     );
 
-    // A NAME THAT IS NOTHING BUT A PLACEHOLDER is judged by every rule above
-    // and credits the export with nothing: one such name would otherwise report
-    // every required context as reported by something.
-    let got = walk(&workflow(code, "${{ matrix.job }}", pr_only));
-    assert_eq!(got.judged, 1, "an all-placeholder name is judged");
-    assert_eq!(got.skips.len(), 2, "and measured: {:?}", got.skips);
-    assert!(
-        got.produced.is_empty(),
-        "and reports no context by name: {:?}",
-        got.produced
-    );
-
     // A JOB WITH NO `name:` reports under its key.
     let keyed = format!(
         "name: synthetic\non:\n{code}\n\njobs:\n  Lint:\n    runs-on: ubuntu-latest\n    \
@@ -5777,42 +5831,140 @@ fn a_job_name_produces_only_the_contexts_its_matrix_can_report() {
         "shard".to_string(),
         ["0", "1"].iter().map(|s| (*s).to_string()).collect(),
     );
-
-    // A plain name is an exact match and carries one literal piece.
-    assert_eq!(name_produces_context("Lint", "Lint", &no_legs), Some(1));
-    assert_eq!(name_produces_context("Lint", "Lint job", &no_legs), None);
-
-    // A MATRIX name produces the legs the matrix declares and no others.
     let sharded = "Test (Linux) shard ${{ matrix.shard }}";
+
+    // A PLAIN NAME is compared whole.
+    assert_eq!(name_produces_context("Lint", "Lint", &no_legs), Ok(true));
+    assert_eq!(
+        name_produces_context("Lint", "Lint job", &no_legs),
+        Ok(false)
+    );
+
+    // A MATRIX NAME produces the legs the matrix declares and no others.
     assert_eq!(
         name_produces_context(sharded, "Test (Linux) shard 1", &legs),
-        Some(1)
+        Ok(true)
     );
     assert_eq!(
         name_produces_context(sharded, "Test (Linux) shard 3", &legs),
-        None,
+        Ok(false),
         "a leg the matrix does not run reports nothing"
     );
     assert_eq!(
         name_produces_context(sharded, "Test (macOS) shard 0", &legs),
-        None
-    );
-    // With no matrix to read, the literal pieces anchor the match.
-    assert_eq!(
-        name_produces_context(sharded, "Test (Linux) shard 3", &no_legs),
-        Some(1)
+        Ok(false),
+        "and another job's name reports none of its contexts"
     );
 
-    // A name that is NOTHING but placeholders is judged and credits nothing.
-    assert_eq!(
-        name_produces_context("${{ matrix.job }}", "Lint", &no_legs),
-        Some(0)
+    // A KEY THE MATRIX DOES NOT DECLARE is a refusal naming the placeholder,
+    // never a match on the literal pieces around it.
+    let why = name_produces_context(sharded, "Test (Linux) shard 3", &no_legs)
+        .expect_err("an undeclared key is refused");
+    assert!(
+        why.contains("${{ matrix.shard }}") && why.contains(sharded),
+        "the placeholder and the name are named: {why}"
     );
-    // And a placeholder that never closes matches nothing at all.
-    assert_eq!(
-        name_produces_context("${{ matrix.job", "Lint", &no_legs),
-        None
+    let other_key = name_produces_context(
+        "Test (Linux) shard ${{ matrix.missing }}",
+        "Test (Linux) shard 0",
+        &legs,
+    )
+    .expect_err("a key outside the matrix is refused");
+    assert!(
+        other_key.contains("${{ matrix.missing }}"),
+        "the key it could not read is named: {other_key}"
     );
+    // A placeholder that reads something other than a matrix key is refused the
+    // same way.
+    let not_matrix = name_produces_context(
+        "Test (Linux) shard ${{ github.run_id }}",
+        "Test (Linux) shard 0",
+        &legs,
+    )
+    .expect_err("a placeholder outside the matrix is refused");
+    assert!(
+        not_matrix.contains("${{ github.run_id }}"),
+        "the expression is named: {not_matrix}"
+    );
+    // And so is a placeholder that never closes.
+    assert!(
+        name_produces_context(
+            "Test (Linux) shard ${{ matrix.shard",
+            "Test (Linux) shard 0",
+            &legs
+        )
+        .is_err(),
+        "an unterminated placeholder is refused"
+    );
+
+    // A MATRIX CARRYING `exclude:` reports no legs at all to this reader, so a
+    // name over it is refused rather than credited for a leg that may be gone.
+    let excluded = String::from("  j:\n    name: Test (Linux) shard ${{ matrix.shard }}\n")
+        + "    strategy:\n      matrix:\n        shard: [0, 1, 2, 3]\n"
+        + "        exclude:\n          - shard: 3\n";
+    let excluded_legs = job_matrix_legs(&excluded);
+    assert!(
+        excluded_legs.is_empty(),
+        "a matrix with `exclude:` is not one this reader models"
+    );
+    assert!(
+        name_produces_context(sharded, "Test (Linux) shard 3", &excluded_legs).is_err(),
+        "so the name over it is refused"
+    );
+
+    // A NAME WHOSE LITERALS CANNOT REACH THE CONTEXT is no concern of the
+    // required list, however little of it this walk can expand: this is what
+    // keeps the release lanes, whose matrices carry `include:`, out of the way.
+    assert_eq!(
+        name_produces_context("Build ${{ matrix.target }}", "Lint", &no_legs),
+        Ok(false)
+    );
+    assert_eq!(
+        name_produces_context("${{ matrix.job }}", "Lint", &legs),
+        Err("this walk cannot expand `${{ matrix.job }}` in `${{ matrix.job }}`".to_string()),
+        "a name that is all placeholder could be any context, so it is refused"
+    );
+}
+
+/// The export refuses a row that is not a bare name and a name that appears
+/// twice.
+#[test]
+fn the_required_context_export_refuses_a_duplicate_row() {
+    let twenty: Vec<String> = (0..20).map(|n| format!("Check {n}")).collect();
+    let text = format!("# a header\n\n{}\n", twenty.join("\n"));
+    assert_eq!(
+        required_contexts_of("export", &text).len(),
+        20,
+        "twenty distinct rows read as twenty"
+    );
+    let doubled = text.replace("Check 19", "Check 7");
+    assert_eq!(
+        doubled
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .count(),
+        20,
+        "the duplicated text still carries twenty rows, which is the hole"
+    );
+}
+
+/// And it says which name is doubled.
+#[test]
+#[should_panic(expected = "names `Check 7` twice")]
+fn a_duplicated_export_row_is_refused_by_name() {
+    let twenty: Vec<String> = (0..20).map(|n| format!("Check {n}")).collect();
+    let text = format!("# a header\n\n{}\n", twenty.join("\n")).replace("Check 19", "Check 7");
+    let _ = required_contexts_of("export", &text);
+}
+
+/// A name whose matrix this walk cannot read fails the live walk by name.
+#[test]
+#[should_panic(expected = "cannot expand `${{ matrix.shard }}`")]
+fn a_matrix_name_the_walk_cannot_expand_fails_it() {
+    let text = String::from("name: synthetic\non:\n  pull_request:\n  merge_group:\n")
+        + "\njobs:\n  j:\n    name: Test (Linux) shard ${{ matrix.shard }}\n"
+        + "    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+    let _ = walk_required_context_jobs("w.yml", &text, &["Test (Linux) shard 0".to_string()]);
 }
 
 /// The trigger reader and the condition reader, on the forms they have to
