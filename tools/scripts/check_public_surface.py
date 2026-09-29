@@ -27,10 +27,23 @@ DASH_RE = re.compile("[" + DASHES + "]")
 # its own scan (the same trick the sibling gates use for their banned tokens).
 TRACKER_RE = re.compile(r"\b[C]ER-[0-9]+\b")
 TODO_OWNER_RE = re.compile(r"\b(TODO|FIXME)\(([A-Za-z][A-Za-z0-9_.]*)\)")
-# A pictograph from the emoji planes on a shipped page. The check mark and the
-# cross mark a support table draws with (U+2713, U+2717) are typography and
-# stay; a rocket is not typography.
-PICTOGRAPH_RE = re.compile("[\U0001F000-\U0001FAFF]")
+# A pictograph on a shipped page. "Emoji" is not one range, so this is three
+# shapes: the astral emoji planes; a curated BMP set of characters that exist
+# only as a sign or as the emoji twin of a mark (the warning sign, and the heavy
+# and emoji forms of the check mark and the cross); and U+FE0F, the variation
+# selector that forces emoji presentation onto any base character, which is how
+# a plain check mark becomes one.
+# The BARE check mark and ballot X (U+2713, U+2717) STAY: a support table draws
+# its yes and no with them and 28 such cells ship, so refusing them would be a
+# rule against a table rather than against decoration.
+PICTOGRAPH_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"                 # the emoji planes
+    "\u26a0"                                 # warning sign
+    "\u2705\u2714\u274c\u2716\u2718"        # emoji and heavy check, cross, ballot X
+    "\u2b50\u2757\u2764\u2728"              # star, exclamation, heart, sparkles
+    "\ufe0f"                                 # the emoji variation selector
+    "]")
 # The legal entity, which reads the same wherever a shipped file names it.
 # LICENSE is the verbatim licence text and carries the licence author's own
 # holder line, so it is not in the set.
@@ -670,10 +683,12 @@ def compute_dash_counts(root, files):
 
 
 def entity_findings(root, files):
-    """One legal entity spelling across NOTICE, CITATION.cff, README.md and the
-    contributor agreements. Two spellings is a reader asking which company the
-    agreement binds, so the rarer one is the finding and the message names both
-    sides."""
+    """One spelling PER ENTITY across NOTICE, CITATION.cff, README.md and the
+    contributor agreements. Entities are grouped by their first word with commas
+    and periods dropped, so a third-party holder that a NOTICE exists to list is
+    a group of its own and passes; two spellings inside ONE group is a reader
+    asking which company the agreement binds, and the rarer spelling is the
+    finding while the message names both sides."""
     seen = {}
     for f in sorted(files):
         if not ENTITY_FILES_RE.match(f):
@@ -682,19 +697,24 @@ def entity_findings(root, files):
         if txt is None:
             continue
         for m in ENTITY_RE.finditer(txt):
-            name = m.group(1).rstrip(".")
+            name = m.group(1)
             count, where = seen.get(name, (0, None))
             seen[name] = (count + 1, where or (f, line_of(txt, m.start())))
-    if len(seen) < 2:
-        return []
-    ranked = sorted(seen, key=lambda n: (-seen[n][0], n))
-    canonical = ranked[0]
+    groups = {}
+    for name in seen:
+        groups.setdefault(re.sub(r"[.,]", "", name.split()[0]).lower(), []).append(name)
     findings = []
-    for name in ranked[1:]:
-        f, line = seen[name][1]
-        findings.append(Finding("shipped-text", f, line,
-                                "the legal entity reads `%s` here and `%s` in %s: one spelling across the agreements, NOTICE and CITATION.cff"
-                                % (name, canonical, seen[canonical][1][0])))
+    for key in sorted(groups):
+        names = groups[key]
+        if len(names) < 2:
+            continue
+        ranked = sorted(names, key=lambda n: (-seen[n][0], n))
+        canonical = ranked[0]
+        for name in ranked[1:]:
+            f, line = seen[name][1]
+            findings.append(Finding("shipped-text", f, line,
+                                    "the entity reads `%s` here and `%s` in %s: one spelling per entity across NOTICE, CITATION.cff, README.md and the agreements"
+                                    % (name, canonical, seen[canonical][1][0])))
     return findings
 
 
@@ -722,7 +742,9 @@ def check_shipped_text(root, files, phrases, ledger):
                 findings.append(Finding("shipped-text", f, line_of(txt, m.start()), "`%s` is a claim the README contradicts (listed in %s)" % (phrase, PHRASES_FILE)))
         if f.endswith(".md"):
             for m in PICTOGRAPH_RE.finditer(txt):
-                findings.append(Finding("shipped-text", f, line_of(txt, m.start()), "a pictograph on a shipped page: prose says what the product does in words"))
+                findings.append(Finding("shipped-text", f, line_of(txt, m.start()),
+                                        "a pictograph on a shipped page (U+%04X): prose says what the product does in words"
+                                        % ord(m.group(0))))
     findings.extend(entity_findings(root, files))
     for path in sorted(ledger):
         if path not in files or is_test_path(path):
@@ -1392,6 +1414,8 @@ Paths: `crates/cerulion_core/src/wire.rs` is fine, `cerulion_core/src/wire.rs` i
 RUSTFLOOR is a claim the README contradicts; this page is still UNPUBLISHED. A dash here: a \u2014 b.
 
 Support: yes \u2713 and no \u2717 are typography and stay; a rocket \U0001F680 is not. Join the WAITWORD today.
+
+\u26a0\ufe0f A sign with a variation selector on a heading is decoration, not a warning.
 """.replace("WAITWORD", "wait" + "list").replace("RUSTFLOOR", "Rust 1." + "88").replace("UNPUBLISHED", "not yet published" + " to crates.io")
 
 FIXTURE_DAMAGED = '''fn topics() {
@@ -1510,12 +1534,21 @@ def build_fixture(root):
     _put(root, "crates/ws_ledger/src/below.rs", "// chunk 1 wired the seam\npub fn f() {}\n")
     _put(root, "docs/ws_page.md", "# Limits\n\nThe honest wall is client isolation.\n")
     _put(root, "docs/ws_allowed.md", "# Recording\n\nA reader seeks to seq 0 in chunk 2 of the file.\n")
+    # An allow entry names ONE line: two waivers here, and a third line of the
+    # same wording that nothing excuses and the gate must still report.
+    _put(root, "crates/ws_allowed/src/lib.rs",
+         "// Undo: git revert <this commit> to put the file back\n"
+         "// the tool does not reverse this commit either\n"
+         "// this commit renames the flag with nothing excusing it\n"
+         "pub fn k() {}\n")
     _put(root, "docs/benchmarks/results/pkg-cited/run.log", "pass-5 on the box: raw evidence is never rewritten\n")
     _put(root, "docs/legal/HISTORY.md", "# History\n\nThe founders relicensed the tree.\n")
     _put(root, ALLOW_FILE, "# fixture allow list\n"
          "crates/ws_ledger/src/at.rs | work-state | seq 0 in chunk 7 | an MCAP chunk index is the recording format's own number\n"
          "docs/ws_allowed.md | work-state | seq 0 in chunk 2 | an MCAP chunk index is the recording format's own number\n"
          "examples/gate_only | examples-shape | no Cargo.toml | a container gate, not a workspace: the maintainer ruling is pending\n"
+         "crates/ws_allowed/src/lib.rs | work-state | git revert <this commit> | the undo instruction names the reader's own commit\n"
+         "crates/ws_allowed/src/lib.rs | work-state | does not reverse this commit | the refusal names the reader's own commit\n"
          "docs/never.md | docs-refs | * | a stale entry that excuses nothing and must be reported\n")
     _put(root, LEDGER_FILE, LEDGER_HEADER + "1 crates/lib_ledgered/src/lib.rs\n3 crates/lib_stale/src/lib.rs\n2 crates/gone/src/lib.rs\n")
     _put(root, CLI_FILE, FIXTURE_CLI)
@@ -1533,7 +1566,10 @@ def build_fixture(root):
     _put(root, ".github/workflows/ci.yml", "name: CI \u2014 dashed\non: push\njobs:\n  a:\n    steps:\n      - name: plain step\n        run: echo hi # a \u2014 comment\n")
     _put(root, "CHANGELOG.md", "## 0.2.0\n- C" + "ER-999 may be cited here\n")
     _put(root, "README.md", FIXTURE_README + "\nPublished by Acme Inc.\n")
-    _put(root, "CITATION.cff", 'cff-version: 1.2.0\nauthors:\n  - name: "Beta Systems Inc. and contributors"\n')
+    _put(root, "CITATION.cff",
+         'cff-version: 1.2.0\nauthors:\n  - name: "Acme, Inc. and contributors"\n'
+         '# a third-party holder a NOTICE exists to list is its own group and passes\n'
+         'notice: "portions copyright Eclipse Foundation Inc."\n')
     _put(root, "docs/page.md", FIXTURE_PAGE)
     _put(root, "docs/PERFORMANCE.md", "# Performance\n\nThe 64 B p50 is 4.08 µs.\n")
     _put(root, "docs/media/used.svg", "<svg/>\n")
@@ -1610,8 +1646,11 @@ EXPECTED = [
     ("shipped-text", "docs/page.md", "`Rust 1." + "88` is a claim"),
     ("shipped-text", "docs/page.md", "`not yet published" + " to crates.io` is a claim"),
     ("shipped-text", "docs/page.md", "`" + "wait" + "list` is a claim"),
-    ("shipped-text", "docs/page.md", "a pictograph on a shipped page"),
-    ("shipped-text", "CITATION.cff", "the legal entity reads `Beta Systems Inc` here and `Acme Inc` in README.md"),
+    ("shipped-text", "docs/page.md", "a pictograph on a shipped page (U+1F680)"),
+    ("shipped-text", "docs/page.md", "a pictograph on a shipped page (U+26A0)"),
+    ("shipped-text", "docs/page.md", "a pictograph on a shipped page (U+FE0F)"),
+    ("shipped-text", "CITATION.cff", "the entity reads `Acme, Inc.` here and `Acme Inc.` in README.md"),
+    ("work-state", "crates/ws_allowed/src/lib.rs", "`history-voice` wording `this commit`: `// this commit renames the flag with nothing excusing it`"),
     ("work-state", "crates/ws/tests/it.rs", "`plan-step` wording `Phase 4`"),
     ("work-state", "crates/ws_ledger/src/above.rs", "`plan-step` wording `chunk 1`: `// chunk 1 wired the seam` (2 such lines in the file, the ledger allows 1)"),
     ("work-state", "crates/ws_ledger/src/above.rs", "`plan-step` wording `chunk 2`: `// chunk 2 wired the drain` (2 such lines in the file, the ledger allows 1)"),
@@ -1691,7 +1730,8 @@ def self_test(out=sys.stdout):
             arm("control:" + path, not any(l.startswith(path + ":") for l in findings), "\n" + text)
         for sub in ("`cerulion graph run`", "`cerulion graph validate`", "`cerulion graph run-worker`", "`cerulion ros`", "`cerulion viz`",
                     "`cerulion make-it-so`", "`cerulion account devices list`", "graph bogus", "figure 4.08", "figure 5.54", "figure 15.89",
-                    "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717"):
+                    "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717",
+                    "Eclipse Foundation", "git revert <this commit>", "does not reverse this commit"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
         # its own key, and the legitimate neighbour fires no key at all.

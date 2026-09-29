@@ -23,4 +23,5 @@ tools/scripts/check_agents_md.sh | work-state | see pt56 for the measurement | a
 .github/CONTRIBUTING.md | work-state | coming soon | maintainer ruling: the Discord row announces the chat as coming
 docs/media/charts/build_benchmark_plots.py | work-state | coming soon | maintainer ruling: the macOS latency improvement is announced as coming
 docs/media/platform-rtt.svg | work-state | coming soon | maintainer ruling: the macOS latency improvement is announced as coming
-crates/cerulion_cli_engine/src/ros2_migrate.rs | work-state | this commit | the undo instructions name the reader's own commit, which is what git revert takes
+crates/cerulion_cli_engine/src/ros2_migrate.rs | work-state | git revert <this commit> | the undo instruction names the reader's own commit, which is what git revert takes
+crates/cerulion_cli_engine/src/ros2_migrate.rs | work-state | does not reverse this commit | the refusal names the reader's own commit, which is what git apply would reverse

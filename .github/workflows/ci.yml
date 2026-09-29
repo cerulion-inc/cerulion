@@ -851,10 +851,13 @@ jobs:
       # remedy line per class, and it belongs in `lint` for the same reason the
       # gates above do: pure python3 over `git ls-files`, no cargo, seconds.
       #
-      # The same class also keeps a page in words (no pictograph from the
-      # emoji planes; the check mark and cross mark a support table draws with
-      # are typography and stay) and holds the legal entity to ONE spelling
-      # across NOTICE, CITATION.cff, README.md and the contributor agreements.
+      # The same class also keeps a page in words (no pictograph: the emoji
+      # planes, a curated set of sign and emoji-twin characters, and the
+      # variation selector that forces emoji presentation; the BARE check mark
+      # and ballot X a support table draws with are typography and stay) and
+      # holds each entity to ONE spelling across NOTICE, CITATION.cff,
+      # README.md and the contributor agreements, grouping by first word so a
+      # third-party holder a NOTICE exists to list passes.
       #
       # It reads data files beside it: an allow list whose entries name
       # one finding each and FAIL when stale, a phrase list of claims the

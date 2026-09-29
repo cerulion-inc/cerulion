@@ -65,14 +65,28 @@
 #                         (d) no phrase from `public_surface_phrases.txt`, a
 #                             data file of claims the README contradicts (it
 #                             grows the day the README changes a fact).
-#                         (e) no pictograph from the emoji planes on a `.md`
-#                             page: prose says what the product does in words.
-#                             The check mark and cross mark a support table
-#                             draws with are typography and stay.
-#                         (f) ONE legal entity spelling across NOTICE,
+#                         (e) no pictograph on a `.md` page: prose says what
+#                             the product does in words. Three shapes, because
+#                             "emoji" is not one range: the astral emoji
+#                             planes; a curated set of characters that exist
+#                             only as a sign or as the emoji twin of a mark
+#                             (the warning sign, the heavy and emoji check,
+#                             cross and ballot X, star, exclamation, heart,
+#                             sparkles); and U+FE0F, the variation selector
+#                             that forces emoji presentation onto any base
+#                             character, which is how a plain check mark
+#                             becomes one. The BARE check mark and ballot X
+#                             STAY: a support table draws its yes and no with
+#                             them and 28 such cells ship, so refusing them
+#                             would be a rule against a table.
+#                         (f) ONE spelling PER ENTITY across NOTICE,
 #                             CITATION.cff, README.md and the contributor
-#                             agreements: two spellings leave a reader asking
-#                             which company the agreement binds. LICENSE is the
+#                             agreements. Entities group by their first word
+#                             with commas and periods dropped, so a
+#                             third-party holder that a NOTICE exists to list
+#                             is a group of its own and passes; two spellings
+#                             inside ONE group leave a reader asking which
+#                             company the agreement binds. LICENSE is the
 #                             verbatim licence text and carries the licence
 #                             author's own holder line, so it is outside the
 #                             set. The rarer spelling is the finding and the
