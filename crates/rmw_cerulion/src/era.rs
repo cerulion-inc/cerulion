@@ -2034,7 +2034,8 @@ mod tests {
         );
         for member in members {
             assert!(
-                era.remedy().contains(&format!("/opt/ros/{member}/setup.bash")),
+                era.remedy()
+                    .contains(&format!("/opt/ros/{member}/setup.bash")),
                 "the era-claim remedy must name {member}: {}",
                 era.remedy()
             );

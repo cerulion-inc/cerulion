@@ -1921,11 +1921,17 @@ fn the_strip_matcher_reads_spaced_split_and_commented_calls() {
     // rather than only under a one-off planted mutant. The oracle is the
     // hand-written classification of each fixture.
     let mut constants = std::collections::HashMap::new();
-    constants.insert("RUNTIME_DISTRO_ENV".to_string(), RUNTIME_DISTRO_ENV.to_string());
+    constants.insert(
+        "RUNTIME_DISTRO_ENV".to_string(),
+        RUNTIME_DISTRO_ENV.to_string(),
+    );
 
     // A space before the paren.
     assert_eq!(
-        scan_removal_sites("fn f() { std::env::remove_var (RUNTIME_DISTRO_ENV); }", &constants),
+        scan_removal_sites(
+            "fn f() { std::env::remove_var (RUNTIME_DISTRO_ENV); }",
+            &constants
+        ),
         (1, 0, vec![]),
         "a space before the paren must be counted, not skipped"
     );
@@ -1938,13 +1944,19 @@ fn the_strip_matcher_reads_spaced_split_and_commented_calls() {
     );
     // A block comment sitting between the identifier and the paren.
     assert_eq!(
-        scan_removal_sites("fn f() { remove_var /* here */ (RUNTIME_DISTRO_ENV); }", &constants),
+        scan_removal_sites(
+            "fn f() { remove_var /* here */ (RUNTIME_DISTRO_ENV); }",
+            &constants
+        ),
         (1, 0, vec![]),
         "a block comment before the paren must not hide the call"
     );
     // An argument that never closes: fail-closed to unreadable, never a silent pass.
     assert_eq!(
-        scan_removal_sites("fn f() { std::env::remove_var(RUNTIME_DISTRO_ENV", &constants),
+        scan_removal_sites(
+            "fn f() { std::env::remove_var(RUNTIME_DISTRO_ENV",
+            &constants
+        ),
         (0, 0, vec![1]),
         "an unclosed argument must land in unreadable rather than pass"
     );
@@ -1968,7 +1980,10 @@ fn the_strip_matcher_fails_closed_on_a_slash_star_from_a_multiline_string() {
     // carrying block-comment depth across newlines drops the strip and turns
     // both cases red here.
     let mut constants = std::collections::HashMap::new();
-    constants.insert("RUNTIME_DISTRO_ENV".to_string(), RUNTIME_DISTRO_ENV.to_string());
+    constants.insert(
+        "RUNTIME_DISTRO_ENV".to_string(),
+        RUNTIME_DISTRO_ENV.to_string(),
+    );
 
     let not_silently_dropped = |src: &str, what: &str| {
         let (distro, _opaque, unreadable) = scan_removal_sites(src, &constants);
