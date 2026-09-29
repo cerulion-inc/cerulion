@@ -2072,8 +2072,6 @@ def self_test(out=sys.stdout):
         TRAILING_SUFFIX_RE.match(" LLC") is not None
         and TRAILING_SUFFIX_RE.match("\nAB Volvo") is None
         and TRAILING_SUFFIX_RE.match(" ab initio") is None)
-    arm("the-floor-cannot-be-waived",
-        any(n in "the declared legal name `x` is written nowhere in shipped text" for n in NEVER_EXCUSED))
     arm("the-suffix-family-is-the-list-it-is-meant-to-be",
         LEGAL_SUFFIX_WORDS == ("Inc", "Inc.", "Incorporated", "Corp", "Corp.", "Corporation", "Co.",
                                "LLC", "LLP", "Ltd", "Ltd.", "Limited", "PLC", "GmbH", "AG",
@@ -2184,6 +2182,18 @@ def self_test(out=sys.stdout):
         arm("a-tree-that-never-writes-the-name-is-a-finding",
             rc2c == 1 and "is written nowhere in shipped text" in buf2c.getvalue()
             and "in 0 mention(s)" in buf2c.getvalue(), buf2c.getvalue())
+        # And that finding CANNOT be waived. An allow entry naming it is ignored
+        # and is itself reported as a waiver that excused nothing. This runs the
+        # tree with the waiver in place: asserting the constant holds the message
+        # would pass with the guard deleted from run_tree.
+        _put(clean, ALLOW_FILE,
+             "%s | shipped-text | is written nowhere | the floor is the guard this class stands behind\n" % ENTITY_FILE)
+        buf2d = io.StringIO()
+        rc2d = run_tree(clean, buf2d)
+        arm("the-floor-cannot-be-waived",
+            rc2d == 1 and "is written nowhere in shipped text" in buf2d.getvalue()
+            and "stale allow entry" in buf2d.getvalue(), buf2d.getvalue())
+        os.remove(os.path.join(clean, ALLOW_FILE))
         _put(clean, "README.md", named)
         # The text cache is keyed by (root, path) for the life of the process, so a
         # SECOND pass over this tree has to read each file as it is NOW. Each of the
