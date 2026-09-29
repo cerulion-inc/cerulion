@@ -567,7 +567,7 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
     stop.store(true, Ordering::Relaxed);
     ringer.join().expect("ringer thread panicked");
 
-    let (entries, _listener, doorbell, _timeout) = runtime.park_wake_counts();
+    let (entries, _listener, doorbell, timeout) = runtime.park_wake_counts();
     assert!(
         entries > 0,
         "the parked live drive must route its idle through the park"
@@ -576,6 +576,17 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
         doorbell >= 1,
         "a doorbell ring landing inside a park window must be attributed to the \
          DOORBELL wake counter — got {doorbell} across {entries} park entries"
+    );
+    // The claim the product makes is that the ring ENDS the park, not that the
+    // park happens to end. A block that timed out at its slice would satisfy
+    // `doorbell >= 1` just as well, because the loop-top poll then attributes the
+    // ring it finds. The ringer runs at 200 microseconds against a 50 millisecond
+    // window, so every park entry here has a ring inside it and NONE may reach
+    // its timeout.
+    assert_eq!(
+        timeout, 0,
+        "a park window with a ring inside it must be ended by the ring, never by \
+         its own timeout - got {timeout} timeouts across {entries} park entries"
     );
     assert_eq!(
         fires.load(Ordering::Relaxed),
@@ -935,6 +946,17 @@ fn degraded_default_policy_parks_fires_and_delivers() {
             );
         }
     }
+    // The NEGATIVE control for the doorbell rung, and the premise every other
+    // pin of this shared counter rests on: this policy has the doorbell OFF, so
+    // the rung must decline and the counter must stay at zero. Without it, a
+    // rung that ignored `policy.doorbell()` would be caught by nothing.
+    assert_eq!(
+        runtime.park_wake_word_block_count_for_test(),
+        0,
+        "the doorbell is off on this policy, so no wake-word block may run: this \
+         graph has no barrier participant and no credit edge either, so any \
+         count here can only have come from the doorbell rung"
+    );
     runtime.shutdown();
 }
 

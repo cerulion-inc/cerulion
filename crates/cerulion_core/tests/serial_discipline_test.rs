@@ -462,6 +462,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point; the parent runs it with `--exact … --ignored` and reads the park decision it prints",
     ),
     (
+        "doorbell_os_sync_independence_test.rs",
+        "child_prints_doorbell_primitive_availability",
+        "child",
+        "self-re-exec entry point; the parent runs it with `--exact … --ignored` and reads the wake-word block decision it prints",
+    ),
+    (
         "cdylib_iox2_log_level_test.rs",
         "subprocess_child_cdylib_level_probe",
         "child",
