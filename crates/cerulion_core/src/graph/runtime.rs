@@ -2040,6 +2040,30 @@ fn set_nonblocking(raw: std::os::unix::io::RawFd, node_id: &Arc<str>) -> bool {
 /// recheck — the timer backstop bounds it to ≤recheck, the same discipline as an
 /// ignored listener `try_wait_one` error; it is never mistaken for a wake and
 /// never panics.
+/// Does the DOORBELL rung of the park's `!performed` arm apply at all?
+///
+/// Every term is a separate reason for the rung to decline, and the caller maps
+/// a `false` here to `AddrParkOutcome::Unavailable`:
+/// - the policy did not arm the doorbell, so the producer never rings;
+/// - this host has no wake word a consumer can kernel-block on;
+/// - the graph has no doorbell registry, so no page is mapped;
+/// - no baseline snapshot was taken, so a ring cannot be re-derived;
+/// - the registry is empty, so there is no primary line to watch.
+///
+/// Pure and compiled on every OS so the table is pinned where the rung itself is
+/// not built: on a target where the rung is compiled out, a term deleted here is
+/// invisible to every macOS test that could have caught it.
+#[cfg(any(target_os = "macos", test))]
+fn doorbell_rung_applies(
+    policy_doorbell: bool,
+    wake_word_available: bool,
+    has_registry: bool,
+    has_baseline: bool,
+    has_primary: bool,
+) -> bool {
+    policy_doorbell && wake_word_available && has_registry && has_baseline && has_primary
+}
+
 fn park_poll_fd_ready(raw: std::os::unix::io::RawFd) -> bool {
     let mut pfd = libc::pollfd {
         fd: raw,
@@ -12364,12 +12388,17 @@ impl GraphRuntime {
         cap: Duration,
     ) -> crate::monitor_wait::AddrParkOutcome {
         use crate::monitor_wait::AddrParkOutcome;
-        if !self.monitor_wait_policy.doorbell()
-            || !crate::doorbell::wake_word_block_primitive_available()
-        {
+        let reg = self.doorbell_registry.as_ref();
+        if !doorbell_rung_applies(
+            self.monitor_wait_policy.doorbell(),
+            crate::doorbell::wake_word_block_primitive_available(),
+            reg.is_some(),
+            baseline.is_some(),
+            reg.is_some_and(|r| r.primary().is_some()),
+        ) {
             return AddrParkOutcome::Unavailable;
         }
-        let (Some(reg), Some(base)) = (self.doorbell_registry.as_ref(), baseline) else {
+        let (Some(reg), Some(base)) = (reg, baseline) else {
             return AddrParkOutcome::Unavailable;
         };
         let Some(bell) = reg.primary() else {
@@ -12377,19 +12406,17 @@ impl GraphRuntime {
         };
         // The parked claim is scoped to THIS block sequence: taken BEFORE the
         // snapshot and the re-derive (the store-buffer litmus order), released by
-        // the guard on every exit path including an unwind.
-        let _guard = crate::doorbell::ParkedDoorbellGuard::enter(bell);
-        let snap = bell.wake_seq_snapshot();
+        // the guard on every exit path including an unwind. The snapshot and the
+        // wait come off the GUARD, so the three statements cannot be written out
+        // of order.
+        let guard = crate::doorbell::ParkedDoorbellGuard::enter(bell);
+        let snap = guard.snapshot();
         if reg.any_advanced_since(base) {
             // A ring is already in hand: skip the block AND the nap; the loop-top
             // re-poll returns with it immediately.
             return AddrParkOutcome::RingPending;
         }
-        if bell.park_wait_ring(snap, cap) {
-            AddrParkOutcome::Parked
-        } else {
-            AddrParkOutcome::Unavailable
-        }
+        guard.wait(snap, cap)
     }
 
     /// The shallow monitor-wait replacement for the blocking WaitSet
@@ -13329,10 +13356,19 @@ impl GraphRuntime {
         // monitor-wait park active", but a spawned worker never runs that arm — so
         // surface the same fact here where the live loop actually decides how to
         // idle (the observability gap an earlier investigation fell into).
+        //
+        // `data_wake` is the fact the macOS doorbell rung turns on, stated here
+        // because it is decided per process: the supervisor resolves the policy
+        // and stamps it, and the shared os_sync family can latch off in THIS
+        // process after that. Without it the run's only statement about the wake
+        // word is the CLI's resolution line, which a worker never prints.
         tracing::info!(
             graph = %self.config.identity(),
             park_active = self.park_active(),
             doorbell = self.doorbell_registry.is_some(),
+            data_wake = self.monitor_wait_policy.doorbell()
+                && self.doorbell_registry.is_some()
+                && crate::doorbell::wake_word_block_primitive_available(),
             barrier = self.barrier_participant.is_some(),
             credit_edges = self.credit_park_edges.len(),
             primary_topic = tracing::field::display(
@@ -17357,6 +17393,36 @@ mod tests {
     use crate::graph::node::OutputMeta;
     use serial_test::serial;
     use tracing_test::traced_test;
+
+    /// The doorbell rung's decision table, over injected facts. Pinned on every
+    /// OS, because on a target where the rung is compiled out a term deleted
+    /// from the conjunction is invisible to every test that could catch it, and
+    /// three of the five terms are redundant at today's call site (an armed
+    /// policy doorbell implies a registry implies a baseline), so deleting one
+    /// changes nothing observable until the day it does.
+    #[test]
+    fn the_doorbell_rung_applies_only_when_every_term_holds() {
+        assert!(
+            doorbell_rung_applies(true, true, true, true, true),
+            "every term holds, so the rung runs"
+        );
+        for (i, (policy, wake, reg, base, primary)) in [
+            (false, true, true, true, true),
+            (true, false, true, true, true),
+            (true, true, false, true, true),
+            (true, true, true, false, true),
+            (true, true, true, true, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                !doorbell_rung_applies(policy, wake, reg, base, primary),
+                "term {i} is load-bearing: with it false the rung must decline \
+                 and the caller must nap"
+            );
+        }
+    }
 
     /// Build an `OutputMeta` with an explicit schema-default
     /// `max_slice_len` (tier-2). `bytes` must be `>= WireHeader::SIZE`
