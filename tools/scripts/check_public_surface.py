@@ -51,10 +51,6 @@ PICTOGRAPH_RE = re.compile(
 # reordering, a translated line or a deleted line hands it a vendor's name and
 # it goes on policing that, green. Declared inputs, parsed outputs.
 ENTITY_FILE = "tools/scripts/public_surface_entity.txt"
-# The suffix family. `Co.` carries its period, because a bare `Co` matches the
-# first half of a hyphenated word. The trailing guard is what keeps `Inc` out of
-# `Incidentally`; the order of the alternatives is cosmetic, since the guard
-# forces the backtrack either way.
 # THE ONE LIST. The family a mention may end in, the family a refusal names, and
 # the characters a declared name may hold all come from here, so the three can
 # never disagree again. `Co.` is spelled only with its period, because a bare
@@ -2053,9 +2049,8 @@ def self_test(out=sys.stdout):
     # 1: the per-suffix arms below are GENERATED from this list, so a member that
     # is deleted deletes its own arm. This second copy is deliberate: it is the
     # only thing that makes a deletion loud.
-    # A declared form without a period reads the same at the end of a sentence:
-    # the full stop is punctuation, not a second spelling.
-    # A final full stop is punctuation BOTH ways, and nothing else is.
+    # A final full stop is ASYMMETRIC: one the page added is punctuation, one it
+    # dropped is a finding. Nothing else about a mention is forgiven.
     arm("a-final-stop-is-punctuation-when-the-declaration-omits-it",
         all(mention_is_the_declared_spelling(
                 legal_name_mentions_checked(d).search("Shipped by %s. Next." % d).group(0), d)
@@ -2074,6 +2069,18 @@ def self_test(out=sys.stdout):
         TRAILING_SUFFIX_RE.match(" LLC") is not None
         and TRAILING_SUFFIX_RE.match("\nAB Volvo") is None
         and TRAILING_SUFFIX_RE.match(" ab initio") is None)
+    # The shell header carries a THIRD copy of the family, in prose a contributor
+    # reads. A comment cannot derive from the constant, so it is pinned instead.
+    try:
+        _sh = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_public_surface.sh"),
+                   encoding="utf-8").read()
+        _sh_family = _sh.split("THE SUFFIX FAMILY is", 1)[1].split("That one", 1)[0]
+        _sh_family = " ".join(_sh_family.replace("#", " ").split())
+    except (OSError, IndexError):
+        _sh_family = ""
+    arm("the-header-names-the-family-the-pattern-holds",
+        all(re.search(r"(?<![A-Za-z.])" + re.escape(w) + r"(?![A-Za-z])", _sh_family) for w in LEGAL_SUFFIX_WORDS),
+        repr(_sh_family))
     arm("the-suffix-family-is-the-list-it-is-meant-to-be",
         LEGAL_SUFFIX_WORDS == ("Inc", "Inc.", "Incorporated", "Corp", "Corp.", "Corporation", "Co.",
                                "LLC", "LLP", "Ltd", "Ltd.", "Limited", "PLC", "GmbH", "AG",

@@ -88,46 +88,64 @@
 #                             its own input takes whichever line comes first,
 #                             and a rename, a reordering or a deleted line
 #                             hands it a vendor's name to police, green. An
-#                             absent file, an empty one, a second line, or a
-#                             line carrying leading or trailing whitespace is
-#                             exit 3. Every mention of the declared name is
-#                             then found case-insensitively, keyed on its first
-#                             word and the name's OWN other words, so a mention
-#                             that drops one of them is still judged (a mention
-#                             that ADDS a word the name does not have is not a
-#                             mention of it), across a comma and one line break
-#                             PER GAP, so a name written down a list of items
-#                             is a finding to waive: a wrapped name in a narrow
-#                             comment column is worth more than the noise
-#                             with the comment or quote prefix a wrapped line
-#                             carries (a blank line ends the sentence and is
-#                             not a wrap), and over the suffix family
-#                             (Inc, Inc., Incorporated, Corp, Corp.,
-#                             Corporation, Co., LLC, LLP, Ltd, Ltd., Limited,
-#                             PLC, GmbH, AG, S.A., B.V., AB, Oy, A/S). That one
-#                             list also decides which characters a declared name
-#                             may hold, so a suffix the rule accepts can never
-#                             be one a declaration may not spell. `Co.` carries
-#                             its period, because a bare `Co` matches the first
-#                             half of a hyphenated word. A mention whose raw
-#                             text is not the declared spelling is a finding.
-#                             A FINAL FULL STOP is asymmetric: one the page
-#                             ADDED is punctuation, since a declared `Ltd` at a
-#                             sentence end cannot be told from the same name
-#                             plus a stop; one the page DROPPED is a finding,
-#                             since the family matches longest first and so
-#                             carries the stop whenever the page wrote one.
-#                             Everything else is exact, the letters, their case,
-#                             the comma before the suffix, and which word of the
-#                             family the suffix is. and a SECOND suffix behind a correct
-#                             mention is a finding of its own: one form of the
-#                             name, not two. A word in front of the name is not part
-#                             of a mention, because the scan starts at the name.
-#                             A third-party holder is a candidate only where it
-#                             SHARES the name's first word, which the allow list
-#                             carries when it happens. `Co.` keeps its period,
-#                             so a bare `Co` is the one suffix spelling this
+#                             absent file, an empty one, a second line, a line
+#                             carrying whitespace or a character a reader
+#                             cannot see, a name that is only a suffix, and a
+#                             name the rule cannot find whole are each exit 3.
+#                             A mention is the declared name's first word, then
+#                             the name's OWN other words, then a suffix of the
+#                             family. A mention that DROPS one of those words is
+#                             still judged; one that ADDS a word the name does
+#                             not have is not a mention of it. Between the words
+#                             may stand a comma or ONE line break per gap, with
+#                             the comment or quote prefix a wrapped line carries
+#                             (a blank line ends the sentence and is not a
+#                             wrap). A name written down a list of items is
+#                             therefore a finding to waive: seeing a name
+#                             wrapped in a narrow comment column is worth that
+#                             noise.
+#                             THE SUFFIX FAMILY is Inc, Inc., Incorporated,
+#                             Corp, Corp., Corporation, Co., LLC, LLP, Ltd,
+#                             Ltd., Limited, PLC, GmbH, AG, S.A., B.V., AB, Oy,
+#                             A/S. That one list also decides which characters
+#                             a declared name may hold, so a suffix the rule
+#                             accepts can never be one a declaration may not
+#                             spell. It is matched LONGEST FIRST, so a page
+#                             writing the period gets the form with it. `Co.`
+#                             keeps its period, because a bare `Co` would match
+#                             the first half of a hyphenated word, and a bare
+#                             `Co` is therefore the one suffix spelling this
 #                             does not see.
+#                             A mention whose text is not the declared spelling
+#                             is a finding. A FINAL FULL STOP is asymmetric: one
+#                             the page ADDED is punctuation, since a declared
+#                             `Ltd` at a sentence end cannot be told from the
+#                             same name plus a stop; one the page DROPPED is a
+#                             finding, since the family matches longest first
+#                             and so carries the stop whenever the page wrote
+#                             one. Everything else is exact: the letters, their
+#                             case, the comma before the suffix, and which word
+#                             of the family the suffix is.
+#                             A SECOND suffix behind a correct mention, ON THE
+#                             SAME LINE, is a finding of its own: one form of
+#                             the name, not two. Across a line break it would
+#                             read the next line's opening word, and several
+#                             countries write the form first. That check is
+#                             case SENSITIVE, deliberately: an upper-case `AB`
+#                             after the name is a company form, a lower-case
+#                             `ab` is an English or a Latin word.
+#                             A word in front of the name is not part of a
+#                             mention, because the scan starts at the name. A
+#                             third-party holder is a candidate only where its
+#                             own name IS the declared name followed by a
+#                             suffix; a holder carrying a word the declared name
+#                             does not have is not a mention of it.
+#                             ZERO mentions is a finding, not a clean run: a
+#                             declaration the scan never matches reads the same
+#                             green as a tree where every mention is right. The
+#                             summary line carries the declared spelling and the
+#                             number of mentions judged, and no allow entry may
+#                             excuse the zero.
 #   work-state            Shipped text describes the product to its user: what
 #                         works, what is experimental, what is not supported,
 #                         what to do. It never reports how the project was
