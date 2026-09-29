@@ -2226,6 +2226,58 @@ jobs:
       # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
       # on shard 2, which is why shard 2 gets the lightest package set below).
       # ---------------------------------------------------------------
+      # Descriptor sampler, recording only what it can read. The kernel's
+      # open-file counters at 10 Hz on one line per tick, and once a second a
+      # second line with the count of live `iox2_` shared memory objects
+      # (counted through their `.shm_state` records, the only enumeration macOS
+      # offers) and an `lsof` descriptor count for up to five processes whose
+      # command line names this checkout. The log is uploaded whatever the
+      # outcome and is quoted in part by the snapshot step at the end of the
+      # job. `lsof` runs at 1 Hz rather than 10 because it costs a process per
+      # pid per tick.
+      - name: Start the descriptor sampler
+        run: |
+          cat > "$RUNNER_TEMP/sampler.py" <<'PY'
+          import datetime, glob, subprocess, sys, time
+
+          log, tick = sys.argv[1], 0
+          with open(log, "a", buffering=1) as f:
+              while True:
+                  now = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                  try:
+                      out = subprocess.run(
+                          ["sysctl", "-n", "kern.num_files", "kern.maxfiles", "kern.maxfilesperproc"],
+                          capture_output=True, text=True, timeout=2).stdout.split()
+                  except Exception:
+                      out = []
+                  nf, mx, mp = (out + ["?", "?", "?"])[:3]
+                  f.write("%s table num_files=%s maxfiles=%s maxfilesperproc=%s\n" % (now, nf, mx, mp))
+                  if tick % 10 == 0:
+                      iox = len(glob.glob("/tmp/iox2_*.shm_state"))
+                      allshm = len(glob.glob("/tmp/*.shm_state"))
+                      pids = subprocess.run(["pgrep", "-f", "cerulion"],
+                                            capture_output=True, text=True).stdout.split()[:5]
+                      fds = []
+                      for pid in pids:
+                          n = subprocess.run("lsof -nP -p %s 2>/dev/null | wc -l" % pid,
+                                             shell=True, capture_output=True, text=True).stdout.strip()
+                          fds.append("%s:%s" % (pid, n))
+                      f.write("%s procs iox2_objects=%d shm_state_total=%d fds=%s\n"
+                              % (now, iox, allshm, " ".join(fds) or "none"))
+                  tick += 1
+                  time.sleep(0.1)
+          PY
+          nohup python3 "$RUNNER_TEMP/sampler.py" "$RUNNER_TEMP/descriptors.log" >/dev/null 2>&1 &
+          echo $! > "$RUNNER_TEMP/sampler.pid"
+          echo "sampler pid $(cat "$RUNNER_TEMP/sampler.pid")"
+
+      # The three credit death arms ahead of the shard's normal list, so the
+      # sampler window around them is short. `CLI binary tests` below runs the
+      # whole binary again, these three included.
+      - name: Credit death arms first (shard 0)
+        if: matrix.shard == 0
+        run: cargo test -p cerulion_cli --test credit_death_e2e_test c7_ -- --test-threads=1
+
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
 
@@ -2380,6 +2432,37 @@ jobs:
       - name: cargo test -p cerulion_viz --test video_decode_test
         if: matrix.shard == 2
         run: cargo test -p cerulion_viz --test video_decode_test -- --test-threads=1
+
+      # The same set once, at the moment a step failed, so the numbers do not
+      # have to be recovered from the artifact. `getrlimit` is read from inside
+      # a process this step starts, because the limit a running process holds
+      # is the one it inherited and not what `launchctl limit` reports.
+      - name: Descriptor snapshot on failure
+        if: ${{ failure() }}
+        run: |
+          sysctl kern.num_files kern.maxfiles kern.maxfilesperproc || true
+          python3 -c 'import resource; s, h = resource.getrlimit(resource.RLIMIT_NOFILE); print("getrlimit RLIMIT_NOFILE soft", s, "hard", h)'
+          echo "ulimit -n soft $(ulimit -Sn) hard $(ulimit -Hn)"
+          echo "launchctl limit maxfiles: $(launchctl limit maxfiles)"
+          echo "live iox2_ objects: $(ls /tmp/iox2_*.shm_state 2>/dev/null | wc -l)"
+          echo "shm_state records total: $(ls /tmp/*.shm_state 2>/dev/null | wc -l)"
+          for pid in $(pgrep -f cerulion | head -5); do
+            echo "fds $pid: $(lsof -nP -p "$pid" 2>/dev/null | wc -l)"
+          done
+          echo "--- last 200 sampler lines ---"
+          tail -200 "$RUNNER_TEMP/descriptors.log" 2>/dev/null || echo "no sampler log"
+
+      - name: Stop the descriptor sampler
+        if: ${{ always() }}
+        run: kill "$(cat "$RUNNER_TEMP/sampler.pid" 2>/dev/null)" 2>/dev/null || true
+
+      - name: Upload the descriptor sampler log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: descriptors-macos-shard-${{ matrix.shard }}-${{ github.sha }}
+          path: ${{ runner.temp }}/descriptors.log
+          if-no-files-found: warn
 
   # ==========================================================================
   # The packages that ran in NO job.
