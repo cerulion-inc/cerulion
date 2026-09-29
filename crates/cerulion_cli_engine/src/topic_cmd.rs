@@ -378,8 +378,8 @@ impl std::ops::Deref for ScopedSubscriber {
 /// is gone) is a STALE mirror — do NOT surface its misleading "verify your graph
 /// YAML" LOCAL error; FALL THROUGH to the netd demand rung.
 /// `--local` or the `CERULION_NETWORK=off` kill-switch skips the remote rung. The demand
-/// is held by the subscriber's [`DemandGuard`]: process exit — including a clean Ctrl-C
-/// — closes its UDS connection → netd releases the demand (the crash-safe
+/// is held by the subscriber's [`DemandGuard`]. Process exit (including Ctrl-C)
+/// closes its UDS connection → netd releases the demand (the crash-safe
 /// refcount). A topic found NOWHERE errors precisely, naming that both local AND
 /// remote were searched.
 fn ensure_topic_available(
