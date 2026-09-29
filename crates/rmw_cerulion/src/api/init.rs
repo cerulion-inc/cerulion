@@ -33,6 +33,14 @@ pub unsafe extern "C" fn rmw_get_serialization_format() -> *const c_char {
 /// this build's size over the caller's smaller `dst`; `fini` zeroes
 /// it. So every one of those entry points asks this first.
 ///
+/// Two verdicts refuse, both from the ONE classifier
+/// ([`crate::era::runtime_load_refusal`]): the baked claim and the runtime
+/// `ROS_DISTRO` name DIFFERENT distros, or the build is a generated
+/// post-Jazzy library and the runtime names no distro at all (from Lyrical
+/// on the introspection stride is 120 bytes against Jazzy's 112, so an
+/// unnamed runtime that is really an earlier distro crashes at the first
+/// typed operation).
+///
 /// The decision reads NOTHING from the caller's struct: it is the baked
 /// claim ([`crate::era::baked_distro`]) against the runtime `ROS_DISTRO`
 /// — exactly the evidence `rmw_init` uses. For the record, the
@@ -59,34 +67,49 @@ pub unsafe extern "C" fn rmw_get_serialization_format() -> *const c_char {
 fn refuse_on_era_mismatch(entry: crate::era::GuardedEntry) -> Result<(), rmw_ret_t> {
     #[cfg(feature = "test-seams")]
     crate::test_seams::maybe_panic_inside_era_guard();
-    let Some((baked, requested)) = crate::era::runtime_distro_mismatch(crate::era::baked_distro())
-    else {
+    let Some(refusal) = crate::era::runtime_load_refusal(crate::era::baked_distro()) else {
         return Ok(());
     };
-    // ALLOCATION CADENCE: the `format!` below and the two `String`s
-    // `classify_distro_pair` returns are per-CALL, and that is fine here
-    // — these four exports are called per rmw CONTEXT at process
-    // start-up, never per message. The sibling C++ bridge gate sits on
-    // the per-MESSAGE resolve path and therefore caches its rcl text; the
-    // difference is the cadence, not the taste.
-    //
-    // The refusal must also reach rcl's error channel — rcl reports
-    // `rmw_get_error_string()` to rclpy/rclcpp on the failed return, and
-    // without this the operator's first line reads "error not set"
-    // while the real reason sits on a stderr the host may never show.
-    // That string carries the entry point and both distros too (rcl has
-    // no structured fields); the tracing line then records whether rcl
-    // got it. Best-effort: outside a ROS process there is no librcutils.
-    // `requested` is env-derived: rendered with control
-    // characters escaped, the same rule as the tracing line below.
-    let rcl_channel = ffi::rcutils_set_error_state_best_effort(&format!(
-        "{} entry={} baked_ros_distro={baked} runtime_ros_distro={}",
-        crate::era::DISTRO_MISMATCH_REFUSAL,
-        entry.name(),
-        crate::era_check::escape_control_chars(&requested)
-    ));
-    runtime::install_tracing();
-    crate::era::emit_distro_refusal(entry, &baked, &requested, rcl_channel);
+    match refusal {
+        crate::era::LoadRefusal::DistroMismatch { baked, runtime } => {
+            // ALLOCATION CADENCE: the `format!` below and the two `String`s
+            // `classify_distro_pair` returns are per-CALL, and that is fine
+            // here, because these four exports are called per rmw CONTEXT at
+            // process start-up, never per message. The sibling C++ bridge
+            // gate sits on the per-MESSAGE resolve path and therefore
+            // caches its rcl text; the difference is the cadence, not the
+            // taste.
+            //
+            // The refusal must also reach rcl's error channel, since rcl reports
+            // `rmw_get_error_string()` to rclpy/rclcpp on the failed return,
+            // and without this the operator's first line reads "error not
+            // set" while the real reason sits on a stderr the host may never
+            // show. That string carries the entry point and both distros too
+            // (rcl has no structured fields); the tracing line then records
+            // whether rcl got it. Best-effort: outside a ROS process there
+            // is no librcutils. `runtime` is env-derived: rendered with
+            // control characters escaped, the same rule as the tracing line.
+            let rcl_channel = ffi::rcutils_set_error_state_best_effort(&format!(
+                "{} entry={} baked_ros_distro={baked} runtime_ros_distro={}",
+                crate::era::DISTRO_MISMATCH_REFUSAL,
+                entry.name(),
+                crate::era_check::escape_control_chars(&runtime)
+            ));
+            runtime::install_tracing();
+            crate::era::emit_distro_refusal(entry, &baked, &runtime, rcl_channel);
+        }
+        crate::era::LoadRefusal::UnsetDistro(unset) => {
+            // Nothing here is env-derived (the environment set NOTHING;
+            // the claim and the remedy both come from the baked side), so
+            // there is no hostile value to escape and the rcl text is a
+            // build constant: rendered once for this library's own claim
+            // and handed to rcl by pointer, the way the C++ bridge
+            // refusal's is.
+            let rcl_channel = unset.set_rcl_error_state();
+            runtime::install_tracing();
+            crate::era::emit_unset_distro_refusal(entry, &unset, rcl_channel);
+        }
+    }
     Err(RMW_RET_ERROR)
 }
 

@@ -556,7 +556,10 @@ fn main() {
                          after trimming) — the generated \
                          bindings' fingerprint + layout imply '{claim}', baking that (the \
                          runtime guard admits only its layout-identical members). Set \
-                         ROS_DISTRO to name the target distro exactly."
+                         ROS_DISTRO to name the target distro exactly. A claim of a \
+                         post-Jazzy era also REFUSES rmw_init_options_init in a process that \
+                         sets no ROS_DISTRO, so the runtime environment must name the distro \
+                         even where the build did not."
                     ));
                     claim
                 }
