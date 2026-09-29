@@ -5327,7 +5327,7 @@ pub fn graph_run(
     // A run whose intent is Derive WILL be
     // multi-process, and `resolve_deployment` rejects `--time-source
     // external` for multi-process — but that rejection sits AFTER the
-    // pre-flight, whose `--yes`/confirmed arm WRITES the graph file. A failed
+    // pre-flight, whose `--yes` arm WRITES the graph file. A failed
     // run must leave the file byte-untouched, so evaluate the same rejection
     // EARLY (same text — ONE error surface) before any consent/write can
     // happen. `resolve_deployment`'s own check stays as the backstop.

@@ -4,12 +4,10 @@
 //! launch story on an UNPARTITIONED 3-node chain (`ticker`(Period 50ms) →
 //! `relay`(data-trigger) → `sink`(data-trigger)):
 //!
-//! 1. **The no-TTY floor, live** — `cerulion graph run apdemo --record=DIR`
-//!    with stdin explicitly `/dev/null` (the binary's REAL
-//!    `stdin().is_terminal()` probe — the main.rs consent wiring that
-//!    cannot be tested purely — resolves false): the run derives the
-//!    process-per-node partition IN-MEMORY, the floor notice lands in the
-//!    child log naming `--yes` AND `--single-process`, the graph file stays
+//! 1. **The ephemeral default, live** — `cerulion graph run apdemo --record=DIR`
+//!    with stdin explicitly `/dev/null`: the run derives the
+//!    process-per-node partition in memory, the lifecycle notice says the
+//!    graph file is unchanged, the graph file stays
 //!    BYTE-UNTOUCHED (no `.bak`), and the run is REALLY multi-process — 3
 //!    `run-worker` children observable under the supervisor, the GO
 //!    breadcrumb fires, and the multi-process recording captures the
@@ -76,27 +74,58 @@ impl Drop for ChildGuard {
     }
 }
 
-/// bagd GRANDCHILD leak guard (the `graph_record_e2e_test` pattern): bagd runs
-/// in its OWN process group, so killing the supervisor on a mid-window panic
-/// orphans it. The relative `--out recordings/apdemo_` cmdline form is unique
-/// to THIS file's graph name.
-struct BagdGuard;
+/// The recorder has its own process group. Stop only the recorder belonging
+/// to this test's supervisor if an assertion fails before normal teardown.
+struct BagdGuard {
+    supervisor_pid: u32,
+    observed: std::cell::RefCell<Vec<u32>>,
+}
+impl BagdGuard {
+    fn new(supervisor_pid: u32) -> Self {
+        Self {
+            supervisor_pid,
+            observed: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Production observations come from the live supervisor's child listing.
+    /// Tests can supply an already-owned process to exercise orphan cleanup.
+    fn remember_owned(&self, pids: &[u32]) {
+        let mut observed = self.observed.borrow_mut();
+        for &pid in pids {
+            if !observed.contains(&pid) {
+                observed.push(pid);
+            }
+        }
+    }
+
+    fn pids(&self) -> Vec<u32> {
+        let live: Vec<u32> = Command::new("pgrep")
+            .args([
+                "-P",
+                &self.supervisor_pid.to_string(),
+                "-f",
+                "bagd --out recordings/apdemo_",
+            ])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| line.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.remember_owned(&live);
+        self.observed.borrow().clone()
+    }
+}
 impl Drop for BagdGuard {
     fn drop(&mut self) {
-        if let Ok(out) = Command::new("pgrep")
-            .args(["-f", "bagd --out recordings/apdemo_"])
-            .output()
-        {
-            for pid in String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|l| l.trim().parse::<i32>().ok())
-            {
-                // SAFETY: killpg(2) on the grandchild's own process group
-                // (pgid == pid — spawned with process_group(0)); no memory is
-                // touched. ESRCH after a clean exit is the expected no-op.
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                }
+        for pid in self.pids() {
+            // SAFETY: the recorder is an observed child of this test's own
+            // supervisor and leads its own process group. No memory is touched.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
             }
         }
     }
@@ -440,10 +469,10 @@ fn assert_embed_prefix_names_the_recorded_channels(
     }
 }
 
-/// The floor-notice marker (a substring of `partition_emit`'s warn — pinned
+/// The ephemeral lifecycle marker (a substring of `partition_emit`'s info - pinned
 /// loosely enough to survive tracing-field formatting, tightly enough that
-/// only the auto-partition floor emits it).
-const IN_MEMORY_NOTICE_MARKER: &str = "derived process groups IN-MEMORY";
+/// only auto-partition adoption emits it).
+const IN_MEMORY_NOTICE_MARKER: &str = "derived process groups in memory";
 /// The supervisor's deployment-live breadcrumb (the mp-path marker).
 /// `tracing`'s fmt layer wraps a field's NAME and its `=` in ANSI escapes (its
 /// `ansi` default is a compile-time feature, NOT a tty probe), so
@@ -489,7 +518,7 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
     let original_yaml = build_unpartitioned_workspace(tmp.path(), "apda");
     let (mut guard, stdout_path, stderr_path) =
         spawn_graph_run(tmp.path(), &["--record=recordings"]);
-    let _bagd_guard = BagdGuard;
+    let _bagd_guard = BagdGuard::new(guard.0.id());
     let sup_pid = guard.0.id();
 
     // The mp bring-up completes: bag file appears (planning + 3 worker spawns
@@ -527,6 +556,7 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
                 && snap.frames_on("/apda/ticker/cmd") > 0
         },
     );
+    let _ = _bagd_guard.pids(); // retain the owned recorder before reaping the parent
     send_sigint(sup_pid);
     let status = wait_bounded(&mut guard.0, Duration::from_secs(90))
         .expect("supervisor did not exit after SIGINT");
@@ -537,15 +567,19 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
         read_file(&stderr_path)
     );
 
-    // The floor notice: in-memory, file untouched, BOTH escape hatches named.
+    // The ordinary run announces in-memory adoption without a persistence question.
     let log = merged_log(&stdout_path, &stderr_path);
     assert!(
         log.contains(IN_MEMORY_NOTICE_MARKER),
         "the no-TTY floor notice must land in the child log; log:\n{log}"
     );
     assert!(
-        log.contains("--yes") && log.contains("--single-process"),
-        "the floor notice names both escape hatches; log:\n{log}"
+        log.contains("graph file unchanged"),
+        "the ephemeral run names its file policy; log:\n{log}"
+    );
+    assert!(
+        !log.contains("Apply this partition") && !log.contains("+++ proposed"),
+        "ordinary runs show neither a save prompt nor a partition diff; log:\n{log}"
     );
     // The supervisor path really ran.
     assert!(
@@ -704,7 +738,7 @@ fn a_single_process_record_embeds_the_unpartitioned_graph_it_actually_ran() {
     );
     let (mut guard, stdout_path, stderr_path) =
         spawn_graph_run(tmp.path(), &["--single-process", "--record=recordings"]);
-    let _bagd_guard = BagdGuard;
+    let _bagd_guard = BagdGuard::new(guard.0.id());
 
     let recordings = tmp.path().join("recordings");
     let bag = wait_for_bag(&recordings, Duration::from_secs(90)).unwrap_or_else(|| {
@@ -723,6 +757,7 @@ fn a_single_process_record_embeds_the_unpartitioned_graph_it_actually_ran() {
         RECORDED_WINDOW_TIMEOUT,
         |snap| snap.user_topics_with_frames(1) >= 1,
     );
+    let _ = _bagd_guard.pids(); // retain the owned recorder before reaping the parent
     send_sigint(guard.0.id());
     let status = wait_bounded(&mut guard.0, Duration::from_secs(90))
         .expect("the single-process record run did not exit after SIGINT");
@@ -1176,7 +1211,7 @@ fn a_block_graph_runs_on_the_no_tty_default_and_co_locates_the_edge() {
     let original_yaml = build_workspace_with_sink(tmp.path(), Some("apdbk"), BLOCK_SINK_FIXTURE);
     let (mut guard, stdout_path, stderr_path) =
         spawn_graph_run(tmp.path(), &["--record=recordings"]);
-    let _bagd_guard = BagdGuard;
+    let _bagd_guard = BagdGuard::new(guard.0.id());
     let sup_pid = guard.0.id();
 
     let recordings = tmp.path().join("recordings");
@@ -1208,6 +1243,7 @@ fn a_block_graph_runs_on_the_no_tty_default_and_co_locates_the_edge() {
         RECORDED_WINDOW_TIMEOUT,
         |snap| (0..2).all(|rank| snap.boundaries_for_rank(rank) >= RECORDED_WINDOW_BOUNDARIES),
     );
+    let _ = _bagd_guard.pids(); // retain the owned recorder before reaping the parent
     send_sigint(sup_pid);
     let status = wait_bounded(&mut guard.0, Duration::from_secs(90))
         .expect("supervisor did not exit after SIGINT");
@@ -1598,4 +1634,219 @@ fn a_hand_written_split_of_a_multi_producer_block_edge_is_refused_pre_spawn() {
         split,
         "a refused run never mutates the graph file"
     );
+}
+
+/// Empty terminal stdin must reach real delivery without an answer. The
+/// non-terminal control exercises the same command and hand-written oracles.
+#[test]
+#[serial]
+fn tty_default_runs_two_nodes_without_a_choice_and_stops_owned_workers() {
+    assert_two_node_ephemeral_run(true);
+}
+
+#[test]
+#[serial]
+fn non_tty_default_runs_two_nodes_without_a_choice_and_stops_owned_workers() {
+    assert_two_node_ephemeral_run(false);
+}
+
+fn assert_two_node_ephemeral_run(terminal: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    cerulion_cli_engine::auth::seed_logged_in_at(&home, "acct-ephemeral-run-test")
+        .expect("seed private logged-in identity");
+    let prefix = if terminal { "apdtty" } else { "apdpipe" };
+    let three_node_yaml = build_unpartitioned_workspace(tmp.path(), prefix);
+    let original_yaml = three_node_yaml
+        .split("- id: sink\n")
+        .next()
+        .unwrap()
+        .to_owned();
+    std::fs::write(tmp.path().join("graphs/apdemo.yaml"), &original_yaml).unwrap();
+    let stdout_path = tmp.path().join("choice.stdout");
+    let stderr_path = tmp.path().join("choice.stderr");
+    let pty = terminal.then(open_terminal);
+    let stdin = pty.as_ref().map_or_else(Stdio::null, |(_, slave)| {
+        Stdio::from(slave.try_clone().expect("clone terminal stdin"))
+    });
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    cmd.args([
+        "graph",
+        "run",
+        "apdemo",
+        "--network",
+        "off",
+        "--record=recordings",
+    ])
+    .current_dir(tmp.path())
+    .env_remove("CARGO_TARGET_DIR")
+    .env("CERULION_HOME", &home)
+    .env_remove("CERULION_LOGIN_GATE")
+    .env("CERULION_NETWORK", "off")
+    .env("CERULION_FLASHBACK", "off")
+    .env(
+        "RUST_LOG",
+        "cerulion=info,cerulion_cli_engine=info,cerulion_bagd=info",
+    )
+    .stdin(stdin)
+    .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()))
+    .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
+    let mut guard = mp_support::ChildGuard::spawn_group_leader(&mut cmd).expect("spawn graph run");
+    let bagd_guard = BagdGuard::new(guard.id());
+    let sup_pid = guard.id();
+    let bag = wait_for_bag(&tmp.path().join("recordings"), Duration::from_secs(90)).unwrap_or_else(
+        || {
+            panic!(
+                "no output without answering stdin; terminal={terminal}\n{}",
+                merged_log(&stdout_path, &stderr_path)
+            )
+        },
+    );
+    let workers = wait_for_workers(sup_pid, 2, Duration::from_secs(60));
+    assert_eq!(workers.len(), 2, "each node retains its own process");
+    guard.note_workers_explicit(workers);
+    let ticker = format!("/{prefix}/ticker/cmd");
+    let relay = format!("/{prefix}/relay/cmd");
+    wait_for_bag_state(
+        &bag,
+        "both nodes' output",
+        RECORDED_WINDOW_TIMEOUT,
+        |snap| snap.frames_on(&ticker) > 0 && snap.frames_on(&relay) > 0,
+    );
+    let recorders = bagd_guard.pids();
+    assert_eq!(
+        recorders.len(),
+        1,
+        "the run must own one continuous recorder"
+    );
+    send_sigint(sup_pid);
+    let status = guard
+        .wait_bounded(Duration::from_secs(90))
+        .expect("Ctrl-C stops the run");
+    assert_eq!(status.code(), Some(0), "Ctrl-C must be a clean shutdown");
+    guard.finish().assert_clean();
+    for pid in recorders {
+        assert!(
+            mp_support::pid_is_gone(pid),
+            "owned recorder {pid} must be reaped"
+        );
+    }
+    drop(pty);
+
+    let log = strip_ansi(&merged_log(&stdout_path, &stderr_path));
+    assert!(
+        log.contains("graph running")
+            && log.contains("nodes=2")
+            && log.contains("mode=\"multi-process\"")
+            && log.contains("press Ctrl+C to stop"),
+        "the useful running status carries the real shape and stop instruction:\n{log}"
+    );
+    for unwanted in ["Apply this partition", "+++ proposed", "proposed change to"] {
+        assert!(
+            !log.contains(unwanted),
+            "ordinary run displayed {unwanted}:\n{log}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("graphs/apdemo.yaml")).unwrap(),
+        original_yaml
+    );
+    assert!(!tmp.path().join("graphs/apdemo.yaml.bak").exists());
+    let reader = BagReader::open(&bag).expect("open recording");
+    let (messages, completeness) = reader.recover_messages().expect("recover recording");
+    assert!(
+        completeness.is_finalized(),
+        "clean stop must finalize the recording"
+    );
+    for topic in [&ticker, &relay] {
+        let frames: Vec<_> = messages.iter().filter(|m| &m.topic == topic).collect();
+        assert!(!frames.is_empty(), "{topic} must publish actual frames");
+        for frame in frames {
+            assert_eq!(
+                frame.data.len(),
+                56,
+                "32-byte wire header and fixed Vector3"
+            );
+            assert_eq!(
+                &frame.data[32..],
+                &[0u8; 24],
+                "ticker writes zero x and relay forwards it; untouched y/z remain zero"
+            );
+        }
+    }
+    assert_eq!(read_manifest(&reader, 0).unwrap(), vec!["ticker"]);
+    assert_eq!(read_manifest(&reader, 1).unwrap(), vec!["relay"]);
+    assert!(read_manifest(&reader, 2).is_none());
+}
+
+/// Keep the master open so terminal stdin stays readable but receives no
+/// answer. Descriptor ownership closes both ends on every exit path.
+fn open_terminal() -> (std::fs::File, std::fs::File) {
+    use std::io::IsTerminal as _;
+    use std::os::fd::FromRawFd as _;
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty writes two initialized descriptor slots, allocates no
+    // Rust memory, and receives null pointers for the optional name/settings.
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: successful openpty returned two distinct owned descriptors;
+    // each is transferred to exactly one File and closed by its Drop.
+    let files = unsafe {
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    };
+    assert!(
+        files.1.is_terminal(),
+        "this arm must exercise real terminal stdin"
+    );
+    files
+}
+
+/// Exercise the cached-identity error path over real owned processes. The
+/// observation seam avoids timing a supervisor crash against a recorder spawn.
+#[test]
+#[serial]
+fn recorder_guard_remembers_owned_pid_after_the_supervisor_is_gone() {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    let mut parent = mp_support::ChildGuard::single_process(
+        Command::new("true")
+            .spawn()
+            .expect("spawn short-lived parent"),
+    );
+    let parent_pid = parent.id();
+    parent
+        .wait_bounded(Duration::from_secs(5))
+        .expect("parent exits");
+    assert!(mp_support::pid_is_gone(parent_pid));
+    let mut child = mp_support::ChildGuard::single_process(
+        Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn owned process"),
+    );
+    let child_pid = child.id();
+    let recorder = BagdGuard::new(parent_pid);
+    recorder.remember_owned(&[child_pid]);
+    assert_eq!(
+        recorder.pids(),
+        vec![child_pid],
+        "an empty dead-parent lookup must retain the observed identity"
+    );
+    drop(recorder);
+    let status = child
+        .wait_bounded(Duration::from_secs(5))
+        .expect("guard stops observed process");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert!(mp_support::pid_is_gone(child_pid));
 }
