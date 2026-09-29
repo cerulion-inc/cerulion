@@ -186,6 +186,12 @@ fn spawn_supervisor(root: &Path) -> (ChildGuard, PathBuf, PathBuf) {
     cmd.args(["graph", "run", "gwmp", "--no-validate"])
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
+        // HERMETIC on the execution mode: REMOVED from the child, never inherited.
+        // This spawn exercises the SHIPPED DEFAULT of a `process_groups:` run (free
+        // run), so a developer with `CERULION_EXECUTION_MODE=lockstep` exported
+        // cannot silently flip this binary onto the opt-out and test the wrong
+        // contract. The same three-direction rule as `mp_support::SpawnExecutionMode`.
+        .env_remove("CERULION_EXECUTION_MODE")
         .env("RUST_LOG", "cerulion=info,cerulion_cli_engine=info")
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())

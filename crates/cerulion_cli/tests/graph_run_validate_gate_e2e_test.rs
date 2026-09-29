@@ -588,6 +588,11 @@ fn spawn_run_no_single(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf) {
     cmd.args(&args)
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
+        // HERMETIC on the execution mode: REMOVED, never inherited. These arms
+        // run the DERIVED partition, which is a SUPERVISOR run and therefore
+        // free-runs by default; an inherited `lockstep` would silently put
+        // them on the opt-out.
+        .env_remove("CERULION_EXECUTION_MODE")
         .env("CERULION_NETWORK", "off")
         .env("RUST_LOG", "cerulion=info,cerulion_cli_engine=info")
         .stdin(Stdio::null())

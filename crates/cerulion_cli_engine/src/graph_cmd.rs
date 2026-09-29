@@ -5431,18 +5431,21 @@ pub fn graph_run(
     // the RESULT is threaded to the run-directory descriptor, the supervisor
     // (which stamps it into every worker plan) and the recording paths, so no
     // two of them can disagree about the contract the run executed under.
-    // Lockstep on every route; `FreeRun` only on a supervisor run the user
-    // opted into via CERULION_EXECUTION_MODE=free_run. An opt-in the route
-    // cannot honour warns loudly rather than silently doing nothing.
+    // A supervisor run FREE-RUNS by default;
+    // `CERULION_EXECUTION_MODE=lockstep` opts it back into barrier lockstep;
+    // a run with no ranks is the one-rank lockstep timeline whatever is
+    // asked. An explicit `free_run` the route cannot honour warns loudly
+    // rather than silently doing nothing.
     // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
     // value to "unset" and skips the garbage warn every other unrecognised
-    // value gets. The lossy form is never `free_run`, so it
-    // takes the garbage arm and is printed under `got=`.
+    // value gets. The lossy form is never a recognised
+    // spelling, so it takes the garbage arm and is printed under `got=`.
     let raw_execution_mode =
         std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
-    let free_run_opt_in = resolve_free_run_opt_in(raw_execution_mode.as_deref());
-    let execution_mode = resolve_run_execution_mode(executes_process_groups, free_run_opt_in);
-    note_inert_free_run_opt_in(executes_process_groups, free_run_opt_in);
+    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
+    let execution_mode =
+        resolve_run_execution_mode(executes_process_groups, execution_mode_request);
+    note_inert_execution_mode_request(executes_process_groups, execution_mode_request);
 
     // Arm the graceful-exit hygiene pass.
     //
@@ -5691,13 +5694,16 @@ pub fn graph_run(
 
     // Deployment dispatch. A graph declaring
     // `process_groups:` runs MULTI-PROCESS (the SUPERVISOR — build the full
-    // graph ONCE for planning, then spawn one worker process per group,
-    // coordinated by a shared SHM barrier) — unless `--single-process` forces
+    // graph ONCE for planning, then spawn one worker process per group; by
+    // default the ranks FREE-RUN, and the `CERULION_EXECUTION_MODE=lockstep`
+    // opt-out is what coordinates them on a shared SHM barrier), unless
+    // `--single-process` forces
     // the monolith, or the host is non-Unix (monolith FALLBACK with a loud
-    // notice; macOS is NOT gated out: the barrier is real POSIX SHM on every
-    // Unix, so only future-Windows falls back). `--time-source external` is
-    // REJECTED on the supervisor arm (multi-process is always
-    // deterministic-live on the barrier-gated clock).
+    // notice; macOS is NOT gated out: the opt-out's barrier is real POSIX SHM
+    // on every Unix, so only future-Windows falls back). `--time-source
+    // external` is REJECTED on the supervisor arm (a multi-process run always
+    // gates on a clock the runtime owns, the wall-following one by default and
+    // the barrier-gated one under the opt-out).
     // The decision matrix is the pure `resolve_deployment` (oracle-tested).
     // Single-process `graph run` (no `process_groups`) falls through unchanged.
     match deployment {
@@ -6350,32 +6356,48 @@ pub fn graph_run(
 ///
 /// This is the WORKER half of the multi-process spawner. The SUPERVISOR
 /// plans the deployment ([`plan_deployment`](crate::multiprocess::plan_deployment)),
-/// mints the shared iceoryx2 `Config` + creates the shared barrier, writes one
+/// mints the shared iceoryx2 `Config`, writes one
 /// plan file per process group, and execs `cerulion graph run-worker --plan <f>`
 /// (with cwd = the workspace root) per worker. THIS reconstructs the worker's
-/// context from the plan and runs it as ONE deterministic-live context of the
+/// context from the plan and runs it as ONE live context of the
 /// cross-process DAG split.
+///
+/// The plan's stamped execution mode decides the shape, exactly as the
+/// supervisor's own rustdoc says: the FREE-RUN default gives this rank its own
+/// clock and no rendezvous with any peer, and the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out is the mode with the shared
+/// barrier. `resolve_worker_build_path` turns the stamped mode plus the trace
+/// bit into the `WorkerBuildPath` every step below branches on.
 ///
 /// Steps (each mirrors the corresponding part of [`graph_run`], filtered to the
 /// plan's subgraph):
 /// 1. read + `serde_json` the plan; reject an empty `ix_config_json` LOUDLY.
 /// 2. `serde_json` the shared iceoryx2 `Config` back out of the plan.
-/// 3. build the gating `VirtualClock` ONCE (shared transport + build fn — an
-///    `Arc::ptr_eq` clock contract).
+/// 3. build the gating clock ONCE (shared transport + build fn, an
+///    `Arc::ptr_eq` clock contract): a controlled `VirtualClock` on the lockstep
+///    and traced free-run paths, the `RealClock` on the ring-less free-run path.
 /// 4. init the transport singleton on the SHARED config
 ///    ([`TransportManager::init_with_config`](cerulion_core::TransportManager::init_with_config)).
-/// 5. OPEN the supervisor-owned barrier (bounded retry — exec races the create).
+/// 5. LOCKSTEP OPT-OUT ONLY: open the supervisor-owned barrier (bounded retry,
+///    since exec races the create). A free-run rank opens none and maps none.
 /// 6. resolve the subgraph's node cdylibs (the plan's subgraph already holds ONLY
 ///    this worker's nodes, so this is `graph_run`'s load loop verbatim).
-/// 7. build via
+/// 7. build on this rank's path: by default
+///    [`GraphRuntime::build_live_free_run`](cerulion_core::GraphRuntime::build_live_free_run)
+///    with no ring, or
+///    [`GraphRuntime::build_live_deterministic_free_run`](cerulion_core::GraphRuntime::build_live_deterministic_free_run)
+///    with one, both with no barrier, no participant map and no handed quantum;
+///    under the opt-out
 ///    [`GraphRuntime::build_live_deterministic_with_manager_and_barrier`](cerulion_core::GraphRuntime::build_live_deterministic_with_manager_and_barrier),
-///    handing it the shared barrier, this worker's global-level participant map,
+///    handed the shared barrier, this worker's global-level participant map,
 ///    and the shared handed quantum.
 /// 8. touch the READY sentinel (owned publishers now exist — the supervisor's
 ///    cross-process build-order handshake).
 /// 9. `run_live` until Ctrl+C / node shutdown, then poll
-///    [`is_barrier_failed`](cerulion_core::GraphRuntime::is_barrier_failed): on a
-///    barrier-boundary timeout (a peer stalled/crashed) exit with code 2, else
+///    [`is_barrier_failed`](cerulion_core::GraphRuntime::is_barrier_failed),
+///    structurally `false` on a free-run rank (no participant, so no poison):
+///    under the opt-out a
+///    barrier-boundary timeout (a peer stalled/crashed) exits with code 2, else
 ///    clean exit 0 (Principle #3 — a poisoned peer must be a LOUD, distinguishable
 ///    failure).
 ///
@@ -8088,9 +8110,12 @@ fn drain_window_from_env() -> Duration {
 /// (nonzero exit, or `Lost`/unpollable) while the deployment is in Normal mode.
 ///
 /// `Continue` (the LOCKED default) keeps the survivors running DEGRADED: the
-/// supervisor drops the dead peer from the shared barrier cohort (so its slot no
-/// longer stalls the survivors at the next level boundary), logs loudly, records
-/// the loss, and keeps joining. `Fail` selects the fail-loud contract
+/// supervisor logs loudly, records the loss, and keeps joining. Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out it also drops the dead peer from
+/// the shared barrier cohort, so its slot no longer stalls the survivors at the
+/// next level boundary; under the free-run default there is no cohort to drop
+/// from and the survivors were never stalled by the death, which the degraded
+/// summary says in those words. `Fail` selects the fail-loud contract
 /// (return `Err`, SIGKILL every sibling).
 ///
 /// Selected by the user-facing `graph run --peer-loss <continue|fail>` flag,
@@ -8102,7 +8127,8 @@ fn drain_window_from_env() -> Duration {
 /// crate does not depend on clap — same pattern as [`TimeSource`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PeerLossPolicy {
-    /// Keep the survivors running degraded; drop the dead peer from the barrier.
+    /// Keep the survivors running degraded; under the `lockstep` opt-out also
+    /// drop the dead peer from the barrier.
     Continue,
     /// Fail-loud on any worker death (return `Err`, SIGKILL siblings).
     Fail,
@@ -8168,10 +8194,13 @@ enum Deployment {
     /// supervisor (`graph_run_supervisor`).
     Supervisor,
     /// `process_groups:` on a NON-Unix host (future Windows) → run the
-    /// MONOLITH with a loud notice (`reason`): the cross-process barrier is a
-    /// POSIX `shm_open` `MAP_SHARED` primitive, so multi-process cannot run
-    /// there — but the graph itself runs single-process with identical results
-    /// (the determinism firewall), just without process isolation.
+    /// MONOLITH with a loud notice (`reason`): every mode's cross-process
+    /// plumbing is POSIX `shm_open` `MAP_SHARED` (the per-rank trace rings and
+    /// the `block`-edge credit words a run maps whatever its mode, and the
+    /// shared barrier the `CERULION_EXECUTION_MODE=lockstep` opt-out adds), so
+    /// multi-process cannot run there. The graph itself still runs
+    /// single-process with identical results (the determinism firewall), just
+    /// without process isolation.
     MonolithFallback { reason: &'static str },
     /// The plain single-process path: no `process_groups:`, or the user forced
     /// it with `--single-process`.
@@ -8181,9 +8210,9 @@ enum Deployment {
 /// The `Deployment::MonolithFallback` notice text (the WHY; the dispatch site
 /// adds the graph name as a structured field).
 const NON_UNIX_MONOLITH_FALLBACK: &str =
-    "graph declares `process_groups:` but this host is not a Unix — running SINGLE-PROCESS \
-     (monolith fallback). The cross-process barrier is a POSIX shm_open MAP_SHARED primitive \
-     (available on Linux and macOS), unavailable on this platform. \
+    "graph declares `process_groups:` but this host is not a Unix: running SINGLE-PROCESS \
+     (monolith fallback). A deployment's cross-process plumbing is POSIX shm_open MAP_SHARED \
+     shared memory (available on Linux and macOS), unavailable on this platform. \
      The graph still runs with identical results (the determinism firewall: same fire \
      set/order/data), just without process isolation.";
 
@@ -8191,9 +8220,9 @@ const NON_UNIX_MONOLITH_FALLBACK: &str =
 /// site prefixes the graph name).
 const EXTERNAL_CLOCK_MULTIPROCESS_REJECTION: &str =
     "a multi-process (`process_groups:`) deployment cannot run under `--time-source external`: \
-     every worker runs on the real clock — barrier-gated lockstep by default, or free-run \
-     (`CERULION_EXECUTION_MODE=free_run`) with each rank on its own wall-following clock — and an \
-     external time master driving N separate processes is unspecified either way. \
+     every worker runs on the real clock, free-run by default (each rank on its own \
+     wall-following clock) or barrier-gated lockstep under `CERULION_EXECUTION_MODE=lockstep`, \
+     and an external time master driving N separate processes is unspecified either way. \
      Fix: drop `--time-source external`, or \
      force one process with `--single-process`.";
 
@@ -8651,12 +8680,15 @@ impl ChildGuard {
         self.reaped = true;
     }
 
-    /// Send SIGINT to the child (best-effort) so it self-drops
-    /// from the barrier cohort (`leave_barrier_cohort`) and exits 0 gracefully. Used
-    /// when a peer exits CLEANLY and the supervisor winds the survivors down —
-    /// without it the departing worker's self-drop already removed the barrier
-    /// stall, so the survivors would keep running until the drain-deadline SIGKILL
-    /// (worse than the ~5s barrier poison). No-op once reaped.
+    /// Send SIGINT to the child (best-effort) so it exits 0 gracefully, and,
+    /// under the `CERULION_EXECUTION_MODE=lockstep` opt-out, self-drops from the
+    /// barrier cohort first (`leave_barrier_cohort`). Used when a peer exits
+    /// CLEANLY and the supervisor winds the survivors down. Without it the
+    /// survivors would keep running until the drain-deadline SIGKILL: under the
+    /// opt-out the departing worker's self-drop has already removed the barrier
+    /// stall that would otherwise have stopped them sooner (the ~5s barrier
+    /// poison), and under the free-run default no peer's departure reaches them
+    /// at all. No-op once reaped.
     ///
     /// ALSO fanned out on the Ctrl-C→Draining transition. A terminal
     /// Ctrl-C delivers SIGINT to the whole foreground process group, making the
@@ -9271,11 +9303,19 @@ fn stamp_cap_mode(plan: &mut crate::multiprocess::DeploymentPlan, mode: CpuDmaLo
 /// holds the loaded metadata and injects the answer here).
 ///
 /// **The SAME vector goes to EVERY worker, and that is a correctness
-/// requirement, not a convenience.** The flags decide how many barrier
+/// requirement, not a convenience.** Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out the flags decide how many barrier
 /// generations each level burns, so two workers disagreeing on one level
 /// desynchronise the shared generation counter for the rest of the run — every
 /// later rendezvous times out and poisons. Computing it once here and cloning is
 /// what makes disagreement unrepresentable.
+///
+/// **The stamp itself is MODE-INDEPENDENT; its EFFECT is not.** The free-run
+/// default creates no barrier and no rank maps one, so the flags ride a plan
+/// nothing reads and no level crosses an extra generation. Stamping anyway is
+/// deliberate (the plan file stays one shape, and the mode a plan is read under
+/// is not this function's to know), but it is why the run's own line is written
+/// per mode: `execution_mode` is taken here for the LOG, never for the stamp.
 ///
 /// Sized from the plan's own `global_level_map` (not from the classifier), so
 /// the vector is index-compatible with the map by construction. A worker whose
@@ -9286,12 +9326,15 @@ fn stamp_cap_mode(plan: &mut crate::multiprocess::DeploymentPlan, mode: CpuDmaLo
 fn stamp_mid_level_barrier(
     plan: &mut crate::multiprocess::DeploymentPlan,
     pairs: &[crate::multiprocess::SplitNonTriggerPair],
+    execution_mode: crate::multiprocess::ExecutionMode,
 ) {
     if pairs.is_empty() {
-        // The overwhelmingly common case: nothing to order, so every level keeps
-        // exactly one generation per step. `plan_deployment` already sized an
-        // all-`false` vector per worker; leave it, and say nothing (a clean
-        // partition logs NOTHING — the reporter's own rule).
+        // The overwhelmingly common case: nothing to flag, so under the
+        // `lockstep` opt-out every level keeps exactly one generation per step
+        // (the free-run default pays nothing either way).
+        // `plan_deployment` already sized an all-`false` vector per worker;
+        // leave it, and say nothing (a clean partition logs NOTHING: the
+        // reporter's own rule).
         return;
     }
     for w in &mut plan.workers {
@@ -9299,21 +9342,39 @@ fn stamp_mid_level_barrier(
             crate::multiprocess::mid_level_barrier_flags(pairs, w.global_level_map.len());
     }
     // One line per RUN (the per-pair detail is the reporter's). `levels` is the
-    // count of DISTINCT global levels taking the extra rendezvous, which is what
-    // the run's generation-per-step law is derived from — not the pair count.
+    // count of DISTINCT global levels FLAGGED, not the pair count. Under the
+    // `lockstep` opt-out that is also the count taking the extra rendezvous, and
+    // the run's generation-per-step law is derived from it; under the free-run
+    // default no level takes one, which is why the line below is written per
+    // mode rather than stating the law unconditionally.
     let flagged = plan
         .workers
         .first()
         .map(|w| w.mid_level_barrier.iter().filter(|f| **f).count())
         .unwrap_or(0);
-    tracing::info!(
-        pairs = pairs.len(),
-        levels = flagged,
-        workers = plan.workers.len(),
-        "stamping mid-level barrier levels into every worker plan — each flagged \
-         level crosses TWO barrier generations per step so every group's step-start \
-         snapshots are ordered before any group ticks"
-    );
+    match execution_mode {
+        crate::multiprocess::ExecutionMode::Lockstep => tracing::info!(
+            pairs = pairs.len(),
+            levels = flagged,
+            workers = plan.workers.len(),
+            execution_mode = %"lockstep",
+            "stamping mid-level barrier levels into every worker plan: each flagged \
+             level crosses TWO barrier generations per step so every group's step-start \
+             snapshots are ordered before any group ticks"
+        ),
+        crate::multiprocess::ExecutionMode::FreeRun => tracing::info!(
+            pairs = pairs.len(),
+            levels = flagged,
+            workers = plan.workers.len(),
+            execution_mode = %"free_run",
+            "stamping mid-level barrier levels into every worker plan: this run is \
+             free-run, so it creates no barrier and no rank maps one: the flags ride the \
+             plan INERT, every level crosses exactly one generation per step, and nothing \
+             orders a split same-level non-trigger edge. \
+             `CERULION_EXECUTION_MODE=lockstep` is what turns these levels into a \
+             rendezvous"
+        ),
+    }
 }
 
 fn stamp_topic_requirements(
@@ -9472,10 +9533,12 @@ fn supervisor_precreate_error(
 /// Builds the full graph ONCE (planning: fail-fast full-graph validation + the
 /// IMPURE `Levels`/`tightest_timing_ns` the pure planner needs), plans one worker
 /// per group, mints + injects the shared iceoryx2 `Config`, creates the shared
-/// SHM barrier, then spawns one `cerulion graph run-worker --plan <f>` process
+/// SHM barrier ONLY under the `lockstep` opt-out (the body branches on
+/// `execution_mode`; the free-run default creates none and no rank maps one),
+/// then spawns one `cerulion graph run-worker --plan <f>` process
 /// per group (producer-owning groups first, gated on each worker's READY
 /// sentinel) and joins them under a fail-loud lifecycle contract (see the JOIN
-/// state machine below). Unix-only (the cross-process barrier is
+/// state machine below). Unix-only (the lockstep barrier is
 /// portable POSIX SHM, so macOS runs the real supervisor too) — the
 /// `resolve_deployment` dispatch in `graph_run` routes non-Unix hosts to
 /// the monolith FALLBACK before ever calling this; single-process `graph run`
@@ -9589,9 +9652,10 @@ fn graph_run_supervisor(
     }
 
     // (2) The multi-process run ALWAYS runs its workers on the real clock —
-    // barrier-gated lockstep (`build_live_deterministic_with_manager_and_barrier`)
-    // by default, or free-run (the two `*_free_run` ctors) when opted in,
-    // so a `--time-source` other than the live default is
+    // free-run (the two `*_free_run` ctors) by default, or barrier-gated
+    // lockstep (`build_live_deterministic_with_manager_and_barrier`) under the
+    // `CERULION_EXECUTION_MODE=lockstep` opt-out, so a
+    // `--time-source` other than the live default is
     // IGNORED — warn loudly (loud inference; house rule) rather than silently
     // overriding it.
     if time_source != TimeSource::Real {
@@ -9937,16 +10001,24 @@ fn graph_run_supervisor(
             crate::multiprocess::LoadedNodeMetadata(&loaded_entry_infos),
             &levels,
         );
+        // The advisory is MODE-SPLIT. The classification above is
+        // mode-independent (the same pairs, the same stamp either way), but the
+        // CONSEQUENCE is not: only the lockstep opt-out builds the mid-level
+        // barrier that orders this shape (the owner below is minted on the
+        // `Lockstep` arm alone, and the worker opens none on either free-run
+        // path), so a default run told it had a rendezvous would be told
+        // something false at the one moment it can still act on it.
         crate::multiprocess::report_split_same_level_non_trigger_pairs(
             config.identity(),
             &split_non_trigger_pairs,
+            execution_mode,
         );
     }
 
     // Stamp the classified levels into every worker plan BEFORE the
     // plans are serialised (below). Empty on a clean partition, which leaves the
     // planner's all-`false` vectors untouched and the run paying nothing.
-    stamp_mid_level_barrier(&mut plan, &split_non_trigger_pairs);
+    stamp_mid_level_barrier(&mut plan, &split_non_trigger_pairs, execution_mode);
 
     // (5.5) The recorded topic set was resolved at (4.5),
     // BEFORE the planning build — so the fail-fast ordering is unchanged
@@ -11246,7 +11318,7 @@ fn graph_run_supervisor(
         // foreground process GROUP (a real terminal Ctrl-C). A DIRECTED
         // `kill -INT <supervisor-pid>` (how a macOS harness delivers it — macOS
         // has no setsid(1)-style group tooling) reaches ONLY the supervisor:
-        // the workers would keep lockstep-running, never drain, and be SIGKILLed
+        // the workers would keep running, never drain, and be SIGKILLed
         // at the drain deadline (sinks never dumped). The directed fan-out is
         // idempotent when the group delivery DID happen (the worker's ctrlc
         // handler is a pure `store(false)` — a second SIGINT is a no-op), so
@@ -11460,16 +11532,30 @@ fn graph_run_supervisor(
                         tracing::debug!(group = %group, "worker drained (clean exit)");
                     } else {
                         // Draining: workers self-drop + exit 0 on a clean
-                        // shutdown, so a NONZERO drain exit is UNEXPECTED (a barrier
-                        // poison or a crash raced the drain). Still TOLERATED — a
-                        // shutdown never fail-louds — but name it as unexpected. No
+                        // shutdown, so a NONZERO drain exit is UNEXPECTED. The
+                        // CAUSE is mode-dependent and the text says only what
+                        // this run can produce: a FREE-RUN deployment creates no
+                        // barrier at all (`barrier_owner` is `None` on every
+                        // free-run run), so a poison is not among its causes and
+                        // naming one would send an operator looking for a
+                        // rendezvous that never existed. Gated the same way as
+                        // the degraded-run summary below. Still TOLERATED (a
+                        // shutdown never fail-louds) but named as unexpected. No
                         // supervisor drop here: everyone is departing and the drain
                         // deadline backstops any straggler.
-                        tracing::warn!(
-                            group = %group,
-                            status = %status,
-                            "worker exited NONZERO during drain — unexpected (workers self-drop + exit 0 on a clean shutdown; a nonzero drain exit means a barrier poison or crash raced the drain); tolerating"
-                        );
+                        if barrier_owner.is_some() {
+                            tracing::warn!(
+                                group = %group,
+                                status = %status,
+                                "worker exited NONZERO during drain: unexpected (workers self-drop + exit 0 on a clean shutdown; a nonzero drain exit means a barrier poison or a crash raced the drain); tolerating"
+                            );
+                        } else {
+                            tracing::warn!(
+                                group = %group,
+                                status = %status,
+                                "worker exited NONZERO during drain: unexpected (workers self-drop + exit 0 on a clean shutdown; this free-run deployment has no barrier, so a crash raced the drain); tolerating"
+                            );
+                        }
                     }
                 }
                 ChildPoll::Lost if normal => {
@@ -14966,68 +15052,76 @@ pub fn render_recorder_json(
     .expect("recorder.json is a static-shape object; serialization cannot fail")
 }
 
-/// The free-run OPT-IN environment variable.
+/// The execution-mode environment variable: the barrier-lockstep OPT-OUT.
 ///
-/// `CERULION_EXECUTION_MODE=free_run` asks a multi-process `graph run` to
-/// coordinate its workers WITHOUT the barrier (each rank on its own wall-following
-/// clock); `lockstep`, empty, or unset keeps
-/// the shipped barrier-lockstep default. Deliberately an environment variable
-/// and NOT a CLI flag or a graph-YAML key: the user-facing surface is the
-/// contract, and the flagless default may become free-run — a flag minted
-/// here would become a misleading name the moment that happens. The variable
-/// is read ONCE per `graph run`, in the same breath as the deployment decision
+/// A multi-process `graph run` coordinates its workers WITHOUT the barrier by
+/// default (free-run: each rank on its own wall-following clock).
+/// `CERULION_EXECUTION_MODE=lockstep` opts the run back into the shared-barrier
+/// lockstep; `free_run`, empty, or unset all name the default. Deliberately an
+/// environment variable and NOT a CLI flag or a graph-YAML key: the user-facing
+/// surface is the contract, and the variable carries the plan enum's own two
+/// spellings, so the default could move from lockstep to free-run without a
+/// second grammar (a flag named for either direction would have become a
+/// misleading name the moment the default moved). The variable is read ONCE
+/// per `graph run`, in the same breath as the deployment decision
 /// (`resolve_run_execution_mode`), and the resolved mode is THREADED from there
-/// to every consumer — the run directory's `recorder.json`, the supervisor's
-/// worker plans, and the bag a `--record` writes — so no two of them can
+/// to every consumer (the run directory's `recorder.json`, the supervisor's
+/// worker plans, and the bag a `--record` writes) so no two of them can
 /// disagree about the contract the run executed under. Values follow the
 /// `CERULION_BARRIER_OS_SYNC` grammar: exact match, and an unrecognised value
-/// keeps the DEFAULT with a loud warn rather than silently opting in.
+/// keeps the DEFAULT with a loud warn rather than silently choosing either mode.
 pub const EXECUTION_MODE_ENV: &str = "CERULION_EXECUTION_MODE";
 
-/// Pure parse of [`EXECUTION_MODE_ENV`] → `(free_run, was_garbage)`.
+/// Pure parse of [`EXECUTION_MODE_ENV`] into
+/// `(explicit request, was_garbage)`.
 ///
-/// unset / empty / `"lockstep"` → `(false, false)` (the default, explicitly or
-/// by absence); `"free_run"` → `(true, false)` (the opt-in); anything else →
-/// `(false, true)` (keep the default, flagged for the loud warn — the
+/// unset / empty → `(None, false)` (take the default); `"lockstep"` →
+/// `(Some(Lockstep), false)` (the opt-out); `"free_run"` →
+/// `(Some(FreeRun), false)` (the default, spelled out); anything else →
+/// `(None, true)` (take the default, flagged for the loud warn; the
 /// exact-match discipline of `parse_os_sync_kill_switch`). The two accepted
 /// spellings are the enum's own serde names, so the variable, the plan file
 /// and the bag stamp share ONE vocabulary. Extracted so the contract is
 /// oracle-testable without env mutation.
-fn parse_execution_mode_env(raw: Option<&str>) -> (bool, bool) {
+fn parse_execution_mode_env(
+    raw: Option<&str>,
+) -> (Option<crate::multiprocess::ExecutionMode>, bool) {
     match raw {
-        None | Some("") | Some("lockstep") => (false, false),
-        Some("free_run") => (true, false),
-        Some(_) => (false, true),
+        None | Some("") => (None, false),
+        Some("lockstep") => (Some(crate::multiprocess::ExecutionMode::Lockstep), false),
+        Some("free_run") => (Some(crate::multiprocess::ExecutionMode::FreeRun), false),
+        Some(_) => (None, true),
     }
 }
 
-/// Resolve the raw [`EXECUTION_MODE_ENV`] value to "opted in?",
-/// emitting the loud garbage warn the resolution requires. Split out of the
-/// `graph run` call site so the warn is `#[traced_test]`-pinnable without env
-/// games (the `resolve_os_sync_disabled` shape). Every recognised value
-/// resolves SILENTLY.
-fn resolve_free_run_opt_in(raw: Option<&str>) -> bool {
-    let (free_run, was_garbage) = parse_execution_mode_env(raw);
+/// Resolve the raw [`EXECUTION_MODE_ENV`] value to the explicit request it
+/// carries (`None` = take the default), emitting the loud garbage warn the
+/// resolution requires. Split out of the `graph run` call site so the warn is
+/// `#[traced_test]`-pinnable without env games (the `resolve_os_sync_disabled`
+/// shape). Every recognised value resolves SILENTLY.
+fn resolve_execution_mode_request(raw: Option<&str>) -> Option<crate::multiprocess::ExecutionMode> {
+    let (request, was_garbage) = parse_execution_mode_env(raw);
     if was_garbage {
         tracing::warn!(
             env = EXECUTION_MODE_ENV,
             got = %raw.unwrap_or(""),
-            "CERULION_EXECUTION_MODE is set but not `free_run` (opt in) or `lockstep`/unset \
-             (the default); keeping the barrier-lockstep default (`free_run` is the explicit \
-             opt-in)"
+            "CERULION_EXECUTION_MODE is set but not `lockstep` (opt out of free-run) or \
+             `free_run`/unset (the default); keeping the default: a multi-process run \
+             free-runs unless `lockstep` is spelled exactly"
         );
     }
-    free_run
+    request
 }
 
 /// THE one place a run's execution mode is decided.
 ///
-/// `FreeRun` iff the run EXECUTES process groups (the supervisor route — a
-/// monolith has no ranks to free-run and stays the degenerate one-rank
-/// lockstep timeline, opt-in or not) AND the user opted in; `Lockstep`
-/// otherwise. The default is `Lockstep` on every route, and
-/// that is what makes this commit mergeable ahead of the wake half: nothing a
-/// user runs today changes behaviour.
+/// A run that EXECUTES process groups (the supervisor route) free-runs unless
+/// the user opted out: `request` is the explicit [`EXECUTION_MODE_ENV`]
+/// spelling, `None` the flagless default, and that default is `FreeRun`. A run
+/// with no ranks (a monolith, the non-Unix fallback, a `--single-process` run)
+/// is the degenerate one-rank lockstep timeline whatever was asked: there is
+/// nothing to free-run, so it stays `Lockstep`, and an explicit `free_run`
+/// there is warned (`note_inert_execution_mode_request`).
 ///
 /// PURE (no env, no I/O): `graph run` reads the environment once and hands
 /// the answer here beside `executes_process_groups`, then threads the RESULT to
@@ -15035,38 +15129,45 @@ fn resolve_free_run_opt_in(raw: Option<&str>) -> bool {
 /// `WorkerPlan` — `stamp_execution_mode`) and the supervisor recording path,
 /// so the three consumers cannot drift (the monolith recording route reads
 /// the fixed `MONOLITH_EXECUTION_MODE` instead — it has no ranks). Pinned by
-/// `the_supervisor_route_resolves_free_run_only_when_opted_in`.
+/// `the_supervisor_route_free_runs_by_default_and_lockstep_opts_out` and, for
+/// the routing that did NOT move, `the_deployment_routes_are_unchanged_by_the_flip`.
 fn resolve_run_execution_mode(
     executes_process_groups: bool,
-    free_run_opt_in: bool,
+    request: Option<crate::multiprocess::ExecutionMode>,
 ) -> crate::multiprocess::ExecutionMode {
-    if executes_process_groups && free_run_opt_in {
-        crate::multiprocess::ExecutionMode::FreeRun
-    } else {
-        crate::multiprocess::ExecutionMode::Lockstep
+    if !executes_process_groups {
+        return crate::multiprocess::ExecutionMode::Lockstep;
     }
+    request.unwrap_or(crate::multiprocess::ExecutionMode::FreeRun)
 }
 
-/// The opt-in was set on a run that cannot honour it: say so.
+/// An explicit `free_run` was asked of a run that cannot honour it: say so.
 ///
 /// A run that executes no process groups (`--single-process`, a non-Unix
 /// host, or an unpartitioned graph under a non-real clock — under the real
 /// clock an unpartitioned graph is AUTO-PARTITIONED by the pre-flight
-/// and honours the opt-in) has no ranks to free-run; the opt-in is INERT
-/// there, and a knob that silently does nothing is the loud-inference class
-/// this repo forbids. One `warn!` per run, at the resolution site, naming the
-/// two things that would make it take effect. Pure over its two inputs so the
-/// line is `#[traced_test]`-pinnable.
-fn note_inert_free_run_opt_in(executes_process_groups: bool, free_run_opt_in: bool) {
-    if free_run_opt_in && !executes_process_groups {
+/// and free-runs like any supervisor run) has no ranks to free-run; the
+/// request is INERT there, and a knob that silently does nothing is the
+/// loud-inference class this repo forbids. One `warn!` per run, at the
+/// resolution site, naming the two things that would make it take effect.
+/// An explicit `lockstep` on such a run is deliberately SILENT: the run IS
+/// the one-rank lockstep timeline, so the request holds and nothing is
+/// inferred or ignored; a warn there would fire on every `--single-process`
+/// run under a globally exported opt-out. Pure over its two inputs so each
+/// branch is `#[traced_test]`-pinnable.
+fn note_inert_execution_mode_request(
+    executes_process_groups: bool,
+    request: Option<crate::multiprocess::ExecutionMode>,
+) {
+    if !executes_process_groups && request == Some(crate::multiprocess::ExecutionMode::FreeRun) {
         tracing::warn!(
             env = EXECUTION_MODE_ENV,
             "CERULION_EXECUTION_MODE=free_run is INERT on this run — free-run coordinates the \
              workers of a MULTI-PROCESS deployment, and this run executes no process groups \
              (`--single-process`, a non-Unix host, or an unpartitioned graph under a non-real \
              clock; under the real clock an unpartitioned graph is auto-partitioned and \
-             honours the opt-in, and a partitioned graph under `--time-source virtual` still \
-             runs the supervisor and honours it). The run proceeds as the degenerate one-rank \
+             free-runs by default, and a partitioned graph under `--time-source virtual` still \
+             runs the supervisor and free-runs). The run proceeds as the degenerate one-rank \
              lockstep timeline; drop the variable, or run a partitioned graph."
         );
     }
@@ -15101,13 +15202,13 @@ fn resolve_run_coordination(
 }
 
 /// The MONOLITH recording route's execution mode — one process, the degenerate
-/// one-rank lockstep timeline, whatever the opt-in says. Named rather than
+/// one-rank lockstep timeline, whatever the variable says. Named rather than
 /// written at the call site: the monolith's
 /// mode is STRUCTURAL, not a function of `resolve_run_execution_mode`'s inputs,
 /// and stating it here beside the resolver is what lets the pin
-/// `the_supervisor_route_resolves_free_run_only_when_opted_in` assert the two
-/// agree (`resolve_run_execution_mode(false, _)` is this value for every
-/// opt-in), rather than trusting a bare literal three call sites away.
+/// `the_supervisor_route_free_runs_by_default_and_lockstep_opts_out` assert
+/// the two agree (`resolve_run_execution_mode(false, _)` is this value for
+/// every request), rather than trusting a bare literal three call sites away.
 #[cfg(unix)]
 const MONOLITH_EXECUTION_MODE: crate::multiprocess::ExecutionMode =
     crate::multiprocess::ExecutionMode::Lockstep;
@@ -17068,7 +17169,7 @@ fn configure_recording_runtime(
 /// `--record` half (per-tick durations) and runs on EVERY build path that
 /// records, while [`configure_traced_runtime_free_run`] is the CLOCK half and
 /// runs on every `FreeRunTraced` rank whether or not it records. The contract
-/// above holds VERBATIM for the lockstep route (the default) and is INVERTED
+/// above holds VERBATIM for the lockstep route (the opt-out) and is INVERTED
 /// on the free-run route by the other half, where each rank has no peers to
 /// stay in lockstep with, exactly the monolith's reason.
 ///
@@ -18321,10 +18422,12 @@ pub(crate) struct CreditDeathWatch {
     /// `credit_death_actions`. Lives for the supervisor's whole scope.
     ///
     /// MONOTONE, with no eviction. Nothing in this deployment restarts a dead
-    /// worker (`--peer-loss continue` drops it from the barrier and runs
-    /// degraded), so that is correct today — but if a rank ever comes BACK,
-    /// it stays "dead" here and its consumer's warn would be silently
-    /// suppressed. A restart story has to clear this set.
+    /// worker (`--peer-loss continue` keeps the survivors running degraded, and
+    /// under the `CERULION_EXECUTION_MODE=lockstep` opt-out drops the dead rank
+    /// from the barrier cohort as well), so that is correct as the deployment
+    /// behaves. If a rank ever came BACK, it would stay "dead" here and its
+    /// consumer's warn would be silently suppressed: restarting a rank has to
+    /// clear this set.
     dead_so_far: std::collections::BTreeSet<u32>,
 }
 
@@ -19157,7 +19260,8 @@ fn start_supervisor_recording(
         // The SUPERVISOR route: the mode `graph_run`
         // resolved and this supervisor stamped into every worker plan, renamed
         // into the bag's vocabulary. `FreeRun` here means the workers really
-        // free-ran (same value, same stamp); `Lockstep` is the default.
+        // free-ran (same value, same stamp), the default; `Lockstep` means
+        // the run opted out with `CERULION_EXECUTION_MODE=lockstep`.
         coordination: resolve_run_coordination(execution_mode),
     })?;
 
@@ -19488,7 +19592,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         record_env,
         // The MONOLITH route: one process, no process
         // groups, the degenerate one-rank lockstep timeline, whatever the
-        // free-run opt-in says (`resolve_run_execution_mode` answers the same
+        // execution-mode variable says (`resolve_run_execution_mode` answers the same
         // for a monolith; the pin asserts the two agree).
         coordination: resolve_run_coordination(MONOLITH_EXECUTION_MODE),
     })?;
@@ -23814,13 +23918,16 @@ nodes:
         runtime.shutdown();
     }
 
-    /// The MULTI-PROCESS recording config pin — the mp
+    /// The MULTI-PROCESS recording config pin for the
+    /// `CERULION_EXECUTION_MODE=lockstep` OPT-OUT route: the mp
     /// sibling of `configure_recording_runtime_pins_recording_flags`.
     /// `configure_recording_runtime_mp` must flip per-tick duration recording
     /// ON while leaving the wall-following gating clock OFF (the binding
-    /// contract: mp recordings are QUANTUM-timed — a wall-following worker
+    /// contract: a LOCKSTEP mp recording is QUANTUM-timed, because a
+    /// wall-following worker
     /// clock would desync from its barrier-lockstep peers and break merged-trace
-    /// replay determinism). A refactor that "helpfully" adds the
+    /// replay determinism; the free-run default takes the other route and IS
+    /// wall-following, per rank). A refactor that "helpfully" adds the
     /// single-process `set_gating_follows_wall(true)` call fails HERE.
     #[cfg(unix)]
     #[test]
@@ -23882,8 +23989,9 @@ nodes:
         );
         assert!(
             !runtime.gating_follows_wall_for_test(),
-            "mp recording config must NEVER flip the wall-following gating clock — workers are \
-             quantum-timed in barrier lockstep (multi-process recording)"
+            "mp recording config must NEVER flip the wall-following gating clock: workers on \
+             this route are quantum-timed in barrier lockstep (a multi-process recording under \
+             the lockstep opt-out)"
         );
         runtime.shutdown();
     }
@@ -25230,38 +25338,51 @@ nodes:
         assert_eq!(v["trace_format"], 6);
     }
 
-    /// The ONE resolution point, and its rule:
-    /// the DEFAULT is `Lockstep` on every route, `FreeRun`
-    /// is an OPT-IN, and a monolith never free-runs however hard it opts in.
+    /// The ONE resolution point, and the rule it decides: a
+    /// SUPERVISOR run free-runs BY DEFAULT, `CERULION_EXECUTION_MODE=lockstep`
+    /// opts it out, `free_run` spells the default, and a run with no ranks is
+    /// the one-rank lockstep timeline whatever is asked. The
+    /// `(true, no request)` arm is the one a lockstep default would change;
+    /// every other cell holds under either default.
     ///
     /// Every arm is a hand oracle, and the two halves are asserted TOGETHER
     /// (the mode, and the bag stamp it maps to) so the map cannot silently
     /// invert one while the other stays green.
     #[test]
-    fn the_supervisor_route_resolves_free_run_only_when_opted_in() {
+    fn the_supervisor_route_free_runs_by_default_and_lockstep_opts_out() {
         use crate::multiprocess::ExecutionMode;
-        // The default: no opt-in ⇒ Lockstep, on BOTH routes.
+        // THE FLIP: no request on the supervisor route ⇒ FreeRun.
         assert_eq!(
-            resolve_run_execution_mode(true, false),
-            ExecutionMode::Lockstep,
-            "a supervisor run WITHOUT the opt-in must keep the shipped barrier-lockstep default"
-        );
-        assert_eq!(
-            resolve_run_execution_mode(false, false),
-            ExecutionMode::Lockstep
-        );
-        // The opt-in: honoured ONLY where there are ranks to free-run.
-        assert_eq!(
-            resolve_run_execution_mode(true, true),
+            resolve_run_execution_mode(true, None),
             ExecutionMode::FreeRun,
-            "a supervisor run WITH the opt-in must free-run"
+            "a supervisor run with NO request must free-run: the default"
         );
+        // The opt-out.
         assert_eq!(
-            resolve_run_execution_mode(false, true),
+            resolve_run_execution_mode(true, Some(ExecutionMode::Lockstep)),
             ExecutionMode::Lockstep,
-            "a monolith never free-runs — the opt-in is inert there (and warned, see \
-             `an_inert_free_run_opt_in_is_warned_once`)"
+            "`lockstep` must opt a supervisor run back into barrier lockstep"
         );
+        // The default, spelled out, is the default.
+        assert_eq!(
+            resolve_run_execution_mode(true, Some(ExecutionMode::FreeRun)),
+            ExecutionMode::FreeRun,
+            "an explicit `free_run` names the default and changes nothing"
+        );
+        // No ranks ⇒ Lockstep, whatever was asked (a monolith never free-runs;
+        // an explicit `free_run` is inert there and warned, see
+        // `an_explicit_free_run_request_on_a_run_with_no_ranks_is_warned_once`).
+        for request in [
+            None,
+            Some(ExecutionMode::Lockstep),
+            Some(ExecutionMode::FreeRun),
+        ] {
+            assert_eq!(
+                resolve_run_execution_mode(false, request),
+                ExecutionMode::Lockstep,
+                "a run with no ranks is the one-rank lockstep timeline (request={request:?})"
+            );
+        }
         #[cfg(unix)]
         {
             use crate::replay_engine::CoordinationMode;
@@ -25275,75 +25396,271 @@ nodes:
                 CoordinationMode::FreeRun
             );
             // The monolith recording route's structural mode AGREES with what
-            // the resolver answers for a monolith under every opt-in — the two
-            // are one rule stated twice, and this is what keeps them one.
-            for opt_in in [false, true] {
+            // the resolver answers for a monolith under every request; the
+            // two are one rule stated twice, and this is what keeps them one.
+            for request in [
+                None,
+                Some(ExecutionMode::Lockstep),
+                Some(ExecutionMode::FreeRun),
+            ] {
                 assert_eq!(
-                    resolve_run_execution_mode(false, opt_in),
+                    resolve_run_execution_mode(false, request),
                     MONOLITH_EXECUTION_MODE,
                     "the monolith recording route must stamp the same mode the resolver \
-                     answers for a monolith (opt_in={opt_in})"
+                     answers for a monolith (request={request:?})"
                 );
             }
         }
     }
 
-    /// The opt-in grammar: exact-match, and an unrecognised
-    /// value keeps the DEFAULT (never silently opts in). Hand oracle over
+    /// The free-run default changed the DEFAULT, not the ROUTING. Composed
+    /// through the UNCHANGED `resolve_deployment` matrix: every arm that does
+    /// not execute process groups (no groups, `--single-process`, the
+    /// non-Unix fallback, and the `--time-source external` refusal) resolves
+    /// `Lockstep` under every request, and ONLY the supervisor arm (Real or
+    /// Virtual clock: a partitioned graph under `virtual` still runs the
+    /// supervisor) free-runs by default. A mode keyed on anything but the
+    /// deployment fact (a clock, a flag) breaks a cell here.
+    #[test]
+    fn the_deployment_routes_are_unchanged_by_the_flip() {
+        use crate::multiprocess::ExecutionMode;
+        let requests = [
+            None,
+            Some(ExecutionMode::Lockstep),
+            Some(ExecutionMode::FreeRun),
+        ];
+        let mode_for = |deployment: Result<Deployment, &'static str>, request| {
+            let executes = matches!(deployment, Ok(Deployment::Supervisor));
+            resolve_run_execution_mode(executes, request)
+        };
+        for request in requests {
+            for ts in [TimeSource::Real, TimeSource::Virtual, TimeSource::External] {
+                for unix in [false, true] {
+                    // No groups: the monolith, every platform/clock.
+                    assert_eq!(
+                        mode_for(resolve_deployment(false, false, unix, ts), request),
+                        ExecutionMode::Lockstep,
+                        "unpartitioned ⇒ monolith ⇒ Lockstep (unix={unix}, ts={ts:?}, \
+                         request={request:?})"
+                    );
+                    // `--single-process`: the forced monolith.
+                    assert_eq!(
+                        mode_for(resolve_deployment(true, true, unix, ts), request),
+                        ExecutionMode::Lockstep,
+                        "--single-process ⇒ Lockstep (unix={unix}, ts={ts:?}, \
+                         request={request:?})"
+                    );
+                }
+                // Non-Unix fallback: the monolith with a notice.
+                assert_eq!(
+                    mode_for(resolve_deployment(true, false, false, ts), request),
+                    ExecutionMode::Lockstep,
+                    "non-Unix fallback ⇒ Lockstep (ts={ts:?}, request={request:?})"
+                );
+            }
+            // The external-clock refusal is an `Err` the caller returns on
+            // before any mode is resolved; composed here it is the no-ranks
+            // answer, never FreeRun.
+            assert_eq!(
+                mode_for(
+                    resolve_deployment(true, false, true, TimeSource::External),
+                    request
+                ),
+                ExecutionMode::Lockstep
+            );
+            // The supervisor route: free-run by default, the request honoured.
+            for ts in [TimeSource::Real, TimeSource::Virtual] {
+                assert_eq!(
+                    mode_for(resolve_deployment(true, false, true, ts), request),
+                    request.unwrap_or(ExecutionMode::FreeRun),
+                    "supervisor ⇒ the request or the free-run default (ts={ts:?}, \
+                     request={request:?})"
+                );
+            }
+        }
+    }
+
+    /// A DEFAULT supervisor run takes the TRACED free-run path
+    /// (`FreeRunTraced` → `build_live_deterministic_free_run`) on every rank
+    /// that mints a trace ring, which is every plain multi-process run and
+    /// every `--record` run alike; only `--no-rings` leaves a rank on the
+    /// `RealClock` live path. The opt-out is the lockstep worker whether or
+    /// not the rank is traced. Composed end to end from the raw env value
+    /// through the worker's build-path seam, so the three pure decisions
+    /// cannot drift apart: the default changed the mode and NOT the
+    /// record/resim contract, and this is the test that says so rather than a
+    /// sentence.
+    #[test]
+    fn a_default_supervisor_run_with_record_takes_the_traced_free_run_path() {
+        use crate::multiprocess::ExecutionMode;
+        let default_mode = resolve_run_execution_mode(true, resolve_execution_mode_request(None));
+        assert_eq!(default_mode, ExecutionMode::FreeRun);
+        // `traced` is "this rank mints a trace ring": true on a plain run and
+        // under `--record`, false only under `--no-rings`.
+        assert_eq!(
+            resolve_worker_build_path(default_mode, true),
+            WorkerBuildPath::FreeRunTraced,
+            "default + a trace ring (`--record` among them) ⇒ the controlled-clock free-run worker"
+        );
+        assert_eq!(
+            resolve_worker_build_path(default_mode, false),
+            WorkerBuildPath::FreeRunLive,
+            "default + `--no-rings` ⇒ the RealClock free-run worker"
+        );
+        let opted_out =
+            resolve_run_execution_mode(true, resolve_execution_mode_request(Some("lockstep")));
+        assert_eq!(opted_out, ExecutionMode::Lockstep);
+        for traced in [false, true] {
+            assert_eq!(
+                resolve_worker_build_path(opted_out, traced),
+                WorkerBuildPath::Lockstep,
+                "the opt-out is the barrier worker, traced or not (traced={traced})"
+            );
+        }
+    }
+
+    /// The run directory's `gating` label follows the ONE resolved mode: a
+    /// default supervisor run is labelled `recorded_wall` whenever its ranks
+    /// mint a trace ring (a plain run, or `--record`) and `wall` only under
+    /// `--no-rings`; the opt-out is `quantum`; and the monolith shapes are
+    /// untouched by the default. The e2e twin (`mp_execution_mode_e2e_test`)
+    /// reads the same label off a real run's `run.json`.
+    #[test]
+    fn the_run_descriptor_labels_the_default_supervisor_run_recorded_wall() {
+        use crate::multiprocess::ExecutionMode;
+        use crate::run_dir::GatingClock;
+        let default_mode = resolve_run_execution_mode(true, None);
+        // (supervisor, virtual, records, traced, mode)
+        assert_eq!(
+            GatingClock::classify(true, false, false, true, default_mode),
+            GatingClock::RecordedWall,
+            "a plain default run mints its rings, so every rank is on the controlled clock"
+        );
+        assert_eq!(
+            GatingClock::classify(true, false, true, true, default_mode),
+            GatingClock::RecordedWall
+        );
+        assert_eq!(
+            GatingClock::classify(true, false, false, false, default_mode),
+            GatingClock::Wall,
+            "`--no-rings` is the one default shape on the read-only clock"
+        );
+        let opted_out = resolve_run_execution_mode(true, Some(ExecutionMode::Lockstep));
+        for (records, traced) in [(false, false), (false, true), (true, true)] {
+            assert_eq!(
+                GatingClock::classify(true, false, records, traced, opted_out),
+                GatingClock::Quantum,
+                "the opt-out is quantum-gated, recording or not (records={records}, traced={traced})"
+            );
+        }
+        // Monolith shapes: the default is not visible here at all (a monolith
+        // mints no trace ring).
+        let monolith = resolve_run_execution_mode(false, None);
+        assert_eq!(monolith, ExecutionMode::Lockstep);
+        assert_eq!(
+            GatingClock::classify(false, true, false, false, monolith),
+            GatingClock::Polled
+        );
+        assert_eq!(
+            GatingClock::classify(false, false, true, false, monolith),
+            GatingClock::RecordedWall
+        );
+        assert_eq!(
+            GatingClock::classify(false, false, false, false, monolith),
+            GatingClock::Wall
+        );
+    }
+
+    /// The grammar: exact-match, and an unrecognised value
+    /// takes the DEFAULT (never silently chooses either mode). Hand oracle over
     /// every arm of the parser, including the two accepted spellings, which
     /// are the plan enum's own serde names.
     #[test]
     fn the_execution_mode_env_parses_exactly_two_spellings_and_flags_garbage() {
-        // The default, by absence or explicitly.
-        assert_eq!(parse_execution_mode_env(None), (false, false));
-        assert_eq!(parse_execution_mode_env(Some("")), (false, false));
-        assert_eq!(parse_execution_mode_env(Some("lockstep")), (false, false));
-        // The opt-in.
-        assert_eq!(parse_execution_mode_env(Some("free_run")), (true, false));
-        // Garbage keeps the default AND is flagged — the exact-match
-        // discipline: no case-folding, no trimming, no aliases.
+        use crate::multiprocess::ExecutionMode;
+        // The default, by absence.
+        assert_eq!(parse_execution_mode_env(None), (None, false));
+        assert_eq!(parse_execution_mode_env(Some("")), (None, false));
+        // The opt-out.
+        assert_eq!(
+            parse_execution_mode_env(Some("lockstep")),
+            (Some(ExecutionMode::Lockstep), false)
+        );
+        // The default, spelled out.
+        assert_eq!(
+            parse_execution_mode_env(Some("free_run")),
+            (Some(ExecutionMode::FreeRun), false)
+        );
+        // Garbage takes the default AND is flagged: the exact-match
+        // discipline: no case-folding, no trimming, no aliases in EITHER
+        // direction.
         for junk in [
             "FREE_RUN",
+            "LOCKSTEP",
             "free-run",
+            "lock_step",
             "freerun",
             " free_run",
+            " lockstep",
+            "barrier",
             "1",
             "on",
+            "off",
             "true",
         ] {
             assert_eq!(
                 parse_execution_mode_env(Some(junk)),
-                (false, true),
-                "{junk:?} must keep the default and be flagged"
+                (None, true),
+                "{junk:?} must take the default and be flagged"
             );
         }
         // The serde spellings and the env spellings are ONE vocabulary.
         assert_eq!(
-            serde_json::to_value(crate::multiprocess::ExecutionMode::FreeRun).unwrap(),
+            serde_json::to_value(ExecutionMode::FreeRun).unwrap(),
             serde_json::json!("free_run")
         );
         assert_eq!(
-            serde_json::to_value(crate::multiprocess::ExecutionMode::Lockstep).unwrap(),
+            serde_json::to_value(ExecutionMode::Lockstep).unwrap(),
             serde_json::json!("lockstep")
         );
     }
 
-    /// A garbage opt-in value is LOUD (and still the default);
-    /// every recognised value is silent.
+    /// A garbage value is LOUD (and takes the default), and the
+    /// warn names BOTH the opt-out spelling and what the default is; every
+    /// recognised value is silent.
     #[test]
     #[tracing_test::traced_test]
-    fn a_garbage_execution_mode_value_warns_and_keeps_the_default() {
-        assert!(!resolve_free_run_opt_in(Some("FREE_RUN")));
+    fn a_garbage_execution_mode_value_warns_and_takes_the_default() {
+        use crate::multiprocess::ExecutionMode;
+        assert_eq!(resolve_execution_mode_request(Some("FREE_RUN")), None);
         assert!(logs_contain("CERULION_EXECUTION_MODE is set but not"));
         assert!(
             logs_contain("got=FREE_RUN"),
             "the offending value rides the structured `got=` field"
         );
-        assert!(logs_contain("keeping the barrier-lockstep default"));
+        assert!(
+            logs_contain("keeping the default"),
+            "the warn says the default is kept"
+        );
+        assert!(
+            logs_contain("`lockstep` (opt out of free-run)"),
+            "the warn names the opt-out spelling and what it opts out of"
+        );
+        assert!(
+            logs_contain("a multi-process run free-runs unless `lockstep` is spelled exactly"),
+            "the warn states the shipped default in plain words"
+        );
         // Anti-tautology: the recognised values must NOT produce the line.
-        assert!(resolve_free_run_opt_in(Some("free_run")));
-        assert!(!resolve_free_run_opt_in(Some("lockstep")));
-        assert!(!resolve_free_run_opt_in(None));
+        assert_eq!(
+            resolve_execution_mode_request(Some("free_run")),
+            Some(ExecutionMode::FreeRun)
+        );
+        assert_eq!(
+            resolve_execution_mode_request(Some("lockstep")),
+            Some(ExecutionMode::Lockstep)
+        );
+        assert_eq!(resolve_execution_mode_request(None), None);
+        assert_eq!(resolve_execution_mode_request(Some("")), None);
         logs_assert(|lines| {
             let n = lines
                 .iter()
@@ -25357,21 +25674,31 @@ nodes:
         });
     }
 
-    /// An opt-in on a run that cannot honour it is WARNED, once,
-    /// naming what would make it take effect — and a supervisor run with the
-    /// opt-in, or any run without it, says nothing.
+    /// An explicit `free_run` on a run that cannot honour it
+    /// is WARNED, once, naming what would make it take effect, and every
+    /// other shape is silent, INCLUDING the opt-out on a no-ranks run: that run
+    /// IS the one-rank lockstep timeline, so `lockstep` holds there and must
+    /// not cry inert (it would fire on every `--single-process` run under a
+    /// globally exported opt-out).
     #[test]
     #[tracing_test::traced_test]
-    fn an_inert_free_run_opt_in_is_warned_once() {
-        note_inert_free_run_opt_in(false, true);
+    fn an_explicit_free_run_request_on_a_run_with_no_ranks_is_warned_once() {
+        use crate::multiprocess::ExecutionMode;
+        note_inert_execution_mode_request(false, Some(ExecutionMode::FreeRun));
         assert!(logs_contain(
             "CERULION_EXECUTION_MODE=free_run is INERT on this run"
         ));
         assert!(logs_contain("executes no process groups"));
-        // Anti-tautology: the three non-inert shapes are silent.
-        note_inert_free_run_opt_in(true, true);
-        note_inert_free_run_opt_in(true, false);
-        note_inert_free_run_opt_in(false, false);
+        assert!(
+            logs_contain("free-runs by default"),
+            "the warn describes the shipped default on the routes that DO have ranks"
+        );
+        // Anti-tautology: the five other shapes are silent.
+        note_inert_execution_mode_request(false, Some(ExecutionMode::Lockstep));
+        note_inert_execution_mode_request(false, None);
+        note_inert_execution_mode_request(true, Some(ExecutionMode::FreeRun));
+        note_inert_execution_mode_request(true, Some(ExecutionMode::Lockstep));
+        note_inert_execution_mode_request(true, None);
         logs_assert(|lines| {
             let n = lines
                 .iter()
@@ -38840,12 +39167,15 @@ mod supervisor_tests {
         assert_eq!(round.state_arm_tag.as_deref(), Some("cer_run_42"));
     }
 
-    /// `stamp_execution_mode` writes the RESOLVED mode into EVERY
-    /// worker plan — the deployment-wide switch (a lockstep rank waiting at a
-    /// barrier no free-run rank will arrive at is a deployment-wide stall, so
-    /// the mode is one value per run, never per worker). Pure-fn pin mirroring
-    /// `stamp_park_policy`: the planner default is `Lockstep`; a `FreeRun`
-    /// stamp lands on all workers; re-stamping `Lockstep` reverts all of them.
+    /// `stamp_execution_mode` writes the RESOLVED mode into
+    /// EVERY worker plan, the deployment-wide switch (a lockstep rank waiting
+    /// at a barrier no free-run rank will arrive at is a deployment-wide
+    /// stall, so the mode is one value per run, never per worker). Pure-fn pin
+    /// mirroring `stamp_park_policy`: the pure planner leaves the plan-file
+    /// default (`Lockstep`, the reading of an UNSTAMPED field, NOT the run
+    /// default, which `resolve_run_execution_mode` decides and the supervisor
+    /// stamps); a `FreeRun` stamp lands on all workers; re-stamping
+    /// `Lockstep` reverts all of them.
     #[test]
     fn stamp_execution_mode_writes_the_resolved_mode_into_every_worker() {
         use crate::multiprocess::ExecutionMode;
@@ -38854,7 +39184,8 @@ mod supervisor_tests {
             assert_eq!(
                 w.execution_mode,
                 ExecutionMode::Lockstep,
-                "planner default is the shipped barrier-lockstep worker"
+                "the pure planner leaves the unstamped plan-file reading (Lockstep); the run \
+                 default is decided by the resolver and stamped by the supervisor"
             );
         }
         stamp_execution_mode(&mut plan, ExecutionMode::FreeRun);
@@ -39072,7 +39403,7 @@ mod supervisor_tests {
     /// absent key must mean "the shipped barrier-lockstep worker" — never a
     /// parse failure, and never a silent free-run. The round-trip direction is
     /// asserted on the WIRE spelling too (`"free_run"`), because that string
-    /// is what the bag's `coordination` stamp and the env opt-in share.
+    /// is what the bag's `coordination` stamp and the env variable share.
     #[test]
     fn the_worker_plans_execution_mode_is_additive_in_both_directions() {
         use crate::multiprocess::ExecutionMode;
@@ -39094,7 +39425,7 @@ mod supervisor_tests {
         let wire = serde_json::to_string(&stamped.workers[0]).unwrap();
         assert!(
             wire.contains("\"execution_mode\":\"free_run\""),
-            "the plan file must spell the mode the way the bag stamp and the env opt-in do, got: {wire}"
+            "the plan file must spell the mode the way the bag stamp and the env variable do, got: {wire}"
         );
         let round: crate::multiprocess::WorkerPlan =
             serde_json::from_str(&wire).expect("round-trip");

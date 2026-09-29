@@ -903,20 +903,27 @@ impl ClockInner {
     /// Advance the per-step gating clock by `delta_ns` and return the new time.
     ///
     /// The `Virtual` arm is the GATING clock (Period nodes gate
-    /// against it), so it advances by a run-INDEPENDENT logical quantum — the
-    /// fixed polled delta OR a replay-bag RECORDED execution duration — NEVER a
-    /// wall-derived or max-of-peers value (that would break replay = live,
-    /// Principle #7). The dedicated `advance_by_recorded` call names that
+    /// against it). `delta_ns` is one of the THREE wired feeds: the fixed
+    /// polled quantum, the MEASURED wall elapsed of a recording step (the
+    /// free-run multi-process default and a `--record` monolith), or a
+    /// bag-recorded step-boundary difference on replay. A max-of-peers or
+    /// off-seam telemetry value is NOT among them and must never be passed:
+    /// the boundary this step pushes is the only thing replay can hand back,
+    /// so a delta that reaches no boundary record breaks replay = live
+    /// (Principle #7). The dedicated `advance_by_recorded` call names that
     /// contract at the seam; see [`VirtualClock::advance_by_recorded`] for the
     /// canonical text. The `Real` arm is the no-op live path.
     fn advance(&self, delta_ns: u64) -> u64 {
         match self {
             ClockInner::Virtual(c) => c.advance_by_recorded(delta_ns),
             // Mechanically identical to the `Virtual`
-            // arm. The contract on what `delta_ns` means here is enforced by the
-            // CALLER (the live loop): it hands the LIVE logical quantum,
-            // NOT wall elapsed. So the `Barrier` gating clock advances
-            // deterministically and is NEVER a no-op (unlike `Real`).
+            // arm. What `delta_ns` means here is the CALLER's (the live loop's)
+            // decision, and it is mode-dependent: under the lockstep opt-out it
+            // hands the fixed LIVE logical quantum, and on a free-run recording
+            // it hands the step's measured wall elapsed (the
+            // `gating_follows_wall` arm). Either way the clock is CONTROLLED and
+            // is NEVER a no-op (unlike `Real`), so the value is stamped into
+            // this step's boundary record and is re-advanceable in replay.
             ClockInner::Barrier(c) => c.advance_by_recorded(delta_ns),
             // Read-only clocks (RealClock / ExternalClock) are not advanced by
             // the scheduler — their time is driven externally (the kernel
@@ -4447,9 +4454,11 @@ impl Scheduler {
     /// shared by the flat `Scheduler::step` and the `GraphRuntime::step` level
     /// executor (and the live path via `live_step -> step`). On the gating
     /// (polled/replay) path `delta` MUST be a run-INDEPENDENT logical quantum —
-    /// the poll-loop's fixed delta OR a replay-bag recorded duration — NOT a
-    /// wall-derived or max-of-peers value, so replay is bit-for-bit identical to
-    /// the polled gating run (Principle #7). The advance routes through
+    /// the poll-loop's fixed delta, a recording step's measured wall elapsed, OR
+    /// a replay-bag recorded boundary difference, NOT a max-of-peers or
+    /// off-seam telemetry value, so a run is bit-for-bit reproducible from its
+    /// own record and a polled gating run is additionally identical run to run
+    /// (Principle #7). The advance routes through
     /// [`VirtualClock::advance_by_recorded`] via `ClockInner::advance`; see it
     /// for the canonical contract.
     pub(crate) fn begin_step(&mut self, delta: Duration) -> u64 {

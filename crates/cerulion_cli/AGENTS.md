@@ -36,7 +36,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   `-- --test-threads=1`. Build fixtures first:
   - `replay_cli_test`: `cargo build -p test_node_macro_period_cdylib -p
     test_node_macro_period_perturbed_cdylib -p test_node_macro_period_panic_cdylib -p test_node_nondeterministic_cdylib`
-  - `mp_record_e2e_test`, `mp_auto_partition_e2e_test`, `network_gateway{,_mp}_e2e_test`:
+  - `mp_record`, `mp_auto_partition`, `mp_execution_mode`, `network_gateway{,_mp}` e2e:
     `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`
   - `signal_matrix_e2e_test`: `cargo build -p test_node_macro_period_cdylib`. `credit_death_e2e_test`: + `..._trigger_block_cdylib`.
     `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`
@@ -54,6 +54,5 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   that ASSERT call `#[must_use]` `finish().assert_clean()`. A walk enforces constructor shape
   and flags bare reaps it can see; await GO (`deployment live`) before a kill, else ABORT path.
 
-Deep reference: docs/internals/cli.md - command contracts (replay exit codes,
-completions design rules, discovery ladder, graph run/profile/partition) and the test
-map for both crates.
+Deep reference: docs/internals/cli.md - command contracts (replay exit codes, completions
+design rules, discovery ladder, graph run/profile/partition) and the test map for both crates.
