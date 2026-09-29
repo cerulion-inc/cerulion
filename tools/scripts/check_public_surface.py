@@ -62,8 +62,12 @@ LEGAL_SUFFIX_WORDS = (
 # LONGEST FIRST, so `Inc.` wins over `Inc` and the match carries the period a
 # page actually wrote. Without that order the pattern would read a correct
 # `<name> Inc.` as `<name> Inc` and report the right spelling as wrong.
+# The trailing guard is `\w`, not `[A-Za-z]`: a digit, an underscore or a letter
+# of any other script after the suffix means the run is an identifier or another
+# word, and truncating it to the suffix would report `<name> Inc1` as a
+# misspelling of `<name> Inc.`
 LEGAL_SUFFIX = (r"(?:" + "|".join(re.escape(w) for w in sorted(LEGAL_SUFFIX_WORDS, key=len, reverse=True))
-                + r")(?![A-Za-z])")
+                + r")(?!\w)")
 
 # Widening this set by adding CHARACTERS is safe. Widening it by admitting a
 # unicode CATEGORY is not: that is how the invisible characters got in, and a
@@ -77,10 +81,12 @@ LEGAL_NAME_CHARS = frozenset(
 # them, which a typesetter inserts and a reader cannot see), a comma, or ONE
 # line break with the prefix a wrapped line carries. The prefix set is every
 # line-lead marker this tree writes: a doc comment `///` or `//!`, a block
-# comment `*`, a shell or heading `#`, a quote `>`, a table cell `|`, a list
-# `-`, and `;` `%` `!` from the other comment syntaxes. One break and no blank
-# line, because a blank line ends the sentence and the two sides are then not
-# one mention.
+# comment `*`, a shell or heading `#`, a quote `>`, and `;` `%` `!` from the
+# other comment syntaxes. A table cell `|` and a list `-` are NOT here: they
+# lead a new cell or a new item rather than continue a sentence, and carrying
+# them read a name spelled down consecutive list items as one mention. One
+# break and no blank line, because a blank line ends the sentence and the two
+# sides are then not one mention.
 LEGAL_SPACE = r"[ \t\u00a0\u202f]"
 LEGAL_GAP = (r"(?:" + LEGAL_SPACE + r"+|" + LEGAL_SPACE + r"*," + LEGAL_SPACE + r"*|"
              + LEGAL_SPACE + r"*,?" + LEGAL_SPACE + r"*\r?\n" + LEGAL_SPACE + r"*(?:[>#*/!;%]+" + LEGAL_SPACE + r"*)?)")
@@ -2078,6 +2084,13 @@ def self_test(out=sys.stdout):
         _sh_family = " ".join(_sh_family.replace("#", " ").split())
     except (OSError, IndexError):
         _sh_family = ""
+    # A run that continues past the suffix is another word, whatever script it
+    # is in: truncating it would report an identifier as a misspelled name.
+    arm("a-suffix-that-runs-on-is-not-a-suffix",
+        all(legal_name_mentions("Acme Inc.").search("Acme " + t) is None
+            for t in ("Inc1", "Inc_", "Inc\u00e9", "Incidentally", "Incs"))
+        and legal_name_mentions("Acme Inc.").search("Acme Inc.") is not None
+        and legal_name_mentions("Acme Inc.").search("Acme Incorporated") is not None)
     arm("the-header-names-the-family-the-pattern-holds",
         all(re.search(r"(?<![A-Za-z.])" + re.escape(w) + r"(?![A-Za-z])", _sh_family) for w in LEGAL_SUFFIX_WORDS),
         repr(_sh_family))
