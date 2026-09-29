@@ -3342,6 +3342,9 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     // serial_discipline_test walks the repository root itself
     // (`collect_rs(&root, &root, &mut all_rs)`).
     ("cerulion_core", "all", "whole-tree"),
+    // state_record_framing_scan_test's table reads
+    // `crates/cerulion_bag/src/writer.rs`.
+    ("cerulion_core", "cerulion_bag", "crate-path"),
     // doc_attachment_discipline_test's table reads `../cerulion_bagd/src/lib.rs`.
     ("cerulion_core", "cerulion_bagd", "crate-path"),
     // cdylib_iox2_log_level_test reads

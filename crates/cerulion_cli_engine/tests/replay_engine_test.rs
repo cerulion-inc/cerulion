@@ -12405,7 +12405,7 @@ fn relay_anchor_blob() -> Vec<u8> {
 /// Chunk `blob` into the 512-byte `__cerulion/state` records the ring carries.
 fn state_records(run_id: u64, step: u64, node_idx: u32, blob: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    let mut chunker = StateChunker::new(run_id, step, node_idx);
+    let mut chunker = StateChunker::new(run_id, step, node_idx, 0);
     {
         let mut emit = |rec: &[u8; STATE_RECORD_SIZE as usize]| out.push(rec.to_vec());
         chunker.append(blob, &mut emit);
@@ -12460,6 +12460,8 @@ fn coverage_naming(node: &str, version: u32, rings: usize, node_idx: Option<u32>
         attached_mid_run: true,
         armed: None,
         rings_declared: rings,
+        ring_ranks: Default::default(),
+        state_record_format_version: Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
         ranks_discovered: Vec::new(),
         ranks_missing: Vec::new(),
         rings_unavailable: Default::default(),
@@ -13916,6 +13918,8 @@ fn coverage_for_nodes(nodes: &[(&str, u32)]) -> Vec<u8> {
         attached_mid_run: true,
         armed: None,
         rings_declared: 1,
+        ring_ranks: Default::default(),
+        state_record_format_version: Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
         ranks_discovered: Vec::new(),
         ranks_missing: Vec::new(),
         rings_unavailable: Default::default(),
