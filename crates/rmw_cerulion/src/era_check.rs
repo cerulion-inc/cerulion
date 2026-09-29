@@ -538,12 +538,48 @@ pub enum DistroClaimVerdict {
 }
 
 /// Era rank for a known distro name (input must already be normalized).
-fn distro_era_rank(distro: &str) -> Option<usize> {
+///
+/// (Also the runtime side's rank lookup for the unset-distro guard, which
+/// is why it is public: `era::classify_unset_distro` compares a baked
+/// claim's rank against [`UNSET_DISTRO_REFUSED_FROM_ERA`], and a second
+/// copy of this table walk is exactly the drift the one-table rule
+/// forbids.)
+pub fn distro_era_rank(distro: &str) -> Option<usize> {
     DISTRO_ERAS
         .iter()
         .find(|(name, _)| *name == distro)
         .map(|(_, rank)| *rank)
 }
+
+/// Era rank of an `era:<token>` claim's token (the `era:` prefix already
+/// stripped), read from the SAME canonical token table the claims are
+/// baked from, so a claim's rank and its spelling cannot disagree.
+/// `None` for a token no era carries.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub fn era_claim_token_rank(token: &str) -> Option<usize> {
+    ERA_CLAIM_TOKENS.iter().position(|t| *t == token)
+}
+
+/// The era at and above which EVERY generated build refuses to load when
+/// the runtime names no distro at all. It is one input to
+/// [`refuses_unnamed_runtime`], not the whole rule: the refusing set is
+/// exactly `{kilted, lyrical, rolling}`, and Kilted sits at the Jazzy rank
+/// below this bound, admitted here but refused there by its init-options
+/// size.
+///
+/// From Lyrical on, the `rmw_init_options_t` layout is Kilted's 160-byte
+/// shape and the introspection `MessageMember` stride is 120 bytes against
+/// Jazzy's 112, so a library of this era handed an earlier distro's struct
+/// writes at the wrong offsets and dies at the first typed operation. An
+/// environment that sets no `ROS_DISTRO` offers no evidence that the
+/// process really runs this era, and the refusal is cheap while the crash
+/// is not: these builds fail closed. Iron-era and earlier generated builds
+/// keep admitting an unnamed runtime, Jazzy admits by its 168-byte layout,
+/// and the VENDORED snapshot's admission rule ([`RESERVED_UNCLAIMED_MARKER`])
+/// is untouched: its whole purpose is a development machine with no ROS
+/// environment.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub const UNSET_DISTRO_REFUSED_FROM_ERA: usize = ERA_LYRICAL;
 
 /// The era rank an observed fingerprint matches EXACTLY, if any.
 pub fn observed_era_rank(observed: &[&str]) -> Option<usize> {
@@ -626,6 +662,57 @@ pub fn probe_init_options_size(bindings: &str) -> Option<usize> {
 /// jazzy↔kilted env-lie hole whenever the size is
 /// readable).
 const CLAIM_INIT_OPTIONS_SIZE: &[(&str, usize)] = &[("jazzy", 168), ("kilted", 160)];
+
+/// Jazzy's `rmw_init_options_t` size: the ONE Jazzy-era layout that ADMITS
+/// an unnamed runtime. Kilted shares Jazzy's era RANK yet lays out 160
+/// bytes (it dropped `localhost_only`), so the size, not the rank, is what
+/// separates the two for the unset-distro guard.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub const JAZZY_INIT_OPTIONS_SIZE: usize = 168;
+
+/// The `rmw_init_options_t` size a claim's distro lays out, for the
+/// Jazzy-era pair the rank alone cannot separate (`jazzy` 168, `kilted`
+/// 160). `None` for every other distro: the unset-distro guard decides
+/// those by rank.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub fn claim_init_options_size(distro: &str) -> Option<usize> {
+    CLAIM_INIT_OPTIONS_SIZE
+        .iter()
+        .find(|(c, _)| *c == distro)
+        .map(|(_, size)| *size)
+}
+
+/// Does a GENERATED build baked for `distro` refuse to load when the
+/// runtime names no distro at all?
+///
+/// True for EXACTLY `{kilted, lyrical, rolling}`, by two inputs that are
+/// both read here: the era rank ([`DISTRO_ERAS`]) and, at the Jazzy rank
+/// the era cannot split, the init-options size (`CLAIM_INIT_OPTIONS_SIZE`).
+/// A distro whose era is at or past [`UNSET_DISTRO_REFUSED_FROM_ERA`]
+/// (`lyrical`, `rolling`) refuses unconditionally; a distro of the Jazzy
+/// era refuses only when its init-options layout is NOT Jazzy's
+/// ([`JAZZY_INIT_OPTIONS_SIZE`]), which is Kilted's 160-byte shape and
+/// never Jazzy's own 168; every earlier era (`foxy`, `galactic`, `humble`,
+/// `iron`) admits. From Lyrical on the introspection member stride also
+/// grew (112 to 120), but that stride does NOT separate Kilted from Jazzy
+/// (both are the Jazzy rank, both 112), so only the init-options size
+/// carries Kilted. An unknown distro admits: nothing to classify.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub fn refuses_unnamed_runtime(distro: &str) -> bool {
+    let Some(rank) = distro_era_rank(distro) else {
+        return false;
+    };
+    if rank >= UNSET_DISTRO_REFUSED_FROM_ERA {
+        return true;
+    }
+    if rank != ERA_JAZZY {
+        return false;
+    }
+    // Jazzy era: Kilted's 160-byte layout refuses, Jazzy's own 168 admits.
+    // A rank-4 distro the size table does not know admits (nothing states
+    // its layout differs from Jazzy's).
+    claim_init_options_size(distro).is_some_and(|size| size != JAZZY_INIT_OPTIONS_SIZE)
+}
 
 /// A jazzy/kilted claim whose bindings lay out a DIFFERENT
 /// `rmw_init_options_t` size than the claim requires:
@@ -1721,6 +1808,72 @@ mod tests {
             era_claim_members(VENDORED_SNAPSHOT_ERA_TOKEN),
             Some(&["lyrical", "rolling"][..])
         );
+    }
+
+    #[test]
+    fn refuses_unnamed_runtime_is_exactly_kilted_lyrical_rolling() {
+        // DERIVATION 1's inputs, read here: the product predicate refuses
+        // EXACTLY {kilted, lyrical, rolling} over the distros the era table
+        // knows, and it does so by rank AND, at the Jazzy rank, init-options
+        // size. The independent derivation from the era_pins size pins lives
+        // in era.rs (`the_unset_distro_refusing_set_is_the_160_byte_init_options_layout`).
+        use std::collections::BTreeSet;
+        let refusing: BTreeSet<&str> = DISTRO_ERAS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| refuses_unnamed_runtime(name))
+            .collect();
+        assert_eq!(refusing, BTreeSet::from(["kilted", "lyrical", "rolling"]));
+
+        // The unconditional part of the bound is still the era that grew the
+        // introspection member (`is_rosidl_buffer`), and it is ERA_LYRICAL.
+        let stride_era = CAPABILITY_MIN_ERA
+            .iter()
+            .find(|(cap, _)| *cap == "is_rosidl_buffer")
+            .map(|(_, rank)| *rank)
+            .expect("the capability table names is_rosidl_buffer");
+        assert_eq!(UNSET_DISTRO_REFUSED_FROM_ERA, stride_era);
+
+        // The Kilted split cannot be a rank cut: Kilted and Jazzy share the
+        // rank one below the bound, and only the size (160 vs Jazzy's 168)
+        // separates them.
+        assert_eq!(distro_era_rank("kilted"), Some(ERA_JAZZY));
+        assert_eq!(distro_era_rank("jazzy"), Some(ERA_JAZZY));
+        assert_eq!(UNSET_DISTRO_REFUSED_FROM_ERA - 1, ERA_JAZZY);
+        assert_eq!(claim_init_options_size("kilted"), Some(160));
+        assert_eq!(
+            claim_init_options_size("jazzy"),
+            Some(JAZZY_INIT_OPTIONS_SIZE)
+        );
+        assert!(refuses_unnamed_runtime("kilted"));
+        assert!(!refuses_unnamed_runtime("jazzy"));
+    }
+
+    #[test]
+    fn an_era_claim_tokens_rank_is_the_rank_of_every_distro_it_names() {
+        // The token table and the distro table agree, in both directions,
+        // so a rank read through a claim label can never disagree with the
+        // rank read through a distro name.
+        for (rank, token) in ERA_CLAIM_TOKENS.iter().enumerate() {
+            assert_eq!(era_claim_token_rank(token), Some(rank), "token {token}");
+            assert_eq!(distro_era_rank(token), Some(rank), "token {token}");
+        }
+        for (distro, rank) in DISTRO_ERAS {
+            assert_eq!(distro_era_rank(distro), Some(*rank), "distro {distro}");
+        }
+        for (token, members) in ERA_CLAIM_ADMITTED_MEMBERS {
+            for member in *members {
+                assert_eq!(
+                    distro_era_rank(member),
+                    era_claim_token_rank(token),
+                    "`{token}` admits `{member}` of another era"
+                );
+            }
+        }
+        // An unknown token ranks nothing, so an unrecognizable claim can
+        // never satisfy a rank comparison by accident.
+        assert_eq!(era_claim_token_rank("m_next"), None);
+        assert_eq!(era_claim_token_rank(""), None);
     }
 
     #[test]

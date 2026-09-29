@@ -282,6 +282,126 @@ shard_filterset_terms() {
 }
 
 # --------------------------------------------------------------------------
+# THE SELECTION.
+#
+# `CI_SELECTED_PACKAGES` carries the `pkgs` output of ci.yml's `changes` job:
+# the JSON array of the packages a pull request's change can reach, the reverse
+# cargo closure unioned with the observation edges in
+# `tools/ci/observation_edges.tsv`. This script runs ONE package, so the
+# intersection of its member list with that array is either that package or
+# nothing, and nothing means this shard has no work to do.
+#
+# FAIL CLOSED, twice. An unset or empty variable RUNS: a shard invoked by hand
+# or by a job that publishes no selection must behave as it always did. A value
+# that is not a JSON array RUNS too: a selection this script cannot read is not
+# a selection it may act on, and the word `all` arrives here exactly that way.
+#
+# WHOLE TOKEN, quotes included, which is what keeps `cerulion_viz` and
+# `cerulion_vizd` apart: a bare substring test would report `cerulion_viz`
+# selected by an array holding only `cerulion_vizd`.
+#
+# READABLE MEANS A JSON ARRAY OF QUOTED NAMES, not merely a bracketed string.
+# `[cerulion_bag]` reads as a selection under a brackets-only test and holds no
+# quoted name, so the shard SKIPPED on a value no producer emits and no reader
+# can parse, which is the one direction this function is documented never to
+# take. Every shape below that is not `[]` or `["a"]` or `["a","b"]` is
+# unreadable and RUNS.
+selection_holds() {
+    # $1 is the package this shard runs, $2 the selection.
+    case "$2" in
+        "") return 0 ;;
+        \[*\]) ;;
+        *) return 0 ;;
+    esac
+    _sel_inner=${2#\[}
+    _sel_inner=${_sel_inner%\]}
+    _sel_found=1
+    _sel_rest=$_sel_inner
+    while [ -n "$_sel_rest" ]; do
+        _sel_tok=${_sel_rest%%,*}
+        case "$_sel_rest" in
+            *,*) _sel_rest=${_sel_rest#*,} ;;
+            *)   _sel_rest= ;;
+        esac
+        # JSON puts optional whitespace around a value, so the token is trimmed
+        # before it is judged: a producer that starts writing `["a", "b"]` must
+        # not silently stop being readable.
+        while :; do
+            case "$_sel_tok" in
+                " "*)  _sel_tok=${_sel_tok# } ;;
+                *" ")  _sel_tok=${_sel_tok% } ;;
+                *)     break ;;
+            esac
+        done
+        # A QUOTED NAME, and nothing else: opening and closing quote, at least
+        # one character between them, and no quote inside.
+        case "$_sel_tok" in
+            '"'*'"') ;;
+            *) return 0 ;;
+        esac
+        _sel_name=${_sel_tok#\"}
+        _sel_name=${_sel_name%\"}
+        case "$_sel_name" in
+            ''|*'"'*) return 0 ;;
+        esac
+        [ "$_sel_name" != "$1" ] || _sel_found=0
+    done
+    return "$_sel_found"
+}
+
+# The hand table `--check` holds `selection_holds` to.
+#
+# `<package>|<selection>|<runs>`. Written out rather than generated: the rows
+# say what the answer IS, so a reader that changed its mind fails here instead
+# of agreeing with itself.
+#
+# THE MALFORMED ROWS PAIR WITH A WELL-FORMED SKIP, and the pair differs only in
+# the quoting: `["cerulion_bag"]` is readable and skips `cerulion_core`, while
+# `[cerulion_bag]` is not a JSON array of quoted names, so it is unreadable and
+# RUNS. `[cerulion_core]` is the same shape naming the package itself, so the
+# answer cannot come from a match. The spaced rows say the trimming is real in
+# both directions.
+SELECTION_CASES='
+cerulion_core|["cerulion_core"]|yes
+cerulion_core|["cerulion_bag","cerulion_core"]|yes
+cerulion_core|["cerulion_bag"]|no
+cerulion_core|[]|no
+cerulion_core||yes
+cerulion_core|all|yes
+cerulion_core|not json|yes
+cerulion_core|[cerulion_bag]|yes
+cerulion_core|[cerulion_core]|yes
+cerulion_core|["cerulion_bag]|yes
+cerulion_core|[cerulion_bag,"cerulion_core"]|yes
+cerulion_core|[""]|yes
+cerulion_core|["cerulion_bag", "cerulion_viz"]|no
+cerulion_core|["cerulion_bag", "cerulion_core"]|yes
+cerulion_viz|["cerulion_viz"]|yes
+cerulion_viz|["cerulion_vizd"]|no
+cerulion_vizd|["cerulion_viz"]|no
+cerulion-wire|["cerulion-wire"]|yes
+'
+
+check_selection() {
+    _fails=0
+    while IFS= read -r _row; do
+        [ -n "$_row" ] || continue
+        _pkg=${_row%%|*}
+        _rest=${_row#*|}
+        _sel=${_rest%|*}
+        _want=${_rest##*|}
+        if selection_holds "$_pkg" "$_sel"; then _got=yes; else _got=no; fi
+        if [ "$_got" != "$_want" ]; then
+            printf 'VIOLATION: selection_holds %s "%s" -> %s, wanted %s\n' \
+                "$_pkg" "$_sel" "$_got" "$_want" >&2
+            _fails=$((_fails + 1))
+        fi
+    done <<< "$SELECTION_CASES"
+    [ "$_fails" -eq 0 ] || exit 1
+    printf 'ci_test_shard --check: OK, the selection reader agrees with its hand table.\n'
+}
+
+# --------------------------------------------------------------------------
 # --check: the partition is TOTAL and DISJOINT.
 #
 # A shard runner that silently DROPPED a test file would be worse than the
@@ -376,6 +496,8 @@ $_members"
 
     printf 'ci_test_shard --check: OK — %d test file(s) partitioned across %d shard(s) of %s, total and disjoint.\n' \
         "$_total" "$_count" "$_pkg"
+
+    check_selection
 }
 
 # --------------------------------------------------------------------------
@@ -401,6 +523,21 @@ require_index "shard index" "$INDEX"
 require_index "shard count" "$COUNT"
 [ "$COUNT" -ge 1 ] || die "shard count must be >= 1 (got '$COUNT')"
 [ "$INDEX" -lt "$COUNT" ] || die "shard index $INDEX is out of range for $COUNT shard(s)"
+
+# THE SELECTION, before anything is enumerated or built. One line with the fixed
+# `selection:` prefix, then exit 0 without invoking cargo.
+#
+# The workflow step that runs this shard is deliberately NOT gated by an `if:`:
+# `cerulion_core` observes the whole repository tree (its `serial_discipline_test`
+# walks every `.rs` file under the root), so `tools/ci/observation_edges.tsv`
+# records it as observing `all` and it is selected on every change. The
+# intersection below is the mechanism for any package whose shard step is added
+# later and whose observation edges the walk can attribute.
+if [ "$MODE" = run ] && ! selection_holds "$PACKAGE" "${CI_SELECTED_PACKAGES:-}"; then
+    printf 'selection: skipped %s shard %s (selected: %s)\n' \
+        "$PACKAGE" "$INDEX" "${CI_SELECTED_PACKAGES:-}"
+    exit 0
+fi
 
 # ENUMERATE FIRST, IN THIS SHELL. `enumerate` is otherwise only ever reached
 # from inside a `$( … )`, where its `die` exits the SUBSHELL: a missing or
