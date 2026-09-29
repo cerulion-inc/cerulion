@@ -556,7 +556,7 @@ pull_request;;benches/latency/workspace/nodes/ping_node/src/lib.rs|true|true|all
 pull_request;;LICENSE|true|true|all|unknown-path
 pull_request;;.github/CODEOWNERS|true|true|all|unknown-path
 pull_request;;CITATION.cff|true|true|all|unknown-path
-pull_request;;README.md|false|true||docs:README.md
+pull_request;;README.md|true|true|cerulion_cli_engine|docs:README.md
 pull_request;;My Notes.md|false|true||docs:My Notes.md
 pull_request;;|false|false||none
 '
