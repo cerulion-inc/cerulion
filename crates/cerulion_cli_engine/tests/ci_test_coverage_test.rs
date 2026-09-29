@@ -4764,11 +4764,13 @@ const OTHER_PAYLOAD_READS: &[&str] = &[
 ];
 
 /// The part of a step block a payload read counts in: everything but its
-/// `name:` and its `if:`.
+/// `name:`.
 ///
-/// A step NAMED after a field reads nothing, and a condition that tests one is
-/// the condition this walk already read; counting either would exclude a step
-/// over text that does no work.
+/// A step NAMED after a field reads nothing, so counting its name would exclude
+/// a step over text that does no work. The `if:` needs no such care: the caller
+/// reaches this only for a condition [`events_a_condition_allows`] read, and
+/// that grammar is tests on `github.event_name` alone, which carry no payload
+/// read.
 fn step_payload_text(block: &[&str]) -> String {
     let Some(first) = block.first() else {
         return String::new();
@@ -4793,7 +4795,7 @@ fn step_payload_text(block: &[&str]) -> String {
             out.push(line);
             continue;
         };
-        if key.starts_with("name:") || key.starts_with("if:") {
+        if key.starts_with("name:") {
             skip_under = Some(key_column);
             continue;
         }
@@ -4805,10 +4807,10 @@ fn step_payload_text(block: &[&str]) -> String {
 /// What the step walk found in one job.
 #[derive(Default)]
 struct StepCoverage {
-    /// The trigger events the steps that split the work do not admit between
-    /// them.
+    /// The trigger events no side of the split admits.
     uncovered: Vec<String>,
-    /// How many steps of the job split the work by event.
+    /// How many steps of the job are a SIDE of the split: a step whose event
+    /// condition this walk reads and that the exclusion below does not reach.
     members: usize,
     /// How many steps of the job are pull-request-only by construction.
     pull_request_only: usize,
@@ -4830,9 +4832,10 @@ struct StepCoverage {
 /// nothing about events: neither is a side, so neither covers an event nor
 /// withholds one. And a step whose condition admits `pull_request` ALONE, whose
 /// `env:`, `with:` or script reads `github.event.pull_request.`, and which
-/// reads no other event's payload, is pull-request-only by construction: every
-/// field it reads is in the pull request payload and nowhere else, so it is
-/// work with no counterpart on another event rather than one side of a split.
+/// reads none of the other payloads this walk lists, is pull-request-only by
+/// construction: it reads the pull request payload and none of the others, so
+/// it is work with no counterpart on another event rather than one side of a
+/// split.
 /// A step reading TWO payloads carries work for both, so it is a side. An
 /// excluded step is neither a side nor a gap, and where the job has sides its
 /// events are credited to them: a job with one leg per event whose pull request
@@ -4918,7 +4921,7 @@ struct RequiredJobWalk {
     judged: usize,
     /// How many of those carry steps, so the step rule judged them.
     step_judged: usize,
-    /// How many of those carry a step that is a partition member.
+    /// How many of those carry a step that splits the work by event.
     step_conditioned: usize,
     /// How many steps across them are pull-request-only by construction.
     pull_request_only_steps: usize,
@@ -5414,7 +5417,7 @@ fn a_required_job_that_can_skip_is_named_and_one_matched_to_its_triggers_is_not(
     assert_eq!(got.pull_request_only_steps, 2, "both gates are excluded");
     assert_eq!(
         got.step_conditioned, 0,
-        "and the job has no partition member"
+        "and no step of the job splits the work by event"
     );
 
     // (b) THE EXCLUSION NEEDS BOTH HALVES: a pull-request-gated step that reads
@@ -5472,7 +5475,7 @@ fn a_required_job_that_can_skip_is_named_and_one_matched_to_its_triggers_is_not(
     let got = walk(&steps(dispatch, &[(None, run), (None, run)]));
     assert!(
         got.uncovered.is_empty() && got.step_conditioned == 0,
-        "a job with no partition member owes nothing: {:?}",
+        "a job with no step that splits the work owes nothing: {:?}",
         got.uncovered
     );
 
@@ -5530,8 +5533,8 @@ fn a_required_job_that_can_skip_is_named_and_one_matched_to_its_triggers_is_not(
         got.uncovered
     );
 
-    // (k) A NAME OR A CONDITION that merely mentions a payload field is no read
-    // of it, so this step is a side and owes the other triggers.
+    // (k) A `name:` THAT MENTIONS a payload field is no read of it, so this
+    // step is a side of the split and owes the other triggers.
     let named_step = String::from("      - name: read github.event.pull_request.title\n")
         + "        if: github.event_name == 'pull_request'\n"
         + "        run: true\n";
