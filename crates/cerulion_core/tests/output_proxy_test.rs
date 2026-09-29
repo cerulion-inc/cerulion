@@ -814,7 +814,7 @@ fn output_discard_count_is_observable_through_node_handle_e2e() {
 // live listener nobody drains no longer does, because a full doorbell is
 // swallowed and a notify into an already-notified listener skips the send. A
 // wedged-but-alive consumer as the stimulus would make this test assert on a
-// count that can never move — see `notify_shortfall_iox2_test` for the
+// count that can never move, see `notify_shortfall_iox2_test` for the
 // measurements and for the apparatus arm.
 // ============================================================
 
@@ -893,7 +893,7 @@ const CHILD_DRAIN_TICKS: usize = 120_000;
 /// iceoryx2's notified state, where a later notify returns success without
 /// touching the doorbell, and no shortfall would ever be observed.
 #[test]
-#[ignore = "child process entry point — driven by the NodeHandle test in this file"]
+#[ignore = "child process entry point, driven by the NodeHandle test in this file"]
 fn subprocess_child_holds_a_subscriber() {
     let Some(config) = cerulion_core::testing::child_iceoryx_config() else {
         return;
@@ -1019,7 +1019,7 @@ fn notify_undelivered_count_is_observable_through_node_handle_e2e() {
         observed > 0,
         "after {steps} publishes with a KILLED consumer's listener still registered on \
          the output topic, notifies must be reaching fewer listeners than the service \
-         reports and the count must show it — got 0, so either the registration was \
+         reports and the count must show it, got 0, so either the registration was \
          already reaped or the NodeHandle wiring is not hooked up"
     );
 

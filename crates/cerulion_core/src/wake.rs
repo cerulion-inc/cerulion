@@ -55,7 +55,7 @@
 //!   skips the send), so an undrained listener now costs the producer LESS than
 //!   a drained one. A wake-driven consumer drains its listener on every wake by
 //!   construction, so what it costs the producer is one doorbell send per
-//!   publish — present-vs-absent, which is what the next point is about.
+//!   publish, present-vs-absent, which is what the next point is about.
 //! * **Notify elision** means a GRAPH publisher with zero listeners
 //!   skips notify work entirely. Attaching here un-arms that for the topic.
 //!   Attach a wake only where the publisher is one you are willing to bill.

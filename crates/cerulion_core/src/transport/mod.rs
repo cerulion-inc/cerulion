@@ -6543,7 +6543,7 @@ mod tap_depth_tests {
             flashback_tap_buffer_depth(BUDGET, 64 * 1024 * 1024, 4096),
             FLASHBACK_TAP_BUFFER_DEPTH_FLOOR
         );
-        // HALF the budget buys exactly one slot, which the floor lifts to two —
+        // HALF the budget buys exactly one slot, which the floor lifts to two,
         // the boundary on the side the floor is for.
         assert_eq!(BUDGET / iceoryx2_slot_bytes(32 * 1024 * 1024) as u64, 1);
         assert_eq!(
@@ -6980,7 +6980,7 @@ mod tests {
             "the JSON path reads the same full identity as the struct path"
         );
         // Hand oracle for the well-known iceoryx2 defaults, unchanged on the
-        // linked release — every
+        // linked release, every
         // discovery-keying field, so a codegen/default drift fails here loudly.
         assert_eq!(got.prefix, "iox2_", "default segment prefix");
         assert_eq!(got.service_dir, "services", "default service directory");
@@ -7576,7 +7576,7 @@ mod tests {
         assert_eq!(
             all_open.len(),
             OPEN_VARIANTS,
-            "the sweep must cover every open variant — extend the list, \
+            "the sweep must cover every open variant. Extend the list, \
              `want_open` AND `OPEN_VARIANTS` together when iceoryx2 adds one"
         );
         for v in all_open {

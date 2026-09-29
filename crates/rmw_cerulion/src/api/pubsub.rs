@@ -1373,7 +1373,7 @@ pub unsafe extern "C" fn rmw_borrow_loaned_message(
         // Alignment gate (fail closed — never hand out, and never run a
         // typed `init_function` on, a misaligned struct pointer). Expected
         // to ALWAYS hold: the sample header is align 8 and its size is a
-        // multiple of 8 (measured — see `IOX2_SAMPLE_HEADER_BYTES` in
+        // multiple of 8 (measured, see `IOX2_SAMPLE_HEADER_BYTES` in
         // cerulion_core, currently 48) and a `[u8]` payload has align 1, so
         // the payload starts 8-aligned in an 8-aligned chunk; +32
         // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen
@@ -3886,7 +3886,7 @@ unsafe fn take_loaned_impl(
         }
         // Alignment gate (fail closed — never hand out a misaligned struct
         // pointer). Expected to ALWAYS hold: the sample header is align 8 and
-        // its size is a multiple of 8 (measured — see
+        // its size is a multiple of 8 (measured, see
         // `IOX2_SAMPLE_HEADER_BYTES` in cerulion_core, currently 48) and a
         // `[u8]` payload has align 1, so the payload starts 8-aligned; +32
         // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen static
@@ -3913,7 +3913,7 @@ unsafe fn take_loaned_impl(
         // but the subscriber-side loan contract is read-only: the mapping IS
         // read-only (iceoryx2 opens subscriber data segments
         // `AccessMode::Read`), so a caller writing through it faults loudly
-        // rather than corrupting the frame every other subscriber reads —
+        // rather than corrupting the frame every other subscriber reads. That is
         // inherent to the rmw loan ABI, not specific to this implementation.
         inner.pending_takes.push(runtime::PendingTake {
             key: ros_ptr as usize,

@@ -25,7 +25,7 @@
 //!
 //! The budgeted depth is asserted as `63` rather than as
 //! `flashback_tap_buffer_depth(..)`, because calling the rule to check the rule
-//! is a self-compare. 63 is `4 MiB / (64 KiB + 48)` floored — and the arm ALSO
+//! is a self-compare. 63 is `4 MiB / (64 KiB + 48)` floored, and the arm ALSO
 //! asserts it is strictly under the NOMINAL `4 MiB / 64 KiB = 64`, which is the
 //! discriminator for the real-vs-nominal divisor through the production path.
 //!
@@ -1000,7 +1000,7 @@ fn wide_publisher(
 ///
 /// The shape is exact, and its numbers are the oracle: the tap opens at depth 16
 /// against a 112-byte slot; a 4096-byte publisher joins; 16 of ITS samples
-/// occupy `16 x 4144` = 66,304 B — OVER the 64 KiB budget — while a cached
+/// occupy `16 x 4144` = 66,304 B, OVER the 64 KiB budget, while a cached
 /// price reports `16 x 112` = 1,792 B.
 ///
 /// Both numbers are asserted: the equality says the live price is used, and the

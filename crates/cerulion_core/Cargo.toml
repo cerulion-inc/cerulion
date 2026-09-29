@@ -82,7 +82,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 # PINNED to EXACT `=0.10.0` (not `^0.10`/`~0.10.0`): a user's freshly
 # scaffolded workspace (no Cargo.lock) would otherwise re-resolve to
 # the newest 0.10.x patch (e.g. 0.10.1) while the installed `cerulion`
-# binary links 0.10.0 — two patch releases stamp incompatible
+# binary links 0.10.0, two patch releases stamp incompatible
 # `iceoryx2-bb-elementary::PackageVersion`s into every shared-memory
 # zero-copy connection segment, producing a `VersionMismatch` → an
 # "Unable to establish connection" flood with no data flow.

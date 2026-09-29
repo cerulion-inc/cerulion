@@ -1271,12 +1271,12 @@ fn pump_loop(
 ) {
     while !exit.load(Ordering::Relaxed) {
         match doorbell.as_ref() {
-            // iceoryx2 0.10: `timed_wait_one` is gone — a ring is `Ok(n > 0)`.
+            // iceoryx2 0.10: `timed_wait_one` is gone, a ring is `Ok(n > 0)`.
             // `Ok(0)` is the deadline OR a wake that drained nothing, and both
             // mean republish on the interval (see `run_registry::pump_loop`).
             Some(listener) => match listener.timed_wait(|_a| {}, interval) {
                 // A ring: somebody is gathering and wants this writer's answer.
-                // `n` activations, not one wake — see `note_doorbell_rings`.
+                // `n` activations, not one wake, see `note_doorbell_rings`.
                 Ok(n) if n > 0 => inner.note_doorbell_rings(n),
                 // No ring to answer: the deadline, or a wake that drained
                 // nothing. Republish on the interval as before.

@@ -7449,7 +7449,7 @@ fn elapsed_ns(origin: Instant) -> u64 {
 ///
 /// **This bound keeps the loop's waits from being skipped indefinitely, not a
 /// tuning knob.** The listener's event queue is drained by the multiplexer's
-/// callback, which only runs inside a wait — so a pass that skips its wait
+/// callback, which only runs inside a wait, so a pass that skips its wait
 /// leaves the listener UNDRAINED. A topic publishing faster than the loop
 /// drains would otherwise take the backlog arm on every pass forever and the
 /// loop would never wait again, which is a liveness problem for everything else

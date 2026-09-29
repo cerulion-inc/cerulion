@@ -265,14 +265,14 @@ fn every_event_service_creation_site_passes_the_ceiling() {
     );
     assert!(
         missing.is_empty(),
-        "event service created without `event_id_max_value`: {missing:?} — one \
+        "event service created without `event_id_max_value`: {missing:?}, one \
          uncapped creator restores iceoryx2's 255-wide bitset walk for every \
          later opener of that service"
     );
     assert!(
         wrong_argument.is_empty(),
         "event service created with a ceiling that is not `{CEILING_IDENT}`: \
-         {wrong_argument:?} — the ceiling must track `PubSubEvent::MAX_ID`, and a \
+         {wrong_argument:?}, the ceiling must track `PubSubEvent::MAX_ID`, and a \
          hand written number stops tracking it the moment a variant is added"
     );
 }

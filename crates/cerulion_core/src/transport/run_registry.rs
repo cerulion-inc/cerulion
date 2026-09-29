@@ -1065,13 +1065,13 @@ fn pump_loop(
             // shape guaranteed: it is the deadline expiring OR a wake that
             // found the queue already drained (a concurrent drain, or an
             // activation the level-triggered doorbell had already collapsed).
-            // Both mean the same thing here — republish on the interval — so
+            // Both mean the same thing here, republish on the interval, so
             // the arm is correct either way, and the distinction is written
             // down because a reader reasoning about wake counts from this
             // comment would otherwise conclude that `Ok(0)` implies a timeout.
             Some(listener) => match listener.timed_wait(|_a| {}, RUN_REPUBLISH_INTERVAL) {
                 // A ring: somebody is gathering and wants this run's answer.
-                // `n` activations, not one wake — see `note_doorbell_rings`.
+                // `n` activations, not one wake, see `note_doorbell_rings`.
                 Ok(n) if n > 0 => inner.note_doorbell_rings(n),
                 // No ring to answer: the deadline, or a wake that drained
                 // nothing. Republish on the interval as before.

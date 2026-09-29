@@ -11934,7 +11934,7 @@ impl GraphRuntime {
                 // skip the WaitSet block and burn the iteration), and the
                 // blocking WaitSet path below remains the authoritative wake.
                 // iceoryx2 0.10: one `try_wait` drains the queue and returns the
-                // number of ACTIVATIONS delivered — read that count rather than
+                // number of ACTIVATIONS delivered, read that count rather than
                 // counting callback invocations (0.10 coalesces repeats of one
                 // event id into a single callback carrying `count`).
                 if let Ok(activations) = listener.try_wait(|_activation| {}) {

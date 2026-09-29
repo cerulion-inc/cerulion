@@ -39,7 +39,7 @@
 //! A `SIGKILL`ed consumer leaves its listener registered and its doorbell
 //! socket without a reader. The next notify's send is refused, iceoryx2 drops
 //! that connection and does not count it, and the publisher sees
-//! `triggered < listeners` — a genuinely degraded wake path, with a remedy (a
+//! `triggered < listeners`, a genuinely degraded wake path, with a remedy (a
 //! dead-node sweep) an operator can act on. That is what every arm below drives.
 //!
 //! MEASURED on this apparatus rather than argued: twenty thousand notifies into
@@ -58,19 +58,19 @@
 //!
 //! # What the tests assert
 //!
-//! * [`an_undrained_live_listener_is_never_a_shortfall`] — the 0.10 contract,
+//! * [`an_undrained_live_listener_is_never_a_shortfall`], the 0.10 contract,
 //!   as a number rather than a silence: twenty thousand undrained notifies, all
 //!   delivered, zero counted.
-//! * [`an_ingress_publisher_reports_nothing_undelivered_across_a_long_run`] —
+//! * [`an_ingress_publisher_reports_nothing_undelivered_across_a_long_run`],
 //!   the same contract on the raw ingress path that produced the original
 //!   flood, through real loans and sends rather than bare notifies.
-//! * [`a_killed_consumers_registration_is_counted_as_undelivered`] — the
+//! * [`a_killed_consumers_registration_is_counted_as_undelivered`], the
 //!   apparatus arm: the condition is real and the detector fires.
-//! * [`the_latch_recovers_when_the_dead_registration_is_reaped`] — the regime
+//! * [`the_latch_recovers_when_the_dead_registration_is_reaped`], the regime
 //!   lifecycle over real transport: degraded, then a dead-node sweep removes
 //!   the stale registration, then the count stops growing and the loud path is
 //!   re-armed.
-//! * [`notify_delivery_log_arms_map_warn_then_debug_then_recovery`] — the
+//! * [`notify_delivery_log_arms_map_warn_then_debug_then_recovery`], the
 //!   `tracing` LEVEL mapping through the production call site (an inverted
 //!   warn/debug mapping is invisible to the counter-only arms above).
 //!
@@ -137,7 +137,7 @@ const SETTLE: Duration = Duration::from_millis(200);
 /// `#[ignore]` so a normal suite pass never runs it; the parents invoke it by
 /// exact name with the namespace in the environment.
 #[test]
-#[ignore = "child process entry point — driven by the parent tests in this file"]
+#[ignore = "child process entry point, driven by the parent tests in this file"]
 fn subprocess_child_holds_a_subscriber() {
     let Some(config) = child_iceoryx_config() else {
         // Run directly with `-- --ignored`: do nothing rather than sleep.
@@ -207,7 +207,7 @@ fn parent_publisher(tag: &str) -> (IsolatedRoot, Arc<TransportManager>, Cerulion
 
 /// Remove every dead node's stale resources from a namespace, which is what
 /// deregisters a killed consumer's listener. iceoryx2 carries the sweep on a
-/// node, so this mints one, exactly as `cerulion clean` does — INCLUDING the
+/// node, so this mints one, exactly as `cerulion clean` does, INCLUDING the
 /// config those callers use.
 ///
 /// `sweep_node_config` is not decoration here. It turns off
@@ -246,7 +246,7 @@ fn kill_a_live_consumer(root: &IsolatedRoot, publisher: &CerulionPublisher) {
     assert!(
         publisher.event_listener_count_for_test() >= 2,
         "precondition: the killed consumer's listener must still be registered on the \
-         topic's event service (its own listener plus the publisher's) — with the \
+         topic's event service (its own listener plus the publisher's), with the \
          registration already reaped there is no stale registration to detect"
     );
 }
@@ -292,7 +292,7 @@ fn an_undrained_live_listener_is_never_a_shortfall() {
         publisher.notify_undelivered_count(),
         0,
         "{UNDRAINED_NOTIFIES} notifies at a listener nobody drained must report ZERO \
-         undelivered — a nonzero count here means the wake path degrades on an \
+         undelivered, a nonzero count here means the wake path degrades on an \
          undrained listener again, and every drain this tree removed has to come back"
     );
 }
@@ -371,8 +371,8 @@ fn a_killed_consumers_registration_is_counted_as_undelivered() {
     );
     assert!(
         publisher.notify_undelivered_count() > 0,
-        "a notify that reached fewer listeners than the topic reports must be COUNTED \
-         — the count is the only queryable signal for a degraded wake path once \
+        "a notify that reached fewer listeners than the topic reports must be COUNTED. \
+         The count is the only queryable signal for a degraded wake path once \
          iceoryx2's own complaint is filtered"
     );
 }
@@ -467,7 +467,7 @@ fn notify_delivery_log_arms_map_warn_then_debug_then_recovery() {
     assert_eq!(
         publisher.notify_undelivered_count(),
         at_open + 2,
-        "the sustained arm must still COUNT every undelivered notify — the counter is \
+        "the sustained arm must still COUNT every undelivered notify, the counter is \
          independent of log level and never reset by recovery"
     );
 
@@ -486,7 +486,7 @@ fn notify_delivery_log_arms_map_warn_then_debug_then_recovery() {
         // Level-free: a suppressed repeat must never be LOUD. This is the half
         // of the contract that survives `release_max_level_info`, where the
         // DEBUG count below reads 0 and its lower bound cannot bite. FIRST, so
-        // it is this arm — which names the condition — that fires on a promoted
+        // it is this arm, which names the condition, that fires on a promoted
         // repeat, rather than the exclusive DEBUG count's generic complaint.
         let loud_repeats = mine
             .iter()
@@ -498,7 +498,7 @@ fn notify_delivery_log_arms_map_warn_then_debug_then_recovery() {
         if loud_repeats != 0 {
             return Err(format!(
                 "a sustained repeat was emitted at a LOUD level on {topic} \
-                 ({loud_repeats} line(s)) — the downgrade to debug! is the flood suppression"
+                 ({loud_repeats} line(s)), the downgrade to debug! is the flood suppression"
             ));
         }
         let debugs = count_at_exclusively(

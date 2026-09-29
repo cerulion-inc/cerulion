@@ -538,8 +538,8 @@ const _: fn() = || {
 /// send: a tap that never drained its listener filled its `AF_UNIX SOCK_DGRAM`
 /// socket, after which every publisher notify took a failure path (~12 µs plus a
 /// ~2 KB warning per notify, 10 to 150 MB/s of stderr, enough to fill a disk
-/// during a long replay). 0.10 removed that failure mode — a full doorbell is
-/// swallowed and a notify into an already-notified listener skips the send — so
+/// during a long replay). 0.10 removed that failure mode, a full doorbell is
+/// swallowed and a notify into an already-notified listener skips the send, so
 /// what remains is the ordinary per-publish cost, which is the reason this type
 /// still exists rather than a historical one.
 ///
@@ -2167,11 +2167,11 @@ impl CerulionSubscriber {
                 })?;
 
             if activations == 0 {
-                // Timeout — drain any pending samples (send→notify race)
+                // Timeout, drain any pending samples (send→notify race)
                 return self.drain_samples(&mut callback, ReadSiteRole::Body);
             }
             if saw_data_event {
-                // Data event — drain samples and return
+                // Data event, drain samples and return
                 return self.drain_samples(&mut callback, ReadSiteRole::Body);
             }
             // Only non-data events. Drain to check for any pending data
@@ -2285,7 +2285,7 @@ impl CerulionSubscriber {
         match self.listener.try_wait(|_a| {}) {
             Ok(_) => Ok(()),
             Err(e) => Err(TransportError::Receive {
-                // hot-path-alloc-ok: cold error arm — a listener
+                // hot-path-alloc-ok: cold error arm, a listener
                 // whose try_wait fails is already off the
                 // healthy path.
                 topic: self.topic.clone(),
@@ -3013,14 +3013,14 @@ impl CerulionSubscriber {
         // saturation: an undrained listener filled its `AF_UNIX SOCK_DGRAM`
         // socket and every later notify took the failure path, which on a live
         // robot meant a warning line per publish. 0.10 removed that hazard at
-        // the source — the doorbell is one byte, a full doorbell is
+        // the source, the doorbell is one byte, a full doorbell is
         // swallowed into the NOTIFIED state, and a notify into that state skips
-        // the send entirely — so an undrained listener costs a publisher
+        // the send entirely, so an undrained listener costs a publisher
         // nothing and `notify_undelivered_count` stays 0. The second was stale
         // wakes: an event left in the queue makes the live loop's idle poll
         // read "data pending" when there is none, which is what makes a live
         // graph free-run instead of waiting. That reason still holds, and every listener the live loop actually
-        // polls is still drained inside the step — a `DrainSource::Unified`
+        // polls is still drained inside the step, a `DrainSource::Unified`
         // binding's standalone `ListenerOnly` by `GraphRuntime::drain_level`,
         // a `Separate` or Sync binding's trigger subscriber by
         // `try_receive_for_drain`, and a caller that blocks on this

@@ -30,7 +30,7 @@
 //! `graph_run` continues to call this explicitly even though
 //! iceoryx2's `NodeBuilder::create` ALSO runs the same sweep when
 //! `cleanup_dead_nodes_on_creation: true` is set (the iceoryx2
-//! default — see that release's `config.rs`). The
+//! default, see that release's `config.rs`). The
 //! explicit call is the load-bearing line: it keeps the dead-node
 //! sweep happening regardless of any user-supplied
 //! `iceoryx2.toml` that flips the on-creation default to `false`.
@@ -349,7 +349,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedNodeCleanup {
     /// The node identity exactly as iceoryx2 rendered it in the
-    /// `Unable to remove dead node {id:?} (…)` line — on the pinned release
+    /// `Unable to remove dead node {id:?} (…)` line, on the pinned release
     /// that is `UniqueNodeId(UniqueId { payload_value: …, unique_value: … })`.
     /// Kept verbatim: it is the token every other line about the node
     /// carries, and shortening it here would make a reader's grep against
@@ -510,8 +510,8 @@ fn is_sub_cause_line(log: &CapturedLog) -> bool {
 
 /// The head of a node identity as iceoryx2 renders it under `{:?}`:
 /// `UniqueNodeId` is a tuple struct with a derived `Debug`
-/// (`identifiers.rs`), so every rendering — the refusal line's, a
-/// `DeadNodeView` origin's, a string origin's `{node_id:?}` — opens with this
+/// (`identifiers.rs`), so every rendering (the refusal line's, a
+/// `DeadNodeView` origin's, a string origin's `{node_id:?}`) opens with this
 /// and closes at the paren that balances it. The prefix is what the parser
 /// keys on, which is why it survived the inner type changing in 0.10; the
 /// live rendering is re-derived in
@@ -2405,7 +2405,7 @@ pub(crate) mod tests {
     }
 
     /// Every distinct PER-NODE sub-cause shape the LINKED iceoryx2 can log on
-    /// the way to a refusal — read off `node/mod.rs`
+    /// the way to a refusal, read off `node/mod.rs`
     /// (`remove_stale_resources_impl`, `acquire_cleaner_lock`, `remove_node`,
     /// `blocking_remove_stale_resources`, the per-node walk helpers) plus
     /// `service/stale_resource_cleanup.rs`. Placeholders (`0ns`, port `9`,
@@ -2417,7 +2417,7 @@ pub(crate) mod tests {
     /// `ServiceRemoveNodeError` row whose wording changed, and the two rows
     /// carrying upstream's `insufficent` typo, since fixed), and the arms
     /// 0.10 added were untested. Production classification never depended on
-    /// the rows — `is_sub_cause_line` is a two-substring heuristic — so this is
+    /// the rows, `is_sub_cause_line` is a two-substring heuristic, so this is
     /// a corpus that had stopped describing the library, not a live defect.
     const PER_NODE_SUB_CAUSE_SHAPES: &[&str] = &[
         // remove_stale_resources_impl / blocking_remove_stale_resources

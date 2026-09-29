@@ -81,9 +81,9 @@ const ENV_PREFIX: &str = "CER_ORPHAN_PORT_TAG_IOX2_PREFIX";
 /// The topic the child publishes on (unique per run).
 const ENV_TOPIC: &str = "CER_ORPHAN_PORT_TAG_TOPIC";
 /// `exit` (mint the shape and die), `linger` (mint it and stay alive until
-/// killed — the live-pid arm), or `stall` (the harness's own fixture: print
+/// killed, the live-pid arm), or `stall` (the harness's own fixture: print
 /// the pid, then hang WITHOUT the lingering probe and without touching the
-/// transport — the child the linger reader must give up on and reap).
+/// transport, the child the linger reader must give up on and reap).
 const ENV_MODE: &str = "CER_ORPHAN_PORT_TAG_MODE";
 /// "1" ⇒ the child uses `Config::global_config()` (the desk's real
 /// registry) instead of the isolated root. Operator-driven only.
@@ -103,7 +103,7 @@ fn isolated_config(root: &str, prefix: &str) -> Config {
     cfg
 }
 
-/// The process's ONE isolated root — also its global iceoryx2 config (see the
+/// The process's ONE isolated root, also its global iceoryx2 config (see the
 /// module docs for why that is load-bearing).
 struct IsolatedRoot {
     dir: PathBuf,
@@ -115,7 +115,7 @@ static ROOT: OnceLock<IsolatedRoot> = OnceLock::new();
 
 /// How many arms hold the root RIGHT NOW. The root lives exactly as long as
 /// its last holder: `acquire` creates it (or re-creates it) and counts up,
-/// `Drop` counts down and removes it at zero — so a FILTERED run (one arm,
+/// `Drop` counts down and removes it at zero, so a FILTERED run (one arm,
 /// `--exact`) leaves nothing behind either. An arm COUNT waited for arms
 /// that never ran, and every filtered run leaked its
 /// `/tmp/iceoryx2/orphan_*` root. A mutex rather than an atomic, so a
@@ -150,7 +150,7 @@ impl Drop for RootUse {
 
 impl IsolatedRoot {
     /// Mint the root, write it as an `iceoryx2.toml`, and make it THIS
-    /// process's global config — before anything else touches iceoryx2. The
+    /// process's global config, before anything else touches iceoryx2. The
     /// DIRECTORY comes and goes with its holders (`RootUse`); the config
     /// installed here is in-process state and needs the file only once.
     fn get() -> &'static Self {
@@ -212,8 +212,8 @@ impl IsolatedRoot {
 /// `#[ignore]`d: only the parent spawns it (with `ENV_CHILD=1`); a bare
 /// `-- --ignored` run returns at the env check.
 // P12 exemption, scoped to this fn (the `barrier_test.rs` `child_worker`
-// precedent): this is the body of a SELF-RE-EXEC CHILD process — a process
-// entrypoint by construction — and exiting WITHOUT dropping the transport
+// precedent): this is the body of a SELF-RE-EXEC CHILD process, a process
+// entrypoint by construction, and exiting WITHOUT dropping the transport
 // manager is the whole point (a dead process removes nothing, which is what
 // leaves the orphan tag on disk for the parent's sweep). The ban stays armed
 // for every other line in this binary.
@@ -244,7 +244,7 @@ fn subprocess_child_mint_orphan_port_tag() {
         isolated_config(&root, &prefix)
     };
 
-    // A fresh, NON-singleton manager on the handed config — nothing in this
+    // A fresh, NON-singleton manager on the handed config, nothing in this
     // child ever asks for the process singleton, so the non-singleton
     // constructor is the right one (it also disables iceoryx2's own
     // on-creation dead-node sweep, so the child never sweeps the root).
@@ -259,7 +259,7 @@ fn subprocess_child_mint_orphan_port_tag() {
     // `plain` mints a node with NO port of its own: registered, never
     // deregistered, and removable by an ordinary sweep. Every other mode
     // mints the orphan-tag shape below, which a sweep REFUSES until its tags
-    // are reclaimed — so an arm that needs to watch a removal SUCCEED cannot
+    // are reclaimed, so an arm that needs to watch a removal SUCCEED cannot
     // use it, or "the report held the node back" could not be told apart from
     // "the removal would have failed anyway".
     if mode != "plain" {
@@ -272,7 +272,7 @@ fn subprocess_child_mint_orphan_port_tag() {
         let loan = publisher.loan_raw_uninit(64).expect("raw loan");
         std::mem::forget(loan);
         // THE DESTROY: the port is deregistered from the service, the tag is
-        // not — exactly the shape a leaked rmw loan leaves behind.
+        // not, exactly the shape a leaked rmw loan leaves behind.
         drop(publisher);
     }
 
@@ -319,7 +319,7 @@ fn child_command(root: &IsolatedRoot, topic: &str, mode: &str) -> std::process::
     cmd
 }
 
-/// A spawned child, killed and REAPED on drop — held from the instant of
+/// A spawned child, killed and REAPED on drop, held from the instant of
 /// `spawn`, so every exit from the code that drives it (a deadline, a
 /// closed pipe, a failed `expect`, an assertion in the test itself) reaps
 /// the child. Before it, a panic on the way to `LingerChild` left the child
@@ -425,7 +425,7 @@ fn node_dirs(root: &IsolatedRoot) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The ONE node directory that appeared since `before` — how an arm finds
+/// The ONE node directory that appeared since `before`, how an arm finds
 /// its own child's node without depending on the root being otherwise empty.
 fn new_node_dir(root: &IsolatedRoot, before: &[PathBuf], who: &str) -> PathBuf {
     let new: Vec<PathBuf> = node_dirs(root)
@@ -440,7 +440,7 @@ fn new_node_dir(root: &IsolatedRoot, before: &[PathBuf], who: &str) -> PathBuf {
     new[0].clone()
 }
 
-/// The refusal a sweep attributed to the node minted by `pid`, if any — the
+/// The refusal a sweep attributed to the node minted by `pid`, if any, the
 /// node token renders `pid: <pid>,`.
 fn own_failure(report: &CleanupReport, pid: u32) -> Option<&FailedNodeCleanup> {
     let key = format!("pid: {pid},");

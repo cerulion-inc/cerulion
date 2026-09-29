@@ -95,8 +95,8 @@ enum NotifyListenerCount {
 /// transition clears the arming immediately.
 ///
 /// The bound is what stops the opposite failure. A listener that attaches or
-/// dies WITHOUT ever sending a transition — a foreign observer, a consumer that
-/// crashed — would otherwise arm every publish for the life of the process.
+/// dies WITHOUT ever sending a transition, a foreign observer, a consumer that
+/// crashed, would otherwise arm every publish for the life of the process.
 /// While armed the cost is what every publish paid before this gate existed, so
 /// the budget is set well past any plausible create-then-notify gap rather than
 /// trimmed: it is spent only when the listener count actually moves.
@@ -152,7 +152,7 @@ pub struct CerulionPublisher {
     notifier: Notifier<CerService>,
     listener: Listener<CerService>,
     /// Live listener count on this topic's event service as of the last
-    /// [`Self::check_subscriber_events`] — the cheap gate on the per-publish
+    /// [`Self::check_subscriber_events`], the cheap gate on the per-publish
     /// self drain. `usize::MAX` until the first call, so the first publish
     /// always drains.
     last_listener_count: usize,
@@ -465,7 +465,7 @@ pub struct CerulionPublisher {
     /// Flood-suppression latch + log-level-independent counter for notifies
     /// that could NOT be delivered to every live listener (a consumer whose
     /// process died without deregistering, so its doorbell has no reader while
-    /// its registration stands). Always armed — see [`NotifyDeliveryLatch`] for
+    /// its registration stands). Always armed, see [`NotifyDeliveryLatch`] for
     /// why this signal must exist on OUR side once `IOX2_LOG_LEVEL=error`
     /// correctly filters iceoryx2's own complaint, and for the condition the
     /// latch was built for that iceoryx2 0.10 made unreachable. Read via
@@ -2223,7 +2223,7 @@ impl CerulionPublisher {
             // ~5 MB/s, enough to fill a root disk). 0.10 removed that failure
             // at the source, so `check_subscriber_events` is now gated on the
             // topic's live listener count and does nothing at all on a steady
-            // topic — see its own doc for the gate and for the race it arms
+            // topic, see its own doc for the gate and for the race it arms
             // across.
             //
             // `check_subscriber_events` rather than a bare listener drain
@@ -2234,7 +2234,7 @@ impl CerulionPublisher {
             // `create_ingress_publisher`'s (the sole `arm_publish_raw_notify`
             // caller) and those are built with `history_size = 0`, so the
             // `deliver_history` it drives is a no-op TODAY. It is not dead
-            // weight — it is what keeps this call correct if an ingress
+            // weight, it is what keeps this call correct if an ingress
             // publisher ever requests history.
             self.check_subscriber_events();
             let _ = self.notify_sent_sample();
@@ -2270,7 +2270,7 @@ impl CerulionPublisher {
         //
         // This function's only action is `deliver_history()` on a
         // `SubscriberConnected`, which happens when a subscriber attaches and
-        // at no other time — yet it ran a full listener drain on EVERY
+        // at no other time, yet it ran a full listener drain on EVERY
         // `loan_proxy` and every `publish_raw`. Under iceoryx2 0.9.1 the
         // unconditional drain had a second job: an undrained listener filled
         // its datagram socket, after which every later notify from any
@@ -2280,7 +2280,7 @@ impl CerulionPublisher {
         // per publish to ask a question whose answer is almost always no.
         //
         // The gate is `number_of_listeners()` on the event service the
-        // publisher already holds — `self.listeners.len()` on a shared-memory
+        // publisher already holds, `self.listeners.len()` on a shared-memory
         // container, one relaxed load. A `CerulionSubscriber` bundles a
         // listener, so any late joiner owed history moves that count. A
         // listener-less `DataOnlySubscriber` does not move it and does not need
@@ -2289,7 +2289,7 @@ impl CerulionPublisher {
         //
         // A count change ARMS several drains rather than one, because the
         // count rises when the subscriber's listener is created and the
-        // `SubscriberConnected` notify lands after it — a single gated drain
+        // `SubscriberConnected` notify lands after it, a single gated drain
         // could fall in that window and see nothing. Staying armed until a
         // transition is actually observed closes that race; the bounded count
         // is what stops a listener that attaches or dies WITHOUT an event (a
@@ -2641,9 +2641,9 @@ impl Drop for CerulionPublisher {
 ///
 /// Alignment-safe: reads field bytes via `to_le_bytes`-style extraction,
 /// no `unsafe` and no alignment requirement on the input slice. (A loaned
-/// slot's `[u8]` payload IS 8-aligned — the per-sample header is align 8
+/// slot's `[u8]` payload IS 8-aligned, the per-sample header is align 8
 /// and its size is a multiple of 8 (`IOX2_SAMPLE_HEADER_BYTES`, currently
-/// 48), so the payload starts 8-aligned — but that is DE FACTO, not a
+/// 48), so the payload starts 8-aligned, but that is DE FACTO, not a
 /// declared iceoryx2 contract: the rmw loan paths ASSERT it fail-closed
 /// before handing out a typed pointer, and this parser simply does not
 /// depend on it.)
@@ -3516,7 +3516,7 @@ mod notify_delivery_wiring_tests {
         assert!(publisher.notify_delivery_latch.is_degraded());
     }
 
-    /// The boundary resweep FEEDS the latch — end to end over real transport,
+    /// The boundary resweep FEEDS the latch, end to end over real transport,
     /// with NO per-publish notify involved at any point.
     ///
     /// SCOPE: this pins that the resweep classifies its notify AT ALL. It does

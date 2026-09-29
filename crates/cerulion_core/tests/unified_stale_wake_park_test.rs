@@ -37,7 +37,7 @@
 //!   through `monitor_wait_block` and the park counters see every wake;
 //! - `CERULION_NOTIFY_ELISION=off` keeps the publish NOTIFYING, which is what
 //!   the modelled multi-process shape does and what a single-process harness
-//!   otherwise would not (see [`ParkEnvGuard`]) — without it the publish sends
+//!   otherwise would not (see [`ParkEnvGuard`]), without it the publish sends
 //!   no event at all, so there is no stale event to survive and the
 //!   discriminating assert below passes with or without the drain;
 //! - after a fire+deliver iteration, M SILENT iterations must ALL be
@@ -246,7 +246,7 @@ fn unified_binding_parks_between_paced_publishes_no_stale_listener_wakes() {
     // Anti-vacuity, the second half: the publish must really notify. Elision
     // arms per BUILD off the env read, so a build that armed anything on this
     // graph would mean the guard above did not take and the publish would send
-    // no event — leaving nothing for the drain to remove and nothing for the
+    // no event, leaving nothing for the drain to remove and nothing for the
     // discriminating assert to catch.
     assert_eq!(
         runtime.notify_elision_armed_topic_count_for_test(),

@@ -128,7 +128,7 @@ fn subprocess_child_iox2_probe() {
         .max_notifiers(0)
         .create()
         .expect("the zero ceiling is clamped, not refused");
-    // Prove — independent of any log level — that the clamp really happened in
+    // Prove, independent of any log level, that the clamp really happened in
     // this child, so an "absent marker" assertion cannot pass vacuously.
     use iceoryx2::service::port_factory::PortFactory as _;
     assert_eq!(
@@ -194,7 +194,7 @@ fn run_child(level: Option<&str>) -> String {
     stderr
 }
 
-/// ANTI-TAUTOLOGY CONTROL — read this one first: at `warn` the child's stderr
+/// ANTI-TAUTOLOGY CONTROL, read this one first: at `warn` the child's stderr
 /// DOES carry the real iceoryx2 line. Every "absent" assertion in this file is
 /// meaningful only because this one passes.
 #[test]
@@ -202,8 +202,8 @@ fn warn_level_shows_a_real_iceoryx2_warning() {
     let stderr = run_child(Some("warn"));
     assert!(
         stderr.contains(IOX2_WARN_MARKER),
-        "at IOX2_LOG_LEVEL=warn the genuine iceoryx2 builder warning must be visible — \
-         without it every suppression arm in this file is vacuous; stderr:\n{stderr}"
+        "at IOX2_LOG_LEVEL=warn the genuine iceoryx2 builder warning must be visible. \
+         Without it every suppression arm in this file is vacuous; stderr:\n{stderr}"
     );
 }
 

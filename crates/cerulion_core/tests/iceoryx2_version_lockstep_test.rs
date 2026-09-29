@@ -37,7 +37,8 @@ fn dep_version(line: &str) -> Option<&str> {
 /// Every `iceoryx2*` dependency declared by ANY workspace crate is an exact
 /// `=PIN` pin (so a sub-crate cannot float independently of the top-level
 /// crate). This is the mechanism that propagates the constraint to every
-/// dependent — the binary, the benches, and a user's scaffolded node workspace.
+/// dependent. That is the binary, the benches, and a user's scaffolded node
+/// workspace.
 ///
 /// Workspace-rooted on purpose. `cerulion_cli_engine`, `cerulion_cli` and
 /// `rmw_cerulion` each declare `iceoryx2` themselves, and a loose `"0.10"` in
@@ -216,7 +217,7 @@ fn every_committed_lockfile_resolves_the_family_to_the_pin() {
     assert!(
         locks.len() >= 10,
         "expected at least the workspace lock, the two bench locks and the seven \
-         example locks (>=10), found {} ({locks:?}) — a walk that stops finding them \
+         example locks (>=10), found {} ({locks:?}), a walk that stops finding them \
          is an inert guard",
         locks.len()
     );

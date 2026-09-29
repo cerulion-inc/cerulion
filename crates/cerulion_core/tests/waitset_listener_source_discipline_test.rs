@@ -14,8 +14,8 @@
 //! listener in the WaitSet or in the idle poll and the never drained doorbell
 //! leaves its fd readable forever: the live loop stops parking and free runs,
 //! which is exactly the multi-process failure `unified_stale_wake_park_test`
-//! exists for. That test would NOT catch it — it pins the Unified binding's
-//! standalone `ListenerOnly`, not the body subscriber — so the premise is
+//! exists for. That test would NOT catch it, it pins the Unified binding's
+//! standalone `ListenerOnly`, not the body subscriber, so the premise is
 //! walked here instead.
 //!
 //! The rule: every `WaitSource::Listener(...)` CONSTRUCTED in this crate takes
@@ -28,12 +28,12 @@ use std::path::{Path, PathBuf};
 
 /// The argument forms a listener wake source may be built from.
 ///
-/// * `trigger_subscribers[..].listener()` — the live loop's own trigger
+/// * `trigger_subscribers[..].listener()`, the live loop's own trigger
 ///   subscribers, drained inside the step by `drain_level` (Unified) or
 ///   `try_receive_for_drain` (Separate and Sync).
-/// * `&bell.listener` — an `ExternalBindingKind::Notified` doorbell, drained by
+/// * `&bell.listener`, an `ExternalBindingKind::Notified` doorbell, drained by
 ///   the external fire path that the wake belongs to.
-/// * `&s.listener` — a `WakeSource` the CALLER owns and hands to
+/// * `&s.listener`, a `WakeSource` the CALLER owns and hands to
 ///   `WakeSet::wait`, which drains it before it waits again.
 fn origin_is_drained(arg: &str) -> bool {
     (arg.contains("trigger_subscribers[") && arg.ends_with(".listener()"))
@@ -114,9 +114,9 @@ struct ListenerSite {
 ///
 /// The classification is by POSITION, not by the argument's shape. Shape was
 /// the first attempt and it had a hole: it called any bare snake_case argument a
-/// pattern, so `WaitSource::Listener(body_listener)` — a real construction from
+/// pattern, so `WaitSource::Listener(body_listener)`, a real construction from
 /// a local binding, which is exactly the never-drained body subscriber this file
-/// exists to refuse — was silently skipped instead of checked.
+/// exists to refuse, was silently skipped instead of checked.
 ///
 /// What actually separates the two is what FOLLOWS the balanced close paren.
 /// A pattern is always immediately followed by `=>` (a match arm) or `=` (a
@@ -194,7 +194,7 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 /// This is the hole the shape test had. `WaitSource::Listener(body_listener)`
 /// is indistinguishable from a match binding by shape alone, and it is precisely
 /// the shape a future change would take if it registered a node body
-/// subscriber's listener — the never drained doorbell this whole file exists to
+/// subscriber's listener, the never drained doorbell this whole file exists to
 /// refuse. Position tells them apart.
 #[test]
 fn a_bare_identifier_construction_is_checked_and_refused() {

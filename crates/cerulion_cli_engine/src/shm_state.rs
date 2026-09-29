@@ -545,7 +545,7 @@ pub trait SystemProbe {
     ///
     /// The SECOND piece of evidence, and the one the pid alone cannot
     /// give. Every `.shm_state` file observed on a real desk is a
-    /// `<prefix><id>_node.<major>_<minor>_<patch>.global_mgmt` — the ONE
+    /// `<prefix><id>_node.<major>_<minor>_<patch>.global_mgmt`, the ONE
     /// management segment a whole iceoryx2 NAMESPACE shares, not a per-process
     /// resource. Its creator is simply whichever process opened the namespace
     /// first, so "the creator is gone" says nothing whatever about whether the
@@ -2575,7 +2575,7 @@ mod tests {
     }
 
     /// The headline. Every `.shm_state` file MEASURED on a real desk
-    /// (2,018 of 2,018) is a `<prefix><id>_node.<version>.global_mgmt` — the one
+    /// (2,018 of 2,018) is a `<prefix><id>_node.<version>.global_mgmt`, the one
     /// management segment an iceoryx2 NAMESPACE shares — so the creating pid is
     /// merely whichever process opened the namespace first and says nothing at
     /// all about whether the segment is still in use. A namespace with a node

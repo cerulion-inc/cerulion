@@ -11,14 +11,14 @@
 //! # Why (the failure it makes observable)
 //!
 //! iceoryx2 delivers an event notification over a per-listener `AF_UNIX
-//! SOCK_DGRAM` doorbell, and — because `notify_with_custom_event_id` passes
+//! SOCK_DGRAM` doorbell, and, because `notify_with_custom_event_id` passes
 //! `skip_self_deliver = false` — a publisher's notify is delivered to EVERY
 //! listener on the topic's event service, **including the publisher's own**
 //! (each [`CerulionPublisher`](super::publisher::CerulionPublisher) owns one,
 //! to hear `SubscriberConnected`).
 //!
 //! A listener that cannot be delivered to is a genuinely degraded wake path
-//! (Principle #6 — the consumer stops being woken and falls back to the
+//! (Principle #6, the consumer stops being woken and falls back to the
 //! heartbeat), and iceoryx2's own complaint about it is filtered out by the
 //! log-level default (`init_iceoryx_log_level`), which is correct for the disk
 //! and exactly why this latch exists: Cerulion must carry the signal ITSELF or
@@ -43,7 +43,7 @@
 //!
 //! Until iceoryx2 0.10 the event id rode IN the datagram, so a listener nobody
 //! drained filled its socket and every later notify to it failed and was logged
-//! once per publish — measured at ~2500 lines/s ≈ 5 MB/s on a robot, enough to
+//! once per publish, measured at ~2500 lines/s ≈ 5 MB/s on a robot, enough to
 //! fill a root disk. 0.10 removed that at the source: the id and its repeat
 //! count live in a shared-memory counting bitset, the doorbell carries one
 //! byte, a full doorbell is SWALLOWED rather than refused, and a notify into a

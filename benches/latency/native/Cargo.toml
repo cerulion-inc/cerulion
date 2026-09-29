@@ -61,7 +61,7 @@ cerulion_core = { path = "../../../crates/cerulion_core" }
 # flows (`VersionMismatch`, silent). cerulion_core exact-pins the whole
 # sub-crate family; this top-level pin keeps THIS manifest from ever asking
 # for anything newer. (The retired bench trees carried `iceoryx2 = "0.9"`
-# and their stale lockfiles had resolved a newer patch — the exact skew class this
+# and their stale lockfiles had resolved a newer patch, the exact skew class this
 # pin closes.) Verify after any lockfile regeneration:
 #   grep '^name = "iceoryx2' -A1 Cargo.lock   # every entry must be 0.10.0
 iceoryx2 = "=0.10.0"
