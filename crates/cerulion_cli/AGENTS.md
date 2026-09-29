@@ -4,6 +4,8 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 `cerulion_cli_engine` - read that crate's AGENTS.md first; behavior changes go there.
 
 ## Invariants
+- `graph run` has no terminal probe or partition save prompt; `--yes` explicitly saves
+  the derived groups. Interactive partition saving stays on `graph partition`.
 
 - `clap_complete::CompleteEnv::with_factory(Cli::command).complete()` is the FIRST
   statement of `main()` - it owns stdout for a completion invocation. Nothing may print

@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! PURE tests for the `graph run` LITERAL multi-process
 //! default — the partition-intent decision matrix
-//! ([`resolve_partition_intent`]), the auto-partition pre-flight consent
-//! ladder ([`run_auto_partition_preflight`]: --yes / no-TTY floor / TTY
-//! confirm / decline semantics for both the unpartitioned default and the
-//! `--auto-partition` re-derive), the notice-text pins, and the load-bearing
+//! ([`resolve_partition_intent`]), explicit persistence and ephemeral
+//! adoption ([`run_auto_partition_preflight`]) for the unpartitioned default
+//! and `--auto-partition` re-derive, the notice-text pins, and the load-bearing
 //! IN-MEMORY == WRITTEN deployment-equality pin (the derived-in-memory config
 //! must produce EXACTLY the `plan_deployment` a written file would).
 //!
@@ -57,7 +56,7 @@ fn intent_auto_partition_rederives_over_an_existing_block() {
     assert_eq!(
         resolve_partition_intent(true, false, true, true, TimeSource::Real),
         Ok(PartitionIntent::Derive { re_derive: true }),
-        "--auto-partition re-derives; re_derive=true flips the decline semantics"
+        "--auto-partition re-derives over the existing groups"
     );
 }
 
@@ -294,10 +293,6 @@ fn read_config(ws: &workspace::CerulionWorkspace, name: &str) -> GraphConfig {
     .expect("parse")
 }
 
-fn panic_confirm(_preview: &str) -> CliResult<bool> {
-    panic!("the confirm provider must not be invoked on this path")
-}
-
 fn shape(map: &IndexMap<String, Vec<String>>) -> Vec<(String, Vec<String>)> {
     map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
@@ -330,19 +325,15 @@ fn yes_persists_and_runs_the_derived_groups() {
     write_graph(&ws, "chain", CHAIN_YAML);
     let graph_path = ws.graphs_dir.join("chain.yaml");
 
-    let mut confirm = panic_confirm; // --yes never consults the confirm
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: true,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("--yes preflight");
 
@@ -372,221 +363,60 @@ fn yes_persists_and_runs_the_derived_groups() {
 
 #[tracing_test::traced_test]
 #[test]
-fn no_tty_floor_runs_in_memory_never_mutates_and_names_both_escape_hatches() {
+fn default_derives_in_memory_without_changing_the_graph_or_creating_a_backup() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = setup_workspace(tmp.path());
     write_graph(&ws, "chain", CHAIN_YAML);
-    let graph_path = ws.graphs_dir.join("chain.yaml");
-
-    let mut confirm = panic_confirm; // no TTY => no confirm
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
-    .expect("floor preflight");
-
-    assert_eq!(pre.outcome, RunPartitionOutcome::InMemory);
-    assert_eq!(
-        shape(&pre.config.process_groups),
-        baseline_shape(),
-        "the run proceeds with the derived groups held in-memory"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&graph_path).expect("readable"),
-        CHAIN_YAML,
-        "THE CONSENT FLOOR: the file is NEVER mutated without a TTY confirm or --yes"
-    );
-    assert!(
-        !ws.graphs_dir.join("chain.yaml.bak").exists(),
-        "no backup churn on the floor path"
-    );
-    // The loud one-line notice names both escape hatches.
-    assert!(logs_contain("IN-MEMORY"), "the notice says in-memory");
-    assert!(logs_contain("--yes"), "the notice names --yes (persist)");
-    assert!(
-        logs_contain("--single-process"),
-        "the notice names --single-process (monolith)"
-    );
-    // LOUD means WARN, and a text match cannot tell: nobody was asked here,
-    // so the run adopted a layout without consent and must say so above the
-    // level a quiet filter keeps. The decline arm below is the opposite case.
-    logs_assert(|lines: &[&str]| in_memory_notice_level(lines, "no TTY to confirm", "WARN"));
-}
-
-#[test]
-fn tty_confirm_yes_writes_and_hint_line_names_the_decline_semantics() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ws = setup_workspace(tmp.path());
-    write_graph(&ws, "chain", CHAIN_YAML);
-
-    let mut seen: Option<String> = None;
-    let mut confirm = |preview: &str| -> CliResult<bool> {
-        seen = Some(preview.to_string());
-        Ok(true)
-    };
-    let pre = run_auto_partition_preflight(
-        &ws.root,
-        "chain",
-        read_config(&ws, "chain"),
-        &read_raw(&ws, "chain"),
-        &PreflightOptions {
-            re_derive: false,
-            lenient_costs: true,
-            assume_yes: false,
-            is_tty: true,
-        },
-        &mut confirm,
-    )
-    .expect("confirmed preflight");
-    assert!(matches!(pre.outcome, RunPartitionOutcome::Persisted { .. }));
-
-    let shown = seen.expect("the confirm displayed the preview");
-    assert!(
-        shown.contains("IN-MEMORY — file untouched"),
-        "the interactive preview tells the user what N does BEFORE they answer; got:\n{shown}"
-    );
-    assert!(
-        shown.contains("process-per-node baseline"),
-        "the preview carries the mode line; got:\n{shown}"
-    );
-}
-
-#[tracing_test::traced_test]
-#[test]
-fn tty_decline_on_unpartitioned_graph_runs_derived_in_memory() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ws = setup_workspace(tmp.path());
-    write_graph(&ws, "chain", CHAIN_YAML);
-    let graph_path = ws.graphs_dir.join("chain.yaml");
-
-    let mut confirm = |_: &str| -> CliResult<bool> { Ok(false) };
-    let pre = run_auto_partition_preflight(
-        &ws.root,
-        "chain",
-        read_config(&ws, "chain"),
-        &read_raw(&ws, "chain"),
-        &PreflightOptions {
-            re_derive: false,
-            lenient_costs: true,
-            assume_yes: false,
-            is_tty: true,
-        },
-        &mut confirm,
-    )
-    .expect("declined preflight");
-
-    // Decline ≠ abort: the run still goes multi-process with the derived
-    // groups in-memory (Ctrl-C is abort; --single-process is the monolith).
+    .expect("ephemeral preflight");
     assert_eq!(pre.outcome, RunPartitionOutcome::InMemory);
     assert_eq!(shape(&pre.config.process_groups), baseline_shape());
-    assert_eq!(
-        std::fs::read_to_string(&graph_path).expect("readable"),
-        CHAIN_YAML,
-        "decline leaves the file byte-untouched"
-    );
-    // The post-decline notice says exactly what is happening.
-    assert!(logs_contain("auto-partition declined"));
-    assert!(logs_contain("IN-MEMORY"));
-    assert!(logs_contain("--single-process"));
-    // INFO, not WARN: the person saw the preview and answered no, which is
-    // the documented default. A warn here tells every first-time user that
-    // doing what the quickstart says is a problem.
-    logs_assert(|lines: &[&str]| in_memory_notice_level(lines, "auto-partition declined", "INFO"));
+    assert_eq!(read_raw(&ws, "chain"), CHAIN_YAML);
+    assert!(!ws.graphs_dir.join("chain.yaml.bak").exists());
+    logs_assert(|lines: &[&str]| {
+        let notices: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("derived process groups in memory"))
+            .collect();
+        match notices.as_slice() {
+            [line] if line.split_whitespace().any(|token| token == "INFO") => Ok(()),
+            other => Err(format!(
+                "expected one ordinary INFO lifecycle notice, got {other:?}"
+            )),
+        }
+    });
 }
 
-/// Exactly one captured line carries `marker`, and its level is `level`.
-///
-/// Both in-memory notices share most of their words, so each caller passes
-/// the phrase only ITS arm emits. The count is what makes the level check
-/// non-vacuous: a marker that matched nothing would otherwise pass. Takes the
-/// lines because `logs_assert` exists only inside a `traced_test` body.
-fn in_memory_notice_level(lines: &[&str], marker: &str, level: &str) -> Result<(), String> {
-    let hits: Vec<&&str> = lines.iter().filter(|l| l.contains(marker)).collect();
-    match hits.as_slice() {
-        [line] if line_level(line) == Some(level) => Ok(()),
-        [line] => Err(format!("expected the notice at {level}, got: {line}")),
-        other => Err(format!(
-            "expected exactly one line carrying {marker:?}, got {}",
-            other.len()
-        )),
-    }
-}
-
-/// Read a captured line's level as a whole whitespace token out of its header.
-///
-/// Not a substring match: `tracing-test` renders the span name, which is the
-/// test function's own name, into every captured line, so `contains("WARN")`
-/// can be satisfied by a rename. An unparseable line yields `None` and matches
-/// no level, which fails the check above rather than passing it.
-fn line_level(line: &str) -> Option<&'static str> {
-    const LEVELS: [&str; 5] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
-    let header = line.split(": ").next().unwrap_or(line);
-    header
-        .split_whitespace()
-        .find_map(|token| LEVELS.into_iter().find(|level| *level == token))
-}
-
-#[tracing_test::traced_test]
 #[test]
-fn rederive_tty_decline_keeps_the_existing_hand_written_groups() {
+fn rederive_uses_new_groups_in_memory_without_overwriting_the_existing_layout() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = setup_workspace(tmp.path());
     write_graph(&ws, "chain", CHAIN_WITH_GROUPS_YAML);
-    let graph_path = ws.graphs_dir.join("chain.yaml");
-
-    let mut seen: Option<String> = None;
-    let mut confirm = |preview: &str| -> CliResult<bool> {
-        seen = Some(preview.to_string());
-        Ok(false)
-    };
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: true,
             lenient_costs: false,
             assume_yes: false,
-            is_tty: true,
         },
-        &mut confirm,
     )
-    .expect("re-derive declined");
-
-    // Decline on a re-derive = "don't change what I wrote": the run keeps the
-    // HAND-WRITTEN groups, not the derivation.
-    assert_eq!(pre.outcome, RunPartitionOutcome::KeptExisting);
-    assert_eq!(
-        shape(&pre.config.process_groups),
-        expect(&[("mine_a", &["n0", "n1"]), ("mine_b", &["n2"])]),
-        "the ORIGINAL hand-written groups survive a re-derive decline"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&graph_path).expect("readable"),
-        CHAIN_WITH_GROUPS_YAML
-    );
-    assert!(logs_contain("keeping the existing process_groups"));
-    // The hint told the user N keeps their block.
-    let shown = seen.expect("preview shown");
-    assert!(
-        shown.contains("keep the existing"),
-        "the re-derive hint names the keep-existing semantics; got:\n{shown}"
-    );
-    // The diff shows their block being replaced (had they said y).
-    assert!(
-        shown.contains("-process_groups:") && shown.contains("-  mine_a: [n0, n1]"),
-        "the diff shows the existing block; got:\n{shown}"
-    );
+    .expect("ephemeral re-derive");
+    assert_eq!(pre.outcome, RunPartitionOutcome::InMemory);
+    assert_eq!(shape(&pre.config.process_groups), baseline_shape());
+    assert_eq!(read_raw(&ws, "chain"), CHAIN_WITH_GROUPS_YAML);
+    assert!(!ws.graphs_dir.join("chain.yaml.bak").exists());
+    assert!(pre.preview.contains("-  mine_a: [n0, n1]"));
 }
 
 #[tracing_test::traced_test]
@@ -597,19 +427,15 @@ fn rederive_already_current_file_is_a_quiet_no_op() {
     write_graph(&ws, "chain", CHAIN_YAML);
 
     // First: persist the derivation (--yes).
-    let mut confirm = panic_confirm;
     let first = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: true,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("persist");
     assert!(matches!(
@@ -625,12 +451,9 @@ fn rederive_already_current_file_is_a_quiet_no_op() {
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: true,
             lenient_costs: false,
             assume_yes: false,
-            is_tty: true,
         },
-        &mut confirm,
     )
     .expect("already current");
     assert_eq!(second.outcome, RunPartitionOutcome::AlreadyCurrent);
@@ -658,19 +481,15 @@ fn costs_artifact_at_default_path_makes_the_run_default_fused() {
     )
     .expect("write artifact");
 
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false, // floor: in-memory
         },
-        &mut confirm,
     )
     .expect("fused floor preflight");
     assert_eq!(
@@ -701,19 +520,15 @@ fn run_default_consumes_the_artifacts_frozen_budget_not_unbounded() {
     )
     .expect("write v2 artifact");
 
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false, // floor: in-memory
         },
-        &mut confirm,
     )
     .expect("frozen-budget preflight");
     assert_eq!(
@@ -750,19 +565,15 @@ fn frozen_zero_budget_degrades_the_lenient_run_default_to_baseline() {
     )
     .expect("write zero-frozen v2 artifact");
 
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true, // the zero-flag `graph run` default path
             assume_yes: false,
-            is_tty: false, // floor: in-memory
         },
-        &mut confirm,
     )
     .expect("a hand-edited frozen 0 must not abort the zero-flag run");
     assert_eq!(
@@ -803,19 +614,15 @@ fn in_memory_and_written_configs_produce_identical_deployment_plans() {
     write_graph(&ws, "chain", CHAIN_YAML);
 
     // Path A: the no-TTY floor — derived groups IN-MEMORY, file untouched.
-    let mut confirm = panic_confirm;
     let in_memory = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("in-memory preflight");
     assert_eq!(in_memory.outcome, RunPartitionOutcome::InMemory);
@@ -828,12 +635,9 @@ fn in_memory_and_written_configs_produce_identical_deployment_plans() {
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: true,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("persisted preflight");
     assert!(matches!(
@@ -931,19 +735,15 @@ fn lenient_default_degrades_malformed_artifact_to_baseline_with_warn() {
 
     // The zero-flag literal default (lenient) on the no-TTY floor: the run
     // PROCEEDS on the baseline instead of aborting.
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("a broken DEFAULT artifact must not abort the zero-flag run");
     assert_eq!(pre.outcome, RunPartitionOutcome::InMemory);
@@ -1010,19 +810,15 @@ fn lenient_default_degrades_a_foreign_graphs_artifact_to_baseline_with_warn() {
     std::fs::write(ws.graphs_dir.join("chain.costs.yaml"), FOREIGN_COSTS_YAML)
         .expect("write foreign artifact");
 
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("a FOREIGN default artifact must not abort the zero-flag run");
     assert_eq!(pre.outcome, RunPartitionOutcome::InMemory);
@@ -1069,19 +865,15 @@ fn a_default_artifact_naming_this_graph_still_fuses_on_the_lenient_run_default()
     )
     .expect("write matching artifact");
 
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("an artifact whose provenance AGREES must still fuse");
     assert_eq!(
@@ -1104,19 +896,15 @@ fn lenient_default_degrades_wrong_version_artifact_too() {
     )
     .expect("write future-version artifact");
 
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("a future-version DEFAULT artifact must not abort the zero-flag run");
     assert_eq!(shape(&pre.config.process_groups), baseline_shape());
@@ -1136,19 +924,15 @@ fn auto_partition_contract_keeps_the_hard_err_on_a_broken_artifact() {
     )
     .expect("write junk artifact");
 
-    let mut confirm = panic_confirm;
     let err = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: false, // graph_run passes !auto_partition
             assume_yes: true,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect_err("the explicit cost-aware contract must refuse a broken artifact")
     .to_string();
@@ -1197,19 +981,15 @@ fn lenient_default_degrades_stale_artifact_missing_a_node_cost() {
     )
     .expect("write stale artifact");
 
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("a stale DEFAULT artifact must not abort the zero-flag run");
     assert_eq!(pre.outcome, RunPartitionOutcome::InMemory);
@@ -1252,19 +1032,15 @@ fn auto_partition_keeps_hard_err_on_stale_artifact_missing_a_node_cost() {
     )
     .expect("write stale artifact");
 
-    let mut confirm = panic_confirm;
     let err = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: false, // graph_run passes !auto_partition
             assume_yes: true,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect_err("the explicit cost-aware contract must refuse a stale artifact")
     .to_string();
@@ -1333,19 +1109,15 @@ hop:
     std::fs::write(ws.graphs_dir.join("chain.costs.yaml"), VALID_CYCLE_COSTS)
         .expect("write valid artifact");
 
-    let mut confirm = panic_confirm;
     let err = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true, // the zero-flag default — leniency in play
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect_err("a structural (cycle) failure must propagate even on the lenient path")
     .to_string();
@@ -1467,21 +1239,15 @@ fn preflight_never_refines_bands_over_kahn_and_writes_no_level_block() {
     )
     .expect("write artifact");
 
-    let mut confirm = |_p: &str| -> CliResult<bool> {
-        panic!("assume_yes path must not consult the confirm provider")
-    };
     let pre = run_auto_partition_preflight(
         &ws.root,
         "skewed",
         read_config(&ws, "skewed"),
         &read_raw(&ws, "skewed"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: true,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("preflight persists");
     assert!(matches!(pre.outcome, RunPartitionOutcome::Persisted { .. }));
@@ -1557,12 +1323,9 @@ fn preflight_respects_a_persisted_level_block_and_bands_over_it() {
         read_config(&ws, "skewed"),
         &read_raw(&ws, "skewed"),
         &PreflightOptions {
-            re_derive: true,
             lenient_costs: false,
             assume_yes: true,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("preflight over the persisted file");
     assert!(
@@ -1619,19 +1382,15 @@ fn the_no_tty_default_derives_a_partition_that_co_locates_the_block_edge() {
     make_input_block(&ws, "sink");
     write_graph(&ws, "chain", CHAIN_YAML);
 
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("in-memory preflight");
     assert_eq!(pre.outcome, RunPartitionOutcome::InMemory);
@@ -1656,19 +1415,15 @@ fn the_no_tty_default_without_block_derives_the_untouched_baseline() {
     let ws = setup_workspace(tmp.path());
     write_graph(&ws, "chain", CHAIN_YAML);
 
-    let mut confirm = panic_confirm;
     let pre = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("in-memory preflight");
     assert_eq!(shape(&pre.config.process_groups), baseline_shape());
@@ -1685,19 +1440,15 @@ fn in_memory_and_written_block_partitions_are_identical() {
     make_input_block(&ws, "sink");
     write_graph(&ws, "chain", CHAIN_YAML);
 
-    let mut confirm = panic_confirm;
     let in_memory = run_auto_partition_preflight(
         &ws.root,
         "chain",
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: false,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("in-memory preflight");
     let persisted = run_auto_partition_preflight(
@@ -1706,12 +1457,9 @@ fn in_memory_and_written_block_partitions_are_identical() {
         read_config(&ws, "chain"),
         &read_raw(&ws, "chain"),
         &PreflightOptions {
-            re_derive: false,
             lenient_costs: true,
             assume_yes: true,
-            is_tty: false,
         },
-        &mut confirm,
     )
     .expect("persisted preflight");
     assert!(matches!(

@@ -15,6 +15,8 @@ TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
 `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
 Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
+- `graph run` derives groups in memory without prompting on terminals or in scripts;
+  only `--yes` persists. `graph partition` owns the detailed preview and save prompt.
 - Enforce invariants at the engine boundary; CLI checks are UX.
 - `node build`'s PATH rustc probe is advisory: Cargo compiler overrides may differ.
   Only the built cdylib's full fingerprint is authoritative, checked at load.
