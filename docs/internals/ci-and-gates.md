@@ -427,12 +427,18 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 and no stub job standing in for a skipped required check.
 
 `lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
-`viz-tests`, and the push-only `fuzz`, `miri` and latency jobs), so a red `lint` still
-saves their runner minutes. It does NOT gate the two that do: `test-linux` and
-`test-macos`. Both start at t=0. `test-linux` has no `needs:` at all: each shard builds the
-`cerulion_core` test binaries it runs, so nothing in front of it is a data dependency. A
-`lint` verdict was never a data dependency for either, and while it gated them the wall was
-`lint` plus the longest test job instead of the longest test job.
+`viz-tests`, and the push-only `fuzz`, `miri` and latency jobs). A red `lint` saves the
+runner minutes of the ones that carry no job-level condition. `crate-tests` and
+`viz-tests` are not among them: their `!cancelled()` guard replaces the implicit
+`success()` over the whole `needs:` set, GitHub offers no per-dependency form, so both run
+and report through a red `lint` and the dependency buys the ordering alone. It does NOT
+gate the two that set the wall: `test-linux` and
+`test-macos`. Both are `needs: [changes]` and nothing else, so both start after the
+classifier, which is a checkout and a path classification, about a minute, and no build. No
+REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so nothing
+in front of either job is a data dependency for compilation. A `lint` verdict was never one
+either, and while it gated them the wall was `lint` plus the longest test job instead of the
+longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
 3-way (`[0,1,2]`); both `fail-fast: false`. The macOS count is set from per-step
@@ -496,16 +502,48 @@ from its PR-blocking view, so none of the six can credit pull-request coverage i
 provide.
 
 The `changes` job classifies a pull request's changed paths (rules and a
-`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) and
-`deb-smoke` reads one class: a pull request that touches the packaging inputs
-themselves runs the 22-minute Debian and APT smoke instead of skipping it, because
-those are the only pull requests that can break it and "caught on the merge to main"
-means a revert rather than a red check. The direction is the safe one: a class only
-ever makes a job RUN that would otherwise skip, so no rule in that script can weaken a
-gate a pull request has today, and every class is `false` on `push`, `merge_group` and
-`workflow_dispatch`, where there is no pull request to diff. `deb-smoke` keeps its
-`push` run whatever the classifier did: the job is guarded with `!cancelled()`, because
-`needs:` alone would let a failed classifier skip a job that runs unconditionally today.
+`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) into four
+outputs. `packaging` only ever makes a job RUN that would otherwise skip: a pull request
+that touches the packaging inputs themselves runs the 22-minute Debian and APT smoke,
+because those are the only pull requests that can break it and "caught on the merge to
+main" means a revert rather than a red check. EVERY job that `needs:` the classifier opens
+its job-level `if:` with `!cancelled()`, not `deb-smoke` alone: `needs:` by itself lets a
+failed classifier skip a dependant, and a skipped required context reads as satisfied.
+`test-linux`, `test-macos`, `crate-tests` and `viz-tests` carry the bare call; `deb-smoke`
+carries it in front of its own event gate, so it keeps its `push` run whatever the
+classifier did. `cerulion_cli_engine::ci_test_coverage_test` holds the rule over every
+dependant, however the job consumes the outputs, rather than over the jobs with a one-line
+selection gate alone.
+
+`code`, `docs` and `pkgs` are the test-impact selection, and they run in the other
+direction: they SKIP test steps. Four rules bound them.
+
+* PULL REQUESTS ONLY. On `push`, `merge_group` and `workflow_dispatch` every package is
+  selected. The queue run is the last gate before `main` and the one place a miss has no
+  later catch.
+* ONE OFF SWITCH. The repository variable `CI_SELECTION` reaches the classifier through
+  the workflow-level `env:` block; `off`, and any value the classifier does not know,
+  selects every package. Nothing else may read it: a step is gated on the classifier's
+  OUTPUT, never on the variable, and `ci_test_coverage_test` refuses any other shape.
+* STEPS, NEVER JOBS. Every job still runs and still reports its own required context. A
+  gated step carries the one condition the coverage walk credits,
+  `contains(fromJSON(needs.changes.outputs.pkgs), '<package>')`, and a companion step
+  under the exact negation of that condition prints one line beginning `selection:`, so
+  the log says what was skipped and why.
+* THE SELECTION IS WIDER THAN CARGO. `pkgs` is the reverse cargo dependency closure over
+  normal, build and dev edges UNIONED with the observation edges in
+  `tools/ci/observation_edges.tsv`: a test that reads another package's tree, walks the
+  repository, or loads an artifact another package builds reaches it without a manifest
+  edge. That table is derived from the sources by
+  `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs`, which fails on a missing row
+  and on a stale one. A package the walk cannot attribute is recorded as observing `all`,
+  is selected on every change, and no step of it is gated: four packages are in that state
+  today, `cerulion_core` among them, which is why the `cerulion_core` shard steps carry no
+  condition at all.
+
+The supported subset, stated plainly: the selection narrows PER-PACKAGE test steps on pull
+requests. It does NOT narrow the workspace build, it does not gate a job, it does not apply
+to any event but `pull_request`, and it never removes a required status context.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.
