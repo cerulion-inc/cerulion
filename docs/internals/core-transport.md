@@ -411,6 +411,12 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   host-singleton init; the runtime liveliness sweep uses the explicit API
   (`dead_node_cleanup_config_test`). Any service lifecycle op from cdylib-resident code
   is a reap hazard unless the flags are off; only a real dlopen'd run can catch it.
+  On macOS and FreeBSD, removing a dead node's `/tmp/<name>.shm_state` files BEFORE the
+  node is reaped is silent under 0.10: the sweep reports success and takes the registry
+  entry off, while the segments stay in the kernel under a name nothing can reconstruct
+  (0.9.1 propagated the failure and left the entry behind, which was at least visible).
+  The reclaimer's order, object unlinked first and the file second, is what keeps that
+  from happening (`reclaim_ordering_test`).
 - `AllocationStrategy::Static` pools are LAZY demand-paged tmpfs: resident RAM = pages
   written, not pool size; oversizing is latency-free; oversize generously. NOT free on
   Windows (eager commit) or under `mlockall` / `RLIMIT_AS`. Shmem-THP inflates residency

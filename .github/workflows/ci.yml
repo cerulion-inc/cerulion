@@ -2069,6 +2069,19 @@ jobs:
             df -h /
           fi
 
+      - name: Report the open-file limit
+        # iceoryx2 0.10 keeps one extra open file descriptor per shared-memory
+        # segment on macOS: it holds the segment's `.shm_state` handle for the
+        # life of the segment, where 0.9.1 closed it as soon as it had read the
+        # name. Whether this runner's limit is near that cost is a fact about the
+        # runner, and a service creation that fails for it would surface as an
+        # InternalFailure carrying no errno, so the limit is recorded on every run
+        # instead of being reconstructed from a red afterwards.
+        run: |
+          echo "ulimit -n soft: $(ulimit -Sn)"
+          echo "ulimit -n hard: $(ulimit -Hn)"
+          sysctl kern.maxfiles kern.maxfilesperproc || true
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:

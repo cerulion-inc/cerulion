@@ -153,6 +153,23 @@ fn wait_until_live(stdout: &Path, stderr: &Path) {
     );
 }
 
+/// Hand the supervisor a log level iceoryx2's own refusals can reach.
+///
+/// iceoryx2 reports every refusal through `fail!`, which logs at DEBUG, and the
+/// CLI quiets its logger to `error` unless the caller says otherwise, so a
+/// service that cannot be created reaches the log as our own wrapper's sentence
+/// with the platform's reason and its errno stripped out. This hands the level
+/// down so those lines survive.
+///
+/// It is not by itself a guarantee that EVERY refusal shows up. MEASURED on a
+/// desk reproduction: with the level handed down, the planning namespace's
+/// iceoryx2 lines appear (13 of them, `Unable to update permission rw-------`
+/// with `errno EINVAL`) and a failing DATA-plane service creation still prints
+/// none, so the level reaches some call sites and not that one. The level is
+/// kept per linked copy of `iceoryx2-log`, which is the first thing to check
+/// when a reason is still missing.
+const IOX2_REASONS: (&str, &str) = ("IOX2_LOG_LEVEL", "debug");
+
 /// The credit-word NAMESPACE this run created its words in, read from the
 /// supervisor's OWN log rather than recomputed here.
 ///
@@ -1226,11 +1243,14 @@ fn c7_a_real_consumer_death_strands_its_producer_loudly() {
     let (mut guard, stdout_path, stderr_path) = spawn_mp_record_with_env(
         tmp.path(),
         &["--peer-loss", "continue"],
-        &[(
-            "RUST_LOG",
-            "cerulion=info,cerulion_cli_engine=info,cerulion_cli_engine::graph_cmd=debug,\
-             cerulion_bagd=info",
-        )],
+        &[
+            (
+                "RUST_LOG",
+                "cerulion=info,cerulion_cli_engine=info,cerulion_cli_engine::graph_cmd=debug,\
+                 cerulion_bagd=info",
+            ),
+            IOX2_REASONS,
+        ],
     );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
@@ -1448,7 +1468,7 @@ fn c7_the_free_run_death_line_names_its_dead_groups() {
     let (mut guard, stdout_path, stderr_path) = spawn_mp_record_with_env(
         tmp.path(),
         &["--peer-loss", "continue"],
-        &[("CERULION_EXECUTION_MODE", "free_run")],
+        &[("CERULION_EXECUTION_MODE", "free_run"), IOX2_REASONS],
     );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
@@ -1544,7 +1564,7 @@ fn c7_a_producer_that_dies_after_being_named_gets_retracted() {
     let tmp = tempfile::tempdir().unwrap();
     build_creditable_split_workspace(tmp.path(), "cdretr");
     let (mut guard, stdout_path, stderr_path) =
-        spawn_mp_record_with_env(tmp.path(), &["--peer-loss", "continue"], &[]);
+        spawn_mp_record_with_env(tmp.path(), &["--peer-loss", "continue"], &[IOX2_REASONS]);
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
 
