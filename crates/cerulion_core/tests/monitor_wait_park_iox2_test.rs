@@ -79,19 +79,19 @@ const EXT_TOPIC: &str = "/mwp/ext";
 /// That is invisible under `cargo test -- --test-threads=1`, where the whole
 /// binary is ONE process running its tests sequentially. Under nextest each test
 /// is its OWN process and they run CONCURRENTLY — so
-/// `doorbell_ring_during_park_is_attributed_to_doorbell_counter` (Linux-only,
-/// which rings `/mwp/ext` every 200 µs) and
+/// `doorbell_ring_during_park_is_attributed_to_doorbell_counter` (which rings
+/// `/mwp/ext` every 200 µs on every target that maps a real page) and
 /// `doorbell_data_graph_builds_registry_and_flows_data` (which asserts the
 /// doorbell counter is ZERO, its producer being out-of-graph and never ringing)
 /// would be two processes writing and reading one shared page. The reader sees the
 /// writer's ring: `left: 1, right: 0`.
 ///
-/// MEASURED: that failure is byte-identical every time, always at the same
-/// test index, and always Linux — the ringer is `#[cfg(target_os = "linux")]`,
-/// so Linux runs exactly one more test than macOS and macOS can never
-/// reproduce it. `left: 1` (not a large count) says the overlap is brief, which
-/// is also why a scheduling change could turn it intermittent; scoping
-/// the namespace removes the collision outright rather than making it rarer.
+/// MEASURED on Linux, where the ringer first ran: the failure is byte-identical
+/// every time and always at the same test index. `left: 1` (not a large count)
+/// says the overlap is brief, which is also why a scheduling change could turn
+/// it intermittent; scoping the namespace removes the collision outright rather
+/// than making it rarer. The ringer now runs on macOS too, where the same
+/// collision is reachable for the same reason.
 ///
 /// The iceoryx2 plane is not the problem — these tests already mint isolated
 /// SHM roots. POSIX SHM is a SECOND, machine-global name plane, and the repo
@@ -405,8 +405,8 @@ fn pure_period_graph_fires_under_the_park() {
 // consumer `DoorbellRegistry`, the producer opens an owned doorbell, and data
 // flows e2e identically to the unparked path: publish N frames, drive live each,
 // the consumer fires EXACTLY N times and observes the hand oracle `1.0..=N`. On
-// a no-primitive target the SHM ring is a no-op stub, so the data still flows via real
-// iceoryx2 (the listener poll wakes the loop). Determinism: two runs are
+// a target that maps no real doorbell page the ring is a no-op stub, so the data
+// still flows via real iceoryx2 (the listener poll wakes the loop). Determinism: two runs are
 // byte-identical (Principle #7).
 // ===========================================================================
 #[test]
@@ -510,12 +510,17 @@ fn doorbell_data_graph_builds_registry_and_flows_data() {
     );
 }
 
-/// Linux-only: a doorbell RING landing inside a park window is
-/// attributed to the DOORBELL counter — the `wakes_doorbell` branch's e2e
-/// coverage (the doorbell data test above pins it at 0, since its out-of-graph
-/// producer never rings; off-Linux the ring is a no-op stub, so only Linux can
-/// exercise the real branch — a production-scale Linux run measured
-/// `wakes_doorbell=33638/33640`; this is the CI pin).
+/// A doorbell RING landing inside a park window is attributed to the DOORBELL
+/// counter, the `wakes_doorbell` branch's e2e coverage (the doorbell data test
+/// above pins it at 0, since its out-of-graph producer never rings; on a target
+/// whose ring is the no-op stub there is no real branch to exercise, so this is
+/// gated to the two targets that map a real page. A production-scale Linux run
+/// measured `wakes_doorbell=33638/33640`; this is the CI pin).
+///
+/// On macOS the same ring additionally carries a KERNEL WAKE, so this test is
+/// also the e2e evidence that the macOS data-wake rung is wired: the park
+/// blocks on the wake word and the ringer's `os_sync_wake_by_address_all`
+/// releases it.
 ///
 /// A NON-Cerulion ringer thread opens an OWNED doorbell on the SAME `(ns,
 /// topic)` the consumer registry mapped (both `shm_open(O_CREAT)` the same
@@ -524,7 +529,7 @@ fn doorbell_data_graph_builds_registry_and_flows_data() {
 /// a listener event from a publish. Rings landing BETWEEN parks are absorbed by
 /// the next entry's baseline snapshot; the continuous cadence (~200µs) vs the
 /// 50ms park window guarantees rings land INSIDE windows too.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[serial]
 fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
@@ -577,6 +582,37 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
         0,
         "rings carry no data — the wake is record-only and must not fire the consumer"
     );
+    // On macOS the park has no CPU monitor-wait primitive, so its idle is a
+    // KERNEL BLOCK on the doorbell's wake word rather than a pacing nap. This
+    // graph carries no barrier participant and no credit edge, so the shared
+    // wake-word block counter is attributable to the doorbell rung alone, which
+    // makes it the seam that fails if that rung is removed or the macOS ring
+    // goes back to being a no-op stub.
+    //
+    // Asserted in BOTH directions against the host fact the rung is gated on,
+    // so a host without the Apple os_sync family (macOS before 14.4, or
+    // CERULION_DOORBELL_OS_SYNC=0 in the invoking shell) is a judged arm rather
+    // than a skipped one: the counter must then be exactly 0, which is what a
+    // rung that ignored its own gate would fail.
+    #[cfg(target_os = "macos")]
+    {
+        let blocks = runtime.park_wake_word_block_count_for_test();
+        if cerulion_core::doorbell::wake_word_block_primitive_available() {
+            assert!(
+                blocks > 0,
+                "the macOS park must KERNEL-BLOCK on the doorbell wake word, not \
+                 pace on its recheck nap - no barrier and no credit edge exist \
+                 here, so this counter can only have come from the doorbell rung"
+            );
+        } else {
+            assert_eq!(
+                blocks, 0,
+                "with no wake word on this host the doorbell rung must not run \
+                 at all, and no sibling rung exists in this graph to bump the \
+                 shared counter"
+            );
+        }
+    }
     runtime.shutdown();
 }
 
@@ -825,8 +861,8 @@ fn degraded_default_policy_parks_fires_and_delivers() {
         factories,
         clock,
         8,
-        // The no-primitive DEFAULT shape: monitor_wait ON, doorbell
-        // FORCED OFF (the SHM ring is a no-op stub off Linux).
+        // The shape a no-primitive target resolves to where no consumer can be
+        // woken by a doorbell: monitor_wait ON, doorbell OFF.
         MonitorWaitPolicy::new(true, false, mwp_ns("degraded")),
     )
     .expect("build consumer graph under the degraded default policy");

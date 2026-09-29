@@ -3245,14 +3245,18 @@ pub struct GraphRuntime {
     /// Same UNCONDITIONAL-field rule as its siblings; read via
     /// [`Self::park_os_sync_nap_count_for_test`].
     park_recheck_os_sync_naps: std::sync::atomic::AtomicU64,
-    /// Count of `!performed`-arm iterations that took the
-    /// barrier WAKE-WORD kernel block (`BarrierShared::park_wait_activity`)
-    /// instead of the pacing sleep — the mutation seam pinning that the
-    /// step-start park's kernel wake is LIVE (reverting the arm swap zeroes
-    /// this while every pin stays green, isolating the regression).
-    /// Record-only (never read by the scheduler); 0 when there is no barrier
-    /// participant, no wake primitive (`wake_word_block_primitive_available() ==
-    /// false`), or the rank is beyond the parked bitmask. Same
+    /// Count of `!performed`-arm iterations that took a WAKE-WORD kernel block
+    /// instead of the pacing sleep, summed over the three rungs the arm tries
+    /// in order: the credit word (`CreditShared::park_wait_credit`), the
+    /// barrier (`BarrierShared::park_wait_activity`) and, on macOS, the primary
+    /// doorbell (`Doorbell::park_wait_ring`). The mutation seam pinning that
+    /// those kernel wakes are LIVE (reverting an arm swap zeroes this while
+    /// every pin stays green, isolating the regression).
+    /// Record-only (never read by the scheduler); 0 where no rung applies: no
+    /// credit edge at its threshold, no barrier participant, no doorbell
+    /// registry, a slot beyond a parked bitmask, or no wake primitive on this
+    /// host for the rung in question. A graph with only ONE of the three in
+    /// play therefore attributes the whole count to it. Same
     /// UNCONDITIONAL-field rule as its siblings; read via
     /// [`Self::park_wake_word_block_count_for_test`].
     park_wake_word_blocks: std::sync::atomic::AtomicU64,
@@ -12268,13 +12272,13 @@ impl GraphRuntime {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Test seam: how many `!performed` park iterations took
-    /// the barrier WAKE-WORD kernel block instead of the pacing sleep (see the
+    /// Test seam: how many `!performed` park iterations took a WAKE-WORD
+    /// kernel block instead of the pacing sleep, over all three rungs (see the
     /// `park_wake_word_blocks` field doc). The mutation pin for the arm swap:
-    /// a wake-word-eligible barrier participant reports `> 0` here after
+    /// a context whose rung applies reports `> 0` here after
     /// parking; reverting the swap zeroes it while the pins stay green
-    /// (the wake word is additive latency, not new semantics). 0 whenever
-    /// `wake_word_block_primitive_available()` is false — tier-gate assertions on it; on a HARDWARE-park box (Linux WAITPKG/WFE) it is ALSO 0 (the `!performed` arm never runs — pin 6's hardware arm).
+    /// (the wake word is additive latency, not new semantics). 0 whenever that
+    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park box (Linux WAITPKG/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_wake_word_block_count_for_test(&self) -> u64 {
         self.park_wake_word_blocks
@@ -12316,6 +12320,76 @@ impl GraphRuntime {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn reactor_built_for_test(&self) -> bool {
         self.reactor.is_some()
+    }
+
+    /// Kernel-block on the PRIMARY doorbell's wake word until a producer rings
+    /// it or `cap` expires.
+    ///
+    /// [`Unavailable`](crate::monitor_wait::AddrParkOutcome::Unavailable) when
+    /// the tier is inactive or there is no doorbell to watch (the caller naps,
+    /// exactly as today);
+    /// [`RingPending`](crate::monitor_wait::AddrParkOutcome::RingPending) when a
+    /// ring already landed (skip the block AND the nap, and do NOT count a slice,
+    /// because a wake in flight is not a completed wait);
+    /// [`Parked`](crate::monitor_wait::AddrParkOutcome::Parked) when a real
+    /// kernel block ran.
+    /// The same three-way vocabulary the hardware addr park returns, for the same
+    /// reason: a plain bool cannot separate "skipped" from "waited", and the
+    /// slice telemetry keys on that difference.
+    ///
+    /// # Which line, and what that costs
+    ///
+    /// The registry's PRIMARY (first-declared) topic - exactly the line the CPU
+    /// monitor-wait primitive arms on Linux. A consumer of several topics is NOT
+    /// kernel-woken by a ring on a non-primary line; it observes that ring at the
+    /// next pacing chunk through the record-only poll-all, which is what it does
+    /// today and what a host whose hardware monitor watches one line does. So
+    /// this is a strict improvement on the primary edge and a change to
+    /// nothing else. A linear chain, the shape a multi-process split produces,
+    /// has one input topic per worker and is entirely primary.
+    ///
+    /// # Why it can never be worse than the nap it replaces
+    ///
+    /// It is bounded by the SAME `cap` the nap would have used and the loop-top
+    /// predicates are untouched, so the behaviour on a host where nobody ever
+    /// rings is one bounded wait and the same re-poll.
+    ///
+    /// RECORD-ONLY (Principle 7): it reads the ring COUNTERS and the wake epoch,
+    /// never the iceoryx2 SHM message queue, never a scheduler mutation, never a
+    /// clock. It changes only WHEN this loop re-polls.
+    #[cfg(target_os = "macos")]
+    fn doorbell_wake_word_block(
+        &self,
+        baseline: Option<&[u64]>,
+        cap: Duration,
+    ) -> crate::monitor_wait::AddrParkOutcome {
+        use crate::monitor_wait::AddrParkOutcome;
+        if !self.monitor_wait_policy.doorbell()
+            || !crate::doorbell::wake_word_block_primitive_available()
+        {
+            return AddrParkOutcome::Unavailable;
+        }
+        let (Some(reg), Some(base)) = (self.doorbell_registry.as_ref(), baseline) else {
+            return AddrParkOutcome::Unavailable;
+        };
+        let Some(bell) = reg.primary() else {
+            return AddrParkOutcome::Unavailable;
+        };
+        // The parked claim is scoped to THIS block sequence: taken BEFORE the
+        // snapshot and the re-derive (the store-buffer litmus order), released by
+        // the guard on every exit path including an unwind.
+        let _guard = crate::doorbell::ParkedDoorbellGuard::enter(bell);
+        let snap = bell.wake_seq_snapshot();
+        if reg.any_advanced_since(base) {
+            // A ring is already in hand: skip the block AND the nap; the loop-top
+            // re-poll returns with it immediately.
+            return AddrParkOutcome::RingPending;
+        }
+        if bell.park_wait_ring(snap, cap) {
+            AddrParkOutcome::Parked
+        } else {
+            AddrParkOutcome::Unavailable
+        }
     }
 
     /// The shallow monitor-wait replacement for the blocking WaitSet
@@ -12927,6 +13001,51 @@ impl GraphRuntime {
                                     parked_slice = true;
                                 }
                             }
+                        }
+                    }
+                }
+
+                // The THIRD kernel block: a consumer with no barrier and no full
+                // credit edge blocks on its PRIMARY doorbell's wake word, so a
+                // producer's ring wakes it in microseconds instead of at the next
+                // pacing chunk. This is the DATA plane's own wake word, and it is
+                // the rung that carries a worker whose only wake source is data -
+                // a free-run rank has no barrier participant, and a credit word
+                // exists only where an input declares `block`.
+                //
+                // Tried LAST of the three because a process can block on exactly
+                // ONE address and the earlier two are PACING planes that must not
+                // be displaced: a credit-deferred producer is waiting for the peer
+                // that frees it, and a barrier participant must hear the cohort's
+                // arrival or the step-start signal collapses to the slice cadence.
+                // Only when neither applies is DATA the thing this context waits
+                // for.
+                //
+                // Compiled out entirely off macOS: `wake_word_block_primitive_available`
+                // is a compile-time `false` there, and a Linux consumer wakes on
+                // this very same doorbell line through the CPU monitor-wait
+                // primitive armed above - a hardware park reached on the
+                // `performed == true` path this arm never sees.
+                //
+                // Snapshot, re-derive, block: the same lost-wake protocol as its
+                // two siblings. Any ring landing after the snapshot fails the
+                // kernel compare (Principle 6); a ring that ALREADY advanced the
+                // baseline skips the block and the nap.
+                #[cfg(target_os = "macos")]
+                if !kernel_blocked {
+                    let cap = pace_slice
+                        .min(park_deadline.saturating_duration_since(std::time::Instant::now()));
+                    let outcome = self.doorbell_wake_word_block(baseline.as_deref(), cap);
+                    if outcome.performed() {
+                        kernel_blocked = true;
+                        if outcome.parked() {
+                            // Record-only mutation seam: proves the kernel block
+                            // is live (shared with the two sibling rungs).
+                            self.park_wake_word_blocks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // A real kernel block - a completed wait for slice
+                            // telemetry.
+                            parked_slice = true;
                         }
                     }
                 }
