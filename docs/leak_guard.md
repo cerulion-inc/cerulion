@@ -88,7 +88,7 @@ forge is not a candidate and is not checked; a reference there is a reviewer's j
 | a forge link | `https://github.com/<owner>/<repo>/...` | that owner and repository |
 | a qualified shorthand | `<owner>/<repo>#<n>` | that owner and repository |
 | a bare shorthand | `<repo>#<n>` | `<repo>` under this repository's own owner |
-| a tracker link | a link to `linear.app` or to a private-tier `tracker-host:` | nothing: a tracker is closed to a stranger already |
+| a tracker link | `https://<tracker host>/...`, shipped or private-tier | nothing: a tracker is closed to a stranger already |
 
 `200` means public and is clean. `404` means private, renamed away or never there, and a
 stranger is given nothing in every one of those cases, so all three are one finding,
@@ -229,7 +229,7 @@ tracker-host:tickets.example.invalid    # a tracker whose links a stranger canno
 repo-slug:exampleoldname                # a repository name that must not appear at all
 ```
 
-`tracker-host:` names a tracker host beside the one that ships (`linear.app`): a link to
+`tracker-host:` names a tracker host beside the hosts the scanner ships with: a link to
 it becomes a `ref-unopenable` finding, and the host itself is refused anywhere in the
 tree. `repo-slug:` names a repository whose NAME is the secret, in the spelling the forge
 uses (`<repo>`, or `<owner>/<repo>`): the reference classes see a slug-shaped reference

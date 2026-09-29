@@ -15,7 +15,7 @@ memory: there is no serialize, no deserialize, and no copy on the receive path.
 ## The public fixed100 benchmark
 
 In the fixed100 campaign, the Cerulion multi-process cell, measured with free run
-enabled (lockstep is the default execution mode), reads 3.97 to 4.43 µs p50 from 64 B to
+enabled (now the default execution mode for a multi-process run), reads 3.97 to 4.43 µs p50 from 64 B to
 16 MiB, a 1.1× growth over the range at
 a nominal 100 Hz offered load. Single-process reads 2.66 to 2.80 µs and
 is flat. ROS 2 defaults grow 334× over the same range.
@@ -37,7 +37,7 @@ ping/pong workload. Both ROS 2 lanes are ROS 2 Jazzy.
 | 4 MiB | 4.33 µs | 12.9 ms | 2,983× | 2.77 µs | 33.6 µs |
 | 16 MiB | 4.43 µs | 103.9 ms | 23,422× | 2.80 µs | 33.4 µs |
 
-All values are p50. Recording is ON for the native Cerulion rows (the product default); the ROS 2 and zenoh lanes do not run the native graph recorder. The multi-process column runs with free run enabled (CERULION_EXECUTION_MODE=free_run, an opt-in described under "Environment variables" in [`docs/user-api.md`](user-api.md)), the one change from the shipped defaults, whose execution mode is lockstep; every other setting is the default. The `vs. ROS 2
+All values are p50. Recording is ON for the native Cerulion rows (the product default); the ROS 2 and zenoh lanes do not run the native graph recorder. The multi-process column runs with free run enabled (measured under CERULION_EXECUTION_MODE=free_run, exported for the run because lockstep was the shipped default when this package was measured; free run is now the default execution mode for a multi-process run and `CERULION_EXECUTION_MODE=lockstep` opts out, see "Environment variables" in [`docs/user-api.md`](user-api.md)); every other setting was the shipped default, so the row's configuration is the default configuration today. The `vs. ROS 2
 defaults` column is the ratio of the ROS 2 defaults p50 to the Cerulion
 multi-process p50 (ROS 2 at its defaults against Cerulion multi-process with free run
 enabled), computed from unrounded
@@ -75,7 +75,7 @@ The fixed100 campaign is the source for the native comparison above: [campaign d
 [provenance](benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/PROVENANCE-TWO-BUILDS.txt). Raw `.bin` sample
 dumps stay on the bench host; the package carries every summary CSV, `.rate`
 sidecar, manifest and render needed to audit or re-plot it, and every published
-number is recomputable from those CSVs. Provenance: two builds, stated in the package: the single-process, iceoryx2, zenoh and ROS 2 rows are on git sha 68a0d6196; the multi-process row was measured on the build that pins the recorder to a core (commit a68a2a987); ROS 2 image b18318026199 (Jazzy, harness at 68a0d6196; the ROS 2 rows are on the release-candidate harness and are not label-comparable with the earlier package's ROS 2 rows); STOCK posture (no RT tuning, no DMA lock); nominal 100 Hz offered load; k=5 reps x 2000 samples per size; one x86-64 desktop (24-core Intel Core Ultra 9 285K, performance governor); native Cerulion recorder ON, the default a visitor gets (always-on Flashback: rolling window + trace rings). The multi-process default runs with free run enabled (CERULION_EXECUTION_MODE=free_run, the opt-in execution mode); that is the only change from the shipped defaults. The single-process leg has no execution-mode axis.
+number is recomputable from those CSVs. Provenance: two builds, stated in the package: the single-process, iceoryx2, zenoh and ROS 2 rows are on git sha 68a0d6196; the multi-process row was measured on the build that pins the recorder to a core (commit a68a2a987); ROS 2 image b18318026199 (Jazzy, harness at 68a0d6196; the ROS 2 rows are on the release-candidate harness and are not label-comparable with the earlier package's ROS 2 rows); STOCK posture (no RT tuning, no DMA lock); nominal 100 Hz offered load; k=5 reps x 2000 samples per size; one x86-64 desktop (24-core Intel Core Ultra 9 285K, performance governor); native Cerulion recorder ON, the default a visitor gets (always-on Flashback: rolling window + trace rings). The multi-process row runs with free run enabled (measured under CERULION_EXECUTION_MODE=free_run, exported for the run because lockstep was the shipped default when this package was measured; free run is now the default execution mode for a multi-process run and `CERULION_EXECUTION_MODE=lockstep` opts out); every other setting was the shipped default, so the row's configuration is the default configuration today. The single-process leg has no execution-mode axis.
 The tail with the recorder ON: multi-process (free run enabled) p99 is 6.61 µs at 64 B and
 10.45 µs at 16 MiB; single-process p99 is 9.41 µs at 64 B and
 14.23 µs at 16 MiB. p99 is pooled across the five reps (n=10000 per

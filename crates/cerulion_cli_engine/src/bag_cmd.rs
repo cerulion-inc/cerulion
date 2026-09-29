@@ -100,8 +100,11 @@ use crate::viz_client::SchemaPushOutcome;
 ///    otherwise stall playback for ten minutes.
 /// 2. **Cross-epoch stamps.** `bagd` writes each message's MCAP `log_time` from
 ///    the frame's own `WireHeader::timestamp_ns`, i.e. the PRODUCING process's
-///    clock. Within one recorded graph run the workers advance in barrier
-///    lockstep so those stamps share a number line — but a bag that mixes
+///    clock. Within one recorded graph run the ranks share ONE number line by
+///    construction: under the free-run default every rank's recording clock is
+///    placed at the same `real_ns()` epoch, and under the
+///    `CERULION_EXECUTION_MODE=lockstep` opt-out every rank advances from 0 on
+///    the one handed quantum. A bag that mixes
 ///    producers from different clock epochs (a restarted worker, a mirror
 ///    re-injected from another machine) can carry deltas that are enormous or
 ///    NEGATIVE. Negative deltas play immediately; enormous ones are capped here.

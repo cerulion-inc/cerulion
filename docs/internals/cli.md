@@ -876,7 +876,8 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib) | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib` |
 | `tests/mp_record_e2e_test.rs` | Multi-process `--record` bag contracts (one bag, per-rank manifests, departure sentinel, ring sweep) | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `tests/mp_auto_partition_e2e_test.rs` | Multi-process-by-default consent ladder over the real binary (no-TTY floor, persist, opt-out, refusal never mutates the file) | yes | same two |
-| `tests/mp_split_pair_e2e_test.rs` | The mid-level barrier's PLUMBING over the real binary: classify -> stamp -> serialise -> install, read off each worker's own build line. Deliberately NOT the ordering discriminator (that is deterministic only in-process); what it buys is that the extra generation neither desynchronises a real deployment nor loses frames, and that two live runs record byte-identical frames. | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_input_cdylib` |
+| `tests/mp_split_pair_e2e_test.rs` | The mid-level barrier's PLUMBING over the real binary: classify -> stamp -> serialise -> install, read off each worker's own build line. Pins the `CERULION_EXECUTION_MODE=lockstep` opt-out on purpose: a free-run deployment has no barrier to plumb, so the property under test only exists there. Deliberately NOT the ordering discriminator (that is deterministic only in-process); what it buys is that the extra generation neither desynchronises a real deployment nor loses frames, and that two live runs record byte-identical frames. | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_input_cdylib` |
+| `tests/mp_execution_mode_e2e_test.rs` | The execution-mode default over the real binary: a `process_groups:` run FREE-RUNS by default (`run.json` `gating: recorded_wall`, both workers `build_path=FreeRunTraced`, no shared barrier), `CERULION_EXECUTION_MODE=lockstep` opts out (`gating: quantum`, both workers `build_path=Lockstep`, both leave the cohort), and `--single-process` is the untouched negative control (`process_groups: false`, no worker line, no barrier breadcrumb). Positive `run.json` + per-worker witnesses first; breadcrumb absences second. | yes | same two |
 | `tests/network_gateway_e2e_test.rs` | Permissive gateway lifecycle: notice exactly once, child reaped on SIGINT/SIGTERM, graceful-forward discriminator (the gateway's own shutdown line, not just exit 0 + reap) | yes | same two |
 | `tests/network_gateway_mp_e2e_test.rs` | Strict networked multi-process acceptance (worker → SHM → gateway → zenoh → external) | yes | same two |
 | `tests/signal_matrix_e2e_test.rs` | SIGINT/SIGTERM/SIGHUP each exit EXACTLY 0 (`code()==None` would mean a default-disposition kill) + repeat-SIGINT idempotency, the behavioral floor for the §7 signal contract | yes | `test_node_macro_period_cdylib` |
@@ -887,6 +888,26 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `tests/completions_cli_test.rs` | Zero-stderr completion protocol under a hostile env (trace-level logging, dead daemon socket); bare separator-delimited candidates only | no | none |
 | `src/completion_wiring_tests.rs` | Wired-completer inventory (set equality + spelled-out create-verb guard), free-form inventory walk, `.mcap` path filter; run via `cargo test -p cerulion_cli --bin cerulion` | file-local mutex | none |
 | `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the orphan port-tag reclaim between exactly two sweeps with the verb's mode as its dry-run bit and the SECOND sweep's convergence handed to the gate, the report-only fork placed after the registry block and returning before the summary, plus hand-oracle pins of the three pure renderers and a call-count seam over `sweep_one_node` proving a report never calls the removal. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
+
+**Execution mode in these spawns (hermetic in three directions).** A `graph
+run` that reaches the SUPERVISOR route (a `process_groups:` graph, or any
+unpartitioned graph the non-TTY floor derives a partition for) FREE-RUNS by
+default, and `CERULION_EXECUTION_MODE=lockstep` opts out, so no e2e spawn may
+INHERIT the variable from the developer's shell: one exported value would move
+a whole binary onto the other contract without a single assertion changing. The
+rule is `mp_support::SpawnExecutionMode` (pin `lockstep`, spell out `free_run`,
+or REMOVE the variable). `mp_execution_mode` drives all three directions, and
+`mp_record`, `plain_run_resim` and `credit_death` carry per-arm pins.
+`mp_split_pair` and `mp_supervisor_box_test` pin the `lockstep` OPT-OUT,
+because their whole property is the barrier and a free-run deployment has none.
+Every other binary whose spawn can reach the supervisor REMOVES the variable,
+so that it exercises the shipped default: `mp_auto_partition`,
+`mp_default_ns`, `mp_consumer_first_spawn`, `network_gateway_mp`,
+`graph_run_validate_gate` (its no-`--single-process` recovery arms),
+`wedge_alarm`, and `ros2_graph` (its multi-process default arm, through the
+sandbox helper). `flashback_resim` removes it on a `--single-process` run,
+where the variable is inert and removing it only keeps the inert-request warn
+out of a log the test reads.
 
 ## 10. `cerulion clean`: dead-node sweep, orphan port-tag reclaim, state-file gate
 
@@ -965,7 +986,7 @@ registry config explicitly and never reaches the state-file pass, so
 ## 11. Workspace dependencies and compiler compatibility
 
 `workspace create` writes root `[workspace.dependencies]` by the BINARY's location
-(`find_cerulion_base` from `current_exe`, then baked `CARGO_MANIFEST_DIR`), never
+(the source checkout finder in `workspace.rs`, from `current_exe`, then baked `CARGO_MANIFEST_DIR`), never
 cwd: checkout builds use absolute `path` deps, others exact registry pins. Exposed
 as `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
 user overrides rewritten on recreation.

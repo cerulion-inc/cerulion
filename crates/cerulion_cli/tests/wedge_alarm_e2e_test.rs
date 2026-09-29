@@ -266,6 +266,10 @@ fn spawn_graph_run(
         .args(["graph", "run", graph, "--no-validate"])
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
+        // HERMETIC on the execution mode: REMOVED, never inherited. No
+        // `--single-process`, so this is a SUPERVISOR run on the derived
+        // partition and it free-runs by default.
+        .env_remove("CERULION_EXECUTION_MODE")
         // Hermetic: no scouting session, no gateway (the permissive network
         // default would otherwise open the LAN in CI).
         .env("CERULION_NETWORK", "off")
