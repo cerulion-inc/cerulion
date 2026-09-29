@@ -99,10 +99,15 @@
 #                             with the comment or quote prefix a wrapped line
 #                             carries (a blank line ends the sentence and is
 #                             not a wrap), and over the suffix family
-#                             (Incorporated, Inc, Corporation, Corp, Limited,
-#                             Ltd, LLC, GmbH, Co.). A mention whose raw text is
-#                             not the declared spelling BYTE FOR BYTE is a
-#                             finding. A word in front of the name is not part
+#                             (Incorporated, Inc., Corporation, Corp.,
+#                             Limited, Ltd., LLC, GmbH, Co., each short form
+#                             with its period optional except `Co.`, whose
+#                             period is what keeps a bare `Co` out of the first
+#                             half of a hyphenated word). A mention whose raw
+#                             text is not the declared spelling BYTE FOR BYTE
+#                             is a finding, and a SECOND suffix behind a correct
+#                             mention is a finding of its own: one form of the
+#                             name, not two. A word in front of the name is not part
 #                             of a mention, because the scan starts at the name.
 #                             A third-party holder is a candidate only where it
 #                             SHARES the name's first word, which the allow list

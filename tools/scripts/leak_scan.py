@@ -153,9 +153,11 @@ TAGS = ('host', 'device', 'person', 'login', 'lan', 'nickname', 'slug', 'hygiene
 # The reference classes are here too: when a reference is unopenable BECAUSE the
 # repository is closed, the slug it names is itself the secret, and a CI log
 # outlives the force-push that scrubs the branch.
-# The attribution trailer is here for the same reason: its match CARRIES the
-# co-author's name, so printing the matched text in a CI log publishes the very
-# thing the class exists to keep out of one.
+# The attribution trailer is here for the same reason. Its match reaches one
+# character past the colon, so what it would print is the trailer and the
+# author's INITIAL; on a public pull request that initial arrives with a file
+# and a line number beside it, which is more of a person than a log should
+# carry. Masked, the finding still says where and what.
 IDENTITY_CLASSES = frozenset((
     'lan-addr', 'cgnat-addr', 'home-mac', 'home-linux', 'home-win', 'home-tilde', 'temp-root',
     'login-at-host', 'mdns-local', 'host-field', 'overlay-dns', 'email-personal', 'acl-tag',

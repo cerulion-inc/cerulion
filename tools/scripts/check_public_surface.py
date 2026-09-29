@@ -51,8 +51,11 @@ PICTOGRAPH_RE = re.compile(
 # reordering, a translated line or a deleted line hands it a vendor's name and
 # it goes on policing that, green. Declared inputs, parsed outputs.
 ENTITY_FILE = "tools/scripts/public_surface_entity.txt"
+# Widening this set by adding CHARACTERS is safe. Widening it by admitting a
+# unicode CATEGORY is not: that is how the invisible characters got in, and a
+# category always holds more than the letters it was reached for.
 LEGAL_NAME_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 &.,-'/")
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 &.,-'/()")
 # The suffix family. `Co.` carries its period, because a bare `Co` matches the
 # first half of a hyphenated word. The trailing guard is what keeps `Inc` out of
 # `Incidentally`; the order of the alternatives is cosmetic, since the guard
@@ -71,6 +74,7 @@ LEGAL_SUFFIX = (r"(?:" + "|".join(re.escape(w).replace(r"\.", r"\.?") if w.endsw
 # line, because a blank line ends the sentence and the two sides are then not
 # one mention.
 LEGAL_SPACE = r"[ \t\u00a0\u202f]"
+TRAILING_SUFFIX_RE = None       # built below, once LEGAL_GAP and LEGAL_SUFFIX exist
 LEGAL_GAP = (r"(?:" + LEGAL_SPACE + r"+|" + LEGAL_SPACE + r"*," + LEGAL_SPACE + r"*|"
              + LEGAL_SPACE + r"*,?" + LEGAL_SPACE + r"*\r?\n" + LEGAL_SPACE + r"*(?:[>#*/!;%]+" + LEGAL_SPACE + r"*)?)")
 
@@ -706,6 +710,9 @@ def compute_dash_counts(root, files):
     return counts
 
 
+TRAILING_SUFFIX_RE = re.compile(LEGAL_GAP + LEGAL_SUFFIX)
+
+
 def legal_name(root):
     """The project's legal name, as DECLARED in ENTITY_FILE. Every defect of
     that file is exit 3 rather than a guess: the class compares every mention in
@@ -725,8 +732,6 @@ def legal_name(root):
         raise CannotRun("%s declares no name: one line holding the legal name, and comments" % ENTITY_FILE)
     if len(lines) > 1:
         raise CannotRun("%s declares %d names: the legal name is ONE line, so a second is a name nobody chose between" % (ENTITY_FILE, len(lines)))
-    if not lines[0]:
-        raise CannotRun("%s declares an empty name" % ENTITY_FILE)
     if lines[0] != lines[0].strip():
         raise CannotRun("%s declares a name with leading or trailing whitespace: the comparison is byte for byte, so the spelling must be exact" % ENTITY_FILE)
     # WHAT A NAME MAY HOLD, listed positively. A character a reader cannot see
@@ -757,7 +762,10 @@ def legal_name_mentions(canonical):
     mention of either. Case is ignored, the gap covers a comma and one hard
     wrap, and the suffix is the family in LEGAL_SUFFIX."""
     name_part = re.sub(LEGAL_SPACE + r"*,?" + LEGAL_SPACE + r"*" + LEGAL_SUFFIX + r"\s*$", "", canonical).strip()
-    words = name_part.split()
+    # Split on the SAME punctuation the gap treats as a separator, so a comma
+    # inside the declared name does not get glued to a word and make the
+    # comma-less spelling, the likeliest defect, invisible.
+    words = [w for w in re.split(r"[\s,]+", name_part) if w]
     if not words:
         raise CannotRun("%s declares `%s`, which is a suffix and no name: the rule would have nothing to look for"
                         % (ENTITY_FILE, canonical))
@@ -820,32 +828,54 @@ def legal_name_mentions_checked(canonical):
 
 
 def legal_name_findings(root, files, canonical):
-    """Every mention of the project's legal name in shipped text reads exactly
-    as ENTITY_FILE declares it. An upper-case holder line, an added comma, a hard
-    wrap and a different suffix are all the same defect: a reader cannot tell
-    which spelling binds. A word in front of the name is not a defect, because
-    the scan looks for the name and never for what precedes it."""
+    """(findings, mentions). Every mention of the declared name in shipped text
+    reads exactly as ENTITY_FILE declares it: an upper-case holder line, an
+    added comma, a wrap and a different suffix are one defect, because a reader
+    cannot tell which spelling binds. A word in front of the name is not a
+    defect, because the scan looks for the name and not for what precedes it.
+
+    The COUNT is returned because ZERO of them is the one result this class
+    cannot tell from success: a declaration whose first word was retyped matches
+    nothing, and a scan that matches nothing prints the line a perfect tree
+    prints. The floor below makes that a finding, and the count reaches the
+    summary so a reader of a green run can see what was judged."""
     rx = legal_name_mentions_checked(canonical)
-    findings = []
+    findings, mentions = [], 0
     for f in sorted(files):
         txt = read_text(root, f)
         if txt is None:
             continue
         for m in rx.finditer(txt):
+            # EVERY mention counts, right or wrong: the count exists to say the
+            # scan found the name at all, not to say how often it was misspelled.
+            mentions += 1
             if m.group(0) == canonical:
-                continue
-            # ONE line break to a mention. Two means the words came off separate
-            # lines of a list or a table, which is several mentions of nothing
-            # rather than one wrapped mention.
-            if m.group(0).count("\n") > 1:
+                # A SECOND suffix behind a correct mention is its own defect:
+                # `<name> Inc. LLC` reads as two forms of the company and a
+                # reader cannot tell which one binds.
+                after = TRAILING_SUFFIX_RE.match(txt, m.end())
+                if after is None:
+                    continue
+                findings.append(Finding("shipped-text", f, line_of(txt, m.start()),
+                                        "the legal name reads `%s` here, and `%s` follows it: one form of the name, "
+                                        "not two" % (visible(m.group(0)), visible(after.group(0).strip()))))
                 continue
             findings.append(Finding("shipped-text", f, line_of(txt, m.start()),
                                     "the legal name reads `%s` here and `%s` in %s: one spelling everywhere"
                                     % (visible(m.group(0)), visible(canonical), ENTITY_FILE)))
-    return findings
+    if mentions == 0 and files:
+        findings.append(Finding("shipped-text", ENTITY_FILE, 1,
+                                "the declared legal name `%s` is written nowhere in shipped text: a name the scan "
+                                "never finds makes this class read the same green as a tree where every mention is "
+                                "right, so either the declaration is wrong or the project never states its own name"
+                                % visible(canonical)))
+    return findings, mentions
 
 
 def check_shipped_text(root, files, phrases, ledger):
+    """(findings, one line for the summary naming what the legal-name rule
+    judged). A summary that does not say WHAT was judged cannot tell a reader
+    that the rule ran over nothing."""
     findings = []
     phrase_res = [(p, re.compile(re.escape(p), re.I)) for p in phrases]
     for f in shipped_files(files):
@@ -872,11 +902,14 @@ def check_shipped_text(root, files, phrases, ledger):
                 findings.append(Finding("shipped-text", f, line_of(txt, m.start()),
                                         "a pictograph on a shipped page (U+%04X): prose says what the product does in words"
                                         % ord(m.group(0))))
-    findings.extend(legal_name_findings(root, shipped_files(files), legal_name(root)))
+    canonical = legal_name(root)
+    legal, mentions = legal_name_findings(root, shipped_files(files), canonical)
+    findings.extend(legal)
+    legal_tail = "legal-name=`%s` in %d mention(s)" % (visible(canonical), mentions)
     for path in sorted(ledger):
         if path not in files or is_test_path(path):
             findings.append(Finding("shipped-text", LEDGER_FILE, 1, "the dash ledger names %s, which is not a shipped file: delete its line" % path))
-    return findings
+    return findings, legal_tail
 
 
 # ---------------------------------------------------------------------------
@@ -1281,7 +1314,8 @@ def run_tree(root, out=sys.stdout):
     notes.extend(n2)
     findings.extend(check_unreferenced_media(root, files))
     findings.extend(check_bench_citation(root, files))
-    findings.extend(check_shipped_text(root, files, phrases, ledger))
+    f5, legal_tail = check_shipped_text(root, files, phrases, ledger)
+    findings.extend(f5)
     f6, n6 = check_workstate(root, files, patterns, ws_ledger, allow)
     findings.extend(f6)
     notes.extend(n6)
@@ -1311,7 +1345,8 @@ def run_tree(root, out=sys.stdout):
             failing.append(c)
             out.write("remedy: %s: %s\n" % (c, REMEDIES[c]))
     per_class = ", ".join("%s=%d" % (c, sum(1 for fd in kept if fd.cls == c)) for c in failing)
-    tail = "files=%d, allowlist=%d, ledger=%d file(s), workstate-ledger=%d line(s)" % (len(files), len(allow), len(ledger), len(ws_ledger))
+    tail = "files=%d, allowlist=%d, ledger=%d file(s), workstate-ledger=%d line(s), %s" % (
+        len(files), len(allow), len(ledger), len(ws_ledger), legal_tail)
     if kept:
         out.write("check_public_surface: FAIL (%d finding(s) in %d class(es): %s; %s)\n" % (len(kept), len(failing), per_class, tail))
         return 1
@@ -1715,7 +1750,8 @@ def build_fixture(root):
          + "ACME SYSTEMS INC. shouts it, while MyAcme Systems, Inc. and Acme Systems Incidentally are other words.\n"
          + "\nAcme Systems\n\nIncorporated feedback shaped the API: a blank line ends the sentence.\n"
          + "Acme Systems Co-operative is another word, Acme works with Foo Inc. is two companies,\n"
-         + "and Acme Robotics Systems Inc. adds a word the name does not have.\n")
+         + "and Acme Robotics Systems Inc. adds a word the name does not have.\n"
+         + "Acme Robotics Inc. is a different company that shares one word.\n")
     _put(root, "CITATION.cff",
          'cff-version: 1.2.0\nauthors:\n  - name: "Acme Systems, Inc. and contributors"\n')
     # OUTSIDE the four files the old rule read: the scan is the shipped set now.
@@ -1723,6 +1759,7 @@ def build_fixture(root):
          "//! Shipped by Acme Systems Ltd.\n"
          "//! Earlier releases said Acme Inc., which DROPS a word of the name.\n"
          "//! The notes wrap it as Acme\n//! Systems Corp. behind a comment prefix.\n"
+         "//! A narrow column wraps it over Acme\n//! Systems\n//! Ltd. three lines.\n"
          "pub fn legal() {}\n")
     # The suffixes no other fixture reaches, one per line.
     _put(root, "docs/legal/AUTHORS",
@@ -1733,7 +1770,9 @@ def build_fixture(root):
          # a wrap behind a quote marker and behind a hash, the two prefixes no
          # other fixture reaches
          "> Acme\n> Systems Ltd.\n"
-         "# Acme\n# Systems Corp.\n")
+         "# Acme\n# Systems Corp.\n"
+         # a correct mention with a SECOND suffix behind it
+         "Acme Systems Inc. LLC\n")
     # A HARD WRAP inside the NAME, which a pattern joining the name words with a
     # plain space would not see.
     _put(root, ".github/CLA/individual.md", "# Agreement\n\nThis agreement is with Acme\nSystems Inc. and nobody else.\n")
@@ -1835,6 +1874,8 @@ EXPECTED = [
     ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme Systems Ltd.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
     ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme Inc.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
     ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme\\n//! Systems Corp.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme\\n//! Systems\\n//! Ltd.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Inc.` here, and `LLC` follows it"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Incorporated` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Corporation` here"),
     ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Limited` here"),
@@ -1914,6 +1955,32 @@ def self_test(out=sys.stdout):
     arm("the-declaration-is-a-data-file",
         ENTITY_FILE in DATA_FILES and ENTITY_FILE not in shipped_files([ENTITY_FILE])
         and WORKSTATE_EXCLUDE_RE.search(ENTITY_FILE) is not None)
+    # `visible` writes out what a reader cannot see. Every branch of it, and the
+    # promise that it is the identity over a declared name.
+    arm("visible-writes-out-what-cannot-be-seen",
+        visible("a\\b") == "a\\\\b" and visible("a\nb") == "a\\nb" and visible("a\tb") == "a\\tb"
+        and visible("a\rb") == "a\\rb" and visible("a\u00a0b") == "a\\u00a0b"
+        and visible("a\U0001F680b") == "a\\U0001f680b"
+        and visible("a\nb") != visible("a\\nb"),
+        repr([visible("a\\b"), visible("a\nb"), visible("a\U0001F680b")]))
+    arm("visible-is-the-identity-over-a-declared-name",
+        all(visible(c) == c for c in LEGAL_NAME_CHARS), repr(sorted(LEGAL_NAME_CHARS)))
+    # Every character the set permits really is usable in a declaration, and the
+    # suffix family a message names is the family the pattern matches.
+    arm("every-permitted-character-builds-a-usable-name",
+        all(legal_name_mentions_checked("A%sB Inc." % c).search("A%sB Inc." % c) is not None
+            for c in sorted(LEGAL_NAME_CHARS) if c not in " .,"),
+        "one of the permitted characters cannot appear in a declared name")
+    arm("the-refusal-names-the-suffixes-the-pattern-holds",
+        all(re.compile(LEGAL_SUFFIX).fullmatch(w) for w in LEGAL_SUFFIX_WORDS), repr(LEGAL_SUFFIX_WORDS))
+    # A name whose head carries a regex character is a literal, not a pattern.
+    arm("a-head-with-a-regex-character-is-a-literal",
+        legal_name_mentions("A.B Inc.").search("AxB Inc.") is None
+        and legal_name_mentions("A.B Inc.").search("A.B Inc.") is not None)
+    # GREEDY: the longest run of the name's own words before a suffix.
+    arm("the-longest-run-of-name-words-is-the-mention",
+        [x.group(0) for x in legal_name_mentions("Acme Robotics Co., Ltd.").finditer("Acme Robotics Co., Ltd.")]
+        == ["Acme Robotics Co., Ltd."])
     arm("one-sig-fig", all(ONE_SIG_FIG_RE.match(x) for x in ("100", "10", "2", "500")) and not any(ONE_SIG_FIG_RE.match(x) for x in ("87", "104", "4.08", "311")))
     with tempfile.TemporaryDirectory(prefix="public-surface-selftest-") as tmp:
         root = os.path.join(tmp, "tree")
@@ -1947,6 +2014,7 @@ def self_test(out=sys.stdout):
         for text, rel in ((" Acme Systems Co-operative ", "README.md"),
                           (" Acme works with Foo Inc. ", "README.md"),
                           (" Acme Robotics Systems Inc. ", "README.md"),
+                          ("Acme Robotics Inc. is a different company", "README.md"),
                           ("MyAcme Systems, Inc.", "README.md"),
                           ("The Acme Systems Inc.", "README.md"),
                           ("Acme Systems Incidentally", "README.md"),
@@ -1958,7 +2026,7 @@ def self_test(out=sys.stdout):
                     "`cerulion make-it-so`", "`cerulion account devices list`", "graph bogus", "figure 4.08", "figure 5.54", "figure 15.89",
                     "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717",
                     "Eclipse Foundation", "Willow Garage", "MyAcme", "Incidentally", "Acme Systems Corp.",
-                    "Co-operative", "works with Foo", "Acme Robotics Systems",
+                    "Co-operative", "works with Foo", "Acme Robotics Systems", "Acme Robotics Inc.",
                     "git revert <this commit>", "does not reverse this commit"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
@@ -2050,21 +2118,15 @@ def self_test(out=sys.stdout):
             cannot_run(name, needle, lambda: run_tree(clean, io.StringIO()))
         # Unreadable is the branch a hardcoded fallback would hide: it is the one
         # defect of this file that does not change the file's TEXT.
-        _put(clean, ENTITY_FILE, entity_body)
         entity_path = os.path.join(clean, ENTITY_FILE)
-        os.chmod(entity_path, 0)
-        readable = True
-        try:
-            with open(entity_path):
-                pass
-        except OSError:
-            readable = False
-        if readable:            # running as a user no mode keeps out
-            arm("legal-name-file-unreadable-stops-the-run", True, "skipped: the mode does not keep this user out")
-        else:
-            cannot_run("legal-name-file-unreadable-stops-the-run", "cannot read",
-                       lambda: run_tree(clean, io.StringIO()))
-        os.chmod(entity_path, 0o644)
+        # UNREADABLE without a file mode: a mode keeps nobody out when the run is
+        # root, which is the ordinary container, and an arm that skips in that
+        # case passes without testing anything. Bytes that are not text reach the
+        # same branch whoever runs it.
+        with open(entity_path, "wb") as fh:
+            fh.write(b"\xff\xfe" + "Acme Systems Inc.".encode("utf-16-le"))
+        cannot_run("legal-name-file-unreadable-stops-the-run", "cannot read",
+                   lambda: run_tree(clean, io.StringIO()))
         os.remove(entity_path)
         cannot_run("legal-name-file-missing-stops-the-run", "it declares the legal name",
                    lambda: run_tree(clean, io.StringIO()))
