@@ -2555,7 +2555,7 @@ jobs:
           fi
 
       - name: Raise the open-file limits
-        # A shared memory creation on these shards failed with ENFILE, which
+        # A shared memory creation on shard 0 failed with ENFILE, which
         # iceoryx2 reports as "the system-wide file handle limit was reached"
         # and a caller sees only as a creation that failed with no errno. In
         # XNU's file allocation path ENFILE has one source, `falloc_withinit`
@@ -2571,11 +2571,13 @@ jobs:
         # mechanism is under diagnosis. Separately and from the source rather
         # than from a log: iceoryx2 0.10 keeps two descriptors per macOS shared
         # memory segment for the life of the segment, the segment and its
-        # `.shm_state` mapping file, where 0.9.1 closed that file once it had
+        # `.shm_state` name and mode file, where 0.9.1 closed that file once it had
         # read the real name (cerulion-inc/cerulion issue 180).
         #
-        # The raise stays because it is harmless and the values are worth having
-        # on every run. It is not a fix, and nothing here should be read as one.
+        # The raise stays because the values are worth having on every run, and it
+        # is not a fix. It is not harmless either: `sudo sysctl -w` and the read
+        # after it carry no `|| true`, so a runner that refuses either one reds
+        # this job, which is the loud failure rather than the opaque one.
         run: |
           echo "before:"
           sysctl kern.maxfiles kern.maxfilesperproc || true
@@ -2712,9 +2714,10 @@ jobs:
       # ---------------------------------------------------------------
       # Descriptor sampler, recording only what it can read. The kernel's
       # open-file counters at 10 Hz on one line per tick, and once a second a
-      # second line with the count of live `iox2_` shared memory objects
-      # (counted through their `.shm_state` records, the only enumeration macOS
-      # offers) and an `lsof` descriptor count for up to five processes whose
+      # second line with the count of `iox2_` `.shm_state` records, which is the
+      # only enumeration macOS offers and an upper bound rather than a live
+      # count: a record outlives the process that made it when that process is
+      # killed and an `lsof` descriptor count for up to five processes whose
       # command line names this checkout. The log is uploaded whatever the
       # outcome and is quoted in part by the snapshot step at the end of the
       # job. `lsof` runs at 1 Hz rather than 10 because it costs a process per
@@ -2743,10 +2746,14 @@ jobs:
                                             capture_output=True, text=True).stdout.split()[:5]
                       fds = []
                       for pid in pids:
-                          n = subprocess.run("lsof -nP -p %s 2>/dev/null | wc -l" % pid,
-                                             shell=True, capture_output=True, text=True).stdout.strip()
+                          try:
+                              n = subprocess.run("lsof -nP -p %s 2>/dev/null | wc -l" % pid,
+                                                 shell=True, capture_output=True, text=True,
+                                                 timeout=5).stdout.strip()
+                          except Exception:
+                              n = "timeout"
                           fds.append("%s:%s" % (pid, n))
-                      f.write("%s procs iox2_objects=%d shm_state_total=%d fds=%s\n"
+                      f.write("%s procs iox2_records=%d shm_state_total=%d fds=%s\n"
                               % (now, iox, allshm, " ".join(fds) or "none"))
                   tick += 1
                   time.sleep(0.1)
@@ -3015,10 +3022,10 @@ jobs:
           python3 -c 'import resource; s, h = resource.getrlimit(resource.RLIMIT_NOFILE); print("getrlimit RLIMIT_NOFILE soft", s, "hard", h)'
           echo "ulimit -n soft $(ulimit -Sn) hard $(ulimit -Hn)"
           echo "launchctl limit maxfiles: $(launchctl limit maxfiles)"
-          echo "live iox2_ objects: $(ls /tmp/iox2_*.shm_state 2>/dev/null | wc -l)"
+          echo "iox2_ shm_state records: $(ls /tmp/iox2_*.shm_state 2>/dev/null | wc -l)"
           echo "shm_state records total: $(ls /tmp/*.shm_state 2>/dev/null | wc -l)"
           for pid in $(pgrep -f cerulion | head -5); do
-            echo "fds $pid: $(lsof -nP -p "$pid" 2>/dev/null | wc -l)"
+            echo "fds $pid: $(perl -e 'alarm 5; exec @ARGV' lsof -nP -p "$pid" 2>/dev/null | wc -l)"
           done
           echo "--- last 200 sampler lines ---"
           tail -200 "$RUNNER_TEMP/descriptors.log" 2>/dev/null || echo "no sampler log"
