@@ -127,6 +127,7 @@ impl SubscribeFailureCounts {
     }
 }
 
+/// Locks the hub state, taking the guard even when another thread poisoned the lock.
 fn lock_hub(m: &Mutex<HubState>) -> MutexGuard<'_, HubState> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
