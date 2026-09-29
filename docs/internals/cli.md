@@ -986,7 +986,7 @@ registry config explicitly and never reaches the state-file pass, so
 ## 11. Workspace dependencies and compiler compatibility
 
 `workspace create` writes root `[workspace.dependencies]` by the BINARY's location
-(`workspace.rs`'s root finder: `current_exe`, then baked `CARGO_MANIFEST_DIR`), never
+(the source checkout finder in `workspace.rs`, from `current_exe`, then baked `CARGO_MANIFEST_DIR`), never
 cwd: checkout builds use absolute `path` deps, others exact registry pins. Exposed
 as `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
 user overrides rewritten on recreation.
