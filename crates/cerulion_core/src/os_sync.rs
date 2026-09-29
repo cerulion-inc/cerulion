@@ -7,11 +7,15 @@
 //! OLDER macOS degrades to a sleep fallback instead of dyld-aborting at launch
 //! — never a direct `extern` reference.
 //!
-//! TWO consumers share this ONE backend (the no-two-copies rule):
+//! FOUR consumers share this ONE backend (the no-two-copies rule):
 //!
 //! - [`crate::barrier`]: the barrier boundary wait + the step-start
 //!   park wake word — cross-process SHM words, `OS_SYNC_*_SHARED`, woken by a
 //!   peer's `os_sync_wake_by_address_all`.
+//! - [`crate::credit`]: the producer-side credit park, a cross-process SHM
+//!   word woken by the consuming peer's drain.
+//! - [`crate::doorbell`]: the data-wake word in each topic's doorbell page, a
+//!   cross-process SHM word woken by a producer's ring.
 //! - [`crate::monitor_wait`]: the live-loop park's degraded-tier
 //!   NAP — a process-local scratch word with NO waker, where the timed wait is
 //!   used purely as a tighter-slop replacement for `thread::sleep` (measured
@@ -22,7 +26,9 @@
 //! family: an `EINVAL`/`ENOTSUP` from the kernel means the PRIMITIVE is
 //! unusable on this host, not one call shape — so every consumer degrades
 //! together. Each consumer keeps its OWN kill switch (the barrier's
-//! `CERULION_BARRIER_OS_SYNC`, the park nap's `CERULION_PARK_OS_SYNC`): the
+//! `CERULION_BARRIER_OS_SYNC`, the credit plane's `CERULION_CREDIT_OS_SYNC`,
+//! the doorbell's `CERULION_DOORBELL_OS_SYNC`, the park nap's
+//! `CERULION_PARK_OS_SYNC`): the
 //! env names are consumer-facing surface, and one switch silently disabling an
 //! unrelated tier is the misleading-name class this repo rejects. The pure
 //! `=0`/`=1`/garbage grammar ([`parse_os_sync_kill_switch`]) IS shared, so the
@@ -139,14 +145,14 @@ pub(crate) fn os_sync_backend() -> Option<&'static OsSyncFns> {
                         unsafe { std::mem::transmute(wake.as_ptr()) };
                     tracing::debug!(
                         tier = "macos-os_sync",
-                        "Apple os_sync_wait/wake_by_address resolved (macOS >= 14.4) — shared by the barrier wake tier and the park nap tier"
+                        "Apple os_sync_wait/wake_by_address resolved (macOS >= 14.4); shared by the barrier, credit, doorbell and park nap tiers"
                     );
                     Some(OsSyncFns { wait, wake })
                 }
                 _ => {
                     tracing::debug!(
                         tier = "macos-recheck-fallback",
-                        "os_sync_* symbols absent (macOS < 14.4) — barrier wake + park nap tiers = chunked sleep-recheck"
+                        "os_sync_* symbols absent (macOS < 14.4); the barrier, credit, doorbell and park nap tiers = chunked sleep-recheck"
                     );
                     None
                 }
