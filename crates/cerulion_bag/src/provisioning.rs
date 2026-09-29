@@ -171,6 +171,8 @@ fn parse_u32(key: &str, value: &str) -> Option<u32> {
     }
 }
 
+/// Reads a provisioning metadata value that is exactly `true` or `false`; for any
+/// other text the parser emits a `warn!` and the field reads as `None`, not recorded.
 fn parse_bool(key: &str, value: &str) -> Option<bool> {
     match value {
         "true" => Some(true),
