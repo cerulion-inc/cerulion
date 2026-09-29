@@ -907,7 +907,7 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 |---|---|---|---|
 | `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib) | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib` |
 | `tests/mp_record_e2e_test.rs` | Multi-process `--record` bag contracts (one bag, per-rank manifests, departure sentinel, ring sweep) | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
-| `tests/mp_auto_partition_e2e_test.rs` | Ephemeral multi-process default over PTY and non-TTY stdin, real two-node output and clean worker shutdown; explicit persist, opt-out, refusal never mutates the file | yes | same two |
+| `tests/mp_auto_partition_e2e_test.rs` | Ephemeral multi-process default over PTY and non-TTY stdin, real two-node output and clean worker shutdown; explicit persist, opt-out, refusal never mutates the file | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib`, `test_node_macro_trigger_block_cdylib` |
 | `tests/mp_split_pair_e2e_test.rs` | The mid-level barrier's PLUMBING over the real binary: classify -> stamp -> serialise -> install, read off each worker's own build line. Deliberately NOT the ordering discriminator (that is deterministic only in-process); what it buys is that the extra generation neither desynchronises a real deployment nor loses frames, and that two live runs record byte-identical frames. | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_input_cdylib` |
 | `tests/network_gateway_e2e_test.rs` | Permissive gateway lifecycle: notice exactly once, child reaped on SIGINT/SIGTERM, graceful-forward discriminator (the gateway's own shutdown line, not just exit 0 + reap) | yes | same two |
 | `tests/network_gateway_mp_e2e_test.rs` | Strict networked multi-process acceptance (worker → SHM → gateway → zenoh → external) | yes | same two |
@@ -997,7 +997,7 @@ registry config explicitly and never reaches the state-file pass, so
 ## 11. Workspace dependencies and compiler compatibility
 
 `workspace create` writes root `[workspace.dependencies]` by the BINARY's location
-(`find_cerulion_base` from `current_exe`, then baked `CARGO_MANIFEST_DIR`), never
+(see `find_cerulion_base` in `crates/cerulion_cli_engine/src/workspace.rs`), never the
 cwd: checkout builds use absolute `path` deps, others exact registry pins. Exposed
 as `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
 user overrides rewritten on recreation.
