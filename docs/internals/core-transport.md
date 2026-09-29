@@ -443,13 +443,15 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   `SOCKET_PERMISSIONS` of `OWNER_READ_WRITE` the leaked mask is `0o7177` (the setuid, setgid
   and sticky bits ride along in the complement), which clears the owner SEARCH bit: a
   directory any thread creates afterwards comes out `0o600` and every later stat of a path
-  inside it fails with EACCES. We reach this on every listener creation, so it is not a test
-  hazard alone. 0.9.1 has the same handling and the same leak, silent only because its
+  inside it fails with EACCES. Every listener creation reaches this path, so it is not a
+  test hazard alone. 0.9.1 has the same handling and the same leak, silent only because its
   permission is `OWNER_ALL`, whose complement leaves the search bit alone. The workspace
   builds against a forked `iceoryx2-bb-posix` that sets the permission with chmod after the
   bind (`[patch.crates-io]` in the root manifest). That patch reaches THIS workspace only:
   anyone depending on a published `cerulion_core` resolves the unpatched upstream until the
-  fix merges there.
+  fix merges there. The fix is upstream as eclipse-iceoryx/iceoryx2 pull request 2041 against
+  issue 2040; the patch section leaves the root manifest with the first iceoryx2 release that
+  carries it.
 - `generate_isolated_config()` mints a unique prefix baked into both service paths and
   the node-monitoring registry; a subprocess child must deserialize and reuse the
   parent's exact `Config`. `ipc_threadsafe::Service` is what makes ports `Send`
