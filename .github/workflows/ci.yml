@@ -2070,21 +2070,27 @@ jobs:
           fi
 
       - name: Raise the open-file limits
-        # iceoryx2 0.10 keeps TWO descriptors per macOS shared-memory segment for
-        # the life of the segment: the segment itself and its `.shm_state` mapping
-        # file, which 0.9.1 closed as soon as it had read the real name. One
-        # multi-process deployment in this suite creates 17 segments on its
-        # planning namespace alone. The table that filled is the SYSTEM-WIDE one,
-        # 30,720 on this runner, which counts every open descriptor the job holds
-        # at once rather than any single process's: `shm_open` returned ENFILE and
-        # iceoryx2 reported "the system-wide file handle limit was reached", which
-        # reaches a caller as a service creation that failed with no errno. The
-        # per-process limit was never the binding one (10,240 against a
-        # deployment's tens), so `kern.maxfilesperproc` and `launchctl limit` are
-        # headroom for later steps rather than the fix. The sysctl is deliberately
-        # NOT tolerant: a runner that refuses it cannot run this suite, and saying
-        # so here is better than the opaque failure it would become. `launchctl`
-        # is tolerated because the sysctl above is what the errno named.
+        # A shared memory creation on these shards failed with ENFILE, which
+        # iceoryx2 reports as "the system-wide file handle limit was reached"
+        # and a caller sees only as a creation that failed with no errno. In
+        # XNU's file allocation path ENFILE has one source, `falloc_withinit`
+        # when `nfiles >= maxfiles`, which is system wide; a per-process limit
+        # returns EMFILE from `fdalloc` instead, and `posix_shm.c` returns
+        # neither on its own.
+        #
+        # What is measured, and what is not. Two runners entered this job with
+        # different tables: one at `kern.maxfiles` 30,720 and
+        # `kern.maxfilesperproc` 10,240, another at 92,160 and 46,080. The
+        # second still returned ENFILE after this step raised it to 131,072.
+        # So a table merely a little too small does not account for it, and the
+        # mechanism is under diagnosis. Separately and from the source rather
+        # than from a log: iceoryx2 0.10 keeps two descriptors per macOS shared
+        # memory segment for the life of the segment, the segment and its
+        # `.shm_state` mapping file, where 0.9.1 closed that file once it had
+        # read the real name (cerulion-inc/cerulion issue 180).
+        #
+        # The raise stays because it is harmless and the values are worth having
+        # on every run. It is not a fix, and nothing here should be read as one.
         run: |
           echo "before:"
           sysctl kern.maxfiles kern.maxfilesperproc || true
