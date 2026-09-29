@@ -43,12 +43,12 @@
 //! `mp_supervisor_box_test.rs` (pgrep-based worker-pid observation).
 //! Prerequisites (the repo's fixture pattern — PANICS with the instruction if
 //! missing):
-//! `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`
+//! `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib -p test_node_macro_trigger_block_cdylib`
 //!
-//! GATED `#[cfg(unix)]` (NOT linux-only): the multi-process
-//! supervisor is real on macOS, and the auto-partition default is Unix-wide.
+//! Linux and macOS only: recorder cleanup requires the stable process identity
+//! and working-directory queries implemented for those targets below.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -296,11 +296,6 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_identity(_pid: u32) -> Option<ProcessIdentity> {
-    None // no reliable start identity available: never signal cached PIDs
-}
-
 #[cfg(target_os = "linux")]
 fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd"))
@@ -341,11 +336,6 @@ fn process_cwd(pid: u32) -> Option<PathBuf> {
     let end = path.iter().position(|&byte| byte == 0)?;
     let path = std::ffi::OsString::from_vec(path[..end].to_vec());
     PathBuf::from(path).canonicalize().ok()
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_cwd(_pid: u32) -> Option<PathBuf> {
-    None
 }
 
 /// Poll `try_wait` until the child exits or `timeout` elapses.
