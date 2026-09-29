@@ -6,7 +6,7 @@
 # that names the rule that fired. The caller reads the classes BY NAME, which is
 # how ci.yml invokes it:
 #
-#   git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+#   git diff --name-only --no-renames "$BASE...HEAD" > "$RUNNER_TEMP/changed.txt"
 #   ./tools/scripts/ci_changed_paths.sh < "$RUNNER_TEMP/changed.txt" \
 #     > "$RUNNER_TEMP/classes.txt"
 #   code=$(sed -n 's/^code=//p' "$RUNNER_TEMP/classes.txt")
@@ -16,6 +16,11 @@
 # `selection:` lines OUT of `$GITHUB_OUTPUT`: they are for the reader of the job
 # log, they carry no `<name>=<value>` shape, and piping this whole stream into
 # the outputs file would declare an output nothing reads.
+#
+# `$BASE` above is the tip the pull request was merged onto whenever the event's
+# `base.sha` is an ancestor of the checked-out merge commit's first parent, and
+# ci.yml takes the base from that first parent. Otherwise `$BASE` is `base.sha`
+# itself.
 #
 # FOUR CLASSES, and two directions. `packaging` only ever ADDS work: it runs a
 # push-only job on a pull request that touches its inputs. `code`, `docs` and

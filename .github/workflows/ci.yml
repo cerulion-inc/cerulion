@@ -187,8 +187,8 @@ jobs:
       docs: ${{ steps.classify.outputs.docs }}
       pkgs: ${{ steps.classify.outputs.pkgs }}
     steps:
-      # `fetch-depth: 0` because the diff is against the pull request's BASE
-      # commit, which a shallow checkout does not have. It is the whole cost of
+      # `fetch-depth: 0` because the diff is against the base this job resolves
+      # below, which a shallow checkout does not have. It is the whole cost of
       # this job, apart from the workspace resolve below.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -206,14 +206,47 @@ jobs:
           echo "selection: switch=${CI_SELECTION}"
           : > "$RUNNER_TEMP/changed.txt"
           if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-            # On a `pull_request` event the checkout is the MERGE commit, so
-            # `diff <base> HEAD` is exactly what the pull request changes.
+            # THE BASE, computed here and printed before the diff reads it.
+            # `base.sha` is a snapshot of the target branch that GitHub does not
+            # keep in step with the merge this checkout is built on, so a diff
+            # against it reports every path the target branch gained in between
+            # as a path this pull request touched. GitHub builds the
+            # `refs/pull/N/merge` commit server-side and `actions/checkout`
+            # checks it out; its first parent is the tip the branch was merged
+            # onto, so that is the base.
+            # THE ANCESTOR TEST says whether the first parent can be trusted.
+            # When `base.sha` is not reachable from it, this run cannot tell a
+            # pull request merge ref from a merge the branch made itself, so it
+            # stops trusting the first parent and falls back. The fallback is
+            # the CONSERVATIVE reading, not the more accurate one: on a merge
+            # ref GitHub rebuilt after a rewrite of the target branch, the first
+            # parent is still the tip the branch was merged onto and the
+            # fallback over-reports what that branch gained. An unresolvable
+            # `base.sha` fails the same test, falls back the same way, and the
+            # diff below then refuses and reds this job rather than classifying
+            # from nothing. Same rule as `check_added_lines.py`.
+            if PARENT=$(git rev-parse --verify -q HEAD^2 >/dev/null 2>&1 \
+                        && git rev-parse --verify HEAD^1) \
+               && git merge-base --is-ancestor "$BASE_SHA" "$PARENT"; then
+              BASE="$PARENT"
+              echo "selection: base=$BASE from the first parent of the merge commit"
+            else
+              BASE="$BASE_SHA"
+              echo "selection: base=$BASE from the event"
+            fi
+            # THREE DOTS, which matter only when the base is NOT an ancestor of
+            # HEAD: on the fallback above, a `base.sha` the target branch no
+            # longer contains. Two dots there report every path the two commits
+            # differ on, in either direction, as a path the pull request
+            # touched. Whenever the base IS an ancestor, and the resolved first
+            # parent always is, the three dots collapse to two and change
+            # nothing.
             # `--no-renames` so a rename arrives as its DELETE plus its ADD.
             # With rename detection left on, `--name-only` prints the DESTINATION
             # path alone, so renaming a listed packaging input to an unlisted
             # path would classify as `packaging=false` and skip the job that
             # reads it.
-            git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+            git diff --name-only --no-renames "$BASE...HEAD" > "$RUNNER_TEMP/changed.txt"
             echo "== changed paths =="
             cat "$RUNNER_TEMP/changed.txt"
           else
@@ -606,8 +639,8 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       # `fetch-depth: 0` so the added-line dash gate below can diff against the
-      # pull request's BASE commit. A shallow checkout does not carry it, and
-      # the gate would then refuse rather than read an empty diff.
+      # base it resolves. A shallow checkout does not carry it, and the gate
+      # would then refuse rather than read an empty diff.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
@@ -658,6 +691,16 @@ jobs:
       # would refuse rather than pass, and red a required context on a run that
       # adds no line of its own. The pull request is where every added line is
       # read, and it is the run that blocks.
+      #
+      # `--base` is the FALLBACK, not the base. `base.sha` is a snapshot of the
+      # target branch that GitHub does not keep in step with the merge this
+      # checkout is built on, so a diff against it reports every line the target
+      # branch gained in between as a line this pull request added. GitHub builds
+      # the `refs/pull/N/merge` commit server-side and `actions/checkout` checks
+      # it out; the script resolves the base itself, taking that commit's first
+      # parent when the snapshot is still reachable from that first parent, this
+      # value otherwise. It prints the base it uses and where that base comes
+      # from.
       - name: Added lines carry no typographic dash
         if: github.event_name == 'pull_request'
         env:
