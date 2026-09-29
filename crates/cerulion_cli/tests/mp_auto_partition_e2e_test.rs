@@ -78,13 +78,93 @@ impl Drop for ChildGuard {
 /// to this test's supervisor if an assertion fails before normal teardown.
 struct BagdGuard {
     supervisor_pid: u32,
-    observed: std::cell::RefCell<Vec<u32>>,
+    supervisor_identity: Option<ProcessIdentity>,
+    spawn_logs: Option<(PathBuf, [PathBuf; 2])>,
+    observed: std::cell::RefCell<Vec<ObservedProcess>>,
 }
 impl BagdGuard {
     fn new(supervisor_pid: u32) -> Self {
         Self {
             supervisor_pid,
+            supervisor_identity: process_identity(supervisor_pid),
+            spawn_logs: None,
             observed: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn for_recording(supervisor_pid: u32, root: &Path, stdout: &Path, stderr: &Path) -> Self {
+        let mut guard = Self::new(supervisor_pid);
+        guard.spawn_logs = std::fs::canonicalize(root)
+            .ok()
+            .map(|root| (root, [stdout.to_owned(), stderr.to_owned()]));
+        guard
+    }
+
+    /// Recover a spawn that happened between polls from this test's private
+    /// supervisor logs. Exact argv, private cwd and a stable live identity
+    /// are required; a log PID alone never authorizes a signal.
+    fn observe_spawn_logs(&self) {
+        let Some((root, logs)) = &self.spawn_logs else {
+            return;
+        };
+        for log in logs {
+            for line in strip_ansi(&read_file(log)).lines() {
+                if !line.contains("spawned bagd recorder") {
+                    continue;
+                }
+                let fields: Vec<_> = line.split_whitespace().collect();
+                let pid = fields
+                    .iter()
+                    .find_map(|field| field.strip_prefix("pid="))
+                    .and_then(|field| field.parse::<u32>().ok())
+                    .filter(|pid| *pid > 1);
+                let bag = fields
+                    .iter()
+                    .find_map(|field| field.strip_prefix("bag="))
+                    .map(|bag| bag.trim_matches('"'));
+                let (Some(pid), Some(bag)) = (pid, bag) else {
+                    continue;
+                };
+                if self
+                    .observed
+                    .borrow()
+                    .iter()
+                    .any(|process| process.pid == pid)
+                {
+                    continue; // never refresh a previously captured PID's identity
+                }
+                if !bag.starts_with("recordings/apdemo_") || !bag.ends_with(".mcap") {
+                    continue;
+                }
+                let Some(identity) = process_identity(pid) else {
+                    continue;
+                };
+                if identity.pgid != pid || process_cwd(pid).as_ref() != Some(root) {
+                    continue;
+                }
+                let Ok(command) = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "command="])
+                    .output()
+                else {
+                    continue;
+                };
+                if !command.status.success() {
+                    continue;
+                }
+                let command = String::from_utf8_lossy(&command.stdout);
+                let args: Vec<_> = command.split_whitespace().collect();
+                if args.windows(3).any(|args| args == ["bagd", "--out", bag])
+                    && process_identity(pid) == Some(identity)
+                {
+                    let mut observed = self.observed.borrow_mut();
+                    if !observed.iter().any(|process| process.pid == pid) {
+                        observed.push(ObservedProcess {
+                            pid,
+                            identity: Some(identity),
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -93,42 +173,179 @@ impl BagdGuard {
     fn remember_owned(&self, pids: &[u32]) {
         let mut observed = self.observed.borrow_mut();
         for &pid in pids {
-            if !observed.contains(&pid) {
-                observed.push(pid);
+            if pid > 1 && !observed.iter().any(|process| process.pid == pid) {
+                observed.push(ObservedProcess {
+                    pid,
+                    identity: process_identity(pid),
+                });
             }
         }
     }
 
     fn pids(&self) -> Vec<u32> {
-        let live: Vec<u32> = Command::new("pgrep")
-            .args([
-                "-P",
-                &self.supervisor_pid.to_string(),
-                "-f",
-                "bagd --out recordings/apdemo_",
-            ])
-            .output()
-            .map(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .filter_map(|line| line.trim().parse().ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut live: Vec<u32> = if self.supervisor_pid > 1
+            && self.supervisor_identity.is_some()
+            && process_identity(self.supervisor_pid) == self.supervisor_identity
+        {
+            Command::new("pgrep")
+                .args([
+                    "-P",
+                    &self.supervisor_pid.to_string(),
+                    "-f",
+                    "bagd --out recordings/apdemo_",
+                ])
+                .output()
+                .map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .filter_map(|line| line.trim().parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new() // dead or replaced supervisors cannot contribute new children
+        };
+        // The parent may exit while pgrep runs. Admit its live-child listing
+        // only while the same observed supervisor still owns that PID.
+        if self.supervisor_identity.is_none()
+            || process_identity(self.supervisor_pid) != self.supervisor_identity
+        {
+            live.clear();
+        }
         self.remember_owned(&live);
-        self.observed.borrow().clone()
+        self.observe_spawn_logs();
+        self.observed
+            .borrow()
+            .iter()
+            .map(|process| process.pid)
+            .collect()
     }
 }
 impl Drop for BagdGuard {
     fn drop(&mut self) {
-        for pid in self.pids() {
-            // SAFETY: the recorder is an observed child of this test's own
-            // supervisor and leads its own process group. No memory is touched.
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        let _ = self.pids();
+        for process in self.observed.borrow().iter() {
+            let Some(original) = process.identity else {
+                continue; // metadata errors and unsupported platforms fail closed
+            };
+            if original.pgid == process.pid && process_identity(process.pid) == Some(original) {
+                // SAFETY: this PID still has the observed start identity and
+                // owned group. No memory is touched. This check is best-effort,
+                // not an atomic identity-bound signal (macOS has no pidfd).
+                unsafe {
+                    libc::killpg(process.pid as libc::pid_t, libc::SIGKILL);
+                }
             }
         }
     }
+}
+
+struct ObservedProcess {
+    pid: u32,
+    identity: Option<ProcessIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    pgid: u32,
+    started: (u64, u64),
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) can contain spaces and parentheses. The remaining
+    // numeric fields follow its LAST closing parenthesis; starttime is 22.
+    let (_, fields) = stat.rsplit_once(')')?;
+    let fields: Vec<_> = fields.split_whitespace().collect();
+    if fields.first().copied() == Some("Z") {
+        return None;
+    }
+    Some(ProcessIdentity {
+        pgid: fields.get(2)?.parse().ok()?,
+        started: (0, fields.get(19)?.parse().ok()?),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: the buffer is aligned for the exact libc BSD-info layout and
+    // holds size bytes. Only a complete proc_pidinfo result is read below.
+    let result = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid).ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size).ok()?,
+        )
+    };
+    if usize::try_from(result).ok()? != size {
+        return None;
+    }
+    // SAFETY: the exact-size successful query initialized the complete struct.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid || info.pbi_status == libc::SZOMB {
+        return None;
+    }
+    Some(ProcessIdentity {
+        pgid: info.pbi_pgid,
+        started: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_identity(_pid: u32) -> Option<ProcessIdentity> {
+    None // no reliable start identity available: never signal cached PIDs
+}
+
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()?
+        .canonicalize()
+        .ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>();
+    // SAFETY: aligned buffer for the exact vnode-path libc layout, with size
+    // bytes available. Read it only after a complete successful query.
+    let result = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid).ok()?,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size).ok()?,
+        )
+    };
+    if usize::try_from(result).ok()? != size {
+        return None;
+    }
+    // SAFETY: the exact-size result initialized the entire struct. Find the
+    // terminator within its fixed buffer before reading any path bytes.
+    let info = unsafe { info.assume_init() };
+    let path: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .map(|&byte| byte as u8)
+        .collect();
+    let end = path.iter().position(|&byte| byte == 0)?;
+    let path = std::ffi::OsString::from_vec(path[..end].to_vec());
+    PathBuf::from(path).canonicalize().ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 /// Poll `try_wait` until the child exits or `timeout` elapses.
@@ -358,9 +575,10 @@ fn wait_for_log(path: &Path, needle: &str, deadline: Duration) -> bool {
 }
 
 /// Block until the recordings dir contains a `.mcap` or `timeout` elapses.
-fn wait_for_bag(recordings: &Path, timeout: Duration) -> Option<PathBuf> {
+fn wait_for_bag(recordings: &Path, timeout: Duration, guard: &BagdGuard) -> Option<PathBuf> {
     let start = Instant::now();
     while start.elapsed() < timeout {
+        let _ = guard.pids(); // observe before every fallible startup poll/assertion
         if let Ok(rd) = std::fs::read_dir(recordings) {
             for e in rd.flatten() {
                 let p = e.path();
@@ -518,19 +736,21 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
     let original_yaml = build_unpartitioned_workspace(tmp.path(), "apda");
     let (mut guard, stdout_path, stderr_path) =
         spawn_graph_run(tmp.path(), &["--record=recordings"]);
-    let _bagd_guard = BagdGuard::new(guard.0.id());
+    let _bagd_guard =
+        BagdGuard::for_recording(guard.0.id(), tmp.path(), &stdout_path, &stderr_path);
     let sup_pid = guard.0.id();
 
     // The mp bring-up completes: bag file appears (planning + 3 worker spawns
     // + bagd handshake precede it — generous bound for slow CI VMs).
     let recordings = tmp.path().join("recordings");
-    let bag = wait_for_bag(&recordings, Duration::from_secs(90)).unwrap_or_else(|| {
-        panic!(
-            "bagd never created the bag (mp bring-up failed?)\nstdout:\n{}\nstderr:\n{}",
-            read_file(&stdout_path),
-            read_file(&stderr_path)
-        )
-    });
+    let bag =
+        wait_for_bag(&recordings, Duration::from_secs(90), &_bagd_guard).unwrap_or_else(|| {
+            panic!(
+                "bagd never created the bag (mp bring-up failed?)\nstdout:\n{}\nstderr:\n{}",
+                read_file(&stdout_path),
+                read_file(&stderr_path)
+            )
+        });
 
     // REALLY multi-process: the supervisor carries 3 `run-worker` children
     // (one per derived process-per-node group).
@@ -738,17 +958,19 @@ fn a_single_process_record_embeds_the_unpartitioned_graph_it_actually_ran() {
     );
     let (mut guard, stdout_path, stderr_path) =
         spawn_graph_run(tmp.path(), &["--single-process", "--record=recordings"]);
-    let _bagd_guard = BagdGuard::new(guard.0.id());
+    let _bagd_guard =
+        BagdGuard::for_recording(guard.0.id(), tmp.path(), &stdout_path, &stderr_path);
 
     let recordings = tmp.path().join("recordings");
-    let bag = wait_for_bag(&recordings, Duration::from_secs(90)).unwrap_or_else(|| {
-        panic!(
-            "bagd never created the bag (single-process record bring-up failed?)\n\
+    let bag =
+        wait_for_bag(&recordings, Duration::from_secs(90), &_bagd_guard).unwrap_or_else(|| {
+            panic!(
+                "bagd never created the bag (single-process record bring-up failed?)\n\
              stdout:\n{}\nstderr:\n{}",
-            read_file(&stdout_path),
-            read_file(&stderr_path)
-        )
-    });
+                read_file(&stdout_path),
+                read_file(&stderr_path)
+            )
+        });
     // Waited for on the recorded content the channel assertions below read,
     // instead of a fixed window.
     wait_for_bag_state(
@@ -1211,19 +1433,21 @@ fn a_block_graph_runs_on_the_no_tty_default_and_co_locates_the_edge() {
     let original_yaml = build_workspace_with_sink(tmp.path(), Some("apdbk"), BLOCK_SINK_FIXTURE);
     let (mut guard, stdout_path, stderr_path) =
         spawn_graph_run(tmp.path(), &["--record=recordings"]);
-    let _bagd_guard = BagdGuard::new(guard.0.id());
+    let _bagd_guard =
+        BagdGuard::for_recording(guard.0.id(), tmp.path(), &stdout_path, &stderr_path);
     let sup_pid = guard.0.id();
 
     let recordings = tmp.path().join("recordings");
-    let bag = wait_for_bag(&recordings, Duration::from_secs(90)).unwrap_or_else(|| {
-        panic!(
-            "bagd never created the bag — the defect shape is a `block` consumer's \
+    let bag =
+        wait_for_bag(&recordings, Duration::from_secs(90), &_bagd_guard).unwrap_or_else(|| {
+            panic!(
+                "bagd never created the bag — the defect shape is a `block` consumer's \
              worker dying at graph build, which is exactly what this arm exists to \
              catch\nstdout:\n{}\nstderr:\n{}",
-            read_file(&stdout_path),
-            read_file(&stderr_path)
-        )
-    });
+                read_file(&stdout_path),
+                read_file(&stderr_path)
+            )
+        });
 
     // TWO workers, not three: the block edge is co-located, `ticker` is not.
     let workers = wait_for_workers(sup_pid, 2, Duration::from_secs(60));
@@ -1692,16 +1916,19 @@ fn assert_two_node_ephemeral_run(terminal: bool) {
     .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()))
     .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
     let mut guard = mp_support::ChildGuard::spawn_group_leader(&mut cmd).expect("spawn graph run");
-    let bagd_guard = BagdGuard::new(guard.id());
+    let bagd_guard = BagdGuard::for_recording(guard.id(), tmp.path(), &stdout_path, &stderr_path);
     let sup_pid = guard.id();
-    let bag = wait_for_bag(&tmp.path().join("recordings"), Duration::from_secs(90)).unwrap_or_else(
-        || {
-            panic!(
-                "no output without answering stdin; terminal={terminal}\n{}",
-                merged_log(&stdout_path, &stderr_path)
-            )
-        },
-    );
+    let bag = wait_for_bag(
+        &tmp.path().join("recordings"),
+        Duration::from_secs(90),
+        &bagd_guard,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "no output without answering stdin; terminal={terminal}\n{}",
+            merged_log(&stdout_path, &stderr_path)
+        )
+    });
     let workers = wait_for_workers(sup_pid, 2, Duration::from_secs(60));
     assert_eq!(workers.len(), 2, "each node retains its own process");
     guard.note_workers_explicit(workers);
@@ -1714,6 +1941,7 @@ fn assert_two_node_ephemeral_run(terminal: bool) {
         |snap| snap.frames_on(&ticker) > 0 && snap.frames_on(&relay) > 0,
     );
     let recorders = bagd_guard.pids();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert_eq!(
         recorders.len(),
         1,
@@ -1816,6 +2044,7 @@ fn open_terminal() -> (std::fs::File, std::fs::File) {
 /// observation seam avoids timing a supervisor crash against a recorder spawn.
 #[test]
 #[serial]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recorder_guard_remembers_owned_pid_after_the_supervisor_is_gone() {
     use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     let mut parent = mp_support::ChildGuard::single_process(
@@ -1849,4 +2078,235 @@ fn recorder_guard_remembers_owned_pid_after_the_supervisor_is_gone() {
         .expect("guard stops observed process");
     assert_eq!(status.signal(), Some(libc::SIGKILL));
     assert!(mp_support::pid_is_gone(child_pid));
+}
+
+/// The existing observation seam models a cached PID whose start identity
+/// changed. The victim is a real owned process; surviving Drop is the oracle.
+#[test]
+#[serial]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recorder_guard_preserves_a_live_process_with_a_different_start_identity() {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    let mut child = mp_support::ChildGuard::single_process(
+        Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn owned process"),
+    );
+    let pid = child.id();
+    let recorder = BagdGuard::new(0); // no live supervisor contributes discoveries
+    recorder.remember_owned(&[pid]);
+    {
+        let mut observed = recorder.observed.borrow_mut();
+        let identity = observed[0]
+            .identity
+            .as_mut()
+            .expect("live identity available");
+        identity.started.1 = identity.started.1.wrapping_add(1);
+    }
+    drop(recorder);
+    assert!(
+        child
+            .try_wait_noting()
+            .expect("poll live process")
+            .is_none(),
+        "changed identity must not receive SIGKILL"
+    );
+    send_sigint(pid);
+    let status = child
+        .wait_bounded(Duration::from_secs(5))
+        .expect("stop surviving process");
+    assert_eq!(status.signal(), Some(libc::SIGINT));
+    child.finish().assert_clean();
+}
+
+/// A cached supervisor identity that changed must not admit newly discovered
+/// children. A real owned, recorder-named process proves the refusal is safe.
+#[test]
+#[serial]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recorder_guard_rejects_children_of_a_different_supervisor_identity() {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    let mut child = mp_support::ChildGuard::single_process(
+        Command::new("sleep")
+            .arg0("bagd --out recordings/apdemo_identity")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn recorder-named owned process"),
+    );
+    let pid = child.id();
+    let parent_pid = std::process::id();
+    let found = Command::new("pgrep")
+        .args([
+            "-P",
+            &parent_pid.to_string(),
+            "-f",
+            "bagd --out recordings/apdemo_",
+        ])
+        .output()
+        .expect("observe recorder-named child");
+    assert!(
+        String::from_utf8_lossy(&found.stdout)
+            .lines()
+            .any(|line| line.trim().parse::<u32>() == Ok(pid)),
+        "the live parent's child must be discoverable before identity rejection"
+    );
+    let mut recorder = BagdGuard::new(parent_pid);
+    let identity = recorder
+        .supervisor_identity
+        .as_mut()
+        .expect("live parent identity available");
+    identity.started.1 = identity.started.1.wrapping_add(1);
+    assert!(
+        recorder.pids().is_empty(),
+        "a replaced parent must not admit new children"
+    );
+    drop(recorder);
+    assert!(
+        child
+            .try_wait_noting()
+            .expect("poll live process")
+            .is_none(),
+        "replacement parent's child must survive Drop"
+    );
+    send_sigint(pid);
+    let status = child
+        .wait_bounded(Duration::from_secs(5))
+        .expect("stop surviving process");
+    assert_eq!(status.signal(), Some(libc::SIGINT));
+    child.finish().assert_clean();
+}
+
+/// A real subprocess fixture writes the PID of its own recorder-named child,
+/// then exits without observing it. The calling test owns the orphan cleanup.
+#[test]
+#[ignore = "subprocess fixture invoked only by the logged-orphan regression"]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recorder_spawn_fixture() {
+    use std::os::unix::process::CommandExt as _;
+    let log = std::env::var_os("CERULION_TEST_RECORDER_LOG").expect("fixture log path");
+    let child = mp_support::ChildGuard::single_process(
+        Command::new("sleep")
+            .arg0("bagd --out recordings/apdemo_owned.mcap")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn fixture's recorder-named child"),
+    );
+    std::fs::write(
+        log,
+        format!(
+            "spawned bagd recorder pid={} bag=recordings/apdemo_owned.mcap\n",
+            child.id()
+        ),
+    )
+    .expect("write actual spawn evidence");
+    // This error-path fixture intentionally orphans its child. The parent test
+    // retains the real spawn log and a fallback guard so failure still cleans it.
+    std::mem::forget(child);
+}
+
+#[test]
+#[serial]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recorder_guard_recovers_logged_owned_orphan_before_its_first_poll() {
+    let root = tempfile::tempdir().unwrap();
+    let stdout = root.path().join("supervisor.stdout");
+    let stderr = root.path().join("supervisor.stderr");
+    let mut parent = mp_support::ChildGuard::single_process(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "recorder_spawn_fixture"])
+            .env("CERULION_TEST_RECORDER_LOG", &stderr)
+            .current_dir(root.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn real supervisor fixture"),
+    );
+    let recorder = BagdGuard::for_recording(parent.id(), root.path(), &stdout, &stderr);
+    let status = parent
+        .wait_bounded(Duration::from_secs(5))
+        .expect("supervisor exits");
+    assert_eq!(status.code(), Some(0));
+    let pid = read_file(&stderr)
+        .split_whitespace()
+        .find_map(|field| {
+            field
+                .strip_prefix("pid=")
+                .and_then(|pid| pid.parse::<u32>().ok())
+        })
+        .expect("actual logged child PID");
+    let fallback = BagdGuard::new(0);
+    fallback.remember_owned(&[pid]);
+    assert!(
+        recorder.observed.borrow().is_empty(),
+        "no recorder observation before parent exit"
+    );
+    assert!(
+        !mp_support::pid_is_gone(pid),
+        "the fixture must leave a real owned orphan"
+    );
+    drop(recorder); // first observation must recover the private log, not dead-parent children
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !mp_support::pid_is_gone(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        mp_support::pid_is_gone(pid),
+        "logged owned orphan must be stopped and reaped"
+    );
+    drop(fallback);
+    parent.finish().assert_clean();
+}
+
+#[test]
+#[serial]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recorder_guard_preserves_logged_live_process_with_wrong_cwd_or_bag() {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    let root = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let stdout = root.path().join("supervisor.stdout");
+    let stderr = root.path().join("supervisor.stderr");
+    for (cwd, logged_bag) in [
+        (elsewhere.path(), "recordings/apdemo_owned.mcap"),
+        (root.path(), "recordings/apdemo_different.mcap"),
+    ] {
+        let mut child = mp_support::ChildGuard::single_process(
+            Command::new("sleep")
+                .arg0("bagd --out recordings/apdemo_owned.mcap")
+                .arg("60")
+                .current_dir(cwd)
+                .process_group(0)
+                .spawn()
+                .expect("spawn owned recorder-named process"),
+        );
+        let pid = child.id();
+        std::fs::write(
+            &stderr,
+            format!("spawned bagd recorder pid={pid} bag={logged_bag}\n"),
+        )
+        .unwrap();
+        let recorder = BagdGuard::for_recording(0, root.path(), &stdout, &stderr);
+        assert!(
+            recorder.pids().is_empty(),
+            "wrong cwd or exact bag argument must refuse ownership"
+        );
+        drop(recorder);
+        assert!(
+            child
+                .try_wait_noting()
+                .expect("poll live process")
+                .is_none(),
+            "nonmatching process must survive Drop"
+        );
+        send_sigint(pid);
+        let status = child
+            .wait_bounded(Duration::from_secs(5))
+            .expect("stop surviving process");
+        assert_eq!(status.signal(), Some(libc::SIGINT));
+        child.finish().assert_clean();
+    }
 }
