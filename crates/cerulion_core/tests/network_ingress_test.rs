@@ -615,6 +615,50 @@ fn test_register_ingress_topic_wired_end_to_end_same_session() {
 // re-injection-failure arm (counted, latched, recovers)
 // ---------------------------------------------------------------------------
 
+/// A failed second registration releases only its own publisher and origin,
+/// while the first bridge still delivers once and retains its remote identity.
+#[test]
+fn duplicate_marked_ingress_releases_only_its_own_publisher_and_marker() {
+    let (transport, topic) = setup_with_network("duplicate_marked");
+    let hash = 0xABCD_1234_5566_7788;
+    let slice = MaxSliceLen::const_new(256);
+    let subscriber = transport.create_subscriber(&topic).unwrap();
+    transport
+        .register_ingress_topic(&topic, hash, slice)
+        .unwrap();
+    let error = transport
+        .register_ingress_topic(&topic, hash, slice)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("already has a registered network ingress bridge"),
+        "{error}"
+    );
+    assert!(transport.is_network_mirror(&topic).unwrap());
+    assert!(transport.acquire_local_topic_lease(&topic).is_err());
+
+    // The default data service has two publisher slots. A second owner fitting
+    // proves the failed registration did not retain its newly created publisher.
+    let extra = transport
+        .create_remote_ingress_injector(&topic, hash, slice)
+        .unwrap();
+    drop(extra);
+    let frame = make_wire_frame(hash, 7, 123, &[0x91, 0xA2]);
+    let network = transport.network().unwrap();
+    network.publish_to_network(&topic, frame.clone()).unwrap();
+    let (header, payload) = poll_one(&subscriber, Duration::from_secs(3)).unwrap();
+    assert_eq!(rebuild_frame(&header, &payload), frame);
+    assert_eq!(network.ingress_stats(&topic).unwrap().frames, 1);
+
+    transport.unregister_ingress_topic(&topic).unwrap();
+    assert!(!transport.is_network_mirror(&topic).unwrap());
+    assert!(transport.network_mirror_topics().unwrap().is_empty());
+    assert!(!network.is_ingress_registered(&topic));
+    assert!(network.ingress_stats(&topic).is_none());
+    drop(subscriber);
+    let _local = transport.acquire_local_topic_lease(&topic).unwrap();
+}
+
 /// TWO concurrent ingress bridges on ONE `NetworkManager`
 /// — distinct topics, distinct schema hashes, interleaved frames. Each frame
 /// delivers ONLY to its own local topic, the per-topic counters stay

@@ -345,6 +345,31 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   `MirrorGather { records, completeness }`; an empty windowed-listen answer is NOT
   evidence of absence. A writer with an empty record map still sends a bare PRESENCE
   frame so it can be heard; older readers count it malformed and ignore it (intended).
+- Network source identity (`transport/mirror_origin`) is independent of that
+  best-effort robot attribution. Current network injectors register a verified
+  event-service marker before exposing data, and retain its notifier until after
+  their publisher drops. Full topic attributes verify name-hash collisions;
+  malformed reserved markers fail closed. CLI local source selection and listing
+  use this marker even when attribution failed. Raw local DDS/bag injection and
+  the low-level `NetworkManager::register_ingress` compatibility API remain
+  unmarked; network writers use the marked `TransportManager` APIs. Older
+  unmarked producers without attribution require upgrade/restart before local
+  source selection can distinguish them.
+- Explicit local observations hold a marker listener lease until after their
+  data subscriber drops. Remote constructors register their notifier before data
+  creation. Both roles fence (`SeqCst`) after registration and before counting
+  the opposite role; an occupied opposite role refuses construction and drops
+  only the newly owned port. This is cold admission, with no frame-path polling.
+  The pinned healthy event containers register owner cells before returning and
+  count them after the fence; listener/notifier release and dead-node recovery
+  use `ReleaseMode::Default`, never the registry's `LockIfLastIndex` fast path.
+  Concurrent local/remote creation may both refuse; there is no timing retry.
+  Origin notifier capacity remains 64. `max_listeners` is deliberately omitted,
+  preserving configured creation capacity (native default 16) and existing
+  open compatibility without a requested minimum; quota failure is explicit.
+  Listeners alone do not classify a topic REMOTE. Automatic local reads acquire
+  no lease. The lease and private CLI wrapper add no publisher/subscriber FFI
+  fields, wire changes, or data delivery work.
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally

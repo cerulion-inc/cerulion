@@ -108,7 +108,7 @@ no command that rewrites an existing workspace's manifest in place.
 | `node modify <TYPE> [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC]` | Add ports to an existing node and/or change its trigger policy. For macro-form nodes, splices a new `#[input]` / `#[output]` field into the struct directly; the surrounding tick body and any custom helper fields are preserved. For a legacy `--raw-ffi` node it regenerates the `INFO_BYTES` JSON instead. `-T SCHEMA NAME` adds a TRIGGER input (equivalent to `-i SCHEMA NAME --policy data_trigger=NAME`). Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. `--policy SPEC` rewrites the macro's trigger policy atomically; see `--policy` below. |
 | `node build <TYPE> [--release]` | `cargo build` the node crate as a cdylib. Also probes the node's **optional SYSTEM dependencies** and enables each feature whose system library is actually present; see `Optional SYSTEM dependencies` below. The probe report is printed to stderr BEFORE cargo runs (so a build that fails because of an enabled feature still says which feature that was), and a malformed declaration REFUSES the build rather than silently producing a capability-less artifact. Cargo's own output is captured and shown only when the build fails, so one progress line (`Building '<TYPE>'. …`) goes to stderr just before cargo starts; stdout carries only the result line, `Built '<TYPE>'`. The first build of a workspace also compiles the Cerulion runtime and can take a few minutes. |
 | `node stage <TYPE> [-i ID] [-g GRAPH] [-I NAME SOURCE]...` | Add the node as an instance in a graph YAML. Repeated `-I name source` wires inputs (`-I image camera/image`). A staged instance carries no prefix of its own: `prefix:` is a GRAPH-level key (set by `graph create -n PREFIX`), so topic resolution for every instance in the file comes from there. |
-| `node run <TYPE> [-p PREFIX] [-i ID] [--release] [--network off] [--no-cpu-dma-lock] [--no-monitor-wait]` | Run a single node on its own, which is useful for development without a full graph. Runs through `graph run` (a one-node graph, report skipped), so an output whose `schema:` the workspace defines more than once is refused the same way. `-p` sets the topic prefix (default `standalone`) and `-i` the instance id (default: the type name), so an output lands on `/standalone/<TYPE>/<port>` unless you say otherwise. `--release`, `--network off`, `--no-cpu-dma-lock` and `--no-monitor-wait` mean what they mean on `graph run`. |
+| `node run <TYPE> [-p PREFIX] [-i ID] [--release] [--local] [--network off] [--no-cpu-dma-lock] [--no-monitor-wait]` | Run a single node on its own, which is useful for development without a full graph. Runs through `graph run` (a one-node graph, report skipped), so an output whose `schema:` the workspace defines more than once is refused the same way. `-p` sets the topic prefix (default `standalone`) and `-i` the instance id (default: the type name), so an output lands on `/standalone/<TYPE>/<port>` unless you say otherwise. `--release`, `--local`, `--network off`, `--no-cpu-dma-lock` and `--no-monitor-wait` mean what they mean on `graph run`. |
 | `node list` | List all node types in the workspace. |
 | `node info <TYPE>` | Print the node's metadata (ports, schemas, trigger policy) by parsing `nodes/<TYPE>/src/lib.rs`. |
 
@@ -128,10 +128,63 @@ no command that rewrites an existing workspace's manifest in place.
 
 | Command | Effect |
 |---|---|
-| `topic list [--all] [--no-network] [--connect LOCATOR]... [--listen LOCATOR]... [--scan]` | List LOCAL topics FIRST/instantly, then REMOTE topics discovered over the LAN. The framework's own channels (the recorder's `/bagd/status`, anything under `/__cerulion/`) are HIDDEN from the LOCAL section of the default listing (REMOTE rows are not filtered: a robot's own channel that reaches the announce or demand space, or a local mirror of one, prints as a plain REMOTE row with or without `--all`); when any were, ONE count line says so (`1 internal topic hidden (--all shows it)`), and `--all` lists them with an `internal` marker after the path (the path stays the row's first token; `topic echo`/`info`/`hz` read an internal topic by name either way). Automagic: remote discovery runs BY DEFAULT (multicast + gossip scouting ON, a bounded sub-second query across the demand + announce key-spaces), rendered as a `REMOTE TOPICS` section, so an unpaired robot shows up with no flags; when the bounded gather finds nothing the section collapses to ONE line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)` (a peer that IS reachable, a given locator or a discovered robot, but advertised no topic in time gets a `retry` hint instead of the `--connect` one). `--no-network` skips the remote query (scripts / CI / offline). `--connect tcp/192.168.123.99:7683` (repeatable; `--listen` mirrors it) ADDS locators to reach a peer scouting can't find (7683 is the well-known permissive-gateway port; a graph with an explicit `network:` block listens wherever its `listen:` says); no gating flag required. The remote half is best-effort: a session/query failure is a LOUD note + exit 0 (the local list already printed), never a silently-empty section, never a fake-success. **Discovery ladder:** the LADDER (mDNS `_cerulion._tcp` browse, the PRIMARY rung, plus verified cached peers `~/.cerulion/peers.json` plus the `CERULION_PEERS`/config/`<name>.local` hostname convention, in parallel under a ~1.5 s ceiling) finds robot gateways with zero typed addresses, folds their locators into the query session, and renders a `ROBOTS` section (robot, gateway port, locator, rung) above `REMOTE TOPICS`; nothing discovered = no `ROBOTS` section at all. **`--scan` (rung 4, OPT-IN):** also unicast-sweeps the local `/24`(s) on the well-known gateway port for robots that BOTH multicast and mDNS reflection hide: verify-before-trust (only a gateway that answers a beacon probe is shown), the subnet clamped to the host's `/24`. OFF by default and STRUCTURALLY unreachable without the flag (a horizontal connect sweep reads as port-scan recon to corporate IDS; `--scan` is the sole producer, no env/config path). See `docs/networking.md` "Finding robots". |
-| `topic info <TOPIC>` | Schema name and schema hash, plus the last message's sequence number and wire timestamp. |
-| `topic echo <TOPIC> [--truncate-length N]` | Stream messages with schema-aware decoding for stock types (`std_msgs/String`, `sensor_msgs/Image`, …); hex fallback otherwise. `--truncate-length` caps how many elements of a long array or string each line prints (default 128, minimum 1); raise it to see a whole payload, lower it to keep a fast topic readable. |
-| `topic hz <TOPIC>` | Publish-rate measurement. |
+| `topic list [--all] [--local] [--no-network] [--connect LOCATOR]... [--listen LOCATOR]... [--scan]` | List LOCAL topics FIRST/instantly, then REMOTE topics discovered over the LAN. The framework's own channels (the recorder's `/bagd/status`, anything under `/__cerulion/`) are HIDDEN from the LOCAL section of the default listing (REMOTE rows are not filtered: a robot's own channel that reaches the announce or demand space, or a local mirror of one, prints as a plain REMOTE row with or without `--all`); when any were, ONE count line says so (`1 internal topic hidden (--all shows it)`), and `--all` lists them with an `internal` marker after the path (the path stays the row's first token; `topic echo`/`info`/`hz` read an internal topic by name either way). Automagic: remote discovery runs BY DEFAULT (multicast + gossip scouting ON, a bounded sub-second query across the demand + announce key-spaces), rendered as a `REMOTE TOPICS` section, so an unpaired robot shows up with no flags; when the bounded gather finds nothing the section collapses to ONE line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)` (a peer that IS reachable, a given locator or a discovered robot, but advertised no topic in time gets a `retry` hint instead of the `--connect` one). `--local` (also spelled `--no-network`) or `CERULION_NETWORK=off` skips the whole remote query, including the discovery ladder and `--scan`; explicit locators are ignored in this scope. Existing shared-memory mirrors remain REMOTE rows attributed to their origin robot. `--connect tcp/192.168.123.99:7683` (repeatable; `--listen` mirrors it) ADDS locators to reach a peer scouting can't find (7683 is the well-known permissive-gateway port; a graph with an explicit `network:` block listens wherever its `listen:` says); no gating flag required. The remote half is best-effort: a session/query failure is a LOUD note + exit 0 (the local list already printed), never a silently-empty section, never a fake-success. **Discovery ladder:** the LADDER (mDNS `_cerulion._tcp` browse, the PRIMARY rung, plus verified cached peers `~/.cerulion/peers.json` plus the `CERULION_PEERS`/config/`<name>.local` hostname convention, in parallel under a ~1.5 s ceiling) finds robot gateways with zero typed addresses, folds their locators into the query session, and renders a `ROBOTS` section (robot, gateway port, locator, rung) above `REMOTE TOPICS`; nothing discovered = no `ROBOTS` section at all. **`--scan` (rung 4, OPT-IN):** also unicast-sweeps the local `/24`(s) on the well-known gateway port for robots that BOTH multicast and mDNS reflection hide: verify-before-trust (only a gateway that answers a beacon probe is shown), the subnet clamped to the host's `/24`. OFF by default and STRUCTURALLY unreachable without the flag (a horizontal connect sweep reads as port-scan recon to corporate IDS; `--scan` is the sole producer, no env/config path). See `docs/networking.md` "Finding robots". |
+| `topic info <TOPIC> [--local]` | Schema name and schema hash, plus the last message's sequence number and wire timestamp. |
+| `topic echo <TOPIC> [--local] [--truncate-length N]` | Stream messages with schema-aware decoding for stock types (`std_msgs/String`, `sensor_msgs/Image`, …); hex fallback otherwise. `--truncate-length` caps how many elements of a long array or string each line prints (default 128, minimum 1); raise it to see a whole payload, lower it to keep a fast topic readable. |
+| `topic hz <TOPIC> [--local]` | Publish-rate measurement. |
+
+### Local scope for runs and topic inspection
+
+This source version accepts `--local` on `graph run`, `node run`, and `topic
+list`, `echo`, `hz`, and `info`. Released CLI 1.0.0 uses `--network off` for
+runs, `--no-network` for listing, and `CERULION_NETWORK=off` for observers.
+Those spellings remain supported; `--local` adds a consistent spelling.
+
+```sh
+cerulion graph run obstacle_avoidance --release --local
+cerulion topic list --local
+cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity --local
+cerulion topic hz /obstacle_avoidance/safety_controller/linear_velocity --local
+```
+
+Use `cerulion graph run <NAME> --local` for a graph, or
+`cerulion node run <TYPE> --local` for an individual node.
+
+For runs, `--local` and `--network off` suppress this run's gateway
+registration/startup, network session, egress and ingress, regardless of the
+graph's `network:` block. For inspection, `--local` skips remote discovery,
+network-daemon demand/startup and remote schema lookup. Genuine local producers
+still read from shared memory. An unknown local schema prints the existing
+hash/hex fallback instead of requesting a decoder over the network.
+
+Local scope wins over `topic list`'s `--connect`, `--listen` and `--scan`.
+The environment kill-switch is also honored: unset or whitespace-only
+`CERULION_NETWORK` leaves the default networking behavior; trimmed,
+case-insensitive `off` suppresses networking. Any other nonempty value warns
+and fails closed, preserving the existing behavior. No CLI option overrides
+an engaged environment kill-switch to enable networking. `--local` and the
+legacy run switch may be supplied together.
+
+Local selection applies to the command's runtime/topic plane after the
+existing sign-in gate. A machine that has never signed in still needs
+`cerulion login`; `--local` does not disable the account sign-in flow.
+
+The flag does not stop another process's gateway or remove its mirrors.
+Listing still shows already mirrored shared-memory topics under REMOTE,
+attributed to the source robot, or `origin unavailable` when attribution failed.
+Network injectors retain a required shared-memory identity marker separately
+from that attribution. `echo`, `hz`, and `info` refuse such mirrors
+in local scope because holding a mirror requires a network-daemon demand;
+the refusal names the mirror and the option to read on its source robot.
+While a local observer runs, its source lease refuses remote replacement even
+if its local producer stops; exit releases the lease. Listener quota exhaustion
+or simultaneous local/remote creation fails explicitly. The marker listener quota
+uses the native event configuration (default 16 local observers per topic).
+
+Upgrade and restart an older gateway before relying on this source distinction:
+an already-running older injector without either a marker or attribution cannot
+be distinguished from a local producer. Custom network injectors must use the
+marked transport APIs; raw local DDS and bag playback remain local sources.
 
 ### `cerulion schema`
 
@@ -2588,7 +2641,7 @@ Read by `graph run`, `node run`, `ros2 attach` and the topic verbs. See
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. `off` is the only accepted value; anything else leaves the permissive default in place. Honored by **any** entry point, so it is the way to silence a machine you do not control the command line of. The `--network off` flag is the same switch. |
+| `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. `off` is matched after trimming, case-insensitively. Unset or whitespace-only has no effect; any other nonempty value warns and fails closed to local-only. Honored by **any** entry point, so it is the way to silence a machine you do not control the command line of. The `--local` and legacy `--network off` run flags are the same switch; topic inspection honors the same environment kill-switch. |
 | `CERULION_GATEWAY_PORT` | The port the network gateway listens on, instead of the well-known **7683** (which bind-probes upward on conflict). Set it when 7683 is taken by something else on the robot, or to run two gateways on one box. |
 | `CERULION_ROBOT_IDENTITY` | The robot's announced network identity: the name that shows up in `cerulion topic list`'s `ROBOTS` section, in the mDNS `_cerulion._tcp` record, and as the first chunk of every announce key. Default: this machine's hostname (`.local` stripped). Set it on a stock-image fleet where every machine boots with the same hostname, or when the hostname is not the name your operators use. Resolved identically by the gateway and the remote-plane daemon, so the LAN and WAN planes can never advertise two different names. |
 | `CERULION_PEERS` | Comma-separated `host[:port]` list feeding the discovery ladder's hostname rung, the scripted / CI escape hatch for a robot mDNS and multicast cannot reach. The same list can live in `~/.cerulion/config.toml` under `peers`. Prefer `--connect tcp/<host>:7683` for a one-off. |
