@@ -72,14 +72,14 @@ DASH_OK_MARKER = "dash-ok"
 
 # THE COMMENT SYNTAX THE WAIVER HAS TO SIT IN, by file extension.
 #
-# The marker is a decision its author RECORDED, so it belongs in a comment. As a
-# bare substring of the line it also fired from a string literal, a data column
-# or a heading, which is shipped text rather than a decision: a `.tsv` row or a
-# Rust string carrying the words `dash-ok` waived a dash nobody had ruled on.
+# The marker is a note to the reader, so it belongs in a comment. As a bare
+# substring of the line it would also match a string literal, a data column or
+# a heading, which are shipped text: a `.tsv` row or a Rust string carrying the
+# words `dash-ok` would waive a dash no comment marks.
 #
 # An extension this table does not name has NO waiver: a `.json` line that needs
-# a dash has nowhere to put a comment, and accepting the token anywhere is the
-# rule this replaces. A path with NO extension is read as shell, which is what
+# a dash has nowhere to put a comment, and a token accepted anywhere is no
+# waiver rule at all. A path with NO extension is read as shell, which is what
 # the extensionless hooks under `tools/hooks` are.
 #
 # The reader does not tokenise strings, so an opener spelled EARLIER in a string
