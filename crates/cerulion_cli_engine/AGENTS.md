@@ -39,6 +39,11 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - `orphan_port_tags::reclaim_orphan_port_tags` removes only `.port_tag` files of a provably-dead
   node from a directory re-listed then, holding nothing else; extend its
   refusals, never its acceptance (`docs/internals/cli.md` §10; pin `clean_orphan_port_tag_test`).
+- `TopicScope::Local` must suppress remote schema fallback as well as demand
+  and discovery. Shared-memory mirrors remain REMOTE in listings; local
+  observers refuse them. Topic listing also honors the shared fail-closed
+  environment kill-switch before any discovery ladder or session starts.
+
 ## Workspace dependency contract
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
 pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.

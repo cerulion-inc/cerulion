@@ -23,6 +23,11 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 - Create verbs (`node|graph|schema create`) deliberately complete nothing - the existing
   name set is exactly what a create verb rejects.
 
+- Local scope: `--local` is additive on graph/node run and topic observers;
+  topic list shares one clap boolean with the visible `--no-network` alias.
+  Keep the legacy flags and account sign-in gate. Pass observer scope to the
+  engine; never implement it by mutating process environment.
+
 ## Testing
 
 - Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.

@@ -288,6 +288,32 @@ enum TopicSource {
     },
 }
 
+/// The requested scope for topic inspection. The environment kill-switch is
+/// honored in both scopes; `Local` additionally suppresses every remote tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicScope {
+    /// Read local producers first, then discover and demand remote topics.
+    Automatic,
+    /// Read genuine local shared-memory producers only, without remote queries.
+    Local,
+}
+
+impl TopicScope {
+    /// Convert the CLI's additive `--local` switch to an explicit engine scope.
+    pub fn from_local(local: bool) -> Self {
+        if local {
+            Self::Local
+        } else {
+            Self::Automatic
+        }
+    }
+
+    fn local_only(self) -> bool {
+        let environment_suppressed = crate::graph_cmd::remote_network_suppressed();
+        self == Self::Local || environment_suppressed
+    }
+}
+
 /// Make `topic` observable and
 /// return the transport, an OPEN subscriber on it, its [`TopicSource`], and — for a
 /// remotely-observed topic — a [`DemandGuard`] holding the netd demand.
@@ -312,8 +338,8 @@ enum TopicSource {
 /// can outlive its writer (e.g. a netd mirror mid-teardown). A topic LISTED locally
 /// whose `create_subscriber_open_only` fails `DoesNotExist` (the mirror's publisher
 /// is gone) is a STALE mirror — do NOT surface its misleading "verify your graph
-/// YAML" LOCAL error; FALL THROUGH to the netd demand rung. Only the
-/// `CERULION_NETWORK=off` kill-switch skips the remote rung (local-only). The demand
+/// YAML" LOCAL error; FALL THROUGH to the netd demand rung.
+/// `--local` or the `CERULION_NETWORK=off` kill-switch skips the remote rung. The demand
 /// is held by the returned [`DemandGuard`]: process exit — including a clean Ctrl-C
 /// — closes its UDS connection → netd releases the demand (the crash-safe
 /// refcount). A topic found NOWHERE errors precisely, naming that both local AND
@@ -326,6 +352,7 @@ fn ensure_topic_available(
     // and installing that handler is what removes the default terminate disposition);
     // `topic info` installs none and passes `None`.
     running: Option<&std::sync::atomic::AtomicBool>,
+    scope: TopicScope,
 ) -> CliResult<(
     Arc<cerulion_core::TransportManager>,
     cerulion_core::CerulionSubscriber,
@@ -339,7 +366,7 @@ fn ensure_topic_available(
     // streaming — is DEMANDED from netd, which re-injects the shared frame into the
     // desk's SHM ONCE where this observer reads it via a normal subscriber (the
     // rule: one data source = one topic, obtained over the network once).
-    let killed = crate::graph_cmd::remote_network_suppressed();
+    let killed = scope.local_only();
     let transport = cerulion_core::TransportManager::get_or_init()?;
 
     // Classify: a topic LISTED locally that is NOT a netd mirror is a
@@ -386,7 +413,7 @@ fn ensure_topic_available(
     // of the misleading "not found locally"; otherwise it was NOT searched on any
     // robot — say that.
     if killed {
-        return Err(CliError::Validation(kill_switch_unavailable_message(
+        return Err(CliError::Validation(scope_unavailable_message(
             topic,
             if listed_local {
                 mirror_robot.as_deref()
@@ -397,6 +424,7 @@ fn ensure_topic_available(
             // kill-switch: `topic info foo/bar` under CERULION_NETWORK=off must
             // still say "did you mean '/foo/bar'?" when that topic is right here.
             has_canonical_slash_twin(topic),
+            scope,
         )));
     }
 
@@ -838,33 +866,36 @@ pub fn schema_discovery_not_converged_message(requested: &str) -> String {
     )
 }
 
-/// The PURE `CERULION_NETWORK=off` unavailable
-/// message. `mirror_robot = Some(robot)` means `topic` IS listed locally as a netd
-/// MIRROR of `robot`'s topic — the kill-switch forbids DEMANDING it (participating
-/// in netd's shared refcount), so say so PLAINLY and name BOTH remedies (unset the
-/// kill-switch here, or read it on the source robot) — NEVER the misleading "not
-/// found locally". `None` = the topic is genuinely absent locally (no mirror), so it
-/// was never searched on any robot under the kill-switch. Robot terminal-escape-
-/// sanitized. Oracle-tested.
-fn kill_switch_unavailable_message(
+/// Explain why local scope cannot observe an absent topic or demand a mirror.
+/// Mirror provenance stays accurate and robot names are terminal-sanitized.
+fn scope_unavailable_message(
     topic: &str,
     mirror_robot: Option<&str>,
     has_slashed_twin: bool,
+    scope: TopicScope,
 ) -> String {
+    let (selection, remedy, short_remedy) = match scope {
+        TopicScope::Local => (
+            "--local",
+            "remove --local and unset CERULION_NETWORK",
+            "remove --local and unset CERULION_NETWORK",
+        ),
+        TopicScope::Automatic => ("CERULION_NETWORK=off", "unset CERULION_NETWORK", "unset it"),
+    };
     match mirror_robot {
         Some(robot) => {
             let robot = sanitize_display(robot);
             format!(
                 "topic '{topic}' exists locally as a network mirror of robot '{robot}'s topic, but \
-                 CERULION_NETWORK=off forbids demanding it from cerulion-netd — unset \
-                 CERULION_NETWORK to observe it here, or read it directly on robot '{robot}'"
+                 {selection} forbids demanding it from cerulion-netd; {remedy} \
+                 to observe it here, or read it directly on robot '{robot}'"
             )
         }
         None => {
             let hint = canonical_slash_hint(topic, has_slashed_twin);
             format!(
                 "topic '{topic}' not found locally{hint}, and remote discovery is disabled by \
-                 CERULION_NETWORK=off — unset it to search robots on the LAN (a matching \
+                 {selection}; {short_remedy} to search robots on the LAN (a matching \
                  remote topic is then demanded automatically via cerulion-netd)"
             )
         }
@@ -930,8 +961,8 @@ impl RemoteTopicsOptions {
 /// default is unit-pinnable here (`cerulion_cli` has no lib target): a
 /// regression flipping scouting off would silently disable zero-flag discovery.
 ///
-/// - `no_network == true` (`--no-network`) ⇒ `None`: skip the remote query
-///   entirely (scripts / CI / offline).
+/// - `no_network == true` (`--local` or `--no-network`), or the environment
+///   kill-switch, yields `None`: skip the remote query entirely.
 /// - otherwise ⇒ `Some` with multicast + gossip SCOUTING ON (unpaired robots
 ///   on the LAN are discoverable with zero flags) and any `--connect` /
 ///   `--listen` locators carried ADDITIVELY (they extend the scouting
@@ -941,7 +972,7 @@ pub fn remote_discovery_options(
     connect: Vec<String>,
     listen: Vec<String>,
 ) -> Option<RemoteTopicsOptions> {
-    if no_network {
+    if TopicScope::from_local(no_network).local_only() {
         return None;
     }
     Some(RemoteTopicsOptions {
@@ -3853,12 +3884,28 @@ fn write_custom_decode(
 /// recognition is by `WireHeader::schema_hash` — the
 /// layout-sensitive hash baked in by the message codegen, so it survives
 /// recompiles and round-trips through the wire format unchanged.
-// Logging-rule exception, per the comment at the site: the silence notice is CLI output
-// on STDERR (stdout carries the frame stream), and it must appear whatever
-// RUST_LOG says — a silent `topic echo` with no explanation is the exact
-// failure it reports.
-#[allow(clippy::print_stderr)]
 pub fn topic_echo(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    truncate_length: usize,
+) -> CliResult<()> {
+    topic_echo_with_scope(
+        topic,
+        schemas_dir,
+        running,
+        writer,
+        truncate_length,
+        TopicScope::Automatic,
+    )
+}
+
+/// Echo messages with explicit local or automatic topic scope.
+// The silence notice is CLI output on stderr; stdout carries the frame stream.
+// It must appear independently of the configured tracing filter.
+#[allow(clippy::print_stderr)]
+pub fn topic_echo_with_scope(
     topic: &str,
     schemas_dir: Option<&std::path::Path>,
     running: Arc<AtomicBool>,
@@ -3872,6 +3919,7 @@ pub fn topic_echo(
     // deliberately keeps its one-line `data=N bytes` summary (it never dumps
     // pixel bytes), so the bound does NOT reach it.
     truncate_length: usize,
+    scope: TopicScope,
 ) -> CliResult<()> {
     // The observer transport is LOCAL-ONLY — a genuine local topic
     // reads directly; a REMOTE topic (or a netd mirror) is demanded from the shared
@@ -3890,7 +3938,7 @@ pub fn topic_echo(
     // resolve exits QUIETLY (exit 0, the repo's clean-cancel precedent) rather than
     // rendering a verdict about a topic we stopped looking for.
     let (_transport, subscriber, source, _netd) =
-        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref())) {
+        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref()), scope) {
             Ok(v) => v,
             Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
             Err(e) => return Err(e),
@@ -3946,6 +3994,7 @@ pub fn topic_echo(
 
     let remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
         TopicSource::Remote { robot, walker } => Some((robot, walker)),
+        TopicSource::Local if scope == TopicScope::Local => None,
         TopicSource::Local => resolve_remote_walker_for_topic(topic),
     };
     // The remote-fallback breadcrumb is emitted
@@ -4221,6 +4270,17 @@ pub fn topic_hz(
     running: Arc<AtomicBool>,
     writer: &mut dyn Write,
 ) -> CliResult<()> {
+    topic_hz_with_scope(topic, schemas_dir, running, writer, TopicScope::Automatic)
+}
+
+/// Measure publish rate with explicit local or automatic topic scope.
+pub fn topic_hz_with_scope(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    scope: TopicScope,
+) -> CliResult<()> {
     // Remote-aware — a topic absent locally is DEMANDED from the shared
     // cerulion-netd daemon (netd owns the mirror). The seeded walker in `source` is
     // unused here — `hz` only times arrivals — but the silence report reads its ORIGIN so a
@@ -4233,7 +4293,7 @@ pub fn topic_hz(
     // See `topic_echo` — the wait must be interruptible here too, and an
     // interrupted resolve exits quietly rather than rendering a verdict.
     let (_transport, subscriber, source, _netd) =
-        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref())) {
+        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref()), scope) {
             Ok(v) => v,
             Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
             Err(e) => return Err(e),
@@ -4394,6 +4454,15 @@ pub fn topic_hz(
 /// The remote fetch is LAZY — attempted only when the desk cannot name the
 /// type locally — so a known-type `topic info` stays network-free and instant.
 pub fn topic_info(topic: &str, schemas_dir: Option<&std::path::Path>) -> CliResult<String> {
+    topic_info_with_scope(topic, schemas_dir, TopicScope::Automatic)
+}
+
+/// Get topic metadata with explicit local or automatic topic scope.
+pub fn topic_info_with_scope(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    scope: TopicScope,
+) -> CliResult<String> {
     // Remote-aware — a topic absent locally is DEMANDED from the shared
     // cerulion-netd daemon (netd owns the mirror), so `info` can report a live remote
     // topic AND name its type (item 2) via the walker seeded during the resolve.
@@ -4404,7 +4473,8 @@ pub fn topic_info(topic: &str, schemas_dir: Option<&std::path::Path>) -> CliResu
     // signalled (connection close). `_transport` is the LOCAL read transport.
     // `topic info` installs no signal handler, so it still dies on the
     // default SIGINT disposition and has no flag to thread.
-    let (_transport, subscriber, source, _netd) = ensure_topic_available(topic, schemas_dir, None)?;
+    let (_transport, subscriber, source, _netd) =
+        ensure_topic_available(topic, schemas_dir, None, scope)?;
 
     let local_walker = local_walker_from_workspace(schemas_dir);
 
@@ -4435,7 +4505,9 @@ pub fn topic_info(topic: &str, schemas_dir: Option<&std::path::Path>) -> CliResu
             resolve_schema_line(schema_hash, &local_walker, Some(&remote))
         }
         TopicSource::Local => {
-            if local_walker.schema_name_for_hash(schema_hash).is_some() {
+            if scope == TopicScope::Local
+                || local_walker.schema_name_for_hash(schema_hash).is_some()
+            {
                 resolve_schema_line(schema_hash, &local_walker, None)
             } else {
                 let remote_walker = resolve_remote_walker_for_topic(topic);
@@ -4452,6 +4524,23 @@ pub fn topic_info(topic: &str, schemas_dir: Option<&std::path::Path>) -> CliResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PURE `CERULION_NETWORK=off` unavailable
+    /// message. `mirror_robot = Some(robot)` means `topic` IS listed locally as a netd
+    /// MIRROR of `robot`'s topic; the kill-switch forbids DEMANDING it (participating
+    /// in netd's shared refcount), so say so PLAINLY and name BOTH remedies (unset the
+    /// kill-switch here, or read it on the source robot), never the misleading "not
+    /// found locally". `None` = the topic is genuinely absent locally (no mirror), so it
+    /// was never searched on any robot under the kill-switch. Robot terminal-escape-
+    /// sanitized. Oracle-tested.
+    fn kill_switch_unavailable_message(
+        topic: &str,
+        mirror_robot: Option<&str>,
+        has_slashed_twin: bool,
+    ) -> String {
+        scope_unavailable_message(topic, mirror_robot, has_slashed_twin, TopicScope::Automatic)
+    }
+
     // `DiscoveredPeer` rides in via `super::*` (the parent's private
     // import), but the `DiscoveryRung` variants used by the robots-section
     // oracles are named explicitly.
@@ -4657,11 +4746,11 @@ mod tests {
         // satisfied by prose. The ALLOW marker scan further down
         // deliberately uses RAW lines — the marker IS a comment by construction.
         let src = code_only(TOPIC_CMD_SRC);
-        let echo = fn_body(&src, "pub fn topic_echo(").to_string();
-        let hz = fn_body(&src, "pub fn topic_hz(").to_string();
-        let info = fn_body(&src, "pub fn topic_info(").to_string();
-        let raw_echo = fn_body(TOPIC_CMD_SRC, "pub fn topic_echo(");
-        let raw_hz = fn_body(TOPIC_CMD_SRC, "pub fn topic_hz(");
+        let echo = fn_body(&src, "pub fn topic_echo_with_scope(").to_string();
+        let hz = fn_body(&src, "pub fn topic_hz_with_scope(").to_string();
+        let info = fn_body(&src, "pub fn topic_info_with_scope(").to_string();
+        let raw_echo = fn_body(TOPIC_CMD_SRC, "pub fn topic_echo_with_scope(");
+        let raw_hz = fn_body(TOPIC_CMD_SRC, "pub fn topic_hz_with_scope(");
 
         // Extractor sanity: real, non-trivial bodies (a broken extractor
         // returning "{}" must not vacuously pass the negative assertions).
@@ -4839,8 +4928,8 @@ mod tests {
         // justifying the marker, so a raw-source walk could satisfy the
         // anti-vacuity assert from prose alone.
         let src = code_only(TOPIC_CMD_SRC);
-        let echo = fn_body(&src, "pub fn topic_echo(").to_string();
-        let hz = fn_body(&src, "pub fn topic_hz(").to_string();
+        let echo = fn_body(&src, "pub fn topic_echo_with_scope(").to_string();
+        let hz = fn_body(&src, "pub fn topic_hz_with_scope(").to_string();
 
         for (name, body) in [("topic_echo", echo), ("topic_hz", hz)] {
             // Anti-vacuity: the floor exists at all.
