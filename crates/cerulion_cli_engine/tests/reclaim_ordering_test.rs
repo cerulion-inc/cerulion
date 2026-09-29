@@ -18,7 +18,7 @@
 //! iceoryx2 0.10 changed what that failure LOOKS like, and not for the better.
 //! Up to 0.9.1 the unresolvable name propagated: `try_cleanup_dead_nodes` could
 //! never reap that node again, on this run or any future one, and the permanent
-//! node directory was the visible symptom — which is what
+//! node directory was the visible symptom, which is what
 //! `cerulion_cli/tests/trace_inspect_and_clean_cli_test.rs::
 //! clean_sweeps_its_own_registry_and_leaves_another_root_untouched` asserts
 //! against when it requires a second `clean` over the node it just swept to
@@ -65,22 +65,16 @@ const ENV_ROLE: &str = "PROBE_ROLE";
 const ENV_CONFIG: &str = "PROBE_CONFIG";
 const ENV_READY: &str = "PROBE_READY";
 
-/// The real POSIX object name a state file records, trimmed at its NUL.
+/// The real POSIX object name a state file records.
 ///
-/// The first 33 bytes are the NUL-padded name `generate_real_shm_name` minted
-/// (`<pid>_<sec>_<usec>_<counter>`); 0.10 writes four mode bytes after them,
-/// which are not part of the name.
+/// The SHIPPED parser, never a second copy of the rule: it refuses an empty
+/// file, anything that is not the four numeric segments `generate_real_shm_name`
+/// mints, and a pid that does not parse. A hand-rolled trim at the first NUL
+/// would hand `shm_unlink` whatever bytes the file happened to carry, which is
+/// the one thing the reclaimer's own validation exists to prevent.
 fn real_object_name(content: &[u8]) -> Option<std::ffi::CString> {
-    let name: Vec<u8> = content
-        .iter()
-        .copied()
-        .take(33)
-        .take_while(|b| *b != 0)
-        .collect();
-    if name.is_empty() {
-        return None;
-    }
-    std::ffi::CString::new(name).ok()
+    let parsed = shm_state::parse_real_shm_name(content).ok()?;
+    std::ffi::CString::new(parsed.name).ok()
 }
 
 /// Does the kernel still hold this object?
@@ -89,7 +83,7 @@ fn real_object_name(content: &[u8]) -> Option<std::ffi::CString> {
 /// through the state file, which is the very thing this leg removed. Asking the
 /// kernel for the REAL name is the only question left that has an answer.
 fn shm_object_exists(name: &std::ffi::CStr) -> bool {
-    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY) };
+    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
     if fd < 0 {
         return false;
     }
@@ -349,6 +343,22 @@ fn state_files_removed_before_the_reap_orphan_the_segments_silently() {
         let _ = std::fs::remove_dir_all(root.join(entry));
     }
 
+    // EVERY cleanup first, then every assertion. These orphans are reachable only
+    // through names that live nowhere but this function's stack, so an assertion
+    // that fired before this loop would leave them for the life of the machine on
+    // exactly the run that found a problem.
+    let mut present_before_unlink = 0usize;
+    let mut present_after_unlink = 0usize;
+    for name in &real_names {
+        if shm_object_exists(name) {
+            present_before_unlink += 1;
+        }
+        unsafe { libc::shm_unlink(name.as_ptr()) };
+        if shm_object_exists(name) {
+            present_after_unlink += 1;
+        }
+    }
+
     // THE 0.10 SHAPE, in two halves. The registry comes clean...
     assert_eq!(
         stranded, 0,
@@ -362,32 +372,21 @@ fn state_files_removed_before_the_reap_orphan_the_segments_silently() {
     // gate exists to avoid. Removing the file does NOT unlink the object: the
     // shipped reclaimer unlinks the OBJECT FIRST and only then the file, and this
     // leg models the wrong order on purpose to price it.
-    assert!(
-        !real_names.is_empty(),
-        "precondition: at least one state file must have yielded a real object name, \
-         or the leak half of this oracle is vacuous"
+    // Not `is_empty`: a file that failed to parse would silently shrink the set
+    // and the leak assertion would still read "all of them". Every file the
+    // shipped classifier called ProvenDead parsed its name to get there, so the
+    // two counts must agree.
+    assert_eq!(
+        real_names.len(),
+        proven_dead,
+        "precondition: every state file proved dead must also yield its real object \
+         name, or the leak half of this oracle measures a shrunken set"
     );
-    // Probe and unlink in ONE pass, before anything can panic. These orphans are
-    // reachable only through names that live nowhere but this function's stack, so
-    // an assertion that fired first would leave them for the life of the machine
-    // on exactly the run that found a problem.
-    let mut present_before_unlink = 0usize;
-    let mut present_after_unlink = 0usize;
-    for name in &real_names {
-        if shm_object_exists(name) {
-            present_before_unlink += 1;
-        }
-        unsafe { libc::shm_unlink(name.as_ptr()) };
-        if shm_object_exists(name) {
-            present_after_unlink += 1;
-        }
-    }
-
     assert_eq!(
         present_before_unlink,
         real_names.len(),
         "every segment whose mapping this leg removed must still be in the kernel, \
-         unreachable under any name a later sweep could form — that silent orphan is \
+         unreachable under any name a later sweep could form. That silent orphan is \
          what the gate prevents, and it is strictly worse than 0.9.1's strand because \
          no sweep reports it"
     );

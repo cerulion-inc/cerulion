@@ -39711,8 +39711,8 @@ mod supervisor_tests {
         );
         assert!(
             !obs.ranks[0].step_latch.is_failing(),
-            "and no rank regime may be opened either — an `on_success` later would \
-             claim a recovery that never happened"
+            "and no rank regime may be opened either, since an `on_success` later \
+             would claim a recovery that never happened"
         );
     }
 

@@ -153,22 +153,26 @@ fn wait_until_live(stdout: &Path, stderr: &Path) {
     );
 }
 
-/// Hand the supervisor a log level iceoryx2's own refusals can reach.
+/// Both halves of the path an iceoryx2 refusal has to travel.
 ///
-/// iceoryx2 reports every refusal through `fail!`, which logs at DEBUG, and the
-/// CLI quiets its logger to `error` unless the caller says otherwise, so a
-/// service that cannot be created reaches the log as our own wrapper's sentence
-/// with the platform's reason and its errno stripped out. This hands the level
-/// down so those lines survive.
+/// The level decides what iceoryx2 EMITS: it reports refusals through `fail!`
+/// at DEBUG and the CLI quiets its own logger to `error` unless told otherwise.
+/// The directive decides what SURVIVES: the bridge forwards every iceoryx2 line
+/// to `tracing` under the `iceoryx2` target, so a filter that names no
+/// `iceoryx2` directive drops them before any log sees them. `main.rs` says the
+/// same thing for `cerulion clean` in `RAW_IOX2_LINES_HINT`, naming
+/// `IOX2_LOG_LEVEL` alone as INERT for that verb.
 ///
-/// It is not by itself a guarantee that EVERY refusal shows up. MEASURED on a
-/// desk reproduction: with the level handed down, the planning namespace's
-/// iceoryx2 lines appear (13 of them, `Unable to update permission rw-------`
-/// with `errno EINVAL`) and a failing DATA-plane service creation still prints
-/// none, so the level reaches some call sites and not that one. The level is
-/// kept per linked copy of `iceoryx2-log`, which is the first thing to check
-/// when a reason is still missing.
-const IOX2_REASONS: (&str, &str) = ("IOX2_LOG_LEVEL", "debug");
+/// MEASURED: with the level alone, the macOS shard log at 072c96a7 carried
+/// three `PublishSubscribeCreateError(InternalFailure)` refusals and zero
+/// iceoryx2 lines.
+const IOX2_LEVEL: (&str, &str) = ("IOX2_LOG_LEVEL", "debug");
+
+/// The `tracing` directive that lets the bridged lines through. `info` is the
+/// default a runtime verb already runs at (`log_verb_class` in `main.rs`, where
+/// one-shot verbs take `warn` and long-running ones keep `info`), so only the
+/// iceoryx2 target moves.
+const IOX2_FILTER: (&str, &str) = ("RUST_LOG", "info,iceoryx2=debug");
 
 /// The credit-word NAMESPACE this run created its words in, read from the
 /// supervisor's OWN log rather than recomputed here.
@@ -1247,9 +1251,9 @@ fn c7_a_real_consumer_death_strands_its_producer_loudly() {
             (
                 "RUST_LOG",
                 "cerulion=info,cerulion_cli_engine=info,cerulion_cli_engine::graph_cmd=debug,\
-                 cerulion_bagd=info",
+                 cerulion_bagd=info,iceoryx2=debug",
             ),
-            IOX2_REASONS,
+            IOX2_LEVEL,
         ],
     );
     let _bagd_guard = BagdGuard::arm();
@@ -1468,7 +1472,11 @@ fn c7_the_free_run_death_line_names_its_dead_groups() {
     let (mut guard, stdout_path, stderr_path) = spawn_mp_record_with_env(
         tmp.path(),
         &["--peer-loss", "continue"],
-        &[("CERULION_EXECUTION_MODE", "free_run"), IOX2_REASONS],
+        &[
+            ("CERULION_EXECUTION_MODE", "free_run"),
+            IOX2_LEVEL,
+            IOX2_FILTER,
+        ],
     );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
@@ -1563,8 +1571,11 @@ fn c7_the_free_run_death_line_names_its_dead_groups() {
 fn c7_a_producer_that_dies_after_being_named_gets_retracted() {
     let tmp = tempfile::tempdir().unwrap();
     build_creditable_split_workspace(tmp.path(), "cdretr");
-    let (mut guard, stdout_path, stderr_path) =
-        spawn_mp_record_with_env(tmp.path(), &["--peer-loss", "continue"], &[IOX2_REASONS]);
+    let (mut guard, stdout_path, stderr_path) = spawn_mp_record_with_env(
+        tmp.path(),
+        &["--peer-loss", "continue"],
+        &[IOX2_LEVEL, IOX2_FILTER],
+    );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
 

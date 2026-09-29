@@ -416,7 +416,9 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   entry off, while the segments stay in the kernel under a name nothing can reconstruct
   (0.9.1 propagated the failure and left the entry behind, which was at least visible).
   The reclaimer's order, object unlinked first and the file second, is what keeps that
-  from happening (`reclaim_ordering_test`).
+  from happening (`reclaim_ordering_test`). 0.10 also asks macOS to set permissions on a
+  shared-memory object, which it refuses with EINVAL (`Unable to update permission
+  rw-------`); the line is noise rather than a failure, since creation carries on past it.
 - `AllocationStrategy::Static` pools are LAZY demand-paged tmpfs: resident RAM = pages
   written, not pool size; oversizing is latency-free; oversize generously. NOT free on
   Windows (eager commit) or under `mlockall` / `RLIMIT_AS`. Shmem-THP inflates residency
