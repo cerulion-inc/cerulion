@@ -4,7 +4,7 @@
 //! launch story on an UNPARTITIONED 3-node chain (`ticker`(Period 50ms) →
 //! `relay`(data-trigger) → `sink`(data-trigger)):
 //!
-//! 1. **The ephemeral default, live** — `cerulion graph run apdemo --record=DIR`
+//! 1. **The ephemeral default, live**: `cerulion graph run apdemo --record=DIR`
 //!    with stdin explicitly `/dev/null`: the run derives the
 //!    process-per-node partition in memory, the lifecycle notice says the
 //!    graph file is unchanged, the graph file stays
@@ -1441,7 +1441,7 @@ fn a_block_graph_runs_on_the_no_tty_default_and_co_locates_the_edge() {
     let bag =
         wait_for_bag(&recordings, Duration::from_secs(90), &_bagd_guard).unwrap_or_else(|| {
             panic!(
-                "bagd never created the bag — the defect shape is a `block` consumer's \
+                "bagd never created the bag: the defect shape is a `block` consumer's \
              worker dying at graph build, which is exactly what this arm exists to \
              catch\nstdout:\n{}\nstderr:\n{}",
                 read_file(&stdout_path),
