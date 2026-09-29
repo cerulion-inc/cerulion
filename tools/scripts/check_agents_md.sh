@@ -360,22 +360,28 @@ self_test() {
             "$st_assembled" >&2
         st_fail=1
     fi
+    # The fixture directory holds lines in the shapes this gate refuses,
+    # private-dirty.md included, so its removal is armed BEFORE the directory
+    # exists: an interrupt in the window between creating it and arming would
+    # otherwise leave it behind. The empty default is what lets the handler run
+    # while the name is still unset, without `set -u` aborting inside it.
+    st_dir=
+    trap 'if [ -n "${st_dir:-}" ]; then rm -rf "$st_dir"; fi' EXIT   # removes the fixture directory and every file in it
+    # A signal has to END the run, which is why these exit rather than clean up
+    # in place. A handler that only removed the directory would return to the
+    # arm after the interrupted command, and those arms would then read a
+    # fixture that is gone. That is loud but wrong, which is the point: grep
+    # exits 2 on a missing file, scan_file turns that into a `scanfail` record,
+    # the arms report it as patterns matching nothing, and the run FAILS on a
+    # pile of messages that diagnose the signal instead of the tree. Exiting
+    # hands the EXIT trap above the one removal, and stops the arms before any
+    # of them can report a finding that is not in the tree.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     st_dir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-agents-selftest.XXXXXX") || {
         printf 'self-test FAIL: could not create a fixture directory\n' >&2
         return 1
     }
-    # The fixture directory holds lines in the shapes this gate refuses,
-    # private-dirty.md included, so it is removed on any exit and not only on
-    # the straight-line path at the end: an interrupt, or any early exit from
-    # an arm below, would otherwise leave it behind.
-    trap 'rm -rf "$st_dir"' EXIT   # removes the fixture directory and every file in it
-    # A signal has to END the run, which is why these exit rather than clean up
-    # in place. A handler that only removed the directory would return to the
-    # arm after the interrupted command, and every arm below would then read a
-    # fixture that is gone, find nothing, and pass: a deleted fixture reads
-    # exactly like a clean one. Exiting hands the EXIT trap above the removal.
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
 
     # THE DIRTY FIXTURE, and how it is built is the point.
     #
