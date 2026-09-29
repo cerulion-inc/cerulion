@@ -2077,12 +2077,17 @@ def self_test(out=sys.stdout):
         and TRAILING_SUFFIX_RE.match(" ab initio") is None)
     # The shell header carries a THIRD copy of the family, in prose a contributor
     # reads. A comment cannot derive from the constant, so it is pinned instead.
+    _sh_family = ""
     try:
         _sh = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_public_surface.sh"),
                    encoding="utf-8").read()
-        _sh_family = _sh.split("THE SUFFIX FAMILY is", 1)[1].split("That one", 1)[0]
-        _sh_family = " ".join(_sh_family.replace("#", " ").split())
-    except (OSError, IndexError):
+        # BOTH delimiters are required: `split` on a missing one returns the
+        # whole string, which would widen the window to the end of the header
+        # and let a form named anywhere else in it stand in for the list.
+        if "THE SUFFIX FAMILY is" in _sh and "; the same list" in _sh.split("THE SUFFIX FAMILY is", 1)[1]:
+            _sh_family = _sh.split("THE SUFFIX FAMILY is", 1)[1].split("; the same list", 1)[0]
+            _sh_family = " ".join(_sh_family.replace("#", " ").split())
+    except OSError:
         _sh_family = ""
     # A run that continues past the suffix is another word, whatever script it
     # is in: truncating it would report an identifier as a misspelled name.
@@ -2091,8 +2096,13 @@ def self_test(out=sys.stdout):
             for t in ("Inc1", "Inc_", "Inc\u00e9", "Incidentally", "Incs"))
         and legal_name_mentions("Acme Inc.").search("Acme Inc.") is not None
         and legal_name_mentions("Acme Inc.").search("Acme Incorporated") is not None)
+    # The trailing guard excludes a PERIOD as well as a letter: without that,
+    # `Inc` is satisfied by the `Inc.` the list also carries, so dropping the
+    # bare form from the header went unnoticed.
     arm("the-header-names-the-family-the-pattern-holds",
-        all(re.search(r"(?<![A-Za-z.])" + re.escape(w) + r"(?![A-Za-z])", _sh_family) for w in LEGAL_SUFFIX_WORDS),
+        bool(_sh_family)
+        and all(re.search(r"(?<![A-Za-z.])" + re.escape(w) + r"(?![A-Za-z.])", _sh_family)
+                for w in LEGAL_SUFFIX_WORDS),
         repr(_sh_family))
     arm("the-suffix-family-is-the-list-it-is-meant-to-be",
         LEGAL_SUFFIX_WORDS == ("Inc", "Inc.", "Incorporated", "Corp", "Corp.", "Corporation", "Co.",

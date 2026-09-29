@@ -106,11 +106,11 @@
 #                             noise.
 #                             THE SUFFIX FAMILY is Inc, Inc., Incorporated,
 #                             Corp, Corp., Corporation, Co., LLC, LLP, Ltd,
-#                             Ltd., Limited, PLC, GmbH, AG, S.A., B.V., AB, Oy,
-#                             A/S. That one list also decides which characters
-#                             a declared name may hold, so a suffix the rule
-#                             accepts can never be one a declaration may not
-#                             spell. It is matched LONGEST FIRST, so a page
+#                             Ltd., Limited, PLC, GmbH, AG, S.A., B.V., AB, Oy
+#                             and A/S; the same list also decides which
+#                             characters a declared name may hold, so a suffix
+#                             the rule accepts can never be one a declaration
+#                             may not spell. It is matched LONGEST FIRST, so a page
 #                             writing the period gets the form with it. `Co.`
 #                             keeps its period, because a bare `Co` would match
 #                             the first half of a hyphenated word, and a bare
@@ -136,10 +136,12 @@
 #                             `ab` is an English or a Latin word.
 #                             A word in front of the name is not part of a
 #                             mention, because the scan starts at the name. A
-#                             third-party holder is a candidate only where its
-#                             own name IS the declared name followed by a
-#                             suffix; a holder carrying a word the declared name
-#                             does not have is not a mention of it.
+#                             third-party holder is a candidate only where it
+#                             begins with the declared name's FIRST word and
+#                             adds no word the declared name does not have: a
+#                             holder that DROPS a word is judged, one that adds
+#                             one is not a mention at all. The allow list
+#                             carries the case when it happens.
 #                             ZERO mentions is a finding, not a clean run: a
 #                             declaration the scan never matches reads the same
 #                             green as a tree where every mention is right. The
