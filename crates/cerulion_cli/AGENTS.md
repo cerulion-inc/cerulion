@@ -23,11 +23,6 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 - Create verbs (`node|graph|schema create`) deliberately complete nothing - the existing
   name set is exactly what a create verb rejects.
 
-- Local scope: `--local` is additive on graph/node run and topic observers;
-  topic list shares one clap boolean with the visible `--no-network` alias.
-  Keep the legacy flags and account sign-in gate. Pass observer scope to the
-  engine; never implement it by mutating process environment.
-
 ## Testing
 
 - Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
@@ -59,6 +54,5 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   that ASSERT call `#[must_use]` `finish().assert_clean()`. A walk enforces constructor shape
   and flags bare reaps it can see; await GO (`deployment live`) before a kill, else ABORT path.
 
-Deep reference: docs/internals/cli.md - command contracts (replay exit codes,
-completions design rules, discovery ladder, graph run/profile/partition) and the test
-map for both crates.
+Read `docs/internals/cli.md` before changing topics/local scope, starters,
+replay, completions, or graph run/profile/partition.
