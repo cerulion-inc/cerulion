@@ -102,14 +102,18 @@ fn environment_kill_switch_also_suppresses_topic_list() {
             &["topic", "list", "--scan", "--connect", "tcp/127.0.0.1:1"],
             Some(value),
         );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{error}");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(listing, "No active local topics.\n", "{listing}");
         assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            !error.contains("remote: discovery unavailable"),
+            "the environment kill-switch must skip the query, not fail it: {error}"
         );
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("remote:"));
         if value == "typo" {
-            assert!(String::from_utf8_lossy(&output.stderr).contains("failing CLOSED"));
+            assert!(error.contains("failing CLOSED"), "{error}");
+        } else {
+            assert!(error.is_empty(), "{error}");
         }
     }
 }
