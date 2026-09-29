@@ -45,24 +45,24 @@
 //! missing):
 //! `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib -p test_node_macro_trigger_block_cdylib`
 //!
-//! Linux and macOS only: recorder cleanup requires the stable process identity
-//! and working-directory queries implemented for those targets below.
+//! Unix nonrecording and refusal tests run without a recorder. Recording tests
+//! and ownership guards require the Linux/macOS process identity and cwd queries.
 
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(unix)]
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use cerulion_bag::BagReader;
 use serial_test::serial;
 
-// The shared mp record-harness module, for the ONE helper this file needs from
-// it: the mid-run bag poll that replaced this file's fixed recording windows.
-// Imported by name (not `*`) because this file carries its own `wait_for_bag` /
-// `read_manifest` / `ChildGuard` and they must keep winning.
+// Shared fixture lookup works on Unix; bag polling is Linux/macOS only.
+// Keep this file's wait_for_bag, read_manifest and ChildGuard helpers local.
 mod mp_support;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use mp_support::{wait_for_bag_state, RECORDED_WINDOW_BOUNDARIES, RECORDED_WINDOW_TIMEOUT};
 
 /// SIGKILL + reap on drop so a panicking test never leaks the child.
@@ -76,12 +76,14 @@ impl Drop for ChildGuard {
 
 /// The recorder has its own process group. Stop only the recorder belonging
 /// to this test's supervisor if an assertion fails before normal teardown.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct BagdGuard {
     supervisor_pid: u32,
     supervisor_identity: Option<ProcessIdentity>,
     spawn_logs: Option<(PathBuf, [PathBuf; 2])>,
     observed: std::cell::RefCell<Vec<ObservedProcess>>,
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl BagdGuard {
     fn new(supervisor_pid: u32) -> Self {
         Self {
@@ -221,6 +223,7 @@ impl BagdGuard {
             .collect()
     }
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for BagdGuard {
     fn drop(&mut self) {
         let _ = self.pids();
@@ -240,11 +243,13 @@ impl Drop for BagdGuard {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct ObservedProcess {
     pid: u32,
     identity: Option<ProcessIdentity>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProcessIdentity {
     pgid: u32,
@@ -565,6 +570,7 @@ fn wait_for_log(path: &Path, needle: &str, deadline: Duration) -> bool {
 }
 
 /// Block until the recordings dir contains a `.mcap` or `timeout` elapses.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_bag(recordings: &Path, timeout: Duration, guard: &BagdGuard) -> Option<PathBuf> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -583,6 +589,7 @@ fn wait_for_bag(recordings: &Path, timeout: Duration, guard: &BagdGuard) -> Opti
 }
 
 /// A bag rank manifest's node ids (crib of `mp_record_e2e_test`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_manifest(reader: &BagReader, rank: u32) -> Option<Vec<String>> {
     let att = reader
         .attachment(&format!("__cerulion/trace_manifest_rank{rank}.json"))
@@ -604,6 +611,7 @@ fn read_manifest(reader: &BagReader, rank: u32) -> Option<Vec<String>> {
 /// assertions are made against what replay would actually reconstruct, and a
 /// bag that replay would refuse fails HERE with the reason named, rather than
 /// passing a text-only `contains` check and dying at playback.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_embedded_graph(reader: &BagReader) -> (String, cerulion_core::graph::GraphConfig) {
     let att = reader
         .attachment("graph.yaml")
@@ -633,6 +641,7 @@ fn read_embedded_graph(reader: &BagReader) -> (String, cerulion_core::graph::Gra
 /// `topics` is every channel in the bag; the recorder's OWN reserved channels
 /// (`__cerulion/…` — the scheduler trace) are filtered here rather than at each
 /// call site, since they are not graph topics and carry no prefix by design.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn assert_embed_prefix_names_the_recorded_channels(
     embedded: &cerulion_core::graph::GraphConfig,
     topics: &[String],
@@ -719,6 +728,7 @@ const GO_MARKER: &str = "GO signaled; deployment live";
 
 /// (1) The LITERAL default on a no-TTY run: in-memory mp floor + real
 /// supervisor/workers + the mp recording of the DERIVED split.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[serial]
 fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
@@ -935,6 +945,7 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
 /// It also carries the prefix divergence end-to-end: the graph file is written with
 /// NO `prefix:` line, so the embed's prefix can only have come from the run's
 /// own resolution — and every recorded channel is named under it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[serial]
 fn a_single_process_record_embeds_the_unpartitioned_graph_it_actually_ran() {
@@ -1416,6 +1427,7 @@ const BLOCK_SINK_FIXTURE: &str = "test_node_macro_trigger_block_cdylib";
 ///   `ticker` stays its own worker; and
 /// * the graph file is byte-untouched (the no-TTY floor is unchanged by this
 ///   feature).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[serial]
 fn a_block_graph_runs_on_the_no_tty_default_and_co_locates_the_edge() {
@@ -1852,18 +1864,21 @@ fn a_hand_written_split_of_a_multi_producer_block_edge_is_refused_pre_spawn() {
 
 /// Empty terminal stdin must reach real delivery without an answer. The
 /// non-terminal control exercises the same command and hand-written oracles.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[serial]
 fn tty_default_runs_two_nodes_without_a_choice_and_stops_owned_workers() {
     assert_two_node_ephemeral_run(true);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[serial]
 fn non_tty_default_runs_two_nodes_without_a_choice_and_stops_owned_workers() {
     assert_two_node_ephemeral_run(false);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn assert_two_node_ephemeral_run(terminal: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -1999,6 +2014,7 @@ fn assert_two_node_ephemeral_run(terminal: bool) {
 
 /// Keep the master open so terminal stdin stays readable but receives no
 /// answer. Descriptor ownership closes both ends on every exit path.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_terminal() -> (std::fs::File, std::fs::File) {
     use std::io::IsTerminal as _;
     use std::os::fd::FromRawFd as _;
