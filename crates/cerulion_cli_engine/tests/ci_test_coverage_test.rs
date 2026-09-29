@@ -4746,15 +4746,69 @@ fn events_a_job_skips(block: &str, triggers: &BTreeSet<String>) -> Vec<Skip> {
     }
 }
 
-/// The one field read that makes a step pull-request-only by construction.
+/// The payload read that marks work as a pull request's own.
 const PULL_REQUEST_PAYLOAD_READ: &str = "github.event.pull_request.";
+
+/// The payload reads of the other events this walk knows.
+///
+/// A step that reads one of these carries work for that event too, so it is one
+/// side of a split however its condition is spelled.
+const OTHER_PAYLOAD_READS: &[&str] = &[
+    "github.event.merge_group.",
+    "github.event.issue",
+    "github.event.comment",
+    "github.event.before",
+    "github.event.after",
+    "github.event.head_commit",
+    "github.event.inputs",
+];
+
+/// The part of a step block a payload read counts in: everything but its
+/// `name:` and its `if:`.
+///
+/// A step NAMED after a field reads nothing, and a condition that tests one is
+/// the condition this walk already read; counting either would exclude a step
+/// over text that does no work.
+fn step_payload_text(block: &[&str]) -> String {
+    let Some(first) = block.first() else {
+        return String::new();
+    };
+    let step_indent = indent_of(first);
+    let key_column = step_indent + 2;
+    let mut out: Vec<&str> = Vec::new();
+    let mut skip_under: Option<usize> = None;
+    for line in block {
+        if let Some(col) = skip_under {
+            if line.trim().is_empty() || indent_of(line) > col {
+                continue;
+            }
+            skip_under = None;
+        }
+        let trimmed = line.trim_start();
+        let key = if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed.trim_start_matches("- ")
+        } else if indent_of(line) == key_column {
+            trimmed
+        } else {
+            out.push(line);
+            continue;
+        };
+        if key.starts_with("name:") || key.starts_with("if:") {
+            skip_under = Some(key_column);
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
 
 /// What the step walk found in one job.
 #[derive(Default)]
 struct StepCoverage {
-    /// The trigger events no partition member admits.
+    /// The trigger events the steps that split the work do not admit between
+    /// them.
     uncovered: Vec<String>,
-    /// How many steps of the job are partition members.
+    /// How many steps of the job split the work by event.
     members: usize,
     /// How many steps of the job are pull-request-only by construction.
     pull_request_only: usize,
@@ -4762,32 +4816,43 @@ struct StepCoverage {
     all_pull_request_only: bool,
 }
 
-/// The trigger events no PARTITION MEMBER of this job admits.
+/// The trigger events the steps that SPLIT this job's work by event do not
+/// admit between them.
 ///
 /// A job splits its work across steps by event, and a required name reports
 /// success for the whole job however few of those steps ran, so the split
 /// reaches every event the workflow triggers on.
 ///
-/// WHAT A PARTITION MEMBER IS. A step whose `if:` this walk reads as a test on
-/// `github.event_name` admits the events that test names, and it is a member. A
-/// step with no `if:` runs on every event, and a step whose condition is no
-/// event test at all, a cache-hit or an output comparison, says nothing about
-/// events: neither is a member, so neither covers an event nor withholds one.
-/// And a step whose condition admits `pull_request` ALONE while its block reads
-/// `github.event.pull_request.` in an `env:`, a `with:` or a script is
-/// pull-request-only by construction: the field it reads is in no other event's
-/// payload, so the step is work with no counterpart on another event rather than
-/// one side of a split. A job with no member and at least one step that runs on
-/// every event owes nothing here.
+/// WHAT SPLITS THE WORK. A step whose `if:` this walk reads as a test on
+/// `github.event_name` admits the events that test names, and it is one side of
+/// the split. A step with no `if:` runs on every event, and a step whose
+/// condition is no event test at all, a cache-hit or an output comparison, says
+/// nothing about events: neither is a side, so neither covers an event nor
+/// withholds one. And a step whose condition admits `pull_request` ALONE, whose
+/// `env:`, `with:` or script reads `github.event.pull_request.`, and which
+/// reads no other event's payload, is pull-request-only by construction: every
+/// field it reads is in the pull request payload and nowhere else, so it is
+/// work with no counterpart on another event rather than one side of a split.
+/// A step reading TWO payloads carries work for both, so it is a side. An
+/// excluded step is neither a side nor a gap, and where the job has sides its
+/// events are credited to them: a job with one leg per event whose pull request
+/// leg reads the payload is still total.
 ///
-/// THE ONE SHAPE WITH NO MEMBER THAT STILL OWES. A job whose every step is
-/// pull-request-only, with no step that runs unconditioned, does nothing at all
-/// on the other events its workflow triggers on and reports success under its
-/// required name on each of them, so those events are named.
+/// A job with no side and at least one step that runs on every event owes
+/// nothing here, and neither does a job whose steps all hang on conditions this
+/// walk cannot read: no arm judges that shape.
+///
+/// THE ONE SHAPE WITH NO SIDE THAT STILL OWES. A job whose every step is
+/// pull-request-only, with nothing unconditioned and nothing unreadable beside
+/// them, does nothing at all on the other events its workflow triggers on and
+/// reports success under its required name on each of them, so those events are
+/// named.
 fn events_no_conditioned_step_admits(block: &str, triggers: &BTreeSet<String>) -> StepCoverage {
     let mut out = StepCoverage::default();
     let mut admitted: BTreeSet<String> = BTreeSet::new();
+    let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut unconditioned = 0usize;
+    let mut unreadable = 0usize;
     for step in step_blocks(block) {
         let cond = match step_if_of(&step) {
             Ok(None) => {
@@ -4795,21 +4860,31 @@ fn events_no_conditioned_step_admits(block: &str, triggers: &BTreeSet<String>) -
                 continue;
             }
             Ok(Some(cond)) => cond,
-            Err(_) => continue,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
         };
         let Ok(set) = events_a_condition_allows(&condition_expression(&cond)) else {
+            unreadable += 1;
             continue;
         };
+        let payload = step_payload_text(&step);
         let pull_request_alone = set.len() == 1 && set.contains("pull_request");
-        if pull_request_alone && step.join("\n").contains(PULL_REQUEST_PAYLOAD_READ) {
+        let reads_pull_request = payload.contains(PULL_REQUEST_PAYLOAD_READ);
+        let reads_another = OTHER_PAYLOAD_READS
+            .iter()
+            .any(|read| payload.contains(read));
+        if pull_request_alone && reads_pull_request && !reads_another {
             out.pull_request_only += 1;
+            excluded.extend(set);
             continue;
         }
         out.members += 1;
         admitted.extend(set);
     }
     if out.members == 0 {
-        if out.pull_request_only > 0 && unconditioned == 0 {
+        if out.pull_request_only > 0 && unconditioned == 0 && unreadable == 0 {
             out.all_pull_request_only = true;
             out.uncovered = triggers
                 .iter()
@@ -4819,6 +4894,7 @@ fn events_no_conditioned_step_admits(block: &str, triggers: &BTreeSet<String>) -
         }
         return out;
     }
+    admitted.extend(excluded);
     out.uncovered = triggers
         .iter()
         .filter(|event| !admitted.contains(event.as_str()))
@@ -4963,9 +5039,10 @@ fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> Re
 /// job's name and concludes it SKIPPED, branch protection reads that conclusion
 /// as satisfied, and the change merges with the context never run. One side is
 /// an `if:` the event makes false; one is a `needs:` entry that went red; one is
-/// a job that runs while every scanning step inside it is gated off the event;
-/// and one is an event the workflow triggers on at all, since the run it starts
-/// writes under the same name.
+/// a job that runs while the steps SPLITTING its work by event leave that event
+/// to none of them, a step that is pull-request-only by construction being
+/// neither a split nor a gap; and one is an event the workflow triggers on at
+/// all, since the run it starts writes under the same name.
 #[test]
 fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
     let contexts = required_contexts();
@@ -5311,8 +5388,10 @@ fn a_required_job_that_can_skip_is_named_and_one_matched_to_its_triggers_is_not(
         format!("name: synthetic\non:\n{triggers}\n\njobs:\n  j:\n    name: {required}\n{body}")
     };
     let run = "        run: true\n";
-    let pr_payload = "        env:\n          B: ${{ github.event.pull_request.base.sha }}\n                      \n        run: true\n";
-    let title_payload = "        env:\n          T: ${{ github.event.pull_request.title }}\n                         \n        run: true\n";
+    let pr_payload =
+        "        env:\n          B: ${{ github.event.pull_request.base.sha }}\n        run: true\n";
+    let title_payload =
+        "        env:\n          T: ${{ github.event.pull_request.title }}\n        run: true\n";
     let pr_mg = "github.event_name == 'pull_request' || github.event_name == 'merge_group'";
     let dispatch = "  pull_request:\n  merge_group:\n  push:\n  workflow_dispatch:";
     let pr_mg_only = "  pull_request:\n  merge_group:";
@@ -5352,7 +5431,10 @@ fn a_required_job_that_can_skip_is_named_and_one_matched_to_its_triggers_is_not(
     );
 
     // (c) THE LEAK GUARD PARTITION, which reads both payloads on its first leg.
-    let both_payloads = "        env:\n          B: ${{ github.event.pull_request.base.sha                          || github.event.merge_group.base_sha }}\n        run: true\n";
+    let both_env = "        env:\n          B: ${{ github.event.pull_request.base.sha";
+    let both_tail = " || github.event.merge_group.base_sha }}\n        run: true\n";
+    let both_owned = String::from(both_env) + both_tail;
+    let both_payloads = both_owned.as_str();
     let partition = |triggers: &str, push_cond: Option<&str>| {
         let mut entries: Vec<(Option<&str>, &str)> =
             vec![(None, run), (Some(pr_mg), both_payloads)];
@@ -5400,6 +5482,82 @@ fn a_required_job_that_can_skip_is_named_and_one_matched_to_its_triggers_is_not(
     assert!(
         got.uncovered[0].contains("`workflow_dispatch`"),
         "a dispatch run with no leg of its own scans nothing: {:?}",
+        got.uncovered
+    );
+
+    // (i) A STEP THAT READS TWO PAYLOADS carries work for both events, so the
+    // exclusion does not reach it however its condition is spelled. This is the
+    // shape the leak guard's scanning steps have.
+    let got = walk(&steps(
+        code,
+        &[
+            (None, run),
+            (Some("github.event_name == 'pull_request'"), both_payloads),
+        ],
+    ));
+    assert_eq!(
+        got.pull_request_only_steps, 0,
+        "two payloads is no exclusion"
+    );
+    assert_eq!(got.uncovered.len(), 2, "-> {:?}", got.uncovered);
+    assert!(
+        got.uncovered.iter().any(|c| c.contains("`merge_group`"))
+            && got.uncovered.iter().any(|c| c.contains("`push`")),
+        "the events its one side leaves out are named: {:?}",
+        got.uncovered
+    );
+
+    // (j) A TOTAL PARTITION, one leg per event, whose pull request leg reads the
+    // pull request payload: the excluded leg is no gap, and the event it admits
+    // is credited to the sides beside it.
+    let got = walk(&steps(
+        code,
+        &[
+            (None, run),
+            (Some("github.event_name == 'pull_request'"), pr_payload),
+            (Some("github.event_name == 'merge_group'"), run),
+            (Some("github.event_name == 'push'"), run),
+        ],
+    ));
+    assert_eq!(
+        got.pull_request_only_steps, 1,
+        "the pull request leg is excluded"
+    );
+    assert_eq!(got.step_conditioned, 1, "and the job still has sides");
+    assert!(
+        got.uncovered.is_empty(),
+        "a total partition is total: {:?}",
+        got.uncovered
+    );
+
+    // (k) A NAME OR A CONDITION that merely mentions a payload field is no read
+    // of it, so this step is a side and owes the other triggers.
+    let named_step = String::from("      - name: read github.event.pull_request.title\n")
+        + "        if: github.event_name == 'pull_request'\n"
+        + "        run: true\n";
+    let head = format!("name: synthetic\non:\n{pr_mg_only}\n\njobs:\n  j:\n    name: {required}\n");
+    let mentions = head + "    runs-on: ubuntu-latest\n    steps:\n" + &named_step;
+    let got = walk(&mentions);
+    assert_eq!(got.pull_request_only_steps, 0, "a `name:` reads nothing");
+    assert_eq!(got.uncovered.len(), 1, "-> {:?}", got.uncovered);
+    assert!(
+        got.uncovered[0].contains("`merge_group`"),
+        "the event it leaves out is named: {:?}",
+        got.uncovered
+    );
+
+    // (l) A JOB OF UNREADABLE CONDITIONS beside a pull-request-only step is
+    // judged by no arm: nothing here says when those steps run.
+    let got = walk(&steps(
+        pr_mg_only,
+        &[
+            (Some("steps.probe.outputs.hit == 'true'"), run),
+            (Some("github.event_name == 'pull_request'"), pr_payload),
+        ],
+    ));
+    assert!(
+        got.uncovered.is_empty() && got.all_pull_request_only_jobs == 0,
+        "an unreadable condition is not a step that does nothing: {:?}",
         got.uncovered
     );
 
