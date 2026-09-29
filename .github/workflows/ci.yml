@@ -3681,6 +3681,9 @@ jobs:
     # job's context never run. With it the job runs on its own terms and
     # reports its own result. `Lint` is its own required context and a red one
     # still blocks the pull request; what `needs: [lint]` buys is the ordering.
+    # The cost is the runner minutes this job spends on a change whose lint is
+    # already red, which is what a context that reports beats a context that is
+    # waved through.
     if: ${{ !cancelled() }}
     # 30, and the number follows the MACHINE rather than the job. On a 4-core
     # runner the healthy build ran 8m56s-9m18s and 15 was ample; on a 2-core one
@@ -3788,6 +3791,9 @@ jobs:
     # job's context never run. With it the job runs on its own terms and
     # reports its own result. `Lint` is its own required context and a red one
     # still blocks the pull request; what `needs: [lint]` buys is the ordering.
+    # The cost is the runner minutes this job spends on a change whose lint is
+    # already red, which is what a context that reports beats a context that is
+    # waved through.
     if: ${{ !cancelled() }}
     timeout-minutes: 25
     env:

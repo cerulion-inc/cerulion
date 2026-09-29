@@ -52,9 +52,12 @@ jobs:
     # for EVERY author (see CONVERSATION_HARD), which leaves nothing for an
     # author rule to buy.
     #
-    # The one body never read is the guard's OWN ask: its account and its marker
-    # together, so the guard cannot read itself, and so a marker pasted by
-    # anybody else is still scanned like any other text.
+    # The one body never read is a comment the default token wrote that carries
+    # the ask marker prefix anywhere in it. That is the guard's own ask, and it
+    # is equally any other comment that token writes with the prefix in it; the
+    # marker ends the body it is in, and a condition keyed on that would have to
+    # match the trailing newline, so the prefix test is what runs. A marker
+    # pasted by any other account is scanned like any other text.
     if: >-
       !(github.event.comment.user.login == 'github-actions[bot]'
       && contains(github.event.comment.body, '<!--leak-guard:'))

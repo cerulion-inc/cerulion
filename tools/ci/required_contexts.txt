@@ -1,0 +1,32 @@
+# The status contexts `main` requires. Two settings on this repository hold
+# such a list and both name these rows: the branch protection of `main` and the
+# merge queue ruleset. Regenerate with
+#
+#   gh api repos/cerulion-inc/cerulion/branches/main/protection \
+#     --jq '.required_status_checks.contexts[]' | LC_ALL=C sort
+#
+# One name per line, sorted in byte order. The workflow walk in
+# crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs reads this file and
+# holds every job that reports one of these names to the rules that stop a
+# skipped run from reading as a satisfied context. Comparing this file against
+# what the forge holds is the enqueue waiter's job, not that test's.
+Crate tests (macos-latest)
+Crate tests (ubuntu-latest)
+Demo workspace (examples/go2)
+Dependency Audit (cargo-deny)
+Documentation
+Examples (cargo check)
+Leak guard (media)
+Leak guard (messages)
+Leak guard (tree and names)
+Lint
+Test (Linux) shard 0
+Test (Linux) shard 1
+Test (Linux) shard 2
+Test (Linux) shard 3
+Test (macOS) shard 0
+Test (macOS) shard 1
+Test (macOS) shard 2
+Viz tests (viz, ubuntu-latest)
+Viz tests (vizd, ubuntu-latest)
+netd WAN (clippy + docs, --features wan)

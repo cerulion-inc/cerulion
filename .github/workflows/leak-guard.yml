@@ -29,9 +29,16 @@ name: Leak guard
 #
 # What a fork can reach: a pull request from a fork runs here with NO secret,
 # so only the generic classes gate it and the log says so loudly. On a pull
-# request from a branch of this repository, on the merge queue, on a push to
-# main and on manual dispatch the private tier is REQUIRED: a deleted secret
-# fails the run instead of quietly scanning less.
+# request from a branch of this repository, on the merge queue and on a push to
+# main the private tier is REQUIRED: a deleted secret fails the run instead of
+# quietly scanning less.
+#
+# THREE TRIGGERS, AND THE THREE JOB NAMES ARE REQUIRED CONTEXTS. Any run of this
+# workflow creates a check run under each of those names, and the newest run for
+# a name is the one branch protection reads, so an event whose scan is narrower
+# than the pull request scan would report green over less. A manual run has no
+# base and no head to scan between, so no manual trigger is here at all; the
+# whole-tree pass rides the push to main.
 #
 # `edited` is in the pull request trigger because a title or body edit does not
 # re-run the default trigger, and a re-run replays the original payload. No
@@ -45,7 +52,6 @@ on:
   merge_group:
   push:
     branches: [main]
-  workflow_dispatch:
 
 # The title and body come from the event payload, so no pull-requests scope is
 # needed; the three jobs below write nothing.
@@ -54,8 +60,7 @@ permissions:
 
 # Same three shapes as ci.yml: a pull request keys on its number and cancels
 # the superseded run; a merge queue run keys on the queue's own branch and is
-# never cancelled; a push to main and a manual run key on the run id and group
-# with nothing.
+# never cancelled; a push to main keys on the run id and groups with nothing.
 concurrency:
   group: leak-guard-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'merge_group' && github.event.merge_group.head_ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -63,14 +68,6 @@ concurrency:
 jobs:
   tree:
     name: Leak guard (tree and names)
-    # Every event this workflow triggers on, one by one. This name is a
-    # REQUIRED context and a skipped required context reads as satisfied, so
-    # the condition and the trigger list stay equal; the walk in
-    # crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs reads both and
-    # reds when they part.
-    if: >-
-      github.event_name == 'pull_request' || github.event_name == 'merge_group'
-      || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     # A whole-tree scan takes seconds on a warm file cache; the budget only
     # guards a hang.
@@ -135,10 +132,13 @@ jobs:
           python3 -B tools/scripts/leak_scan.py names --range "$BASE_SHA..$HEAD_SHA" \
             --branch-env BRANCH_NAME --allow-empty --format github ${flags[@]+"${flags[@]}"}
 
-      # A push to main and a manual run scan the WHOLE tree: this is also where
-      # a newly added private pattern meets old content.
-      - name: Scan the whole tree and every name (push, dispatch)
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      # A push to main scans the WHOLE tree: this is also where a newly added
+      # private pattern meets old content. This condition and the one on the
+      # step above partition the three triggers, and no job-level condition
+      # sits over them: a job that skipped would report success under a
+      # required name.
+      - name: Scan the whole tree and every name (push)
+        if: github.event_name == 'push'
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
         run: |
@@ -150,14 +150,6 @@ jobs:
 
   messages:
     name: Leak guard (messages)
-    # Every event this workflow triggers on, one by one. This name is a
-    # REQUIRED context and a skipped required context reads as satisfied, so
-    # the condition and the trigger list stay equal; the walk in
-    # crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs reads both and
-    # reds when they part.
-    if: >-
-      github.event_name == 'pull_request' || github.event_name == 'merge_group'
-      || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -221,15 +213,21 @@ jobs:
           case "$EVENT_NAME" in
             pull_request)
               git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
-              # The checkout on this event is refs/pull/N/merge, so HEAD^1 is
-              # the base tip the merge commit sits on and HEAD^2 is the head.
-              # Where the event's own base sha is an ancestor of that first
-              # parent, the pull request's commits are exactly HEAD^1..HEAD^2,
-              # which the checkout holds whether or not the fetch above reached
-              # either sha. Everywhere else the three-dot spelling names the
-              # same set from the merge base, the same resolution the added-line
-              # dash gate takes.
-              if git merge-base --is-ancestor "$BASE_SHA" HEAD^1 2>/dev/null; then
+              # The checkout on this event is refs/pull/N/merge: HEAD^1 is the
+              # base tip the merge commit sits on and HEAD^2 is the head it
+              # merged. Those two parents are the pull request's own commits
+              # only while HEAD^2 IS the head sha the event names, which a merge
+              # ref the forge has not rebuilt after a push is not, and while the
+              # event's base is an ancestor of the first parent. Both hold or
+              # the fetched pair is what the scan reads. Either spelling reaches
+              # the scanner as the pair A and B and walks the commits reachable
+              # from B and not from A, so the fallback names the same commits
+              # the fast path does.
+              h1=$(git rev-parse -q --verify 'HEAD^1' || echo none)
+              h2=$(git rev-parse -q --verify 'HEAD^2' || echo none)
+              echo "merge ref parents: $h1 $h2; head sha: $HEAD_SHA"
+              if [ "$h2" = "$HEAD_SHA" ] \
+                 && git merge-base --is-ancestor "$BASE_SHA" "$h1"; then
                 range="HEAD^1..HEAD^2"
               else
                 range="$BASE_SHA...$HEAD_SHA"
@@ -251,8 +249,11 @@ jobs:
               body=no
               ;;
             *)
-              range="HEAD~1..HEAD"
-              body=no
+              # Every trigger above has an arm. An event reaching this line has
+              # no range defined for it, and a scan of the wrong range under a
+              # required name is worse than no scan, so the step refuses.
+              echo "::error ::no message range is defined for event $EVENT_NAME"
+              exit 1
               ;;
           esac
           rc_msg=0
@@ -270,14 +271,6 @@ jobs:
 
   media:
     name: Leak guard (media)
-    # Every event this workflow triggers on, one by one. This name is a
-    # REQUIRED context and a skipped required context reads as satisfied, so
-    # the condition and the trigger list stay equal; the walk in
-    # crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs reads both and
-    # reds when they part.
-    if: >-
-      github.event_name == 'pull_request' || github.event_name == 'merge_group'
-      || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -327,8 +320,8 @@ jobs:
           python3 -B tools/scripts/leak_scan.py media --ref "$HEAD_SHA" --files-from changed.zlist \
             --allow-empty --format github ${flags[@]+"${flags[@]}"}
 
-      - name: Walk the metadata of every tracked media container (push, dispatch)
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      - name: Walk the metadata of every tracked media container (push)
+        if: github.event_name == 'push'
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
         run: |
