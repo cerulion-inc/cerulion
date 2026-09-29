@@ -30,9 +30,8 @@ Observe both velocity values, then stop each command with Ctrl+C.
 
 ## Connect the nodes yourself
 
-Read `nodes/laser_scanner/src/lib.rs`, its `src/tests.rs`, and
-`nodes/safety_controller/src/lib.rs`. Each crate contains one node type;
-all wiring belongs in graph YAML. To create your own graph explicitly:
+Read each node's `src/lib.rs` and `src/tests.rs`. Each crate contains one node
+type; all wiring belongs in graph YAML. To create your own graph explicitly:
 
 ```bash
 cerulion graph create lesson -n lesson
@@ -48,5 +47,5 @@ To write both implementations from scratch, create an empty workspace with
 ## Source regression
 
 ```bash
-cargo test -p laser_scanner --lib -- --test-threads=1
+cargo test -p laser_scanner -p safety_controller --lib -- --test-threads=1
 ```

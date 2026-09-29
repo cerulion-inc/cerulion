@@ -232,10 +232,11 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
     // and `src/system_deps.rs` joins the example node manifest. The starter
     // source table also carries a README filename, which the conservative
     // const-table rule pins without tracing its staging-directory receiver.
+    // The starter route regression reads the tutorial and root README.
     (
         "cerulion_cli_engine",
         "cerulion_cli_engine",
-        &["examples", "tools"],
+        &["docs", "examples", "tools"],
         &["README"],
     ),
     // This walk's own read of the workflow it gates.

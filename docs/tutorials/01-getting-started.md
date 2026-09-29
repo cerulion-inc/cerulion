@@ -73,10 +73,34 @@ only place wiring lives.
 ## Complete starter source
 
 To read and run complete scanner and controller implementations before writing
-new node types, use the bundled starter. Check
-`cerulion workspace create --help` for `--starter`; public 1.0.0 binaries do not
-include the option. With those binaries, obtain the repository at tag `v1.0.0`
-and use its obstacle-avoidance example.
+new node types, choose the route for your installed CLI.
+
+### Released CLI 1.0.0
+
+The public 1.0.0 binaries do not include the starter option. Obtain the matching
+source tag and run its complete example:
+
+```bash
+git clone --depth 1 --branch v1.0.0 https://github.com/cerulion-inc/cerulion cerulion-starter-source
+cd cerulion-starter-source/examples/obstacle_avoidance
+cerulion node build laser_scanner --release
+cerulion node build safety_controller --release
+cerulion graph validate obstacle_avoidance
+cerulion graph run obstacle_avoidance --release --network off
+```
+
+In another terminal in that example directory, observe the velocity:
+
+```bash
+CERULION_NETWORK=off cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity
+```
+
+Observe both `x = 0.0` and `x = 0.3`, then stop both commands with Ctrl+C.
+Continue with Step 1 below to author your own nodes from scratch.
+
+### CLI builds with --starter
+
+Use this route only when `cerulion workspace create --help` lists `--starter`:
 
 ```bash
 cerulion workspace create starter_demo --starter obstacle_avoidance
@@ -99,7 +123,7 @@ CERULION_NETWORK=off cerulion topic echo /lesson/safety_controller/linear_veloci
 
 Stop both commands with Ctrl+C. `starter.toml` records the CLI version and
 compiler requirements; exact release dependencies are selected for an installed
-CLI. The scanner's source tests are included. Existing paths are refused, and a
+CLI. Both nodes' source tests are included. Existing paths are refused, and a
 failed installation leaves no partial project. The starter's generated README
 also explains its included graph. The steps below retain the empty-workspace
 path and teach how to author your own node types.

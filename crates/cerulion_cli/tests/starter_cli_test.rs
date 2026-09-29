@@ -109,3 +109,50 @@ fn bare_workspace_create_preserves_the_empty_authoring_workflow() {
     assert!(!root.join("starter.toml").exists());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("starter:"));
 }
+
+#[cfg(unix)]
+#[test]
+fn starter_root_permissions_match_ordinary_workspaces_under_explicit_umasks() {
+    use std::os::unix::fs::PermissionsExt;
+    for (mask, expected_mode) in [("0022", 0o755), ("0077", 0o700)] {
+        let parent = tempfile::tempdir().unwrap();
+        let home = auth_home();
+        for (name, starter) in [("manual", false), ("demo", true)] {
+            // The mask belongs to this child process, never the parallel test runner.
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "umask \"$1\"; shift; exec \"$@\"",
+                "starter-mode-test",
+                mask,
+            ]);
+            command.arg(env!("CARGO_BIN_EXE_cerulion"));
+            command.args(["workspace", "create", name]);
+            if starter {
+                command.args(["--starter", "obstacle_avoidance"]);
+            }
+            let output = command
+                .current_dir(parent.path())
+                .env("CERULION_HOME", home.path())
+                .env_remove("CERULION_LOGIN_GATE")
+                .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::metadata(parent.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                expected_mode,
+                "{name} under umask {mask}"
+            );
+        }
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 2);
+    }
+}

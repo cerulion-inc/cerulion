@@ -1179,6 +1179,9 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Obstacle avoidance source regressions
+        run: cd examples/obstacle_avoidance && cargo test -p laser_scanner -p safety_controller --lib -- --test-threads=1
+
   # The Go2 demo workspace (examples/go2) is ISOLATED: not a member of
   # the root cargo workspace, and deliberately skipped by `examples` (its
   # joystick crate needs the libudev system library, which only this job
@@ -2006,7 +2009,7 @@ jobs:
       # job, and all of it on one runner is what once put shard 1 at 45 min.
       # The placement is the measured packing in the map above, not family.
       # doc-pin: cerulion_cli_engine::bag_record_run_attach_test reads docs
-      # doc-pin: cerulion_cli_engine::cerulion_cli_engine reads README.md, examples, tools
+      # doc-pin: cerulion_cli_engine::cerulion_cli_engine reads README.md, docs, examples, tools
       # doc-pin: cerulion_cli_engine::ci_doc_pin_walk_test reads .github
       # doc-pin: cerulion_cli_engine::ci_test_coverage_test reads .github, tools
       # doc-pin: cerulion_cli_engine::dependency_door_test reads examples, tools

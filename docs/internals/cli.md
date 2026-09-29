@@ -997,15 +997,20 @@ The source-sync test compares every node and graph file with the canonical
 example. `starter.toml` records the CLI version and full compiler requirements;
 normal workspace dependency/toolchain selection still applies.
 
-Stage a complete sibling directory with private permissions, then publish with
+Stage a payload with ordinary umask-governed permissions inside a private
+sibling container, then publish the complete payload with
 rustix `RenameFlags::NOREPLACE`: Linux `renameat2` or macOS `renameatx_np`.
 Never replace an empty directory or dangling symlink. Construct the cleanup
-guard only after mkdir succeeds and disarm it immediately after rename succeeds.
+guard only after the container mkdir succeeds. The container stays owned until
+cleanup; publishing its child never frees or transfers the container name.
 Population or publication errors clean up only this call's staging tree and
 leave no partial destination. Other platforms refuse atomic publication.
 The engine tests pin collisions, racing destinations, staging ownership,
 source determinism and both error paths; `starter_cli_test` pins the command,
-unknown-value refusal and unchanged manual creation through the real binary.
+unknown-value refusal, umask parity and manual creation through the real binary.
+The bundled controller test drives complete scan loans through an isolated
+transport and asserts published stop/cruise velocities, including empty and NaN
+scans; CI runs both canonical node crates serially.
 
 ## 12. The login gate
 

@@ -42,9 +42,6 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 ## Workspace dependency contract
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
 pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.
-Bundled starter files live in `src/starters/`, not outside the published crate.
-Keep node/graph bytes synchronized with `examples/obstacle_avoidance`; preserve
-staging ownership and atomic no-replace publication (`starter::tests`).
 ## Testing
 - Never gate a CI test step on a selection output nothing produces, nor open a
   doc root from a test without its ci.yml `# doc-pin:` marker
@@ -57,5 +54,5 @@ staging ownership and atomic no-replace publication (`starter::tests`).
   `parse_int_literal` or `syn::LitInt::base10_parse`.
 - Numeric verification has false-pass classes (NaN folds, >2^53 widening,
   length-derived fields); see the dossier before adding a metric.
-See `docs/internals/cli.md` before changing replay exits, completions, topic listing,
-or graph run/profile/partition consent.
+Read `docs/internals/cli.md` before changing topics/local scope, starters,
+replay, completions, or graph run/profile/partition.

@@ -111,23 +111,37 @@ Guides: [Execution](https://docs.cerulion.com/cerulion/execution-order) · [Mult
 
 This example connects a synthetic laser scanner to a safety controller. The controller publishes a forward velocity of `0.3` when the path is clear and `0.0` when an obstacle is within half a meter.
 
-Obtain complete example source bundled with your CLI, including node tests and
-all variable-length scan fields. Check `cerulion workspace create --help` for
-`--starter`: the public 1.0.0 binaries do not have this option. For those binaries,
-clone the matching `v1.0.0` tag and follow the
-[example runbook](examples/obstacle_avoidance/README.md).
+Choose the acquisition route for your installed CLI.
+
+### Released CLI 1.0.0
+
+The public 1.0.0 binaries do not include the starter option. Obtain the matching
+source tag and enter its complete example workspace:
+
+```bash
+git clone --depth 1 --branch v1.0.0 https://github.com/cerulion-inc/cerulion cerulion-starter-source
+cd cerulion-starter-source/examples/obstacle_avoidance
+```
+
+Continue with the sign-in, build and run commands below. The
+[example runbook](examples/obstacle_avoidance/README.md) describes the source.
+
+### CLI builds with --starter
+
+Use this route only when `cerulion workspace create --help` lists `--starter`:
 
 ```bash
 cerulion workspace create safety_demo --starter obstacle_avoidance
 cd safety_demo
 ```
 
-The starter uses exact dependencies for the installed release and records its
-compiler requirements in `starter.toml`. It needs no GitHub credentials or
-source download. Existing paths are refused; a failed installation leaves no
-partial workspace. The bundled graph is ready to run, and the generated README
-also shows how to create, stage and wire a new graph explicitly. To write your
-own nodes from scratch, start with `cerulion workspace create my_robot` and the
+This obtains complete source bundled with your CLI, including tests and all
+variable-length scan fields, without GitHub credentials or a source download.
+Exact release dependencies are selected and `starter.toml` records compiler
+requirements. Existing paths are refused; failed installation leaves no partial
+workspace. The generated README also shows explicit graph creation, staging and
+wiring. To write nodes from scratch, start with
+`cerulion workspace create my_robot` and the
 [getting-started tutorial](docs/tutorials/01-getting-started.md).
 
 Sign in once per machine. Cerulion commands run under an account, and the result is read locally from then on, so later commands keep working offline.

@@ -48,6 +48,10 @@ const OBSTACLE_FILES: &[(&str, &str)] = &[
         include_str!("starters/obstacle_avoidance/nodes/safety_controller/src/lib.rs"),
     ),
     (
+        "nodes/safety_controller/src/tests.rs",
+        include_str!("starters/obstacle_avoidance/nodes/safety_controller/src/tests.rs"),
+    ),
+    (
         "README.md",
         include_str!("starters/obstacle_avoidance/README.md"),
     ),
@@ -107,19 +111,22 @@ fn create_with(
     }
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let mut staging = Staging::create(parent.join(format!(
+    let staging = Staging::create(parent.join(format!(
         ".cerulion-starter-{:032x}.tmp",
         u128::from_le_bytes(nonce)
     )))?;
-    let mut ws = populate(&staging.path)?;
-    publish_directory(&staging.path, &destination).map_err(|error| {
+    let payload = staging.path.join("workspace");
+    // The private outer container protects population; the payload inherits
+    // the same umask-governed permissions as an ordinary workspace.
+    std::fs::create_dir(&payload)?;
+    let mut ws = populate(&payload)?;
+    publish_directory(&payload, &destination).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             existing(&destination)
         } else {
             error.into()
         }
     })?;
-    staging.disarm();
     ws.root = destination.clone();
     ws.graphs_dir = destination.join("graphs");
     ws.nodes_dir = destination.join("nodes");
@@ -157,7 +164,6 @@ fn publish_directory(_staging: &Path, _destination: &Path) -> std::io::Result<()
 
 struct Staging {
     path: PathBuf,
-    armed: bool,
 }
 
 impl Staging {
@@ -169,19 +175,12 @@ impl Staging {
             builder.mode(0o700);
         }
         builder.create(&path)?;
-        Ok(Self { path, armed: true })
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
+        Ok(Self { path })
     }
 }
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
         if let Err(error) = std::fs::remove_dir_all(&self.path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(path = %self.path.display(), error = %error, "could not remove starter staging directory");
@@ -193,6 +192,36 @@ impl Drop for Staging {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_documentation_routes_do_not_invoke_unavailable_starter_commands() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (relative, path) in [
+            ("README.md", crate_dir.join("../../README.md")),
+            (
+                "docs/tutorials/01-getting-started.md",
+                crate_dir.join("../../docs/tutorials/01-getting-started.md"),
+            ),
+        ] {
+            let document = std::fs::read_to_string(path).unwrap();
+            let (_, routes) = document.split_once("### Released CLI 1.0.0").unwrap();
+            let (released, starter) = routes.split_once("### CLI builds with --starter").unwrap();
+            assert!(released.contains("git clone --depth 1 --branch v1.0.0"));
+            assert!(released.contains("cd cerulion-starter-source/examples/obstacle_avoidance"));
+            for block in released.split("```bash").skip(1) {
+                let commands = block.split_once("```").unwrap().0;
+                assert!(
+                    !commands.contains("--starter"),
+                    "unavailable flag in released route: {relative}"
+                );
+            }
+            let (capability_guard, commands) = starter.split_once("```bash").unwrap();
+            assert!(capability_guard.contains(
+                "Use this route only when `cerulion workspace create --help` lists `--starter`"
+            ));
+            assert!(commands.contains("--starter obstacle_avoidance"));
+        }
+    }
 
     #[test]
     fn complete_starter_matches_canonical_sources_and_exact_dependencies() {
@@ -282,19 +311,22 @@ mod tests {
     }
 
     #[test]
-    fn successful_publication_disarms_cleanup_of_reused_staging_name() {
+    fn successful_publication_cleans_container_and_preserves_destination() {
         let parent = tempfile::tempdir().unwrap();
         let path = parent.path().join("staging");
-        let mut staging = Staging::create(path.clone()).unwrap();
-        publish_directory(&path, &parent.path().join("published")).unwrap();
-        staging.disarm();
-        std::fs::create_dir(&path).unwrap();
-        std::fs::write(path.join("keep"), "later user source").unwrap();
+        let staging = Staging::create(path.clone()).unwrap();
+        let payload = path.join("workspace");
+        std::fs::create_dir(&payload).unwrap();
+        std::fs::write(payload.join("keep"), "complete user source").unwrap();
+        let destination = parent.path().join("published");
+        publish_directory(&payload, &destination).unwrap();
         drop(staging);
+        assert!(!path.exists());
         assert_eq!(
-            std::fs::read_to_string(path.join("keep")).unwrap(),
-            "later user source"
+            std::fs::read_to_string(destination.join("keep")).unwrap(),
+            "complete user source"
         );
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
     }
 
     #[test]

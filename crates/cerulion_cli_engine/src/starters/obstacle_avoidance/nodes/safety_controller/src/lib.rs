@@ -72,3 +72,6 @@ impl SafetyControllerNode {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
