@@ -10,8 +10,8 @@
 # source line that witnesses the edge. One row per edge; the witness is the
 # first source line that carries it, first by path and then by LINE NUMBER.
 # `all` in the observed column means the walk
-# could not attribute the read to one package, so the observing package is
-# selected on every change and no step of it may be gated.
+# could not attribute the read to one package, so the observing package rides
+# every selection that names a package and no step of it may be gated.
 cerulion_cli	all	unattributable	crates/cerulion_cli/tests/mp_supervisor_box_test.rs:420
 cerulion_cli	all	whole-tree	crates/cerulion_cli/tests/replay_cli_test.rs:690
 cerulion_cli	cerulion_heaphook	dlopen	crates/cerulion_cli/tests/ros2_run_e2e_test.rs:242

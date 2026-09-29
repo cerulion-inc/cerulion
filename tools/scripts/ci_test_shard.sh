@@ -528,9 +528,18 @@ require_index "shard count" "$COUNT"
 # `selection:` prefix, then exit 0 without invoking cargo.
 #
 # The workflow step that runs this shard is deliberately NOT gated by an `if:`:
-# `cerulion_core` observes the whole repository tree (its `serial_discipline_test`
-# walks every `.rs` file under the root), so `tools/ci/observation_edges.tsv`
-# records it as observing `all` and it is selected on every change. The
+# `cerulion_core` observes the whole repository tree (its whole-tree walks,
+# `serial_discipline_test` among them, read every `.rs` file in the source tree), and
+# `tools/ci/observation_edges.tsv` records it as observing `all`; a package
+# observing `all` rides every selection that names a package. A pull request that
+# selects no package at all (one touching only a root markdown file that no
+# doc-pin marker names) reaches this step with the selection `[]`; the step then
+# prints its `selection:` line and exits without running the suite. Every step
+# gated on the selection naming its package skips for that change too, and each
+# package's companion step prints its own `selection:` line; the steps of the packages
+# observing `all` carry no selection condition and still run, the `cerulion_core`
+# doctests step among them (gated on the shard index alone), and among those only
+# this sharded suite skips, by the runner's own reading of the selection. The
 # intersection below is the mechanism for any package whose shard step is added
 # later and whose observation edges the walk can attribute.
 if [ "$MODE" = run ] && ! selection_holds "$PACKAGE" "${CI_SELECTED_PACKAGES:-}"; then

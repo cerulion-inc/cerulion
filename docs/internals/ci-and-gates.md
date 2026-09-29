@@ -426,18 +426,17 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 `merge_group` events like everything else: there is no cost gate, no routing expression
 and no stub job standing in for a skipped required check.
 
-`lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
-`viz-tests`, and the push-only `fuzz`, `miri` and latency jobs). A red `lint` saves the
-runner minutes of the ones that carry no job-level condition. `crate-tests` and
-`viz-tests` are not among them: their `!cancelled()` guard replaces the implicit
-`success()` over the whole `needs:` set, GitHub offers no per-dependency form, so both run
-and report through a red `lint` and the dependency buys the ordering alone. It does NOT
-gate the two that set the wall: `test-linux` and
-`test-macos`. Both are `needs: [changes]` and nothing else, so both start after the
-classifier, which is a checkout and a path classification, about a minute, and no build. No
-REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so nothing
-in front of either job is a data dependency for compilation. A `lint` verdict was never one
-either, and while it gated them the wall was `lint` plus the longest test job instead of the
+`lint` gates six jobs: `docs` and `netd-wan`, which carry no condition of their own, and `fuzz`,
+`miri`, `test-latency` and `cli-e2e-latency`, which no pull request and no queued batch runs; a
+red `lint` saves their runner minutes. `crate-tests` and `viz-tests` depend on `lint` as well
+but are not gated by it: their `!cancelled()` guard replaces the implicit `success()` over the
+whole `needs:` set; GitHub offers no per-dependency form, so both run and report through a red
+`lint`, and the dependency buys the ordering alone. It does NOT gate the two that set the wall:
+`test-linux` and `test-macos`. Both list `changes` and nothing else in `needs:`, so both start
+after the classifier, which is a checkout and a path classification, about a minute, and no
+build. No REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so
+nothing in front of either job is a data dependency for compilation. A `lint` verdict was never
+one either, and while it gated them the wall was `lint` plus the longest test job instead of the
 longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
@@ -536,10 +535,12 @@ direction: they SKIP test steps. Four rules bound them.
   repository, or loads an artifact another package builds reaches it without a manifest
   edge. That table is derived from the sources by
   `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs`, which fails on a missing row
-  and on a stale one. A package the walk cannot attribute is recorded as observing `all`,
-  is selected on every change, and no step of it is gated: four packages are in that state
-  today, `cerulion_core` among them, which is why the `cerulion_core` shard steps carry no
-  condition at all.
+  and on a stale one. A read the walk cannot place on one package, an unattributable literal or
+  a walk over a tree holding more than one member, records the observing package as observing
+  `all`; such a package rides every selection that names a package, and no step of it is gated.
+  Four packages are in that state today, `cerulion_core` among them, which is why the
+  `cerulion_core` shard steps carry no condition of their own: the shard runner reads the
+  selection itself and prints the `selection:` line when it skips.
 
 The supported subset, stated plainly: the selection narrows PER-PACKAGE test steps on pull
 requests. It does NOT narrow the workspace build, it does not gate a job, it does not apply

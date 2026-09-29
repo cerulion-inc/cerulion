@@ -1844,13 +1844,14 @@ jobs:
       # line, so a path-to-step map cannot lose one of these binaries.
       # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
       # doc-pin: cerulion_core::serial_discipline_test reads .github
-      # NOT gated by an `if:`, deliberately. `cerulion_core`'s
-      # `serial_discipline_test` walks every `.rs` file under the repository
-      # root, so `tools/ci/observation_edges.tsv` records the package as
-      # observing `all` and it is selected on every change: an `if:` here could
-      # never be false, and a gate that cannot fire is not a gate. The shard
-      # runner intersects its own package with the selection instead, and prints
-      # one `selection:` line when the intersection is empty.
+      # NOT gated by an `if:`, deliberately. `cerulion_core`'s whole-tree walks
+      # (`serial_discipline_test` among them) read every `.rs` file in the source
+      # tree, and `tools/ci/observation_edges.tsv` records the package
+      # as observing `all`, so it rides every selection that names a package; only
+      # a change that selects nothing reaches this step with `[]`. The shard
+      # runner intersects its own package with the selection instead of a step
+      # condition and prints one `selection:` line when the intersection is
+      # empty, so the decision and its log line live in one place.
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.

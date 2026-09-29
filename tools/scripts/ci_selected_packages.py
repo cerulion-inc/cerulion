@@ -57,8 +57,8 @@ an artifact that changed because one of its dependencies did still pulls in the
 test that loads it.
 
 `all` in the observed column means the observer reached something this walk
-could not attribute to one package: it is selected on every change, and no step
-of it may be gated.
+could not attribute to one package: it rides every selection that names a
+package, and no step of it may be gated.
 
 WITHOUT `--observation-edges` the answer is the cargo closure alone. That is what
 the flag's absence means, and it is what the self-test's live rows compare
