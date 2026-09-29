@@ -110,8 +110,13 @@
 #                             be one a declaration may not spell. `Co.` carries
 #                             its period, because a bare `Co` matches the first
 #                             half of a hyphenated word. A mention whose raw
-#                             text is not the declared spelling BYTE FOR BYTE
-#                             is a finding, and a SECOND suffix behind a correct
+#                             text is not the declared spelling is a finding.
+#                             A FINAL FULL STOP is punctuation either way,
+#                             declared with it or without it, because at the end
+#                             of a sentence the two cannot be told apart;
+#                             everything else is exact, the letters, their case,
+#                             the comma before the suffix, and which word of the
+#                             family the suffix is. and a SECOND suffix behind a correct
 #                             mention is a finding of its own: one form of the
 #                             name, not two. A word in front of the name is not part
 #                             of a mention, because the scan starts at the name.
