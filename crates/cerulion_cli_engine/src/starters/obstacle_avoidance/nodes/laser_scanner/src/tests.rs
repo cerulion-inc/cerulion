@@ -29,7 +29,12 @@ fn scan_delivers_all_beams_on_both_sides_of_the_threshold() {
                         (scan.angle_min + 179.0 * scan.angle_increment - scan.angle_max).abs()
                             < 1e-6
                     );
-                    assert!(scan.header_bytes().ends_with(b"laser"));
+                    assert_eq!(
+                        native_ros2_messages::std_msgs::HeaderShm::from_bytes(scan.header_bytes())
+                            .frame_id()
+                            .unwrap(),
+                        "laser"
+                    );
                 })
                 .unwrap(),
             Some(())

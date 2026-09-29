@@ -66,9 +66,9 @@ not create one.
 
 | Command | Effect |
 |---|---|
-| `workspace create <NAME>` | New workspace under `./<NAME>/` (Cargo workspace + `graphs/`, `nodes/`, `schemas/`, `.cargo/config.toml`). |
+| `workspace create <NAME>` | New workspace under `./<NAME>/` (Cargo workspace + `graphs/`, `nodes/`, `schemas/`, `.cargo/config.toml`). Reserves the destination before scaffolding and refuses an existing path, including a racing creator or dangling symlink. |
 | `workspace create <NAME> --starter obstacle_avoidance` | Complete bundled scanner/controller workspace for this CLI version, including source tests and a graph. Atomic installation on Linux and macOS refuses every existing path, including symlinks. |
-| `workspace init [LOCATION]` | Initialize the current (or given) directory as a workspace in place. |
+| `workspace init [LOCATION]` | Initialize the current (or given) directory as a workspace in place. An initially absent folder is reserved before scaffolding; a competing creator is refused. |
 
 The starter option is absent from the public 1.0.0 binaries; inspect
 `cerulion workspace create --help` before using it. Starter sources are embedded

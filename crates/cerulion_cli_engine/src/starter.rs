@@ -431,6 +431,31 @@ mod tests {
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
     }
 
+    #[test]
+    fn ordinary_workspace_creation_during_staging_is_preserved() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("demo");
+        let mut original = String::new();
+        let error = create_with(parent.path(), "demo", |staging| {
+            let ws = scaffold_workspace(staging)?;
+            let ordinary = crate::workspace::workspace_create(parent.path(), "demo")?;
+            let manifest = ordinary.root.join("Cargo.toml");
+            original = std::fs::read_to_string(&manifest)?;
+            original.push_str("\n# learner's ordinary workspace\n");
+            std::fs::write(manifest, &original)?;
+            Ok(ws)
+        })
+        .unwrap_err();
+        assert!(matches!(error, CliError::WorkspaceExists { .. }));
+        assert_eq!(
+            std::fs::read_to_string(destination.join("Cargo.toml")).unwrap(),
+            original
+        );
+        assert!(destination.join("graphs").is_dir());
+        assert!(!destination.join("starter.toml").exists());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn dangling_symlink_is_preserved_before_and_during_publication() {
