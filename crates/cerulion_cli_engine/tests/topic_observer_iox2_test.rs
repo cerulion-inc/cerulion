@@ -1073,3 +1073,138 @@ fn echo_under_a_progress_free_event_flood_shows_no_phantom_frames_but_still_show
         "no phantom frames may be displayed for events that carried none; saw:\n{out}"
     );
 }
+
+/// The explicit scope must reach the local-frame decoder fallback as well as
+/// the missing-topic rung. A genuine local writer carries a hand-written frame
+/// with an unknown schema; echo must display its bytes without starting netd.
+#[test]
+#[serial]
+fn explicit_local_echo_reads_unknown_schema_without_remote_fallback() {
+    use cerulion_cli_engine::topic_cmd::{topic_echo_with_scope, TopicScope};
+    use iceoryx2::service::port_factory::PortFactory as _;
+    use std::os::unix::fs::PermissionsExt;
+    struct StopOnFrame {
+        output: Vec<u8>,
+        running: Arc<AtomicBool>,
+    }
+    impl std::io::Write for StopOnFrame {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            self.running.store(false, Ordering::Relaxed);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("netd.sock");
+    let _env = EnvGuard::set("CERULION_NETWORK", "");
+    let _socket = EnvGuard::set("CERULION_NETD_SOCK", socket.to_str().unwrap());
+    let binary = root.path().join("netd-start-detector");
+    let marker = root.path().join("netd-started");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\n: > \"$CERULION_LOCAL_TEST_START_MARKER\"\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The production binary-selection seam runs a real child if reached. This
+    // detector has a control proving it can record that forbidden side effect.
+    assert!(std::process::Command::new(&binary)
+        .env("CERULION_LOCAL_TEST_START_MARKER", &marker)
+        .status()
+        .unwrap()
+        .success());
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+    let _marker = EnvGuard::set("CERULION_LOCAL_TEST_START_MARKER", marker.to_str().unwrap());
+    let _binary = EnvGuard::set("CERULION_NETD_BIN", binary.to_str().unwrap());
+    let topic = unique_topic("explicit_local_unknown");
+    let writer = RawTopicWriter::new(&topic, true);
+    let running = Arc::new(AtomicBool::new(true));
+    let handle = {
+        let topic = topic.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            let mut output = StopOnFrame {
+                output: Vec::new(),
+                running: running.clone(),
+            };
+            let result =
+                topic_echo_with_scope(&topic, None, running, &mut output, 128, TopicScope::Local);
+            (result, String::from_utf8(output.output).unwrap())
+        })
+    };
+    // Synchronize against the real SHM port count rather than a timer guess.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while writer
+        ._data_service
+        .dynamic_config()
+        .number_of_subscribers()
+        == 0
+        && !handle.is_finished()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    let mut frame = vec![0u8; WireHeader::SIZE + 4];
+    let mut header = WireHeader::new(0x0123_4567_89AB_CDEF, 7, 2_000);
+    header.total_size = frame.len() as u32;
+    header.write_to_buf(&mut frame[..WireHeader::SIZE]);
+    frame[WireHeader::SIZE..].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    writer.publish(&frame);
+    // Stop synchronously at the output boundary after a frame arrives. A bounded
+    // watchdog makes a missed frame fail without leaving an observer thread alive.
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    running.store(false, Ordering::Relaxed);
+    let (result, output) = handle.join().unwrap();
+    result.unwrap();
+    assert!(output.contains("0x0123456789abcdef"), "{output}");
+    assert!(output.contains("seq=7"), "{output}");
+    assert!(output.contains("payload: 11 22 33 44"), "{output}");
+    assert!(
+        !marker.exists(),
+        "the unknown local schema triggered netd startup"
+    );
+    assert!(
+        !socket.exists(),
+        "the unknown local schema triggered netd startup"
+    );
+}
+
+#[test]
+#[serial]
+fn explicit_local_scope_refuses_a_shared_memory_remote_mirror() {
+    use cerulion_cli_engine::topic_cmd::{topic_info_with_scope, TopicScope};
+    use cerulion_core::wire::MaxSliceLen;
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("netd.sock");
+    let _env = EnvGuard::set("CERULION_NETWORK", "");
+    let _socket = EnvGuard::set("CERULION_NETD_SOCK", socket.to_str().unwrap());
+    let topic = unique_topic("explicit_local_mirror");
+    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+    let _injector = manager
+        .create_ingress_injector(
+            &topic,
+            STD_MSGS_STRING_SCHEMA_HASH,
+            MaxSliceLen::const_new(256),
+        )
+        .unwrap();
+    manager
+        .register_mirror_provenance(&topic, "source-robot")
+        .unwrap();
+    let error = topic_info_with_scope(&topic, None, TopicScope::Local)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("exists locally as a network mirror of robot 'source-robot'"),
+        "{error}"
+    );
+    assert!(error.contains("--local forbids demanding it"), "{error}");
+    assert!(!error.contains("not found locally"), "{error}");
+    assert!(!socket.exists());
+    manager.unregister_mirror_provenance(&topic).unwrap();
+}

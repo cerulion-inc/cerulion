@@ -755,3 +755,31 @@ fn network_transport_config_stamps_identity_not_the_graph_prefix() {
     assert_eq!(cfg.robot_identity.as_deref(), Some("fleet-bot-7"));
     assert_ne!(cfg.robot_identity.as_deref(), Some(config.prefix.as_str()));
 }
+
+/// All topic-list network inputs are subordinate to explicit local scope and
+/// the shared environment kill-switch, including fail-closed legacy values.
+#[test]
+fn topic_list_scope_and_environment_precedence() {
+    use cerulion_cli_engine::topic_cmd::remote_discovery_options;
+    let _lock = env_lock();
+    let previous = std::env::var("CERULION_NETWORK").ok();
+    for value in ["", "off", " OFF ", "on", "typo"] {
+        std::env::set_var("CERULION_NETWORK", value);
+        for explicit_local in [false, true] {
+            let decision = remote_discovery_options(
+                explicit_local,
+                vec!["tcp/127.0.0.1:1".into()],
+                vec!["tcp/127.0.0.1:0".into()],
+            );
+            assert_eq!(
+                decision.is_none(),
+                explicit_local || !value.is_empty(),
+                "local={explicit_local}, env={value:?}"
+            );
+        }
+    }
+    match previous {
+        Some(value) => std::env::set_var("CERULION_NETWORK", value),
+        None => std::env::remove_var("CERULION_NETWORK"),
+    }
+}
