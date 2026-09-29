@@ -100,8 +100,12 @@
 #                             may stand a comma or ONE line break per gap, with
 #                             the comment or quote prefix a wrapped line carries
 #                             (a blank line ends the sentence and is not a
-#                             wrap). A name written down a list of items is
-#                             therefore a finding to waive: seeing a name
+#                             wrap). The prefix set is the comment and quote
+#                             marks only: a `-` list item and a `|` table cell
+#                             are NOT in it, so a name spelled down either is
+#                             silent by design. A `*` list, a `#` heading and a
+#                             doc comment DO carry, so a name spelled down one
+#                             of those is a finding to waive: seeing a name
 #                             wrapped in a narrow comment column is worth that
 #                             noise.
 #                             THE SUFFIX FAMILY is Inc, Inc., Incorporated,
@@ -113,9 +117,12 @@
 #                             may not spell. It is matched LONGEST FIRST, so a page
 #                             writing the period gets the form with it. `Co.`
 #                             keeps its period, because a bare `Co` would match
-#                             the first half of a hyphenated word, and a bare
-#                             `Co` is therefore the one suffix spelling this
-#                             does not see.
+#                             the first half of a hyphenated word. `Co.`,
+#                             `S.A.` and `B.V.` are the three forms the list
+#                             carries WITHOUT a period-less twin, so a page
+#                             writing one of them without its stop is silent
+#                             rather than a finding: the rule never sees that
+#                             spelling at all.
 #                             A mention whose text is not the declared spelling
 #                             is a finding. A FINAL FULL STOP is asymmetric: one
 #                             the page ADDED is punctuation, since a declared

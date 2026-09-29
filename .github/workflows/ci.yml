@@ -865,8 +865,9 @@ jobs:
       # comma and the suffix word, with a final full stop forgiven only when the
       # page ADDED one. A second suffix on the same line is its own finding, and
       # zero mentions is a finding rather than a clean run. A third-party holder
-      # is a candidate only where its own name IS the declared name followed by
-      # a suffix.
+      # is a candidate only where it begins with the declared name's first word
+      # and adds no word the name does not have: one that drops a word is
+      # judged, one that adds a word is not a mention at all.
       #
       # It reads data files beside it: an allow list whose entries name
       # one finding each and FAIL when stale, a phrase list of claims the
