@@ -632,19 +632,19 @@ impl GatingClock {
     /// launch plus the resolved execution mode.
     ///
     /// One function so the CLI cannot spell the classification twice and drift:
-    /// the same facts already decide the deployment (the mode is resolved from
-    /// that decision plus the opt-in), and the mapping is exactly the
-    /// `live_step` match plus the polled shape.
+    /// the same three facts already decide the deployment (the mode is resolved
+    /// from that decision plus the `CERULION_EXECUTION_MODE` request), and the
+    /// mapping is exactly the `live_step` match plus the polled shape.
     ///
-    /// * a SUPERVISOR run under the default LOCKSTEP execution mode builds
-    ///   every worker through `build_live_deterministic_with_manager_and_barrier`,
-    ///   which hands a quantum ⇒ [`Quantum`](Self::Quantum); under the
-    ///   `CERULION_EXECUTION_MODE=free_run` opt-in every rank is
-    ///   on its own wall-faithful clock: a TRACED free-run rank (`traced`: the
-    ///   run ASKS FOR scheduler-trace rings, i.e. anything but `--no-rings`)
-    ///   follows the wall on a controlled clock from a shared epoch ⇒
+    /// * a SUPERVISOR run FREE-RUNS by default: every rank is on its own
+    ///   wall-faithful clock. A TRACED free-run rank (`traced`: the run ASKS
+    ///   FOR scheduler-trace rings, i.e. anything but `--no-rings`) follows the
+    ///   wall on a controlled clock from a shared epoch ⇒
     ///   [`RecordedWall`](Self::RecordedWall), a ring-less one is on the
-    ///   read-only `RealClock` ⇒ [`Wall`](Self::Wall) (the mode is threaded
+    ///   read-only `RealClock` ⇒ [`Wall`](Self::Wall); under the
+    ///   `CERULION_EXECUTION_MODE=lockstep` opt-out every worker is built
+    ///   through `build_live_deterministic_with_manager_and_barrier`, which
+    ///   hands a quantum ⇒ [`Quantum`](Self::Quantum) (the mode is threaded
     ///   from the ONE resolution `graph run` makes, so this label and the run's
     ///   `coordination` stamp cannot disagree);
     ///

@@ -75,25 +75,50 @@ soften failure to re-execute: an unreadable bag, a cdylib that will not load, a
 candidate that panicked and an internal error keep their loud codes in both
 modes.
 
-**A multi-process recording's shutdown tail is tolerated, and reported.**
-A multi-process run's frame stream and its per-rank trace rings
-are cut independently at shutdown, so a rank that outlives rank 0 can commit a
-final step's frames past the last boundary the authoritative (rank 0) stream
-carries: routinely one step at SIGINT, and unboundedly many when a survivor
-outlives a dead rank 0 under `--peer-loss continue`. Those trailing frames are
-IN the bag and readable; a resim excludes them from what it re-executes and
-from the verify comparison (its authoritative clock ends at rank 0's last
-boundary, so they could match nothing and be re-produced by nothing), and the
-verdict reports the derived covered range plus a per-topic count rather than
-excluding them silently. The tolerance is scoped to topics a PEER rank
+**A multi-process recording's shutdown tail, per mode.** A multi-process run's
+frame stream and its per-rank trace rings are cut independently at shutdown, so
+what a resim does with the frames past the last boundary a stream carries is
+decided by WHICH stream bounds a rank, and that is what the bag's `coordination`
+stamp sets (the table under *The `coordination` contract* below). The default and
+the opt-out are therefore stated apart. Single-rank bags are unchanged under
+both: their frames and trace are written by one thread from one batch, so a tail
+frame there really is corruption.
+
+*Under the free-run default*, each rank's OWN recorded boundary stream bounds its
+own pass, and a peer cannot out-run the authoritative stream because there is
+none. A pass is driven from one `BoundaryCursor` over the pass's own rank
+(`PassBoundaries::Rank`, whose doc says why: pulling rank 0's targets for rank
+1's runtime is the cross-clock arithmetic the coordination stamp exists to
+forbid), and the tolerated window's upper bound is that rank's own last recorded
+step (`RaggedTailContext::from_summaries`, its `CoordinationMode::FreeRun` arm).
+Nothing is excluded from the comparison as a peer tail, and nothing is derived to
+exclude it with: the derived covered range and the peer-owned topic set it
+forgives are both built ONLY for a multi-rank lockstep bag, and the resolver says
+so in its own words, that single-rank and free-run bags keep no derived range. A
+produced frame stamped past its own rank's last boundary keeps the refusal, and
+on a FINALIZED continuous recording it cannot arise: a rank banks step *k*'s
+boundary into its own trace ring before any fire of step *k* publishes, and the
+recorder drains those rings only after the batch's tap frames were consumed, so
+the ring cut is strictly later than the tap cut in every batch.
+
+*Under the `CERULION_EXECUTION_MODE=lockstep` opt-out*, rank 0's boundary stream
+is the one authoritative clock and every rank is driven to rank 0's last step
+(`PassBoundaries::Lockstep` pulls rank 0's boundary and advances every peer's
+cursor index-locked; `from_summaries` gives every rank rank 0's last step). So a
+rank that outlives rank 0 can commit a final step's frames past the last boundary
+the authoritative stream carries: routinely one step at SIGINT, and unboundedly
+many when a survivor outlives a dead rank 0 under `--peer-loss continue`. Those
+trailing frames are IN the bag and readable; a resim excludes them from what it
+re-executes and from the verify comparison (its authoritative clock ends at rank
+0's last boundary, so they could match nothing and be re-produced by nothing),
+and the verdict reports the derived covered range plus a per-topic count rather
+than excluding them silently. The tolerance is scoped to topics a PEER rank
 produces: only a peer can legitimately out-run the authoritative stream, so a
 rank-0-produced frame past rank 0's own last boundary is still refused (on a
-healthy recording that shape cannot occur; seeing it means the bag was edited
-or the recorder misbehaved). A frame that matches no boundary INSIDE the range
-is likewise still refused as a corrupt recording (the tolerance is the peer
-tail, never the body), and single-rank bags are unchanged (their frames and
-trace are written by one thread from one batch, so a tail frame there really
-is corruption).
+healthy recording that shape cannot occur; seeing it means the bag was edited or
+the recorder misbehaved). A frame that matches no boundary INSIDE the range is
+likewise still refused as a corrupt recording (the tolerance is the peer tail,
+never the body).
 
 **The mirror shape, a final step boundary with no fires behind it, is
 tolerated too.** A worker banks each step's boundary record BEFORE
@@ -722,12 +747,12 @@ trace stream's FORMAT and the run's COORDINATION contract.
 "recorded before the stamp existed".** That is what makes the inferred reading safe to print as a
 fact rather than a hedge.
 
-**Recording a `free_run` bag is an opt-in.** A multi-process
-`graph run --record` under `CERULION_EXECUTION_MODE=free_run` stamps `free_run`
-and records each rank's own wall-faithful timeline from the shared epoch; the
-reader re-executes such a bag PER RANK. Without the variable every bag
-`graph run --record` produces stamps `lockstep`, and that is the default.
-The variable is an execution-mode switch rather than a tuning knob; see
+**A `free_run` bag is what a multi-process `graph run --record` produces by
+default.** The reader re-executes such a bag PER RANK. A `lockstep` stamp means
+one of two things: the run opted out with `CERULION_EXECUTION_MODE=lockstep`,
+or it was a MONOLITH recording (`--single-process --record`; a monolith has no
+ranks); the `lockstep` row above covers both. The variable is an execution-mode
+switch rather than a tuning knob; see
 [`docs/multi_process.md`](multi_process.md) for the contract. All four rows
 describe current behaviour.
 

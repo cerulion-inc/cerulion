@@ -170,6 +170,10 @@ impl Sandbox {
             .env("CERULION_NETWORK", "off")
             .env("RUST_LOG", "cerulion=info,cerulion_cli_engine=info")
             .env_remove("CARGO_TARGET_DIR")
+            // HERMETIC on the execution mode: REMOVED, never inherited. The
+            // multi-process arm here is a SUPERVISOR run and free-runs by
+            // default; on the `--single-process` arms the variable is inert.
+            .env_remove("CERULION_EXECUTION_MODE")
             .env_remove("CERULION_ROS2_PRELOAD")
             // The login gate is on by default; this file is not about the gate.
             .env("CERULION_LOGIN_GATE", "off")
