@@ -4419,20 +4419,41 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
 // synthetic case in `the_container_bash_shell_walk_discriminates` reddens and
 // greens it on input that is not the real tree.
 
-/// Markers for a construct a container step's default shell (dash on the ROS
-/// base images) may not accept. `pipefail` (a bash extension dash refuses, as in
-/// `set -euo pipefail`) and the `[[` conditional are bash-only. The `set -o`
-/// marker is deliberately conservative: it also matches the POSIX options dash
-/// DOES run (`errexit` and the like), and flagging one of those only asks the
-/// step to name `shell: bash`, which is always safe.
-const BASH_ONLY_MARKERS: &[&str] = &["pipefail", "set -o", "[["];
+/// Substring markers for constructs a container step's default shell (dash on
+/// the ROS base images) may not accept. `pipefail` is a bash extension dash
+/// refuses (as in `set -euo pipefail`); the `set -o` marker is deliberately
+/// conservative, matching the POSIX options dash DOES run (`errexit` and the
+/// like) too, since flagging one of those only asks the step to name
+/// `shell: bash`, which is always safe. The bash `[[ ... ]]` conditional is a
+/// third construct dash refuses; it is matched by [`run_uses_bash_test_bracket`],
+/// not a substring, because a bare `[[` can also begin a POSIX class (`[[:`).
+const BASH_ONLY_MARKERS: &[&str] = &["pipefail", "set -o"];
 
-/// Does a step's `run:` script use a construct only bash accepts? A plain
-/// substring match, so a marker that appears only inside a shell comment or a
-/// string in the script still counts: the fail-safe direction, since the only
-/// consequence is asking the step to name `shell: bash`, which is always safe.
+/// Does the run script use the bash `[[ ... ]]` conditional? A plain `[[`
+/// substring will not do: a POSIX bracket expression such as `[[:space:]]` (a
+/// character class dash runs) also contains `[[`. The bash conditional writes
+/// `[[` before whitespace or the start of its expression; a POSIX class writes
+/// `[[:`. So a `[[` counts unless the byte right after it is `:`.
+fn run_uses_bash_test_bracket(run: &str) -> bool {
+    let bytes = run.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' && bytes.get(i + 2) != Some(&b':') {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Does a step's `run:` script use a construct only bash accepts? The `pipefail`
+/// and `set -o` markers are matched as substrings, so one inside a shell comment
+/// or a string in the script still counts (the fail-safe direction: the only
+/// consequence is asking the step to name `shell: bash`, which is always safe);
+/// the bash `[[ ... ]]` conditional is matched by [`run_uses_bash_test_bracket`],
+/// which does not mistake a POSIX class for it.
 fn run_needs_bash(run: &str) -> bool {
-    BASH_ONLY_MARKERS.iter().any(|marker| run.contains(marker))
+    BASH_ONLY_MARKERS.iter().any(|marker| run.contains(marker)) || run_uses_bash_test_bracket(run)
 }
 
 /// Does a `shell:` value name a bash-family shell? Its first word is `bash`
@@ -4627,6 +4648,28 @@ fn the_container_bash_shell_walk_discriminates() {
     assert!(
         found.is_empty(),
         "and nothing is reported for it: {found:?}"
+    );
+
+    // A POSIX character class (`[[:space:]]`) contains `[[` but is not the bash
+    // `[[ ... ]]` conditional; dash runs it, so a container step using one is
+    // not flagged.
+    let posix_class = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                       - name: grep\n        run: grep -E '[[:space:]]' file\n";
+    let (judged, found) = container_shell_findings("posix.yml", posix_class).expect("classifies");
+    assert_eq!(judged, 1, "the container run step is judged");
+    assert!(
+        found.is_empty(),
+        "a POSIX character class is not the bash conditional and must not be flagged: {found:?}"
+    );
+
+    // The bash `[[ ... ]]` conditional under a container default shell IS flagged.
+    let bash_test = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                     - name: test\n        run: |\n          [[ -n \"$X\" ]] && echo ok\n";
+    let (_judged, found) = container_shell_findings("bashtest.yml", bash_test).expect("classifies");
+    assert_eq!(
+        found.len(),
+        1,
+        "the bash [[ ... ]] conditional with no shell: bash is a violation: {found:?}"
     );
 }
 
