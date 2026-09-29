@@ -363,6 +363,18 @@ struct Harness {
     topic: String,
     /// The continuous bag a `--record` recorder also wrote.
     continuous: Option<PathBuf>,
+    /// The RANK each state ring this run stood up declares in its header,
+    /// ascending, read back off the rings themselves.
+    ///
+    /// Carried because no arm can read it anywhere else. A rank reaches a bag
+    /// through `state_coverage.json`, which is written only when an armed
+    /// plane was observed and these arms stand none up, and the extra rings
+    /// publish nothing, so the records cannot witness them either. The header
+    /// is what every reader downstream takes its word from
+    /// (`StateCoverage::ranks_discovered` is built from `ring.rank()`), which
+    /// is why it is read back from the ring rather than restated from the
+    /// counter that stamped it.
+    state_ring_ranks: Vec<u32>,
 }
 
 impl Harness {
@@ -574,6 +586,14 @@ fn capture_inner_full(
             owner
         })
         .collect();
+    // The ranks as the RINGS declare them, read back off each header rather
+    // than restated from the counter above, and handed to the arm. Without
+    // this the "two REAL ranks" half of the multi-ring shape is pinned by
+    // nothing: every extra ring can be put back at rank 0 and the whole binary
+    // stays green, because nothing else in this harness reads a rank.
+    let state_ring_ranks: Vec<u32> = std::iter::once(state_owner.rank())
+        .chain(_extra_state_owners.iter().map(StateRingOwner::rank))
+        .collect();
     // MINTED ONCE and held: a ring is SPSC, so a second `producer()` answers
     // `None`. It is also the RENDEZVOUS below — the producer is the only handle
     // in this process that can see the consumer's cursor without becoming a
@@ -701,6 +721,7 @@ fn capture_inner_full(
         bag,
         topic,
         continuous,
+        state_ring_ranks,
     }
 }
 
@@ -1453,6 +1474,16 @@ fn a_capture_with_no_anchor_in_window_reads_not_resimmable_honestly() {
 #[test]
 fn a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares() {
     let h = capture_with_extra_state_rings("noanchormulti", &trace_across_the_anchor(), &[], 1);
+    // PRECONDITION on the FIXTURE, and the half that nothing else reads: two
+    // rings on two DIFFERENT ranks, as their own headers declare them. Several
+    // rings all claiming rank 0 is what a hand stamped manifest produces and
+    // what no real run does, and the pair below differs in its WINDOW and in
+    // nothing else, so both arms state the shape they share.
+    assert_eq!(
+        h.state_ring_ranks,
+        vec![0, 1],
+        "PRECONDITION: one ring per rank, counting up from the primary ring's 0"
+    );
 
     let m = flashback_manifest(&h.bag);
     // PRECONDITIONS: this really is the no-anchor arm, and the manifest really
@@ -1485,6 +1516,18 @@ fn a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares() 
         "the verdict must report the RING ambiguity the bag declares — the gap resim reaches \
          first — rather than an anchor-shaped reason: {reason}"
     );
+    // …and it says that NOTHING WALKED a rank space, which is true of this
+    // recorder and is the half a roster alone cannot state: the harness hands
+    // its rings in by name and stands up no discovery tag, so the sweep never
+    // runs, the roster is empty for that reason rather than for having looked,
+    // and an unqualified silence here would read as "no rank published
+    // nothing". This is the one arm that drives that wiring end to end, from
+    // the recorder's own swept set through the verdict to the stored sentence.
+    assert!(
+        reason.contains("nothing walked a rank space"),
+        "a run whose state rings were named walked no rank space, and the stored reason \
+         says so rather than falling silent: {reason}"
+    );
 
     h.cleanup();
 }
@@ -1512,6 +1555,17 @@ fn a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares() 
 #[test]
 fn a_two_rank_capture_whose_window_reaches_step_zero_reads_resimmable() {
     let h = capture_with_extra_state_rings("stepzeromulti", &trace_from_step_zero(), &[], 1);
+    // PRECONDITION, and the RANK half of this arm's own headline: two rings on
+    // two REAL ranks, read back off the ring headers. Nothing else in this
+    // binary reads a rank, so without this the extra ring could be put back at
+    // rank 0 and the arm would still pass while its name and its doc both
+    // claim two ranks.
+    assert_eq!(
+        h.state_ring_ranks,
+        vec![0, 1],
+        "PRECONDITION: two REAL ranks, which is the one ring per rank shape a \
+         multi-process run provisions"
+    );
 
     let m = flashback_manifest(&h.bag);
     // PRECONDITIONS. Without all three this arm could read `resimmable: true`

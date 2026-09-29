@@ -4269,6 +4269,9 @@ mod tests {
                 ResimGap::MultiRing {
                     rings: 4,
                     ranks_missing: Vec::new(),
+                    // A run whose rings were discovered, which is what a
+                    // multi-process deployment provisions.
+                    rank_space_walked: true,
                 },
                 "no rank",
             ),

@@ -9794,6 +9794,7 @@ fn judge_capture_resimmable(
     trace_gap: Option<cerulion_core::flashback::resim::TraceGap>,
     trace_rings: TraceRingCoverage,
     ranks_missing: &[u32],
+    rank_space_walked: bool,
 ) -> Result<(), cerulion_core::flashback::resim::ResimGap> {
     let (anchor_run_id, runs_at_step) = match anchor {
         flashback_plane::AnchorReport::Embedded { run_id, .. } => (*run_id, 1),
@@ -9854,6 +9855,10 @@ fn judge_capture_resimmable(
             // what carries the answer here and the stored reason can name the
             // same rank the warn named.
             ranks_missing,
+            // …and whether anything looked, which is what stops the empty
+            // roster a hand picked `--state-ring` list produces from reading
+            // as the sweep's report that no rank published nothing.
+            rank_space_walked,
             required_nodes: &trimmed.executed_nodes,
             anchor_facts,
         },
@@ -12687,13 +12692,29 @@ impl Recorder {
     /// See `missing_state_ring_ranks_within`, which states both halves.
     fn state_rank_holes(&self) -> Vec<u32> {
         cerulion_core::state_ring::missing_state_ring_ranks_within(
-            &self
-                .state_ring_swept_ranks
-                .iter()
-                .copied()
-                .collect::<Vec<u32>>(),
+            &self.swept_ranks(),
             &self.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
         )
+    }
+
+    /// The ranks the discovery sweep WALKED, ascending.
+    ///
+    /// Read in one place because two questions are asked of it and a roster
+    /// that answered one of them from a different set would be the very drift
+    /// [`Self::state_rank_holes`] exists to stop.
+    fn swept_ranks(&self) -> Vec<u32> {
+        self.state_ring_swept_ranks.iter().copied().collect()
+    }
+
+    /// Did anything WALK a rank space in this run?
+    ///
+    /// The SECOND reader of the roster rule, and the one that says what an
+    /// EMPTY roster means. A run whose rings were handed in by name
+    /// (`--state-ring`) walks nothing, so its empty roster is not the report
+    /// "no rank published nothing" but no report at all, and the capture's
+    /// stored `resimmable_reason` says which of the two it is.
+    fn state_rank_space_walked(&self) -> bool {
+        cerulion_core::state_ring::rank_space_walked(&self.swept_ranks())
     }
 
     fn discover_state_rings(&mut self) {
@@ -16480,6 +16501,9 @@ impl Recorder {
         // Its value cannot change under us either: nothing between here and
         // the manifest sweeps a rank or adopts a ring.
         let state_rank_holes = self.state_rank_holes();
+        // Read here for the SAME borrow reason, and beside the roster because
+        // it is the fact that says what an empty one of those means.
+        let state_rank_space_walked = self.state_rank_space_walked();
         let Some(plane) = self.flashback.as_mut() else {
             return;
         };
@@ -17091,6 +17115,9 @@ impl Recorder {
             // which also states why it recomputes, and the read above for why
             // the call cannot sit here.
             &state_rank_holes,
+            // …and whether the walk that fills it ran at all, read at the same
+            // place and for the same borrow reason.
+            state_rank_space_walked,
         );
         // The earlier handoff, with the seam it left OPEN now CLOSED.
         //
@@ -19636,6 +19663,22 @@ mod state_rank_holes_tests {
             rec.state_rank_holes().is_empty(),
             "no walk, no hole: {:?}",
             rec.state_rank_holes()
+        );
+        // …and the recorder SAYS that it did not walk, which is the fact the
+        // stored sentence needs: the empty roster one line above and the empty
+        // roster of a sweep that found nothing are the same vector, so a
+        // reader handed only the vector renders the second as the first.
+        assert!(
+            !rec.state_rank_space_walked(),
+            "a hand picked ring list walked no rank space"
+        );
+        // THE CONTROL, in the other direction: the swept set restored, the
+        // roster is empty for the OTHER reason and the recorder says so.
+        rec.state_ring_swept_ranks = [0].into_iter().collect();
+        rec.state_ring_ranks = [0].into_iter().collect();
+        assert!(
+            rec.state_rank_holes().is_empty() && rec.state_rank_space_walked(),
+            "a sweep that ran and found no hole reports an empty roster too, and it walked"
         );
     }
 }
