@@ -57,7 +57,6 @@
 2 our-machines crates/cerulion_cli/tests/bagd_subprocess_test.rs
 1 history-voice crates/cerulion_cli/tests/flashback_resim_e2e_test.rs
 3 our-machines crates/cerulion_cli/tests/mp_supervisor_box_test.rs
-1 history-voice crates/cerulion_cli_engine/src/graph_cmd.rs
 1 history-voice crates/cerulion_cli_engine/src/multiprocess.rs
 1 candour-voice crates/cerulion_cli_engine/src/shm_state.rs
 2 candour-voice crates/cerulion_cli_engine/src/topic_cmd.rs
