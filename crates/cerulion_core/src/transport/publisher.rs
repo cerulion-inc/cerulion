@@ -772,8 +772,8 @@ impl CerulionPublisher {
     /// arms it at `rmw_create_publisher` under
     /// `crate::doorbell::default_namespace()` — the SAME producer-side ring
     /// the graph build arms, at a second call site rather than a second
-    /// mechanism. (Off Linux the doorbell is the no-op stub; arming is
-    /// harmless.)
+    /// mechanism. (On a target with neither a real SHM page nor a wake word
+    /// the doorbell is the no-op stub; arming is harmless.)
     pub fn enable_doorbell(&mut self, ns: &str) {
         match crate::doorbell::Doorbell::open_owned(ns, &self.topic) {
             Ok(db) => self.doorbell = Some(db),

@@ -425,8 +425,9 @@ fn run_chain(mode: Mode, n: u64) -> (Vec<String>, Vec<f64>) {
 /// `step()`/`drain_level` (the sole, byte-identical firing path).
 ///
 /// With `policy.doorbell` ON, the producers' owned `Doorbell`s are opened and the
-/// consumer `DoorbellRegistry` is built; without the primitive the SHM ring is a no-op stub,
-/// so data still flows through real iceoryx2 and the listener poll wakes the loop.
+/// consumer `DoorbellRegistry` is built; where the target maps no real doorbell
+/// page the ring is a no-op stub, so data still flows through real iceoryx2 and
+/// the listener poll wakes the loop.
 fn run_chain_parked(policy: cerulion_core::MonitorWaitPolicy, n: u64) -> (Vec<String>, Vec<f64>) {
     let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
     let fires = Arc::new(AtomicU64::new(0));
@@ -959,8 +960,8 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
 //   So transitively: virtual-polled == virtual-live == oracle == live-park-OFF
 //   == live-park-ON, with each link an apples-to-apples comparison.
 //
-// On Apple Silicon there is NO real CPU monitor-wait primitive (the
-// doorbell ring is a no-op stub), so the park degrades to a sleep-recheck. The
+// On Apple Silicon there is NO real CPU monitor-wait primitive, so the park
+// degrades to a sleep-recheck. The
 // assertions are about FIRE SEQUENCE + DATA FLOW only (never timing/latency), so
 // they hold regardless of whether a real hardware park ran — the real CPU-park
 // latency is measured separately on WAITPKG/WFE hardware.
