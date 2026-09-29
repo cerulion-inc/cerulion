@@ -3081,25 +3081,42 @@ fn observation_edges_of_source(
 }
 
 /// One row of the committed table.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+///
+/// `witness` is the source FILE, and `line` is the line inside it that the walk
+/// derived; a row parsed from the table carries `None`. The witness column is
+/// the file alone: a change that reflows a source above a witnessed literal
+/// moves the line and alters no edge, and the parser refuses a witness ending
+/// in `:digits`, naming the rule.
+#[derive(Clone, Debug)]
 struct ObservationEdge {
     observing: String,
     observed: String,
     kind: String,
     witness: String,
+    line: Option<usize>,
 }
 
 impl ObservationEdge {
-    fn line(&self) -> String {
+    /// The row as the table carries it: the witness file, never the line.
+    fn row(&self) -> String {
         format!(
             "{}\t{}\t{}\t{}",
             self.observing, self.observed, self.kind, self.witness
         )
     }
+
+    /// Where a reader opens the edge: the witness with the line when the edge
+    /// came from the walk, the file alone when the row was parsed from the table.
+    fn location(&self) -> String {
+        match self.line {
+            Some(line) => format!("{}:{line}", self.witness),
+            None => self.witness.clone(),
+        }
+    }
 }
 
 /// The observation edges this tree carries, one row per
-/// `(observing, observed, kind)` with the FIRST source line that witnesses it.
+/// `(observing, observed, kind)` with the FIRST source that witnesses it.
 ///
 /// One row per FACT, not one per occurrence: a package that walks the whole
 /// tree from forty sources owes one row, and the row names the source a reader
@@ -3130,10 +3147,10 @@ fn derived_observation_edges() -> Vec<ObservationEdge> {
             for (observed, kind, line) in
                 observation_edges_of_source(&src, package, rel, &members, &multi, &cdylibs)
             {
-                // The witness is the FIRST source line, and `first` is decided
-                // on the (path, LINE NUMBER) pair. Compared as the formatted
-                // string `path:line` it was decided alphabetically, which puts
-                // line 10 before line 9 and made the header's own claim false.
+                // The witness is the FIRST source, and `first` is decided on
+                // the (path, LINE NUMBER) pair, so line 9 precedes line 10. The
+                // ROW carries the path alone; the line rides along and reaches
+                // a MISSING row in the failure message, where a reader opens it.
                 let witness = (source_rel.clone(), line);
                 let key = (package.clone(), observed, kind.to_string());
                 best.entry(key)
@@ -3157,7 +3174,8 @@ fn derived_observation_edges() -> Vec<ObservationEdge> {
                 observing,
                 observed,
                 kind,
-                witness: format!("{source}:{line}"),
+                witness: source,
+                line: Some(line),
             },
         )
         .collect()
@@ -3175,6 +3193,20 @@ fn committed_observation_edges() -> Vec<ObservationEdge> {
             path.display()
         )
     });
+    parse_observation_edges(&text, &path)
+}
+
+/// The rows of one table text, `path` named in every refusal.
+///
+/// A row this parser cannot read is a REFUSAL, never a skipped row: a field
+/// count other than four, a field with surrounding whitespace (the failure
+/// message indents the rows it prints by two spaces) or a witness ending in
+/// `:digits` (the line the table does not carry) stops the parse and names the
+/// file, the line and the value refused. Blank lines and lines opening with `#`
+/// are skipped. An empty field
+/// passes through to the table comparison, where no derived row matches it;
+/// `ci_selected_packages.py` refuses it outright.
+fn parse_observation_edges(text: &str, path: &Path) -> Vec<ObservationEdge> {
     let mut out = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() || line.starts_with('#') {
@@ -3189,14 +3221,64 @@ fn committed_observation_edges() -> Vec<ObservationEdge> {
             index + 1,
             fields.len()
         );
+        if let Some((column, field)) = fields.iter().enumerate().find(|(_, f)| **f != f.trim()) {
+            panic!(
+                "{}:{} column {} reads `{field}` with surrounding whitespace; every \
+                 field is the bare value, and the failure message indents the rows \
+                 it prints by two spaces",
+                path.display(),
+                index + 1,
+                column + 1
+            );
+        }
+        let witness = fields[3];
+        assert!(
+            !witness_ends_in_a_line(witness),
+            "{}:{} names the witness `{witness}`; the witness column is the FILE \
+             alone, with no `:line` suffix. The walk prints the line beside a \
+             MISSING row in the failure message.",
+            path.display(),
+            index + 1
+        );
         out.push(ObservationEdge {
             observing: fields[0].to_string(),
             observed: fields[1].to_string(),
             kind: fields[2].to_string(),
-            witness: fields[3].to_string(),
+            witness: witness.to_string(),
+            line: None,
         });
     }
     out
+}
+
+/// Whether `witness` ends in `:` and digits, the line a row must not carry.
+fn witness_ends_in_a_line(witness: &str) -> bool {
+    matches!(
+        witness.rsplit_once(':'),
+        Some((_, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())
+    )
+}
+
+/// The rows the walk derives and the table lacks, each followed by where the
+/// walk reads the edge, and the rows the table carries that no source supports.
+fn missing_and_stale(
+    derived: &[ObservationEdge],
+    committed: &[ObservationEdge],
+) -> (Vec<String>, Vec<String>) {
+    let derived_rows: BTreeMap<String, String> =
+        derived.iter().map(|e| (e.row(), e.location())).collect();
+    let committed_rows: BTreeSet<String> = committed.iter().map(ObservationEdge::row).collect();
+    let missing = derived_rows
+        .iter()
+        .filter(|(row, _)| !committed_rows.contains(*row))
+        .map(|(row, location)| format!("  {row}   (the walk reads it at {location})"))
+        .collect();
+    let stale = committed_rows
+        .iter()
+        .filter(|row| !derived_rows.contains_key(*row))
+        .map(|row| format!("  {row}"))
+        .collect();
+    (missing, stale)
 }
 
 /// The hand scan of the observation edges this tree carries.
@@ -3356,39 +3438,38 @@ fn the_committed_observation_edge_table_matches_the_walk() {
          row per edge",
         observation_edges_path().display()
     );
-    let mut sorted = committed.clone();
+    let committed_rows: Vec<String> = committed.iter().map(ObservationEdge::row).collect();
+    let mut sorted = committed_rows.clone();
     sorted.sort();
     assert_eq!(
-        committed,
+        committed_rows,
         sorted,
-        "{} is not sorted; the walk writes it sorted so a diff of the file is \
-         a diff of the edges",
+        "{} is not in byte order; the rows are sorted so a diff of the file is a \
+         diff of the edges",
         observation_edges_path().display()
     );
 
-    let derived_lines: BTreeSet<String> = derived.iter().map(ObservationEdge::line).collect();
-    let committed_lines: BTreeSet<String> = committed.iter().map(ObservationEdge::line).collect();
-    let missing: Vec<&String> = derived_lines.difference(&committed_lines).collect();
-    let stale: Vec<&String> = committed_lines.difference(&derived_lines).collect();
+    // THE ROW IS THE EQUALITY; a MISSING row prints beside it where the walk
+    // reads the edge (file and line). The rows a reader adds carry the file alone.
+    let derived_rows: BTreeSet<String> = derived.iter().map(ObservationEdge::row).collect();
+    assert!(
+        !derived.is_empty(),
+        "the walk derived no observation edge; the table has nothing to match"
+    );
+    let committed_rows: BTreeSet<String> = committed_rows.into_iter().collect();
+    let (missing, stale) = missing_and_stale(&derived, &committed);
     assert_eq!(
-        committed_lines,
-        derived_lines,
+        committed_rows,
+        derived_rows,
         "{} does not match the observation edges the sources carry.\n\nMISSING \
-         (add each line to the file):\n{}\n\nSTALE (delete each line):\n{}\n\nThe \
-         file is read by `tools/scripts/ci_selected_packages.py \
-         --observation-edges`, so a MISSING row is a package the selection can \
-         skip while a test of it observes the change.",
+         (add each row to the file, WITHOUT the line):\n{}\n\nSTALE (delete \
+         each row):\n{}\n\nThe file is read by \
+         `tools/scripts/ci_selected_packages.py --observation-edges`, so a \
+         MISSING row is a package the selection can skip while a test of it \
+         observes the change.",
         observation_edges_path().display(),
-        missing
-            .iter()
-            .map(|m| format!("  {m}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        stale
-            .iter()
-            .map(|m| format!("  {m}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        missing.join("\n"),
+        stale.join("\n"),
     );
 }
 
@@ -3431,6 +3512,141 @@ fn fixture_edges(src: &str) -> BTreeSet<SourceEdge> {
 
 fn edge(observed: &str, kind: &'static str, line: usize) -> BTreeSet<SourceEdge> {
     [(observed.to_string(), kind, line)].into_iter().collect()
+}
+
+/// A line added above a witnessed literal leaves the ROW and moves the line the
+/// failure prints, and an edge onto another member is another row.
+#[test]
+fn a_line_above_a_witness_moves_the_printed_line_and_leaves_the_row() {
+    let beta_src = format!("crates{}beta{}src{}lib.rs", "/", "/", "/");
+    let gamma_src = format!("crates{}nest{}gamma{}src{}lib.rs", "/", "/", "/", "/");
+    let plain = format!("let p = root.join(\"{beta_src}\");\n");
+    let reflowed = format!("// a line this change adds above it\n{plain}");
+    let witness = format!("crates{}alpha{}src{}lib.rs", "/", "/", "/");
+    let edges = |src: &str| -> Vec<ObservationEdge> {
+        fixture_edges(src)
+            .into_iter()
+            .map(|(observed, kind, line)| ObservationEdge {
+                observing: "alpha".to_string(),
+                observed,
+                kind: kind.to_string(),
+                witness: witness.clone(),
+                line: Some(line),
+            })
+            .collect()
+    };
+    let rows =
+        |src: &str| -> BTreeSet<String> { edges(src).iter().map(ObservationEdge::row).collect() };
+    let locations = |src: &str| -> BTreeSet<String> {
+        edges(src).iter().map(ObservationEdge::location).collect()
+    };
+    let one = |row: String| -> BTreeSet<String> { [row].into_iter().collect() };
+
+    assert_eq!(
+        rows(&plain),
+        one(format!("alpha\tbeta\tcrate-path\t{witness}")),
+        "the plain source is one crate-path row onto beta"
+    );
+    assert_eq!(
+        rows(&reflowed),
+        rows(&plain),
+        "the same edge one line further down is the same row"
+    );
+    assert_eq!(
+        locations(&plain),
+        one(format!("{witness}:1")),
+        "the walk reads the plain source's edge at line 1"
+    );
+    assert_eq!(
+        locations(&reflowed),
+        one(format!("{witness}:2")),
+        "and at line 2, below the added line"
+    );
+
+    // BOTH SIDES: an edge onto another member is a different row, so the rule
+    // is not satisfied by a projection that forgets what it observed.
+    let changed = format!("let p = root.join(\"{gamma_src}\");\n");
+    assert_eq!(
+        rows(&changed),
+        one(format!("alpha\tgamma\tcrate-path\t{witness}")),
+        "an edge onto another member is another row"
+    );
+}
+
+/// A MISSING row prints the row the reader adds and, beside it, the file and
+/// line where the walk reads the edge; a STALE row prints the row alone.
+#[test]
+fn a_missing_row_prints_where_the_walk_reads_it_and_a_stale_row_prints_bare() {
+    let witness = format!("crates{}alpha{}src{}lib.rs", "/", "/", "/");
+    let edge = |observed: &str, line: Option<usize>| ObservationEdge {
+        observing: "alpha".to_string(),
+        observed: observed.to_string(),
+        kind: EDGE_CRATE_PATH.to_string(),
+        witness: witness.clone(),
+        line,
+    };
+    let derived = [edge("beta", Some(7)), edge("delta", Some(3))];
+    let committed = [edge("delta", None), edge("gamma", None)];
+    let (missing, stale) = missing_and_stale(&derived, &committed);
+    assert_eq!(
+        missing,
+        [format!(
+            "  alpha\tbeta\tcrate-path\t{witness}   (the walk reads it at {witness}:7)"
+        )],
+        "the row the table lacks, then where the walk reads it"
+    );
+    assert_eq!(
+        stale,
+        [format!("  alpha\tgamma\tcrate-path\t{witness}")],
+        "the row no source supports, bare"
+    );
+}
+
+/// The parser takes a row's witness as the file, verbatim and without a line,
+/// past comment and blank lines.
+#[test]
+fn the_table_parser_takes_the_witness_as_the_file_alone() {
+    let alpha_src = format!("crates{}alpha{}src{}lib.rs", "/", "/", "/");
+    let text = format!("# a comment\n\nalpha\tbeta\tcrate-path\t{alpha_src}\n");
+    let rows = parse_observation_edges(&text, Path::new("observation_edges.tsv"));
+    assert_eq!(
+        rows.len(),
+        1,
+        "one data row past a comment and a blank line"
+    );
+    assert_eq!(
+        rows[0].row(),
+        format!("alpha\tbeta\tcrate-path\t{alpha_src}")
+    );
+    assert_eq!(rows[0].line, None, "a parsed row carries no line");
+    assert_eq!(
+        rows[0].location(),
+        alpha_src,
+        "and its location is the file alone"
+    );
+}
+
+/// A row pasted with the two-space indent the failure message prints is refused
+/// with the column named.
+#[test]
+#[should_panic(expected = "column 1 reads `  alpha` with surrounding whitespace")]
+fn the_table_parser_refuses_a_field_with_surrounding_whitespace() {
+    let alpha_src = format!("crates{}alpha{}src{}lib.rs", "/", "/", "/");
+    parse_observation_edges(
+        &format!("  alpha\tbeta\tcrate-path\t{alpha_src}\n"),
+        Path::new("observation_edges.tsv"),
+    );
+}
+
+/// A row whose witness still carries `:line` is refused with the rule named.
+#[test]
+#[should_panic(expected = "no `:line` suffix")]
+fn the_table_parser_refuses_a_witness_that_carries_a_line() {
+    let alpha_src = format!("crates{}alpha{}src{}lib.rs", "/", "/", "/");
+    parse_observation_edges(
+        &format!("alpha\tbeta\tcrate-path\t{alpha_src}:12\n"),
+        Path::new("observation_edges.tsv"),
+    );
 }
 
 /// The directory that holds more than one member is the one a walk of it

@@ -221,10 +221,10 @@ jobs:
             # the CONSERVATIVE reading, not the more accurate one: on a merge
             # ref GitHub rebuilt after a rewrite of the target branch, the first
             # parent is still the tip the branch was merged onto and the
-            # fallback over-reports what that branch gained. An unresolvable
-            # `base.sha` fails the same test, falls back the same way, and the
-            # diff below then refuses and reds this job rather than classifying
-            # from nothing. Same rule as `check_added_lines.py`.
+            # fallback over-reports what that branch gained. An unresolvable or
+            # empty `base.sha` fails the same test, falls back the same way, and
+            # the probe below refuses it and reds this job rather than
+            # classifying from nothing. Same rule as `check_added_lines.py`.
             if PARENT=$(git rev-parse --verify -q HEAD^2 >/dev/null 2>&1 \
                         && git rev-parse --verify HEAD^1) \
                && git merge-base --is-ancestor "$BASE_SHA" "$PARENT"; then
@@ -234,6 +234,13 @@ jobs:
               BASE="$BASE_SHA"
               echo "selection: base=$BASE from the event"
             fi
+            # THE PROBE: the base names a commit before the diff reads it. An
+            # empty base turns `$BASE...HEAD` into `...HEAD`, a range git reads
+            # as HEAD against HEAD, so the diff lists no path, the classifier
+            # selects nothing and every gated step skips; a base that names no
+            # commit errors inside the diff. Both stop here, the value printed.
+            git rev-parse --verify -q "$BASE^{commit}" > /dev/null \
+              || { echo "selection: base '$BASE' does not name a commit"; exit 1; }
             # THREE DOTS, which matter only when the base is NOT an ancestor of
             # HEAD: on the fallback above, a `base.sha` the target branch no
             # longer contains. Two dots there report every path the two commits

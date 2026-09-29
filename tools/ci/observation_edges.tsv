@@ -1,37 +1,45 @@
 # Observation edges: what a test observes WITHOUT a cargo dependency edge.
 #
-# DERIVED, never hand-written: `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs`
-# walks every workspace member's `tests/**` and `src/**` and writes this table,
-# and `the_committed_observation_edge_table_matches_the_walk` fails on a MISSING
-# row and on a STALE one. `tools/scripts/ci_selected_packages.py
-# --observation-edges` unions the edges into the reverse cargo closure.
+# DERIVED: `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` walks
+# every workspace member's `tests/**` and `src/**` and demands this table row
+# for row; `the_committed_observation_edge_table_matches_the_walk` fails on a
+# MISSING row and on a STALE one, printing the rows to add and to delete.
+# `tools/scripts/ci_selected_packages.py --observation-edges` unions the edges
+# into the reverse cargo closure.
 #
 # Columns, tab separated: observing package, observed package, kind, and the
-# source line that witnesses the edge. One row per edge; the witness is the
-# first source line that carries it, first by path and then by LINE NUMBER.
+# source FILE that witnesses the edge. One row per edge; the witness is the
+# first source that carries it, first by path and then by line number.
+#
+# THE ROW CARRIES NO LINE. A change that reflows a source above a witnessed
+# literal moves the line and alters no edge; the test's parser refuses a witness
+# ending in `:digits`, naming the rule. The walk still derives the line and
+# prints it beside a MISSING row in the failure message, so a reader opens the
+# line rather than the file.
+#
 # `all` in the observed column means the walk
 # could not attribute the read to one package, so the observing package rides
 # every selection that names a package and no step of it may be gated.
-cerulion_cli	all	unattributable	crates/cerulion_cli/tests/mp_supervisor_box_test.rs:420
-cerulion_cli	all	whole-tree	crates/cerulion_cli/tests/replay_cli_test.rs:690
-cerulion_cli	cerulion_heaphook	dlopen	crates/cerulion_cli/tests/ros2_run_e2e_test.rs:242
-cerulion_cli	rmw_cerulion	dlopen	crates/cerulion_cli/tests/ros2_graph_e2e_test.rs:410
-cerulion_cli_engine	all	whole-tree	crates/cerulion_cli_engine/tests/block_colocation_adoption_test.rs:81
-cerulion_cli_engine	cerulion_cli	crate-path	crates/cerulion_cli_engine/src/shm_state.rs:4354
-cerulion_cli_engine	cerulion_core	crate-path	crates/cerulion_cli_engine/src/replay_engine.rs:21907
-cerulion_cli_engine	cerulion_heaphook	dlopen	crates/cerulion_cli_engine/src/ros2_cmd.rs:94
-cerulion_cli_engine	cerulion_wsd	crate-path	crates/cerulion_cli_engine/tests/workspace_lock_verb_adoption_test.rs:145
-cerulion_cli_engine	go2_tf_source	crate-path	crates/cerulion_cli_engine/tests/dependency_door_test.rs:99
-cerulion_cli_engine	native_ros2_messages	crate-path	crates/cerulion_cli_engine/src/workspace.rs:431
-cerulion_cli_engine	rmw_cerulion	dlopen	crates/cerulion_cli_engine/src/ros2_cmd.rs:83
-cerulion_core	all	whole-tree	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs:619
-cerulion_core	cerulion_bagd	crate-path	crates/cerulion_core/tests/doc_attachment_discipline_test.rs:70
-cerulion_core	cerulion_cli_engine	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs:683
-cerulion_core	cerulion_macros	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs:618
-cerulion_hygiene	all	whole-tree	crates/cerulion_hygiene/tests/crate_license_texts_test.rs:259
-cerulion_hygiene	cerulion_cli	crate-path	crates/cerulion_hygiene/tests/shipped_surface_structure_test.rs:658
-cerulion_hygiene	go2_tf	crate-path	crates/cerulion_hygiene/tests/dependency_rules_test.rs:1068
-cerulion_hygiene	go2_tf_source	crate-path	crates/cerulion_hygiene/tests/dependency_rules_test.rs:1046
-cerulion_hygiene	native_ros2_messages	crate-path	crates/cerulion_hygiene/tests/crate_license_texts_test.rs:315
-rmw_cerulion	cerulion_heaphook	crate-path	crates/rmw_cerulion/src/heaphook.rs:834
-rmw_cerulion	cerulion_heaphook	dlopen	crates/rmw_cerulion/tests/rmw_adopt_take_linux_test.rs:74
+cerulion_cli	all	unattributable	crates/cerulion_cli/tests/mp_supervisor_box_test.rs
+cerulion_cli	all	whole-tree	crates/cerulion_cli/tests/replay_cli_test.rs
+cerulion_cli	cerulion_heaphook	dlopen	crates/cerulion_cli/tests/ros2_run_e2e_test.rs
+cerulion_cli	rmw_cerulion	dlopen	crates/cerulion_cli/tests/ros2_graph_e2e_test.rs
+cerulion_cli_engine	all	whole-tree	crates/cerulion_cli_engine/tests/block_colocation_adoption_test.rs
+cerulion_cli_engine	cerulion_cli	crate-path	crates/cerulion_cli_engine/src/shm_state.rs
+cerulion_cli_engine	cerulion_core	crate-path	crates/cerulion_cli_engine/src/replay_engine.rs
+cerulion_cli_engine	cerulion_heaphook	dlopen	crates/cerulion_cli_engine/src/ros2_cmd.rs
+cerulion_cli_engine	cerulion_wsd	crate-path	crates/cerulion_cli_engine/tests/workspace_lock_verb_adoption_test.rs
+cerulion_cli_engine	go2_tf_source	crate-path	crates/cerulion_cli_engine/tests/dependency_door_test.rs
+cerulion_cli_engine	native_ros2_messages	crate-path	crates/cerulion_cli_engine/src/workspace.rs
+cerulion_cli_engine	rmw_cerulion	dlopen	crates/cerulion_cli_engine/src/ros2_cmd.rs
+cerulion_core	all	whole-tree	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
+cerulion_core	cerulion_bagd	crate-path	crates/cerulion_core/tests/doc_attachment_discipline_test.rs
+cerulion_core	cerulion_cli_engine	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
+cerulion_core	cerulion_macros	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
+cerulion_hygiene	all	whole-tree	crates/cerulion_hygiene/tests/crate_license_texts_test.rs
+cerulion_hygiene	cerulion_cli	crate-path	crates/cerulion_hygiene/tests/shipped_surface_structure_test.rs
+cerulion_hygiene	go2_tf	crate-path	crates/cerulion_hygiene/tests/dependency_rules_test.rs
+cerulion_hygiene	go2_tf_source	crate-path	crates/cerulion_hygiene/tests/dependency_rules_test.rs
+cerulion_hygiene	native_ros2_messages	crate-path	crates/cerulion_hygiene/tests/crate_license_texts_test.rs
+rmw_cerulion	cerulion_heaphook	crate-path	crates/rmw_cerulion/src/heaphook.rs
+rmw_cerulion	cerulion_heaphook	dlopen	crates/rmw_cerulion/tests/rmw_adopt_take_linux_test.rs
