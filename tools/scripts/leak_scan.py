@@ -999,9 +999,9 @@ GLUED_TAG_RX = re.compile(r'@(?:' + '|'.join(TAGS) + r')$', re.I)
 # The two KEYS. A key is an entry like any other: it counts in the index, it
 # compiles to a pattern that is HARD in every mode, and its value never prints.
 # `tracker-host:` additionally tells the reference class that a link to that
-# host is a defect, the way `linear.app` already is. `repo-slug:` is the one
-# shape the generic reference class cannot see: a repository named by a single
-# word, with no separator and no link around it, which reads as prose.
+# host is a defect, the way a host in `TRACKER_HOSTS` already is. `repo-slug:`
+# is the one shape the generic reference class cannot see: a repository named
+# by a single word, with no separator and no link around it, reading as prose.
 KEYS = {'tracker-host': 'host', 'repo-slug': 'slug'}
 KEY_PREFIX_RX = re.compile(r'(?:' + '|'.join(KEYS) + r'):', re.I)
 KEY_RX = re.compile(r'(' + '|'.join(KEYS) + r'):(\S+)$')

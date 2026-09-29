@@ -123,11 +123,20 @@ fail() {
 # boundary rules (BSD grep has no \b, GNU grep has no [[:<:]]).
 # NOTE 2: literals start as a bracket class ('[f]ounder') so this list never
 # matches itself if the script is ever added to its own scan scope.
+# NOTE 3: a host literal is assembled from two pieces, the way `leak_scan.py`
+# builds `TRACKER_HOSTS` and `FORGE_HOST`, and split across two lines because
+# the bracket class alone still leaves a readable host on one line, and a host
+# can be the very thing a private pattern tier refuses to see anywhere in the
+# tree. The value the array holds is unchanged, so the derived self-test
+# fixture is too, and the self-test pins that value by checksum so a slip in
+# either piece is loud.
 # ---------------------------------------------------------------------------
+tracker_host_token='[l]inear'
+tracker_host_token="${tracker_host_token}"'\.app'
 banned_tokens=(
     '[f]ounder'
     '[p]t[0-9]+'
-    '[l]inear\.app'
+    "$tracker_host_token"
     '[c]er-[0-9]+'
     '[t]s\.net'
     '192\.168\.[0-9]{1,3}\.[0-9]{1,3}'
@@ -335,10 +344,31 @@ self_test() {
             "${#host_identity_patterns[@]}" >&2
         st_fail=1
     fi
+    if [ "${#banned_tokens[@]}" -lt 8 ]; then
+        printf 'self-test FAIL: banned_tokens has %s entries, expected at least 8; a pattern was deleted (raise this floor with every entry added)\n' \
+            "${#banned_tokens[@]}" >&2
+        st_fail=1
+    fi
+    # Every entry shares one blind spot: st_sample_for reads each sample OUT of
+    # its own pattern, so a wrong value arrives with a fixture that matches it
+    # and every arm below passes. The assembled entry (NOTE 3) is the one whose
+    # value can change without a visible edit to a literal, so a checksum pins
+    # it, and the pin states no host.
+    st_assembled=$(printf '%s' "$tracker_host_token" | cksum)
+    if [ "$st_assembled" != '162579530 13' ]; then
+        printf 'self-test FAIL: the assembled token checksums to %s, not its pinned value; one of its two pieces changed. Confirm the assembled pattern still matches the host it refuses, then update the pin\n' \
+            "$st_assembled" >&2
+        st_fail=1
+    fi
     st_dir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-agents-selftest.XXXXXX") || {
         printf 'self-test FAIL: could not create a fixture directory\n' >&2
         return 1
     }
+    # The fixture directory holds lines in the shapes this gate refuses,
+    # private-dirty.md included, so it is removed on any exit and not only on
+    # the straight-line path at the end: an interrupt, or any early exit from
+    # an arm below, would otherwise leave it behind.
+    trap 'rm -rf "$st_dir"' EXIT INT TERM
 
     # THE DIRTY FIXTURE, and how it is built is the point.
     #
