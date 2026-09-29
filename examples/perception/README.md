@@ -79,8 +79,10 @@ verification with the shifted detector:
    loop needs: `cerulion node build <type> --release` for `camera`, `detector`
    and `detector_perturbed`, then `cerulion graph validate perception_min`.
 2. **Record** `perception_min` for ~3 s: `cerulion graph run perception_min --release --single-process --record`
-   (single-process is the wall-faithful recording path; a split run records
-   on its lockstep quantum instead).
+   (single-process stays the wall-faithful recording path; under the free-run
+   default a split run records each rank's OWN wall-following boundary times,
+   and the `CERULION_EXECUTION_MODE=lockstep` opt-out records on the handed
+   quantum instead).
 3. **Replay #1 (golden):** `cerulion bag play <bag> --resim all --verify --tolerance tolerance.yaml`: **exit 0**, `replay PASS`.
 4. **Swap** `libdetector_perturbed` over `libdetector` (the deliberate output regression).
 5. **Replay #2 (perturbed):** same command: **exit 1**, a `bbox_iou` regression:

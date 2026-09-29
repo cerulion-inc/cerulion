@@ -1017,11 +1017,15 @@ impl GraphTopology {
     /// faster-tier sink levels). See the in-body comment for the full
     /// derivation.
     ///
-    /// Growing the count is safe for CONSISTENCY across processes: the
-    /// assignment is FROZEN into the graph yaml (`level_assignments:`) and
-    /// every process derives its barrier generations from the same block, so
-    /// cross-process consistency holds at ANY count by construction. But
-    /// growth is NOT free for multi-process CADENCE: the level-lockstep
+    /// Growing the count is safe for CONSISTENCY across processes in every
+    /// execution mode: the assignment is FROZEN into the graph yaml
+    /// (`level_assignments:`) and every process reads its levelization from
+    /// that one block rather than re-deriving one, so every rank names the
+    /// same DAG stage by the same index at ANY count by construction. Under
+    /// the `CERULION_EXECUTION_MODE=lockstep` opt-out that is also what makes
+    /// the per-step barrier generations agree across ranks. But
+    /// growth is NOT free for the CADENCE of a multi-process run under the
+    /// `CERULION_EXECUTION_MODE=lockstep` opt-out: the level-lockstep
     /// barrier advances ONE generation per level, so +1 level = +1
     /// cross-process rendezvous per step (measured ~19% chain-cadence cost at
     /// neutral p50; growth still HELPS the monolith, ~−10% p50). Growth is
@@ -1064,9 +1068,12 @@ impl GraphTopology {
     ///   level. `debug_assert`ed against the input node count.
     /// * **Contiguous, no empty level.** The level count may GROW (cascade)
     ///   under [`LevelGrowth::Allow`] but the final assignment is COMPRESSED
-    ///   to a contiguous `0..K` range with every level occupied (the barrier
-    ///   advances one generation per level, so empties are structurally
-    ///   excluded), and `K` never exceeds the node count. With no applied
+    ///   to a contiguous `0..K` range with every level occupied (the level
+    ///   index is what the executor and the merged fire trace name a DAG stage
+    ///   by, in every mode; under the `CERULION_EXECUTION_MODE=lockstep`
+    ///   opt-out the cross-process barrier additionally advances one generation
+    ///   per level, so empties are structurally excluded), and `K` never
+    ///   exceeds the node count. With no applied
     ///   cascade the count is preserved exactly (phase 1 alone cannot move a
     ///   critical-path node: by induction from its sink each has zero slack).
     ///   Under [`LevelGrowth::Deny`] the count can NEVER grow (every
@@ -1234,9 +1241,11 @@ impl GraphTopology {
         // would violate strict increase (transitively), appending levels as
         // needed, so a whole dense chain slides later uniformly and vacates
         // the fast chain's gating level. Cross-process consistency at ANY
-        // count holds by construction: the assignment is FROZEN in the yaml
-        // and every process derives its barrier generations from the same
-        // block.
+        // count holds by construction: the assignment is FROZEN in the yaml,
+        // so every process reads the same levels from the same block. That is
+        // all a free-run rank needs (it steps its own levels on its own
+        // clock); under the `CERULION_EXECUTION_MODE=lockstep` opt-out it is
+        // also what makes every process derive the same barrier generations.
         //
         // A node's CHAIN RATE is its observed fire cadence, which the
         // profiler measures at the OUTGOING edge:
@@ -1543,9 +1552,18 @@ impl GraphTopology {
     /// [`TransportError`] — hand-edited files are untrusted input):
     ///
     /// 1. **No empty level** (contiguity): the levels vector has no empty
-    ///    entry — the multi-process barrier advances ONE generation per
-    ///    level, so an empty level would desync the per-step generation
-    ///    math across processes.
+    ///    entry. TRUE IN BOTH MODES, and for a reason the barrier does not
+    ///    own: the level INDEX is how every consumer names a DAG stage. The
+    ///    executor runs the levels vector by index
+    ///    (`GraphRuntime::step_live`'s `0..levels.len()` loop), every fire
+    ///    record is stamped with the level it fired at and merged on it, and
+    ///    the derived levelization this assignment replaces is COMPRESSED to a
+    ///    gap-free `0..K` by construction (see [`Self::refine_levels`]), so an
+    ///    empty level is an index with no stage behind it. Under the
+    ///    `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process barrier
+    ///    is a FURTHER consumer of that index, advancing ONE generation per
+    ///    level, and there an empty level would additionally desync the
+    ///    per-step generation math across processes.
     /// 2. **Every trigger edge strictly level-increasing**: for every
     ///    TRIGGERING consumer edge, `level(producer) < level(consumer)` —
     ///    else the consumer would fire in the same step-phase as (or before)
@@ -1566,10 +1584,16 @@ impl GraphTopology {
         for (idx, level) in levels.iter().enumerate() {
             if level.nodes.is_empty() {
                 return Some(format!(
-                    "level {idx} is EMPTY — assigned levels must form a contiguous \
-                     0..={} range with no gaps (the multi-process barrier advances \
-                     one generation per level, so an empty level would desync the \
-                     generation math); renumber the levels to close the gap",
+                    "level {idx} is EMPTY: assigned levels must form a contiguous \
+                     0..={} range with no gaps. The level INDEX is how every consumer \
+                     names a DAG stage (the executor runs the levels vector by index, \
+                     and every fire record is stamped and merged on the level it fired \
+                     at), and the derived levelization this map replaces never emits a \
+                     gap, so an empty level is an index with no stage behind it. Under \
+                     the `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process \
+                     barrier advances one generation per level and is a further consumer \
+                     of that same index, so there an empty level would also desync the \
+                     generation math. Renumber the levels to close the gap",
                     levels.len().saturating_sub(1)
                 ));
             }
@@ -2022,15 +2046,17 @@ impl Levels {
 ///
 /// A cascade slides a dense chain later, appending levels when the chain has
 /// no slack below the current max (the flagship perception-pipeline shape).
-/// Growth HELPS a single-process (monolith) graph — measured −10% p50 with a
-/// tail collapse — but is NOT free for a multi-process split: the
-/// level-lockstep barrier advances ONE generation per level, so +1 level =
-/// +1 cross-process rendezvous per step (measured ~19% chain-cadence cost at
-/// neutral p50). Growth is therefore gated on the EMITTED shape — a
-/// graph destined for a multi-group `process_groups:` partition refines under
-/// [`Deny`], a single-group (monolith) graph under [`Allow`]. The gate is a
-/// pure point-predicate on each cascade's target-level set, so refinement
-/// stays byte-reproducible (Principle #7) in BOTH modes.
+/// Growth HELPS a single-process (monolith) graph (measured 10% lower p50 with
+/// a tail collapse) but is NOT free for a multi-process split run under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out: there the cross-process barrier
+/// advances ONE generation per level, so +1 level = +1 cross-process
+/// rendezvous per step (the ~19% chain-cadence cost at neutral p50 was measured
+/// in that mode). Growth is therefore gated on the EMITTED shape, not on the
+/// execution mode, which is resolved later and is the user's to change between
+/// runs: a graph destined for a multi-group `process_groups:` partition refines
+/// under [`Deny`], a single-group (monolith) graph under [`Allow`]. The gate is
+/// a pure point-predicate on each cascade's target-level set, so refinement
+/// stays byte-reproducible (Principle #7) whichever growth setting it runs on.
 ///
 /// [`Allow`]: LevelGrowth::Allow
 /// [`Deny`]: LevelGrowth::Deny
@@ -2040,7 +2066,7 @@ pub enum LevelGrowth {
     /// earlier behavior, and the DEFAULT — so every construction that
     /// omits the field is byte-stable with the pre-gate output. Correct for a
     /// single-group (monolith) destination, where each extra level is a free
-    /// scheduler phase, not a cross-process barrier generation.
+    /// scheduler phase and no cross-process rendezvous can be built over it.
     #[default]
     Allow,
     /// A cascade whose target levels would EXCEED the Kahn input's max level
@@ -2049,8 +2075,8 @@ pub enum LevelGrowth {
     /// cascades (every target within the original `0..base.len()` range)
     /// still apply: the gate kills GROWTH, not cascading. Set by the
     /// shape-gated `cerulion graph partition` wiring when the graph
-    /// bands into multiple process groups, so refinement never adds a
-    /// cross-process barrier generation.
+    /// bands into multiple process groups, so refinement never adds a level a
+    /// lockstep run would spend a cross-process barrier generation on.
     Deny,
 }
 
@@ -5110,11 +5136,21 @@ mod tests {
             .expect_err("gapped level range must be rejected");
         let msg = format!("{err}");
         assert!(msg.contains("level 1 is EMPTY"), "names the gap: {msg}");
+        // The WHY must be true on a DEFAULT (free-run) load, which maps no
+        // barrier at all: the mode-independent half comes first and the
+        // barrier appears only as the opt-out's further consumer.
         assert!(
-            msg.contains("barrier advances one generation per level"),
-            "explains the WHY: {msg}"
+            msg.contains("The level INDEX is how every consumer names a DAG stage"),
+            "explains the WHY without a barrier: {msg}"
         );
-        assert!(msg.contains("renumber"), "remedy: {msg}");
+        assert!(
+            msg.contains(
+                "Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process \
+                 barrier advances one generation per level"
+            ),
+            "scopes the barrier clause to the mode that has one: {msg}"
+        );
+        assert!(msg.contains("Renumber"), "remedy: {msg}");
     }
 
     #[test]

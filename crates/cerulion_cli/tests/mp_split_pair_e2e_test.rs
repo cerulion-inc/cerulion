@@ -58,6 +58,19 @@
 //! gate, so the ORDERING guarantee is pinned where it can be made deterministic:
 //! the in-process A/B, which reproduces the defect on demand.
 //!
+//! # This file measures the LOCKSTEP opt-out, on purpose
+//!
+//! A `process_groups:` run FREE-RUNS by default, and a free-run deployment
+//! creates NO barrier (the end-of-level one or the mid-level one), so the
+//! classify -> stamp -> serialise -> install chain this file discriminates on
+//! only exists under `CERULION_EXECUTION_MODE=lockstep`.
+//! The spawn PINS that opt-out explicitly (never inherited from the developer's
+//! shell). It is not a test silently switched to stay green: the property under
+//! test is the mid-level barrier's plumbing, which is a lockstep mechanism by
+//! construction; the default path's own witnesses live in
+//! `mp_execution_mode_e2e_test.rs` and `mp_record_e2e_test.rs` (the `Default`
+//! arm).
+//!
 //! # The two arms
 //!
 //! 1. **Record -> re-execute -> EXIT 0.** The bag passes its own
@@ -278,6 +291,13 @@ fn record_split_pair_bag(tag: &str) -> (tempfile::TempDir, PathBuf) {
             .current_dir(tmp.path())
             .env_remove("CARGO_TARGET_DIR")
             .env("CERULION_NETWORK", "off")
+            // A supervisor run FREE-RUNS by default, and a free-run
+            // deployment has NO barrier (mid-level or otherwise), so the
+            // plumbing chain this file discriminates on only exists
+            // under the `lockstep` opt-out. Pinned explicitly (never
+            // inherited from the developer's shell), and stated in the module
+            // docs: this file measures the opt-out path, on purpose.
+            .env("CERULION_EXECUTION_MODE", "lockstep")
             .env(
                 "RUST_LOG",
                 "cerulion=info,cerulion_cli_engine=info,cerulion_bagd=info",

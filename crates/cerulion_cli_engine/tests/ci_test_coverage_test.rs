@@ -119,6 +119,14 @@
 //! `job_is_gated` and pinned by
 //! `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
 //!
+//! THE BASE, PROBED BEFORE THE DIFF READS IT. The classifier's step resolves a
+//! base, then diffs `$BASE...HEAD` for the changed paths. An empty base turns
+//! that range into `...HEAD`, which git reads as HEAD against HEAD: no path,
+//! `pkgs=[]`, every gated step skipped and nothing red. The step probes
+//! `$BASE^{commit}` first and fails the job with the value printed; the walk
+//! pins the probe, its refusal and their order ahead of the diff in the script
+//! text: `the_selection_job_probes_the_base_before_the_diff_reads_it`.
+//!
 //! The producing rule reads the script TEXT, so `ci.yml`'s own `changes` job
 //! grounds today only because its non-pull-request branch spells
 //! `packaging=false` literally, its pull-request branch piping
@@ -3248,6 +3256,72 @@ const SELECTION_SWITCH_DECLARATION: &str = "  CI_SELECTION: ${{ vars.CI_SELECTIO
 /// The job whose script has to READ the switch, and the step that reads it.
 const SELECTION_SWITCH_READER_STEP: &str = "classify";
 
+/// The probe the `classify` step runs on the base it resolved, before the diff.
+const SELECTION_BASE_PROBE: &str = "git rev-parse --verify -q \"$BASE^{commit}\"";
+
+/// The probe's refusal: a `selection:` marker line carrying the value, then a
+/// failing exit.
+const SELECTION_BASE_REFUSAL: &str =
+    "|| { echo \"selection: base '$BASE' does not name a commit\"; exit 1; }";
+
+/// The diff that lists the changed paths from that base.
+const SELECTION_BASE_DIFF: &str = "git diff --name-only --no-renames \"$BASE...HEAD\"";
+
+/// Whether `script` carries the probe, then its refusal VERBATIM, then the
+/// diff, in the script TEXT; `Err` names what is missing or out of order.
+///
+/// An empty base turns `$BASE...HEAD` into `...HEAD`, a range git reads as
+/// HEAD against HEAD, so a diff that runs first lists no path and the
+/// classifier selects nothing. A probe whose `||` branch does not exit lets the
+/// same base through, so the refusal text is pinned with the probe; a reworded
+/// refusal re-pins here on purpose.
+fn base_probe_guards_diff(script: &str) -> Result<(), String> {
+    let probe = script
+        .find(SELECTION_BASE_PROBE)
+        .ok_or_else(|| format!("no `{SELECTION_BASE_PROBE}`"))?;
+    let diff = script
+        .find(SELECTION_BASE_DIFF)
+        .ok_or_else(|| format!("no `{SELECTION_BASE_DIFF}`"))?;
+    if probe >= diff {
+        return Err(format!(
+            "the probe follows the diff, so an empty base reaches `{SELECTION_BASE_DIFF}` first"
+        ));
+    }
+    if !script[probe..diff].contains(SELECTION_BASE_REFUSAL) {
+        return Err(format!(
+            "no `{SELECTION_BASE_REFUSAL}` between the probe and the diff; the refusal is \
+             pinned verbatim"
+        ));
+    }
+    Ok(())
+}
+
+/// The `run:` script of the `classify` step of the `changes` job in ci.yml.
+fn selection_classifier_script(texts: &BTreeMap<String, String>) -> String {
+    let ci = texts
+        .get("ci.yml")
+        .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
+    let jobs = jobs_of(ci);
+    let (_, block) = jobs
+        .iter()
+        .find(|(name, _)| name == SELECTION_JOB)
+        .unwrap_or_else(|| panic!("ci.yml carries no `{SELECTION_JOB}` job"));
+    let reader = step_blocks(block)
+        .into_iter()
+        .find(|b| step_id_of(b).as_deref() == Some(SELECTION_SWITCH_READER_STEP))
+        .unwrap_or_else(|| {
+            panic!(
+                "the `{SELECTION_JOB}` job carries no step with id `{SELECTION_SWITCH_READER_STEP}`"
+            )
+        });
+    run_script_of(&reader).unwrap_or_else(|| {
+        panic!(
+            "the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job carries no \
+             `run:` script"
+        )
+    })
+}
+
 /// The prefix every selection skip line carries.
 const SELECTION_MARKER_PREFIX: &str = "selection:";
 
@@ -3495,20 +3569,7 @@ fn the_selection_switch_is_declared_once_and_read_by_the_classifier() {
 
     // The switch reaches the CLASSIFIER, and the classifier alone. A switch
     // nothing reads is a switch that stops nothing.
-    let jobs = jobs_of(ci);
-    let (_, block) = jobs
-        .iter()
-        .find(|(name, _)| name == SELECTION_JOB)
-        .unwrap_or_else(|| panic!("ci.yml carries no `{SELECTION_JOB}` job"));
-    let reader = step_blocks(block)
-        .into_iter()
-        .find(|b| step_id_of(b).as_deref() == Some(SELECTION_SWITCH_READER_STEP))
-        .unwrap_or_else(|| {
-            panic!(
-                "the `{SELECTION_JOB}` job carries no step with id `{SELECTION_SWITCH_READER_STEP}`"
-            )
-        });
-    let script = run_script_of(&reader).unwrap_or_default();
+    let script = selection_classifier_script(&texts);
     assert!(
         script.contains(SELECTION_SWITCH),
         "the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job \
@@ -3520,6 +3581,58 @@ fn the_selection_switch_is_declared_once_and_read_by_the_classifier() {
         "the `{SELECTION_SWITCH_READER_STEP}` step never prints a \
          `{SELECTION_MARKER_PREFIX}` line, so a reader of the log cannot see \
          which way the switch was set"
+    );
+}
+
+/// The `changes` job probes the base it resolved, refuses one that names no
+/// commit, and does both before the diff reads it.
+#[test]
+fn the_selection_job_probes_the_base_before_the_diff_reads_it() {
+    let script = selection_classifier_script(&workflow_texts());
+    if let Err(why) = base_probe_guards_diff(&script) {
+        panic!("the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job: {why}");
+    }
+}
+
+/// The probe counts only with its refusal verbatim, both ahead of the diff; a
+/// refusal in other words, or one that follows the diff, does not count.
+#[test]
+fn a_base_probe_counts_only_with_its_refusal_ahead_of_the_diff() {
+    let probe = format!("{SELECTION_BASE_PROBE} > /dev/null");
+    let diff = format!("{SELECTION_BASE_DIFF} > changed.txt");
+    let no_refusal = format!(
+        "no `{SELECTION_BASE_REFUSAL}` between the probe and the diff; the refusal is pinned \
+         verbatim"
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n{SELECTION_BASE_REFUSAL}\n{diff}\n")),
+        Ok(())
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{diff}\n{probe}\n{SELECTION_BASE_REFUSAL}\n"))
+            .unwrap_err(),
+        format!(
+            "the probe follows the diff, so an empty base reaches `{SELECTION_BASE_DIFF}` first"
+        )
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n|| echo refused\n{diff}\n")).unwrap_err(),
+        no_refusal,
+        "a refusal in other words"
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n{diff}\n{SELECTION_BASE_REFUSAL}\n"))
+            .unwrap_err(),
+        no_refusal,
+        "a refusal after the diff"
+    );
+    assert_eq!(
+        base_probe_guards_diff(&diff).unwrap_err(),
+        format!("no `{SELECTION_BASE_PROBE}`")
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n{SELECTION_BASE_REFUSAL}\n")).unwrap_err(),
+        format!("no `{SELECTION_BASE_DIFF}`")
     );
 }
 

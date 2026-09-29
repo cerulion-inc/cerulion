@@ -57,8 +57,8 @@ an artifact that changed because one of its dependencies did still pulls in the
 test that loads it.
 
 `all` in the observed column means the observer reached something this walk
-could not attribute to one package: it is selected on every change, and no step
-of it may be gated.
+could not attribute to one package: it rides every selection that names a
+package, and no step of it may be gated.
 
 WITHOUT `--observation-edges` the answer is the cargo closure alone. That is what
 the flag's absence means, and it is what the self-test's live rows compare
@@ -112,8 +112,10 @@ METADATA_FORMAT_VERSION = 1
 EVERY_PACKAGE = 'all'
 
 # The number of tab-separated fields one row of the observation-edge table
-# carries: observing package, observed package, kind, and the source line that
-# witnesses it.
+# carries: observing package, observed package, kind, and the source FILE that
+# witnesses it. The row carries no line, and the table test in
+# `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` refuses a witness
+# ending in `:digits`; this reader takes the first two fields only.
 OBSERVATION_EDGE_FIELDS = 4
 
 # The committed table, relative to the repository root. Read by the live arm of
@@ -162,7 +164,7 @@ class MalformedObservationEdges(SelectionError):
 
     def __str__(self):
         return ('ci_selected_packages: malformed observation edge at %s:%d: %r; every row is '
-                '`observing_package<TAB>observed_package<TAB>kind<TAB>source_file:line`, and '
+                '`observing_package<TAB>observed_package<TAB>kind<TAB>source_file`, and '
                 '`%s` in the observed column means the whole workspace'
                 % (self.path, self.line_number, self.found, EVERY_PACKAGE))
 
@@ -320,8 +322,9 @@ def read_observation_edges(path):
     """The `(observing, observed)` pairs of a committed observation-edge table.
 
     The file is the derived table
-    `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` writes: one row
-    per edge, four tab-separated fields, blank lines and `#` comments skipped.
+    `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` demands row for
+    row: one row per edge, four tab-separated fields, blank lines and `#`
+    comments skipped.
     A row this reader cannot parse is a REFUSAL, never a skipped row: a table
     read as shorter than it is selects fewer packages than the tree demands,
     which is the silent skip every rule here exists to refuse.
@@ -453,8 +456,8 @@ OBSERVED = _document({'leaf': [], 'mid': ['leaf'], 'watcher': [], 'watcher_user'
 OBSERVATION_TABLE = '\n'.join([
     '# a comment, and the blank line below it, are skipped',
     '',
-    'watcher\tleaf\tcrate-path\tcrates/watcher/tests/a.rs:1',
-    'watcher\tmid\tdlopen\tcrates/watcher/tests/b.rs:2',
+    'watcher\tleaf\tcrate-path\tcrates/watcher/tests/a.rs',
+    'watcher\tmid\tdlopen\tcrates/watcher/tests/b.rs',
 ]) + '\n'
 
 # `name | document | touched | edges | expected closure`.
@@ -683,7 +686,7 @@ def self_test():
             got == [('watcher', 'leaf'), ('watcher', 'mid')], '-> %r' % (got,))
         for case, row in (('too-few-fields', 'watcher\tleaf\tcrate-path\n'),
                           ('too-many-fields', 'a\tb\tc\td\te\n'),
-                          ('empty-field', 'watcher\t\tcrate-path\tsrc.rs:1\n')):
+                          ('empty-field', 'watcher\t\tcrate-path\tsrc.rs\n')):
             bad = os.path.join(scratch, 'bad.tsv')
             with open(bad, 'w', encoding='utf-8') as handle:
                 handle.write(row)

@@ -343,9 +343,19 @@ pub(crate) struct TrimmedTrace {
     /// external-frame trim (see [`trim_to_anchor`]), and a capture that cannot
     /// compute it does not trim rather than guessing one.
     pub anchor_target_ns: Option<u64>,
-    /// The gating-clock target of the LAST authoritative-rank
-    /// step-boundary record KEPT — the instant a resume of this capture can
-    /// cover TO.
+    /// The gating-clock target of the LAST step-boundary record KEPT on the rank
+    /// a range is measured from ([`AUTHORITATIVE_TRACE_RANK`], rank 0): the
+    /// instant a resume of this capture can cover TO.
+    ///
+    /// What that instant MEANS across ranks is set by the run's execution mode,
+    /// and only the WRITER-and-READER agreement below is mode-independent. Under
+    /// the `CERULION_EXECUTION_MODE=lockstep` opt-out the replay engine's
+    /// `validate_step_boundaries` phase 2 refuses a bag whose peer targets differ
+    /// from rank 0's at a shared step, so this is the whole recording's instant.
+    /// Under the FREE-RUN default each rank's gating clock wall-follows on its
+    /// own from the shared epoch, that phase is mode-gated off, and cross-rank
+    /// targets differ on essentially every step: this is then rank 0's own last
+    /// target, and a peer's records can carry later ones.
     ///
     /// `None` when the kept records carry no such boundary, which is exactly the
     /// state resim refuses separately (`BagNoStepBoundaries`): a capture with no
@@ -503,11 +513,20 @@ fn walk(
                 out.first_recorded_step = Some(rec.step);
             }
             // The covered range's upper endpoint, measured over the
-            // records the BAG will carry. Rank-filtered to the authoritative
-            // rank because that is the set the replayer's own cursor walks
-            // (`BoundaryCursor::for_rank(trace, AUTHORITATIVE_TRACE_RANK)`) —
-            // a peer rank's boundary is pinned to rank 0's on every shared step
-            // and is not what a frame's timestamp is matched against.
+            // records the BAG will carry. Rank-filtered to
+            // `AUTHORITATIVE_TRACE_RANK` because that is the set the replayer's
+            // own cursor walks in BOTH modes
+            // (`BoundaryCursor::for_rank(trace, AUTHORITATIVE_TRACE_RANK)`, in
+            // the replay engine's `last_recorded_boundary_target`, which takes
+            // no coordination argument), so the writer and the reader measure
+            // one fact off one stream. The filter does NOT assert cross-rank
+            // equality: under the lockstep opt-out a peer's boundary IS pinned
+            // to rank 0's on every shared step (`validate_step_boundaries`
+            // phase 2), while under the free-run default that phase is
+            // mode-gated off and peer targets differ by design. Either way a
+            // peer's boundary is not what a frame's timestamp is matched
+            // against, so taking one here would answer off a stream the reader
+            // never walks.
             //
             // Deliberately NOT folded into `first_recorded_step`'s filter above:
             // that field answers "which step does a resume BEGIN at", which
@@ -943,15 +962,17 @@ mod tests {
         assert_eq!(out.anchor_target_ns, Some(4_000));
     }
 
-    /// The endpoint is read off the AUTHORITATIVE rank only — the set the
-    /// replayer's own `BoundaryCursor` walks.
+    /// The endpoint is read off [`AUTHORITATIVE_TRACE_RANK`] only: the set the
+    /// replayer's own `BoundaryCursor` walks, in both execution modes.
     ///
-    /// A peer rank's boundary is pinned to rank 0's on every shared step
-    /// (`validate_step_boundaries` phase 2) and is NOT what a frame's timestamp
-    /// is matched against, so taking one as the endpoint would advertise
-    /// coverage the reader's cursor never reaches. The foreign record sits LAST
-    /// in retained order and carries the HIGHER target, so a rank-blind
-    /// implementation answers `9_000` and this arm reads it directly.
+    /// A peer rank's boundary is NOT what a frame's timestamp is matched
+    /// against (under the lockstep opt-out it is pinned to rank 0's on every
+    /// shared step by `validate_step_boundaries` phase 2; under the free-run
+    /// default it belongs to a clock of its own), so taking one as the endpoint
+    /// would advertise coverage the reader's cursor never reaches. The foreign
+    /// record sits LAST in retained order and carries the HIGHER target, so a
+    /// rank-blind implementation answers `9_000` and this arm reads it
+    /// directly.
     #[test]
     fn a_foreign_ranks_boundary_never_ends_the_covered_range() {
         let mut foreign = boundary(7, 9_000);

@@ -431,15 +431,15 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 `merge_group` events like everything else: there is no cost gate, no routing expression
 and no stub job standing in for a skipped required check.
 
-`lint` gates the four push-only jobs that depend on it (`fuzz`, `miri` and the two latency
-jobs), and a red `lint` saves their runner minutes; none of the four reports a required
-context. It gates none of the four dependants that DO report one (`docs`, `netd-wan`,
-`crate-tests`, `viz-tests`): each carries the `!cancelled()` guard, which replaces the
-implicit `success()` over the whole `needs:` set, GitHub offers no per-dependency form, so
-all four run and report through a red `lint` and the dependency buys the ordering alone.
-A skipped required context counts as satisfied, which is what the guard is there to stop.
-It does NOT gate the two that set the wall: `test-linux` and `test-macos`. Both are
-`needs: [changes]` and nothing else, so both start after the
+`lint` gates the four push-only jobs that depend on it (`fuzz`, `miri`, `test-latency` and
+`cli-e2e-latency`), which no pull request and no queued batch runs; a red `lint` saves their
+runner minutes, and none of the four reports a required context. It gates none of the four
+dependants that DO report one (`docs`, `netd-wan`, `crate-tests`, `viz-tests`): each carries
+the `!cancelled()` guard, which replaces the implicit `success()` over the whole `needs:` set;
+GitHub offers no per-dependency form, so all four run and report through a red `lint`, and the
+dependency buys the ordering alone. A skipped required context counts as satisfied, which is
+what the guard is there to stop. It does NOT gate the two that set the wall: `test-linux` and
+`test-macos`. Both list `changes` and nothing else in `needs:`, so both start after the
 classifier, which is a checkout and a path classification, about a minute, and no build. No
 REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so nothing
 in front of either job is a data dependency for compilation. A `lint` verdict was never one
@@ -519,7 +519,11 @@ failed classifier skip a dependant, and a skipped required context reads as sati
 carries it in front of its own event gate, so it keeps its `push` run whatever the
 classifier did. `cerulion_cli_engine::ci_test_coverage_test` holds the rule over every
 dependant, however the job consumes the outputs, rather than over the jobs with a one-line
-selection gate alone.
+selection gate alone. The `changes` job probes the base it resolved before the diff reads
+it: an empty base turns `$BASE...HEAD` into a range over HEAD alone, which lists no path and
+selects nothing, so the probe refuses it and fails the job;
+`the_selection_job_probes_the_base_before_the_diff_reads_it` in the same test binary pins the
+probe, its refusal and their order ahead of the diff in the script text.
 
 `code`, `docs` and `pkgs` are the test-impact selection, and they run in the other
 direction: they SKIP test steps. Four rules bound them.
@@ -542,10 +546,12 @@ direction: they SKIP test steps. Four rules bound them.
   repository, or loads an artifact another package builds reaches it without a manifest
   edge. That table is derived from the sources by
   `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs`, which fails on a missing row
-  and on a stale one. A package the walk cannot attribute is recorded as observing `all`,
-  is selected on every change, and no step of it is gated: four packages are in that state
-  today, `cerulion_core` among them, which is why the `cerulion_core` shard steps carry no
-  condition at all.
+  and on a stale one. A read the walk cannot place on one package, an unattributable literal or
+  a walk over a tree holding more than one member, records the observing package as observing
+  `all`; such a package rides every selection that names a package, and no step of it is gated.
+  Four packages are in that state today, `cerulion_core` among them, which is why the
+  `cerulion_core` shard steps carry no condition of their own: the shard runner reads the
+  selection itself and prints the `selection:` line when it skips.
 
 The supported subset, stated plainly: the selection narrows PER-PACKAGE test steps on pull
 requests. It does NOT narrow the workspace build, it does not gate a job, it does not apply
@@ -681,7 +687,7 @@ before the checker reads the real files.
 | `tools/scripts/check_citation_release.sh` | citation version, calendar, and release-date window validation | n/a |
 | `crates/cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` | every member inherits the one lint table; the table's levels | no |
 | `crates/cerulion_cli_engine/tests/library_print_ban_test.rs` | every library crate carries the print ban | no |
-| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. The required names are read from `tools/ci/required_contexts.txt` | no |
+| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. The required names are read from `tools/ci/required_contexts.txt` | no |
 | `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches` or `examples`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |

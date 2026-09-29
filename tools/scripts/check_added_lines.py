@@ -24,10 +24,24 @@ comment, and enforced: the marker in a string literal, a data column or a
 heading is text the change ships rather than a decision its author recorded, and
 a file type with no comment syntax at all (`.json`) has no waiver.
 
-WHAT IT READS. `git diff <base>...HEAD` with the three-dot spelling, which
-diffs against the MERGE BASE of `<base>` and HEAD. Two dots would report every
-line `main` gained since the branch left it as a line this branch added, so a
-dash somebody else landed would red this pull request.
+WHAT IT READS. `git diff <base>...HEAD`, which diffs against the MERGE BASE of
+`<base>` and HEAD. The three dots matter only when the base is NOT an ancestor
+of HEAD, which is a base on a target branch somebody rewrote and a base that is
+an ordinary branch tip: two dots there report every line that branch gained
+since this one left it as a line this branch added. Whenever the base IS an
+ancestor of HEAD, and the first parent this file resolves to always is, the
+three dots collapse to two and change nothing.
+
+THE BASE IS RESOLVED HERE, not taken on trust. `base.sha` on a `pull_request`
+event is a snapshot of the target branch that GitHub does not keep in step with
+the merge the checkout is built on, and diffing against it reports every line
+the target branch gained in between as a line this pull request added. GitHub
+builds the `refs/pull/N/merge` commit server-side and `actions/checkout` checks
+it out; its FIRST parent is the tip the branch was merged onto, so that is the
+base the gate uses. The value handed in is the fallback, and it is what a branch
+checkout uses. Which of the two applies is decided by an ancestor test,
+described at `resolve_base`. The gate prints the base it uses and where that
+base comes from.
 
 A file the diff reports as DELETED contributes nothing: its `+` lines are the
 `+++` header, which is not an added line.
@@ -37,8 +51,12 @@ Usage:
   check_added_lines.py --diff FILE
   check_added_lines.py --self-test
 
-`--base` defaults to `origin/main`. `--diff` reads a diff from a file or from
-`-` (standard input) instead of running git, which is what the self-test drives.
+`--base` defaults to `origin/main` and is the FALLBACK: on the merge checkout of
+a pull request the first parent usually wins and the diff does not run against
+this value. The probe runs once HEAD^2 and HEAD^1 resolve; either way a value it
+cannot read becomes the base and refuses with exit 2. `--diff` reads a diff from
+a file or from `-` (standard input) instead of running git, which is what the
+self-test drives.
 THE INPUT IS `git diff` OUTPUT in either mode: a hunk that arrives before any
 `diff --git` file header is refused with exit 2, never read as an empty diff.
 
@@ -141,6 +159,33 @@ def waived(path, text):
     return False
 
 DEFAULT_BASE = "origin/main"
+
+# The environment the SELF-TEST's fixture repositories run git in, and only
+# them: the real run keeps the host environment, because `actions/checkout`
+# writes `safe.directory` into the GLOBAL configuration and a run that parked it
+# could stop reading the repository it was pointed at wherever the workspace
+# ownership differs from the step's user (a container job, a self-hosted runner).
+#
+# A fixture that reads the machine it runs on proves nothing about the gate, and
+# git takes host settings by TWO routes. The configuration FILES are parked by
+# pointing both paths at an empty device: `merge.verifySignatures = true` makes
+# the fixture merges refuse and a `diff.external` sends the fixture diffs
+# through somebody else's program. The ENVIRONMENT carries its own:
+# a `GIT_EXTERNAL_DIFF` does what `diff.external` does, and a
+# `GIT_CONFIG_PARAMETERS` carries whole settings no file holds, so both are
+# REMOVED rather than emptied: an empty `GIT_EXTERNAL_DIFF` is a program git
+# tries to run and fails on.
+# `GIT_CONFIG_COUNT=0` says the environment carries no settings of its own.
+#
+# THE LIMIT: the configuration routes are parked; the location variables
+# (`GIT_DIR`, `GIT_WORK_TREE`) are not, and a host that sets them reds the
+# self-test rather than passing it; a `git` that is an old version or a wrapper
+# on `PATH` still runs the fixtures.
+FIXTURE_GIT_ENV = {k: v for k, v in os.environ.items()
+                   if k not in ("GIT_EXTERNAL_DIFF", "GIT_CONFIG_PARAMETERS")}
+FIXTURE_GIT_ENV.update(GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_SYSTEM=os.devnull,
+                       GIT_CONFIG_COUNT="0")
 
 
 class DiffError(Exception):
@@ -247,11 +292,67 @@ def decode_diff(raw):
     return raw.decode("utf-8", errors="surrogateescape")
 
 
-def git_diff(base, repo):
-    """`git diff <base>...HEAD` in `repo`, as text."""
+def git_output(args, repo, env=None):
+    """One git command in `repo`, as text, or None when it exits non-zero.
+
+    `env` is the whole environment to run in, or None for this process's own,
+    which is what the real run uses.
+    """
+    try:
+        completed = subprocess.run(
+            ["git"] + args, cwd=repo, env=env, capture_output=True, check=False)
+    except OSError as error:
+        raise DiffError("check_added_lines: cannot run git: %r" % error)
+    if completed.returncode != 0:
+        return None
+    return decode_diff(completed.stdout).strip()
+
+
+def resolve_base(given, repo, env=None):
+    """The base to diff against, and the phrase saying where it comes from.
+
+    THE PRECONDITION. On a merge commit, `HEAD^1` is the base when `given` is a
+    commit the branch has NOT itself merged. On the `refs/pull/N/merge` commit
+    GitHub builds and `actions/checkout` checks out, `given` is `base.sha`, a
+    snapshot of the target branch, and the branch side of that merge sits under
+    `HEAD^2`, so the precondition holds by construction. Where it does not hold,
+    taking `HEAD^1` would hide every line the branch added before its own last
+    merge, so the value handed in stays the base.
+
+    THE ANCESTOR TEST is how the precondition is checked. `given` REACHABLE from
+    the first parent is the case this run acts on: this run then has not seen the
+    first parent as the branch's own work and takes it as the base; a branch that
+    has already merged `given` into itself defeats the test, which the merge-ref
+    shape rules out.
+    UNREACHABLE, and this run cannot tell the merge ref apart from a merge the
+    pull request's branch made itself, so it stops trusting the first parent and
+    the value handed in stays the base. Each reason string below reports what
+    was observed and names where the base came from.
+    """
+    if git_output(["rev-parse", "--verify", "-q", "HEAD^2"], repo, env) is None:
+        return given, "the value handed to --base (HEAD^2 did not resolve)"
+    parent = git_output(["rev-parse", "--verify", "HEAD^1"], repo, env)
+    if parent is None:
+        return given, "the value handed to --base (HEAD^1 did not resolve)"
+    # PROBED SEPARATELY, because `merge-base --is-ancestor` exits non-zero both
+    # for "no ancestor" and for a revision it cannot resolve, so one reason
+    # string for the two would state a branch-history fact this run never saw.
+    if git_output(["rev-parse", "--verify", "-q", "%s^{commit}" % given], repo, env) is None:
+        return given, "the value handed to --base (%s did not resolve)" % given
+    if git_output(["merge-base", "--is-ancestor", given, parent], repo, env) is None:
+        return given, "the value handed to --base (%s is not reachable from HEAD^1)" % given
+    return parent, "the first parent of the merge commit HEAD"
+
+
+def git_diff(base, repo, env=None):
+    """`git diff <base>...HEAD` in `repo`, as text.
+
+    `env` as in `git_output`: None for this process's own environment.
+    """
     command = ["git", "diff", "--no-color", "%s...HEAD" % base]
     try:
-        completed = subprocess.run(command, cwd=repo, capture_output=True, check=False)
+        completed = subprocess.run(command, cwd=repo, env=env,
+                                   capture_output=True, check=False)
     except OSError as error:
         raise DiffError("check_added_lines: cannot run git: %r" % error)
     if completed.returncode != 0:
@@ -285,10 +386,13 @@ def report(offenders, where):
 # Self-test.
 #
 # The diffs below are written out by hand, so no arm compares one run of the
-# parser with another. The last arm is the other half: it builds a real
-# repository, commits, edits, and runs the real `git diff`, which is the only
-# arm that can catch a parser that is self-consistently wrong about the format
-# git actually emits.
+# parser with another. Two blocks near the end are the other half, and they
+# build real repositories: the first commits, edits and runs the real
+# `git diff`, and the second also merges.
+# `a-real-git-diff-reports-the-added-dash-only` is the arm whose job is to catch
+# a parser self-consistently wrong about the format git actually emits, and the
+# base arms in the second block are the ones whose job is to catch a base
+# resolved from the wrong commit.
 # ---------------------------------------------------------------------------
 
 def _hunk(path, body_lines, start=1):
@@ -313,15 +417,18 @@ def self_test():
             failures.append("%s %s" % (name, detail))
 
     def silently(thunk):
-        """Run `thunk` with both streams parked, and return what it returned."""
-        parked = open(os.devnull, "w", encoding="utf-8")
-        out, err = sys.stdout, sys.stderr
-        try:
-            sys.stdout, sys.stderr = parked, parked
-            return thunk()
-        finally:
-            sys.stdout, sys.stderr = out, err
-            parked.close()
+        """Run `thunk` with both streams captured: `(what it returned, output)`."""
+        with tempfile.TemporaryDirectory() as parked_dir:
+            path = os.path.join(parked_dir, "streams")
+            out, err = sys.stdout, sys.stderr
+            with open(path, "w", encoding="utf-8") as parked:
+                try:
+                    sys.stdout, sys.stderr = parked, parked
+                    code = thunk()
+                finally:
+                    sys.stdout, sys.stderr = out, err
+            with open(path, encoding="utf-8") as parked:
+                return code, parked.read()
 
     # A planted dash on an ADDED line fails, in every file type the tree
     # carries, and each type is spelled with its own comment syntax so the
@@ -582,7 +689,7 @@ def self_test():
         with open(undecodable, "wb") as handle:
             handle.write(planted)
         try:
-            code = silently(lambda: run(["--diff", undecodable]))
+            code, _ = silently(lambda: run(["--diff", undecodable]))
         except UnicodeDecodeError as error:
             code = "raised %r" % (error,)
     arm("the-command-line-over-an-undecodable-diff-returns-an-exit-code",
@@ -593,7 +700,7 @@ def self_test():
     # three-dot spelling reports only what THIS branch added.
     with tempfile.TemporaryDirectory() as scratch:
         def git(*args):
-            done = subprocess.run(["git"] + list(args), cwd=scratch,
+            done = subprocess.run(["git"] + list(args), cwd=scratch, env=FIXTURE_GIT_ENV,
                                   capture_output=True, text=True, check=False)
             if done.returncode != 0:
                 raise DiffError("git %s failed: %s" % (" ".join(args), done.stderr.strip()))
@@ -615,7 +722,7 @@ def self_test():
         write("waived.md", "A span `a %s b` <!-- %s -->\n" % (EM_DASH, DASH_OK_MARKER))
         git("add", "-A")
         git("commit", "--quiet", "-m", "work")
-        got = offending_lines(git_diff("base", scratch))
+        got = offending_lines(git_diff("base", scratch, FIXTURE_GIT_ENV))
         arm("a-real-git-diff-reports-the-added-dash-only",
             [(p, n) for p, n, _, _ in got] == [("added.md", 2)], "-> %r" % (got,))
 
@@ -626,9 +733,130 @@ def self_test():
         git("add", "-A")
         git("commit", "--quiet", "-m", "base moves")
         git("checkout", "--quiet", "work")
-        got = offending_lines(git_diff("base", scratch))
+        got = offending_lines(git_diff("base", scratch, FIXTURE_GIT_ENV))
         arm("the-three-dot-diff-ignores-what-the-base-gained",
             [(p, n) for p, n, _, _ in got] == [("added.md", 2)], "-> %r" % (got,))
+
+    # THE BASE ARMS, on a real repository shaped like the checkout a pull request
+    # gets. `main` carries a file, a branch adds two lines with a dash, `main`
+    # then advances with a DIFFERENT dashed line, and the checkout is the MERGE
+    # of the branch onto that newer `main`. The value handed in is the older
+    # snapshot of `main`, which is the shape `base.sha` has: a diff against it
+    # reports the line `main` gained as a line this branch added, because the
+    # merge base of that snapshot and a merge commit descending from it IS the
+    # snapshot and the three dots collapse to two.
+    with tempfile.TemporaryDirectory() as scratch:
+        def git(*args):
+            done = subprocess.run(["git"] + list(args), cwd=scratch, env=FIXTURE_GIT_ENV,
+                                  capture_output=True, text=True, check=False)
+            if done.returncode != 0:
+                raise DiffError("git %s failed: %s" % (" ".join(args), done.stderr.strip()))
+            return done.stdout.strip()
+
+        def write(name, text):
+            with open(os.path.join(scratch, name), "w", encoding="utf-8") as handle:
+                handle.write(text)
+
+        git("init", "--quiet", "-b", "main")
+        git("config", "user.email", "gate@example.invalid")
+        git("config", "user.name", "gate")
+        git("config", "commit.gpgsign", "false")
+        write("kept.md", "A base sentence.\n")
+        git("add", "-A")
+        git("commit", "--quiet", "-m", "base")
+        stale = git("rev-parse", "HEAD")
+
+        # TWO commits on the branch, so its head's FIRST parent is not the base
+        # handed in: an arm whose fallback happens to equal `HEAD^1` says
+        # nothing about which of the two the resolver read.
+        git("checkout", "--quiet", "-b", "work")
+        write("branch.md", "A branch sentence %s here.\n" % EM_DASH)
+        git("add", "-A")
+        git("commit", "--quiet", "-m", "the branch")
+        write("branch_again.md", "A second branch sentence %s here.\n" % EM_DASH)
+        git("add", "-A")
+        git("commit", "--quiet", "-m", "the branch again")
+        branch_head = git("rev-parse", "HEAD")
+
+        git("checkout", "--quiet", "main")
+        write("landed.md", "A sentence somebody else landed %s here.\n" % EN_DASH)
+        git("add", "-A")
+        git("commit", "--quiet", "-m", "main moves on")
+        main_tip = git("rev-parse", "HEAD")
+
+        git("merge", "--quiet", "--no-ff", "-m", "merge the branch", branch_head)
+        base, why = resolve_base(stale, scratch, FIXTURE_GIT_ENV)
+        arm("a-merge-checkout-resolves-its-base-to-the-first-parent",
+            base == git("rev-parse", "HEAD^1") and "first parent" in why,
+            "-> %r %r" % (base, why))
+        got = offending_lines(git_diff(base, scratch, FIXTURE_GIT_ENV))
+        arm("a-merge-checkout-reports-only-the-branchs-own-added-dashes",
+            [(p, n) for p, n, _, _ in got]
+            == [("branch.md", 1), ("branch_again.md", 1)], "-> %r" % (got,))
+        # What the base handed in would have reported on that same checkout, so
+        # the arm above is not satisfied by a gate that reports nothing: the
+        # line somebody ELSE landed comes back as a line this branch added.
+        stale_got = offending_lines(git_diff(stale, scratch, FIXTURE_GIT_ENV))
+        arm("the-base-handed-in-would-report-what-the-target-branch-gained",
+            [(p, n) for p, n, _, _ in stale_got]
+            == [("branch.md", 1), ("branch_again.md", 1), ("landed.md", 1)],
+            "-> %r" % (stale_got,))
+
+        # THE OTHER SIDE: a checkout that is no merge keeps the base handed in,
+        # which here is neither `HEAD` nor `HEAD^1`, so the arm says which of
+        # the two the resolver read.
+        git("checkout", "--quiet", branch_head)
+        fallback, why = resolve_base(stale, scratch, FIXTURE_GIT_ENV)
+        arm("a-non-merge-checkout-keeps-the-base-handed-in",
+            fallback == stale
+            and fallback != git("rev-parse", "HEAD^1")
+            and "HEAD^2 did not resolve" in why,
+            "-> %r %r" % (fallback, why))
+        got = offending_lines(git_diff(fallback, scratch, FIXTURE_GIT_ENV))
+        arm("a-non-merge-checkout-reports-every-line-its-given-base-makes-added",
+            [(p, n) for p, n, _, _ in got]
+            == [("branch.md", 1), ("branch_again.md", 1)], "-> %r" % (got,))
+
+        # A BRANCH THAT MERGES THE TARGET BRANCH INTO ITSELF is a merge commit
+        # too, and its first parent is the branch's own previous head. Taking
+        # that as the base would report NOTHING for every line the branch added
+        # before the merge, which is the fail-open direction. The snapshot
+        # handed in is a target-branch commit the branch had not got, so it is
+        # no ancestor of that first parent, and that is what tells the two
+        # merges apart.
+        git("checkout", "--quiet", "work")
+        git("merge", "--quiet", "--no-ff", "-m",
+            "merge the target branch into the branch", main_tip)
+        inward, why = resolve_base(main_tip, scratch, FIXTURE_GIT_ENV)
+        arm("a-target-branch-merged-into-the-branch-keeps-the-base-handed-in",
+            inward == main_tip
+            and inward != git("rev-parse", "HEAD^1")
+            and "not reachable from HEAD^1" in why,
+            "-> %r %r" % (inward, why))
+        got = offending_lines(git_diff(inward, scratch, FIXTURE_GIT_ENV))
+        arm("a-target-branch-merged-into-the-branch-still-reports-the-branchs-dashes",
+            [(p, n) for p, n, _, _ in got]
+            == [("branch.md", 1), ("branch_again.md", 1)], "-> %r" % (got,))
+
+        # A BASE THAT DOES NOT RESOLVE says so. `merge-base --is-ancestor` exits
+        # non-zero for a revision it cannot read as well as for one that is no
+        # ancestor, so without its own probe the run reports a missing ref as a
+        # branch-history fact. The whole command line refuses with exit 2 rather
+        # than reading an empty diff.
+        git("checkout", "--quiet", "main")
+        missing, why = resolve_base("origin/no-such-ref", scratch, FIXTURE_GIT_ENV)
+        arm("a-base-that-does-not-resolve-is-reported-as-not-resolving",
+            missing == "origin/no-such-ref" and "did not resolve" in why
+            and "reachable" not in why, "-> %r %r" % (missing, why))
+        code, _ = silently(
+            lambda: run(["--base", "origin/no-such-ref", "--repo", scratch]))
+        arm("a-base-that-does-not-resolve-refuses-rather-than-reading-nothing",
+            code == 2, "-> %r" % (code,))
+        for where, head in (("merge", "main"), ("non-merge", branch_head)):
+            git("checkout", "--quiet", head)
+            code, said = silently(lambda: run(["--base", "", "--repo", scratch]))
+            arm("an-empty-base-refuses-rather-than-reading-nothing-on-a-%s-head" % where,
+                code == 2 and "no added line" not in said, "-> %r %r" % (code, said))
 
     for failure in failures:
         print("SELF-TEST FAILED: " + failure, file=sys.stderr)
@@ -646,7 +874,10 @@ def run(argv):
         prog="check_added_lines.py",
         description="Refuse a typographic dash on any line a pull request adds.")
     parser.add_argument("--base", default=DEFAULT_BASE, metavar="REF",
-                        help="the base ref to diff against (default: %s)" % DEFAULT_BASE)
+                        help="the base ref this run falls back to; on the merge "
+                             "checkout of a pull request the first parent "
+                             "usually wins, but an unreadable value here still "
+                             "refuses (default: %s)" % DEFAULT_BASE)
     parser.add_argument("--repo", default=".", metavar="DIR",
                         help="the repository to diff in (default: the working directory)")
     parser.add_argument("--diff", metavar="FILE",
@@ -655,20 +886,36 @@ def run(argv):
                         help="run the self-test and exit")
     args = parser.parse_args(argv)
 
-    if args.self_test:
-        if args.diff or args.base != DEFAULT_BASE or args.repo != ".":
-            parser.error("--self-test takes no other argument")
-        return self_test()
+    if args.self_test and (args.diff or args.base != DEFAULT_BASE
+                           or args.repo != "."):
+        parser.error("--self-test takes no other argument")
 
     try:
+        # INSIDE the try, so a fixture repository whose git cannot run is a
+        # refusal with exit 2 and one line, never a traceback.
+        if args.self_test:
+            return self_test()
         if args.diff:
             raw = (sys.stdin.buffer.read() if args.diff == "-"
                    else open(args.diff, "rb").read())
             text = decode_diff(raw)
             where = args.diff
         else:
-            text = git_diff(args.base, args.repo)
-            where = "%s...HEAD" % args.base
+            base, why = resolve_base(args.base, args.repo)
+            # FLUSHED, because Python block-buffers stdout into a pipe and the
+            # refusal below goes to stderr: without this the log shows the
+            # offending lines before the base they were measured against.
+            print("check_added_lines: base %s, %s" % (base, why))
+            sys.stdout.flush()
+            # The EMPTY string is the one unreadable value `git diff` accepts:
+            # `...HEAD` is a valid range over HEAD alone, so it reads clean.
+            if git_output(["rev-parse", "--verify", "-q", "%s^{commit}" % base],
+                          args.repo) is None:
+                raise DiffError(
+                    "check_added_lines: the base %r names no commit in %s; pass a "
+                    "base this repository carries" % (base, args.repo))
+            text = git_diff(base, args.repo)
+            where = "%s...HEAD" % base
         return report(offending_lines(text), where)
     except (DiffError, OSError) as error:
         print(error if isinstance(error, DiffError)
