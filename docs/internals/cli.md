@@ -221,11 +221,13 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   derives a partition (cost-fused via `graphs/<name>.costs.yaml` when present, else
   process-per-node) and runs supervisor + one worker per group. A `process_groups:`
   block is respected as written. Non-Unix falls back to the monolith with a loud notice.
-- **Consent ladder (the never-mutate floor)**: persisting a derived partition into the
-  YAML needs consent. `--yes` writes it (with a `.bak`); a TTY previews and asks y/N
-  (N = run the derived groups in-memory, file untouched); no-TTY runs in-memory with a
-  loud notice naming `--yes` and `--single-process`. A refused/failed run never mutates
-  the graph file and never leaves a `.bak`.
+- **Explicit save only**: terminal and non-terminal runs adopt derived groups in
+  memory without a prompt or a partition preview. `--yes` writes the groups with a
+  `.bak` backup; `graph partition` retains the detailed preview and interactive
+  confirmation. `--auto-partition` uses the same policy over an existing block.
+  Partition refusals leave the graph file and its backup untouched. The real CLI
+  tests exercise empty PTY stdin and non-terminal stdin, verify both nodes' recorded
+  output against hand-written bytes, and assert the owned workers disappear on Ctrl-C.
 - `--single-process` opts out entirely; `--auto-partition` re-derives over an existing
   block and conflicts with `--single-process`; virtual/external clocks keep the monolith
   routing. The in-memory derived plan and the written plan must be equal, pinned by a
@@ -848,7 +850,7 @@ own binary.
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `partition_emit_test.rs` | Surgical `process_groups:` splice, block scanner, `process_group_order` removal, atomic write + `.bak`; `node stage` over the untouched `graph create` scaffold takes no `.bak` and no warn, any other byte keeps both | no | none |
 | `graph_partition_test.rs` | `graph partition` verb: cost-mode selection, consent ladder, replace-scoped validation | no | none |
-| `graph_run_preflight_test.rs` | `resolve_partition_intent` matrix, consent ladder, lenient-costs degrade, in-memory==written plan equality | no | none |
+| `graph_run_preflight_test.rs` | `resolve_partition_intent` matrix, explicit save and ephemeral adoption, lenient-costs degrade, in-memory==written plan equality | no | none |
 | `network_run_gate_test.rs` | `resolve_run_network` decision matrix + gateway-port parse (env-mutating; file-local mutex inside) | no | none |
 | `completions_test.rs` | Completion value sources vs hand-written candidate lists; wire-safety filter; structural no-side-effect walk | no | none |
 | `discovery_ladder_test.rs` | Hermetic injected-rung ladder pins | no | none |
@@ -875,7 +877,7 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 |---|---|---|---|
 | `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib) | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib` |
 | `tests/mp_record_e2e_test.rs` | Multi-process `--record` bag contracts (one bag, per-rank manifests, departure sentinel, ring sweep) | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
-| `tests/mp_auto_partition_e2e_test.rs` | Multi-process-by-default consent ladder over the real binary (no-TTY floor, persist, opt-out, refusal never mutates the file) | yes | same two |
+| `tests/mp_auto_partition_e2e_test.rs` | Ephemeral multi-process default over PTY and non-TTY stdin, real two-node output and clean worker shutdown; explicit persist, opt-out, refusal never mutates the file | yes | same two |
 | `tests/mp_split_pair_e2e_test.rs` | The mid-level barrier's PLUMBING over the real binary: classify -> stamp -> serialise -> install, read off each worker's own build line. Deliberately NOT the ordering discriminator (that is deterministic only in-process); what it buys is that the extra generation neither desynchronises a real deployment nor loses frames, and that two live runs record byte-identical frames. | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_input_cdylib` |
 | `tests/network_gateway_e2e_test.rs` | Permissive gateway lifecycle: notice exactly once, child reaped on SIGINT/SIGTERM, graceful-forward discriminator (the gateway's own shutdown line, not just exit 0 + reap) | yes | same two |
 | `tests/network_gateway_mp_e2e_test.rs` | Strict networked multi-process acceptance (worker → SHM → gateway → zenoh → external) | yes | same two |

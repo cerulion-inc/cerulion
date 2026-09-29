@@ -77,31 +77,30 @@ UNPARTITIONED graph goes multi-process **by default**:
 - **No `process_groups:` + Unix + the real (default) clock** →
   `graph run` DERIVES a partition: a cost-aware partition derived by greedy
   fusion when `graphs/<name>.costs.yaml` exists (from `cerulion graph profile`),
-  else the **process-per-node baseline** (maximal fault isolation). It then runs the
-  consent ladder for persisting the derivation into the YAML:
+  else the **process-per-node baseline** (maximal fault isolation). The run uses
+  the derived groups in memory without prompting or showing a partition diff.
 
   | You ran | File | Run |
   |---|---|---|
+  | Terminal or non-terminal, no `--yes` | **Untouched** | multi-process, derived groups in memory |
   | `--yes` | Written (surgical splice, `.bak` backup) | multi-process, derived groups |
-  | TTY, answered `y` | Written (same) | multi-process, derived groups |
-  | TTY, answered `N` | **Untouched** | multi-process, derived groups held IN-MEMORY (decline ≠ abort; Ctrl-C is abort). Logged at `info`, not `warn`: you were asked and this is what you chose |
-  | no TTY, no `--yes` | **Untouched** (the floor: never mutate without consent) | multi-process, derived groups IN-MEMORY + a loud notice naming `--yes` and `--single-process` |
-  | `--single-process` | Untouched | the plain MONOLITH: no derivation, no prompt (the opt-out) |
+  | `--single-process` | Untouched | a single process without process isolation; no derivation |
 
-  An in-memory derivation produces EXACTLY the deployment a written file
-  would (same plan, ranks, subgraphs; pinned by test).
-- **`--auto-partition`** → re-derive even over an existing `process_groups:`
-  block: shows the diff vs your block; TTY `y` applies, `N` KEEPS your block
-  (decline means "don't change what I wrote"); `--yes` applies; no TTY runs
-  the re-derivation in-memory. Uses replace-scoped validation, so it also
-  recovers a stale/broken block. Conflicts with `--single-process`.
+  An in-memory derivation produces exactly the deployment a written file
+  would: the same plan, ranks and subgraphs. Once the workers are ready, the
+  run reports its node count, multi-process mode and Ctrl-C stop instruction.
+- **`--auto-partition`** re-derives over an existing `process_groups:` block
+  and runs the new groups in memory. The graph file remains unchanged unless
+  `--yes` explicitly saves the new groups. Uses replace-scoped validation,
+  so it also recovers a stale or broken block. Conflicts with `--single-process`.
 - **`--time-source virtual`/`external` on an unpartitioned graph** → the
   monolith paths (the default derives on the REAL-clock live path only).
 - **Non-Unix** → monolith fallback (below), derivation skipped entirely.
 
-Persist once and forget: `cerulion graph partition <name>` (see
-`docs/auto_partitioning.md`) writes the same derivation with a preview +
-confirm, after which every run takes the declared-`process_groups:` path.
+Inspect with `cerulion graph partition <name> --dry-run`. Save with
+`cerulion graph partition <name>` after its preview and confirmation, or add
+`--yes` to `graph run` to save the layout that run derives. Subsequent runs
+use the saved `process_groups:`. See [Auto-partitioning](auto_partitioning.md).
 
 ## Authoring `process_groups:` in graph YAML
 
