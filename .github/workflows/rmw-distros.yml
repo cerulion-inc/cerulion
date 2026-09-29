@@ -1,8 +1,9 @@
 name: rmw distro lanes
 
 # One hosted lane per ROS 2 distro in the support set (Jazzy, the validated distro, as the regression
-# guard; Lyrical, Humble and Foxy as they land), inside the stock ros:<distro>-ros-base image,
-# building rmw_cerulion against that distro's REAL headers (bindgen; the vendored fallback is refused).
+# guard; Lyrical, Humble, Galactic and Foxy as they land), inside the stock ros:<distro>-ros-base
+# image, building rmw_cerulion against that distro's REAL headers (bindgen; the vendored fallback is
+# refused).
 # Each lane asserts the distro's KNOWN state through tools/ci/rmw-distros/gate.sh, so the lane is
 # green while the state is true and turns red the moment the truth moves in either direction.
 # Runs on PRs and pushes to main that touch the rmw path (the crate, its in-tree dependencies, the workspace manifests). No lane is a required context on main, so a
@@ -38,6 +39,15 @@ concurrency:
   group: rmw-distros-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Cache save policy, identical to ci.yml (see the CACHE_SAVE_* comment there):
+  # the rmw lanes are restore-only under the default and save when the variable
+  # names `rmw-distros-<distro>` or `all`. The PRUNE runs on every
+  # default-branch run of this lane either way, so a restore-only namespace is
+  # emptied rather than left holding archives nothing will replace.
+  CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
+  CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
+
 permissions:
   contents: read
 
@@ -45,11 +55,16 @@ jobs:
   lane:
     name: rmw distro lane (${{ matrix.distro }})
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        distro: [jazzy, lyrical, humble, foxy]
+        distro: [jazzy, lyrical, humble, galactic, foxy]
     container:
       image: ros:${{ matrix.distro }}-ros-base
       options: --shm-size=1g
@@ -102,12 +117,57 @@ jobs:
       - name: Gate (expected state for this distro)
         run: bash tools/ci/rmw-distros/gate.sh "${{ matrix.distro }}"
 
+      # `gh` and `jq` are on every hosted runner image and on NEITHER of the
+      # ros:<distro>-ros-base images this lane runs in, so the prune step below
+      # died at its first `gh cache list` the moment the policy enabled this
+      # namespace. Installed under the prune's own condition, so it costs this
+      # lane nothing on the runs that do not prune. `ci_cache_policy_check.py`
+      # holds the pairing (rule R9_CONTAINER_TOOLS).
+      - name: Install the cache prune tools (gh, jq)
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl jq
+          install -m 0755 -d /usr/share/keyrings
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          arch=$(dpkg --print-architecture)
+          printf 'deb [arch=%s signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' \
+            "$arch" > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gh
+          gh --version
+          jq --version
+
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      # The prune is gated on the BRANCH only, never on the namespace list: this
+      # lane is restore-only under the default, and a namespace that never
+      # prunes keeps its stale archives for ever.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}" "cargo-rmw-distros-${{ matrix.distro }}-"
+
       # Saved as the LAST step so a green job stores what it built, and never from
       # a merge-queue build: its branch is deleted after the batch, so nothing could
       # restore what it saved, and the upload only adds eviction pressure on the
       # store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |

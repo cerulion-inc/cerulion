@@ -26,6 +26,10 @@ set -u
 #   humble:  builds from generated bindings and its whole suite is green (24-byte GID storage padded,
 #            int8 request guids cast, the C++ mirror in its pre-Iron shape under
 #            cfg(not(cerulion_has_is_key)));
+#   galactic: builds from generated bindings and its whole suite is green (the same 96-byte
+#             pre-Humble C++ mirror as foxy, and seven post-Galactic rmw entry points compiled
+#             out whole, three fewer than foxy: Galactic declares the qos compatibility call and
+#             the two network flow calls);
 #   foxy:    builds from generated bindings and its whole suite is green (the C++ mirror in its
 #            96-byte pre-Humble shape under cfg(not(cerulion_has_fetch_function)), and the ten
 #            post-Foxy rmw entry points compiled out whole rather than stubbed).
@@ -39,9 +43,11 @@ set -u
 # that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run; 33 and 479
 # with the two vendored-gate binaries) with margin for
 # targets that come and go; a lane that silently loses half its binaries lands below the floor.
-# The ten entry points Foxy's rmw headers do not declare: the four listener callbacks and
-# rmw_event_set_callback (Humble), the two content filter calls (Humble), rmw_feature_supported
-# (Humble), and rmw_qos_profile_check_compatible plus the two network flow calls (Galactic).
+# The ten entry points Foxy's rmw headers do not declare: rmw_event_set_callback,
+# rmw_subscription_set_on_new_message_callback, rmw_service_set_on_new_request_callback and
+# rmw_client_set_on_new_response_callback (Humble), the two content filter calls (Humble),
+# rmw_feature_supported (Humble), and rmw_qos_profile_check_compatible plus the two network
+# flow calls (Galactic).
 foxy_absent_symbols="rmw_event_set_callback
 rmw_subscription_set_on_new_message_callback
 rmw_service_set_on_new_request_callback
@@ -52,6 +58,21 @@ rmw_publisher_get_network_flow_endpoints
 rmw_subscription_get_network_flow_endpoints
 rmw_qos_profile_check_compatible
 rmw_feature_supported"
+# Galactic's list is DERIVED from the same place the cfgs are: every guarded export sits behind
+# #[cfg(cerulion_has_<cap>)], and CAPABILITY_MIN_ERA in crates/rmw_cerulion/src/era_check.rs
+# gives each capability the era whose headers introduced it. A distro lacks exactly the exports
+# whose capability is LATER than its own era, so Galactic's list is Foxy's without the three
+# Galactic-era entry points (qos_compatibility, network_flow): the event_callback exports, the
+# content_filter_options exports and rmw_feature_supported (features), all Humble. Seven.
+# crates/rmw_cerulion/tests/rmw_absent_export_table_test.rs recomputes every row's list from the
+# guarded exports and the era tables and fails on any difference.
+galactic_absent_symbols="rmw_event_set_callback
+rmw_subscription_set_on_new_message_callback
+rmw_service_set_on_new_request_callback
+rmw_client_set_on_new_response_callback
+rmw_subscription_set_content_filter
+rmw_subscription_get_content_filter
+rmw_feature_supported"
 # No row is `refuse` today; the arm stays for the next distro that starts there, so its two inputs
 # carry inert defaults rather than being unset under `set -u`. The arm REFUSES those defaults
 # (refuse_row_pinned): an errors=0 or empty-marker row would pass vacuously.
@@ -61,6 +82,7 @@ case "$distro" in
     jazzy)   expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="" ;;
     lyrical) expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="" ;;
     humble)  expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="" ;;
+    galactic) expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="$galactic_absent_symbols" ;;
     foxy)    expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="$foxy_absent_symbols" ;;
     *) echo "FATAL: no expected state for distro '$distro'"; exit 1 ;;
 esac

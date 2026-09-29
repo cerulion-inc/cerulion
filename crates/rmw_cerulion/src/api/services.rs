@@ -218,6 +218,27 @@ pub unsafe extern "C" fn rmw_take_request(
         // drain more than it can hand back (Principle #6). It is also the
         // only request take path cerulion_core offers, by design.
         let result = server.try_take_one_request(|envelope, payload| {
+            // A member this build's C++ typesupport gives no way to WRITE (a
+            // `bool[]` before Humble, at the top level or inside a nested
+            // message) makes every request of this type undeliverable.
+            // Decided at registration, so this is one `Option` read per
+            // request, and taken BEFORE `unflatten` so the caller's message
+            // is untouched: a server that decoded half a request and then
+            // failed would answer with fields from the previous call. The
+            // request is consumed and dropped through the same latch and
+            // regime as every other decode refusal, with the member named.
+            if let Some((var_idx, path)) = bridge.unwritable_bool_seq() {
+                crate::decode_failure_latch::report_decode_entry_refused(
+                    &data.decode_failures,
+                    crate::decode_failure_latch::DecodeSite::ServiceRequest,
+                    &data.service_name,
+                    &data.type_name,
+                    payload.len(),
+                    var_idx,
+                    &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+                );
+                return;
+            }
             if bridge.unflatten(payload, ros_request) {
                 got = Some(envelope);
                 crate::decode_failure_latch::report_decode_success(
@@ -535,6 +556,21 @@ pub unsafe extern "C" fn rmw_take_response(
         let bridge = &data.response_bridge;
         let mut got_seq: Option<i64> = None;
         let result = client_guard.try_take_one_response(|seq, payload| {
+            // The request site's arm, on the client: refused BEFORE any
+            // write, with the member named, so a caller reusing one response
+            // message across calls never reads a mixture of two replies.
+            if let Some((var_idx, path)) = bridge.unwritable_bool_seq() {
+                crate::decode_failure_latch::report_decode_entry_refused(
+                    &data.decode_failures,
+                    crate::decode_failure_latch::DecodeSite::ServiceResponse,
+                    &data.service_name,
+                    &data.type_name,
+                    payload.len(),
+                    var_idx,
+                    &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+                );
+                return;
+            }
             if bridge.unflatten(payload, ros_response) {
                 got_seq = Some(seq);
                 crate::decode_failure_latch::report_decode_success(

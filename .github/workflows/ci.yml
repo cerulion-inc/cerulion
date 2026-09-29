@@ -83,7 +83,64 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # CACHE SAVE POLICY. The Actions cache store has a 10 GB free allowance; the
+  # rest is billed, and a failed payment makes the service refuse every save
+  # while the store is above 10 GB (measured 2026-09-28: 13 refusals into a
+  # 15.8 GB store, one accepted save into an emptied one). One generation of
+  # the eight namespaces measured is 17.1 GB (the rmw lanes and the smaller
+  # tool caches are not in that figure), so the default saves two archives: the
+  # macOS test shards' archive (shard 0 ran 28.3 min with a cache hit on run
+  # 35666419690 against 29 to 44 min across eight 2026-09-27 runs whose cache
+  # state is not recorded) and the Linux test shards' archive the shards need,
+  # which fit together (4.27 GB and 3.18 GB, 7.45 GB, main only). Every other
+  # namespace is restore-only.
+  # Directly before every save of a lockfile-keyed archive (the machete tool
+  # cache is exempt) a prune step keeps exactly the job's current `main` key and
+  # deletes every other entry of its namespace (stale lockfile generations,
+  # `pr` scope, legacy unqualified keys), so the store never holds two archives
+  # of one namespace.
+  #
+  # THE PRUNE IS NOT GATED ON THE NAMESPACE LIST, only on the branch: every
+  # default-branch run of a job that has a prune step prunes, and keeps exactly
+  # that job's current key even when no entry under it exists. A restore-only
+  # namespace is therefore EMPTIED rather than left holding stale archives
+  # nothing will replace -- a pull request's restore refreshes an entry's
+  # last-access time, so GitHub's idle eviction never reclaims one on its own.
+  # A run BEHIND THE TIP deletes nothing and saves nothing: only the run for the
+  # newest commit may delete, and its save step is gated on the prune step's
+  # `proceed` output, because a run that skipped the prune and uploaded anyway
+  # would leave two generations of its namespace resident and the next save
+  # would be refused.
+  #
+  # CACHE_SAVE_NAMESPACES: space-separated namespace tokens that may save, the
+  # token being the key text between `cargo-` and the scope segment with any
+  # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`,
+  # `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
+  # `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lock
+  # hash>`, whose header hash is a cache generation rather than part of the
+  # namespace), or `all`. The default lives HERE, so a repository with no
+  # variable saves the measured frontier and a typo matches nothing
+  # (fail-closed on content). CACHE_SAVE_ON_PULL_REQUEST: empty means saves run
+  # on main only; any value lets pull-request runs save too, and only from a
+  # branch of this repository -- a fork's token cannot hold `actions: write`, so
+  # the prune's delete would fail the job. rmw-distros.yml and
+  # examples-replay.yml carry the same two values, and
+  # `tools/scripts/ci_cache_policy_check.py` (Lint job) holds every save step in
+  # every workflow to this contract.
+  CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
+  CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
   CARGO_TERM_COLOR: always
+  # THE SELECTION OFF SWITCH. `ci_changed_paths.sh` narrows a pull request's
+  # test steps to the packages the change can reach; this variable stops that
+  # with no pull request, no deploy and no review. Unset or `on` applies the
+  # selection; `off`, and any value the classifier does not know, selects every
+  # package and runs every step. The default lives HERE, in the expression, so a
+  # repository with no variable behaves exactly as this file reads.
+  #
+  # The switch reaches a step ONLY through the classifier's outputs. A step
+  # gated on the variable itself would read a value the `changes` job never
+  # saw, and `cerulion_cli_engine::ci_test_coverage_test` refuses that shape.
+  CI_SELECTION: ${{ vars.CI_SELECTION || 'on' }}
   RUST_BACKTRACE: 1
   # Suppress iceoryx2 log noise
   IOX2_LOG_LEVEL: error
@@ -117,53 +174,140 @@ env:
 
 jobs:
   # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
-  # that care. Two runner-seconds of work plus a checkout.
+  # that care: a checkout with full history plus a workspace resolve.
   #
-  # Only `deb-smoke` reads it today, and only to RUN ITSELF on a pull request it
-  # would otherwise skip. Nothing in this file uses a class to SKIP a job that
-  # would otherwise run, which is the direction that could weaken a gate: the
-  # rules live in `tools/scripts/ci_changed_paths.sh` with the reasoning and a
-  # `--self-test` table, and `lint` runs that table.
+  # FOUR CLASSES, in two directions. `packaging` only ever makes `deb-smoke` RUN
+  # on a pull request it would otherwise skip. `code`, `docs` and `pkgs` are the
+  # test-impact selection and they SKIP test steps, so every rule behind them is
+  # fail-closed. The rules, the reason token each one emits and a `--self-test`
+  # table live in `tools/scripts/ci_changed_paths.sh`, and `lint` runs that
+  # table.
   #
-  # On `push`, `merge_group` and `workflow_dispatch` there is no pull request to
-  # diff, so every class is `false` and the jobs that consult it fall back to the
-  # event test they had before.
+  # PULL REQUESTS ONLY. On `push`, `merge_group` and `workflow_dispatch` there
+  # is no pull request to diff, and the classifier answers with EVERY package
+  # rather than with nothing: the queue run is the last gate before `main`.
+  # The repository variable `CI_SELECTION` is the stop: `off`, and any value the
+  # classifier does not know, selects every package on a pull request too.
+  #
+  # A FAILURE HERE REDS THE TEST JOBS, by design. Every job that carries a
+  # selection gate needs this one and guards itself with `if: ${{ !cancelled() }}`,
+  # so a failed classification runs those jobs with an empty `pkgs`, every gated
+  # step's `fromJSON('')` is an expression error, and the pull request blocks on
+  # a red rather than on a skipped required context that GitHub reads as
+  # satisfied.
+  #
+  # Never gate a test step on a class that omits the package that step runs
+  # (`cerulion_cli_engine::ci_test_coverage_test`).
   changes:
     name: Changed paths
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       packaging: ${{ steps.classify.outputs.packaging }}
+      code: ${{ steps.classify.outputs.code }}
+      docs: ${{ steps.classify.outputs.docs }}
+      pkgs: ${{ steps.classify.outputs.pkgs }}
     steps:
-      # `fetch-depth: 0` because the diff is against the pull request's BASE
-      # commit, which a shallow checkout does not have. It is the whole cost of
-      # this job.
+      # `fetch-depth: 0` because the diff is against the base this job resolves
+      # below, which a shallow checkout does not have. It is the whole cost of
+      # this job, apart from the workspace resolve below.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
+      # `cargo` is preinstalled on `ubuntu-latest`; the classifier runs
+      # `cargo metadata --no-deps`, which resolves nothing off the network.
       - name: Classify the changed paths
         id: classify
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "not a pull request: every class is false"
-            echo "packaging=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          # THE OFF SWITCH, printed on its own line before anything reads it.
+          echo "selection: switch=${CI_SELECTION}"
+          : > "$RUNNER_TEMP/changed.txt"
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            # THE BASE, computed here and printed before the diff reads it.
+            # `base.sha` is a snapshot of the target branch that GitHub does not
+            # keep in step with the merge this checkout is built on, so a diff
+            # against it reports every path the target branch gained in between
+            # as a path this pull request touched. GitHub builds the
+            # `refs/pull/N/merge` commit server-side and `actions/checkout`
+            # checks it out; its first parent is the tip the branch was merged
+            # onto, so that is the base.
+            # THE ANCESTOR TEST says whether the first parent can be trusted.
+            # When `base.sha` is not reachable from it, this run cannot tell a
+            # pull request merge ref from a merge the branch made itself, so it
+            # stops trusting the first parent and falls back. The fallback is
+            # the CONSERVATIVE reading, not the more accurate one: on a merge
+            # ref GitHub rebuilt after a rewrite of the target branch, the first
+            # parent is still the tip the branch was merged onto and the
+            # fallback over-reports what that branch gained. An unresolvable or
+            # empty `base.sha` fails the same test, falls back the same way, and
+            # the probe below refuses it and reds this job rather than
+            # classifying from nothing. Same rule as `check_added_lines.py`.
+            if PARENT=$(git rev-parse --verify -q HEAD^2 >/dev/null 2>&1 \
+                        && git rev-parse --verify HEAD^1) \
+               && git merge-base --is-ancestor "$BASE_SHA" "$PARENT"; then
+              BASE="$PARENT"
+              echo "selection: base=$BASE from the first parent of the merge commit"
+            else
+              BASE="$BASE_SHA"
+              echo "selection: base=$BASE from the event"
+            fi
+            # THE PROBE: the base names a commit before the diff reads it. An
+            # empty base turns `$BASE...HEAD` into `...HEAD`, a range git reads
+            # as HEAD against HEAD, so the diff lists no path, the classifier
+            # selects nothing and every gated step skips; a base that names no
+            # commit errors inside the diff. Both stop here, the value printed.
+            git rev-parse --verify -q "$BASE^{commit}" > /dev/null \
+              || { echo "selection: base '$BASE' does not name a commit"; exit 1; }
+            # THREE DOTS, which matter only when the base is NOT an ancestor of
+            # HEAD: on the fallback above, a `base.sha` the target branch no
+            # longer contains. Two dots there report every path the two commits
+            # differ on, in either direction, as a path the pull request
+            # touched. Whenever the base IS an ancestor, and the resolved first
+            # parent always is, the three dots collapse to two and change
+            # nothing.
+            # `--no-renames` so a rename arrives as its DELETE plus its ADD.
+            # With rename detection left on, `--name-only` prints the DESTINATION
+            # path alone, so renaming a listed packaging input to an unlisted
+            # path would classify as `packaging=false` and skip the job that
+            # reads it.
+            git diff --name-only --no-renames "$BASE...HEAD" > "$RUNNER_TEMP/changed.txt"
+            echo "== changed paths =="
+            cat "$RUNNER_TEMP/changed.txt"
+          else
+            echo "selection: not a pull request, every package is selected"
           fi
-          # On a `pull_request` event the checkout is the MERGE commit, so
-          # `diff <base> HEAD` is exactly what the pull request changes.
-          # `--no-renames` so a rename arrives as its DELETE plus its ADD.
-          # With rename detection left on, `--name-only` prints the DESTINATION
-          # path alone, so renaming a listed packaging input to an unlisted path
-          # would classify as `packaging=false` and skip the job that reads it.
-          git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
-          echo "== changed paths =="
-          cat "$RUNNER_TEMP/changed.txt"
           ./tools/scripts/ci_changed_paths.sh < "$RUNNER_TEMP/changed.txt" \
-            | tee -a "$GITHUB_OUTPUT"
+            > "$RUNNER_TEMP/classes.txt"
+          cat "$RUNNER_TEMP/classes.txt"
+          packaging=$(sed -n 's/^packaging=//p' "$RUNNER_TEMP/classes.txt")
+          code=$(sed -n 's/^code=//p' "$RUNNER_TEMP/classes.txt")
+          docs=$(sed -n 's/^docs=//p' "$RUNNER_TEMP/classes.txt")
+          pkgs=$(sed -n 's/^pkgs=//p' "$RUNNER_TEMP/classes.txt")
+          # FAIL CLOSED on a class the classifier did not produce. An absent
+          # output is the empty string in every job that consults it: `== 'true'`
+          # is then false on every event, and `fromJSON('')` is an expression
+          # error that fails the step rather than running it.
+          for value in "$packaging" "$code" "$docs" "$pkgs"; do
+            if [ -z "$value" ]; then
+              echo "the classifier produced no value for one of its four classes" >&2
+              exit 1
+            fi
+          done
+          # Each name written LITERALLY, because that is the evidence
+          # `cerulion_cli_engine::ci_test_coverage_test` grounds a gated step on:
+          # an output whose declaration names a step that writes no such name is
+          # the empty string on every event, and a step gated on it runs nowhere
+          # while reading as a selected step.
+          {
+            echo "packaging=$packaging"
+            echo "code=$code"
+            echo "docs=$docs"
+            echo "pkgs=$pkgs"
+          } >> "$GITHUB_OUTPUT"
 
   deb-smoke:
     name: Debian and APT package smoke
@@ -500,6 +644,11 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # The limit covers runner setup, cache restore, cold compilation of the
     # iroh tree (netd's `wan` is default-ON, so feature unification pulls it
     # into `cargo clippy --workspace --all-targets`), the checks, and the cache
@@ -517,7 +666,12 @@ jobs:
       # step below; test jobs keep their own profiles untouched.
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
+      # `fetch-depth: 0` so the added-line dash gate below can diff against the
+      # base it resolves. A shallow checkout does not carry it, and the gate
+      # would then refuse rather than read an empty diff.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
 
       - name: Release installer self-test
         run: ./tools/scripts/install.sh --self-test
@@ -550,11 +704,36 @@ jobs:
       - name: Crates.io publish retry self-test
         run: ./tools/scripts/test_publish_crates.sh
 
-      # The path classifier the `changes` job runs. Its table is what decides
-      # whether a pull request pays for the 22-minute packaging smoke, so it is
-      # executed here rather than only read by shellcheck below.
-      - name: Changed-path classifier self-test
-        run: ./tools/scripts/ci_changed_paths.sh --self-test
+      # NO ADDED LINE CARRIES A TYPOGRAPHIC DASH. Diff-scoped, not tree-wide:
+      # the cut tree carries an em or en dash in over a thousand files, almost
+      # all of it in comments, so a tree scan would red `main` and say nothing
+      # about the change under review. `check_public_surface.py` reads only
+      # string literals in non-test Rust files and no Python at all, which is
+      # the hole this closes.
+      - name: Added-line dash gate (self-test)
+        run: python3 -B tools/scripts/check_added_lines.py --self-test
+
+      # PULL REQUESTS ONLY, and `fetch-depth: 0` above is what makes their base
+      # commit reachable. A `merge_group` or `push` run has no pull-request base
+      # to scope a diff to: pointing the gate at a ref that may not be fetched
+      # would refuse rather than pass, and red a required context on a run that
+      # adds no line of its own. The pull request is where every added line is
+      # read, and it is the run that blocks.
+      #
+      # `--base` is the FALLBACK, not the base. `base.sha` is a snapshot of the
+      # target branch that GitHub does not keep in step with the merge this
+      # checkout is built on, so a diff against it reports every line the target
+      # branch gained in between as a line this pull request added. GitHub builds
+      # the `refs/pull/N/merge` commit server-side and `actions/checkout` checks
+      # it out; the script resolves the base itself, taking that commit's first
+      # parent when the snapshot is still reachable from that first parent, this
+      # value otherwise. It prints the base it uses and where that base comes
+      # from.
+      - name: Added lines carry no typographic dash
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 -B tools/scripts/check_added_lines.py --base "$BASE_SHA"
 
       # A static linter is the only automated reader most of these scripts
       # get: CI executes only a few of them (the two gates this workflow runs,
@@ -620,6 +799,20 @@ jobs:
           actionlint -version
           actionlint
 
+      # The cache save policy (CACHE_SAVE_* in `env`) is enforced by a checker
+      # over EVERY workflow in the directory, not a hand list of the two that
+      # were known to cache: two others were writing into the same store with
+      # the combined `actions/cache` action, ungated and unpruned, while a
+      # two-file invocation reported clean. Its self-test and the prune
+      # script's self-test run first so a silent checker cannot pass.
+      - name: Cache save policy (self-tests, then the workflows)
+        run: |
+          set -euo pipefail
+          bash tools/scripts/ci_cache_prune.sh --self-test
+          python3 tools/scripts/ci_cache_policy_check.py --self-test
+          python3 tools/scripts/ci_cache_policy_check.py .github/workflows
+
+
       # The workspace + restored target cache no longer fit ubuntu-latest's
       # free disk alongside the preinstalled toolchains the workspace never
       # uses. `ubuntu-latest` ships tens of GB of them, and reclaiming ~25 GB up
@@ -645,9 +838,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-lint-main-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
@@ -781,6 +975,40 @@ jobs:
       - name: Leak guard (tree, generic classes)
         run: python3 -B tools/scripts/leak_scan.py tree --no-private --offline
 
+      # Which packages a change can reach: the touched packages plus their
+      # reverse-dependency closure. The table is hand-built metadata documents
+      # with their closures written out beside them, and the live rows run the
+      # walk over this workspace, so the step sits AFTER the toolchain install
+      # above rather than beside the other pure-python gates: those rows shell
+      # out to `cargo metadata`.
+      - name: Selected-packages closure self-test
+        run: python3 -B tools/scripts/ci_selected_packages.py --self-test
+
+      # The path classifier the `changes` job runs. Its table is what decides
+      # which test steps a pull request pays for and whether it pays for the
+      # 22-minute packaging smoke, so it is executed here rather than only read
+      # by shellcheck. It sits beside the selector rather than with the other
+      # pure-shell gates because its last rows drive the whole pipeline, which
+      # resolves the workspace with `cargo metadata`.
+      - name: Changed-path classifier self-test
+        run: ./tools/scripts/ci_changed_paths.sh --self-test
+
+      # THE SHARD PARTITION AND ITS SELECTION READER. `--check` proves the
+      # partition of `cerulion_core`'s test files is total and disjoint, that
+      # the one routing exception landed where it declares, and that the
+      # selection reader agrees with its hand table. A bare `--check` is the
+      # SHIPPED configuration, which is why no argument follows it.
+      #
+      # `cerulion_cli_engine::ci_test_coverage_test` drives the same invocation
+      # from a test, so a broken split is a local red as well; this step is what
+      # makes it a red on a pull request that never runs that package, and the
+      # walker's `the_shard_check_runs_in_a_named_lint_step` arm fails if this
+      # step is renamed, removed, given an argument, moved into another job or
+      # another workflow, or given an `if:` of its own, and if `lint` stops
+      # running on a pull request.
+      - name: Shard partition and selection check
+        run: ./tools/scripts/ci_test_shard.sh --check
+
       # The public-surface gate. The week before the public cut, seven classes
       # of mistake in the shipped tree were found and fixed BY HAND, one page
       # at a time: example programs that were not workspaces (several node
@@ -883,22 +1111,42 @@ jobs:
   # needed) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
   # cost on the critical path.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-lint ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   cross-aarch64-linux:
     name: Cross-check (aarch64-linux)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
@@ -944,12 +1192,27 @@ jobs:
   # Runs in PARALLEL (no `needs:`) — off the critical path. STABLE, not the
   # PINNED_NIGHTLY used by fuzz/miri.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -960,6 +1223,11 @@ jobs:
   msrv:
     name: MSRV (1.93)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
@@ -994,12 +1262,27 @@ jobs:
   # changes. `cargo check` per example workspace is the cheap blocking
   # check: an example that does not compile fails CI.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' msrv-1.93 '))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -1010,6 +1293,11 @@ jobs:
   examples:
     name: Examples (cargo check)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 30
     env:
       # Same ENOSPC class as the lint job (see its comment): each example
@@ -1085,12 +1373,27 @@ jobs:
   # run: it is the rig that needs GStreamer at runtime, and without the feature it deliberately FAILS
   # rather than reporting a vacuous `0 passed` (see its module docs).
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-examples-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/**/Cargo.toml') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -1110,6 +1413,11 @@ jobs:
     # one; a container network that does not carry `IFF_MULTICAST` would make
     # the precondition unsatisfiable, so this job must stay on the plain VM.
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 40
     env:
       # Same ENOSPC class as the lint/examples jobs: this workspace compiles
@@ -1276,12 +1584,27 @@ jobs:
   # binaries apart.
 
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-examples-go2-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock', 'examples/go2/**/Cargo.toml') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-go2-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -1292,9 +1615,29 @@ jobs:
   test-linux:
     name: Test (Linux) shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # No `needs:`. Each shard builds the `cerulion_core` test binaries it runs,
-    # so nothing in front of it is a data dependency and the four shards start
-    # at t=0 with every other job.
+    # `needs: [changes]` for the per-package selection only. Every leg still
+    # runs and still reports its own context. The shards no longer start at
+    # t=0: they wait for the classifier, about a minute of checkout and
+    # workspace resolve, on every event, which is the price of a selection that
+    # can be read by a step rather than guessed at by a job.
+    needs: [changes]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. `needs: [changes]` makes the
+    # classifier a prerequisite on every event, and GitHub SKIPS a dependent
+    # when its dependency fails; a skipped required context counts as
+    # SATISFIED, so without this guard a failed classifier would wave the pull
+    # request through with this job's contexts never run. With it the job runs,
+    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
+    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    if: ${{ !cancelled() }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
+    # Each shard builds the `cerulion_core` test binaries it runs, so the
+    # classifier above is the only thing in front of it and the four shards
+    # start together once it reports.
     strategy:
       # One shard's failure must not cancel the other three: the whole point of
       # the split is that the shards report independently, and a red shard 2
@@ -1483,9 +1826,10 @@ jobs:
       # superset of shard 0's (`rmw_cerulion` rides shard 3). If the package
       # map moves again, re-derive this
       # rather than trusting it.)
-      # (On Linux `lint` normally reserves this key first and every save here is
-      # skipped as an exact hit; there is no `lint` leg on macOS, which is where
-      # the race actually bit.)
+      # (Shard 0 is the SOLE saver of `cargo-Linux-`. `lint`, `docs` and
+      # `netd-wan` used to share this key and whichever finished first wrote it;
+      # they have their own namespaces now and fall through their `restore-keys`
+      # to this one, which is a superset of what they build.)
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
         if: matrix.shard == 0
@@ -1565,9 +1909,25 @@ jobs:
       # `cerulion_core/tests/serial_discipline_test.rs`, so it cannot silently
       # lose a binary.
 
+      # The doc-pin markers below name the test binaries in this package that
+      # read a tree outside their own crate. The set is derived from the test
+      # sources by `ci_doc_pin_walk_test`, which fails on a missing or a stale
+      # line, so a path-to-step map cannot lose one of these binaries.
+      # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
+      # doc-pin: cerulion_core::serial_discipline_test reads .github
+      # NOT gated by an `if:`, deliberately. `cerulion_core`'s whole-tree walks
+      # (`serial_discipline_test` among them) read every `.rs` file in the source
+      # tree, and `tools/ci/observation_edges.tsv` records the package
+      # as observing `all`, so it rides every selection that names a package; only
+      # a change that selects nothing reaches this step with `[]`. The shard
+      # runner intersects its own package with the selection instead of a step
+      # condition and prints one `selection:` line when the intersection is
+      # empty, so the decision and its log line live in one place.
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
@@ -1633,9 +1993,12 @@ jobs:
       #     `target/debug/build/`, whose entries are hardlinks to these, and a
       #     hardlink means deleting one copy frees no blocks anyway.
       #
-      # No cache cost: the `cargo-Linux-` archive measures ~563 MB restored
-      # (registry + git — this job builds `target` cold), so there are no test
-      # executables in it to lose.
+      # Cache cost, restated now that shard 0 is the sole saver of
+      # `cargo-Linux-` (3.18 GB measured 2026-09-28, this job's own `target/`
+      # included): the save step runs at the END of this job, after this
+      # reclaim, so the executables removed here are not in the archive the next
+      # run restores. Cargo relinks them from the `.rlib`/`.rmeta` artefacts
+      # that stay, which is the cost this reclaim already accepted.
       #
       # TWO placements, not one. Before the wan step alone would fix the five
       # observed firings and nothing else: the second main push entered that step
@@ -1771,14 +2134,21 @@ jobs:
       # Touches the iceoryx2 singleton — serial. Shard 3 after the
       # rebalance (see the map above); it runs BEFORE that shard's pre-wan
       # reclaim, which prunes its test executables.
+      # doc-pin: rmw_cerulion::rmw_absent_export_table_test reads tools
       - name: rmw_cerulion tests (serial)
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
         # The runner has no ROS: a build that silently fell back to (or
         # away from) the vendored bindings could not otherwise be told —
         # every claim test is a disjunction over both sources.
         env:
           CERULION_RMW_EXPECT_BINDINGS: vendored
         run: cargo test -p rmw_cerulion -- --test-threads=1
+      - name: selection marker, rmw_cerulion
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped rmw_cerulion (selected: $SELECTED)"
 
       # The borrow-window heap hook (`cerulion_heaphook`). LINUX ONLY (this
       # step is only on `test-linux`; the interposition `.so` cannot build on
@@ -1791,12 +2161,25 @@ jobs:
       # it needs — so it rides shard 2, the tail shard, beside `macros` and
       # `discovery`, and it is named in that job's package map above.
       - name: cerulion_heaphook tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_heaphook')
         run: cargo test -p cerulion_heaphook
+      - name: selection marker, cerulion_heaphook
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_heaphook') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_heaphook (selected: $SELECTED)"
 
+      # doc-pin: native_ros2_messages::upstream_drift_test reads tools
       - name: native_ros2_messages tests
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
         run: cargo test -p native_ros2_messages
+      - name: selection marker, native_ros2_messages
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped native_ros2_messages (selected: $SELECTED)"
 
       # BOTH bag crates are named explicitly — every job here names its
       # `-p` packages and there is no blanket `cargo test --workspace`
@@ -1816,18 +2199,36 @@ jobs:
       # level shard 3. See the table above before pairing them up on cosmetic
       # grounds.
       - name: cerulion_bag tests
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')
         run: cargo test -p cerulion_bag
+      - name: selection marker, cerulion_bag
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_bag (selected: $SELECTED)"
       - name: cerulion_bagd tests (serial, process-global panic hook)
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
         run: cargo test -p cerulion_bagd -- --test-threads=1
+      - name: selection marker, cerulion_bagd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_bagd (selected: $SELECTED)"
 
       # cerulion_macros is a proc-macro crate compiled into the host
       # toolchain — its own unit tests (parse + determinism) are NOT
       # exercised transitively by `-p cerulion_core`, so name it explicitly.
       - name: cerulion_macros tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros')
         run: cargo test -p cerulion_macros
+      - name: selection marker, cerulion_macros
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
       # The CLI crates are named here too. Their 160+ tests
       # are pure-logic / filesystem and safe to run with default threading.
@@ -1836,15 +2237,31 @@ jobs:
       # together the three are 13.5 of the 28.6 min of package work in this
       # job, and all of it on one runner is what once put shard 1 at 45 min.
       # The placement is the measured packing in the map above, not family.
+      # doc-pin: cerulion_cli_engine::bag_record_run_attach_test reads docs
+      # doc-pin: cerulion_cli_engine::cerulion_cli_engine reads examples, tools
+      # doc-pin: cerulion_cli_engine::ci_doc_pin_walk_test reads .github, tools
+      # doc-pin: cerulion_cli_engine::ci_test_coverage_test reads .github, tools
+      # doc-pin: cerulion_cli_engine::dependency_door_test reads examples, tools
+      # doc-pin: cerulion_cli_engine::library_print_ban_test reads examples
+      # doc-pin: cerulion_cli_engine::ros_attach_test reads examples
+      # doc-pin: cerulion_cli_engine::user_api_inspector_doc_test reads docs
+      # doc-pin: cerulion_cli_engine::workspace_lints_manifest_test reads examples
       - name: CLI engine tests
         if: matrix.shard == 2
         run: cargo test -p cerulion_cli_engine
+      # doc-pin: cerulion_cli::graph_run_validate_gate_e2e_test reads docs
       - name: CLI binary tests
         if: matrix.shard == 1
         run: cargo test -p cerulion_cli
       - name: CLI TUI tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
         run: cargo test -p cerulion_cli_tui
+      - name: selection marker, cerulion_cli_tui
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_cli_tui (selected: $SELECTED)"
 
       # `cerulion_discovery` — the LAN peer-discovery substrate extracted
       # from `cerulion_cli_engine` (the peers.json format+reader, the discovered-peer
@@ -1855,8 +2272,14 @@ jobs:
       # is named here. Same reason as the wireclient/connectd
       # steps below. Leaf crate (std + serde + dirs + tracing) — ~3 s, no transport.
       - name: cerulion_discovery tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery')
         run: cargo test -p cerulion_discovery
+      - name: selection marker, cerulion_discovery
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
 
       # The test jobs enumerate packages explicitly: there is NO blanket
       # `cargo test --workspace` step (it would hang on iceoryx2's SHM singleton). So
@@ -1866,8 +2289,14 @@ jobs:
       # `--workspace` overrides default-members — but we run no such step for tests.)
       # The iroh tree it compiles is shared with the connectd + netd steps below.
       - name: cerulion_wireclient tests
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient')
         run: cargo test -p cerulion_wireclient
+      - name: selection marker, cerulion_wireclient
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_wireclient (selected: $SELECTED)"
 
       # cerulion_connectd is a workspace member excluded from
       # default-members (it pulls the iroh tree), so — like wireclient above — it needs
@@ -1878,8 +2307,14 @@ jobs:
       # SHM roots ⇒ parallel-safe; shares the iroh tree the wireclient/netd steps
       # compile (no extra cold cost).
       - name: cerulion_connectd tests
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd')
         run: cargo test -p cerulion_connectd
+      - name: selection marker, cerulion_connectd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_connectd (selected: $SELECTED)"
 
       # The wan step below is where all four of the red PRs ran the
       # runner out of disk, and until now the ONLY `df` in this job ran before a
@@ -1917,8 +2352,19 @@ jobs:
       # the loopback-iroh WAN-plane e2e (real iceoryx2 + loopback iroh, per-test SHM
       # roots + per-test iroh identities ⇒ parallel-safe).
       - name: cerulion_netd tests (--features wan)
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: cargo test -p cerulion_netd --features wan
+      # The SKIP BRANCH of the gate above. A skipped step prints nothing of
+      # its own, so the one line that says what the selection dropped lives
+      # here, beside it, under the exact negation of its condition.
+      # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
+      # for every gated step in this job.
+      - name: selection marker, cerulion_netd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_netd (selected: $SELECTED)"
 
       # The terminal reading, and the one every post-mortem so far has
       # lacked — `if: always()` because the state that matters is the state a
@@ -1941,23 +2387,27 @@ jobs:
   # automatically faster; the question is whether the variable work divides
   # further than the fixed cost grows, and on this job it does.
   #
-  # WHAT THE 2-WAY SPLIT MEASURED, per step, on two runs a week apart:
+  # WHAT THE 2-WAY SPLIT MEASURED, per step, with a cache hit on the
+  # default-branch run 35666419690 (2026-09-21):
   #
-  #   leg      cache hit    cache miss
-  #   shard 0    28.3 min     57.4 min
-  #   shard 1    46.0 min     55.1 min
+  #   leg      cache hit
+  #   shard 0    28.3 min
+  #   shard 1    46.0 min
   #
-  # Two facts out of that table, and they point the same way. The legs were
-  # skewed 1.6 to 1 with a warm cache, so one of them set the wall of the whole
-  # workflow while the other idled for 18 minutes. And the skew INVERTS when
-  # the cache misses, because shard 0 carried the pinned `macro_compile_fail_test`
-  # trybuild tail, which compiles 91 fixture projects and costs 6 min warm
-  # against 18 min cold. A hand tilt tuned on either column is wrong in the
-  # other one; a third shard is better in BOTH, because it divides the variable
-  # work by 3 while the fixed cost is paid once more.
+  # Two facts out of that, and they point the same way. The legs were skewed
+  # 1.6 to 1, so one of them set the wall of the whole workflow while the
+  # other idled for 18 minutes. And the skew turns over when the cache misses,
+  # because shard 0 carried the pinned `macro_compile_fail_test` trybuild tail,
+  # which compiles 91 fixture projects: 6 min with a cache hit and the largest
+  # single step of a cold leg. A hand tilt tuned on the cache-hit column is
+  # wrong on a miss; a third shard is better in BOTH states, because it divides
+  # the variable work by 3 while the fixed cost is paid once more. (A cache-miss
+  # measurement of the 2-way split was taken but its run id was not kept, so
+  # its numbers are not cited here.)
   #
   # PREDICTED from the same per-step numbers: longest leg 26.6 min warm (from
-  # 46.0) and 42.7 min cold (from 57.4).
+  # 46.0). OBSERVED since: the eight default-branch runs of 2026-09-27 put the
+  # macOS shards' wall at 29 to 44 min, cache state not recorded.
   #
   # The package map below is balanced by hand against those numbers, under
   # three constraints: the iroh-tree packages (wireclient, connectd, netd-wan)
@@ -1968,12 +2418,29 @@ jobs:
   # more than 5 min apart WITH THE SAME CACHE STATE (comparing a warm leg
   # against a cold one measures the cache, not the map).
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          matrix.shard == 0
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green shard 0 stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
       # so nothing could restore what it saved, and the upload only adds
       # eviction pressure on the store.
       - name: Cache cargo, shard 0 saves (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && matrix.shard == 0 && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && matrix.shard == 0
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -1984,6 +2451,24 @@ jobs:
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
+    # `needs: [changes]` for the per-package selection only. Every leg still
+    # runs and still reports its own context, and every leg now waits for the
+    # classifier (about a minute) before it starts, on every event.
+    needs: [changes]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. `needs: [changes]` makes the
+    # classifier a prerequisite on every event, and GitHub SKIPS a dependent
+    # when its dependency fails; a skipped required context counts as
+    # SATISFIED, so without this guard a failed classifier would wave the pull
+    # request through with this job's contexts never run. With it the job runs,
+    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
+    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    if: ${{ !cancelled() }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # NO `needs: [lint]`: a `lint` verdict was never a data dependency for a
     # test job. This is the job the omission is aimed at. It is
     # the longest in the workflow (46.1 min of the 54.0 min wall on the last
@@ -2014,12 +2499,12 @@ jobs:
     # runtime budget.
     # 75 → 60 (the 3-way split), and DOWN for the first time in this file's
     # history, because for the first time there are per-step MEASUREMENTS to
-    # derive it from rather than a guess. The per-step costs are measured, on
-    # the 2-way runs tabulated above; the longest 3-way leg is PROJECTED from
-    # them at 26.6 min warm and 42.7 min cold, and no three-shard run has put
-    # an observed wall on it yet. 60 leaves 40 percent headroom over the WORSE
-    # of those two projections. Re-set it from the first three green 3-way
-    # runs, which replace the projection with a measurement. A ceiling that tracks the measured wall
+    # derive it from rather than a guess. The per-step costs are measured on
+    # the 2-way cache-hit run tabulated above; the longest 3-way leg is
+    # PROJECTED from them at 26.6 min warm, and the eight default-branch runs
+    # of 2026-09-27 observed the macOS shards' wall at 29 to 44 min with the
+    # cache state not recorded. 60 leaves a third of headroom over the worst
+    # observed wall. Re-set it from green 3-way runs as they accumulate. A ceiling that tracks the measured wall
     # turns a hang into a fast red instead of a 75-minute one, which is the
     # point of having one. Every raise above is a run that was CANCELLED with
     # every suite green, so the rule those raises teach still holds: tighten
@@ -2159,9 +2644,8 @@ jobs:
       # saver under this map than under the 2-way one, not merely a defensible
       # one. If the package map moves again, re-derive this rather than
       # trusting it.
-      # (On Linux `lint` normally reserves this key first and every save here is
-      # skipped as an exact hit; there is no `lint` leg on macOS, which is where
-      # the race actually bit.)
+      # (Shard 0 is the SOLE saver of `cargo-macOS-`: no other job on this
+      # runner writes that key.)
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
         if: matrix.shard == 0
@@ -2278,7 +2762,11 @@ jobs:
         if: matrix.shard == 0
         run: cargo test -p cerulion_cli --test credit_death_e2e_test c7_ -- --test-threads=1
 
+      # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
+      # observes the whole tree, so the shard runner does the intersection.
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
@@ -2309,34 +2797,64 @@ jobs:
       # WHAT runs changed and both nightly mirrors still cover the job; only
       # which leg runs it did. Touches the iceoryx2 singleton — serial.
       - name: rmw_cerulion tests (serial)
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
         # The runner has no ROS: a build that silently fell back to (or
         # away from) the vendored bindings could not otherwise be told —
         # every claim test is a disjunction over both sources.
         env:
           CERULION_RMW_EXPECT_BINDINGS: vendored
         run: cargo test -p rmw_cerulion -- --test-threads=1
+      - name: selection marker, rmw_cerulion
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped rmw_cerulion (selected: $SELECTED)"
 
       - name: native_ros2_messages tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
         run: cargo test -p native_ros2_messages
+      - name: selection marker, native_ros2_messages
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped native_ros2_messages (selected: $SELECTED)"
 
       # See the Linux job's note — neither bag crate was in ANY job's
       # `-p` list, so both suites compiled and never ran. bagd is serial for the
       # process-global panic hook, not for iceoryx2.
       - name: cerulion_bag tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')
         run: cargo test -p cerulion_bag
+      - name: selection marker, cerulion_bag
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_bag (selected: $SELECTED)"
       - name: cerulion_bagd tests (serial, process-global panic hook)
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
         run: cargo test -p cerulion_bagd -- --test-threads=1
+      - name: selection marker, cerulion_bagd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_bagd (selected: $SELECTED)"
 
       # cerulion_macros is a proc-macro crate compiled into the host
       # toolchain — its own unit tests (parse + determinism) are NOT
       # exercised transitively by `-p cerulion_core`, so name it explicitly.
       - name: cerulion_macros tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros')
         run: cargo test -p cerulion_macros
+      - name: selection marker, cerulion_macros
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
       # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
       # rides shard 1 and the binary rides shard 0, because the binary's suite
@@ -2349,8 +2867,14 @@ jobs:
         if: matrix.shard == 0
         run: cargo test -p cerulion_cli
       - name: CLI TUI tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
         run: cargo test -p cerulion_cli_tui
+      - name: selection marker, cerulion_cli_tui
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_cli_tui (selected: $SELECTED)"
 
       # `cerulion_discovery` — the LAN peer-discovery substrate extracted
       # from `cerulion_cli_engine` (the peers.json format+reader, the discovered-peer
@@ -2361,8 +2885,14 @@ jobs:
       # is named here. Same reason as the wireclient/connectd
       # steps below. Leaf crate (std + serde + dirs + tracing) — ~3 s, no transport.
       - name: cerulion_discovery tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery')
         run: cargo test -p cerulion_discovery
+      - name: selection marker, cerulion_discovery
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
 
       # The test jobs enumerate packages explicitly: there is NO blanket
       # `cargo test --workspace` step (it would hang on iceoryx2's SHM singleton). So
@@ -2372,8 +2902,14 @@ jobs:
       # `--workspace` overrides default-members — but we run no such step for tests.)
       # The iroh tree it compiles is shared with the connectd + netd steps below.
       - name: cerulion_wireclient tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient')
         run: cargo test -p cerulion_wireclient
+      - name: selection marker, cerulion_wireclient
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_wireclient (selected: $SELECTED)"
 
       # cerulion_connectd is a workspace member excluded from
       # default-members (it pulls the iroh tree), so — like wireclient above — it needs
@@ -2383,8 +2919,14 @@ jobs:
       # reader loop, and this is the only CI step that runs it. The tests are OS-portable
       # (loopback iroh + iceoryx2 both work on macOS), so they gate on both runners.
       - name: cerulion_connectd tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd')
         run: cargo test -p cerulion_connectd
+      - name: selection marker, cerulion_connectd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_connectd (selected: $SELECTED)"
 
       # The wan step is where the Linux leg ran out of disk on all four of
       # the red PRs. macOS has no measured ENOSPC — see the reclaim step at the
@@ -2398,8 +2940,14 @@ jobs:
       # on macOS — the cerulion_connectd reinject e2e this cribs runs on macOS too),
       # so it gates on both runners.
       - name: cerulion_netd tests (--features wan)
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: cargo test -p cerulion_netd --features wan
+      - name: selection marker, cerulion_netd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_netd (selected: $SELECTED)"
 
       # THE macOS HALF OF `viz-tests`, folded in here rather than run as two
       # more macOS jobs. The `run:` lines are VERBATIM copies of the
@@ -2415,23 +2963,46 @@ jobs:
       # for a REQUIRED check on the slower runner is the riskier error. The job
       # ceiling still bounds it.
       - name: cerulion_viz tests (whole suite, parallel)
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --no-fail-fast
       - name: cerulion_vizd tests (whole suite, serial)
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd')
         run: cargo test -p cerulion_vizd --no-fail-fast -- --test-threads=1
+      - name: selection marker, cerulion_vizd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_vizd (selected: $SELECTED)"
       - name: go2_tf tests
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')
         run: cargo test -p go2_tf
+      - name: selection marker, go2_tf
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped go2_tf (selected: $SELECTED)"
       - name: cargo test -p cerulion_viz --lib openh264_fetch
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --lib openh264_fetch
       - name: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
       - name: cargo test -p cerulion_viz --test video_decode_test
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test video_decode_test -- --test-threads=1
+      # The SKIP BRANCH of the gate above. A skipped step prints nothing of
+      # its own, so the one line that says what the selection dropped lives
+      # here, beside it, under the exact negation of its condition.
+      # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
+      # for every gated step in this job.
+      - name: selection marker, cerulion_viz
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_viz (selected: $SELECTED)"
 
       # The same set once, at the moment a step failed, so the numbers do not
       # have to be recovered from the artifact. `getrlimit` is read from inside
@@ -2535,12 +3106,29 @@ jobs:
   # rationing a healthy one, which is the rule this file applies everywhere.
   # ==========================================================================
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          matrix.shard == 0
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green shard 0 stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
       # so nothing could restore what it saved, and the upload only adds
       # eviction pressure on the store.
       - name: Cache cargo, shard 0 saves (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && matrix.shard == 0 && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && matrix.shard == 0
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2550,7 +3138,24 @@ jobs:
           key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   crate-tests:
     name: Crate tests (${{ matrix.os }})
-    needs: [lint]
+    needs: [lint, changes]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. `needs:` makes the classifier a
+    # prerequisite on every event, and GitHub SKIPS a dependent when its
+    # dependency fails; a skipped required context counts as SATISFIED, so
+    # without this guard a failed classifier would wave the pull request
+    # through with this job's contexts never run. With it the job runs,
+    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
+    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    #
+    # IT LIFTS THE SHORT-CIRCUIT ON `lint` TOO. A job-level condition replaces
+    # the implicit `success()` over the WHOLE `needs:` set, and GitHub offers no
+    # per-dependency form, so a red `lint` no longer skips this job either. That
+    # direction is the acceptable one: more runs, never fewer. `Lint` is its own
+    # required context and a red one still blocks the pull request, and this job
+    # reports its own result rather than being waved through as a skip. What
+    # `needs: [lint]` still buys is the ordering.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -2558,6 +3163,11 @@ jobs:
         # so each leg renders its own required check name.
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 40
     env:
       # `line-tables-only`, matching the other TEST jobs: backtraces keep
@@ -2625,21 +3235,77 @@ jobs:
       # `cerulion_link` and `cerulion_pairing`, including two `compile_fail`
       # pins that assert a misuse does NOT compile).
       - name: cerulion_pairing tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
         run: cargo test -p cerulion_pairing
+      - name: selection marker, cerulion_pairing
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_pairing (selected: $SELECTED)"
       - name: cerud tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerud')
         run: cargo test -p cerud
+      - name: selection marker, cerud
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerud') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerud (selected: $SELECTED)"
       - name: cerulion_remoted tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
         run: cargo test -p cerulion_remoted
+      - name: selection marker, cerulion_remoted
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_remoted (selected: $SELECTED)"
       - name: cerulion_accountd tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_accountd')
         run: cargo test -p cerulion_accountd
+      - name: selection marker, cerulion_accountd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_accountd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_accountd (selected: $SELECTED)"
       - name: cerulion_dds tests (default features, jazzy/live)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_dds')
         run: cargo test -p cerulion_dds
+      - name: selection marker, cerulion_dds
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_dds') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_dds (selected: $SELECTED)"
       - name: cerulion_link tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_link')
         run: cargo test -p cerulion_link
+      - name: selection marker, cerulion_link
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_link') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_link (selected: $SELECTED)"
       - name: cerulion-wire tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire')
         run: cargo test -p cerulion-wire
+      - name: selection marker, cerulion-wire
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion-wire (selected: $SELECTED)"
       - name: cerulion_mdns tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_mdns')
         run: cargo test -p cerulion_mdns
+      - name: selection marker, cerulion_mdns
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_mdns') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_mdns (selected: $SELECTED)"
       # The ONE non-`cargo test` step here, and it is load-bearing.
       # `cerulion_wsd`'s two production `--inspect-node` arms run the SHIPPED
       # binary against a real node cdylib, and a cdylib is opened with
@@ -2653,9 +3319,26 @@ jobs:
       # "a pin that cannot fail a PR is not a gate" class this job's header
       # names. Default profile and target dir, matching the `cargo test` below.
       - name: Build the cerulion_wsd --inspect-node fixture cdylib
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
         run: cargo build -p test_node_cdylib
       - name: cerulion_wsd tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
         run: cargo test -p cerulion_wsd
+      # The SKIP BRANCH of the gate above. A skipped step prints nothing of
+      # its own, so the one line that says what the selection dropped lives
+      # here, beside it, under the exact negation of its condition.
+      # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
+      # for every gated step in this job.
+      - name: selection marker, cerulion_wsd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_wsd (selected: $SELECTED)"
+      # doc-pin: cerulion_hygiene::crate_license_texts_test reads docs
+      # doc-pin: cerulion_hygiene::dependency_rules_test reads examples
+      # doc-pin: cerulion_hygiene::shipped_surface_structure_test reads .github, benches, docs, tools
+      # doc-pin: cerulion_hygiene::user_api_doc_test reads docs
       - name: cerulion_hygiene tests
         run: cargo test -p cerulion_hygiene
 
@@ -2684,12 +3367,27 @@ jobs:
   # surfaces on main rather than on the PR. Use workflow_dispatch to run
   # it pre-merge when a PR touches release-gated code.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' crates-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2700,6 +3398,11 @@ jobs:
   test-latency:
     name: Latency Threshold (Linux)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # Allowlist (not `!= 'pull_request'`): a new event class has to be NAMED
     # here to reach the job, which is why the merge_group trigger on this
     # workflow does NOT start this slow release build on queued batches.
@@ -2820,12 +3523,27 @@ jobs:
   # `graph_latency_test` in the Linux-only `test-latency` job — this dedicated
   # matrix job is what gives the CLI-driven path its macOS coverage.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2848,6 +3566,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # Generous: the cold cerulion_core release compile in the fresh tempdir dominates
     # (~11 min on a cache miss) and the test itself is ~17 min, so the ubuntu leg has
     # run 26-29 min for weeks; 30 cancelled a GREEN run on main (the test had already
@@ -2896,12 +3619,27 @@ jobs:
 
   # Fuzz testing (Linux-only, nightly toolchain)
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -2916,6 +3654,11 @@ jobs:
   fuzz:
     name: Fuzz (Linux)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
@@ -2993,12 +3736,27 @@ jobs:
   # PINNED_NIGHTLY is stable). If a future nightly / iceoryx2 bump breaks
   # Miri, fix or re-pin rather than silently reverting to non-blocking.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-fuzz-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' fuzz-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -3010,6 +3768,11 @@ jobs:
   miri:
     name: Miri (Linux, scoped to FFI-free tests)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
@@ -3061,12 +3824,27 @@ jobs:
 
   # Documentation check
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' miri-{0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -3078,6 +3856,11 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     needs: [lint]
     # 30, and the number follows the MACHINE rather than the job. On a 4-core
     # runner the healthy build ran 8m56s-9m18s and 15 was ample; on a 2-core one
@@ -3120,9 +3903,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-docs-main-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
@@ -3140,22 +3924,42 @@ jobs:
   # explicit-feature + lean-variant analysis OFF the tight `lint`/`docs` gates. Pure
   # analysis (clippy + doc), so no debuginfo. It gates NO other job.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-docs ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   netd-wan:
     name: netd WAN (clippy + docs, --features wan)
     runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     needs: [lint]
     timeout-minutes: 25
     env:
@@ -3191,9 +3995,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-netd-wan-main-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
 
@@ -3372,8 +4177,10 @@ jobs:
   # `needs: [lint]`. This job COMPILES
   # the rerun SDK tree (257 crates, ~7 min measured). Gating it behind `lint` costs
   # nothing on a healthy PR (the critical path is the ~hour-long `test-linux` /
-  # `test-macos` jobs, which are gated too) and saves a whole runner when a
-  # PR arrives with a fmt/clippy failure. NB for anyone comparing: `demos-go2`,
+  # `test-macos` jobs, which are gated too). It no longer saves a runner on a red
+  # `lint`: the `!cancelled()` guard below lifts the short-circuit over the whole
+  # `needs:` set, so this job runs and reports its own result, and the dependency
+  # buys the ordering alone. NB for anyone comparing: `demos-go2`,
   # `msrv`, `examples` and `cross-aarch64-linux` also compile source and are NOT
   # gated — "every compile job is gated" is not the house rule; this one is
   # gated because it is expensive AND nothing waits on its result.
@@ -3411,22 +4218,54 @@ jobs:
   # output (the viz lane links its ~29 rerun-carrying test binaries, the vizd
   # lane its own), which is exactly the part that had been growing.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-netd-wan ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
-    needs: [lint]
+    needs: [lint, changes]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. `needs:` makes the classifier a
+    # prerequisite on every event, and GitHub SKIPS a dependent when its
+    # dependency fails; a skipped required context counts as SATISFIED, so
+    # without this guard a failed classifier would wave the pull request
+    # through with this job's contexts never run. With it the job runs,
+    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
+    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    #
+    # IT LIFTS THE SHORT-CIRCUIT ON `lint` TOO. A job-level condition replaces
+    # the implicit `success()` over the WHOLE `needs:` set, and GitHub offers no
+    # per-dependency form, so a red `lint` no longer skips this job either. That
+    # direction is the acceptable one: more runs, never fewer. `Lint` is its own
+    # required context and a red one still blocks the pull request, and this job
+    # reports its own result rather than being waved through as a skip. What
+    # `needs: [lint]` still buys is the ordering.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -3439,6 +4278,11 @@ jobs:
         # `vizd` — the `cerulion-vizd` daemon suite, which is the serial one.
         lane: [viz, vizd]
     runs-on: ${{ matrix.os }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
     # 55, matching `test-linux` / `test-macos` rather than the predecessor's 40.
     # That 40 was set for a Linux-only job building TWO test binaries against a
     # WARM cache; this builds 29, and while it still had a macOS leg that leg
@@ -3585,7 +4429,7 @@ jobs:
       # the opposite of what a whole-suite lane is for. With the flag, every
       # binary runs and the step still fails.
       - name: cerulion_viz tests (whole suite, parallel)
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --no-fail-fast
 
       # SERIAL by design — see (a)/(b)/(c) in the job comment. Whole package,
@@ -3605,9 +4449,15 @@ jobs:
       # test step alone — no healthy run comes near it — while turning a hang
       # into an attributable step failure in well under half the job ceiling.
       - name: cerulion_vizd tests (whole suite, serial)
-        if: matrix.lane == 'vizd'
+        if: matrix.lane == 'vizd' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd')
         timeout-minutes: 30
         run: cargo test -p cerulion_vizd --no-fail-fast -- --test-threads=1
+      - name: selection marker, cerulion_vizd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_vizd (selected: $SELECTED)"
 
       # `go2_tf` is the viz tree's THIRD package (`cerulion_viz/lib/go2_tf`);
       # naming only two packages would leave it executed by NO CI job, the exact
@@ -3615,8 +4465,14 @@ jobs:
       # (std + thiserror, no transport, no rerun), runs in ~0.0 s. Parallel: it
       # has no globals to share and no `tests/` dir.
       - name: go2_tf tests
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')
         run: cargo test -p go2_tf
+      - name: selection marker, go2_tf
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped go2_tf (selected: $SELECTED)"
 
       # The OpenH264 fetcher's own suite. SAME argument as the two
       # whole-suite lanes above — `cargo clippy --workspace --all-targets`
@@ -3630,14 +4486,14 @@ jobs:
       # network-only, in `openh264_live_fetch_test.rs`). The marginal cost is seconds
       # — the expensive part, building the rerun SDK tree, is already paid above.
       - name: cargo test -p cerulion_viz --lib openh264_fetch
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --lib openh264_fetch
 
       # Its OWN binary on purpose: the wiring pin counts a process-global
       # consultation counter and asserts it starts at zero, which only holds when
       # nothing else in the process has driven a decoder-less pool.
       - name: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
 
       # `--test-threads=1`: two arms drive the process-global cache generation
@@ -3645,8 +4501,19 @@ jobs:
       # but the surrounding decode arms share a Rerun stream, so serial is the
       # cheap correct answer here.
       - name: cargo test -p cerulion_viz --test video_decode_test
-        if: matrix.lane == 'viz'
+        if: matrix.lane == 'viz' && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
         run: cargo test -p cerulion_viz --test video_decode_test -- --test-threads=1
+      # The SKIP BRANCH of the gate above. A skipped step prints nothing of
+      # its own, so the one line that says what the selection dropped lives
+      # here, beside it, under the exact negation of its condition.
+      # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
+      # for every gated step in this job.
+      - name: selection marker, cerulion_viz
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_viz (selected: $SELECTED)"
 
   # Unused-dependency audit (cargo-machete).
   #
@@ -3698,12 +4565,27 @@ jobs:
   # Resolve-only against the manifests; no compile, no cargo cache, no `needs:`
   # gate. Runs in PARALLEL and gates nothing.
 
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
       # nothing could restore what it saved, and the upload only adds eviction
       # pressure on the store.
       - name: Cache cargo (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' viz-{0}-{1} ', matrix.lane, runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -3757,12 +4639,21 @@ jobs:
   # both places. No Rust toolchain, no cargo cache, no `needs:` gate.
   # Policy lives in tools/release/deny.toml. Blocking by design.
 
-      # Saved as the LAST step so a green job stores what it built, and never
-      # from a merge-queue build: its branch is deleted after the batch, so
-      # nothing could restore what it saved, and the upload only adds eviction
-      # pressure on the store.
+      # NOT under the cache save policy, deliberately. This is a TOOL cache: one
+      # binary of a few MB under `~/.cargo/bin`, keyed on the pinned version and
+      # not on a lockfile hash. It has no lockfile generation for
+      # `ci_cache_prune.sh` to prune by, and gating it into a namespace the
+      # default never names meant the binary was never cached and
+      # `cargo install cargo-machete` ran on every push. It keeps the two tests
+      # that are about correctness rather than budget: do not re-upload what was
+      # restored, and never save from a merge-queue build whose branch is
+      # deleted after the batch. `ci_cache_policy_check.py` holds this shape
+      # (rule TOOL_CACHE) so a lockhash-free key over a `target/` directory
+      # cannot slip through the same door.
       - name: Cache cargo-machete (save)
-        if: steps.cache-restore-1.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/bin/cargo-machete

@@ -31,7 +31,7 @@
 //! zero-copy) applies to recursively-fixed messages exactly as on the C
 //! side.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::raw::c_void;
 
 use cerulion_core::codegen::layout::{LayoutResolver, VariableFieldLayout, WireLayout};
@@ -81,9 +81,13 @@ pub(crate) const BOOL_SEQ_NO_FETCH_NESTED: &str = concat!(
 /// The TAKE side's twin of [`bool_seq_no_fetch_detail`]: the same member,
 /// the same reason, the `assign` accessor instead of `fetch`. Reached
 /// BEFORE any write, so the caller's message is untouched.
-pub(crate) fn bool_seq_no_assign_detail(member: &str) -> String {
+///
+/// `path` is the member's own name at the top level and the nested member
+/// names joined with `.` below it (`pose.flags`), so the reader is sent to
+/// the field itself rather than to the enclosing member.
+pub(crate) fn bool_seq_no_assign_detail(path: &str) -> String {
     format!(
-        "bool sequence member '{member}' cannot be decoded: {}",
+        "bool sequence member '{path}' cannot be decoded: {}",
         bool_seq_no_fetch_reason!()
     )
 }
@@ -160,7 +164,7 @@ pub struct CppBridgedMessage {
     /// `forge_count` and [`Self::can_loan_take`].
     forge_count: usize,
     /// The FIRST `bool[]` member this build cannot write, as
-    /// `(var_idx, member name)`, or `None` when every one of them has its
+    /// `(var_idx, member path)`, or `None` when every one of them has its
     /// `assign` accessor. A property of the TYPE, decided once here rather
     /// than per frame: before Humble the C++ typesupport generator emits no
     /// `assign` for `std::vector<bool>`, so every frame carrying such a
@@ -168,6 +172,13 @@ pub struct CppBridgedMessage {
     /// anything. Reported through the decode latch with
     /// [`bool_seq_no_assign_detail`], never as a generic malformed-entry
     /// warning blaming the wire.
+    ///
+    /// The census that fills it walks NESTED messages transitively
+    /// ([`unwritable_bool_seq_census`]), because the nested decode reaches
+    /// such a member through `decode_complex_cpp` after earlier fields of
+    /// the destination are already written. `var_idx` is the TOP-LEVEL
+    /// member's offset-table index, which is the entry the refusal names;
+    /// the path names the member inside it.
     unwritable_bool_seq: Option<(usize, String)>,
 }
 
@@ -340,21 +351,9 @@ impl CppBridgedMessage {
 
         // The one type-level decode blocker (see the field's doc): a
         // `bool[]` member whose `assign` accessor this build's C++
-        // `MessageMember` does not carry.
-        let unwritable_bool_seq = ops.iter().find_map(|op| match op {
-            CppFieldOp::PrimSeq {
-                var_idx,
-                is_bool: true,
-                member_index,
-                ..
-            } if member_assign(&member_slice[*member_index]).is_none() => Some((
-                *var_idx,
-                ffi::cstr(member_slice[*member_index].name_)
-                    .unwrap_or("<field>")
-                    .to_string(),
-            )),
-            _ => None,
-        });
+        // `MessageMember` does not carry, at the top level or anywhere
+        // below it.
+        let unwritable_bool_seq = unwritable_bool_seq_census(&ops, member_slice);
 
         Ok(Self {
             qualified_name: root_qualified,
@@ -736,13 +735,14 @@ impl CppBridgedMessage {
         }
     }
 
-    /// The first `bool[]` member this build cannot write, if any; see the
-    /// field of the same name. Both take paths consult it BEFORE any write
-    /// and refuse the frame with the member named.
+    /// The first `bool[]` member this build cannot write, if any, as the
+    /// top-level entry index and the member PATH; see the field of the same
+    /// name. EVERY path that decodes this type consults it BEFORE any write
+    /// and refuses the frame with the member named.
     pub fn unwritable_bool_seq(&self) -> Option<(usize, &str)> {
         self.unwritable_bool_seq
             .as_ref()
-            .map(|(idx, name)| (*idx, name.as_str()))
+            .map(|(idx, path)| (*idx, path.as_str()))
     }
 
     /// Can this frame's VARIABLE entries be resolved at
@@ -763,8 +763,10 @@ impl CppBridgedMessage {
     /// the type. Three failure classes remain and still fail mid-decode,
     /// exactly as the plain copying take does: an ALLOCATION failure inside
     /// a copy arm; a malformed BODY inside a nested member (its top-level
-    /// entry resolves, its interior is only checked as it is decoded); and a
-    /// forged entry whose start address is not element-aligned
+    /// entry resolves, its interior is only checked as it is decoded), less
+    /// its bool-sequence subclass, which is a property of the TYPE and is
+    /// settled at registration by `unwritable_bool_seq_census` instead;
+    /// and a forged entry whose start address is not element-aligned
     /// (`ForgePlacement::Malformed`), which is arm-dependent — the copying
     /// decode serves such an entry rather than failing, so refusing it here
     /// would DROP a frame the over-retention arm can deliver.
@@ -1724,6 +1726,124 @@ fn cpp_op_var_idx(op: &CppFieldOp) -> usize {
     }
 }
 
+/// The FIRST bool sequence this build's C++ typesupport cannot WRITE,
+/// searched over the whole type: the top-level members and, transitively,
+/// every nested message and nested message array below them. Returns the
+/// TOP-LEVEL member's offset-table index (the entry a refusal names) and the
+/// member PATH, the member names from the top level down joined with `.`.
+///
+/// Why the walk goes below the top level: the op plan describes top-level
+/// members only, and every nested message becomes one `Complex` op, so a
+/// census over `ops` alone sees a `bool[]` in a nested message not at all.
+/// The nested decode reaches that member from `decode_complex_cpp` AFTER
+/// earlier fields of the destination are written and after the nested
+/// sequence is resized, so a take that consults this record only for
+/// top-level members leaves the caller's message half changed on a frame it
+/// reports as not taken.
+///
+/// `FixedCopy` ops are skipped by construction, not by choice: a fixed
+/// member holds no sequence at all, and a nested message carrying a bool
+/// SEQUENCE is variable by `is_variable_member_cpp`, so it can only ever be
+/// a `Complex` op. A fixed `bool[N]` needs no accessor either way, since it
+/// rides the fixed section as plain bytes.
+///
+/// # Safety
+/// `ops` must be the plan just built over `member_slice`, and both must
+/// describe live, process-lifetime introspection data.
+unsafe fn unwritable_bool_seq_census(
+    ops: &[CppFieldOp],
+    member_slice: &[CppMessageMember],
+) -> Option<(usize, String)> {
+    // ONE visited set for the whole census. A nested type reached twice is
+    // scanned once, which is sound because a type the walk already scanned
+    // and returned nothing for holds nothing to find on a second path; it
+    // is also what makes a self-referential typesupport terminate here
+    // instead of recursing until the stack ends.
+    let mut visited: BTreeSet<usize> = BTreeSet::new();
+    for op in ops {
+        match op {
+            CppFieldOp::PrimSeq {
+                var_idx,
+                is_bool: true,
+                member_index,
+                ..
+            } => {
+                let member = &member_slice[*member_index];
+                if unwritable_bool_seq_member_cpp(member) {
+                    return Some((*var_idx, member_name_cpp(member)));
+                }
+            }
+            CppFieldOp::Complex {
+                var_idx,
+                member_index,
+                ..
+            } => {
+                let member = &member_slice[*member_index];
+                if let Some(rest) = unwritable_bool_seq_below_cpp(member, &mut visited) {
+                    return Some((*var_idx, format!("{}.{rest}", member_name_cpp(member))));
+                }
+            }
+            CppFieldOp::PrimSeq { .. }
+            | CppFieldOp::String { .. }
+            | CppFieldOp::FixedCopy { .. } => {}
+        }
+    }
+    None
+}
+
+/// The first unwritable bool sequence anywhere INSIDE `member`'s nested
+/// type, as the member names below `member` joined with `.`. `None` for a
+/// member that is not a nested message.
+///
+/// # Safety
+/// `member` must come from live, process-lifetime introspection data.
+unsafe fn unwritable_bool_seq_below_cpp(
+    member: &CppMessageMember,
+    visited: &mut BTreeSet<usize>,
+) -> Option<String> {
+    if member.type_id_ != ros_type::MESSAGE {
+        return None;
+    }
+    let nested = nested_members_of_cpp(member);
+    if nested.is_null() || !visited.insert(nested as usize) {
+        return None;
+    }
+    let nm = &*nested;
+    let nested_slice = std::slice::from_raw_parts(nm.members_, nm.member_count_ as usize);
+    for nested_member in nested_slice {
+        if unwritable_bool_seq_member_cpp(nested_member) {
+            return Some(member_name_cpp(nested_member));
+        }
+        if let Some(rest) = unwritable_bool_seq_below_cpp(nested_member, visited) {
+            return Some(format!("{}.{rest}", member_name_cpp(nested_member)));
+        }
+    }
+    None
+}
+
+/// Is this member a bool SEQUENCE whose `assign` accessor this build's C++
+/// `MessageMember` does not carry? Unbounded and bounded sequences both
+/// qualify (both are written element by element through `assign`); a fixed
+/// `bool[N]` does not, because it is copied as plain bytes and needs no
+/// accessor.
+///
+/// # Safety
+/// `member` must come from live, process-lifetime introspection data.
+unsafe fn unwritable_bool_seq_member_cpp(member: &CppMessageMember) -> bool {
+    member.type_id_ == ros_type::BOOLEAN
+        && member.is_array_
+        && (member.array_size_ == 0 || member.is_upper_bound_)
+        && member_assign(member).is_none()
+}
+
+/// A member's own name, or `<field>` where the typesupport carries none.
+///
+/// # Safety
+/// `member.name_` must be the member's own NUL-terminated name.
+unsafe fn member_name_cpp(member: &CppMessageMember) -> String {
+    ffi::cstr(member.name_).unwrap_or("<field>").to_string()
+}
+
 /// May the forged loaned take aim this C++ member's
 /// `std::vector` triplet at the held SHM sample instead of filling it? The
 /// C twin's rule (`crate::type_bridge::is_forgeable_sequence` — unbounded,
@@ -1771,6 +1891,17 @@ unsafe fn seq_size(member: &CppMessageMember, field: *const c_void) -> Result<us
 /// other case resizes through the typesupport then bulk-copies (or
 /// assigns per element for vector<bool>). Returns false on missing
 /// accessors or fixed-array length mismatch.
+///
+/// The missing-`assign` refusal for a bool sequence is taken FIRST, before
+/// the resize: a `std::vector<bool>` is written element by element through
+/// `assign`, so a member without that accessor can never be filled whatever
+/// the frame says, and deciding it after the resize would leave the
+/// container emptied or grown on a decode that then fails. Registration
+/// already refuses every such TYPE
+/// ([`unwritable_bool_seq_census`]), so this leaf is the second line: it
+/// holds even for a member a future census gap lets through, and it makes
+/// the zero-length case agree with the type-level verdict instead of
+/// succeeding on a member nothing can write.
 unsafe fn write_prim_seq_cpp(
     member: &CppMessageMember,
     field: *mut c_void,
@@ -1778,6 +1909,9 @@ unsafe fn write_prim_seq_cpp(
     count: usize,
     is_bool: bool,
 ) -> bool {
+    if is_bool && member_assign(member).is_none() {
+        return false;
+    }
     if member.array_size_ > 0 && !member.is_upper_bound_ {
         if count != member.array_size_ {
             return false;
@@ -1825,6 +1959,8 @@ unsafe fn write_prim_seq_cpp(
         return true;
     }
     if is_bool {
+        // Bound here, refused at the top of the function: this arm cannot be
+        // reached with `None` (no `else` branch can be covered by a test).
         let Some(assign) = member_assign(member) else {
             return false;
         };
@@ -2642,6 +2778,181 @@ mod cpp_package_tests {
         let vector = u8_sequence_member(false);
         assert!(super::is_forgeable_sequence_cpp(&vector, true));
         assert!(is_unbounded_u8_vector(&vector));
+    }
+
+    /// A bit-packed `std::vector<bool>` stand-in. The bridge reaches a
+    /// sequence only through the member's function pointers, so a Rust
+    /// struct with Rust `extern "C"` accessors is indistinguishable from the
+    /// real container, and the bit packing means no contiguous copy can
+    /// serve it.
+    #[repr(C)]
+    struct FakeVecBool {
+        bits: *mut u8,
+        len: usize,
+    }
+
+    /// The pre-Humble `bool[]` member: a container that can be resized and
+    /// whose elements cannot be written, because the C++ generator emits no
+    /// `assign` for `std::vector<bool>`.
+    fn bool_sequence_member(
+        resize: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, usize)>,
+    ) -> super::CppMessageMember {
+        super::CppMessageMember {
+            name_: c"flags".as_ptr(),
+            type_id_: super::ros_type::BOOLEAN,
+            string_upper_bound_: 0,
+            members_: std::ptr::null(),
+            #[cfg(cerulion_has_is_key)]
+            is_key_: false,
+            is_array_: true,
+            array_size_: 0,
+            is_upper_bound_: false,
+            offset_: 0,
+            default_value_: std::ptr::null(),
+            size_function: None,
+            get_const_function: None,
+            get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
+            fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
+            assign_function: None,
+            resize_function: resize,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer_: false,
+        }
+    }
+
+    /// The poison the destination carries in and must still carry out.
+    const POISON: usize = 0xA5A5_A5A5_A5A5_A5A5;
+
+    fn poisoned_destination() -> FakeVecBool {
+        FakeVecBool {
+            bits: POISON as *mut u8,
+            len: POISON,
+        }
+    }
+
+    static REFUSED_RESIZES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_resize(field: *mut std::os::raw::c_void, size: usize) {
+        REFUSED_RESIZES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let v = &mut *(field as *mut FakeVecBool);
+        let mut storage = vec![0u8; size.div_ceil(8).max(1)];
+        v.bits = storage.as_mut_ptr();
+        v.len = size;
+        std::mem::forget(storage);
+    }
+
+    /// The LEAF refuses a bool sequence with no `assign` accessor before it
+    /// touches the destination, including the zero-length frame.
+    ///
+    /// Registration refuses every such type first, so no frame reaches this
+    /// leaf in a shipped build; the leaf is the second line, and it must not
+    /// depend on the census being complete. The decision used to come AFTER
+    /// the resize, so the destination was already emptied or grown on a
+    /// decode that then failed.
+    ///
+    /// Oracles, both hand-written here: the destination's bytes, poisoned
+    /// going in and compared field by field coming out; and a resize SPY
+    /// whose count must stay 0, which is what proves the refusal is taken
+    /// before the side effect rather than merely reported. The zero-length
+    /// call is the arm the hoist changed: it used to resize and report
+    /// success on a member nothing can ever write, which disagreed with the
+    /// type-level verdict.
+    #[test]
+    fn the_leaf_refuses_a_bool_sequence_with_no_assign_before_any_resize() {
+        use std::sync::atomic::Ordering;
+        let member = bool_sequence_member(Some(counting_resize));
+        for (bytes, count) in [(&[1u8, 0, 1][..], 3usize), (&[][..], 0usize)] {
+            REFUSED_RESIZES.store(0, Ordering::SeqCst);
+            let mut dest = poisoned_destination();
+            let wrote = unsafe {
+                super::write_prim_seq_cpp(
+                    &member,
+                    &mut dest as *mut _ as *mut std::os::raw::c_void,
+                    bytes,
+                    count,
+                    true,
+                )
+            };
+            assert!(
+                !wrote,
+                "count {count}: a bool sequence with no assign accessor is unwritable"
+            );
+            assert_eq!(
+                dest.bits as usize, POISON,
+                "count {count}: the refusal must not touch the container's data pointer"
+            );
+            assert_eq!(dest.len, POISON, "count {count}: nor its length");
+            assert_eq!(
+                REFUSED_RESIZES.load(Ordering::SeqCst),
+                0,
+                "count {count}: the refusal must come BEFORE the resize"
+            );
+        }
+    }
+
+    #[cfg(cerulion_has_fetch_function)]
+    static WRITING_RESIZES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(cerulion_has_fetch_function)]
+    unsafe extern "C" fn writing_resize(field: *mut std::os::raw::c_void, size: usize) {
+        WRITING_RESIZES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let v = &mut *(field as *mut FakeVecBool);
+        let mut storage = vec![0u8; size.div_ceil(8).max(1)];
+        v.bits = storage.as_mut_ptr();
+        v.len = size;
+        std::mem::forget(storage);
+    }
+
+    #[cfg(cerulion_has_fetch_function)]
+    unsafe extern "C" fn writing_assign(
+        field: *mut std::os::raw::c_void,
+        index: usize,
+        value: *const std::os::raw::c_void,
+    ) {
+        let v = &mut *(field as *mut FakeVecBool);
+        let byte = v.bits.add(index / 8);
+        if *(value as *const bool) {
+            *byte |= 1 << (index % 8);
+        } else {
+            *byte &= !(1 << (index % 8));
+        }
+    }
+
+    /// The positive control for the arm above: the SAME leaf, the SAME
+    /// fixture with the accessor installed, writes. Refusing a sequence the
+    /// accessor can fill would drop deliverable data, which is worse than
+    /// the partial write the refusal prevents.
+    ///
+    /// Oracle: the bit pattern typed out here, read back out of the
+    /// destination's own packed bits, plus the resize spy at exactly 1.
+    #[cfg(cerulion_has_fetch_function)]
+    #[test]
+    fn the_leaf_writes_a_bool_sequence_whose_assign_accessor_is_present() {
+        use std::sync::atomic::Ordering;
+        let mut member = bool_sequence_member(Some(writing_resize));
+        member.assign_function = Some(writing_assign);
+        WRITING_RESIZES.store(0, Ordering::SeqCst);
+        let mut dest = poisoned_destination();
+        let pattern = [true, false, true, true, false];
+        let bytes: Vec<u8> = pattern.iter().map(|&b| b as u8).collect();
+        let wrote = unsafe {
+            super::write_prim_seq_cpp(
+                &member,
+                &mut dest as *mut _ as *mut std::os::raw::c_void,
+                &bytes,
+                pattern.len(),
+                true,
+            )
+        };
+        assert!(wrote, "the accessor is there, so the sequence is writable");
+        assert_eq!(WRITING_RESIZES.load(Ordering::SeqCst), 1);
+        assert_eq!(dest.len, pattern.len());
+        let decoded: Vec<bool> = (0..dest.len)
+            .map(|i| unsafe { (*dest.bits.add(i / 8) >> (i % 8)) & 1 != 0 })
+            .collect();
+        assert_eq!(decoded, pattern);
     }
 
     use super::cpp_package;

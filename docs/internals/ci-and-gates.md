@@ -7,10 +7,11 @@ or anything under `tools/scripts/`.
 ## Lint job budget
 
 The `Lint` job has a 45-minute limit covering runner setup, cache restore,
-compilation, the checks themselves, and the cache save. A cold cache restore can
-take a quarter of an hour on its own, so a tighter budget expires inside Clippy
-and the job dies before it saves a cache, which makes the next run pay the same
-restore again. The limit bounds this job alone; which checks are required is set
+compilation, the checks themselves, and the cache save (restore-only under the
+default save policy below; the save runs when `CACHE_SAVE_NAMESPACES` names
+`Linux-lint` on a default-branch run). A cold cache restore can take a quarter of an hour on its own, so
+a tighter budget expires inside Clippy and the job dies before it saves a cache,
+which makes the next run pay the same restore again. The limit bounds this job alone; which checks are required is set
 elsewhere in the workflow.
 
 ## Lint policy: one table, inherited
@@ -425,24 +426,31 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 `merge_group` events like everything else: there is no cost gate, no routing expression
 and no stub job standing in for a skipped required check.
 
-`lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
-`viz-tests`, and the push-only `fuzz`, `miri` and latency jobs), so a red `lint` still
-saves their runner minutes. It does NOT gate the two that do: `test-linux` and
-`test-macos`. Both start at t=0. `test-linux` has no `needs:` at all: each shard builds the
-`cerulion_core` test binaries it runs, so nothing in front of it is a data dependency. A
-`lint` verdict was never a data dependency for either, and while it gated them the wall was
-`lint` plus the longest test job instead of the longest test job.
+`lint` gates six jobs: `docs` and `netd-wan`, which carry no condition of their own, and `fuzz`,
+`miri`, `test-latency` and `cli-e2e-latency`, which no pull request and no queued batch runs; a
+red `lint` saves their runner minutes. `crate-tests` and `viz-tests` depend on `lint` as well
+but are not gated by it: their `!cancelled()` guard replaces the implicit `success()` over the
+whole `needs:` set; GitHub offers no per-dependency form, so both run and report through a red
+`lint`, and the dependency buys the ordering alone. It does NOT gate the two that set the wall:
+`test-linux` and `test-macos`. Both list `changes` and nothing else in `needs:`, so both start
+after the classifier, which is a checkout and a path classification, about a minute, and no
+build. No REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so
+nothing in front of either job is a data dependency for compilation. A `lint` verdict was never
+one either, and while it gated them the wall was `lint` plus the longest test job instead of the
+longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
 3-way (`[0,1,2]`); both `fail-fast: false`. The macOS count is set from per-step
-measurement: under the earlier 2-way split the legs ran 28.3 and 46.0 min with a warm
-cargo cache and 57.4 and 55.1 with none, so one leg set the wall of the whole workflow
-while the other idled, and the skew INVERTED with the cache state (the pinned trybuild
-tail costs 6 min warm against 18 cold, so a hand tilt tuned on either column is wrong in
-the other). A third leg divides the variable work by 3 while the fixed per-leg cost
-(`cargo build --workspace`, toolchain, nextest install) is paid once more, which is
-better in both cache states: a longest leg PROJECTED from those per-step costs at 26.6
-min warm and 42.7 cold, not yet an observed three-shard wall. Each leg
+measurement: under the earlier 2-way split the legs ran 28.3 and 46.0 min with a cache hit
+on the default-branch run 35666419690, so one leg set the wall of the whole workflow while
+the other idled, and the skew turns over when the cache misses (the pinned trybuild tail
+costs 6 min with a cache hit and is the largest single step of a cold leg, so a hand tilt
+tuned on the cache-hit column is wrong on a miss; the cache-miss measurement of that split
+was taken but its run id was not kept, so its numbers are not cited). A third leg divides
+the variable work by 3 while the fixed per-leg cost (`cargo build --workspace`, toolchain,
+nextest install) is paid once more, which is better in both cache states: a longest leg
+PROJECTED from those per-step costs at 26.6 min warm; the eight default-branch runs of
+2026-09-27 put the observed macOS shard walls at 29 to 44 min, cache state not recorded. Each leg
 runs `./tools/scripts/ci_test_shard.sh cerulion_core <shard> <count>`, which ENUMERATES
 `crates/cerulion_core/tests/*.rs` at depth 1 and takes every file whose position is
 `index mod count`, GENERATED, never hand-listed, save for ONE pinned name
@@ -493,16 +501,54 @@ from its PR-blocking view, so none of the six can credit pull-request coverage i
 provide.
 
 The `changes` job classifies a pull request's changed paths (rules and a
-`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) and
-`deb-smoke` reads one class: a pull request that touches the packaging inputs
-themselves runs the 22-minute Debian and APT smoke instead of skipping it, because
-those are the only pull requests that can break it and "caught on the merge to main"
-means a revert rather than a red check. The direction is the safe one: a class only
-ever makes a job RUN that would otherwise skip, so no rule in that script can weaken a
-gate a pull request has today, and every class is `false` on `push`, `merge_group` and
-`workflow_dispatch`, where there is no pull request to diff. `deb-smoke` keeps its
-`push` run whatever the classifier did: the job is guarded with `!cancelled()`, because
-`needs:` alone would let a failed classifier skip a job that runs unconditionally today.
+`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) into four
+outputs. `packaging` only ever makes a job RUN that would otherwise skip: a pull request
+that touches the packaging inputs themselves runs the 22-minute Debian and APT smoke,
+because those are the only pull requests that can break it and "caught on the merge to
+main" means a revert rather than a red check. EVERY job that `needs:` the classifier opens
+its job-level `if:` with `!cancelled()`, not `deb-smoke` alone: `needs:` by itself lets a
+failed classifier skip a dependant, and a skipped required context reads as satisfied.
+`test-linux`, `test-macos`, `crate-tests` and `viz-tests` carry the bare call; `deb-smoke`
+carries it in front of its own event gate, so it keeps its `push` run whatever the
+classifier did. `cerulion_cli_engine::ci_test_coverage_test` holds the rule over every
+dependant, however the job consumes the outputs, rather than over the jobs with a one-line
+selection gate alone. The `changes` job probes the base it resolved before the diff reads
+it: an empty base turns `$BASE...HEAD` into a range over HEAD alone, which lists no path and
+selects nothing, so the probe refuses it and fails the job;
+`the_selection_job_probes_the_base_before_the_diff_reads_it` in the same test binary pins the
+probe, its refusal and their order ahead of the diff in the script text.
+
+`code`, `docs` and `pkgs` are the test-impact selection, and they run in the other
+direction: they SKIP test steps. Four rules bound them.
+
+* PULL REQUESTS ONLY. On `push`, `merge_group` and `workflow_dispatch` every package is
+  selected. The queue run is the last gate before `main` and the one place a miss has no
+  later catch.
+* ONE OFF SWITCH. The repository variable `CI_SELECTION` reaches the classifier through
+  the workflow-level `env:` block; `off`, and any value the classifier does not know,
+  selects every package. Nothing else may read it: a step is gated on the classifier's
+  OUTPUT, never on the variable, and `ci_test_coverage_test` refuses any other shape.
+* STEPS, NEVER JOBS. Every job still runs and still reports its own required context. A
+  gated step carries the one condition the coverage walk credits,
+  `contains(fromJSON(needs.changes.outputs.pkgs), '<package>')`, and a companion step
+  under the exact negation of that condition prints one line beginning `selection:`, so
+  the log says what was skipped and why.
+* THE SELECTION IS WIDER THAN CARGO. `pkgs` is the reverse cargo dependency closure over
+  normal, build and dev edges UNIONED with the observation edges in
+  `tools/ci/observation_edges.tsv`: a test that reads another package's tree, walks the
+  repository, or loads an artifact another package builds reaches it without a manifest
+  edge. That table is derived from the sources by
+  `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs`, which fails on a missing row
+  and on a stale one. A read the walk cannot place on one package, an unattributable literal or
+  a walk over a tree holding more than one member, records the observing package as observing
+  `all`; such a package rides every selection that names a package, and no step of it is gated.
+  Four packages are in that state today, `cerulion_core` among them, which is why the
+  `cerulion_core` shard steps carry no condition of their own: the shard runner reads the
+  selection itself and prints the `selection:` line when it skips.
+
+The supported subset, stated plainly: the selection narrows PER-PACKAGE test steps on pull
+requests. It does NOT narrow the workspace build, it does not gate a job, it does not apply
+to any event but `pull_request`, and it never removes a required status context.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.
@@ -521,6 +567,112 @@ future dates before publishing artifacts. The shared implementation is
 `tools/scripts/check_citation_release.sh`, which is also exercised by the release-gate
 regression script.
 
+## The cache save policy (`CACHE_SAVE_*` in `ci.yml`)
+
+The Actions cache store has a 10 GB free allowance; storage above it is billed, and while the
+account carries a failed payment the service refuses every save into a store above 10 GB
+(measured 2026-09-28: 13 refusals into a 15.8 GB store, then one accepted save into an emptied
+one). One generation of the eight namespaces measured is 17.1 GB (the rmw lanes and the smaller
+tool caches are not in that figure), so the workflows save only what fits and pays: the macOS
+test shards' archive (4.27 GB, shard 0 of `test-macos`; shard 0 ran 28.3 min with a cache hit on
+run 35666419690, against 29 to 44 min across eight 2026-09-27 runs whose cache state is not
+recorded) and the Linux test shards' archive (3.18 GB, shard 0 of `test-linux`; 19 to 28 min
+across runs 36284081039, 36295731007 and 36357164260), 7.45 GB together, on `main` only. Every other `actions/cache/save` step is gated off by default and its job is
+restore-only.
+
+The policy is two workflow-level `env` values, each defaulting from a repository variable:
+
+* `CACHE_SAVE_NAMESPACES` (`${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}`): the
+  space-separated namespace tokens that may save, or `all`. A token is the key text between
+  `cargo-` and the scope segment, with any `${{ steps.*.outputs.* }}` segment removed: `macOS`,
+  `Linux`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
+  `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lockhash>`, whose
+  header hash is a cache generation rather than part of the namespace. The default is the
+  expression's literal, so a repository with no variable saves the measured frontier and a
+  misspelt variable matches nothing.
+* `CACHE_SAVE_ON_PULL_REQUEST` (`${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}`): empty means saves
+  run on `main` only; any value lets pull-request runs save into their own `-pr-` scoped keys
+  as well, and only from a branch of this repository. A fork pull request's token cannot hold
+  `actions: write`, so the prune's delete would fail the job; the clause tests
+  `github.event.pull_request.head.repo.full_name == github.repository`.
+
+Before every save of a lockfile-keyed archive (the machete tool cache is exempt, below)
+`tools/scripts/ci_cache_prune.sh "<the save key>"` runs: it keeps exactly that key and deletes
+every other entry of the namespace (stale lockfile generations, `pr` scoped entries, legacy
+unqualified keys), so the store never holds two archives of one namespace and a lockfile change
+costs one generation, never two. The jobs that prune carry
+`permissions: {contents: read, actions: write}`; nothing else does.
+
+The prune's gate is WIDER than the save's, deliberately: the branch clause and the merge-queue
+clause, never the namespace list. Every default-branch run of a job that has a prune step
+prunes, whether or not its namespace may save, and keeps exactly that job's current key even
+when no entry under that key exists -- so a restore-only namespace is emptied rather than left
+holding archives nothing will ever replace. Nothing else reclaims them: a pull request's restore
+refreshes an entry's last-access time, so GitHub's seven-day idle eviction never fires on a
+stale archive that pull requests keep reading.
+
+Three rules inside the script keep a prune from deleting what another run still needs.
+
+* **The tip check.** On `refs/heads/main` the script reads the branch tip once and deletes
+  nothing unless the tip is this run's own commit. Two runs on `main` overlap all the time, and
+  the older one would otherwise delete the generation the newer one had just saved -- and then
+  skip its own save as an exact hit, leaving the namespace empty. A run behind the tip deletes
+  nothing and saves nothing: the prune step writes `proceed=false` to its `$GITHUB_OUTPUT` and
+  every save step tests `steps.cache-prune.outputs.proceed == 'true'`, because a run that skipped
+  the prune and uploaded anyway would leave two generations of its namespace resident (14.90 GB
+  across the two shard namespaces, over the allowance, with the next save refused). The next tip
+  run prunes what it left.
+* **The clock guard.** The prune records the UTC second it began -- before the tip check, which
+  is a network round trip a newer run can save during -- and deletes only entries created strictly
+  earlier than that. An entry that appeared while the prune was
+  running belongs to a run ahead of this one; it is kept and named in the log.
+* **The scope rule.** A keep key scoped `-pr-` may delete only `-pr-` entries of its namespace:
+  a pull-request prune must never take the `-main-` archive or the legacy unqualified entries,
+  which are what every other run restores. A `-main-` or unscoped keep key deletes every
+  shape-matching entry of the namespace, which is the point of the prune. Identity is (key,
+  ref), because GitHub stores one entry per pair and under the pull-request override every open
+  branch holds its own entry under the same key string.
+
+`lint`, `docs` and `netd-wan` build far smaller targets than the shards and used to share the
+shards' `cargo-Linux-` key, so whichever finished first saved it: on 2026-09-28 the entry under
+the shards' key was a 0.63 GB archive saved by one of the smaller jobs, not the shards' 3.18 GB
+one. They now have their own namespaces (`cargo-Linux-lint-`, `cargo-Linux-docs-`,
+`cargo-Linux-netd-wan-`). Under the default all three are restore-only and fall through their
+`restore-keys` to `cargo-Linux-main-`, the shards' archive, a superset of what they need;
+`test-linux` shard 0 restores and saves its own key; the shards 1 to 3 restore it.
+
+Two exemptions, both narrow. The machete binary cache (`~/.cargo/bin/cargo-machete`, keyed on
+the pinned version and not on a lockfile hash) is a TOOL cache: a few MB with no lockfile
+generation for the prune to work from, so it carries no namespace gate and no prune step, only
+the cache-hit test and the merge-queue test. Gating it into a namespace the default never names
+meant the binary was never cached and `cargo install cargo-machete` ran on every push.
+`release.yml` restores and never saves: a tag run's entry is restorable by no other ref, so
+saving one would only add to the store.
+
+`tools/scripts/ci_cache_policy_check.py` holds every workflow in `.github/workflows` to this
+contract -- the directory, not a hand list of the files known to cache, because two workflows
+were writing into the same store with the combined `actions/cache` action while a two-file
+invocation reported clean. The rules: the gate names the key's namespace (R1); it carries the
+main-only clause with its fork condition (R2); the prune step directly precedes the save with
+the byte-identical key under `id: cache-prune`, an explicit sweep prefix is exactly the key text
+before the generation segment, and the save's condition is the prune's own plus the cache-hit test
+in front and the prune's `proceed` output and the namespace gate behind (R3); the job permission is declared (R4); the default literal is
+unchanged (R5); a save is never reachable from a merge-queue run (R6); the save is the job's
+last step (R7); every gate is a conjunction of clauses from a closed set, each at most once,
+with no top-level `||` (R8 -- which is what stops `... || true` from turning a gate off while
+every other rule still passes); a container job installs `gh` and `jq` in the step before its
+prune, under the prune's own condition (R9); nothing shadows the policy in a job- or step-level
+`env` (R10); a prune whose keep key carries no `-main-`/`-pr-` scope segment -- one the scope rule
+cannot narrow, so it clears the whole namespace -- lives only in a job whose `if:` can never be
+true on a pull request, either a `github.event_name != 'pull_request'` conjunct or an allowlist of
+events naming none (R11); a key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
+the
+combined `actions/cache` action appears nowhere (NO_COMBINED_CACHE_ACTION); and a job whose
+steps the reader cannot enumerate -- a reusable-workflow call, or one carrying no `steps:` -- is
+refused rather than passed in silence. The `Lint` step "Cache save policy" runs the prune
+script's self-test and the checker's self-test, both of which flip every rule from both sides,
+before the checker reads the real files.
+
 ## Test map
 
 | Test | What it pins | Serial? |
@@ -528,11 +680,41 @@ regression script.
 | `tools/scripts/check_citation_release.sh` | citation version, calendar, and release-date window validation | n/a |
 | `crates/cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` | every member inherits the one lint table; the table's levels | no |
 | `crates/cerulion_cli_engine/tests/library_print_ban_test.rs` | every library crate carries the print ban | no |
-| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint | no |
+| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths | no |
+| `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches` or `examples`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |
 | `tools/scripts/check_hot_path_allocs.sh --self-test` | the annotation grammar and scope rules | n/a |
 | `tools/scripts/check_pr_title.sh --self-test` | the title/branch oracle table | n/a |
 | `tools/scripts/check_agents_md.sh` | context-file budgets, shims, banned tokens | n/a |
+| `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
 | `tools/scripts/leak_scan.py --self-test` | every generic class on every surface, the redacted private output contract, exit codes, allowlist and pragma rules, the self-scan | n/a |
 | `tools/scripts/install_hooks.sh --self-test` | the hooks refuse a planted leak and a planted message, pass a clean commit, cover a worktree without `tools/hooks`, and uninstall cleanly | n/a |
+
+A `# doc-pin:` marker is a YAML comment in `ci.yml`, of the form
+`# doc-pin: <package>::<test binary> reads <root>, <root>`, recording that the
+named test binary opens a path outside its own crate; it changes no step and no
+condition, and it sits beside the step that runs its package so a rule deciding
+which test steps a change needs can find it there.
+
+## What the selection proofs cover, and what they do not
+
+`tools/scripts/ci_selected_packages.py` is the reverse CARGO-DEPENDENCY closure:
+given the packages a change touches, it prints those packages plus every
+workspace member that depends on one of them through a normal, build or
+dev-dependency edge. That is what it proves. It validates the metadata document
+before any mode, `--all` included, and refuses one that is not an object
+carrying `packages` (a list), `workspace_members` (a list) and `version` with
+exit 2 and one line naming the field. The refusal is about the DOCUMENT, not the
+answer: a well-formed document whose workspace has no members legitimately
+prints `[]` at exit 0, and what no caller can get is an empty selection read out
+of a document the script could not parse. A test can observe another package
+with no dependency edge at all: by opening a path literal into that package's
+tree, by walking the whole repository, or by loading an artifact built from that
+package at run time (`dlopen`). The closure sees none of those.
+
+The doc-pin walk covers one of those classes: every test binary that opens the
+shared documentation and tool trees (`docs`, `tools`, `.github`, `benches`,
+`examples`) or a root markdown file is pinned, both ways, against the markers in
+`ci.yml`. Cross-crate source literals and dlopen fixtures are an open class. They
+have to be pinned before any CI test step is gated on the selection.

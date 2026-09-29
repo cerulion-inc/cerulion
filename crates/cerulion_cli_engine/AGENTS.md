@@ -40,11 +40,12 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
 pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.
 ## Testing
-- `cargo test -p cerulion_cli_engine` covers most binaries.
+- Never gate a CI step on a selection output nothing produces or with no
+  `selection:` marker, nor read a doc root with no `# doc-pin:` marker
+  (`ci_test_coverage_test`, `ci_doc_pin_walk_test`).
 - Run `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`
-  individually with `-- --test-threads=1`; the latter two share iceoryx2's ns.
-- Build `test_node_macro_period_cdylib` + `test_node_macro_data_trigger_cdylib`
-  before `graph_profile_iox2_test`; `mdns_live_test` is hardware-only, ignored.
+  with `-- --test-threads=1`; latter two share iceoryx2's ns. Build
+  `test_node_macro_period_cdylib`+`test_node_macro_data_trigger_cdylib` first.
 ## Gotchas
 - `proc_macro2::Literal::to_string()` preserves `100_000`, `100u64`, `0xff`; use
   `parse_int_literal` or `syn::LitInt::base10_parse`.

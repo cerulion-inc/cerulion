@@ -8,11 +8,11 @@ Users build a WORKSPACE: ONE node type per `nodes/<type>/` crate, wiring ONLY in
 run by `cerulion` verbs. Examples, docs, rustdoc, README and the scaffold must show nothing else:
 multi-node files, `main`, in-code graphs, runtime-API construction (`GraphRuntime`) are for tests ONLY.
 
-## Critical invariants (bugs, not style - each has an enforcing gate)
+## Critical invariants (bugs, not style; gated)
 Code comments cite these as "Principle #N" (`docs/internals/core-scheduler-graph.md`).
 
 - **Zero-copy hot path**: no heap allocation on publish/receive paths. Enforced by
-  `zero_alloc_test`, `zero_copy_hot_path_test` and `./tools/scripts/check_hot_path_allocs.sh`;
+  `zero_alloc_test`, `zero_copy_hot_path_test` and `tools/scripts/check_hot_path_allocs.sh`;
   a justified cold-path alloc needs a `// hot-path-alloc-ok: <reason>` line.
 - **Replay = Live**: re-executing a recording is byte-identical to the live run. Never add
   wall-clock reads, hash-order iteration or randomness to execution paths - use
@@ -33,7 +33,7 @@ Code comments cite these as "Principle #N" (`docs/internals/core-scheduler-graph
 
 ```bash
 cargo build  # default members only
-cargo fmt --all  # CI fails on unformatted code, in every workspace
+cargo fmt --all  # CI fails unformatted code in every workspace
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps  # docs gate
 ```
@@ -43,7 +43,7 @@ Testing ladder (long builds are normal - don't kill them):
 1. Per-crate, parallel-safe: `cargo test -p <crate>`. `cerulion_core` is
    SHARDED in CI - one leg: `./tools/scripts/ci_test_shard.sh cerulion_core <n> 4`.
 2. Shared-memory suites: run each named binary individually with `-- --test-threads=1`;
-   the per-crate `AGENTS.md` lists which ones are serial.
+   the per-crate `AGENTS.md` lists the serial ones.
 3. Fixture tests `dlopen` prebuilt cdylibs - build them first; each header names its prereqs.
 4. Release-only latency gates (main CI, not PRs): the `--release` `latency_threshold_test`.
 5. Hardware-in-the-loop (robots, lab boxes): never in agent sessions.
@@ -52,7 +52,7 @@ Lints live ONCE: `[workspace.lints]` in the root `Cargo.toml`, inherited via
 `[lints] workspace = true` (a manifest gate names any member that does not; an extra lint goes in
 the crate's own source, never a forked table). `dead_code`/`unused_imports`/`unused_variables` =
 **deny** - delete dead code at once. CI's stable is newer than most local ones: write the form the
-strictest clippy accepts (`if let` over `is_some()`+`unwrap()`). Detail: `docs/internals/ci-and-gates.md`.
+strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 
 ## Conventions
 
@@ -84,17 +84,17 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`). Detail: `docs/i
   id in the name (it goes in the PR body); gated by `tools/scripts/check_pr_title.sh`.
 - PR titles: `<type>(<scope>)!: <description>`. PRs are SQUASH-merged, so the title becomes
   the commit message. Commit bodies carry the WHY.
-- PR bodies are self-contained: summary, what changed, how to test (copy-pasteable
-  commands), actual test output. Keep diffs reviewable (~800 lines; split above).
-  Self-review first; call out breaking changes with migration steps.
-- Stacked PRs (B depends on unmerged A): base B on A's branch; merge in dependency
-  order. GitHub retargets dependents when a merged base is deleted; a rename closes them.
-- Plan gate: read the issue in full, check dependencies (an unlanded one => confirm the
-  base with the user), produce the plan (files, tests, risks, chunks) + its questions, get
-  the go-ahead. Never skip it.
+- PR bodies (product voice, ~40 lines/450 words): a summary paragraph,
+  `## What changed`, `## How to verify` (commands), a latency section for a change on a non-test path under `crates/`,
+  `Closes #N` last on its own line (omit when no issue closes). No questions, process talk, HTML, em or en dashes,
+  internal ids, hostnames or machine paths. Diffs ~800 lines (split above); breaking changes carry migration steps.
+- Stacked PRs (B on unmerged A): base B on A's branch; merge in dependency order
+  (deleting a merged base retargets B; a rename closes it).
+- Plan gate: read the issue in full, check dependencies (an unlanded one => confirm the base with
+  the user), produce the plan (files, tests, risks, chunks) + its questions, get the go-ahead. Never skip it.
 - Chunked implementation: 3-5 logical chunks, one commit each, nothing unrelated bundled;
   gates after EVERY chunk (fmt, clippy `-D warnings`, affected tests incl. serial): a kill
-  or rollback then loses one chunk, not the branch.
+  or rollback loses one chunk, not the branch.
 - Final gate before merge: affected parallel + serial tests green; fmt + clippy clean; local
   review clean of HIGH/MEDIUM-actionable; bench within ~10% of baseline (a regression = stop);
   log + memory updated. MERGE RULE for the EXTERNAL read (the local two-pass review runs before
@@ -104,8 +104,8 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`). Detail: `docs/i
   evidence, or filed - never wait for an empty read; no PR absorbs another's work.
 - Review discipline: (1) after every major chunk run the two-pass review - pass 1 (correctness,
   silent failures, type design, test coverage) finds; fix HIGH + MEDIUM-actionable; pass 2
-  (comment accuracy in place of type design) validates the fixes and catches regressions they
-  introduced - never skip it. (2) Push for the external bots only when the gates AND pass 2 are
+  (comment accuracy in place of type design) validates the fixes and catches their
+  regressions - never skip it. (2) Push for the external bots only when the gates AND pass 2 are
   clean. (3) A bot finding is a CLASS, not a line: before pushing, sweep the WHOLE diff for
   every sibling and fix them all in ONE push. (4) Bots review the latest commit only: after a
   substantive push confirm a fresh review ran; read ALL of it, including reviews you did not
@@ -114,20 +114,20 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`). Detail: `docs/i
 - A behavior change updates its docs (`docs/user-api.md`, `docs/`, the affected `AGENTS.md`)
   in the same PR. Never commit, push, force-push or run destructive git unasked.
 
-## Working agreements (mandatory for every agent here)
+## Working agreements
 
-- Findings surfaced during active work: SEVERE fixed in the CURRENT PR, the rest FILED
+- Findings during active work: SEVERE fixed in the CURRENT PR, the rest FILED
   (merge rule above); decide by severity, never offer "now vs. later". DROPPING a finding
   needs maintainer buy-in. Ledgers burn DOWN, never up. No drive-by or review-driven growth.
 - Be terse; never collapse the rules that produce a default into the value they produce.
 - End substantial turns with two tables - Decisions
   (`# | change beyond the ask | why | risk & undo | alternatives considered`) and Deferrals
-  (`# | item | where it lives | why deferred | cost`); write "none serious" rather than
+  (`# | item | where it lives | why deferred | cost`); write "none serious", not
   padding. "Substantial" = >=2 substantive changes, >=1 commit, or edits beyond a one-line
   tweak; skip trivia (fmt, lint fixes in your own new code). The bar: would it surprise a
   reviewer reading the diff? Put them in the reply, never only in a log/PR.
 - The user-facing surface (macro attributes, CLI flags, YAML keys, error text, defaults) is
-  the contract: changes need explicit maintainer approval, and every special case in a
+  the contract: changes need maintainer approval, and every special case in a
   defaulting rule is a future semantic-flip bug - prefer unification.
 - The bar for `unsafe` is high; modest perf wins don't clear it.
 
@@ -174,16 +174,17 @@ Unmarked crates have no scoped file: use this page plus the area dossier
 - **Always**: fmt/clippy/doc gates green before any push; docs ride the same PR.
 - **Ask first**: new dependencies (license + real-time fit; `deny.toml` gates CI), any
   user-API surface change, anything `unsafe`.
-- **Never**: hand-edit generated sources (`native_ros2_messages` types are `build.rs` output in `OUT_DIR`;
-  vendored `.msg` edits go via `tools/scripts/refresh_upstream_msg_manifest.sh`); commit
+- **Never**: hand-edit generated sources (`native_ros2_messages` types come from `build.rs`;
+  vendored `.msg` edits via `tools/scripts/refresh_upstream_msg_manifest.sh`); commit
   credentials; name a machine, address, path, login or person (public;
-  `docs/leak_guard.md`); fabricate data; leave dead code.
+  `docs/leak_guard.md`); fabricate data; leave dead code; add a cache save step without
+  its gate and prune.
 
 ## Deeper context
 
 - `docs/user-api.md` - the user API reference (CLI, macros, YAML, env vars).
-- `crates/<crate>/AGENTS.md` - scoped invariants, serial-test lists, gotchas.
+- `crates/<crate>/AGENTS.md` - scoped invariants, serial tests, gotchas.
 - `docs/internals/*.md` - contributor dossiers (test maps, module contracts); each crate
-  names its own; `ci-and-gates.md`: the repo-wide gates.
-- `docs/` - user guides (networking, multi-process, recording/replay, tutorials).
-- https://docs.cerulion.com - hosted docs; index at `/llms.txt`.
+  names its own; `ci-and-gates.md`: the gates.
+- `docs/` - user guides (networking, multi-process, recording/replay, tutorials); hosted at
+  https://docs.cerulion.com, index `/llms.txt`.
