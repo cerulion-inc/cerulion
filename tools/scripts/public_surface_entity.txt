@@ -1,0 +1,14 @@
+# The project's legal name, for tools/scripts/check_public_surface.sh (class
+# shipped-text). Every mention of this name in shipped text must read exactly
+# as it is written here, byte for byte.
+#
+# It is DECLARED here rather than read out of a notice or a licence, because a
+# notice is a list of OTHER people's copyright lines: a rule that parses one to
+# find its own input picks whichever line comes first, and a rename or a
+# reordering silently hands the rule a vendor's name to police instead.
+#
+# ONE line, holding the name and nothing else. No leading or trailing space:
+# the comparison is byte for byte, so the spelling here is the spelling that
+# ships. An absent file, an empty one, a second line, or a line carrying
+# whitespace is exit 3, never a guess.
+Cerulion Inc.

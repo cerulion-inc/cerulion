@@ -79,18 +79,30 @@
 #                             STAY: a support table draws its yes and no with
 #                             them and 28 such cells ship, so refusing them
 #                             would be a rule against a table.
-#                         (f) ONE spelling PER ENTITY across NOTICE,
-#                             CITATION.cff, README.md and the contributor
-#                             agreements. Entities group by their first word
-#                             with commas and periods dropped, so a
-#                             third-party holder that a NOTICE exists to list
-#                             is a group of its own and passes; two spellings
-#                             inside ONE group leave a reader asking which
-#                             company the agreement binds. LICENSE is the
-#                             verbatim licence text and carries the licence
-#                             author's own holder line, so it is outside the
-#                             set. The rarer spelling is the finding and the
-#                             message names both sides.
+#                         (f) ONE spelling of the project's legal name,
+#                             everywhere in shipped text. The name is DECLARED
+#                             in `public_surface_entity.txt`, one line and
+#                             nothing else, and is parsed out of no prose at
+#                             all: a notice is a list of OTHER holders'
+#                             copyright lines, so a rule that reads one to find
+#                             its own input takes whichever line comes first,
+#                             and a rename, a reordering or a deleted line
+#                             hands it a vendor's name to police, green. An
+#                             absent file, an empty one, a second line, or a
+#                             line carrying leading or trailing whitespace is
+#                             exit 3. Every mention of the declared name is
+#                             then found case-insensitively, keyed on its first
+#                             word so a mention that drops or adds a word is
+#                             still judged, across a comma and ONE line break
+#                             with the comment or quote prefix a wrapped line
+#                             carries (a blank line ends the sentence and is
+#                             not a wrap), and over the suffix family
+#                             (Incorporated, Inc, Corporation, Corp, Limited,
+#                             Ltd, LLC, GmbH, Co.). A mention whose raw text is
+#                             not the declared spelling BYTE FOR BYTE is a
+#                             finding. A third-party holder does not carry the
+#                             name, so it is never a candidate, and a word in
+#                             front of the name is not one either.
 #   work-state            Shipped text describes the product to its user: what
 #                         works, what is experimental, what is not supported,
 #                         what to do. It never reports how the project was
