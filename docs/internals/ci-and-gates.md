@@ -426,14 +426,15 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 `merge_group` events like everything else: there is no cost gate, no routing expression
 and no stub job standing in for a skipped required check.
 
-`lint` gates the jobs that do NOT set the wall (`docs`, `netd-wan`, `crate-tests`,
-`viz-tests`, and the push-only `fuzz`, `miri` and latency jobs). A red `lint` saves the
-runner minutes of the ones that carry no job-level condition. `crate-tests` and
-`viz-tests` are not among them: their `!cancelled()` guard replaces the implicit
-`success()` over the whole `needs:` set, GitHub offers no per-dependency form, so both run
-and report through a red `lint` and the dependency buys the ordering alone. It does NOT
-gate the two that set the wall: `test-linux` and
-`test-macos`. Both are `needs: [changes]` and nothing else, so both start after the
+`lint` gates the four push-only jobs that depend on it (`fuzz`, `miri` and the two latency
+jobs), and a red `lint` saves their runner minutes; none of the four reports a required
+context. It gates none of the four dependants that DO report one (`docs`, `netd-wan`,
+`crate-tests`, `viz-tests`): each carries the `!cancelled()` guard, which replaces the
+implicit `success()` over the whole `needs:` set, GitHub offers no per-dependency form, so
+all four run and report through a red `lint` and the dependency buys the ordering alone.
+A skipped required context counts as satisfied, which is what the guard is there to stop.
+It does NOT gate the two that set the wall: `test-linux` and `test-macos`. Both are
+`needs: [changes]` and nothing else, so both start after the
 classifier, which is a checkout and a path classification, about a minute, and no build. No
 REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so nothing
 in front of either job is a data dependency for compilation. A `lint` verdict was never one

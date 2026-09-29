@@ -3674,6 +3674,14 @@ jobs:
       contents: read
       actions: write
     needs: [lint]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
+    # dependency fails and a skipped required context counts as SATISFIED, so
+    # without this guard a red `lint` waves the pull request through with this
+    # job's context never run. With it the job runs on its own terms and
+    # reports its own result. `Lint` is its own required context and a red one
+    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
+    if: ${{ !cancelled() }}
     # 30, and the number follows the MACHINE rather than the job. On a 4-core
     # runner the healthy build ran 8m56s-9m18s and 15 was ample; on a 2-core one
     # `cargo doc --workspace` takes about twice that, and 15 became a coin flip:
@@ -3684,9 +3692,9 @@ jobs:
     #
     # 30 is ~2x the slower measured wall, the same ratio 15 gave the faster
     # machine, and it guards a HUNG job rather than rationing a healthy one,
-    # the rule this file applies everywhere else. It is not a required context,
-    # so the cancellations blocked nothing; they just meant the docs gate
-    # silently stopped gating two runs out of three.
+    # the rule this file applies everywhere else. `Documentation` is a required
+    # context, so a job cancelled at its budget reports a cancellation the pull
+    # request cannot merge past.
     timeout-minutes: 30
     env:
       # Same ENOSPC class as the lint job (see its comment): rustdoc's dep
@@ -3773,6 +3781,14 @@ jobs:
       contents: read
       actions: write
     needs: [lint]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
+    # dependency fails and a skipped required context counts as SATISFIED, so
+    # without this guard a red `lint` waves the pull request through with this
+    # job's context never run. With it the job runs on its own terms and
+    # reports its own result. `Lint` is its own required context and a red one
+    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
+    if: ${{ !cancelled() }}
     timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"

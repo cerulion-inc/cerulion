@@ -4276,3 +4276,706 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
         "a step with a condition of its own is named: {complaints:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A REQUIRED CONTEXT NEVER SKIPS: NOT ON A TRIGGERED EVENT, NOT ON A FAILED
+// DEPENDENCY
+// ---------------------------------------------------------------------------
+
+/// The contexts `main` requires, mirrored from the two settings that hold such
+/// a list: the branch protection on `main` and the merge queue ruleset. The two
+/// name the same twenty contexts.
+///
+/// WHY A REQUIRED NAME IS DIFFERENT FROM EVERY OTHER JOB NAME. GitHub counts a
+/// SKIPPED required context as satisfied. A job whose `if:` is false on an
+/// event its workflow triggers on still creates a check run under its name on
+/// that event, with conclusion skipped, and that run is the NEWEST one for the
+/// name on the head: the context then reads as satisfied by a run that scanned
+/// nothing. A comment event on a pull request is the cheapest way to produce
+/// one, and `!cancelled()` on a dependant of a failed job is the other.
+///
+/// A name here is the name a job REPORTS, so a matrix job's `name:` carries
+/// `${{ }}` placeholders and one such name produces several of these contexts.
+/// [`name_produces_context`] is what pairs the two.
+const REQUIRED_CONTEXTS: &[&str] = &[
+    "Crate tests (macos-latest)",
+    "Crate tests (ubuntu-latest)",
+    "Demo workspace (examples/go2)",
+    "Dependency Audit (cargo-deny)",
+    "Documentation",
+    "Examples (cargo check)",
+    "Leak guard (media)",
+    "Leak guard (messages)",
+    "Leak guard (tree and names)",
+    "Lint",
+    "Test (Linux) shard 0",
+    "Test (Linux) shard 1",
+    "Test (Linux) shard 2",
+    "Test (Linux) shard 3",
+    "Test (macOS) shard 0",
+    "Test (macOS) shard 1",
+    "Test (macOS) shard 2",
+    "Viz tests (viz, ubuntu-latest)",
+    "Viz tests (vizd, ubuntu-latest)",
+    "netd WAN (clippy + docs, --features wan)",
+];
+
+/// The expression that reads the event a workflow run was started by.
+const EVENT_NAME_READ: &str = "github.event_name";
+
+/// The `name:` of one job block, read in every scalar form.
+///
+/// The same shape as [`job_if_of`], and for the same reason: a name this walk
+/// cannot read is a name it cannot pair with a required context, so the form is
+/// an `Err` the caller turns into a failure rather than into no name at all.
+fn job_name_of(block: &str) -> Option<Result<String, String>> {
+    let lines: Vec<&str> = block.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("    name:"))?;
+    let rest = &lines[at]["    name:".len()..];
+    Some(read_scalar_value(
+        "name",
+        rest,
+        &lines,
+        at,
+        JOB_KEY_INDENT.len(),
+    ))
+}
+
+/// Every event name in a workflow's `on:` block.
+///
+/// The mapping form is what the tree spells, and the sequence and inline forms
+/// are read too so a rewrite into one of them is not a silently empty trigger
+/// set. An `on:` this reader cannot classify PANICS, and so does an empty
+/// result: the trigger set decides which jobs may carry a condition, so a
+/// reader that stopped reading must not read as a workflow that runs on
+/// nothing.
+fn workflow_trigger_events(file: &str, text: &str) -> BTreeSet<String> {
+    let mut events: BTreeSet<String> = BTreeSet::new();
+    let mut in_on = false;
+    for line in text.lines() {
+        if !in_on {
+            let Some(rest) = line.strip_prefix("on:") else {
+                continue;
+            };
+            in_on = true;
+            // `on: push` and `on: [push, pull_request]` both sit on this line.
+            let head = rest.trim().trim_start_matches('[').trim_end_matches(']');
+            for name in head.split(',') {
+                let name = name.trim().trim_matches('\'').trim_matches('"');
+                if !name.is_empty() {
+                    events.insert(name.to_string());
+                }
+            }
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        // A new top-level key ends the `on:` block.
+        if !line.starts_with(' ') {
+            break;
+        }
+        // The event names sit one level in; `types:` and the rest sit deeper.
+        if indent_of(line) != 2 {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let item = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        let name = item.split(':').next().unwrap_or("").trim();
+        assert!(
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "{file}: `{trimmed}` is not an event name this walk can read, and the \
+             trigger set decides which jobs may skip, so it refuses to guess"
+        );
+        events.insert(name.to_string());
+    }
+    assert!(
+        !events.is_empty(),
+        "{file}: no trigger was read out of its `on:` block, and every workflow \
+         runs on something: the reader is not reaching the triggers"
+    );
+    events
+}
+
+/// Does this job `name:` produce `context`?
+///
+/// A matrix job's name carries `${{ matrix.<key> }}` placeholders and each one
+/// stands for one leg's value, so the LITERAL pieces around them have to appear
+/// in the context in order, anchored at whichever end carries no placeholder.
+/// `Test (Linux) shard ${{ matrix.shard }}` produces `Test (Linux) shard 0` and
+/// produces no `Test (macOS)` context at all.
+fn name_produces_context(name: &str, context: &str) -> bool {
+    let mut pieces: Vec<&str> = Vec::new();
+    let opens_open = name.starts_with("${{");
+    let mut ends_open = false;
+    let mut rest = name;
+    loop {
+        let Some(at) = rest.find("${{") else {
+            if !rest.is_empty() {
+                pieces.push(rest);
+                ends_open = false;
+            }
+            break;
+        };
+        if at > 0 {
+            pieces.push(&rest[..at]);
+        }
+        let Some(close) = rest[at..].find("}}") else {
+            // A placeholder with no end is a name this walk cannot read; the
+            // widening direction is to judge the job, so it matches nothing and
+            // the floor below is what notices.
+            return false;
+        };
+        rest = &rest[at + close + 2..];
+        ends_open = true;
+    }
+    // A name that is nothing BUT placeholders produces any context at all, and
+    // judging such a job is the fail-closed direction.
+    if pieces.is_empty() {
+        return true;
+    }
+    let mut cursor = context;
+    for (i, piece) in pieces.iter().enumerate() {
+        let at = if i == 0 && !opens_open {
+            if !cursor.starts_with(piece) {
+                return false;
+            }
+            0
+        } else {
+            match cursor.find(piece) {
+                Some(at) => at,
+                None => return false,
+            }
+        };
+        cursor = &cursor[at + piece.len()..];
+    }
+    ends_open || cursor.is_empty()
+}
+
+/// Split an expression on `op` at paren depth zero, outside single quotes.
+///
+/// `a == 'x' && (b == 'y' || c == 'z')` splits on `&&` into two terms and the
+/// second splits on `||` into two of its own. Non-ASCII bytes are stepped over
+/// rather than sliced at, so a name in a condition cannot panic the reader.
+fn split_top_level<'a>(expr: &'a str, op: &str) -> Vec<&'a str> {
+    let bytes = expr.as_bytes();
+    let mut parts: Vec<&str> = Vec::new();
+    let mut depth = 0i32;
+    let mut quoted = false;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch >= 0x80 {
+            i += 1;
+            continue;
+        }
+        if quoted {
+            if ch == b'\'' {
+                quoted = false;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            b'\'' => quoted = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && !quoted && expr[i..].starts_with(op) {
+            parts.push(&expr[start..i]);
+            i += op.len();
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&expr[start..]);
+    parts
+}
+
+/// Peel the parentheses that wrap a whole term, and only those.
+fn strip_outer_parens(term: &str) -> &str {
+    let mut cur = term.trim();
+    while cur.starts_with('(') && cur.ends_with(')') {
+        let inner = &cur[1..cur.len() - 1];
+        let mut depth = 0i32;
+        let mut whole = true;
+        for ch in inner.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            if depth < 0 {
+                whole = false;
+                break;
+            }
+        }
+        if !whole || depth != 0 {
+            break;
+        }
+        cur = inner.trim();
+    }
+    cur
+}
+
+/// The event one `github.event_name == '<event>'` term admits, or `None` for
+/// any other term.
+fn event_name_equality(term: &str) -> Option<String> {
+    let term = strip_outer_parens(term);
+    let rest = term.strip_prefix(EVENT_NAME_READ)?.trim_start();
+    let rest = rest.strip_prefix("==")?.trim();
+    let quote = rest.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let inner = rest.strip_prefix(quote)?.strip_suffix(quote)?;
+    if inner.is_empty() || inner.contains(quote) {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
+/// Every event a job condition PROVES the job runs on, or `None` when it proves
+/// nothing.
+///
+/// The one shape read is a test on the event name: a disjunction of
+/// `github.event_name == '<event>'` admits those events, and an `&&` chain of
+/// such disjunctions admits their intersection. EVERYTHING ELSE reads as `None`
+/// and the caller treats that as admitting no event at all, which is the
+/// fail-closed direction: `github.actor != 'nobody'` is false on any event
+/// whatever the workflow triggers on, and a condition this reader has not been
+/// taught costs a maintainer one line here rather than costing a required
+/// context its meaning.
+fn events_a_condition_allows(expr: &str) -> Option<BTreeSet<String>> {
+    let mut allowed: Option<BTreeSet<String>> = None;
+    for term in split_top_level(expr, "&&") {
+        let mut here: BTreeSet<String> = BTreeSet::new();
+        for alt in split_top_level(strip_outer_parens(term), "||") {
+            here.insert(event_name_equality(alt)?);
+        }
+        allowed = Some(match allowed {
+            None => here,
+            Some(prev) => prev.intersection(&here).cloned().collect(),
+        });
+    }
+    allowed
+}
+
+/// The trigger events a job's own `if:` does not prove it runs on.
+///
+/// No condition, and the sanctioned `!cancelled()` guard, admit every event:
+/// the guard exists so a job runs when a job it `needs:` FAILED, which is the
+/// same skipped-context hole seen from the other side. A condition that OPENS
+/// with the guard is read on past it, so the tail of one is measured like any
+/// other condition and `!cancelled() && github.event_name == 'push'` still
+/// names every other trigger.
+fn events_a_job_skips(block: &str, triggers: &BTreeSet<String>) -> Vec<String> {
+    let cond = match job_if_of(block) {
+        None => return Vec::new(),
+        Some(Ok(cond)) => cond,
+        Some(Err(why)) => panic!(
+            "{why}\n\nThe walk cannot say which events this JOB runs on, so it \
+             refuses to guess. Spell the job's `if:` as a NON-EMPTY plain, \
+             quoted or block scalar, or teach `read_scalar_form` the form."
+        ),
+    };
+    let expr = condition_expression(&cond);
+    let tail = if expr == GUARD_CALL {
+        String::new()
+    } else if let Some(tail) = expr.strip_prefix(GUARD_CALL_AND) {
+        tail.to_string()
+    } else {
+        expr
+    };
+    if tail.is_empty() {
+        return Vec::new();
+    }
+    let allowed = events_a_condition_allows(&tail).unwrap_or_default();
+    triggers
+        .iter()
+        .filter(|event| !allowed.contains(event.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// What one workflow contributes to the required-context rules.
+struct RequiredJobWalk {
+    /// One line per job and event the job can skip on.
+    skips: Vec<String>,
+    /// One line per job a FAILED dependency would skip.
+    unguarded: Vec<String>,
+    /// How many jobs carry a name that produces a required context.
+    judged: usize,
+    /// Which required contexts a job of this workflow produces.
+    produced: BTreeSet<String>,
+}
+
+/// Walk one workflow: pair every job name against the required contexts, then
+/// measure the job's own condition against the workflow's triggers and against
+/// its `needs:` set.
+fn walk_required_context_jobs(file: &str, text: &str) -> RequiredJobWalk {
+    let triggers = workflow_trigger_events(file, text);
+    let mut walk = RequiredJobWalk {
+        skips: Vec::new(),
+        unguarded: Vec::new(),
+        judged: 0,
+        produced: BTreeSet::new(),
+    };
+    for (job, block) in jobs_of(text) {
+        let name = match job_name_of(&block) {
+            None => continue,
+            Some(Ok(name)) => name,
+            Some(Err(why)) => panic!(
+                "{file} / {job}: {why}\n\nA job NAME is the context branch \
+                 protection requires, so a name this walk cannot read is not \
+                 one it may skip past."
+            ),
+        };
+        let contexts: Vec<&str> = REQUIRED_CONTEXTS
+            .iter()
+            .copied()
+            .filter(|context| name_produces_context(&name, context))
+            .collect();
+        if contexts.is_empty() {
+            continue;
+        }
+        walk.judged += 1;
+        walk.produced
+            .extend(contexts.iter().map(|c| (*c).to_string()));
+        for event in events_a_job_skips(&block, &triggers) {
+            walk.skips.push(format!(
+                "  {file} / {job} (\"{name}\") skips on `{event}`, which it \
+                 triggers on"
+            ));
+        }
+        // A DEPENDANT OWES THE GUARD. GitHub skips a job whose dependency
+        // failed, and the skip lands under this job's required name, so a red
+        // `lint` or a red classifier would wave the change through with this
+        // context never run. Nothing else satisfies the rule: a job with no
+        // condition at all is skipped by a failed dependency exactly like a job
+        // behind an event test.
+        let needs = job_needs(&block);
+        if !needs.is_empty() {
+            let guarded = matches!(
+                job_if_of(&block),
+                Some(Ok(cond)) if condition_survives_a_failed_dependency(&cond)
+            );
+            if !guarded {
+                walk.unguarded.push(format!(
+                    "  {file} / {job} (\"{name}\") needs {needs:?} and its \
+                     job-level `if:` does not open with `{GUARD_CALL}`"
+                ));
+            }
+        }
+    }
+    walk
+}
+
+/// No job reporting a required context can skip: not on an event its own
+/// workflow triggers on, and not on a dependency of its own that failed.
+///
+/// The two rules are the same hole from two sides. GitHub creates a check run
+/// under the job's name and concludes it SKIPPED, branch protection reads that
+/// conclusion as satisfied, and the change merges with the context never run.
+/// One side is an `if:` the event makes false; the other is a `needs:` entry
+/// that went red. `!cancelled()` answers both, which is why it is the one
+/// job-level condition this file sanctions.
+#[test]
+fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut unguarded: Vec<String> = Vec::new();
+    let mut judged = 0usize;
+    let mut produced: BTreeSet<String> = BTreeSet::new();
+    for (file, text) in workflow_texts() {
+        let walk = walk_required_context_jobs(&file, &text);
+        complaints.extend(walk.skips);
+        unguarded.extend(walk.unguarded);
+        judged += walk.judged;
+        produced.extend(walk.produced);
+    }
+    assert!(
+        complaints.is_empty(),
+        "these jobs report a REQUIRED context and carry a condition that is \
+         false on an event their workflow triggers on:\n{}\n\nGitHub creates a \
+         check run under the job's name on that event and concludes it skipped, \
+         a skipped required context counts as satisfied, and that run is the \
+         newest one for the name on the head. Either drop the event from the \
+         workflow's `on:` block, so no run is created for it, or widen the \
+         condition to every event the workflow triggers on.",
+        complaints.join("\n")
+    );
+    assert!(
+        unguarded.is_empty(),
+        "these jobs report a REQUIRED context and a FAILED dependency would \
+         skip them:\n{}\n\nGitHub skips a dependant of a failed job, the skip \
+         lands under the job's required name, and a skipped required context \
+         counts as satisfied. A job-level `if:` opening with `{GUARD_CALL}` \
+         runs the job anyway, so it reports a result of its own.",
+        unguarded.join("\n")
+    );
+    // The population is not empty, so a reader that pairs nothing is not a
+    // pass: ten jobs of ci.yml and three of leak-guard.yml carry these names.
+    assert!(
+        judged >= 13,
+        "only {judged} job(s) carry a name that produces a required context: \
+         the rule above is judging a population the reader is no longer finding"
+    );
+    // And the constant is not stale in the other direction: a context no job
+    // produces is a context nothing can ever report, which is a misspelling
+    // here or a rename in the workflows.
+    let missing: Vec<&str> = REQUIRED_CONTEXTS
+        .iter()
+        .copied()
+        .filter(|context| !produced.contains(*context))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "no job in any workflow produces these required contexts: \
+         {missing:?}\n\nA required context nothing reports blocks every pull \
+         request until somebody removes it from the protection lists, and a \
+         context misspelled here judges no job at all."
+    );
+}
+
+/// The required-context rules, both sides, on synthetic workflows.
+#[test]
+fn a_required_job_that_can_skip_is_named_and_one_matched_to_its_triggers_is_not() {
+    let required = *REQUIRED_CONTEXTS
+        .first()
+        .expect("the required context list is not empty");
+    let both = "  pull_request:\n  issue_comment:\n    types: [created]";
+    let code_only = "  pull_request:";
+    let workflow = |triggers: &str, name: &str, body: &str| {
+        format!(
+            "name: synthetic\non:\n{triggers}\n\njobs:\n  j:\n    name: {name}\n{body}    \
+             runs-on: ubuntu-latest\n    steps:\n      - run: true\n"
+        )
+    };
+    let event_gate = "    if: github.event_name == 'pull_request'\n";
+    let guard = "    if: ${{ !cancelled() }}\n";
+
+    // A required name, an event-keyed condition, and a workflow that triggers
+    // on an event the condition refuses.
+    let walk = walk_required_context_jobs("w.yml", &workflow(both, required, event_gate));
+    assert_eq!(walk.judged, 1, "the job is in the population");
+    assert_eq!(walk.skips.len(), 1, "-> {:?}", walk.skips);
+    assert!(
+        walk.skips[0].contains("issue_comment"),
+        "the event the job skips on is named: {:?}",
+        walk.skips
+    );
+
+    // The same job under a workflow that triggers on exactly what its condition
+    // admits.
+    let walk = walk_required_context_jobs("w.yml", &workflow(code_only, required, event_gate));
+    assert_eq!(walk.judged, 1, "the job is still in the population");
+    assert!(
+        walk.skips.is_empty(),
+        "a condition equal to the trigger list stops nothing: {:?}",
+        walk.skips
+    );
+
+    // A name no protection list requires carries any condition it likes.
+    let walk = walk_required_context_jobs("w.yml", &workflow(both, "Ordinary job", event_gate));
+    assert_eq!(walk.judged, 0, "the job is out of the population");
+    assert!(
+        walk.skips.is_empty(),
+        "an unrequired name is not judged: {:?}",
+        walk.skips
+    );
+
+    // No condition at all, and the sanctioned guard, both admit every event.
+    for body in ["", guard] {
+        let walk = walk_required_context_jobs("w.yml", &workflow(both, required, body));
+        assert!(
+            walk.skips.is_empty(),
+            "`{body}` stops the job on no event: {:?}",
+            walk.skips
+        );
+    }
+
+    // The guard's TAIL is measured like any other condition.
+    let walk = walk_required_context_jobs(
+        "w.yml",
+        &workflow(
+            both,
+            required,
+            "    if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n",
+        ),
+    );
+    assert_eq!(
+        walk.skips.len(),
+        1,
+        "a guard followed by an event test still skips: {:?}",
+        walk.skips
+    );
+
+    // A condition that is no event test at all admits nothing, so every trigger
+    // is named.
+    let walk = walk_required_context_jobs(
+        "w.yml",
+        &workflow(both, required, "    if: github.actor != 'nobody'\n"),
+    );
+    assert_eq!(
+        walk.skips.len(),
+        2,
+        "a condition that proves no event names them all: {:?}",
+        walk.skips
+    );
+
+    // THE DEPENDENCY SHAPE. A required name listing `needs:` and carrying no
+    // guard is skipped whenever that dependency fails.
+    let needs = "    needs: [lint]\n";
+    let walk = walk_required_context_jobs("w.yml", &workflow(both, required, needs));
+    assert_eq!(walk.unguarded.len(), 1, "-> {:?}", walk.unguarded);
+    assert!(
+        walk.unguarded[0].contains("lint"),
+        "the dependency is named: {:?}",
+        walk.unguarded
+    );
+    let walk = walk_required_context_jobs(
+        "w.yml",
+        &workflow(both, required, &format!("{needs}{guard}")),
+    );
+    assert!(
+        walk.unguarded.is_empty(),
+        "the guard satisfies the dependency rule: {:?}",
+        walk.unguarded
+    );
+    // A condition that OPENS with the guard satisfies it too, and its tail is
+    // still measured by the event rule beside it.
+    let walk = walk_required_context_jobs(
+        "w.yml",
+        &workflow(
+            code_only,
+            required,
+            &format!(
+                "{needs}    if: ${{{{ !cancelled() && github.event_name == 'pull_request' }}}}\n"
+            ),
+        ),
+    );
+    assert!(
+        walk.unguarded.is_empty() && walk.skips.is_empty(),
+        "a guard with a tail matched to the triggers is clean: {:?} {:?}",
+        walk.unguarded,
+        walk.skips
+    );
+    // An ordinary condition is not the guard.
+    let walk = walk_required_context_jobs(
+        "w.yml",
+        &workflow(code_only, required, &format!("{needs}{event_gate}")),
+    );
+    assert_eq!(
+        walk.unguarded.len(),
+        1,
+        "an event test does not survive a failed dependency: {:?}",
+        walk.unguarded
+    );
+    // And a name no list requires owes nothing, however it depends.
+    let walk = walk_required_context_jobs("w.yml", &workflow(both, "Ordinary job", needs));
+    assert!(
+        walk.unguarded.is_empty(),
+        "an unrequired name owes no guard: {:?}",
+        walk.unguarded
+    );
+    // A job that depends on nothing owes no guard either, so the rule cannot be
+    // satisfied by pasting the call everywhere.
+    let walk = walk_required_context_jobs("w.yml", &workflow(both, required, ""));
+    assert!(
+        walk.unguarded.is_empty(),
+        "a job with no dependency owes no guard: {:?}",
+        walk.unguarded
+    );
+
+    // A MATRIX name produces the context its legs report, so such a job is
+    // judged like a job named in full.
+    let templated = "Crate tests (${{ matrix.os }})";
+    assert!(
+        name_produces_context(templated, "Crate tests (ubuntu-latest)"),
+        "a placeholder stands for one leg's value"
+    );
+    assert!(
+        !name_produces_context(templated, "Crate tests (ubuntu-latest) extra"),
+        "the literal tail is anchored at the end of the context"
+    );
+    assert!(
+        !name_produces_context(
+            "Test (Linux) shard ${{ matrix.shard }}",
+            "Test (macOS) shard 0"
+        ),
+        "the literal head is anchored at the start of the context"
+    );
+    let walk = walk_required_context_jobs("w.yml", &workflow(both, templated, event_gate));
+    assert_eq!(walk.judged, 1, "a matrix name is in the population");
+    assert_eq!(
+        walk.skips.len(),
+        1,
+        "a matrix job is judged like any other: {:?}",
+        walk.skips
+    );
+}
+
+/// The trigger reader and the condition reader, on the forms they have to
+/// carry.
+#[test]
+fn the_trigger_block_and_the_event_condition_are_read_in_the_forms_the_tree_uses() {
+    let mapping = "on:\n  pull_request:\n    types: [opened]\n  merge_group:\n  push:\n    \
+                   branches: [main]\n  workflow_dispatch:\n\njobs:\n";
+    assert_eq!(
+        workflow_trigger_events("w.yml", mapping),
+        ["merge_group", "pull_request", "push", "workflow_dispatch"]
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect::<BTreeSet<_>>(),
+        "the mapping form is the one the tree spells"
+    );
+    assert_eq!(
+        workflow_trigger_events("w.yml", "on: [push, pull_request]\njobs:\n"),
+        ["pull_request", "push"]
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect::<BTreeSet<_>>(),
+        "an inline sequence is read too"
+    );
+    assert_eq!(
+        workflow_trigger_events("w.yml", "on:\n  - push\n  - issues\njobs:\n"),
+        ["issues", "push"]
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect::<BTreeSet<_>>(),
+        "a block sequence is read too"
+    );
+
+    let admits = |expr: &str| events_a_condition_allows(expr).map(|set| set.into_iter().collect());
+    assert_eq!(
+        admits("github.event_name == 'push'"),
+        Some(vec!["push".to_string()]),
+        "one equality admits one event"
+    );
+    assert_eq!(
+        admits("github.event_name == 'push' || github.event_name == 'merge_group'"),
+        Some(vec!["merge_group".to_string(), "push".to_string()]),
+        "a disjunction admits both"
+    );
+    assert_eq!(
+        admits(
+            "(github.event_name == 'push' || github.event_name == 'issues') && \
+                github.event_name == 'push'"
+        ),
+        Some(vec!["push".to_string()]),
+        "a chain admits the intersection"
+    );
+    assert_eq!(
+        admits("github.event_name != 'push'"),
+        None,
+        "a negated test is not a shape this reader claims to know"
+    );
+    assert_eq!(
+        admits("contains('push issues', github.event_name)"),
+        None,
+        "nor is a containment test"
+    );
+}

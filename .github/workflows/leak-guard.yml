@@ -37,11 +37,8 @@ name: Leak guard
 # re-run the default trigger, and a re-run replays the original payload. No
 # `paths:` filter: every diff, title, body and message is in scope.
 #
-# Issues, issue comments and review comments are public the moment they are
-# written and no check runs before they are: the incident that added the
-# reference classes was an internal ticket quoted as a `#` shorthand in an issue
-# on this repository. The conversation job cannot stop that text from existing,
-# so it labels, asks once, and goes red.
+# Conversation surfaces, an issue body, an issue comment and a pull request
+# review comment, are gated by .github/workflows/leak-guard-conversation.yml.
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
@@ -49,22 +46,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-  issues:
-    types: [opened, edited]
-  issue_comment:
-    types: [created, edited, deleted]
-  pull_request_review_comment:
-    types: [created, edited, deleted]
 
 # The title and body come from the event payload, so no pull-requests scope is
-# needed; the three code jobs write nothing. The conversation job raises its own
-# scope to the two it needs and nothing wider.
+# needed; the three jobs below write nothing.
 permissions:
   contents: read
 
 # Same three shapes as ci.yml: a pull request keys on its number and cancels
 # the superseded run; a merge queue run keys on the queue's own branch and is
-# never cancelled; anything else keys on the run id and groups with nothing.
+# never cancelled; a push to main and a manual run key on the run id and group
+# with nothing.
 concurrency:
   group: leak-guard-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'merge_group' && github.event.merge_group.head_ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -72,8 +63,11 @@ concurrency:
 jobs:
   tree:
     name: Leak guard (tree and names)
-    # The code events only: a comment carries no diff, no name and no
-    # container, and this job would report success on an empty scan.
+    # Every event this workflow triggers on, one by one. This name is a
+    # REQUIRED context and a skipped required context reads as satisfied, so
+    # the condition and the trigger list stay equal; the walk in
+    # crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs reads both and
+    # reds when they part.
     if: >-
       github.event_name == 'pull_request' || github.event_name == 'merge_group'
       || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -156,8 +150,11 @@ jobs:
 
   messages:
     name: Leak guard (messages)
-    # The code events only: a comment carries no diff, no name and no
-    # container, and this job would report success on an empty scan.
+    # Every event this workflow triggers on, one by one. This name is a
+    # REQUIRED context and a skipped required context reads as satisfied, so
+    # the condition and the trigger list stay equal; the walk in
+    # crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs reads both and
+    # reds when they part.
     if: >-
       github.event_name == 'pull_request' || github.event_name == 'merge_group'
       || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -224,7 +221,20 @@ jobs:
           case "$EVENT_NAME" in
             pull_request)
               git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
-              range="$BASE_SHA..$HEAD_SHA"
+              # The checkout on this event is refs/pull/N/merge, so HEAD^1 is
+              # the base tip the merge commit sits on and HEAD^2 is the head.
+              # Where the event's own base sha is an ancestor of that first
+              # parent, the pull request's commits are exactly HEAD^1..HEAD^2,
+              # which the checkout holds whether or not the fetch above reached
+              # either sha. Everywhere else the three-dot spelling names the
+              # same set from the merge base, the same resolution the added-line
+              # dash gate takes.
+              if git merge-base --is-ancestor "$BASE_SHA" HEAD^1 2>/dev/null; then
+                range="HEAD^1..HEAD^2"
+              else
+                range="$BASE_SHA...$HEAD_SHA"
+              fi
+              echo "commit range: $range"
               flags+=(--require-commits --pr-title-env PR_TITLE)
               body=yes
               ;;
@@ -260,8 +270,11 @@ jobs:
 
   media:
     name: Leak guard (media)
-    # The code events only: a comment carries no diff, no name and no
-    # container, and this job would report success on an empty scan.
+    # Every event this workflow triggers on, one by one. This name is a
+    # REQUIRED context and a skipped required context reads as satisfied, so
+    # the condition and the trigger list stay equal; the walk in
+    # crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs reads both and
+    # reds when they part.
     if: >-
       github.event_name == 'pull_request' || github.event_name == 'merge_group'
       || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -321,291 +334,3 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B tools/scripts/leak_scan.py media --require-private --format github
-
-  conversation:
-    name: Leak guard (issue and comment bodies)
-    # Issues, issue comments and pull request review comments. These events run
-    # in the context of this repository, so the private tier is always here and
-    # is always required.
-    #
-    # Every author is in scope, bots included. A bot restates a diff and quotes
-    # what it found, so an address, a home path or a closed reference reaches a
-    # public thread through a bot exactly as it does through a person: the one
-    # genuine finding this guard has made was a home path inside a review app's
-    # comment. Skipping bots would give that class away on the surface where it
-    # is most likely to appear.
-    #
-    # What made bot text unbearable was not the author, it was style classes
-    # counting as hard on a conversation body, so a dash in a machine's prose
-    # bought a label, an ask and a red run. The conversation hard set fixes that
-    # for EVERY author (see CONVERSATION_HARD), which leaves nothing for an
-    # author rule to buy.
-    #
-    # The one body never read is the guard's OWN ask: its account and its marker
-    # together, so the guard cannot read itself, and so a marker pasted by
-    # anybody else is still scanned like any other text.
-    if: >-
-      (github.event_name == 'issues' || github.event_name == 'issue_comment'
-      || github.event_name == 'pull_request_review_comment')
-      && !(github.event.comment.user.login == 'github-actions[bot]'
-      && contains(github.event.comment.body, '<!--leak-guard:'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # One run at a time per BODY, newest wins. The workflow level group keys on
-    # the run id for these events, so without this an edit could be overtaken by
-    # the scan of the text it replaced, and the label and the ask would describe
-    # a body that no longer exists. Two different bodies on one thread are
-    # independent and still run in parallel.
-    concurrency:
-      group: >-
-        leak-guard-body-${{ github.event.issue.number || github.event.pull_request.number }}-${{
-        github.event.comment.id || 'body' }}
-      cancel-in-progress: true
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Scanner self-test
-        run: python3 -B tools/scripts/leak_scan.py --self-test
-
-      # The body reaches the scanner through an environment variable NAME, never
-      # interpolated into a shell line, and is neither echoed nor written to
-      # disk. What the scanner prints is a masked shape and a class, which is
-      # what every other job here prints.
-      - name: Scan the body
-        id: scan
-        env:
-          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
-          EVENT_NAME: ${{ github.event_name }}
-          ACTION: ${{ github.event.action }}
-          LG_BODY: ${{ github.event.comment.body || github.event.issue.body }}
-        run: |
-          set -uo pipefail
-          case "$EVENT_NAME" in
-            issues) label=issue-body ;;
-            *) label=comment-body ;;
-          esac
-          # Which KINDS of finding fired, so the ask describes the defect the
-          # author actually has. The scan catches every class on this surface,
-          # not only references, and a home path told to mind its number signs
-          # is a guard nobody listens to. Class ids only: no values.
-          classes="${RUNNER_TEMP:-/tmp}/leak-guard-classes.txt"
-          : > "$classes"
-          rc=0
-          if [ "${ACTION:-}" = deleted ]; then
-            # The text is gone, so there is nothing to scan and nothing to ask
-            # about. A deleted body is a CLEAN body: the step below takes back
-            # the ask left for it and clears the label if that was the last one,
-            # which is the only way a label on a deleted comment ever comes off.
-            echo "the body was deleted; treating it as clean"
-          else
-            python3 -B tools/scripts/leak_scan.py messages --require-private --format github \
-              --conversation --skip-code --body-env LG_BODY --body-label "$label" \
-              --hard-classes-file "$classes" || rc=$?
-          fi
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-
-      # The job cannot stop the text from existing, so this is the whole
-      # remedy: a label the triage list can see, one ask addressed to the
-      # author, and a red run. The label tracks the THREAD, not this body: an
-      # outstanding ask is a comment the GUARD left and has not taken back, so
-      # the label comes off only when the last one is gone.
-      #
-      # Three rules make that safe. A lookup that FAILS is not an empty thread:
-      # the step goes red and touches neither the label nor a comment, because
-      # "the forge would not tell me" must never read as "nothing is
-      # outstanding". Only comments written by this workflow's own identity
-      # count as asks and only those are ever deleted, so a marker pasted by
-      # anyone else neither suppresses an ask nor gets the guard to delete
-      # someone's comment. And the label is removed only after a SECOND read
-      # still shows no ask, then confirmed by a third: two bodies on one thread
-      # are scanned concurrently by design, and a clean run must not race a
-      # flagged one into taking the label off behind it.
-      - name: Label, ask once, and fail
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RC: ${{ steps.scan.outputs.rc }}
-          REPO: ${{ github.repository }}
-          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
-          EVENT_NAME: ${{ github.event_name }}
-          COMMENT_ID: ${{ github.event.comment.id }}
-          LG_BODY: ${{ github.event.comment.body || github.event.issue.body }}
-        run: |
-          set -euo pipefail
-          # 0 is clean and 1 is a finding. Everything else, a usage error at 2, a
-          # missing interpreter at 127, a signal, is a scan that did not happen,
-          # and a scan that did not happen must never reach the label and the ask
-          # with an empty classes file and tell an author their text carries
-          # something it did not find.
-          case "$RC" in
-            0|1) ;;
-            *) echo "::error ::the leak guard could not run on this body (exit $RC)"
-               exit 1 ;;
-          esac
-          # The marker names the surface and digests the text that was refused,
-          # so one body is asked once however often it is rescanned, and an edit
-          # that leaves the reference in place is a new ask.
-          asks="${RUNNER_TEMP:-/tmp}/leak-guard-asks.txt"
-          # Written by the scan step above, which runs in its own shell, so the
-          # path is spelled again here rather than inherited. A missing file means
-          # no class was recorded, and the ask falls back to saying only that
-          # something was found.
-          classes="${RUNNER_TEMP:-/tmp}/leak-guard-classes.txt"
-          [ -f "$classes" ] || : > "$classes"
-          scope=${COMMENT_ID:-body}
-          digest=$(printf '%s' "$LG_BODY" | sha256sum | cut -c1-16)
-          prefix="<!--leak-guard:$EVENT_NAME:$scope:"
-          marker="$prefix$digest-->"
-
-          # One read of the thread, into a file outside the checkout, keeping
-          # only comments this workflow's own identity wrote. Nothing is piped
-          # into a reader that may stop early: under pipefail that reads as a
-          # failed lookup. A lookup that fails is fatal, never an empty list.
-          read_asks() {
-            # The identity is this workflow's own, which is a fixed forge name
-            # and not a project name, so it sits in the filter rather than in a
-            # variable that would have to be expanded into it.
-            if ! gh api --paginate "repos/$REPO/issues/$NUMBER/comments" \
-                 --jq '.[] | select(.user.login == "github-actions[bot]")
-                           | select(.body | test("<!--leak-guard:"))
-                           | "\(.id) \(.body | match("<!--leak-guard:[^>]*-->").string)"' \
-                 > "$asks"; then
-              echo "::error ::the thread could not be read; the leak label is left as it is"
-              exit 1
-            fi
-          }
-          # Prints 1 when an ask from another body is outstanding, else 0.
-          others_outstanding() {
-            local id found out=0
-            while read -r id found; do
-              [ -n "${id:-}" ] || continue
-              case "$found" in "$prefix"*) ;; *) out=1 ;; esac
-            done < "$asks"
-            echo "$out"
-          }
-          read_asks
-
-          if [ "$RC" = 0 ]; then
-            stuck=0
-            while read -r id found; do
-              [ -n "${id:-}" ] || continue
-              case "$found" in
-                "$prefix"*)
-                  # -i prints the status line, so the outcome is read from the
-                  # forge's own answer rather than from whether the client exited
-                  # nonzero. 204 is deleted, 404 is already gone, and both are the
-                  # outcome asked for. EVERYTHING else, a throttle, a network
-                  # error, an authorization failure, a reply that cannot be
-                  # parsed, leaves the ask standing, and an ask standing must
-                  # never end with the label coming off. Unknown is stuck.
-                  status=$(gh api "repos/$REPO/issues/comments/$id" -X DELETE -i 2>/dev/null \
-                           | head -n 1 || true)
-                  case "$status" in
-                    HTTP/*\ 204\ *|HTTP/*\ 204|HTTP/*\ 404\ *|HTTP/*\ 404) ;;
-                    *) stuck=1; echo "the ask on comment $id could not be taken back" ;;
-                  esac
-                  ;;
-              esac
-            done < "$asks"
-            if [ "$stuck" = 1 ]; then
-              echo "::error ::an ask could not be taken back; the leak label is left as it is"
-              exit 1
-            fi
-            read_asks
-            # A status line says what the forge REPLIED, not what is true. The
-            # asks for this surface are read back, and if one is still listed the
-            # delete did not take effect whatever it answered, so the label stays
-            # and the run goes red. Absence is confirmed, never inferred.
-            while read -r id found; do
-              case "${found:-}" in
-                "$prefix"*) stuck=1 ;;
-              esac
-            done < "$asks"
-            if [ "$stuck" = 1 ]; then
-              echo "::error ::an ask is still listed after being deleted; the leak label is left as it is"
-              exit 1
-            fi
-            if [ "$(others_outstanding)" = 1 ]; then
-              echo "clean here, but another body on this thread still has an outstanding ask"
-              exit 0
-            fi
-            # Read from the forge's own status line, like the ask delete above.
-            # 200 and 204 are removed, 404 is a label that was not there, and
-            # anything else means the label may still be on a thread this run has
-            # just called clean, which is a visible state nobody would question.
-            lstat=$(gh api "repos/$REPO/issues/$NUMBER/labels/leak" -X DELETE -i 2>/dev/null \
-                    | head -n 1 || true)
-            case "$lstat" in
-              HTTP/*\ 200*|HTTP/*\ 204*|HTTP/*\ 404*) ;;
-              *)
-                echo "::error ::the leak label could not be removed from a thread with no"\
-                     "outstanding ask"
-                exit 1
-                ;;
-            esac
-            # A flagged run for another body can have posted its ask between the
-            # read above and the delete just now, and it added the label before
-            # this run took it off. Confirm, and put it back if so.
-            read_asks
-            if [ "$(others_outstanding)" = 1 ]; then
-              gh api "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=leak" >/dev/null
-              echo "an ask landed while the label was coming off; the label is back"
-            else
-              echo "clean, and no ask is outstanding on this thread"
-            fi
-            exit 0
-          fi
-
-          # The ask goes up BEFORE the label, so the label is the last write this
-          # run makes. A clean run for another body that removed the label just
-          # before this point either sees the ask on one of its re-reads and puts
-          # the label back, or has already finished, and then the add below
-          # stands. Claiming the label first would leave a posted ask with no
-          # label whenever a clean run deleted it in between.
-          asked=0
-          while read -r id found; do
-            [ "${found:-}" = "$marker" ] && asked=1
-          done < "$asks"
-          # Which kinds fired. Read BEFORE the branch below, because the error
-          # line at the end needs them whether or not an ask was posted this run.
-          refs=no; others=no
-          while read -r c; do
-            case "$c" in
-              ref-unopenable|ref-unverified) refs=yes ;;
-              '') ;;
-              *) others=yes ;;
-            esac
-          done < "$classes"
-          if [ "$asked" = 1 ]; then
-            echo "already asked about this body"
-          else
-            # The ask is assembled from the classes that fired. A body can carry
-            # both kinds at once, and then it gets both sentences.
-            msg=""
-            if [ "$others" = yes ]; then
-              msg="This text carries a value that should not be public, such as a machine name, an address, a home path or a personal detail. Please edit it out."
-            fi
-            if [ "$refs" = yes ]; then
-              ref_msg="This text points at a repository or a tracker that people outside this project cannot open. Please edit the reference out, or replace it with a link anyone can follow, so that everyone reading can get to what it names. If it is not a repository reference at all, a space before the number sign is enough: \`name #8\` reads as prose, \`name#8\` reads as a repository."
-              if [ -n "$msg" ]; then msg="$msg"$'\n\n'"$ref_msg"; else msg="$ref_msg"; fi
-            fi
-            if [ -z "$msg" ]; then
-              msg="This text carries something that should not be public. Please edit it out."
-            fi
-            printf '%s\n\n%s\n\n%s\n' "$msg" \
-              "Nothing that was found is printed anywhere by this check." \
-              "$marker" | gh api "repos/$REPO/issues/$NUMBER/comments" -F body=@- >/dev/null
-          fi
-          gh api "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=leak" >/dev/null
-          # The error names the kind that fired, for the same reason the ask does.
-          if [ "$refs" = yes ] && [ "$others" = no ]; then
-            echo "::error ::a reference in this body is not openable by a stranger"
-          elif [ "$refs" = no ] && [ "$others" = yes ]; then
-            echo "::error ::this body carries a value that should not be public"
-          else
-            echo "::error ::this body carries something that should not be public"
-          fi
-          exit 1
