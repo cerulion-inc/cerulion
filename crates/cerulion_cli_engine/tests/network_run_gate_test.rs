@@ -98,7 +98,10 @@ fn network_off_forces_off_and_warns() {
     let config = graph_with(Some(block_with_ingress()));
     let decision = resolve_run_network(&config, true, TimeSource::Real, false).unwrap();
     assert!(matches!(decision, RunNetwork::Off));
-    assert!(logs_contain("network disabled by --network off"));
+    assert!(logs_contain(
+        "local execution selected: the graph's declared egress/ingress"
+    ));
+    assert!(!logs_contain("--network off"));
     assert!(logs_contain("will NOT cross the machine boundary"));
 }
 
@@ -119,6 +122,7 @@ fn network_off_on_blockless_real_clock_confirms_suppression() {
         !logs_contain("redundant"),
         "the real-clock arm must not claim the flag was redundant"
     );
+    assert!(!logs_contain("--network off"));
 }
 
 /// The GENUINELY redundant arm: `--network off` + no block + a replay-class
@@ -139,6 +143,7 @@ fn network_off_on_virtual_clock_is_genuinely_redundant() {
         !logs_contain(NETWORK_OFF_LOCAL_ONLY_NOTICE),
         "the replay-class arm must not claim the flag suppressed the permissive default"
     );
+    assert!(!logs_contain("--network off"));
 }
 
 /// The `CERULION_NETWORK=off` env knob == `--network off` for

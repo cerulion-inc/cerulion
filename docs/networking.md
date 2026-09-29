@@ -122,8 +122,18 @@ closed. No run or inspection flag enables networking over this kill-switch.
 
 A command does not stop a gateway owned by another process or remove
 already mirrored topics. Listing reads mirror provenance locally and
-continues to label those rows REMOTE with their source robot. Local
-observers refuse mirrors instead of demanding them from `cerulion-netd`.
+continues to label those rows REMOTE with their source robot, or
+`origin unavailable` if attribution failed. Required publisher markers retain
+network identity independently of robot attribution. Local observers refuse
+mirrors instead of demanding them from `cerulion-netd`. A running local observer
+also holds its local source until it exits: a remote injector must refuse that
+same topic while the observer retains it, even if the local producer exits.
+Concurrent local/remote creation can refuse both attempts; the command reports
+that refusal. Native marker listener capacity limits simultaneous explicitly
+local observers (default 16 per topic; existing configured limits remain honored).
+Upgrade and restart an
+older injector before relying on that distinction: an unmarked older producer
+with no attribution is indistinguishable from a local source.
 
 ## Egress converges onto cerulion-netd
 

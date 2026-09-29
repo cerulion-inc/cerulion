@@ -87,12 +87,26 @@ pub fn gather_mirror_provenance() -> BTreeMap<String, String> {
         Err(e) => {
             tracing::debug!(
                 error = %e,
-                "topic list: mirror-provenance gather failed — treating as no mirrors \
-                 (any mirrored topics show as LOCAL this run)"
+                "topic list: mirror attribution is unavailable; \
+                 required network source identity is checked separately"
             );
             BTreeMap::new()
         }
     }
+}
+
+/// Listing identities combine optional attribution with required mirror markers.
+/// A marked mirror with no readable attribution remains REMOTE, with an explicit
+/// unknown-origin label. Marker read errors never downgrade it to a local row.
+pub fn gather_mirror_identities() -> CliResult<BTreeMap<String, String>> {
+    let mut mirrors = gather_mirror_provenance();
+    let transport = cerulion_core::TransportManager::get_or_init()?;
+    for topic in transport.network_mirror_topics()? {
+        mirrors
+            .entry(topic)
+            .or_insert_with(|| "origin unavailable".to_string());
+    }
+    Ok(mirrors)
 }
 
 /// List active topics by enumerating iceoryx2 services on the process-global
@@ -314,9 +328,33 @@ impl TopicScope {
     }
 }
 
-/// Make `topic` observable and
-/// return the transport, an OPEN subscriber on it, its [`TopicSource`], and — for a
-/// remotely-observed topic — a [`DemandGuard`] holding the netd demand.
+/// A subscriber owns its observation guard and drops the data subscriber first.
+/// This is private CLI ownership; core publisher/subscriber ABI is unchanged.
+struct ScopedSubscriber {
+    subscriber: cerulion_core::CerulionSubscriber,
+    _guard: ObservationGuard,
+}
+
+enum ObservationGuard {
+    None,
+    LocalLease {
+        _lease: Box<cerulion_core::transport::mirror_origin::LocalObservationLease>,
+    },
+    RemoteDemand {
+        _demand: DemandGuard,
+    },
+}
+
+impl std::ops::Deref for ScopedSubscriber {
+    type Target = cerulion_core::CerulionSubscriber;
+
+    fn deref(&self) -> &Self::Target {
+        &self.subscriber
+    }
+}
+
+/// Make `topic` observable and return the transport, an OPEN subscriber on it
+/// bundled with its lifetime guard, and its [`TopicSource`].
 ///
 /// A GENUINELY-LOCAL topic (listed in local SHM, NOT a netd mirror, and whose
 /// open-only subscriber actually opens) is read directly — this process opens NO
@@ -340,7 +378,7 @@ impl TopicScope {
 /// is gone) is a STALE mirror — do NOT surface its misleading "verify your graph
 /// YAML" LOCAL error; FALL THROUGH to the netd demand rung.
 /// `--local` or the `CERULION_NETWORK=off` kill-switch skips the remote rung. The demand
-/// is held by the returned [`DemandGuard`]: process exit — including a clean Ctrl-C
+/// is held by the subscriber's [`DemandGuard`]: process exit — including a clean Ctrl-C
 /// — closes its UDS connection → netd releases the demand (the crash-safe
 /// refcount). A topic found NOWHERE errors precisely, naming that both local AND
 /// remote were searched.
@@ -355,9 +393,8 @@ fn ensure_topic_available(
     scope: TopicScope,
 ) -> CliResult<(
     Arc<cerulion_core::TransportManager>,
-    cerulion_core::CerulionSubscriber,
+    ScopedSubscriber,
     TopicSource,
-    Option<DemandGuard>,
 )> {
     // The observer's transport is now strictly LOCAL-ONLY — the ONE
     // per-computer network session lives in `cerulion-netd`, not in this process.
@@ -380,12 +417,34 @@ fn ensure_topic_available(
     // provenance registry) — `Some` drives both the demand routing AND the accurate
     // kill-switch message below.
     let mirror_robot = gather_mirror_provenance().get(topic).cloned();
+    let mut marked_mirror = transport.is_network_mirror(topic)?;
     if matches!(
-        classify_observed_topic(listed_local, mirror_robot.is_some()),
+        classify_observed_topic(listed_local, mirror_robot.is_some() || marked_mirror),
         ObserveVia::LocalDirect
     ) {
+        // Only explicit local scope (including the environment kill-switch)
+        // claims a local source for the full observation. Automatic retains its
+        // existing local-direct behavior. Acquire before opening the subscriber.
+        let guard = if killed {
+            ObservationGuard::LocalLease {
+                _lease: Box::new(transport.acquire_local_topic_lease(topic)?),
+            }
+        } else {
+            ObservationGuard::None
+        };
         match transport.create_subscriber_open_only(topic) {
-            Ok(subscriber) => return Ok((transport, subscriber, TopicSource::Local, None)),
+            Ok(subscriber) => {
+                // Bundle immediately: any later failure drops the subscriber
+                // before the local lease. Retain the identity recheck as well.
+                let subscriber = ScopedSubscriber {
+                    subscriber,
+                    _guard: guard,
+                };
+                marked_mirror = transport.is_network_mirror(topic)?;
+                if !marked_mirror {
+                    return Ok((transport, subscriber, TopicSource::Local));
+                }
+            }
             // DISCRIMINATE the failure. A LISTED topic whose data service
             // is GONE (`data_service_missing` ⇒ the open failed `DoesNotExist`) is
             // a STALE re-injection mirror — do NOT surface its "verify your graph
@@ -413,6 +472,13 @@ fn ensure_topic_available(
     // of the misleading "not found locally"; otherwise it was NOT searched on any
     // robot — say that.
     if killed {
+        if marked_mirror && mirror_robot.is_none() {
+            return Err(CliError::Validation(format!(
+                "topic '{topic}' exists locally as a network mirror with origin unavailable; \
+                 local scope forbids demanding it from cerulion-netd. Remove --local and \
+                 unset CERULION_NETWORK to resolve and observe its remote source"
+            )));
+        }
         return Err(CliError::Validation(scope_unavailable_message(
             topic,
             if listed_local {
@@ -461,12 +527,14 @@ fn ensure_topic_available(
     let (subscriber, guard) = demand_remote_from_netd(&transport, topic, &target)?;
     Ok((
         transport,
-        subscriber,
+        ScopedSubscriber {
+            subscriber,
+            _guard: ObservationGuard::RemoteDemand { _demand: guard },
+        },
         TopicSource::Remote {
             robot: target.robot,
             walker: target.walker,
         },
-        Some(guard),
     ))
 }
 
@@ -3928,16 +3996,15 @@ pub fn topic_echo_with_scope(
     // `ensure_topic_available` returns the OPEN subscriber it validated
     // (a live local topic, or a freshly-demanded remote mirror) — opened once, no
     // stale-mirror re-open trap.
-    // `_netd` is the DEMAND GUARD for a remotely-observed topic — bound (not
-    // dropped) so its UDS connection to cerulion-netd stays open for the whole
-    // observer loop; releasing the demand only when this fn returns / is signalled
-    // (connection close = release). `_transport` stays bound for the subscriber.
+    // The subscriber owns its local source lease or remote demand guard for
+    // the whole loop, and drops its data subscriber before releasing that guard.
+    // `_transport` stays bound until after the subscriber drops.
     // `running` rides in so a Ctrl-C during the first-contact wait is
     // honoured — this verb's own handler is what removed the default SIGINT
     // disposition, so without it the wait is uninterruptible. And an interrupted
     // resolve exits QUIETLY (exit 0, the repo's clean-cancel precedent) rather than
     // rendering a verdict about a topic we stopped looking for.
-    let (_transport, subscriber, source, _netd) =
+    let (_transport, subscriber, source) =
         match ensure_topic_available(topic, schemas_dir, Some(running.as_ref()), scope) {
             Ok(v) => v,
             Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
@@ -4285,14 +4352,13 @@ pub fn topic_hz_with_scope(
     // cerulion-netd daemon (netd owns the mirror). The seeded walker in `source` is
     // unused here — `hz` only times arrivals — but the silence report reads its ORIGIN so a
     // silent report can name where the frames were supposed to come from. The netd
-    // demand is held by the guard `_netd` (NOT `_transport`, which is the local read
-    // transport): the guard's UDS connection stays open for the whole hz loop,
-    // releasing the demand on exit (connection close).
+    // demand is owned by the subscriber for the whole hz loop. Its data port
+    // drops before its demand guard (connection close) or local source lease.
     // `ensure_topic_available` returns the OPEN subscriber (opened once, no
     // stale-mirror re-open trap).
     // See `topic_echo` — the wait must be interruptible here too, and an
     // interrupted resolve exits quietly rather than rendering a verdict.
-    let (_transport, subscriber, source, _netd) =
+    let (_transport, subscriber, source) =
         match ensure_topic_available(topic, schemas_dir, Some(running.as_ref()), scope) {
             Ok(v) => v,
             Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
@@ -4467,14 +4533,12 @@ pub fn topic_info_with_scope(
     // cerulion-netd daemon (netd owns the mirror), so `info` can report a live remote
     // topic AND name its type (item 2) via the walker seeded during the resolve.
     // `ensure_topic_available` returns the OPEN subscriber (opened once, no
-    // stale-mirror re-open trap). `_netd` is the DEMAND GUARD for a remotely-observed
-    // topic — bound (not dropped) so its UDS connection to cerulion-netd stays open
-    // for the whole info read, releasing the demand only when this fn returns / is
-    // signalled (connection close). `_transport` is the LOCAL read transport.
+    // stale-mirror re-open trap). It owns its remote demand or local source
+    // lease for the whole read and drops the data subscriber before that guard.
+    // `_transport` is the LOCAL read transport, retained until after that drop.
     // `topic info` installs no signal handler, so it still dies on the
     // default SIGINT disposition and has no flag to thread.
-    let (_transport, subscriber, source, _netd) =
-        ensure_topic_available(topic, schemas_dir, None, scope)?;
+    let (_transport, subscriber, source) = ensure_topic_available(topic, schemas_dir, None, scope)?;
 
     let local_walker = local_walker_from_workspace(schemas_dir);
 

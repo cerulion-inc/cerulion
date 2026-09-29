@@ -2,12 +2,10 @@
 //! Real-binary local-scope refusals and precedence over network locators.
 //! Each spawn reads a private shared-memory registry and Cerulion home.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn run(root: &Path, args: &[&str], network: Option<&str>) -> Output {
-    let home = root.join("home");
-    cerulion_cli_engine::auth::seed_logged_in_at(&home, "local-scope-test").unwrap();
+fn registry_config(root: &Path) -> PathBuf {
     let config = root.join("config");
     std::fs::create_dir_all(&config).unwrap();
     let registry = root.join("shm");
@@ -15,11 +13,20 @@ fn run(root: &Path, args: &[&str], network: Option<&str>) -> Output {
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
+    let prefix = root.file_name().unwrap().to_str().unwrap();
+    let file = config.join("iceoryx2.toml");
     std::fs::write(
-        config.join("iceoryx2.toml"),
-        format!("[global]\nroot-path = \"{path}\"\n"),
+        &file,
+        format!("[global]\nroot-path = \"{path}\"\nprefix = \"scope_{prefix}_\"\n"),
     )
     .unwrap();
+    file
+}
+
+fn run(root: &Path, args: &[&str], network: Option<&str>) -> Output {
+    let home = root.join("home");
+    cerulion_cli_engine::auth::seed_logged_in_at(&home, "local-scope-test").unwrap();
+    registry_config(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_cerulion"));
     command
         .args(args)
@@ -114,6 +121,59 @@ fn environment_kill_switch_also_suppresses_topic_list() {
             assert!(error.contains("failing CLOSED"), "{error}");
         } else {
             assert!(error.is_empty(), "{error}");
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn unattributed_network_mirrors_stay_remote_in_real_local_list_and_observers() {
+    use cerulion_core::wire::MaxSliceLen;
+    use cerulion_core::{TransportConfig, TransportManager};
+    for failed in [false, true] {
+        // Keep event socket paths below the Unix pathname length limit.
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let file = registry_config(root.path());
+        let config =
+            iceoryx2::config::Config::from_file(&file.to_str().unwrap().try_into().unwrap())
+                .unwrap();
+        let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
+        let topic = "/scope/remote-unattributed";
+        let _injector = manager
+            .create_remote_ingress_injector(topic, 0x1234, MaxSliceLen::const_new(256))
+            .unwrap();
+        if failed {
+            assert!(manager
+                .register_mirror_provenance(topic, &"x".repeat(257))
+                .is_err());
+        }
+        let output = run(root.path(), &["topic", "list", "--local"], None);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listing = String::from_utf8(output.stdout).unwrap();
+        assert!(listing.contains("REMOTE TOPICS"), "{listing}");
+        assert!(listing.contains(topic), "{listing}");
+        assert!(listing.contains("origin unavailable"), "{listing}");
+        assert!(
+            !listing
+                .split("REMOTE TOPICS")
+                .next()
+                .unwrap()
+                .contains(topic),
+            "{listing}"
+        );
+        for verb in ["echo", "hz", "info"] {
+            let output = run(root.path(), &["topic", verb, topic, "--local"], None);
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{error}");
+            assert!(
+                error.contains("network mirror with origin unavailable"),
+                "{error}"
+            );
+            assert!(output.stdout.is_empty());
         }
     }
 }

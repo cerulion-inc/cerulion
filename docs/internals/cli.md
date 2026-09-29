@@ -560,6 +560,21 @@ empty, never a hang.
 - Local listing keeps SHM mirror provenance under REMOTE. Local observers
   refuse mirrors rather than take a daemon demand; they do not stop an existing
   daemon or remove another process's mirrors.
+- `mirror_origin` marks all current network injection publishers before data
+  exposure, independently of the best-effort robot provenance registry. Listing
+  folds a marked, unattributed source under REMOTE as `origin unavailable`;
+  malformed reserved marker identities fail closed. Availability checks both
+  before and after opening a subscriber. Explicit local observation acquires a
+  marker listener lease before opening its subscriber and retains it until after
+  that subscriber drops, so a remote injector cannot replace its local producer
+  during the observation. Automatic local-direct behavior keeps its prior source
+  selection. `ScopedSubscriber` owns the subscriber first and the local lease or
+  remote demand guard last; error returns keep the same destruction order.
+  Its local lease is boxed once during setup; delivery has no new allocation.
+  Older unmarked injectors with failed
+  attribution cannot be identified: upgrade/restart them. The low-level
+  `NetworkManager::register_ingress` compatibility seam and raw local
+  DDS/bag injectors remain unmarked; custom network writers use the marked APIs.
 - Pins: `local_scope_flag_tests`, `local_scope_e2e_test`,
   `topic_list_scope_and_environment_precedence` and the explicit-local arms in
   the serial `topic_observer_iox2_test` binary.

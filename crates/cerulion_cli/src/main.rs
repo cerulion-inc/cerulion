@@ -1824,7 +1824,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 // engine's oracle-tested `render_local_topics_section`; the
                 // binary prints its string verbatim.
                 let topics = topic_cmd::topic_list()?;
-                let mirrors = topic_cmd::gather_mirror_provenance();
+                let mirrors = topic_cmd::gather_mirror_identities()?;
                 let (genuine_local, streaming) =
                     topic_cmd::partition_local_topics(topics, &mirrors);
                 print!(

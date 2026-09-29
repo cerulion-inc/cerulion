@@ -294,6 +294,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `network_test.rs` | Network transport basics over the SHM-backed API. | tt1 | none |
 | `network_graph_wiring_test.rs` | `network:` block → `GatewayPlan` derivation; a graph build starts nothing network. | parallel | none |
 | `network_ingress_test.rs` | Byte-identical re-injection; schema-mismatch counted-not-delivered; structural loop exclusion; lazy session; teardown release. | `#[serial]` tt1 | none |
+| `mirror_origin_test.rs` | Required network identity despite failed robot attribution; consumer-first attach; multiple-owner rollback; local replacement; malformed identity refusals. | per-test SHM | none |
 | `network_ingress_e2e_test.rs` | Cross-session producer→gateway→zenoh-TCP→re-inject→subscriber, byte-identical vs hand-stamped headers. | `#[serial]` | none |
 | `network_ingress_unregister_test.rs` | Ingress teardown: slot freed, self-ingress cleared, full re-register cycle, loud double-unregister. | `#[serial]` | none |
 | `network_yaml_e2e_test.rs` | Config-only cross-machine delivery: two YAML graphs, bit-identical payload through the full chain. | `#[serial]` | none |
