@@ -3134,8 +3134,26 @@ jobs:
           python3 -c 'import resource; s, h = resource.getrlimit(resource.RLIMIT_NOFILE); print("getrlimit RLIMIT_NOFILE soft", s, "hard", h)'
           echo "ulimit -n soft $(ulimit -Sn) hard $(ulimit -Hn)"
           echo "launchctl limit maxfiles: $(launchctl limit maxfiles)"
-          echo "iox2_ shm_state records: $(ls /tmp/iox2_*.shm_state 2>/dev/null | wc -l)"
-          echo "shm_state records total: $(ls /tmp/*.shm_state 2>/dev/null | wc -l)"
+          # `find`, not `ls`, because actionlint runs shellcheck over this block
+          # and SC2012 refuses parsing `ls` output. For the regular,
+          # non-dot-prefixed records this counts, both forms emit one line per name and
+          # `wc -l` counts newlines, so a name carrying a newline miscounts in
+          # either. They are NOT interchangeable in general: `ls` lists a
+          # matching directory's contents, and a shell glob skips a dot-prefixed
+          # name that `-name` matches.
+          #
+          # The TRAILING SLASH is load bearing on macOS, where /tmp is a symlink
+          # to private/tmp. BSD find defaults to -P and does not follow a
+          # symlinked starting POINT, so `find /tmp` walks the link itself,
+          # matches nothing, prints nothing and exits 0: the snapshot would have
+          # reported zero leaked records on exactly the run it exists to
+          # diagnose. `find /tmp/` follows it.
+          #
+          # No `2>/dev/null`: with `-maxdepth 1` there is no traversal noise to
+          # suppress, and hiding a failure here would restore the silent zero
+          # this line exists to remove.
+          echo "iox2_ shm_state records: $(find /tmp/ -maxdepth 1 -name 'iox2_*.shm_state' | wc -l | tr -d ' ')"
+          echo "shm_state records total: $(find /tmp/ -maxdepth 1 -name '*.shm_state' | wc -l | tr -d ' ')"
           for pid in $(pgrep -f cerulion | head -5); do
             echo "fds $pid: $(perl -e 'alarm 5; exec @ARGV' lsof -nP -p "$pid" 2>/dev/null | wc -l)"
           done
