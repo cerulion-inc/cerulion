@@ -9834,8 +9834,9 @@ fn judge_capture_resimmable(
             // resim refuses at `BagMissingAttachment`.
             // USABLE, not merely named — and `usable` means every step
             // `run_replay` takes on this attachment before anything runs, which
-            // is UTF-8 -> parse -> VALIDATE (`replay_cmd.rs:1371-1401`), each
-            // failing as `BagInvalidAttachment`.
+            // is `from_utf8` then `parse_graph` then
+            // `validate_graph` (`replay_cmd.rs:1371-1401`), each failing as
+            // `BagInvalidAttachment`.
             //
             // The predicate has now been one gate short TWICE, in the same
             // direction: first name-presence (a truncated or binary attachment

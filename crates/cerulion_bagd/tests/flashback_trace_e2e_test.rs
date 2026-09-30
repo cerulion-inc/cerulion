@@ -427,7 +427,7 @@ const GRAPH_YAML: &[u8] = b"name: trace-demo\nnodes:\n  - id: probe\n    type: p
 ///
 /// The discriminator for the REPLAY_VERDICT thread: a predicate that
 /// stops at `parse_graph` accepts this, and `run_replay` refuses it at
-/// `BagInvalidAttachment` (`replay_cmd.rs:579`).
+/// `BagInvalidAttachment` (`replay_cmd.rs:1398`).
 const GRAPH_YAML_PARSES_BUT_INVALID: &[u8] =
     b"name: trace-demo\nnodes:\n  - id: sink\n    type: sink_node\n    inputs:\n      - name: inp\n        source: ghost/out\n";
 
@@ -1036,7 +1036,7 @@ fn the_fixture_graphs_have_the_validity_their_arms_depend_on() {
 /// The sibling arm above covers a graph that is ABSENT. This one covers a graph
 /// that is present and unusable — the case a presence check and a parse check
 /// both wave through. `run_replay` runs UTF-8 -> parse -> `validate_graph`
-/// (`replay_cmd.rs:553-583`), each failing as `BagInvalidAttachment` -> exit 2,
+/// (`replay_cmd.rs:1371-1401`), each failing as `BagInvalidAttachment` -> exit 2,
 /// so a capture whose predicate stopped at `parse_graph` published
 /// `resimmable: true` against a bag replay refuses before loading anything.
 ///
