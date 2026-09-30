@@ -446,8 +446,8 @@ hot path.
   55 000 draws (64 B) sits lower than over 2 000 draws (16 MB) purely
   from sample count. Cross-size and cross-cell SHAPE claims are
   therefore made on **p1/p10** (present in every CSV row), and any
-  future flatness GATE on this data must use p10, per
-  `benches/AGENTS.md`. max is reproducible in distribution, never in
+  future flatness GATE on this data must use p10, the percentile §2
+  supports at every size. max is reproducible in distribution, never in
   value: a published max names its run, and recurring-vs-one-off
   outliers are separated by the rep structure (§10), never by one
   run's max. The `.bin`s preserve chronological sample order by
