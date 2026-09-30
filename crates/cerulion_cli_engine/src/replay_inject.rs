@@ -112,8 +112,10 @@
 //! rank) is a different thing and is not a refusal: it contributes no
 //! constraint, and the surviving covered edges steer. It is reported in
 //! [`InjectionSchedule::uncovered`] so the caller can say so. Only when NO edge
-//! on the topic has coverage is there nothing to steer FROM, and the topic
-//! stands down.
+//! on the topic PLANS A READ is there nothing to steer FROM, and the topic
+//! stands down, which is not the report above's test: an edge whose every record
+//! is a hand off plans no read and is still not reported, because each of its
+//! records names a frame an earlier record on that edge consumed.
 //!
 //! # What the tests pin
 //!
@@ -633,6 +635,10 @@ pub struct InjectionSchedule {
     pub per_step: Vec<StepInjection>,
     /// Edges with NO kind-6 coverage: they constrained nothing, and the caller
     /// must say so rather than implying the schedule was verified against them.
+    ///
+    /// An edge whose every record is a hand off is NOT here: each of its records
+    /// names a frame an earlier record on that edge consumed, so the schedule
+    /// leaves no read of it unexplained.
     pub uncovered: Vec<EdgeId>,
     /// Recorded frames NO covered edge accounts for — trailing frames published
     /// after the last recorded read, most often.
@@ -765,7 +771,10 @@ pub enum StandDownReason {
     /// No edge on this rank has any kind-6 read record, so there is nothing to
     /// steer from. Not a defect — a fully quarantined or pre-annotation rank.
     NoCoverage {
-        /// Every edge that was offered, all of them uncovered.
+        /// Every offered edge that planned no read and carried nothing that
+        /// accounts for one. An edge whose records are all hand offs is ABSENT
+        /// from this list: it plans nothing to steer from and leaves nothing
+        /// unexplained, so the list can be shorter than the topic's edge count.
         edges: Vec<EdgeId>,
     },
     /// An overflow marker: `dropped_records` kind-6 records were dropped at the
@@ -901,7 +910,9 @@ impl fmt::Display for StandDownReason {
         match self {
             Self::NoCoverage { edges } => write!(
                 f,
-                "no consuming edge on this rank has a recorded read log ({} edge(s))",
+                "no consuming edge on this rank plans a recorded read, \
+                 so there is nothing to steer from \
+                 ({} edge(s) carry no read record)",
                 edges.len()
             ),
             Self::TruncatedReadLog {
@@ -1193,8 +1204,12 @@ pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> Topi
                     reason,
                 })
             }
-            Ok(None) => uncovered.push(edge.id.clone()),
-            Ok(Some(plan)) => covered.push(plan),
+            Ok(EdgeFold::Planned(plan)) => covered.push(plan),
+            // Covered, nothing to do. Pushing it onto `uncovered` would report a
+            // read this schedule was not checked against, and every record on
+            // the edge names a frame an earlier record consumed.
+            Ok(EdgeFold::Covered) => {}
+            Ok(EdgeFold::NoReads) => uncovered.push(edge.id.clone()),
         }
     }
 
@@ -1295,20 +1310,40 @@ pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> Topi
     })
 }
 
+/// What folding ONE edge's recorded stream answered.
+///
+/// THREE answers, not an `Option`'s two. A stream that plans no read splits into
+/// two different facts, and one `None` writes both: a stream whose every record
+/// is already accounted for, and a stream that accounts for nothing. The first
+/// leaves no read unexplained on the edge, the second leaves the whole edge
+/// unexplained, and only the second is a coverage gap the caller reports.
+enum EdgeFold {
+    /// The stream plans this schedule of reads.
+    Planned(EdgePlan),
+    /// COVERED, nothing to do: the stream carries at least one hand off and no
+    /// record that plans a read. A hand off names a frame an earlier record on
+    /// this edge already consumed, so it occupies no position in the frame
+    /// stream and needs no injection: the edge is explained without a schedule.
+    Covered,
+    /// The stream plans no read and carries nothing that accounts for one: an
+    /// empty stream, or annotations alone, which name the producer of a read
+    /// without being a read.
+    NoReads,
+}
+
 /// Fold one edge's recorded stream: drop the annotations onto the reads they
 /// annotate, resolve each read's frame range, and cross-check every serving
 /// read against the frame its own `popped` sum lands on.
 ///
-/// `Ok(None)` = the edge has coverage of zero reads (annotations alone do not
-/// count — they describe reads, and a stream of pure annotations describes
-/// none).
-fn fold_edge(
-    edge: &ConsumerEdge,
-    topic: &TopicReplay,
-) -> Result<Option<EdgePlan>, StandDownReason> {
+/// The three answers are [`EdgeFold`]'s arms.
+fn fold_edge(edge: &ConsumerEdge, topic: &TopicReplay) -> Result<EdgeFold, StandDownReason> {
     let mut pending_token: Option<&ResolvedProducer> = None;
     let mut cursor = 0usize;
     let mut reads: Vec<PlannedRead> = Vec::new();
+    // Set at the hand off skip below. A `Truncated` body returns and a
+    // `Producer` body continues before that skip, so `HandOff` is the only body
+    // that reaches it.
+    let mut covered_without_pop = false;
 
     for record in &edge.reads {
         match &record.body {
@@ -1349,6 +1384,7 @@ fn fold_edge(
             popped,
         } = &record.body
         else {
+            covered_without_pop = true;
             continue;
         };
         let (kind, served_seq) = (*kind, *served_seq);
@@ -1407,9 +1443,13 @@ fn fold_edge(
     }
 
     if reads.is_empty() {
-        return Ok(None);
+        return Ok(if covered_without_pop {
+            EdgeFold::Covered
+        } else {
+            EdgeFold::NoReads
+        });
     }
-    Ok(Some(EdgePlan {
+    Ok(EdgeFold::Planned(EdgePlan {
         id: edge.id.clone(),
         mode: edge.mode,
         depth: edge.depth,
@@ -2204,6 +2244,91 @@ mod tests {
             StandDownReason::NoCoverage {
                 edges: vec![edge_id("a", "in"), edge_id("b", "in")],
             }
+        );
+    }
+
+    /// The THIRD fold answer: an edge whose every record is a hand off is
+    /// COVERED, not a coverage gap.
+    ///
+    /// A hand off names a frame an earlier record on the same edge already
+    /// consumed, so such an edge plans no read AND leaves no read unexplained.
+    /// Reporting it in `uncovered` would tell the caller the schedule was never
+    /// checked against a read, when every record of it is accounted for.
+    ///
+    /// The two neighbouring answers are pinned by
+    /// `an_uncovered_edge_constrains_nothing_and_is_reported_explicitly` (an
+    /// empty stream) and `a_topic_whose_every_edge_is_uncovered_stands_down` (an
+    /// annotation-only stream); both still hold, and the second arm here is what
+    /// stops this answer from swallowing them.
+    #[test]
+    fn a_hand_off_only_edge_is_covered_and_not_reported_uncovered() {
+        let hand_off_only = |node: &str| {
+            edge(
+                edge_id(node, "in"),
+                ConsumeMode::Latest,
+                vec![RecordedRead::read(
+                    1,
+                    ReadKind::DrainedBatch,
+                    Some(5),
+                    0,
+                    true,
+                )],
+            )
+        };
+        let live = || {
+            edge(
+                edge_id("live", "in"),
+                ConsumeMode::EachFifo,
+                vec![served(1, 5, 1), served(2, 6, 1)],
+            )
+        };
+
+        let s = expect_steered(plan_no_local(&topic(
+            false,
+            frames(&[5, 6]),
+            vec![hand_off_only("promoted"), live()],
+        )));
+        assert_eq!(shape(&s), vec![(1, vec![5]), (2, vec![6])]);
+        assert!(
+            s.uncovered.is_empty(),
+            "a hand off only edge is covered, nothing to do: {:?}",
+            s.uncovered
+        );
+
+        // An ANNOTATION-only stream stays a gap: it names the producer of a read
+        // it does not carry, so nothing on it is accounted for.
+        let with_annotation = expect_steered(plan_no_local(&topic(
+            false,
+            frames(&[5, 6]),
+            vec![
+                hand_off_only("promoted"),
+                edge(
+                    edge_id("noted", "in"),
+                    ConsumeMode::Latest,
+                    vec![producer_note(1, "p/out")],
+                ),
+                live(),
+            ],
+        )));
+        assert_eq!(with_annotation.uncovered, vec![edge_id("noted", "in")]);
+
+        // With no edge planning a read there is nothing to steer from, so the
+        // topic still stands down, and the covered edge is absent from the list
+        // the stand down names.
+        let sd = expect_stand_down(plan_no_local(&topic(
+            false,
+            frames(&[5, 6]),
+            vec![hand_off_only("promoted")],
+        )));
+        assert_eq!(sd.reason, StandDownReason::NoCoverage { edges: vec![] });
+        // The rendered sentence counts the edges carrying no read record, and
+        // says nothing about what this edge's records are: the earlier wording
+        // claimed no edge HAS a read log, which this topic contradicts.
+        assert_eq!(
+            sd.reason.to_string(),
+            "no consuming edge on this rank plans a recorded read, \
+             so there is nothing to steer from \
+             (0 edge(s) carry no read record)"
         );
     }
 
