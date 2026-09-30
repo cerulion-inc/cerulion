@@ -17,12 +17,12 @@
 //!
 //! | Code | Class (the operator-facing phrase) | Meaning |
 //! |---|---|---|
-//! | 0 | — | pass ([`EXIT_PASS`]) — `outcome.passed` |
-//! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]) — `!outcome.passed` |
-//! | 2 | — | bag I/O or not-replay-grade (incl. bag/graph mismatch, and a read log that cannot be ENFORCED on a graph-produced edge) |
-//! | 3 | — | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
-//! | 4 | — | tolerance-YAML validation error |
-//! | 5 | — | internal error (panic, transport, scheduler) |
+//! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
+//! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, and a read log that cannot be ENFORCED on a graph-produced edge) |
+//! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
+//! | 4 | none | tolerance-YAML validation error |
+//! | 5 | none | internal error (panic, transport, scheduler) |
 //! | 6 | **fire-schedule divergence** or **edge-read divergence** | structural trace divergence, or a recorded EDGE READ the re-execution did not reproduce |
 //!
 //! Vocabulary rule: the two
