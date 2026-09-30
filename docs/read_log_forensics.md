@@ -590,17 +590,24 @@ producer has already published is withheld from the consumer's pop until the ste
 the recording read it at, so which step a read lands at is the recording's fact
 rather than the replay host's timing. A LOCKSTEP bag arms no gate, because one
 gating clock already orders every publish against every step. The `--report` JSON
-states which of the two happened in `read_log_enforcement`, with the gated stage
-count, the frames admitted and the frames held.
+states which happened in `read_log_enforcement.status`: `enforced` with the
+gated stage count, the frames admitted and the consults refused; `lockstep`;
+`not_applicable`, which says no such edge exists on this recording;
+`not_gateable`, which names the stages the core cannot gate on wiring facts (a
+per-set `Sync` trigger input, a `multi_publisher_topics` edge) and which took
+today's drain; and `not_enforced`, which says the edge exists, no gate was built
+over it, and its intra-step arrival is whatever its queue held. `consults_refused` counts
+CONSULTS the gate refused and not frames, one per refused consult, so a drain
+site added to a gated body moves it with no behaviour change.
 
 Enforcement splits the read log's findings across three exit codes, and a read
 log finding is never exit 1:
 
 | exit | what it means for the read log |
 |---|---|
-| 0 | every gated edge admitted the frames the recording popped, at the steps it popped them, and the redundant per-edge verifier found nothing it retained |
+| 0 | every gated stage admitted the frames the recording popped, at the steps it popped them, and the redundant per-edge verifier found nothing it retained. `read_log_enforcement.status` says which stages those were: `enforced` gates every stage of every produced-and-consumed edge that CAN be gated, while `not_gateable`, `not_enforced` and `enforced.stages_not_gateable` each name stages that were not, and exit 0 says nothing about their intra-step arrival |
 | 1 | frame CONTENT diverged. No read-log condition reaches this code |
-| 2 | the recording's read log cannot be enforced on a gated edge, so the run is refused rather than gated on a claim it cannot trust. The message names the cause token (`read_log_no_coverage`, `read_log_record_dropped`, `read_log_truncated`, `read_log_unenforceable_record`, `read_log_input_name_unresolved`, `read_log_input_name_duplicated`), the stage and the remedy |
+| 2 | the recording's read log cannot be enforced on a gated edge, so the run is refused rather than gated on a claim it cannot trust. The message names the cause token (`read_log_no_coverage`, `read_log_record_dropped`, `read_log_edge_not_gateable`, `read_log_unenforceable_record`, `read_log_input_name_unresolved`, `read_log_input_name_duplicated`, `read_log_budget_declined`, `read_log_verdict_incomplete`), the stage and the remedy |
 | 6 | a recorded EDGE READ the re-execution did not reproduce: a frame due at a step that never arrived, a surviving sequence that does not match, or a divergence the per-edge verifier retained. It shares exit 6 with the fire comparator because both say the same thing, the re-executed SCHEDULE is not the recorded one |
 
 The terminal block for the last of those is headed `EDGE-READ DIVERGENCE` and

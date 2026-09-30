@@ -666,17 +666,28 @@ static EXPECTED: &[Expected] = &[
             "cursor",
             "admitted_this_step",
             "lifetime_admitted",
-            "lifetime_held",
+            "refused_consults",
+            "unplanned_consults",
             "violations",
             "violations_dropped",
             "mismatches",
             "unusable",
         ],
-        // MEASURED via `dump_measured_table`, never hand computed.
+        // Re-snapshot (MEASURED via `dump_measured_table`, never hand
+        // computed): `unplanned_consults: u64` grows the struct 104 -> 112 bytes
+        // and moves the two bools and `admitted_this_step` in the tail;
+        // `lifetime_held` is renamed `refused_consults` in the field list, which
+        // is a NAME change with no layout effect.
+        //
+        // The ABI VERSION is unchanged at 23, on the rule the
+        // `StagedReadOutcome` entry states: the version already moved for this
+        // struct family in this release, and a later change to a struct in the
+        // same family is a re-snapshot rather than a second bump. Host and
+        // cdylib are built together from one tree.
         layout: Layout::Pinned {
-            size: 104,
+            size: 112,
             align: 8,
-            offsets: &[48, 100, 0, 56, 96, 64, 72, 24, 80, 88, 101],
+            offsets: &[48, 108, 0, 56, 104, 64, 72, 80, 24, 88, 96, 109],
         },
     },
     Expected {

@@ -1855,6 +1855,88 @@ fn a_fully_served_refilled_burst_raises_no_wake_hint() {
     );
 }
 
+/// A trace-driven fire over a refill the READ GATE emptied is counted apart from
+/// an input SHORTFALL, and changes nothing else about the burst.
+///
+/// The two empties mean opposite things. `RefillEmptyCause::Queue` says the
+/// recording holds a consumed frame this replay's input stream does not, which
+/// the engine reports against the harness; `EnforcedByReadPlan` says the
+/// recording's read at this position consumed nothing and the gate withheld,
+/// which is the enforcement working. Before this arm the second cause was
+/// reachable from no test at all: both hooks in this file answer
+/// `NotEmpty`/`Queue` only, so nothing pinned that the shortfall counter stays
+/// still, that the enforced counter moves, or that the burst's own arithmetic is
+/// untouched by the split.
+#[test]
+#[serial]
+fn a_planned_fire_over_an_enforced_empty_refill_counts_neither_a_shortfall() {
+    let clock = Arc::new(VirtualClock::new());
+    let mut scheduler = Scheduler::with_virtual_clock(clock);
+    let (cb, count) = counting_callback();
+    let handle = scheduler
+        .add_node(NodeConfig {
+            id: "sink".to_string(),
+            policy: TriggerPolicy::Data,
+            callback: cb,
+        })
+        .unwrap();
+    // Every refill inside the burst is the GATE's empty: the recording's read at
+    // that position consumed nothing.
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_hook = Arc::clone(&calls);
+    scheduler
+        .set_trigger_refill("sink", "inp", move || {
+            calls_hook.fetch_add(1, Ordering::Relaxed);
+            RefillOutcome {
+                popped: 0,
+                latest_ts: None,
+                empty_cause: RefillEmptyCause::EnforcedByReadPlan,
+            }
+        })
+        .unwrap();
+    scheduler
+        .set_replay_fire_plan(
+            0,
+            &[cerulion_core::scheduler::ReplayFire {
+                node_id: "sink",
+                first_fire_ns: 1_000_000,
+                fire_count: 2,
+                interval_ns: 1_000_000,
+            }],
+        )
+        .unwrap();
+    scheduler.step(Duration::from_millis(10));
+
+    // The PLAN is authoritative for the schedule: both fires happen, over a
+    // refill that supplied nothing.
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        2,
+        "the recorded fire count is the schedule, whatever the refill answered"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "the refill is asked once per fire after the first"
+    );
+    assert_eq!(
+        scheduler.replay_enforced_empty_refills("sink"),
+        Some(1),
+        "the gate's empty is counted as its own cause"
+    );
+    assert_eq!(
+        scheduler.replay_refill_shortfalls("sink"),
+        Some(0),
+        "and NOT as an input shortfall, which would name the harness for a frame \
+         the recording never read"
+    );
+    assert_eq!(
+        handle.pending_data_count(),
+        0,
+        "a refill that popped nothing queues nothing"
+    );
+}
+
 /// A mid-burst pre-fire defer stops the burst and CARRIES what it did not
 /// fire — `throttle_ms` means "at most one fire per step", and it must cost
 /// nothing.

@@ -2695,7 +2695,7 @@ impl CerulionSubscriber {
         // delivered frame's sequence (drain order — "latest wins"), popped =
         // the delivered count (malformed frames are skipped by
         // `deliver_raw_frame` and not counted, matching the timestamps the
-        // trigger path forwards). Armed-only; the seq parse is gated on it.
+        // trigger path forwards). Armed-only.
         // rmw `take` / services route through `try_receive_one`, which is
         // DELIBERATELY out of the read log's scope (not recorded in graph
         // bags today) — see that method.
@@ -2744,10 +2744,19 @@ impl CerulionSubscriber {
             |sample| {
                 if deliver_raw_frame(topic, sample.payload(), callback) {
                     count.set(count.get() + 1);
-                    if capture {
+                    // The served-sequence parse follows the CAPTURE bit or the
+                    // GRANT, either of which consumes it: the record below
+                    // carries it, and the settle below compares it against the
+                    // recorded sequence. Reading it on the capture bit alone
+                    // compared a recorded `Some(seq)` against `None` on every
+                    // gated batch drain of a run whose read-log verifier is
+                    // disabled, since the memory sink that sets the capture bit
+                    // is enabled only on the verifier's active path, and minted
+                    // one sequence mismatch per drain over a clean replay.
+                    if capture || granted.is_some() {
                         if let Some(seq) = wire_sequence(sample.payload()) {
                             newest_seq = Some(seq);
-                            if annotate {
+                            if capture && annotate {
                                 newest_origin = Some(sample.origin());
                             }
                         }
@@ -2794,8 +2803,14 @@ impl CerulionSubscriber {
         // carries for this site. It runs BEFORE the mid-drain `Err` propagates
         // for the same reason the staging does: the frames delivered so far
         // really reached the callback.
-        if let (Some(gate), Some(due)) = (self.replay_gate(), granted) {
-            gate.settle(due, count as u64, newest_seq);
+        // Settled through the plan HANDLE and not through `replay_gate()`: a
+        // grant is proof the gate was armed at the consult, so re-testing
+        // `is_armed` here would drop the compare for a pop the gate authorised
+        // and pay a second `Acquire` load per drain.
+        if let Some(due) = granted {
+            if let Some(gate) = self.replay_plan.as_deref() {
+                gate.settle(due, count as u64, newest_seq);
+            }
         }
         drain_result?;
         Ok(count)
@@ -3123,7 +3138,7 @@ impl CerulionSubscriber {
             },
         };
         let outcome = self.drain_with_accounting_body(limit_one, granted.map(|d| d.pop_count()));
-        if let (Some(gate), Some(due)) = (self.replay_gate(), granted) {
+        if let (Some(gate), Some(due)) = (self.replay_plan.as_deref(), granted) {
             // The surviving frame's own wire sequence, read off the slot the
             // body kept. `Empty` and `Err` carry none, and a DECIMATED drain's
             // survivor is nothing either, its recorded `served_seq` names the

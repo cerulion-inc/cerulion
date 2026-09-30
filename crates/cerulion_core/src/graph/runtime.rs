@@ -8360,17 +8360,21 @@ impl GraphRuntime {
                         .map(|(_node, plan)| Arc::clone(plan))
                 });
             scheduler.set_trigger_refill(binding.node_id.as_ref(), input, move || {
-                // The HELD witness before and after the drain. It is a monotone
-                // per-stage counter the gate bumps on every refused pop, so a
-                // rise across this one call is proof the gate withheld here,
-                // no clock, no poll count, and no second authority for the fact.
-                let held_before = refill_gate.as_ref().map_or(0, |g| g.held());
+                // The REFUSED-CONSULT witness before and after the drain. It is
+                // a monotone per-stage counter the gate bumps on every refused
+                // consult, so a rise across this one call is proof the gate
+                // withheld here, no clock, no poll count, and no second
+                // authority for the fact.
+                let held_before = refill_gate.as_ref().map_or(0, |g| g.refused_consults());
                 match node_arc.lock() {
                     Ok(mut guard) => {
                         let (popped, latest_ts) = guard.refill_trigger_input(&refill_input);
                         let empty_cause = if popped > 0 {
                             crate::scheduler::RefillEmptyCause::NotEmpty
-                        } else if refill_gate.as_ref().is_some_and(|g| g.held() > held_before) {
+                        } else if refill_gate
+                            .as_ref()
+                            .is_some_and(|g| g.refused_consults() > held_before)
+                        {
                             crate::scheduler::RefillEmptyCause::EnforcedByReadPlan
                         } else {
                             crate::scheduler::RefillEmptyCause::Queue
@@ -15561,7 +15565,12 @@ impl GraphRuntime {
         for plan in resolved {
             plan.arm()?;
         }
-        self.replay_read_armed = !keys.is_empty();
+        // DERIVED from the stages themselves, in both this call and
+        // `clear_replay_read_plan`: the flag and the per-stage `armed` bits are
+        // one fact, and a second arming with an empty key list set the flag
+        // false while stages stayed armed, which stops `step_live` publishing
+        // the step and sweeping while every consult still gates.
+        self.refresh_replay_read_armed();
         Ok(())
     }
 
@@ -15609,16 +15618,21 @@ impl GraphRuntime {
                     ),
                 });
             }
-            if let Err(over) = plan.install_step(step, edge.due) {
-                return Err(TransportError::GraphError {
-                    reason: format!(
-                        "set_replay_read_plan: stage {} names {} reads at step {step} but its \
-                         derived rim holds {}, the recording is foreign or truncated",
-                        edge.key.label(),
-                        over.named,
-                        over.rim
+            if let Err(refusal) = plan.install_step(step, edge.due) {
+                let reason = match refusal {
+                    crate::read_outcome::InstallRefusal::RimExceeded { named, rim } => format!(
+                        "set_replay_read_plan: stage {} names {named} reads at step {step} but \
+                         its derived rim holds {rim}, the recording is foreign or truncated",
+                        edge.key.label()
                     ),
-                });
+                    crate::read_outcome::InstallRefusal::GateUnusable => format!(
+                        "set_replay_read_plan: stage {} refuses the install ({}), a panic \
+                         poisoned its gate and it admits nothing from here on",
+                        edge.key.label(),
+                        refusal.code()
+                    ),
+                };
+                return Err(TransportError::GraphError { reason });
             }
         }
         Ok(())
@@ -15629,7 +15643,16 @@ impl GraphRuntime {
         for (_node, plan) in &self.replay_read_plans {
             plan.disarm();
         }
-        self.replay_read_armed = false;
+        self.refresh_replay_read_armed();
+    }
+
+    /// Re-read the armed flag off the stages, the ONE writer of
+    /// `replay_read_armed`.
+    fn refresh_replay_read_armed(&mut self) {
+        self.replay_read_armed = self
+            .replay_read_plans
+            .iter()
+            .any(|(_node, plan)| plan.is_armed());
     }
 
     /// Is any read gate armed (Principle #3; false on a virgin runtime).
@@ -15672,13 +15695,37 @@ impl GraphRuntime {
             .map(|(_node, plan)| plan.admitted())
     }
 
-    /// Pops this stage's gate REFUSED over the run (the other monotone
+    /// Consults this stage's gate REFUSED over the run (the other monotone
     /// witness). `None` for a stage this build did not wire.
-    pub fn replay_read_held(&self, key: &crate::read_outcome::StageKey) -> Option<u64> {
+    pub fn replay_read_refused_consults(&self, key: &crate::read_outcome::StageKey) -> Option<u64> {
         self.replay_read_plans
             .iter()
             .find(|(_node, plan)| plan.key() == key)
-            .map(|(_node, plan)| plan.held())
+            .map(|(_node, plan)| plan.refused_consults())
+    }
+
+    /// Consults the installed plan held no position for, summed over the armed
+    /// stages: an armed stage with no install for the step, and a consult past
+    /// the step's last recorded read. A harness fault the engine reports beside
+    /// the verdict.
+    pub fn replay_read_unplanned_consults(&self) -> u64 {
+        self.replay_read_plans
+            .iter()
+            .map(|(_node, plan)| plan.unplanned_consults())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Every armed stage whose gate a panic POISONED, in stage order.
+    ///
+    /// A poisoned gate withholds every later admission, so a run that ends with
+    /// one served nothing from that stage after the panic: the engine refuses
+    /// the run rather than reporting a verdict over reads that never happened.
+    pub fn replay_read_gates_unusable(&self) -> Vec<crate::read_outcome::StageKey> {
+        self.replay_read_plans
+            .iter()
+            .filter(|(_node, plan)| plan.is_unusable())
+            .map(|(_node, plan)| plan.key().clone())
+            .collect()
     }
 
     /// Consults that found a plan installed for a DIFFERENT step (the

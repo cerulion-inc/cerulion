@@ -521,6 +521,14 @@ pub struct ReplayOutcome {
     /// crashed before the comparisons that populate it, so the array is EMPTY
     /// on the loudest failure the verb has. [`Self::passed`] and the exit code
     /// are the verdict; this is the vocabulary for what was found.
+    ///
+    /// The read-log class is the reachable case: a replay that PASSES with exit
+    /// 0 still lists [`DivergenceClass::EdgeRead`] when the redundant verifier
+    /// found divergences and every one of them fell inside the quarantine's
+    /// scope, so none reached [`Self::read_log_verdict`]. The findings are in
+    /// [`Self::read_log_divergence`] and the excluded rows in
+    /// [`Self::read_log_quarantine`], which is what the class points a reader
+    /// at.
     pub divergence_classes: Vec<DivergenceClass>,
     /// The report schema version ([`REPORT_VERSION`]).
     pub report_version: u32,
@@ -751,6 +759,11 @@ pub enum ReadLogStatus {
 
 /// `skip_serializing_if` predicate for the counts that are absent at zero.
 fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Its 64-bit twin, for the counters the core's monotone witnesses carry.
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -2055,12 +2068,27 @@ pub enum ReadLogEnforcement {
     /// gated bodies, and a multi-publisher edge's wire sequence is per publisher,
     /// so the due frame is not necessarily the head. Those stages take today's
     /// drain, and this status is what says so rather than letting the absence of
-    /// a gate read as "there was nothing to gate".
+    /// a gate read as "there was nothing to gate". See
+    /// [`replay_inject::AdmissionPlan::NotGateable`] for why the condition is
+    /// this status and not an exit-2 refusal.
     NotGateable {
         /// Stages left ungated.
         stages: usize,
         /// The core's reason per stage, in stage order.
         reasons: Vec<String>,
+    },
+    /// The rank holds a graph-produced input edge and NO gate was built over it.
+    ///
+    /// The distinct arm exists because [`Self::NotApplicable`] is a POSITIVE
+    /// claim ("no graph-produced input edge runs inside one rank on this
+    /// recording") that is false exactly here: the edge exists, the bag carries
+    /// no read log the gate could be built from, and that edge's intra-step
+    /// arrival is therefore whatever its queue held.
+    NotEnforced {
+        /// Topics this rank both produces and consumes.
+        topics: usize,
+        /// Why no gate was built, in the words of the site that found it.
+        reason: String,
     },
     /// The gate was armed and driven.
     Enforced {
@@ -2072,8 +2100,22 @@ pub enum ReadLogEnforcement {
         /// witnesses, which is what makes "the gate engaged" auditable rather
         /// than inferred from an absent failure.
         frames_admitted: u64,
-        /// Pops the gates REFUSED, the other witness.
-        frames_held: u64,
+        /// CONSULTS the gates refused, the other witness. One per refused
+        /// consult and never one per queued frame: a gated body with two consult
+        /// sites moves it twice per step with no behaviour change, which is why
+        /// it is not named for frames.
+        consults_refused: u64,
+        /// Consults the installed plan held no position for (no install for the
+        /// step, or past the step's last recorded read). A HARNESS fault
+        /// reported beside the verdict, never part of it. Serialized only when
+        /// nonzero.
+        #[serde(skip_serializing_if = "is_zero_u64")]
+        unplanned_consults: u64,
+        /// Trace-driven refills that found their queue empty because the gate
+        /// WITHHELD, never counted as input shortfalls. Serialized only when
+        /// nonzero.
+        #[serde(skip_serializing_if = "is_zero_u64")]
+        enforced_empty_refills: u64,
         /// Plan entries the pass never reached (a `--duration` bound, or a rank
         /// whose recorded stream ends before the plan's tail). Never a verdict.
         #[serde(skip_serializing_if = "is_zero")]
@@ -2101,7 +2143,9 @@ impl ReadLogEnforcement {
                     stages,
                     steps,
                     frames_admitted,
-                    frames_held,
+                    consults_refused,
+                    unplanned_consults,
+                    enforced_empty_refills,
                     steps_not_reached,
                     stages_not_gateable,
                 },
@@ -2109,7 +2153,9 @@ impl ReadLogEnforcement {
                     stages: s2,
                     steps: st2,
                     frames_admitted: a2,
-                    frames_held: h2,
+                    consults_refused: h2,
+                    unplanned_consults: u2,
+                    enforced_empty_refills: e2,
                     steps_not_reached: n2,
                     stages_not_gateable: g2,
                 },
@@ -2117,11 +2163,31 @@ impl ReadLogEnforcement {
                 stages: stages.saturating_add(s2),
                 steps: steps.saturating_add(st2),
                 frames_admitted: frames_admitted.saturating_add(a2),
-                frames_held: frames_held.saturating_add(h2),
+                consults_refused: consults_refused.saturating_add(h2),
+                unplanned_consults: unplanned_consults.saturating_add(u2),
+                enforced_empty_refills: enforced_empty_refills.saturating_add(e2),
                 steps_not_reached: steps_not_reached.saturating_add(n2),
                 stages_not_gateable: stages_not_gateable.saturating_add(g2),
             },
             (e @ Self::Enforced { .. }, _) | (_, e @ Self::Enforced { .. }) => e,
+            (
+                Self::NotEnforced { topics, reason },
+                Self::NotEnforced {
+                    topics: t2,
+                    reason: r2,
+                },
+            ) => Self::NotEnforced {
+                topics: topics.saturating_add(t2),
+                // BOTH sentences survive: one rank's cause is not the other's,
+                // and a fold that kept one dropped the reason the other rank's
+                // edge went ungated.
+                reason: if reason == r2 {
+                    reason
+                } else {
+                    format!("{reason}; {r2}")
+                },
+            },
+            (n @ Self::NotEnforced { .. }, _) | (_, n @ Self::NotEnforced { .. }) => n,
             (
                 Self::NotGateable { stages, reasons },
                 Self::NotGateable {
@@ -9237,10 +9303,19 @@ struct PassVerification {
     /// is what the read GATE installs per step. Empty under lockstep, and on every
     /// pass whose rank holds no graph-produced input edge.
     admission: std::collections::HashMap<String, Vec<replay_inject::StageAdmission>>,
+    /// Topics this rank both PRODUCES and consumes, whose recorded reads the
+    /// gate must admit at their recorded steps. Counted even when no gate was
+    /// built, which is what lets the report tell "no such edge exists" from
+    /// "the edge exists and nothing gated it".
     /// Stages of a gated topic the core refuses to gate, each rendered with its
     /// reason. They take today's drain; the report names them so an absent gate
     /// is never read as an absent edge.
     admission_ungateable: Vec<String>,
+    enforce_topics: usize,
+    /// Why no gate was built over a non-empty enforce set, in the words of the
+    /// site that found it. `None` when the gate was built, or when the rank
+    /// holds no such edge at all.
+    enforcement_skipped: Option<String>,
     /// The SENTENCE the prepare-time cause was found with,
     /// when the site that found it wrote one.
     ///
@@ -9424,6 +9499,8 @@ impl PassVerification {
             block_edges: Vec::new(),
             admission: std::collections::HashMap::new(),
             admission_ungateable: Vec::new(),
+            enforce_topics: 0,
+            enforcement_skipped: None,
             declined: None,
             declined_detail: None,
         }
@@ -9448,6 +9525,17 @@ impl PassVerification {
     /// would be the mirror-image false report.
     fn declined_at_prepare(cause: VerifierDecline, rank: u32, inject_topics: &[String]) -> Self {
         Self::declined_at_prepare_with(cause, rank, inject_topics, None)
+    }
+
+    /// Record that this rank holds `topics` produced-and-consumed edges and no
+    /// gate was built over them, so the report says the edge went UNGATED rather
+    /// than claiming no such edge exists. A no-op when the rank holds none.
+    fn with_enforcement_skipped(mut self, topics: usize, reason: String) -> Self {
+        if topics > 0 {
+            self.enforce_topics = topics;
+            self.enforcement_skipped = Some(reason);
+        }
+        self
     }
 
     /// [`Self::declined_at_prepare`] with the cause's own SENTENCE supplied by the
@@ -9716,6 +9804,23 @@ fn render_ungateable(
         .collect()
 }
 
+/// Does this rank's trace carry ANY read-outcome record?
+///
+/// The ONE question a degraded manifest still leaves answerable: the record's
+/// rank rides in the record header, while placing it on an input needs the
+/// manifest's own name table. Walked only when the rank holds a
+/// produced-and-consumed edge AND the manifest was refused, which is why a full
+/// trace walk here costs nothing on the shipped paths.
+fn rank_has_read_records(trace: &RecordedTrace, rank: u32) -> Result<bool, ReplayError> {
+    let mut cursor = trace.cursor()?;
+    while let Some(r) = cursor.consume_next()? {
+        if r.record_type == RECORD_TYPE_READ_OUTCOME && r.rank() == rank {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A prepare-time DECLINE over a rank that holds a GATED edge is a refusal, not
 /// a degrade.
 ///
@@ -9780,9 +9885,6 @@ fn prepare_pass_verification(
     // the gate may hold its frames back, the ONE authority on both questions
     // (`replay_read_enforceable`).
     census: &[cerulion_core::read_outcome::ReadEdgeCapability],
-    // The last step this rank's recorded boundary stream carries,
-    // against which a gated stage's read stream is held.
-    last_boundary_step: u64,
     // May this bag's kind-6 role bits be read as roles? The
     // steering and the re-derivation feed both branch on it — see
     // `ROLE_STAMPED_MIN_TRACE_FORMAT`.
@@ -9836,11 +9938,34 @@ fn prepare_pass_verification(
             // reports `read_log_enforcement: not_applicable` beside the loud
             // warn above rather than refusing every archived bag whose rank
             // holds a produced-and-consumed edge.
+            // A gated rank whose bag DOES carry read records is refused here
+            // too: the records exist, the manifest cannot address them, and a
+            // replay that ran anyway would serve a produced-and-consumed edge
+            // whatever its queue held. The probe is what keeps an archived bag
+            // that carries NO read log on today's path, which is the whole
+            // reason this site degraded unconditionally before: with no readable
+            // input table the census cannot run, so the absence of a read log
+            // and an unreadable one looked alike from here.
+            if !enforce_topics.is_empty() && rank_has_read_records(trace, plan.rank())? {
+                if let Some(refusal) =
+                    enforcement_blocked_by_decline(enforce_topics, cause.code(), &reason)
+                {
+                    return Err(refusal);
+                }
+            }
             return Ok(PassVerification::declined_at_prepare_with(
                 cause,
                 plan.rank(),
                 inject_topics,
                 Some(&reason),
+            )
+            .with_enforcement_skipped(
+                enforce_topics.len(),
+                format!(
+                    "this rank's manifest could not be used ({}) and its bag carries no read \
+                     outcome record for the rank",
+                    cause.code()
+                ),
             ));
         }
     };
@@ -9880,11 +10005,16 @@ fn prepare_pass_verification(
             {
                 return Err(refusal);
             }
-            return Ok(PassVerification::declined_at_prepare(
-                cause,
-                plan.rank(),
-                inject_topics,
-            ));
+            return Ok(
+                PassVerification::declined_at_prepare(cause, plan.rank(), inject_topics)
+                    .with_enforcement_skipped(
+                        enforce_topics.len(),
+                        format!(
+                            "this rank's read log was declined at prepare ({})",
+                            cause.code()
+                        ),
+                    ),
+            );
         }
     };
 
@@ -9917,6 +10047,13 @@ fn prepare_pass_verification(
             VerifierDecline::FrameIndexBudget,
             plan.rank(),
             inject_topics,
+        )
+        .with_enforcement_skipped(
+            enforce_topics.len(),
+            format!(
+                "this rank's frame index was declined at prepare ({})",
+                VerifierDecline::FrameIndexBudget.code()
+            ),
         ));
     };
 
@@ -9979,8 +10116,37 @@ fn prepare_pass_verification(
     // lost. Collected only where the rank holds a gated edge, so a pass that
     // enforces nothing allocates nothing.
     let mut per_input: BTreeMap<(String, String), Vec<replay_inject::SitedRead>> = BTreeMap::new();
+    // The `(node, input)` pairs whose reads the gate will admit, so an
+    // unplaceable record is judged only where it constrains a replay.
+    let enforced_edges: BTreeSet<(String, String)> = consumed
+        .iter()
+        .filter(|(topic, _, _)| enforce_topics.iter().any(|t| t == topic))
+        .map(|(_, node, input)| (node.clone(), input.clone()))
+        .collect();
     for r in &reads {
         let Some(kind) = read_outcome_kind_from_wire(r.kind) else {
+            // A wire kind this binary does not know names a read whose position
+            // in the pop stream is unknown: skipping it leaves the step's
+            // admissions one entry short, so every later consult in that step
+            // spends the wrong entry and the gate admits a frame at a read the
+            // recording made elsewhere. The three admission shapes ARE the
+            // enforcement vocabulary, which is what makes a new kind a trace
+            // format bump. Off a gated edge the skip stands: the steering and
+            // the verifier already report an unknown kind their own way.
+            if enforced_edges.contains(&(r.node_id.to_string(), r.input.clone())) {
+                return Err(ReplayError::ReadLogNotEnforceable {
+                    edge: Some(format!("{}.{}", r.node_id, r.input)),
+                    cause: "read_log_unenforceable_record".to_string(),
+                    detail: format!(
+                        "a read record at step {} on '{}.{}' carries wire kind {}, which this \
+                         binary's admission vocabulary has no meaning for, so the recorded \
+                         reads of a topic this rank both produces and consumes cannot be placed \
+                         on their recorded steps. Replay this bag with the binary that recorded \
+                         it, or under CERULION_EXECUTION_MODE=lockstep",
+                        r.step, r.node_id, r.input, r.kind
+                    ),
+                });
+            }
             continue;
         };
         let served_seq = narrow_served_seq(r.served_seq, &r.node_id, &r.input)?;
@@ -10506,12 +10672,30 @@ fn prepare_pass_verification(
     // frame back until the step the recording read it at.
     let mut admission: std::collections::HashMap<String, Vec<replay_inject::StageAdmission>> =
         std::collections::HashMap::new();
+    // Why no gate was built over a non-empty enforce set. `None` once one is.
     let mut admission_ungateable: Vec<String> = Vec::new();
+    let mut enforcement_skipped: Option<String> = None;
     // `reads` EMPTY is a bag that carries no read log for this rank (every
     // `trace_format` <= 2 bag, and any rank whose records the census thinned to
     // nothing): it makes no claim about its reads, so there is nothing to
-    // enforce and nothing to refuse, and the pass reports
-    // `read_log_enforcement: not_applicable`.
+    // enforce and nothing to refuse. It is NOT `not_applicable`, which claims
+    // no such edge exists: the edge exists and nothing gated it, which is what
+    // the warn below and `ReadLogEnforcement::NotEnforced` state.
+    if !enforce_topics.is_empty() && reads.is_empty() {
+        tracing::warn!(
+            rank = plan.rank(),
+            topics = %enforce_topics.join(", "),
+            "replay: this rank both produces and consumes these topic(s) and its bag carries NO \
+             read log record for the rank, so the recorded reads of those edges are unknown and \
+             each one's intra-step arrival is whatever its queue holds. Re-record the bag with \
+             this binary, or replay it under CERULION_EXECUTION_MODE=lockstep"
+        );
+        enforcement_skipped = Some(format!(
+            "this rank's bag carries no read log record for it, so the recorded reads of the \
+             {} produced-and-consumed topic(s) are unknown",
+            enforce_topics.len()
+        ));
+    }
     if !enforce_topics.is_empty() && !reads.is_empty() {
         let stages = replay_inject::StageTable::new(&recorded_inputs, census);
         for topic in enforce_topics {
@@ -10536,7 +10720,6 @@ fn prepare_pass_verification(
                 topic: topic.clone(),
                 multi_publisher: config.is_multi_publisher(topic),
                 edges,
-                last_boundary_step,
             };
             match replay_inject::plan_edge_admission(&planned, &stages) {
                 replay_inject::AdmissionPlan::Enforced { stages, ungateable } => {
@@ -10731,6 +10914,8 @@ fn prepare_pass_verification(
         block_edges,
         admission,
         admission_ungateable,
+        enforce_topics: enforce_topics.len(),
+        enforcement_skipped,
         declined: None,
         declined_detail: None,
     })
@@ -10966,11 +11151,6 @@ fn run_rank_pass(
             &inject_topics,
             &enforce_topics,
             &runtime.replay_read_enforceable(),
-            pass.ragged
-                .authoritative_last
-                .get(plan.rank() as usize)
-                .copied()
-                .unwrap_or(0),
             pass.roles_stamped,
             pass.kind_width,
             pass.catchup_onset,
@@ -11679,14 +11859,28 @@ fn run_rank_pass(
     // mismatch — blaming the candidate for a frame the HARNESS did not supply.
     // Reported per node so the real cause is nameable; never a verdict.
     // ── what the READ GATE observed ──────────────────────────────────────
+    // `not_applicable` is a POSITIVE claim: no graph-produced input edge runs
+    // inside one rank on this recording. It is selected from the ENFORCE SET and
+    // not from the absence of a gate, because the two differ exactly where it
+    // matters: a rank that holds such an edge and built no gate over it replayed
+    // that edge on whatever its queue held, and reporting `not_applicable` there
+    // asserted the edge does not exist. Overwritten by `Enforced` below whenever
+    // a gate ran.
     let mut read_enforcement = if lockstep {
         ReadLogEnforcement::Lockstep
-    } else if verification.admission_ungateable.is_empty() {
+    } else if verification.enforce_topics == 0 {
         ReadLogEnforcement::NotApplicable
-    } else {
+    } else if !verification.admission_ungateable.is_empty() {
         ReadLogEnforcement::NotGateable {
             stages: verification.admission_ungateable.len(),
             reasons: verification.admission_ungateable.clone(),
+        }
+    } else {
+        ReadLogEnforcement::NotEnforced {
+            topics: verification.enforce_topics,
+            reason: verification.enforcement_skipped.clone().unwrap_or_else(|| {
+                "no gate was built over this rank's produced-and-consumed edge(s)".to_string()
+            }),
         }
     };
     let mut unmet_reads: Vec<UnmetReadReport> = Vec::new();
@@ -11696,11 +11890,37 @@ fn run_rank_pass(
         // means the report of what diverged is INCOMPLETE, and a truncated
         // verdict over a candidate is a claim the evidence does not support, so
         // the run is refused instead.
+        // A gate a PANIC poisoned withholds every later admission and accepts no
+        // install, so from that consult on the stage served nothing: no verdict
+        // over this rank's reads means anything, and the retained findings are
+        // the panic's own. Checked FIRST, ahead of the two counter gates, because
+        // a poisoned stage is why their numbers look the way they do.
+        let poisoned = runtime.replay_read_gates_unusable();
+        if !poisoned.is_empty() {
+            let stages: Vec<String> = poisoned
+                .iter()
+                .map(cerulion_core::read_outcome::StageKey::label)
+                .collect();
+            return Err(ReplayError::Internal {
+                reason: format!(
+                    "rank {}: a panic poisoned the read gate of {} stage(s) ({}), so every later \
+                     drain at them withheld and this rank's replayed reads are the panic's, not \
+                     the candidate's. This is a bug in the replay engine, please report",
+                    plan.rank(),
+                    poisoned.len(),
+                    stages.join(", ")
+                ),
+            });
+        }
         let dropped = runtime.replay_read_violations_dropped();
         if dropped > 0 {
             return Err(ReplayError::ReadLogNotEnforceable {
                 edge: None,
-                cause: "read_log_record_dropped".to_string(),
+                // Its OWN token: `read_log_record_dropped` is a fact about the
+                // BAG (an overflow marker the recorder wrote), while this is the
+                // replay's own bounded violation list overflowing, and one token
+                // for both left an operator unable to tell them apart.
+                cause: "read_log_verdict_incomplete".to_string(),
                 detail: format!(
                     "rank {}'s read gate dropped {dropped} read divergence(s) past its bounded \
                      per-stage list, so the report of which reads did not reproduce is \
@@ -11806,17 +12026,65 @@ fn run_rank_pass(
                  class)"
             );
         }
+        // A consult the installed plan held no position for is the plan and the
+        // drain disagreeing about how many reads one step holds. Reported beside
+        // the verdict and never inside it: the frames it withheld surface as
+        // ordinary divergences, and naming the number is what keeps a cursor
+        // over-run from reading as the enforcement working.
+        let unplanned = runtime.replay_read_unplanned_consults();
+        if unplanned > 0 {
+            tracing::warn!(
+                rank = plan.rank(),
+                unplanned,
+                "replay: read-gate consult(s) found no position in the installed plan (no \
+                 install for the step, or past the step's last recorded read), so each one \
+                 withheld. The recording writes NO record for a drain that found its queue \
+                 empty, so a step whose recorded read was not its first consult spends its \
+                 admissions at earlier consults: report-only, never a replay verdict"
+            );
+        }
+        // The refill empties the GATE caused, summed over the rank's nodes. The
+        // scheduler counts them apart from `replay_refill_shortfalls` so the two
+        // are never added: a shortfall names the harness under-feeding a node,
+        // and this names the enforcement withholding a frame that was not due.
+        // Counted and REPORTED, not merely logged.
+        let enforced_empty: u64 = plan
+            .subgraph()
+            .nodes
+            .iter()
+            .map(|n| runtime.replay_enforced_empty_refills(&n.id).unwrap_or(0))
+            .fold(0u64, |a, b| a.saturating_add(b));
         read_enforcement = ReadLogEnforcement::Enforced {
             stages: observed.stages,
             steps: observed.steps,
             frames_admitted: observed.frames_admitted,
-            frames_held: observed.frames_held,
+            consults_refused: observed.consults_refused,
+            unplanned_consults: unplanned,
+            enforced_empty_refills: enforced_empty,
             steps_not_reached: observed.steps_not_reached,
             stages_not_gateable: verification.admission_ungateable.len(),
         };
+        // DISARM, the arming's twin: the gate's findings are taken, and a stage
+        // left armed past the pass that installed its quotas would gate the next
+        // one's drains against a retired plan.
+        runtime.clear_replay_read_plan();
     }
     let mut input_shortfalls: Vec<ReplayInputShortfall> = Vec::new();
     for node in &plan.subgraph().nodes {
+        // The refill's OTHER empty: the gate withheld, so the queue's own depth
+        // says nothing. Counted apart from a shortfall and reported apart from
+        // it, because a shortfall names the harness under-feeding the node while
+        // this one is the enforcement working.
+        let enforced_empty = runtime.replay_enforced_empty_refills(&node.id).unwrap_or(0);
+        if enforced_empty > 0 {
+            tracing::debug!(
+                rank = plan.rank(),
+                node_id = %node.id,
+                count = enforced_empty,
+                "replay: this node's trace-driven refill found its queue empty because the read \
+                 GATE withheld, which is not an input shortfall"
+            );
+        }
         let count = runtime.replay_refill_shortfalls(&node.id).unwrap_or(0);
         if count > 0 {
             tracing::warn!(
@@ -16349,19 +16617,23 @@ impl AdmissionGate {
     /// witnesses.
     fn finish(self, runtime: &cerulion_core::graph::GraphRuntime) -> ReadEnforcementOutcome {
         let mut admitted = 0u64;
-        let mut held = 0u64;
+        let mut refused = 0u64;
         let mut unspent = 0usize;
         for s in &self.stages {
             admitted =
                 admitted.saturating_add(runtime.replay_read_admitted(&s.key).unwrap_or_default());
-            held = held.saturating_add(runtime.replay_read_held(&s.key).unwrap_or_default());
+            refused = refused.saturating_add(
+                runtime
+                    .replay_read_refused_consults(&s.key)
+                    .unwrap_or_default(),
+            );
             unspent = unspent.saturating_add(s.cursor.unspent_steps());
         }
         ReadEnforcementOutcome {
             stages: self.stages.len(),
             steps: self.steps,
             frames_admitted: admitted,
-            frames_held: held,
+            consults_refused: refused,
             steps_not_reached: unspent,
             violations: self.violations.into_iter().map(|(_, v)| v).collect(),
             violations_total: self.violations_total,
@@ -16374,7 +16646,7 @@ struct ReadEnforcementOutcome {
     stages: usize,
     steps: u64,
     frames_admitted: u64,
-    frames_held: u64,
+    consults_refused: u64,
     steps_not_reached: usize,
     /// The retained first divergence per stage.
     violations: Vec<cerulion_core::read_outcome::ReplayReadViolation>,
@@ -22368,25 +22640,30 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         }
     }
 
-    // The redundant per-edge read-log verifier's findings —
-    // rendered in BOTH the PASS and the FAIL path (REPORT-ONLY: a PASS whose
-    // read log diverged is exactly the signal this verifier exists for and must
-    // never be silent; a FAIL gains the per-edge attribution alongside the
-    // positional fire divergence).
+    // The read log's EXIT 6 verdict, rendered in BOTH the pass-shaped and the
+    // fail-shaped epilogue: this block clears `passed` and takes exit 6, and a
+    // fail gains the per-edge attribution alongside the positional fire
+    // divergence.
     if let Some(v) = &outcome.read_log_verdict {
+        // Counted off the VERDICT's own rows and not off the unfiltered
+        // verifier report: the verdict excludes the quarantined edges, so
+        // rendering the report's totals printed "0 edge(s) diverged across 0
+        // step(s)" on an enforcement-only verdict and overstated the count
+        // whenever the quarantine filtered a finding out.
+        let mut verdict_steps: BTreeSet<u64> = BTreeSet::new();
+        for e in &v.edges {
+            verdict_steps.insert(e.step);
+        }
+        for u in &v.unmet {
+            verdict_steps.insert(u.step);
+        }
         let _ = writeln!(
             s,
             "{}: {} edge(s) diverged across {} step(s), {} recorded read(s) never reproduced; \
              the recorded schedule did not replay.",
             DivergenceClass::EdgeRead.header(),
-            outcome
-                .read_log_divergence
-                .as_ref()
-                .map_or(0, |rl| rl.diverging_edges),
-            outcome
-                .read_log_divergence
-                .as_ref()
-                .map_or(0, |rl| rl.diverging_steps),
+            v.edges.len(),
+            verdict_steps.len(),
             v.unmet_total
         );
         for e in &v.edges {
@@ -22424,21 +22701,44 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
                 let _ = writeln!(s, "  - {r}");
             }
         }
+        ReadLogEnforcement::NotEnforced { topics, reason } => {
+            let _ = writeln!(
+                s,
+                "NOTE: read-log enforcement: NONE over {topics} topic(s) this rank both \
+                 produces and consumes ({reason}), so each such edge's intra-step arrival is \
+                 whatever its queue held."
+            );
+        }
         ReadLogEnforcement::Enforced {
             stages,
             steps,
             frames_admitted,
-            frames_held,
+            consults_refused,
+            unplanned_consults,
+            enforced_empty_refills,
             steps_not_reached,
             stages_not_gateable,
         } => {
             let _ = write!(
                 s,
                 "NOTE: read-log enforcement: {stages} graph-produced stage(s) gated across \
-                 {steps} step(s) ({frames_admitted} frame(s) admitted, {frames_held} held back"
+                 {steps} step(s) ({frames_admitted} frame(s) admitted, {consults_refused} \
+                 consult(s) refused"
             );
             if *steps_not_reached > 0 {
                 let _ = write!(s, ", {steps_not_reached} planned step(s) never reached");
+            }
+            if *enforced_empty_refills > 0 {
+                let _ = write!(
+                    s,
+                    ", {enforced_empty_refills} refill(s) empty by enforcement"
+                );
+            }
+            if *unplanned_consults > 0 {
+                let _ = write!(
+                    s,
+                    ", {unplanned_consults} consult(s) the installed plan held no position for"
+                );
             }
             if *stages_not_gateable > 0 {
                 let _ = write!(s, ", {stages_not_gateable} stage(s) NOT gateable");

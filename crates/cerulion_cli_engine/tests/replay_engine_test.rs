@@ -17919,6 +17919,14 @@ fn assert_clean_verdict_with_declines(outcome: &ReplayOutcome, label: &str) {
             "{label}: one reason per ungated stage: {:?}",
             outcome.read_log_enforcement
         ),
+        // An edge that exists and was NOT gated must NAME why: a status that
+        // said so with no reason would be the silence this field exists to
+        // replace, and `not_applicable` would deny the edge exists.
+        replay_engine::ReadLogEnforcement::NotEnforced { topics, reason } => assert!(
+            *topics > 0 && !reason.is_empty(),
+            "{label}: an ungated produced-and-consumed edge names its cause: {:?}",
+            outcome.read_log_enforcement
+        ),
         replay_engine::ReadLogEnforcement::Enforced {
             frames_admitted, ..
         } => assert!(
@@ -17940,9 +17948,15 @@ fn assert_edge_read_verdict(outcome: &ReplayOutcome, label: &str) {
     let v = outcome.read_log_verdict.as_ref().unwrap_or_else(|| {
         panic!("{label}: the read log must carry the exit-6 verdict: {outcome:?}")
     });
+    // The COMPARATOR half, asserted on its own. The disjunction it replaces
+    // (`edges` or `unmet` non-empty) let either half of the read-log plane pass
+    // this helper on the other's findings, so an arm aimed at one was satisfied
+    // by the other. Every arm that calls this helper crafts a record the
+    // redundant per-edge verifier reads, which is the half asserted here; an arm
+    // whose oracle is the ENFORCEMENT's unmet reads asserts `v.unmet` itself.
     assert!(
-        !v.edges.is_empty() || !v.unmet.is_empty(),
-        "{label}: a verdict names the edges it found: {v:?}"
+        !v.edges.is_empty(),
+        "{label}: the per-edge verifier names the edges it found: {v:?}"
     );
     assert!(
         !outcome.passed,
@@ -35574,13 +35588,13 @@ fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
         replay_engine::ReadLogEnforcement::Enforced {
             stages,
             frames_admitted,
-            frames_held,
+            consults_refused,
             ..
         } => {
             assert_eq!(stages, 1, "the consumer's one body stage is gated");
-            assert_eq!(
-                frames_held, 2,
-                "the two steps whose plan admits nothing REFUSED a pop each: {:?}",
+            assert!(
+                consults_refused >= 2,
+                "the two steps whose plan admits nothing REFUSED their consult: {:?}",
                 outcome.read_log_enforcement
             );
             assert_eq!(
@@ -35592,6 +35606,110 @@ fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
         }
         other => panic!("the crafted bag gates the consumer's read: {other:?}"),
     }
+}
+
+/// **A recorded POP the replay's drain cannot deliver is the ENFORCEMENT's own
+/// exit-6 verdict**, naming the edge, the step and both counts.
+///
+/// The enforcement half of the exit-6 verdict (`PoppedShortfall`,
+/// `SequenceMismatch`, `NeverArrived` into `ReadLogVerdict::unmet`) was reached
+/// by NO arm: every exit-6 arm crafted a record the redundant per-edge verifier
+/// reads, and the shared helper's earlier `edges` or `unmet` disjunction let all
+/// of them pass on `edges` alone. So the gate's own settle could have minted
+/// nothing at all and the suite would have stayed green.
+///
+/// The craft is ONE field of a verified recording: the step-4 record claims it
+/// popped THREE frames where the producer published one per step, so the gate
+/// grants three and the drain delivers one. The consumer is a plain PERIOD sink,
+/// so its fire schedule is its period's whatever its queue holds, and it
+/// publishes nothing: the only thing the craft can move is the settle's own
+/// compare.
+#[test]
+#[serial]
+fn a_recorded_pop_the_drain_cannot_deliver_is_the_enforcements_exit_6_verdict() {
+    let steps = 6;
+    const SHORT_STEP: u64 = 4;
+    const CLAIMED_POPS: u64 = 3;
+    let mut rec = record_uniform_with_read_log(
+        source_plain_sink_yaml(),
+        source_plain_sink_factories,
+        &[],
+        steps,
+    );
+    // The same HAND ORACLE the hold-back arm anchors on: step 0 reads nothing and
+    // every later step serves the frame published one step earlier.
+    let served = |step: u64| (step, 1, 0, READ_OUTCOME_SERVED, step - 1, 1);
+    assert_eq!(
+        kind6_records(&rec),
+        vec![
+            (0, 1, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+            served(1),
+            served(2),
+            served(3),
+            served(4),
+            served(5),
+        ],
+        "the reference recording carries the hand-oracle read log"
+    );
+    // ONE field: the step-4 read claims three pops. Its served sequence is
+    // untouched, so the identity the settle compares still matches and the ONLY
+    // finding the gate can mint is the count.
+    let short = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == SHORT_STEP)
+        .expect("the step-4 kind-6 record exists");
+    short.duration_ns = CLAIMED_POPS;
+    assert_eq!(
+        kind6_records(&rec),
+        vec![
+            (0, 1, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+            served(1),
+            served(2),
+            served(3),
+            (
+                SHORT_STEP,
+                1,
+                0,
+                READ_OUTCOME_SERVED,
+                SHORT_STEP - 1,
+                CLAIMED_POPS as u32
+            ),
+            served(5),
+        ],
+        "the craft moved the popped count of one record and nothing else"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_short_pop.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let outcome = replay(&bag, source_plain_sink_factories, None, None)
+        .expect("a crafted pop count is a verdict, never a refusal");
+    assert_edge_read_verdict(&outcome, "a recorded pop the drain cannot deliver");
+    let v = outcome
+        .read_log_verdict
+        .as_ref()
+        .expect("the helper asserted the verdict is present");
+    assert_eq!(
+        v.unmet.len(),
+        1,
+        "the GATE's own finding is retained, one per stage: {v:?}"
+    );
+    let unmet = &v.unmet[0];
+    assert_eq!(unmet.cause, "popped_shortfall");
+    assert_eq!(unmet.node_id, "relay");
+    assert_eq!(unmet.input, "inp");
+    assert_eq!(unmet.step, SHORT_STEP);
+    // The RECORDED count is the craft and is asserted; the delivered count is
+    // whatever the host's timing had queued at that drain (one frame, or two if
+    // the producer's next publish had already landed), so asserting it would
+    // make the arm a timing oracle.
+    assert!(
+        unmet.detail.contains("consumed 3 frame(s)"),
+        "the sentence names the recorded count: {}",
+        unmet.detail
+    );
 }
 
 /// **A LOCKSTEP pass wires the gate and arms nothing**, and says so.
@@ -35772,10 +35890,16 @@ fn an_overflow_marker_on_a_gated_stage_is_an_exit_2_refusal() {
 /// at the bottom measures: the same craft on a bag that arms no gate leaves the
 /// fire schedule clean.
 ///
-/// NOT a refusal. `read_log_truncated` is the planner's answer to a stream that
-/// stops below the rank's AUTHORITATIVE last boundary, which a one-rank free-run
-/// bag does not present; that token stays pinned by
-/// `every_admission_refusal_names_its_cause_and_its_edge` in `replay_inject.rs`.
+/// NOT a refusal, and nothing about the rank's own last step enters the answer:
+/// an EMPTY drain writes no read record at all, so a step the stream holds no
+/// entry for is the recording saying the read consumed nothing. The refusal that
+/// keyed on the rank's authoritative last boundary
+/// (`AdmissionRefusalReason::StreamEndsEarly`, token `read_log_truncated`) is
+/// deleted with its token, because it refused every ordinary recording whose
+/// consumer stops reading before that boundary; the replacement claim is pinned
+/// by `a_gateable_stage_with_no_recorded_read_is_armed_with_an_empty_schedule` in
+/// `replay_inject.rs`. Positive truncation evidence is still a refusal, from the
+/// overflow marker.
 #[test]
 #[serial]
 fn a_read_log_missing_its_last_step_is_the_fire_schedule_verdict() {
@@ -35825,9 +35949,11 @@ fn a_read_log_missing_its_last_step_is_the_fire_schedule_verdict() {
         "the divergence names the node and the step: {detail}"
     );
     match outcome.read_log_enforcement {
-        replay_engine::ReadLogEnforcement::Enforced { frames_held, .. } => assert_eq!(
-            frames_held, 1,
-            "the gate withheld exactly the frame the missing record does not admit: {:?}",
+        replay_engine::ReadLogEnforcement::Enforced {
+            consults_refused, ..
+        } => assert!(
+            consults_refused >= 1,
+            "the gate refused the consult the missing record does not admit: {:?}",
             outcome.read_log_enforcement
         ),
         other => panic!("the free-run rank is gated: {other:?}"),
