@@ -74,8 +74,14 @@
 //! export AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH"
 //! export LD_LIBRARY_PATH="$PREFIX/lib:$LD_LIBRARY_PATH"
 //! export RMW_IMPLEMENTATION=rmw_cerulion
-//! rm -rf /tmp/iceoryx2 /dev/shm/iox2_*             # clean iox state BETWEEN tests
-//! cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --nocapture
+//! # each direction in its OWN process, with iox state cleaned BEFORE each (what
+//! # the rmw distro lanes do in tools/ci/rmw-distros/gate.sh):
+//! for t in direction_a_rclpy_string_talker_to_native_subscriber \
+//!          direction_b_native_twist_publisher_to_rclpy_listener \
+//!          direction_b_native_string_publisher_to_rclpy_listener; do
+//!   rm -rf /tmp/iceoryx2 /dev/shm/iox2_*           # fresh iox state per test
+//!   cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --exact "$t" --nocapture
+//! done
 //! ```
 //!
 //! Run each test with clean iox state in a FRESH process — the native
@@ -161,6 +167,7 @@ fn forced_wrong_payload() -> Option<String> {
 /// stay `#[ignore]`'d). This arm and `forced_wrong_payload` are the only readers
 /// of the seam variable.
 #[test]
+#[serial]
 fn wrong_payload_seam_selects_literal_only_when_set() {
     const VAR: &str = "CERULION_RCLPY_XPROC_FORCE_WRONG_PAYLOAD";
     let oracle = "b-1";
@@ -196,8 +203,10 @@ PREFIX=/tmp/rmw_prefix; mkdir -p \"$PREFIX/lib\"; cp target/release/librmw_cerul
 export AMENT_PREFIX_PATH=\"$PREFIX:$AMENT_PREFIX_PATH\"\n  \
 export LD_LIBRARY_PATH=\"$PREFIX/lib:$LD_LIBRARY_PATH\"\n  \
 export RMW_IMPLEMENTATION=rmw_cerulion\n  \
-rm -rf /tmp/iceoryx2 /dev/shm/iox2_*  # between tests\n  \
-cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --nocapture\n\
+# each direction in its own process, iox state cleaned before each:\n  \
+for t in direction_a_rclpy_string_talker_to_native_subscriber direction_b_native_twist_publisher_to_rclpy_listener direction_b_native_string_publisher_to_rclpy_listener; do\n  \
+  rm -rf /tmp/iceoryx2 /dev/shm/iox2_*; cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --exact \"$t\" --nocapture\n  \
+done\n\
 (the same steps as ensure_rmw_cerulion in benches/latency/ros2/run_bench.sh)";
 
 /// Assert the inherited env is a real ROS 2 + rmw_cerulion environment. Panics

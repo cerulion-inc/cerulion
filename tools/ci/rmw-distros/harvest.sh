@@ -99,3 +99,52 @@ refuse_row_pinned() {
     fi
     return 0
 }
+
+# --- rclpy cross-process exchange predicates -------------------------------------
+# Sourced by gate.sh's `build` case and PROVEN by gate_selftest.sh on crafted
+# inputs, so the gate's rclpy red-path reasoning has teeth on the self-test step
+# (which runs before any build, with no real exchange). The gate runs the real
+# python3 / cargo / timeout(1); these judge the already-collected result. Each
+# prints its NAMED reason on the failing branch.
+
+# staged_so_present <so path> <distro>: exit 0 when the librmw_cerulion.so at
+# <so path> exists (the caller passes the freshly built build output, which is
+# then staged and digest-checked into the ament prefix the exchange loads from);
+# else print the named reason and return 1. The
+# exchange must run against a real, freshly built library; an absent .so is
+# nothing to run against.
+staged_so_present() {
+    local so="$1" distro="$2"
+    if [ ! -f "$so" ]; then
+        echo "GATE FAIL: $distro rclpy exchange - required librmw_cerulion.so is missing: $so (nothing to run the exchange against)"
+        return 1
+    fi
+    return 0
+}
+
+# rclpy_probe_ok <probe output> <distro>: exit 0 only when the python3 import
+# probe printed exactly "ok". A missing python3/rclpy/std_msgs/geometry_msgs is a
+# NAMED failure, never a silent skip; the caller runs the probe under the sourced
+# ROS env and passes its captured output here.
+rclpy_probe_ok() {
+    local probe="$1" distro="$2"
+    if [ "$probe" != "ok" ]; then
+        echo "GATE FAIL: $distro rclpy exchange cannot run - python3/rclpy/std_msgs/geometry_msgs unavailable in ros:$distro-ros-base: $probe"
+        return 1
+    fi
+    return 0
+}
+
+# rclpy_timed_out <rc> <distro> <what> <timeout secs> [suffix]: return 0 (TRUE)
+# and print the NAMED reason when rc is a timeout(1) code - 124 (TERM at the
+# deadline) or 137 (escalated to KILL); return 1 silently otherwise. Same
+# polarity as `crashed`. The caller `&& exit 1`s on a true return. `what` names
+# the leg (e.g. "rclpy exchange 'direction_a...'"); optional `suffix` appends a note.
+rclpy_timed_out() {
+    local rc="$1" distro="$2" what="$3" secs="$4" suffix="${5:-}"
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        echo "GATE FAIL: $distro $what timed out after ${secs}s${suffix:+ $suffix}"
+        return 0
+    fi
+    return 1
+}
