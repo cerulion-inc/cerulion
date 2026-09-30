@@ -225,6 +225,17 @@ case "$expect" in
         [ "$rc_rclpy" -eq 0 ] || { echo "GATE FAIL: $distro rclpy exchange exited rc=$rc_rclpy"; exit 1; }
         [ "$failed_x" -eq 0 ] || { echo "GATE FAIL: $distro rclpy exchange had $failed_x failing test(s)"; exit 1; }
         [ "$passed_x" -ge "$EXCHANGES_EXPECTED" ] || { echo "GATE FAIL: $distro rclpy exchange ran only $passed_x test(s), floor $EXCHANGES_EXPECTED (both directions); a zero or short count is a non-run (rule 37)"; exit 1; }
+        # Pin the exchange IDENTITIES, not just the count (rule 37): each named
+        # exchange test must show its own passing line, so a future edit that
+        # renames or drops a direction reds here by name even if some other
+        # ignored test keeps the count at the floor.
+        for xt in \
+            direction_a_rclpy_string_talker_to_native_subscriber \
+            direction_b_native_twist_publisher_to_rclpy_listener \
+            direction_b_native_string_publisher_to_rclpy_listener; do
+            grep -qE "^test ${xt} \.\.\. ok$" "$plain_x" || { echo "GATE FAIL: $distro rclpy exchange did not run '${xt}' to a pass; the named exchange direction is missing (a count at the floor is not proof of identity)"; echo "-- test lines seen:"; grep -E "^test " "$plain_x" | head -20; exit 1; }
+        done
+        echo "EXCHANGE IDENTITIES PINNED ($distro): direction_a (rclpy->native) and direction_b twist + string (native->rclpy) each passed by name"
         echo "GATE PASS (rclpy exchange): $distro ran $passed_x/$EXCHANGES_EXPECTED cross-process rclpy exchanges over rmw_cerulion"
         echo "GATE TABLE | distro=$distro | judged=rclpy_xproc | exchanges=$passed_x/$EXCHANGES_EXPECTED | directions=A(rclpy_talker->native),B(native->rclpy:twist,string) | staged_so=$dig_built | rc=$rc_rclpy"
 
