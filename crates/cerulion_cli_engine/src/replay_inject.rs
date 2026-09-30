@@ -128,7 +128,10 @@
 //! 3. the multi-publisher stand-down deleted — an unresolvable token joins a
 //!    read to whichever frame the file order happened to land on.
 
-use cerulion_core::read_outcome::ReadOutcomeKind;
+use cerulion_core::read_outcome::{
+    DueRead, ReadEdgeCapability, ReadOutcomeKind, ReadPlanRefusal, ReadSiteRole, ReadStageRole,
+    StageKey,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -1676,6 +1679,713 @@ fn pending_occupancy(
         }
     }
     occupancy
+}
+
+// ===========================================================================
+// The ENFORCEMENT planner
+// ===========================================================================
+
+/// Which read-outcome stages one wired input owns, and which of them the core
+/// will GATE.
+///
+/// Existence and gateability are two facts and both are needed. WHICH stage
+/// staged a record is decided by existence (a record's site names a stage only
+/// where that stage exists), while whether the gate may hold that stage's frames
+/// back is a wiring fact the core answers: a per-set Sync trigger input pops
+/// outside the two gated bodies, and a multi-publisher edge's wire sequence is
+/// per publisher, so neither can be gated. A stage the core refuses is UNGATED
+/// for the whole run and takes today's drain byte for byte, which is the answer
+/// for every OTHER ungated edge in this engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageRoles {
+    /// The node body's own read stage exists.
+    pub body: bool,
+    /// A runtime-owned trigger/sync drain stage exists.
+    pub drain: bool,
+    /// The body stage can be gated.
+    pub body_gateable: bool,
+    /// The drain stage can be gated.
+    pub drain_gateable: bool,
+}
+
+impl StageRoles {
+    /// Can the stage this role names be gated?
+    fn gateable(self, role: ReadStageRole) -> bool {
+        match role {
+            ReadStageRole::Body => self.body_gateable,
+            ReadStageRole::Drain => self.drain_gateable,
+        }
+    }
+}
+
+/// The name-to-index table a recorded read's input name resolves through, plus
+/// the stages this build wires.
+///
+/// Both halves are needed and neither can stand in for the other: the RECORDING
+/// names an input by the position the recorder stamped
+/// ([`crate::replay_engine`] resolves `input_idx` to a name through the bag's
+/// manifest), so going back from a name to a `StageKey` inverts that same table,
+/// while WHICH stages exist at that index is a fact about the graph this replay
+/// built.
+#[derive(Debug, Clone, Default)]
+pub struct StageTable {
+    /// Node id to its ordered recorded input names, the bag's own table.
+    inputs: BTreeMap<String, Vec<String>>,
+    /// `(node, input_idx)` to the stages this build wired there.
+    stages: BTreeMap<(String, u16), StageRoles>,
+    /// The core's own reason for each stage it refuses to gate. A `Vec` because
+    /// `StageKey` is a hashable identity and not an ordered one, and the list is
+    /// one entry per refused stage on one rank.
+    refusals: Vec<(StageKey, ReadPlanRefusal)>,
+}
+
+impl StageTable {
+    /// From the bag's manifest input tables and the core's own stage census.
+    #[must_use]
+    pub fn new(inputs: &BTreeMap<String, Vec<String>>, census: &[ReadEdgeCapability]) -> Self {
+        let mut stages: BTreeMap<(String, u16), StageRoles> = BTreeMap::new();
+        for cap in census {
+            let roles = stages
+                .entry((cap.key.node.clone(), cap.key.input_idx))
+                .or_default();
+            match cap.key.role {
+                ReadStageRole::Body => {
+                    roles.body = true;
+                    roles.body_gateable = cap.enforceable;
+                }
+                ReadStageRole::Drain => {
+                    roles.drain = true;
+                    roles.drain_gateable = cap.enforceable;
+                }
+            }
+        }
+        Self {
+            inputs: inputs.clone(),
+            stages,
+            refusals: census
+                .iter()
+                .filter_map(|c| c.reason.clone().map(|r| (c.key.clone(), r)))
+                .collect(),
+        }
+    }
+
+    /// The core's reason for refusing to gate this stage, when it named one.
+    #[must_use]
+    pub fn refusal(&self, key: &StageKey) -> Option<&ReadPlanRefusal> {
+        self.refusals.iter().find(|(k, _)| k == key).map(|(_, r)| r)
+    }
+
+    /// Resolve one consuming input to its recorded index and its wired stages.
+    ///
+    /// The DUPLICATE arm is scoped to the name being resolved: a node whose
+    /// table repeats some OTHER name still resolves this one to exactly one
+    /// index, and refusing the run for it would refuse a bag whose ambiguity
+    /// touches no gated edge.
+    pub fn resolve(
+        &self,
+        node: &str,
+        input: &str,
+    ) -> Result<(u16, StageRoles), AdmissionRefusalReason> {
+        let unresolved = |detail: String| AdmissionRefusalReason::InputNameUnresolved {
+            node: node.to_string(),
+            input: input.to_string(),
+            detail,
+        };
+        let Some(names) = self.inputs.get(node) else {
+            return Err(unresolved(
+                "no rank manifest carries an input table for this node".to_string(),
+            ));
+        };
+        let mut found: Vec<usize> = Vec::new();
+        for (idx, name) in names.iter().enumerate() {
+            if name == input {
+                found.push(idx);
+            }
+        }
+        match found.as_slice() {
+            [] => {
+                return Err(unresolved(format!(
+                    "the node's recorded input table ({}) does not name it",
+                    render_names(names)
+                )))
+            }
+            [_one] => {}
+            [first, second, ..] => {
+                return Err(AdmissionRefusalReason::InputNameDuplicated {
+                    node: node.to_string(),
+                    name: input.to_string(),
+                    first_idx: u16::try_from(*first).unwrap_or(u16::MAX),
+                    second_idx: u16::try_from(*second).unwrap_or(u16::MAX),
+                })
+            }
+        }
+        let idx = u16::try_from(found[0]).map_err(|_| {
+            unresolved("its recorded index is past the 16-bit wire field".to_string())
+        })?;
+        let Some(roles) = self.stages.get(&(node.to_string(), idx)) else {
+            return Err(unresolved(format!(
+                "this build wires no read-outcome stage at index {idx} of that node"
+            )));
+        };
+        Ok((idx, *roles))
+    }
+}
+
+/// Render an input-name table for a refusal sentence.
+fn render_names(names: &[String]) -> String {
+    if names.is_empty() {
+        return "<empty>".to_string();
+    }
+    names.join(", ")
+}
+
+/// One recorded kind-6 record with the read SITE the wire stamped.
+///
+/// The site rides beside the record rather than inside it because
+/// [`RecordedRead`] is the STEERING vocabulary, where the site is already spent
+/// splitting one input's stream into two queues. The enforcement planner needs
+/// the opposite: one stream per input, in record order, with the site as a
+/// per-record label, so a record can be placed on the stage that STAGED it
+/// (both sites stage into one `Body` stage under the unified discipline) without
+/// the record order being lost to a pre-split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SitedRead {
+    /// The role the wire carries. [`ReadSiteRole::Unstamped`] on every
+    /// `trace_format` <= 4 bag, where the placement below takes the pre-roles
+    /// kind rule.
+    pub role: ReadSiteRole,
+    /// The record itself.
+    pub read: RecordedRead,
+}
+
+/// One consuming input on the replaying rank, with its whole recorded stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionEdge {
+    /// The consuming node's id.
+    pub node_id: String,
+    /// The input port's own name.
+    pub input: String,
+    /// How its drain consumes the queue; carried for the refusal sentences.
+    pub mode: ConsumeMode,
+    /// Every kind-6 record of this input, in RECORD ORDER, both sites
+    /// interleaved.
+    pub reads: Vec<SitedRead>,
+}
+
+/// One graph-produced topic's whole enforcement input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicAdmission {
+    /// The canonical topic name (reporting only).
+    pub topic: String,
+    /// Whether the topic is `multi_publisher_topics`-listed. Carried so the
+    /// planner can name it in a refusal; the core census is what refuses such an
+    /// edge, since a per-publisher wire sequence names no single head.
+    pub multi_publisher: bool,
+    /// The consuming inputs on the rank being replayed.
+    pub edges: Vec<AdmissionEdge>,
+    /// The last step this rank's recorded boundary stream carries.
+    ///
+    /// A stage whose read stream stops below it plans no admission for the
+    /// remaining steps, and an armed stage with no admission WITHHOLDS, so the
+    /// consumer would read nothing from that step on. That is the
+    /// [`AdmissionRefusalReason::StreamEndsEarly`] refusal rather than a replay
+    /// whose tail is gated to empty.
+    pub last_boundary_step: u64,
+}
+
+/// One gated stage's recorded admissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageAdmission {
+    /// The stage the core gates.
+    pub key: StageKey,
+    /// How the edge's drain consumes its queue; carried for the sentences.
+    pub mode: ConsumeMode,
+    /// Ascending in step. A step the recording holds a read for is ALWAYS
+    /// present, including one that admits nothing.
+    pub per_step: Vec<StepAdmission>,
+}
+
+/// One step's admissions at one stage, in RECORDED ORDER.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepAdmission {
+    /// The recorded step.
+    pub step: u64,
+    /// This step's reads, in record order. An entry whose pop count is 0 is a
+    /// DECLARATION (the recorded none, or the served hand off), never an
+    /// omission.
+    pub due: Vec<DueRead>,
+}
+
+/// What the planner answered for one topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionPlan {
+    /// Gate these stages.
+    Enforced {
+        /// The gated stages. Never empty.
+        stages: Vec<StageAdmission>,
+        /// Stages of the same topic the core refuses to gate, each with its
+        /// reason: they take today's drain, and the report says so rather than
+        /// implying the whole topic was gated.
+        ungateable: Vec<(StageKey, String)>,
+    },
+    /// NO stage of this topic's consuming inputs can be gated on WIRING facts,
+    /// each with the core's own reason.
+    ///
+    /// Not a refusal: the stages are ungated, so the replay takes today's drain
+    /// on them, exactly as it does for every edge outside a gated rank. It is a
+    /// third answer rather than an empty [`Self::Enforced`] because the report
+    /// has to say which of the two it was, and an empty plan would read as "the
+    /// gate ran and held nothing".
+    NotGateable(Vec<(StageKey, String)>),
+    /// This recording cannot be enforced on this topic.
+    Refused(AdmissionRefusal),
+}
+
+/// A refusal, naming the topic it was found on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRefusal {
+    /// The topic.
+    pub topic: String,
+    /// The reason, typed so the caller can render it AND branch on it.
+    pub reason: AdmissionRefusalReason,
+}
+
+/// A record shape the plan cannot place on a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordShape {
+    /// It consumed frames while naming none, so the surviving sequence the gate
+    /// compares against is unstated.
+    PoppedWithoutSequence,
+    /// A serving kind that popped nothing and is not the hand off shape
+    /// [`RecordedReadBody::HandOff`] carries.
+    ServedNothingPopped,
+}
+
+impl RecordShape {
+    /// The stable token, rendered in the refusal detail.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::PoppedWithoutSequence => "popped_without_sequence",
+            Self::ServedNothingPopped => "served_nothing_popped",
+        }
+    }
+}
+
+/// Why this recording's read log cannot be ENFORCED on a graph-produced edge.
+///
+/// Every arm is a fact about what the RECORDING can support, never about the
+/// candidate: the engine maps all of them to one exit-2 refusal, because
+/// enforcing what can be enforced and falling back on the rest is the
+/// coincidence the enforcement exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionRefusalReason {
+    /// The bag carries kind-6 records for this rank, and none of them lands on
+    /// a stage of this topic's consuming inputs.
+    NoCoverage {
+        /// Every stage the topic's edges offered.
+        keys: Vec<StageKey>,
+    },
+    /// An overflow marker: records were dropped at the stage rim, so every
+    /// later popped count on that stage is a floor.
+    RecordDropped {
+        /// The stage that overflowed.
+        key: StageKey,
+        /// The step the marker was emitted at.
+        step: u64,
+        /// Records dropped in that window (NOT frames).
+        dropped_records: u32,
+    },
+    /// The stage's read stream stops below the rank's last recorded boundary.
+    StreamEndsEarly {
+        /// The stage.
+        key: StageKey,
+        /// The last step the stream holds a read for.
+        last_read_step: u64,
+        /// The last step the rank's boundary stream carries.
+        last_boundary_step: u64,
+    },
+    /// A record whose shape names no admission.
+    UnenforceableRecord {
+        /// The stage.
+        key: StageKey,
+        /// The record's step.
+        step: u64,
+        /// Which shape it is.
+        shape: RecordShape,
+    },
+    /// A gated input's name does not resolve to exactly one wired stage.
+    InputNameUnresolved {
+        /// The consuming node.
+        node: String,
+        /// The input name the record carried.
+        input: String,
+        /// Which half of the resolution failed.
+        detail: String,
+    },
+    /// A gated input's recorded name appears twice in its node's table, so the
+    /// records naming it address two stages.
+    InputNameDuplicated {
+        /// The consuming node.
+        node: String,
+        /// The repeated name.
+        name: String,
+        /// The first index carrying it.
+        first_idx: u16,
+        /// The second.
+        second_idx: u16,
+    },
+    /// The core's pre-step census refuses to gate the stage.
+    EdgeNotGateable {
+        /// The stage.
+        key: StageKey,
+        /// The core's own reason.
+        reason: ReadPlanRefusal,
+    },
+}
+
+impl AdmissionRefusalReason {
+    /// A stable machine-readable token, one per cause, kept apart from
+    /// [`fmt::Display`], which is prose and free to be reworded.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoCoverage { .. } => "read_log_no_coverage",
+            Self::RecordDropped { .. } => "read_log_record_dropped",
+            Self::StreamEndsEarly { .. } => "read_log_truncated",
+            Self::UnenforceableRecord { .. } => "read_log_unenforceable_record",
+            Self::InputNameUnresolved { .. } => "read_log_input_name_unresolved",
+            Self::InputNameDuplicated { .. } => "read_log_input_name_duplicated",
+            Self::EdgeNotGateable { .. } => "read_log_edge_not_gateable",
+        }
+    }
+
+    /// The stage this refusal names, when one caused it.
+    #[must_use]
+    pub fn key(&self) -> Option<&StageKey> {
+        match self {
+            Self::NoCoverage { .. }
+            | Self::InputNameUnresolved { .. }
+            | Self::InputNameDuplicated { .. } => None,
+            Self::RecordDropped { key, .. }
+            | Self::StreamEndsEarly { key, .. }
+            | Self::UnenforceableRecord { key, .. }
+            | Self::EdgeNotGateable { key, .. } => Some(key),
+        }
+    }
+
+    /// How the refusal NAMES its edge to an operator: the stage label where a
+    /// stage caused it, and `node.input` on the two arms that fire before a
+    /// stage is resolved.
+    #[must_use]
+    pub fn edge_label(&self) -> Option<String> {
+        match self {
+            Self::NoCoverage { .. } => None,
+            Self::InputNameUnresolved { node, input, .. } => Some(format!("{node}.{input}")),
+            Self::InputNameDuplicated { node, name, .. } => Some(format!("{node}.{name}")),
+            other => other.key().map(StageKey::label),
+        }
+    }
+}
+
+impl fmt::Display for AdmissionRefusalReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoCoverage { keys } => write!(
+                f,
+                "this rank's read log carries no record for any of the {} consuming stage(s) of \
+                 a topic the rank both produces and consumes ({}), so the recorded reads of \
+                 that edge are unknown and a replay would serve whatever its queue happened to \
+                 hold. Re-record the bag with this binary",
+                keys.len(),
+                render_keys(keys)
+            ),
+            Self::RecordDropped {
+                key,
+                step,
+                dropped_records,
+            } => write!(
+                f,
+                "a stage-overflow marker at step {step} dropped {dropped_records} read \
+                 record(s) on stage {}, so every later popped count on this stage is a floor \
+                 and the replay cannot admit the recorded frames at their recorded steps. \
+                 Re-record the bag with this binary",
+                key.label()
+            ),
+            Self::StreamEndsEarly {
+                key,
+                last_read_step,
+                last_boundary_step,
+            } => write!(
+                f,
+                "stage {}'s read stream ends at step {last_read_step} while this rank's \
+                 boundary stream runs to step {last_boundary_step}, so the steps in between \
+                 name no recorded read and an armed gate would withhold every frame at them. \
+                 Re-record the bag with this binary",
+                key.label()
+            ),
+            Self::UnenforceableRecord { key, step, shape } => write!(
+                f,
+                "stage {}'s record at step {step} has a shape no admission can be built from \
+                 ({}), so the frames it consumed cannot be placed on their recorded step. \
+                 Re-record the bag with this binary",
+                key.label(),
+                shape.code()
+            ),
+            Self::InputNameUnresolved {
+                node,
+                input,
+                detail,
+            } => write!(
+                f,
+                "the gated input '{input}' of node '{node}' does not resolve to a wired read \
+                 stage ({detail}), so its recorded reads cannot be addressed. Re-record the \
+                 bag with this binary"
+            ),
+            Self::InputNameDuplicated {
+                node,
+                name,
+                first_idx,
+                second_idx,
+            } => write!(
+                f,
+                "node '{node}' records the input name '{name}' twice (index {first_idx} and \
+                 index {second_idx}), so every record naming it addresses two stages and the \
+                 gate cannot tell which one read the frame. Re-record the bag with this binary"
+            ),
+            Self::EdgeNotGateable { key, reason } => write!(
+                f,
+                "stage {} cannot be gated: {reason}. Re-record the bag with a graph whose \
+                 producer and consumer sit on different ranks, or replay it under \
+                 CERULION_EXECUTION_MODE=lockstep",
+                key.label()
+            ),
+        }
+    }
+}
+
+/// Render a stage list for a refusal sentence.
+fn render_keys(keys: &[StageKey]) -> String {
+    if keys.is_empty() {
+        return "<none wired>".to_string();
+    }
+    keys.iter()
+        .map(StageKey::label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Which stage STAGED a record, from the site the wire carried and the stages
+/// the input owns.
+///
+/// One rule, three inputs. An input that owns ONE stage stages every one of its
+/// reads there, whatever the site says: under the unified discipline the
+/// boundary drain and the node body both stage into the `Body` stage
+/// (`cerulion_core::read_outcome::StagedReadOutcome`). An input that owns TWO
+/// splits them, by the wire role where the bag stamps one and by the pre-roles
+/// KIND rule where it does not, which is the same rule
+/// [`crate::replay_engine`]'s steering demux applies to the same records: a
+/// `DrainedBatch` is a drain-site record and every other kind is a body-site
+/// one. A `Peek` steers to the drain stage, since its pop really did leave that
+/// queue.
+fn stage_of_record(role: ReadSiteRole, kind_is_batch: bool, roles: StageRoles) -> ReadStageRole {
+    if !roles.drain {
+        return ReadStageRole::Body;
+    }
+    if !roles.body {
+        return ReadStageRole::Drain;
+    }
+    match role {
+        ReadSiteRole::Drain | ReadSiteRole::Peek => ReadStageRole::Drain,
+        ReadSiteRole::Body => ReadStageRole::Body,
+        ReadSiteRole::Unstamped => {
+            if kind_is_batch {
+                ReadStageRole::Drain
+            } else {
+                ReadStageRole::Body
+            }
+        }
+    }
+}
+
+/// Is this record's kind the batch drain the pre-roles site rule reads as a
+/// drain-site record?
+fn record_is_batch(body: &RecordedReadBody) -> bool {
+    match body {
+        RecordedReadBody::Read { kind, .. } => *kind == ReadKind::DrainedBatch,
+        // A promotion is staged by the per-set Sync matcher, a drain site.
+        RecordedReadBody::HandOff { .. } => true,
+        RecordedReadBody::Producer { .. } | RecordedReadBody::Truncated { .. } => false,
+    }
+}
+
+/// Plan the RECORDED ADMISSION of one graph-produced topic's consuming stages
+/// on the rank being replayed.
+///
+/// [`plan_topic_injection`]'s twin at the other end of the same log: that one
+/// places recorded FRAMES onto steps for a topic nothing local produces, this
+/// one places recorded READS onto steps for a topic the pass produces itself.
+/// It names no frame index because a produced edge has no feed to index into,
+/// and it names no sequence range because the record carries none: one pop count
+/// and one surviving sequence per read, which is exactly what the core's
+/// `DueRead` admits.
+///
+/// Pure and total: every input shape yields either a plan or a typed refusal,
+/// and nothing is logged.
+#[must_use]
+pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> AdmissionPlan {
+    let refused = |reason: AdmissionRefusalReason| {
+        AdmissionPlan::Refused(AdmissionRefusal {
+            topic: topic.topic.clone(),
+            reason,
+        })
+    };
+    let mut planned: Vec<StageAdmission> = Vec::new();
+    let mut offered: Vec<StageKey> = Vec::new();
+    let mut ungateable: Vec<(StageKey, String)> = Vec::new();
+    for edge in &topic.edges {
+        let (input_idx, roles) = match stages.resolve(&edge.node_id, &edge.input) {
+            Ok(v) => v,
+            Err(reason) => return refused(reason),
+        };
+        let key_of = |role: ReadStageRole| StageKey {
+            node: edge.node_id.clone(),
+            input_idx,
+            role,
+        };
+        for (exists, role) in [
+            (roles.body, ReadStageRole::Body),
+            (roles.drain, ReadStageRole::Drain),
+        ] {
+            if !exists {
+                continue;
+            }
+            if roles.gateable(role) {
+                offered.push(key_of(role));
+            } else {
+                ungateable.push((
+                    key_of(role),
+                    stages.refusal(&key_of(role)).map_or_else(
+                        || "the core refuses to gate this stage".to_string(),
+                        |r| r.to_string(),
+                    ),
+                ));
+            }
+        }
+        // Per stage, step to that step's admissions in RECORD ORDER. A
+        // `BTreeMap` orders the STEPS and a `Vec` keeps the records inside one
+        // step exactly as the bag holds them: sorting there would state an order
+        // the recording does not.
+        let mut body: BTreeMap<u64, Vec<DueRead>> = BTreeMap::new();
+        let mut drain: BTreeMap<u64, Vec<DueRead>> = BTreeMap::new();
+        for sited in &edge.reads {
+            let step = sited.read.step;
+            let role = stage_of_record(sited.role, record_is_batch(&sited.read.body), roles);
+            // A stage the core refuses to gate takes today's drain, so its
+            // records constrain nothing and are never READ here: the refusal
+            // vocabulary below speaks only about stages the gate will drive, and
+            // judging a shape on an ungated stage would refuse a run over an
+            // edge this gate never touches.
+            if !roles.gateable(role) {
+                continue;
+            }
+            let key = key_of(role);
+            let due = match &sited.read.body {
+                // Records are missing here, each having consumed an unknown
+                // number of frames, so every later popped count on this stage is
+                // a floor.
+                RecordedReadBody::Truncated { dropped_records } if *dropped_records > 0 => {
+                    return refused(AdmissionRefusalReason::RecordDropped {
+                        key,
+                        step,
+                        dropped_records: *dropped_records,
+                    })
+                }
+                // A marker whose window dropped nothing removes no record.
+                RecordedReadBody::Truncated { .. } => continue,
+                // An annotation names the publisher of the next read and
+                // occupies no position in the pop stream. A multi-publisher edge
+                // is refused by the core census, which reads the wiring.
+                RecordedReadBody::Producer { .. } => continue,
+                // The third meaning: the frame named reached the consumer
+                // without a dequeue, so the gate walks past this entry rather
+                // than withholding at it.
+                RecordedReadBody::HandOff { served_seq } => {
+                    DueRead::served_without_pop(Some(*served_seq))
+                }
+                RecordedReadBody::Read {
+                    kind,
+                    served_seq,
+                    popped,
+                } => {
+                    if *popped > 0 && served_seq.is_none() {
+                        return refused(AdmissionRefusalReason::UnenforceableRecord {
+                            key,
+                            step,
+                            shape: RecordShape::PoppedWithoutSequence,
+                        });
+                    }
+                    if kind.serves() && *popped == 0 {
+                        return refused(AdmissionRefusalReason::UnenforceableRecord {
+                            key,
+                            step,
+                            shape: RecordShape::ServedNothingPopped,
+                        });
+                    }
+                    match (*kind, *popped) {
+                        // A recorded none, or a held read that took no new
+                        // frame: the recording's drain ran at this position and
+                        // consumed nothing, so the gate withholds at it.
+                        (_, 0) => DueRead::nothing(),
+                        // A sample gate dropped this read's frame in favour of
+                        // an earlier one, so the served sequence names the last
+                        // ACCEPTED frame and not what the read popped: the count
+                        // is enforced and the identity is not.
+                        (ReadKind::Decimated, n) => DueRead::decimated(n, *served_seq),
+                        (_, n) => DueRead::pops(n, *served_seq),
+                    }
+                }
+            };
+            let per_step = if role == ReadStageRole::Drain {
+                &mut drain
+            } else {
+                &mut body
+            };
+            per_step.entry(step).or_default().push(due);
+        }
+        for (role, per_step) in [(ReadStageRole::Body, body), (ReadStageRole::Drain, drain)] {
+            if per_step.is_empty() {
+                continue;
+            }
+            let key = key_of(role);
+            let last_read_step = per_step.keys().next_back().copied().unwrap_or(0);
+            if last_read_step < topic.last_boundary_step {
+                return refused(AdmissionRefusalReason::StreamEndsEarly {
+                    key,
+                    last_read_step,
+                    last_boundary_step: topic.last_boundary_step,
+                });
+            }
+            planned.push(StageAdmission {
+                key,
+                mode: edge.mode,
+                per_step: per_step
+                    .into_iter()
+                    .map(|(step, due)| StepAdmission { step, due })
+                    .collect(),
+            });
+        }
+    }
+    if planned.is_empty() {
+        if offered.is_empty() {
+            return AdmissionPlan::NotGateable(ungateable);
+        }
+        return refused(AdmissionRefusalReason::NoCoverage { keys: offered });
+    }
+    AdmissionPlan::Enforced {
+        stages: planned,
+        ungateable,
+    }
 }
 
 // ===========================================================================
@@ -3463,5 +4173,376 @@ mod tests {
         );
         assert!(LocalProducers::none().is_empty());
         assert_eq!(local.len(), 1);
+    }
+
+    // =======================================================================
+    // The ENFORCEMENT planner
+    // =======================================================================
+
+    /// A census over one input's stages, all gateable.
+    fn census(node: &str, idx: u16, roles: &[ReadStageRole]) -> Vec<ReadEdgeCapability> {
+        roles
+            .iter()
+            .map(|role| ReadEdgeCapability {
+                key: StageKey {
+                    node: node.to_string(),
+                    input_idx: idx,
+                    role: *role,
+                },
+                enforceable: true,
+                reason: None,
+            })
+            .collect()
+    }
+
+    fn inputs(node: &str, names: &[&str]) -> BTreeMap<String, Vec<String>> {
+        BTreeMap::from([(
+            node.to_string(),
+            names.iter().map(|n| (*n).to_string()).collect(),
+        )])
+    }
+
+    fn sited(
+        step: u64,
+        role: ReadSiteRole,
+        kind: ReadKind,
+        seq: Option<u32>,
+        popped: u32,
+    ) -> SitedRead {
+        SitedRead {
+            role,
+            read: RecordedRead::read(step, kind, seq, popped, false),
+        }
+    }
+
+    fn one_edge(reads: Vec<SitedRead>, last_boundary_step: u64) -> TopicAdmission {
+        TopicAdmission {
+            topic: "/t".to_string(),
+            multi_publisher: false,
+            edges: vec![AdmissionEdge {
+                node_id: "relay".to_string(),
+                input: "inp".to_string(),
+                mode: ConsumeMode::Latest,
+                reads,
+            }],
+            last_boundary_step,
+        }
+    }
+
+    /// The `(pops, served_seq)` derivation, and the three pop-less meanings, over
+    /// ONE recorded stream with a hand-written expectation per step.
+    #[test]
+    fn a_recorded_stream_folds_to_one_admission_per_record_in_record_order() {
+        let stages = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let topic = one_edge(
+            vec![
+                // step 0: a batch of 2, the newest carrying seq 5.
+                sited(0, ReadSiteRole::Body, ReadKind::DrainedBatch, Some(5), 2),
+                // step 1: the recorded none, then a held read that took nothing:
+                // two POSITIONS the gate withholds at, not one.
+                sited(1, ReadSiteRole::Body, ReadKind::NoFrame, None, 0),
+                sited(1, ReadSiteRole::Body, ReadKind::Held, Some(5), 0),
+                // step 2: a hand off, which SERVED seq 6 without a dequeue.
+                SitedRead {
+                    role: ReadSiteRole::Drain,
+                    read: RecordedRead::read(2, ReadKind::DrainedBatch, Some(6), 0, true),
+                },
+                // step 2 again: a decimated read, whose count is enforced and
+                // whose identity is not.
+                sited(2, ReadSiteRole::Body, ReadKind::Decimated, Some(6), 3),
+            ],
+            2,
+        );
+        let AdmissionPlan::Enforced {
+            stages: plans,
+            ungateable,
+        } = plan_edge_admission(&topic, &stages)
+        else {
+            panic!("the stream plans admissions");
+        };
+        assert!(ungateable.is_empty());
+        assert_eq!(plans.len(), 1, "one input, one stage: {plans:?}");
+        assert_eq!(plans[0].key.role, ReadStageRole::Body);
+        let per_step: Vec<(u64, Vec<DueRead>)> = plans[0]
+            .per_step
+            .iter()
+            .map(|s| (s.step, s.due.clone()))
+            .collect();
+        assert_eq!(
+            per_step,
+            vec![
+                (0, vec![DueRead::pops(2, Some(5))]),
+                (1, vec![DueRead::nothing(), DueRead::nothing()]),
+                (
+                    2,
+                    vec![
+                        DueRead::served_without_pop(Some(6)),
+                        DueRead::decimated(3, Some(6)),
+                    ]
+                ),
+            ],
+            "one admission per record, steps ascending, records in RECORD order"
+        );
+    }
+
+    /// A DRAIN-site record folds into the BODY stage when that is the only stage
+    /// the input owns, and splits by site when it owns both.
+    ///
+    /// Under the unified discipline both read paths stage into one stage, so a
+    /// plan keyed on the record's SITE would address a stage that does not exist
+    /// and every boundary drain would go ungated.
+    #[test]
+    fn a_drain_site_read_folds_into_the_body_stage_under_the_unified_discipline() {
+        let unified = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let reads = vec![
+            sited(0, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(0), 1),
+            sited(0, ReadSiteRole::Body, ReadKind::Served, Some(0), 1),
+        ];
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission(&one_edge(reads.clone(), 0), &unified)
+        else {
+            panic!("the unified input plans admissions");
+        };
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].key.role, ReadStageRole::Body);
+        assert_eq!(
+            plans[0].per_step[0].due.len(),
+            2,
+            "BOTH records land on the one stage that staged them: {:?}",
+            plans[0].per_step
+        );
+
+        let split = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body, ReadStageRole::Drain]),
+        );
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission(&one_edge(reads, 0), &split)
+        else {
+            panic!("the split input plans admissions");
+        };
+        let mut roles: Vec<ReadStageRole> = plans.iter().map(|p| p.key.role).collect();
+        roles.sort_by_key(|r| r.wire());
+        assert_eq!(
+            roles,
+            vec![ReadStageRole::Body, ReadStageRole::Drain],
+            "an input owning two stages splits its stream by site"
+        );
+        for plan in &plans {
+            assert_eq!(plan.per_step[0].due.len(), 1, "one record each: {plan:?}");
+        }
+    }
+
+    /// An UNSTAMPED record is placed by the pre-roles KIND rule, not refused.
+    ///
+    /// The steering demux reads a `DrainedBatch` as a drain-site record and every
+    /// other kind as a body-site one on every `trace_format` <= 4 bag, and the
+    /// gate reads the same rule, so an archived bag's records are placed rather
+    /// than making the whole recording unenforceable.
+    #[test]
+    fn an_unstamped_record_is_placed_by_the_pre_roles_kind_rule() {
+        let split = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body, ReadStageRole::Drain]),
+        );
+        let topic = one_edge(
+            vec![
+                sited(
+                    0,
+                    ReadSiteRole::Unstamped,
+                    ReadKind::DrainedBatch,
+                    Some(0),
+                    1,
+                ),
+                sited(0, ReadSiteRole::Unstamped, ReadKind::Served, Some(1), 1),
+            ],
+            0,
+        );
+        let AdmissionPlan::Enforced { stages: plans, .. } = plan_edge_admission(&topic, &split)
+        else {
+            panic!("an unstamped stream is placeable");
+        };
+        let drain = plans
+            .iter()
+            .find(|p| p.key.role == ReadStageRole::Drain)
+            .expect("the batch went to the drain stage");
+        assert_eq!(drain.per_step[0].due, vec![DueRead::pops(1, Some(0))]);
+        let body = plans
+            .iter()
+            .find(|p| p.key.role == ReadStageRole::Body)
+            .expect("the served read went to the body stage");
+        assert_eq!(body.per_step[0].due, vec![DueRead::pops(1, Some(1))]);
+    }
+
+    /// Every refusal names its cause and, where a stage caused it, that stage.
+    #[test]
+    fn every_admission_refusal_names_its_cause_and_its_edge() {
+        let stages = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        // No record plans a read: an annotation-only stream.
+        let uncovered = one_edge(
+            vec![SitedRead {
+                role: ReadSiteRole::Body,
+                read: RecordedRead::producer(0, ResolvedProducer::Foreign),
+            }],
+            0,
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&uncovered, &stages) else {
+            panic!("an annotation-only stream covers nothing");
+        };
+        assert_eq!(r.reason.code(), "read_log_no_coverage");
+        assert!(r.reason.key().is_none() && r.reason.edge_label().is_none());
+        assert!(
+            r.reason.to_string().contains("relay[0]/body"),
+            "the whole-topic arm names every stage it offered: {}",
+            r.reason
+        );
+
+        // A marker that dropped records.
+        let dropped = one_edge(
+            vec![SitedRead {
+                role: ReadSiteRole::Body,
+                read: RecordedRead::truncated(4, 3),
+            }],
+            4,
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&dropped, &stages) else {
+            panic!("a marker that dropped records is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_record_dropped");
+        assert_eq!(r.reason.edge_label().as_deref(), Some("relay[0]/body"));
+
+        // A stream that stops below the rank's last boundary.
+        let short = one_edge(
+            vec![sited(0, ReadSiteRole::Body, ReadKind::Served, Some(0), 1)],
+            7,
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&short, &stages) else {
+            panic!("a stream that ends early is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_truncated");
+        assert!(r.reason.to_string().contains("step 7"), "{}", r.reason);
+
+        // A record that consumed frames while naming none.
+        let shapeless = one_edge(
+            vec![sited(
+                0,
+                ReadSiteRole::Body,
+                ReadKind::DrainedBatch,
+                None,
+                2,
+            )],
+            0,
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&shapeless, &stages) else {
+            panic!("a popped record that names no sequence is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_unenforceable_record");
+        assert!(
+            r.reason.to_string().contains("popped_without_sequence"),
+            "{}",
+            r.reason
+        );
+
+        // A serving read that popped nothing and is not the hand-off shape.
+        let served_nothing = one_edge(
+            vec![sited(0, ReadSiteRole::Body, ReadKind::Served, Some(3), 0)],
+            0,
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&served_nothing, &stages) else {
+            panic!("a zero-pop Served record is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_unenforceable_record");
+        assert!(
+            r.reason.to_string().contains("served_nothing_popped"),
+            "{}",
+            r.reason
+        );
+
+        // An input name the recorded table repeats.
+        let ambiguous = StageTable::new(
+            &inputs("relay", &["inp", "inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(
+            &one_edge(
+                vec![sited(0, ReadSiteRole::Body, ReadKind::Served, Some(0), 1)],
+                0,
+            ),
+            &ambiguous,
+        ) else {
+            panic!("a repeated input name is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_input_name_duplicated");
+        assert_eq!(r.reason.edge_label().as_deref(), Some("relay.inp"));
+        let sentence = r.reason.to_string();
+        assert!(
+            sentence.contains("index 0") && sentence.contains("index 1"),
+            "the sentence names BOTH colliding indices: {sentence}"
+        );
+
+        // An input name the recorded table does not carry.
+        let absent = StageTable::new(
+            &inputs("relay", &["other"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(
+            &one_edge(
+                vec![sited(0, ReadSiteRole::Body, ReadKind::Served, Some(0), 1)],
+                0,
+            ),
+            &absent,
+        ) else {
+            panic!("an unresolvable input name is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_input_name_unresolved");
+    }
+
+    /// A stage the CORE refuses to gate is left ungated and NOT refused.
+    ///
+    /// A per-set Sync trigger input pops outside the two gated bodies and a
+    /// multi-publisher edge's wire sequence names no single head, so neither can
+    /// be gated. Those stages take today's drain, exactly as every edge outside a
+    /// gated rank does, and the answer names them so the report never implies
+    /// coverage the run did not have.
+    #[test]
+    fn a_stage_the_core_refuses_to_gate_is_ungated_and_never_a_refusal() {
+        let key = StageKey {
+            node: "relay".to_string(),
+            input_idx: 0,
+            role: ReadStageRole::Body,
+        };
+        let stages = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &[ReadEdgeCapability {
+                key: key.clone(),
+                enforceable: false,
+                reason: Some(ReadPlanRefusal::PerSetSyncEdge(key.clone())),
+            }],
+        );
+        // A stream that would otherwise be REFUSED for its shape: the refusal
+        // vocabulary speaks only about stages the gate will drive.
+        let topic = one_edge(
+            vec![sited(0, ReadSiteRole::Body, ReadKind::Served, Some(3), 0)],
+            9,
+        );
+        let AdmissionPlan::NotGateable(ungateable) = plan_edge_admission(&topic, &stages) else {
+            panic!("no stage of this topic can be gated");
+        };
+        assert_eq!(ungateable.len(), 1);
+        assert_eq!(ungateable[0].0, key);
+        assert!(
+            ungateable[0].1.contains("per_set_sync_edge"),
+            "the core's own reason is carried: {}",
+            ungateable[0].1
+        );
     }
 }
