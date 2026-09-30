@@ -50,6 +50,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// The waiver reason's stable head, as every waived arm's `cfg_attr` spells it.
+///
+/// A FLOOR, not an identity. It tells a binary built from a source that already
+/// had the waiver from one restored out of the build cache from before it, and
+/// nothing more: a binary carrying several waived arms still holds this literal
+/// when one of them loses its `cfg_attr`, which is why the source scan and not
+/// this is what pins each arm. The long form is deliberate, since a short token
+/// would match a binary that merely mentions the number.
+///
+/// It exists ONLY on macOS. Every occurrence in a waived source is inside
+/// `#[cfg_attr(target_os = "macos", ignore = ...)]`, which does not expand
+/// off-target, so a Linux binary never carries it and the check that reads it is
+/// gated to macOS. Reading it unconditionally made all thirteen stems look
+/// unaskable on Linux and the arm passed having asked nothing.
+const WAIVER_2034_MARKER: &str = "upstream iceoryx2 0.10.0 defect 2034";
+
 /// Every arm carrying the 2034 macOS waiver, as `(path from the workspace root,
 /// test name)`. Twenty six arms across thirteen binaries; the counts are
 /// checked, not just written down, by the both-directions inventory below.
@@ -761,33 +777,95 @@ fn deps_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// The newest built binary for `stem` in this run's own deps directory, or
-/// `None` when this invocation did not build it.
+/// Every `<stem>-<hash>` in this run's deps directory, bucketed by stem and
+/// ordered NEWEST FIRST, from ONE directory walk.
 ///
-/// Newest by modification time on purpose: cargo leaves older hashes behind, and
-/// an ancient one would answer for source nobody is running.
-fn built_test_binary(stem: &str) -> Option<PathBuf> {
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(deps_dir()).ok()?.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = path.file_name()?.to_string_lossy().into_owned();
-        // `<stem>-<hash>` and nothing else: not `<stem>-<hash>.d`, not a
-        // different test whose name merely starts with this one.
-        let Some(tail) = name.strip_prefix(&format!("{stem}-")) else {
-            continue;
-        };
-        if !tail.chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        let when = entry.metadata().ok()?.modified().ok()?;
-        if best.as_ref().is_none_or(|(b, _)| when > *b) {
-            best = Some((when, path));
+/// One walk because the directory is large: 124,302 entries in a working
+/// checkout, 7 seconds warm and 22 cold. The previous shape walked it once per
+/// stem and then once more for every stem it could not answer, which on a
+/// platform where no stem can be answered is twice the stems.
+fn candidates_by_stem(stems: &[&str]) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut found: BTreeMap<String, Vec<(std::time::SystemTime, PathBuf)>> = BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir(deps_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            for stem in stems {
+                // `<stem>-<hash>` and nothing else: not `<stem>-<hash>.d`, not
+                // an object file, not a different test whose name merely starts
+                // with this one.
+                let Some(tail) = name.strip_prefix(&format!("{stem}-")) else {
+                    continue;
+                };
+                if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let Ok(when) = entry.metadata().and_then(|m| m.modified()) else {
+                    // This entry, not the next stem: the name already matched
+                    // this one, so trying it against the others would bucket it
+                    // under a stem it does not belong to.
+                    break;
+                };
+                found
+                    .entry((*stem).to_string())
+                    .or_default()
+                    .push((when, path.clone()));
+                break;
+            }
         }
     }
-    best.map(|(_, p)| p)
+    found
+        .into_iter()
+        .map(|(stem, mut v)| {
+            // Newest first, and by PATH when the timestamps tie: a cache restore
+            // stamps many files with one time, and `read_dir` order is arbitrary,
+            // so without the tie-break the pick among them is nondeterministic.
+            v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            (stem, v.into_iter().map(|(_, p)| p).collect())
+        })
+        .collect()
+}
+
+/// The first candidate, newest first, whose BYTES carry `marker`, or `None`.
+///
+/// The marker is what makes the choice correspond to the source rather than to a
+/// timestamp. A shard that does not build a waived binary still finds one in the
+/// deps directory, restored from the build cache and built from an older source,
+/// and newest-by-mtime picks it: the cache sets every restored file's mtime to
+/// the restore, so a stale binary can be newer than the checkout it contradicts.
+/// Asking libtest about that binary answers a question about a source nobody is
+/// testing, which is how this gate reported a waived arm as unignored on macOS
+/// while the arm at that source is ignored, proved by running `--list --ignored`
+/// on the binary built from it.
+///
+/// Newest first, so the marker filters an ordered walk instead of acting as a
+/// second clock.
+fn newest_carrying(candidates: &[PathBuf], marker: &str) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|p| {
+            std::fs::read(p)
+                .is_ok_and(|bytes| bytes.windows(marker.len()).any(|w| w == marker.as_bytes()))
+        })
+        .cloned()
+}
+
+/// The newest built binary for `stem` in this run's own deps directory, or
+/// `None` when no candidate is there at all.
+///
+/// Newest by modification time ONLY, which is weaker than it looks: a
+/// cache-restored binary carries the restore's timestamp, so newest does not mean
+/// built from this source. The waiver arm does not use this for its answer, it
+/// uses [`newest_carrying`], which reads the source's own text out of the
+/// candidate. This remains for the anti-vacuity check, where the question is
+/// merely whether any candidate exists.
+fn built_test_binary(stem: &str) -> Option<PathBuf> {
+    candidates_by_stem(&[stem]).remove(stem)?.into_iter().next()
 }
 
 /// Ask a test binary what libtest knows. `ignored` selects the `--ignored`
@@ -849,9 +927,33 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
     let mut checked_binaries = 0usize;
     let mut checked_arms = 0usize;
     let mut unbuilt: Vec<&str> = Vec::new();
+    let mut stale: Vec<&str> = Vec::new();
+    // ONE directory walk for every stem, rather than one per stem and another
+    // for every stem that cannot be answered.
+    let stems: Vec<&str> = by_binary.keys().copied().collect();
+    let candidates = candidates_by_stem(&stems);
+    let empty: Vec<PathBuf> = Vec::new();
     for (stem, tests) in &by_binary {
-        let Some(bin) = built_test_binary(stem) else {
-            unbuilt.push(stem);
+        let found = candidates.get(*stem).unwrap_or(&empty);
+        // On macOS the newest candidate carrying the waiver's own reason text,
+        // because a cache-restored binary from before the waiver would otherwise
+        // answer for a source nobody is testing. Off macOS the marker cannot
+        // exist, since `cfg_attr(target_os = "macos", ...)` does not expand
+        // there, so the choice stays what it was: the newest candidate.
+        let chosen = if cfg!(target_os = "macos") {
+            newest_carrying(found, WAIVER_2034_MARKER)
+        } else {
+            found.first().cloned()
+        };
+        let Some(bin) = chosen else {
+            if found.is_empty() {
+                unbuilt.push(stem);
+            } else {
+                // Present, and on macOS carrying no waiver text, so built before
+                // the waiver landed. Asserted below: a binary that cannot answer
+                // must not read as an answer.
+                stale.push(stem);
+            }
             continue;
         };
         checked_binaries += 1;
@@ -883,6 +985,23 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
         }
     }
 
+    // A binary that is PRESENT but cannot answer is a red, not a skip. Before
+    // this assertion the arm reported such a binary through an `eprintln`, which
+    // libtest captures on a pass, so the one case this whole arm exists for
+    // printed `ok`.
+    //
+    // The companion rule is below: asking SOME of the stems and silently
+    // skipping the rest is also a red. Only asking NONE is a legitimate skip,
+    // which is a checkout where this invocation built no waived binary at all.
+    assert!(
+        stale.is_empty(),
+        "{stale:?}: a binary for each of these waived stems is in {} but carries \
+         no 2034 waiver text, so it was built before the waiver and cannot answer \
+         what libtest will do with the arm at this source. The shard that runs \
+         this gate must build the binaries it asks. FIX: rebuild those test \
+         binaries in this invocation.",
+        deps_dir().display()
+    );
     if checked_binaries == 0 {
         eprintln!(
             "skip: this invocation built none of the {} waived binaries, so there \
@@ -891,9 +1010,54 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
         );
         return;
     }
+    // ALL or NONE, PER CRATE. A run that asked some of a crate's waived binaries
+    // and silently skipped the rest reports a number that reads like coverage and
+    // is not: the arms in the skipped binaries were never put to libtest.
+    // `unbuilt` was reported and never asserted, which was the remaining way for
+    // this arm to pass having checked less than it says.
+    //
+    // Per CRATE and not across the inventory, because the inventory spans two and
+    // no single `-p` can build both: `cargo test -p cerulion_core` cannot build a
+    // `cerulion_cli_engine` target, so an inventory-wide rule would make the
+    // ordinary per-crate command unpassable while offering a remedy that does not
+    // exist. Per crate, that run reads one crate fully asked and the other fully
+    // unasked, which are both honest, and CI, which builds both, still gets the
+    // whole rule.
+    // Distinct BINARIES per crate, not inventory rows: several arms share one
+    // binary and the question here is which binaries were asked.
+    let mut by_crate: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (file, _) in WAIVED_2034 {
+        let stem = Path::new(file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("a waived path names a .rs file");
+        let crate_dir = file
+            .strip_prefix("crates/")
+            .and_then(|rest| rest.split('/').next())
+            .expect("a waived path names a crate under crates/");
+        by_crate.entry(crate_dir).or_default().insert(stem);
+    }
+    for (crate_dir, stems) in &by_crate {
+        let missing: Vec<&str> = stems
+            .iter()
+            .copied()
+            .filter(|s| unbuilt.contains(s))
+            .collect();
+        let asked = stems.len() - missing.len();
+        assert!(
+            asked == 0 || missing.is_empty(),
+            "in `{crate_dir}` this invocation asked {asked} of {} waived binaries \
+             and skipped {missing:?}, which it did not build. Asking some of a \
+             crate's waived binaries and not the rest reports coverage this arm \
+             does not have. FIX: build that crate's waived binaries in the same \
+             invocation as this gate, or build none of them and take the skip.",
+            stems.len()
+        );
+    }
     eprintln!(
         "libtest list oracle: {checked_arms} waived arm(s) across {checked_binaries} \
-         of {} binaries; not built here: {unbuilt:?}",
+         of {} binaries; not built here: {unbuilt:?}; present but built before the \
+         waiver, so not asked: {stale:?}",
         by_binary.len()
     );
 }
