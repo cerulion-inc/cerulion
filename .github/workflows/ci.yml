@@ -2725,11 +2725,33 @@ jobs:
       - name: Start the descriptor sampler
         run: |
           cat > "$RUNNER_TEMP/sampler.py" <<'PY'
-          import datetime, glob, subprocess, sys, time
+          import datetime, glob, os, signal, subprocess, sys, time
+
+          # Own session, so the stop step's negative pid reaches this sampler
+          # even after the runner's own group is torn down. It does NOT reach the
+          # probes below, which get their own session each: those are reaped by
+          # parent pid, and the stop step says so.
+          try:
+              os.setsid()
+              own_session = "yes"
+          except OSError as e:
+              # Already a group leader. The stop step's positive-pid fallback
+              # covers it, and the log says which shape this run took rather than
+              # leaving the two indistinguishable.
+              own_session = "no:%s" % type(e).__name__
 
           log, tick = sys.argv[1], 0
+          # Two bounds, because ticks are not time: a tick costs 0.1s when every
+          # probe answers and up to ten seconds when they time out, so the tick
+          # count alone is a couple of hours only on a healthy run. The wall bound
+          # is what stops an orphaned sampler writing forever on a run where the
+          # probes are slow, which is the run it exists for.
+          MAX_TICKS = 72_000
+          MAX_WALL_S = 7_200
           with open(log, "a", buffering=1) as f:
-              while True:
+              f.write("sampler pid=%d own_session=%s\n" % (os.getpid(), own_session))
+              started = time.monotonic()
+              while tick < MAX_TICKS and time.monotonic() - started < MAX_WALL_S:
                   now = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S.%f")[:-3]
                   try:
                       out = subprocess.run(
@@ -2742,25 +2764,107 @@ jobs:
                   if tick % 10 == 0:
                       iox = len(glob.glob("/tmp/iox2_*.shm_state"))
                       allshm = len(glob.glob("/tmp/*.shm_state"))
-                      pids = subprocess.run(["pgrep", "-f", "cerulion"],
-                                            capture_output=True, text=True).stdout.split()[:5]
+                      # Bounded and caught like the sysctl above: this one is
+                      # the sampler's own child, and an uncaught raise here ends
+                      # the loop with the traceback going to /dev/null.
+                      try:
+                          pids = subprocess.run(["pgrep", "-f", "cerulion"],
+                                                capture_output=True, text=True,
+                                                timeout=2).stdout.split()[:5]
+                      except Exception:
+                          pids = []
                       fds = []
                       for pid in pids:
+                          # No shell and no pipe. A `shell=True` pipeline's
+                          # timeout reaches the SHELL only, so a blocked `lsof`
+                          # and the `wc` waiting on its pipe both survive the
+                          # tick and accumulate through a run that is already
+                          # diagnosing descriptor pressure. This starts `lsof`
+                          # in its own process group, counts the lines here
+                          # instead of piping, and on a timeout signals the
+                          # whole group and reaps it before the next tick.
                           try:
-                              n = subprocess.run("lsof -nP -p %s 2>/dev/null | wc -l" % pid,
-                                                 shell=True, capture_output=True, text=True,
-                                                 timeout=5).stdout.strip()
+                              probe = subprocess.Popen(
+                                  ["lsof", "-nP", "-p", pid],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL,
+                                  text=True, start_new_session=True)
                           except Exception:
+                              fds.append("%s:unavailable" % pid)
+                              continue
+                          try:
+                              lines = probe.communicate(timeout=5)[0].splitlines()
+                              # A line count with `lsof`'s header row included,
+                              # which is what the `wc -l` form this replaced
+                              # counted. The one changed reading is the EMPTY case:
+                              # a pid that exited between the pgrep and here
+                              # produces no output, `wc -l` called that 0, and 0
+                              # reads as a real descriptor count.
+                              n = str(len(lines)) if lines else "empty"
+                              if probe.returncode not in (0, None):
+                                  # `lsof` exits nonzero after PARTIAL output when it
+                                  # cannot stat a filesystem, so the count above is a
+                                  # floor, not a total. Say so in the field.
+                                  n += "!rc%d" % probe.returncode
+                          except subprocess.TimeoutExpired:
+                              try:
+                                  os.killpg(probe.pid, signal.SIGKILL)
+                              except OSError:
+                                  probe.kill()
+                              # BOUNDED. A blocked `lsof` holds its pipe's write end
+                              # until its syscall returns, which a queued SIGKILL does
+                              # not force, so an unbounded reap here would stall the
+                              # sampler forever inside the code that exists to bound
+                              # it. A leaked zombie costs one entry; a stalled sampler
+                              # costs the whole log.
+                              try:
+                                  probe.communicate(timeout=5)
+                              except Exception:
+                                  pass
                               n = "timeout"
+                          except Exception as e:
+                              # Everything else: a decode error on a NAME column, a
+                              # broken pipe, a MemoryError on a process with tens of
+                              # thousands of descriptors, which is the condition this
+                              # sampler exists to record. Before this catch any of
+                              # them ended the loop, and the traceback went to
+                              # /dev/null, so the log simply stopped mid run and the
+                              # artifact still uploaded. Killed AND reaped like the
+                              # timeout arm: a probe left unreaped here is a child
+                              # held for the sampler's life, under the same pressure.
+                              try:
+                                  os.killpg(probe.pid, signal.SIGKILL)
+                              except OSError:
+                                  probe.kill()
+                              try:
+                                  probe.communicate(timeout=5)
+                              except Exception:
+                                  pass
+                              n = "err:%s" % type(e).__name__
                           fds.append("%s:%s" % (pid, n))
                       f.write("%s procs iox2_records=%d shm_state_total=%d fds=%s\n"
                               % (now, iox, allshm, " ".join(fds) or "none"))
                   tick += 1
                   time.sleep(0.1)
           PY
+          # Compile before launching. The sampler runs with stderr on /dev/null,
+          # so a syntax error in the body above would print `sampler pid N`, exit
+          # 0, and leave an empty log that still uploads. LOUD but not fatal: this
+          # is a diagnostic, and failing the shard over it would red a product job
+          # for a descriptor log.
+          if ! python3 -m py_compile "$RUNNER_TEMP/sampler.py"; then
+            echo "::error::sampler.py does not compile; no descriptor log this run"
+            exit 0
+          fi
           nohup python3 "$RUNNER_TEMP/sampler.py" "$RUNNER_TEMP/descriptors.log" >/dev/null 2>&1 &
-          echo $! > "$RUNNER_TEMP/sampler.pid"
-          echo "sampler pid $(cat "$RUNNER_TEMP/sampler.pid")"
+          pid=$!
+          echo "$pid" > "$RUNNER_TEMP/sampler.pid"
+          sleep 1
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "sampler pid $pid: $(head -1 "$RUNNER_TEMP/descriptors.log" 2>/dev/null)"
+          else
+            echo "::warning::the descriptor sampler died at startup; descriptors.log will be empty"
+          fi
 
       # The three credit death arms ahead of the shard's normal list, so the
       # sampler window around them is short. `CLI binary tests` below runs the
@@ -3032,7 +3136,51 @@ jobs:
 
       - name: Stop the descriptor sampler
         if: ${{ always() }}
-        run: kill "$(cat "$RUNNER_TEMP/sampler.pid" 2>/dev/null)" 2>/dev/null || true
+        run: |
+          pid="$(cat "$RUNNER_TEMP/sampler.pid" 2>/dev/null || true)"
+          if [ -z "$pid" ]; then
+            echo "no sampler pid recorded"
+            exit 0
+          fi
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::warning::the descriptor sampler was already dead before this step; descriptors.log stops where it died"
+            exit 0
+          fi
+          # Refuse a REUSED pid. The negative form below signals a whole group, so
+          # a pid that now belongs to some other group leader would take that
+          # group with it.
+          if ! ps -o command= -p "$pid" | grep -q sampler.py; then
+            echo "::warning::pid $pid is not the sampler any more (reused); leaving it alone"
+            exit 0
+          fi
+          # The probes FIRST, by parent pid. Each `lsof` runs in a session of its
+          # own, so the negative pid below does not reach it, and once the sampler
+          # is gone a blocked probe is reparented and unfindable.
+          pkill -KILL -P "$pid" 2>/dev/null || true
+          # Then the sampler. The negative form reaches its group even after the
+          # runner's own group is gone; the positive form is the fallback for a run
+          # whose `os.setsid` failed, which the log's first line names.
+          kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+          # Wait for it to GO, so the upload does not pack a log that is still
+          # being written to.
+          gone=""
+          for _ in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || { gone=yes; break; }
+            sleep 0.1
+          done
+          if [ -z "$gone" ]; then
+            echo "sampler $pid did not stop on TERM; killing the group"
+            kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$pid" 2>/dev/null || { gone=yes; break; }
+              sleep 0.1
+            done
+          fi
+          if [ -n "$gone" ]; then
+            echo "sampler stopped"
+          else
+            echo "::warning::sampler $pid survived TERM and KILL; the uploaded log may end mid line"
+          fi
 
       - name: Upload the descriptor sampler log
         if: ${{ always() }}
