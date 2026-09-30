@@ -227,11 +227,11 @@ tree, no cargo, no network), and each names the document it is the machine half 
 | `no_source_or_test_file_is_named_after_a_plan_step` | A file under a `src/` or `tests/` directory whose name carries the step of the work that produced it: a `chunk` segment, an indexed `pass2` / `stage3` / `phase1` / `wave2` / `round4`, or a leading lane label like `d2_`. An index is what separates a step from a word, so the `node stage` verb and a `round_trip` are silent, and `e2e_` is not a lane. Seven names the tree still carries are declared in the test; the list may only shrink, and a name that leaves the tree has to leave the list. |
 | `the_documented_login_exemptions_are_the_ones_the_code_exempts` | `docs/user-api.md`'s "Exempt: `login` …" sentence and `command_needs_identity` in `crates/cerulion_cli/src/main.rs` naming different verbs. The code side is read from a comment-stripped view of the function, so a variant mentioned in a comment beside the list does not count as a member of it. `--help` and `--version` are declared separately: clap answers them above the gate, so they are asserted PRESENT in the sentence rather than compared against the code. |
 
-The fourth doc-versus-code property, that every `cerulion <verb>` spelled in `README.md`
-and `docs/user-api.md` exists in the CLI, is enforced by the public-surface gate's
-`docs-refs` class, which walks the verb tree out of the clap definitions; its self-test
-carries a markdown TABLE row, because a table cell is where those two pages spell their
-verbs.
+The fourth doc-versus-code property, that every `cerulion <verb>` spelled in `README.md` and
+`docs/user-api.md` exists in the CLI, is enforced by the public-surface gate's `docs-refs` class,
+which walks the verb tree out of the clap definitions; its self-test carries a markdown TABLE row,
+because a table cell is where those two pages spell their verbs. That gate's `agent-file-ref`
+class refuses `AGENTS.md` and `CLAUDE.md` on a user-facing page, excepting files so named.
 
 ## The dependency-architecture rules
 

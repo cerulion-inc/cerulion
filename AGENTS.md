@@ -166,8 +166,8 @@ Unmarked crates have no scoped file: use this page plus the area dossier
   session-id, deferred-work, proof-tag, our-machines, candour-voice (patterns:
   `tools/scripts/public_surface_workstate.txt`). Its ledger burns down; a user-facing page reads zero.
 - Every removal of shipped content is a maintainer ruling: propose it, never decide it in a lane.
-- Docs name only verbs, flags, paths and files that exist: links resolve, `cerulion` verbs parse,
-  paths are post-move (`crates/...`, `tools/scripts/...`, `docs/user-api.md`).
+- Docs name only what exists: links resolve, verbs and flags parse, paths post-move
+  (`crates/...`, `tools/scripts/...`); no user-facing page names `AGENTS.md`/`CLAUDE.md`.
 
 ## Boundaries
 

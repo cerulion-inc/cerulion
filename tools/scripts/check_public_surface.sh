@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # check_public_surface.sh: the public-surface gate.
 #
-# Eight classes of mistake in a shipped tree are shapes a script can see, so
+# Nine classes of mistake in a shipped tree are shapes a script can see, so
 # this gate makes them fail in CI before the page ships. It runs
 # over the TRACKED tree (`git ls-files`), needs no cargo and no network, and
 # finishes in seconds (the work-state scan, the one costly pass, is split over
@@ -214,6 +214,17 @@
 #                         measurements, and are skipped. A round figure can
 #                         match another package by coincidence; the class is
 #                         built for the measured decimals.
+#   agent-file-ref        No user-facing page names an agent instruction
+#                         file: the token `AGENTS.md` or `CLAUDE.md` in the
+#                         RAW text of README.md, CHANGELOG.md, docs/ outside
+#                         docs/internals/, a .md under examples/ or .github/,
+#                         or a crates/*/README.md. Raw text and not the prose
+#                         view: such a path ships backticked. A file whose own
+#                         basename is one of the two names is out of the scan
+#                         BY NAME, whatever it holds, so `docs/AGENTS.md` and
+#                         the `docs/CLAUDE.md` include shim are silent. One
+#                         finding per line, and the summary line says how many
+#                         files the rule ran over.
 #   string-literal-rewrite This one cannot be a tree check. A bulk edit that
 #                         strips a token turns "/cer561pos/producer/out" into
 #                         "/producer/out" inside a test's string literal and
