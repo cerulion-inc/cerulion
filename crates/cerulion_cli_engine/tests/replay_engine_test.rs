@@ -49,9 +49,9 @@ use cerulion_core::prelude::*;
 use cerulion_core::read_outcome::ReadSiteRole;
 use cerulion_core::trace_ring::{
     pack_read_outcome_meta, read_site_role, unpack_read_outcome_meta, unpack_read_outcome_popped,
-    TraceRingRecord, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NO_FRAME,
-    READ_OUTCOME_ROLE_MASK, READ_OUTCOME_ROLE_SHIFT, RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME,
-    RECORD_TYPE_STEP_BOUNDARY,
+    TraceRingRecord, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
+    READ_OUTCOME_NO_FRAME, READ_OUTCOME_ROLE_MASK, READ_OUTCOME_ROLE_SHIFT, READ_OUTCOME_SERVED,
+    RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
 };
 use cerulion_core::wire::WireHeader;
 use indexmap::IndexMap;
@@ -18285,7 +18285,10 @@ fn restamp_one_relay_records_role(rec: &mut Recording, role: ReadSiteRole) -> Re
 ///    the gate (or deriving it from the kind width, which `KindFieldWidth`'s
 ///    own doc forbids) reports leg 2 as a divergence.
 ///
-/// REPORT-ONLY throughout, as every read-log finding has always been.
+/// A believed role divergence is the EXIT-6 SCHEDULE VERDICT on leg 1, like
+/// every other retained read-log divergence: the two sides named different sites,
+/// so the recorded read did not reproduce. Leg 2 is clean because the bag made no
+/// site claim, not because the class is report-only.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
@@ -27260,8 +27263,8 @@ fn a_mixed_regime_bag_is_refused_in_both_directions() {
             ref other => panic!("{label}: a mixed-regime bag must be refused, got {other:?}"),
         }
         // The contract is "keep the rule; fix the
-        // engine". The read log is REPORT-ONLY: a refusal must produce NO data
-        // violation. `sy`'s cross-rank edges are read-log-STEERED by construction,
+        // engine". A read-log REFUSAL is exit 2 and a retained read-log
+        // divergence is exit 6: neither is ever a DATA violation. `sy`'s cross-rank edges are read-log-STEERED by construction,
         // so a refusal does make the injection fall back to the recorded-clock
         // window and the frames CAN differ — measured, without the decline, as a
         // `ByteMismatch` on `/sy/fusion/out`. Writing that measurement into
@@ -29575,19 +29578,21 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
     );
 }
 
-/// **The CORRUPT-RECORDING stand-down is REPORT-ONLY.**
+/// **The CORRUPT-RECORDING stand-down is REPORTED, and the shape is the exit-6
+/// verdict.**
 ///
 /// On a stamped bag the read-site detector reports CORRUPTION rather than
-/// ambiguity, and the report is *"REPORT-ONLY, and never changes the exit
-/// code"* — because the read log is report-only by rule
-/// (`read_outcome.rs`: *"the read log must never cost a replay its verdict"*)
-/// and a verdict-bearing read-log condition would break that rule.
+/// ambiguity, and the stand-down note is what tells an operator WHICH node's
+/// stream cannot have been written by any recorder. The verdict beside it is exit
+/// 6: a `(kind, role)` pair no mint site can produce can never equal a replayed
+/// read, so the compare retains a divergence on that edge.
 ///
 /// So the two claims are asserted TOGETHER, in one body, and neither means
 /// anything alone: the corruption IS reported (with vocabulary an operator can
 /// act on, and durably in the `--report` JSON, not only in a log line that
-/// scrolls away), AND the four fields the CLI's exit code is a pure function of
-/// are the CLEAN verdict. A test that asserted only the first would pass an
+/// scrolls away), AND the verdict is the EDGE-READ one rather than a data
+/// violation or a fire-schedule divergence. A test that asserted only the first
+/// would pass an
 /// implementation that also failed the replay; one that asserted only the
 /// second would pass an implementation that noticed nothing.
 ///
@@ -29599,7 +29604,7 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
 /// is IN that array.
 #[test]
 #[serial]
-fn an_impossible_read_shape_is_reported_without_moving_the_verdict() {
+fn an_impossible_read_shape_is_reported_and_is_the_exit_6_verdict() {
     let dir = tempfile::tempdir().unwrap();
 
     // ── ANTI-TAUTOLOGY CONTROL: the SAME fixture, unperturbed, replays clean
@@ -29632,13 +29637,11 @@ fn an_impossible_read_shape_is_reported_without_moving_the_verdict() {
     let report = dir.path().join("impossible_shape_report.json");
 
     let outcome = replay(&bag, sy_bounded_factories, None, Some(report.clone()))
-        .expect("a corrupt READ LOG never refuses the replay — it is report-only");
+        .expect("a corrupt READ LOG is a verdict, never a refusal of the replay");
 
-    // (1) THE VERDICT IS UNTOUCHED — the four fields the exit code is a pure
-    // function of.
-    // A shape no recorder can produce can never equal a replayed read, so it is
-    // the exit-6 verdict. The claim this arm makes is the NOTE beside it, which
-    // names the node and the cause.
+    // (1) THE VERDICT IS THE EDGE-READ ONE, and no other class fired: a shape no
+    // recorder can produce can never equal a replayed read. The second claim
+    // this arm makes is the NOTE beside it, which names the node and the cause.
     assert_edge_read_verdict(&outcome, "impossible read shape");
     // Anti-vacuity: a replay that checked NOTHING also carries a clean verdict.
     assert!(
@@ -35422,5 +35425,333 @@ fn two_indices_resolving_to_one_manifest_input_name_is_an_exit_2_refusal() {
             && msg.contains("index 0")
             && msg.contains("index 1"),
         "the refusal names the node, the repeated name and both indices: {msg}"
+    );
+}
+
+// ===========================================================================
+// The read gate's hold-back, the lockstep control, and the two remaining
+// exit-2 refusal tokens
+// ===========================================================================
+
+/// A PERIOD consumer with one PLAIN (drain-to-latest) input and NO outputs.
+///
+/// Two fixture properties the hold-back arm needs, and `RelayNode` has neither.
+/// (1) The fire schedule is the PERIOD's, so a crafted read log that moves a read
+/// to a later step leaves the fire count at every step alone; a data-trigger
+/// node's fire count is re-derived from its FIFO pop count, so the same craft
+/// there is a fire-schedule divergence on a bag that contradicts itself.
+/// (2) It publishes NOTHING, so no frame in the bag can carry the value this node
+/// read, and the only thing the craft can move is which step the gate admits at.
+/// A relay would republish the value it read, and a read moved one step later
+/// would republish the frame it held instead, which is a payload divergence
+/// rather than evidence about the gate.
+///
+/// The same shape as [`TwoPlainFusionNode`] with one input: the data diff runs on
+/// the source's topic and this node exists for its one snapshot-read edge.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct PlainPeriodSinkNode {
+    #[input]
+    ctx: Vector3,
+}
+
+#[cerulion_node_impl]
+impl PlainPeriodSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.ctx.x;
+        Ok(())
+    }
+}
+
+/// [`source_relay_yaml`] with the publishing consumer replaced by the sink.
+fn source_plain_sink_yaml() -> &'static str {
+    "name: scgraph\nprefix: sc\nnodes:\n\
+     \x20 - id: source\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: plain_period_sink_node\n    inputs:\n      - name: inp\n        source: source/out\n"
+}
+
+fn source_plain_sink_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("source", Box::new(SourceNodeEntry::new())),
+        (
+            "relay",
+            Box::new(PlainPeriodSinkNodeEntry::new()) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+/// **A frame the producer published one step BEFORE the recording read it is
+/// HELD, and admitted at the step the recording names.**
+///
+/// The engine twin of the core's `a_zero_quota_step_admits_nothing`, over a real
+/// bag and the whole prepare-plan-install-settle path. The craft is two records of
+/// a verified recording rewritten into the pair a drain-to-latest edge really
+/// records when its read slips one step: step 3 re-serves the frame it already
+/// holds and pops NOTHING, and step 4 pops the two frames then queued and serves
+/// the newer of them. Every frame in the bag keeps its bytes, the consumer's fire
+/// schedule is its period's, and the consumer publishes nothing, so the ONLY
+/// thing the craft can move is which step the gate admits at.
+///
+/// The two witnesses are what stop the arm being a tautology: the gate REFUSED a
+/// pop at each of the two steps whose plan admits nothing (step 0, which the
+/// recording itself reads nothing at, and the crafted step 3), and it still
+/// admitted one frame per recorded pop. An unarmed gate reads 0 and 0 and fails
+/// both.
+#[test]
+#[serial]
+fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
+    let steps = 6;
+    const HELD_STEP: u64 = 3;
+    let mut rec = record_uniform_with_read_log(
+        source_plain_sink_yaml(),
+        source_plain_sink_factories,
+        &[],
+        steps,
+    );
+    // HAND ORACLE on the recording first. The consumer's plain input is read
+    // inside its own tick, so the frame its producer published in the SAME step
+    // is not yet visible to it: step 0 reads nothing and every later step reads
+    // the frame published one step earlier. node_idx 1 (relay), input_idx 0, and
+    // the frame published at the last step is never read.
+    let served = |step: u64| (step, 1, 0, READ_OUTCOME_SERVED, step - 1, 1);
+    assert_eq!(
+        kind6_records(&rec),
+        vec![
+            (0, 1, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+            served(1),
+            served(2),
+            served(3),
+            served(4),
+            served(5),
+        ],
+        "the reference recording carries the hand-oracle read log"
+    );
+
+    // Step 3 becomes the HELD read a step with no new arrival records: it names
+    // the frame already held (the one step 2 served, seq 1) and pops nothing.
+    let held = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == HELD_STEP)
+        .expect("the step-3 kind-6 record exists");
+    held.global_level = pack_read_outcome_meta(0, READ_OUTCOME_HELD, ReadSiteRole::Body);
+    held.fire_time_ns = HELD_STEP - 2;
+    held.duration_ns = 0;
+    // Step 4 then pops BOTH queued frames and serves the newer, which is what a
+    // drain-to-latest read does with a one-frame backlog. Its served sequence is
+    // unchanged: the newer of the two IS the frame it already served.
+    let caught_up = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == HELD_STEP + 1)
+        .expect("the step-4 kind-6 record exists");
+    caught_up.duration_ns = 2;
+    assert_eq!(
+        kind6_records(&rec),
+        vec![
+            (0, 1, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+            served(1),
+            served(2),
+            (3, 1, 0, READ_OUTCOME_HELD, 1, 0),
+            (4, 1, 0, READ_OUTCOME_SERVED, 3, 2),
+            served(5),
+        ],
+        "the crafted read log, by hand"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_late_read.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let outcome = replay(&bag, source_plain_sink_factories, None, None)
+        .expect("a crafted late read is a schedule the gate can reproduce");
+    assert_clean_verdict(&outcome, "a crafted late read");
+    assert_eq!(
+        outcome.topics_checked, 1,
+        "the source's topic is the graph's only one and it was compared: {outcome:?}"
+    );
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            stages,
+            frames_admitted,
+            frames_held,
+            ..
+        } => {
+            assert_eq!(stages, 1, "the consumer's one body stage is gated");
+            assert_eq!(
+                frames_held, 2,
+                "the two steps whose plan admits nothing REFUSED a pop each: {:?}",
+                outcome.read_log_enforcement
+            );
+            assert_eq!(
+                frames_admitted, 5,
+                "and one frame per recorded pop was admitted, at the step the log \
+                 names it: {:?}",
+                outcome.read_log_enforcement
+            );
+        }
+        other => panic!("the crafted bag gates the consumer's read: {other:?}"),
+    }
+}
+
+/// **A LOCKSTEP pass wires the gate and arms nothing**, and says so.
+///
+/// One gating clock orders every rank's publishes against every rank's steps, so
+/// the intra-step arrival the gate pins is already pinned by the contract. The
+/// assertion is on the report's own field rather than on an absence: a pass that
+/// armed the gate on a lockstep bag would still reach exit 0 here, and only this
+/// field's value tells the two apart.
+#[test]
+#[serial]
+fn a_lockstep_pass_wires_the_gate_and_arms_nothing() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_lockstep_control.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::Lockstep);
+
+    let outcome = replay(&bag, source_relay_factories, None, None).expect("the replay runs");
+    assert_clean_verdict(&outcome, "a lockstep bag");
+    assert_eq!(
+        outcome.read_log_enforcement,
+        replay_engine::ReadLogEnforcement::Lockstep,
+        "a lockstep replay arms no gate and states that: {outcome:?}"
+    );
+    // The same recording under the free-run stamp IS gated
+    // (`a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so`),
+    // so the field is answering the coordination and not the graph.
+    assert_eq!(
+        outcome.read_log,
+        replay_engine::ReadLogStatus::VerifiedClean {
+            edges_compared: 1,
+            quarantined_nodes: 0,
+            quarantined_edges: 0,
+        },
+        "the redundant verifier still ran: {outcome:?}"
+    );
+}
+
+/// A recorded input name that resolves to NO wired stage is an exit-2 refusal
+/// naming the edge.
+///
+/// Two legs over one crafted manifest, because the resolution fails in two places
+/// and a fix to either alone would leave the other silent: the node's recorded
+/// table names its input by ANOTHER name, and the table names it at an INDEX this
+/// build wires no stage at. Both are the same refusal token.
+///
+/// Both crafts keep the records PLACEABLE (index 0 of the table exists), which is
+/// what makes this refusal the one that fires: a table with no row for the node at
+/// all, or an empty one, cannot place the node's own records and is declined by
+/// the verifier's census one step earlier, under `read_log_budget_declined`.
+///
+/// The sibling of `two_indices_resolving_to_one_manifest_input_name_is_an_exit_2_refusal`,
+/// and its narrowness control is
+/// `a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so`: the same
+/// recording with its real table exits 0 with the gate armed.
+#[test]
+#[serial]
+fn a_missing_manifest_input_name_is_an_exit_2_refusal() {
+    let steps = 6;
+    let dir = tempfile::tempdir().unwrap();
+
+    for (leg_idx, leg, table) in [
+        (
+            0,
+            "the recorded table names the input by another name",
+            vec!["other".to_string()],
+        ),
+        (
+            1,
+            "the recorded table names it at an index this build wires no stage at",
+            vec!["other".to_string(), "inp".to_string()],
+        ),
+    ] {
+        let mut rec =
+            record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+        rec.input_names
+            .as_mut()
+            .expect("a read-log recording carries the manifest input table")
+            .insert("relay".to_string(), table);
+
+        let bag = dir
+            .path()
+            .join(format!("readlog_unresolved_{leg_idx}.mcap"));
+        write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+        let Err(err) = replay(&bag, source_relay_factories, None, None) else {
+            panic!("{leg}: an unresolvable input name on a gated edge must be REFUSED");
+        };
+        assert_eq!(
+            err.exit_code(),
+            2,
+            "{leg}: the not-replay-grade class: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read_log_input_name_unresolved")
+                && msg.contains("relay.inp")
+                && msg.contains("Re-record"),
+            "{leg}: the refusal names the cause token, the edge and the remedy: {msg}"
+        );
+    }
+}
+
+/// An OVERFLOW MARKER on a gated stage is an exit-2 refusal naming the stage and
+/// the records it dropped.
+///
+/// The marker says `k` records that would have sat at this position were dropped
+/// at the staging rim, each having consumed an unknown number of frames, so every
+/// later pop count on the stage is a floor and no admission schedule can be built
+/// from it. A replay that gated on the surviving records would withhold frames the
+/// recording really read.
+///
+/// The marker is crafted rather than provoked: a rim overflow needs a run whose
+/// stage drops records, which is a property of the recorder's merge cadence
+/// rather than of the graph. Its narrowness control is the positive arm above,
+/// whose identical recording carries no marker and exits 0.
+#[test]
+#[serial]
+fn an_overflow_marker_on_a_gated_stage_is_an_exit_2_refusal() {
+    let steps = 6;
+    const MARKER_STEP: u64 = 2;
+    const DROPPED_RECORDS: u32 = 3;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == MARKER_STEP)
+        .expect("the step-2 kind-6 record exists");
+    let marker = TraceRingRecord {
+        step: MARKER_STEP,
+        // The marker serves no frame.
+        fire_time_ns: READ_OUTCOME_NO_FRAME,
+        // The aux word's low 32 bits carry the records dropped in this window.
+        duration_ns: u64::from(DROPPED_RECORDS),
+        node_idx: 1,
+        global_level: pack_read_outcome_meta(
+            0,
+            cerulion_core::trace_ring::READ_OUTCOME_TRUNCATED,
+            ReadSiteRole::Unstamped,
+        ),
+        record_type: RECORD_TYPE_READ_OUTCOME,
+        reserved: 0,
+    };
+    rec.trace.insert(at + 1, marker);
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_overflow_marker.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let err = replay(&bag, source_relay_factories, None, None)
+        .expect_err("a marked hole in a gated stage's read stream must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_record_dropped")
+            && msg.contains("relay")
+            && msg.contains(&DROPPED_RECORDS.to_string())
+            && msg.contains("Re-record"),
+        "the refusal names the cause token, the stage, the count and the remedy: {msg}"
     );
 }

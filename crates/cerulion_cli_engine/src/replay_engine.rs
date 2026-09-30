@@ -16434,6 +16434,122 @@ mod narrow_served_seq_tests {
 }
 
 #[cfg(test)]
+mod admission_cursor_tests {
+    use super::*;
+    use cerulion_core::read_outcome::DueRead;
+
+    fn at(step: u64, due: Vec<DueRead>) -> replay_inject::StepAdmission {
+        replay_inject::StepAdmission { step, due }
+    }
+
+    fn served(seq: u32) -> DueRead {
+        DueRead::pops(1, Some(seq))
+    }
+
+    /// A step the plan NAMES installs that step's entry, zero-pop entry
+    /// included; a step it does not name installs an EMPTY table.
+    ///
+    /// The two are the same declaration to the core (an armed stage whose table
+    /// omits a step reads nothing there), and both must reach it: a cursor that
+    /// skipped forward to the next entry would spend step 5's admission at step
+    /// 4, which is the intra-step arrival the gate exists to pin.
+    #[test]
+    fn a_recorded_none_step_carries_an_empty_table_and_is_not_omitted() {
+        let mut cursor = AdmissionCursor::new(vec![
+            at(4, vec![DueRead::nothing()]),
+            at(6, vec![served(7)]),
+        ]);
+        cursor.take_at(4).expect("step 4 is installed");
+        assert_eq!(
+            cursor.due(),
+            &[DueRead::nothing()],
+            "the recorded none is INSTALLED as a zero quota"
+        );
+        cursor.take_at(5).expect("step 5 is installed");
+        assert!(
+            cursor.due().is_empty(),
+            "a step the plan does not name installs an empty table"
+        );
+        cursor.take_at(6).expect("step 6 is installed");
+        assert_eq!(
+            cursor.due(),
+            &[served(7)],
+            "and step 6 spends its own entry"
+        );
+    }
+
+    /// Entries below the first executed step are DROPPED, never coalesced into
+    /// it.
+    ///
+    /// A plan is built over the whole rank stream while a resumed pass executes a
+    /// slice of it. `SteeredCursor::due_before` answers the same shape with `<=`,
+    /// which makes an earlier entry due at the first executed step; admitting
+    /// here what the recording admitted three steps earlier is exactly the
+    /// coalescing that must not happen.
+    #[test]
+    fn entries_below_the_first_executed_step_are_dropped_at_construction() {
+        let mut cursor = AdmissionCursor::new(vec![
+            at(1, vec![served(1)]),
+            at(2, vec![served(2)]),
+            at(5, vec![served(5)]),
+        ]);
+        cursor.skip_below(5);
+        assert_eq!(
+            cursor.unspent_steps(),
+            1,
+            "the two entries below the first executed step are retired"
+        );
+        cursor.take_at(5).expect("step 5 is installed");
+        assert_eq!(
+            cursor.due(),
+            &[served(5)],
+            "and the first executed step spends its OWN entry, not the retired ones"
+        );
+    }
+
+    /// An entry below the current step once the loop has started is an INTERNAL
+    /// error, never a silent coalesce.
+    ///
+    /// The step loop walks the rank's recorded boundaries monotonically and
+    /// `skip_below` retires everything under the first executed step, so a cursor
+    /// that is behind means an install was skipped. Relaxing the `at == step`
+    /// test to `<=` turns exactly this case into step 4's admission spent at step
+    /// 5.
+    #[test]
+    fn an_entry_below_the_current_step_after_the_loop_started_is_an_internal_error() {
+        let mut cursor = AdmissionCursor::new(vec![at(4, vec![served(4)]), at(5, vec![served(5)])]);
+        let err = cursor
+            .take_at(5)
+            .expect_err("the step-4 entry cannot be spent at step 5");
+        let ReplayError::Internal { reason } = err else {
+            panic!("a skipped install is an internal error, got {err:?}");
+        };
+        assert!(
+            reason.contains("step 4") && reason.contains("step 5"),
+            "the error names both steps: {reason}"
+        );
+    }
+
+    /// Two steps' admissions are never coalesced: each step's table is its own
+    /// entry and the cursor spends exactly one per install.
+    #[test]
+    fn two_steps_admissions_are_never_coalesced() {
+        let mut cursor = AdmissionCursor::new(vec![at(4, vec![served(7)]), at(5, vec![served(8)])]);
+        cursor.skip_below(4);
+        cursor.take_at(4).expect("step 4 is installed");
+        assert_eq!(cursor.due(), &[served(7)]);
+        assert_eq!(cursor.unspent_steps(), 1, "one entry left");
+        cursor.take_at(5).expect("step 5 is installed");
+        assert_eq!(
+            cursor.due(),
+            &[served(8)],
+            "step 5 admits ITS frame, never step 4's as well"
+        );
+        assert_eq!(cursor.unspent_steps(), 0, "the plan is spent");
+    }
+}
+
+#[cfg(test)]
 mod steered_cursor_tests {
     use super::*;
 
