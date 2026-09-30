@@ -2381,7 +2381,11 @@ mod tests {
         // SAFETY: `st` is zeroed first; `fstat` fills it on success.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: FFI fstat on the descriptor this test opened.
-        assert_eq!(unsafe { libc::fstat(dead, &mut st) }, 0, "fstat the fixture");
+        assert_eq!(
+            unsafe { libc::fstat(dead, &mut st) },
+            0,
+            "fstat the fixture"
+        );
         assert!(
             (st.st_size as usize) >= doorbell_page_bytes_for_test(),
             "the object the fixture created must itself have been sized, so the \
