@@ -4467,8 +4467,8 @@ fn required_contexts() -> Vec<String> {
 /// The rows of one export text, refusing a row that is not a bare name and a
 /// name that appears twice.
 ///
-/// A duplicate passes every count this walk keeps while standing for one context
-/// only, so the length floor reads satisfied over nineteen names.
+/// A duplicate keeps the row count the exact-count gate reads while standing for
+/// one context only, so one required name judges no job.
 fn required_contexts_of(where_from: &str, raw: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -4595,8 +4595,8 @@ enum NamePart<'a> {
 
 /// Split a job `name:` into its literal pieces and its placeholders.
 ///
-/// `None` for a placeholder that never closes, which is a name this walk cannot
-/// read and therefore one it pairs with nothing.
+/// `None` when a `${{` never closes; the caller decides what such a name pairs
+/// with.
 fn name_parts(name: &str) -> Option<Vec<NamePart<'_>>> {
     let mut parts: Vec<NamePart<'_>> = Vec::new();
     let mut rest = name;
@@ -4617,8 +4617,10 @@ fn name_parts(name: &str) -> Option<Vec<NamePart<'_>>> {
     }
 }
 
-/// Every name the job's own matrix can expand this `name:` into, or `None` when
-/// a placeholder reads something the matrix does not declare.
+/// Every name the job's own matrix can expand this `name:` into, or an `Err`
+/// naming the placeholder when it reads something outside `matrix.`, a key these
+/// legs do not carry (a matrix with `include:` or `exclude:` carries none), a key
+/// whose legs are empty, or more than 256 names.
 ///
 /// A matrix job reports one context PER LEG, so the leg values are what the
 /// placeholders stand for. Reading a placeholder as "any text at all" would let
@@ -5926,10 +5928,9 @@ fn a_job_name_produces_only_the_contexts_its_matrix_can_report() {
     );
 }
 
-/// The export refuses a row that is not a bare name and a name that appears
-/// twice.
+/// Twenty distinct rows read as twenty, past a comment row and a blank row.
 #[test]
-fn the_required_context_export_refuses_a_duplicate_row() {
+fn the_required_context_export_reads_twenty_distinct_rows() {
     let twenty: Vec<String> = (0..20).map(|n| format!("Check {n}")).collect();
     let text = format!("# a header\n\n{}\n", twenty.join("\n"));
     assert_eq!(
@@ -5937,18 +5938,9 @@ fn the_required_context_export_refuses_a_duplicate_row() {
         20,
         "twenty distinct rows read as twenty"
     );
-    let doubled = text.replace("Check 19", "Check 7");
-    assert_eq!(
-        doubled
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-            .count(),
-        20,
-        "the duplicated text still carries twenty rows, which is the hole"
-    );
 }
 
-/// And it says which name is doubled.
+/// A doubled name is refused, and the refusal says which name.
 #[test]
 #[should_panic(expected = "names `Check 7` twice")]
 fn a_duplicated_export_row_is_refused_by_name() {
