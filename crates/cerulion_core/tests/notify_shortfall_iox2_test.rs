@@ -60,7 +60,8 @@
 //!
 //! * [`an_undrained_live_listener_is_never_a_shortfall`], the 0.10 contract,
 //!   as a number rather than a silence: twenty thousand undrained notifies, all
-//!   delivered, zero counted.
+//!   reaching BOTH listeners (the publisher's own and a foreign consumer that
+//!   never drains, still registered at the end), zero counted.
 //! * [`an_ingress_publisher_reports_nothing_undelivered_across_a_long_run`],
 //!   the same contract on the raw ingress path that produced the original
 //!   flood, through real loans and sends rather than bare notifies.
@@ -261,7 +262,7 @@ fn kill_a_live_consumer(root: &IsolatedRoot, publisher: &CerulionPublisher) {
 #[test]
 #[serial]
 fn an_undrained_live_listener_is_never_a_shortfall() {
-    let (_root, _transport, publisher) = parent_publisher("undrained");
+    let (_root, transport, publisher) = parent_publisher("undrained");
 
     assert_eq!(
         publisher.notify_undelivered_count(),
@@ -269,24 +270,64 @@ fn an_undrained_live_listener_is_never_a_shortfall() {
         "a fresh publisher must have zero undelivered notifies"
     );
 
-    // The publisher's own listener is a real, connected recipient: without
-    // that, every count below would be vacuous.
+    // A FOREIGN undrained listener, and it is the subject of the arm.
+    //
+    // The count is what moves: with the publisher's own listener alone every
+    // number below is 1, which a notify path that reached exactly one connection,
+    // or none and reported one, would satisfy. At 2 the counts discriminate.
+    //
+    // What this witnesses and what it does not: `triggered` counts connections
+    // iceoryx2 accepted the notify on, so 2 says the consumer's registration is
+    // reachable, not that its doorbell byte landed. After the first notify the
+    // consumer holds an unconsumed wake, and this file's header records that a
+    // notify into that state returns success without touching the doorbell. The
+    // reachability is the property the read and publish paths rest on, and it is
+    // the one asserted.
+    let listeners_before = publisher.event_listener_count_for_test();
+    let undrained_consumer = transport
+        .create_subscriber(TOPIC)
+        .expect("an undrained consumer on the topic");
+    // DERIVED, not hand written, and read back off the event service: a create
+    // that returned Ok without registering a listener fails here rather than
+    // quietly restoring the self-listener-only measurement.
+    let recipients = listeners_before + 1;
+    assert_eq!(
+        publisher.event_listener_count_for_test(),
+        recipients,
+        "precondition: creating the consumer must add exactly one listener to the \
+         topic's event service (it was {listeners_before} before), or the counts \
+         below are about the publisher's own listener alone"
+    );
+
     let first = publisher.notify_sent_sample().expect("first notify");
     assert_eq!(
-        first, 1,
-        "the publisher's OWN listener is the one recipient of its own notify"
+        first, recipients,
+        "the publisher's own listener and the undrained consumer's are both \
+         recipients of its notify"
     );
 
     for i in 0..UNDRAINED_NOTIFIES {
         let triggered = publisher.notify_sent_sample().expect("notify");
         assert_eq!(
-            triggered, 1,
-            "notify {i} reached {triggered} listeners, not 1: a listener nobody drains \
-             must stay reachable forever (the doorbell carries one byte, a full \
-             doorbell is swallowed, and a notify into an already-notified listener \
-             skips the send)"
+            triggered, recipients,
+            "notify {i} reached {triggered} listeners, not {recipients}: a listener \
+             nobody drains must stay reachable forever (the doorbell carries one byte, \
+             a full doorbell is swallowed, and a notify into an already-notified \
+             listener skips the send)"
         );
     }
+
+    // The consumer outlived every notify above. Without this the arm could not
+    // tell 20,000 notifies at two listeners from a consumer that deregistered on
+    // notify 2 and 19,999 notifies at one, since the oracle below reads zero
+    // either way.
+    assert_eq!(
+        publisher.event_listener_count_for_test(),
+        recipients,
+        "the undrained consumer's listener must still be registered after the run, \
+         or the count above stopped being about it partway through"
+    );
+    drop(undrained_consumer);
 
     assert_eq!(
         publisher.notify_undelivered_count(),
@@ -323,6 +364,27 @@ fn an_ingress_publisher_reports_nothing_undelivered_across_a_long_run() {
     let mut ingress = transport
         .create_ingress_publisher(TOPIC, MaxSliceLen::const_new(256))
         .expect("ingress publisher");
+    // The same foreign undrained listener as the bare-notify arm, for the same
+    // reason: without it every publish below notifies the publisher's own
+    // listener and nothing else, so every count is 1 and nothing discriminates.
+    //
+    // 5,000 publishes into this consumer's depth-4 queue with nobody taking rests
+    // on iceoryx2's `enable_safe_overflow`, which the transport never sets and so
+    // inherits as an UPSTREAM default of true: the publisher recycles the oldest
+    // slot instead of refusing the send. If that default ever flips, the
+    // `expect("publish_raw")` below panics, which is loud rather than silent.
+    let listeners_before = ingress.event_listener_count_for_test();
+    let undrained_consumer = transport
+        .create_subscriber(TOPIC)
+        .expect("an undrained consumer on the topic");
+    let recipients = listeners_before + 1;
+    assert_eq!(
+        ingress.event_listener_count_for_test(),
+        recipients,
+        "precondition: creating the consumer must add exactly one listener to the \
+         topic's event service (it was {listeners_before} before), or this arm \
+         measures the publisher's own listener alone"
+    );
 
     let payload = [0xAAu8, 0xBB, 0xCC, 0xDD];
     for seq in 0..GUARANTEE_PUBLISHES {
@@ -335,15 +397,33 @@ fn an_ingress_publisher_reports_nothing_undelivered_across_a_long_run() {
     // DEREGISTERING between an elision-armed publisher's count read and its
     // notify, and this environment excludes it twice over: an ingress publisher
     // is never elision-armed, so every classification takes the self-read path;
-    // and the topic's only listener is the publisher's own, created before the
-    // loop and alive after it, so nothing attaches or detaches inside the
-    // window.
+    // and both of the topic's listeners (the publisher's own and the undrained
+    // consumer's) are created before the loop and alive after it, so nothing
+    // attaches or detaches inside the window.
+    // Before the oracle, not after: `notify_undelivered_count` reads zero whether
+    // the topic carries two listeners or one, so a consumer that went away at
+    // publish 1 would leave the zero below green and silently about the self
+    // listener alone.
+    //
+    // This covers every publish above because of what is in this process, not
+    // because a count cannot return to its old value: there is one consumer, held
+    // in a local binding dropped after the assert, the arm is `#[serial]`, and no
+    // child process touches this topic. A net zero swap, which IS what restores a
+    // count, needs a second consumer, and there is none.
+    assert_eq!(
+        ingress.event_listener_count_for_test(),
+        recipients,
+        "the undrained consumer's listener must still be registered after \
+         {GUARANTEE_PUBLISHES} publishes, or the zero below is about the \
+         publisher's own listener"
+    );
     assert_eq!(
         ingress.notify_undelivered_count(),
         0,
         "{GUARANTEE_PUBLISHES} raw ingress publishes, each notifying a listener nobody \
          drains, must report ZERO undelivered"
     );
+    drop(undrained_consumer);
 }
 
 /// The apparatus arm: the condition the detector exists for is reachable, and
