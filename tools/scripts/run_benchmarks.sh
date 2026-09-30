@@ -3,11 +3,11 @@
 #
 # Usage:
 #   ./tools/scripts/run_benchmarks.sh          # smoke + CI latency gate (the default;
-#                                        # on a host with no captured smoke
-#                                        # baseline the smoke gate is SKIPPED
-#                                        # loudly and the latency gate still
-#                                        # runs — a regression or a setup
-#                                        # failure still stops it)
+#                                              # on a host with no captured smoke
+#                                              # baseline the smoke gate is SKIPPED
+#                                              # loudly and the latency gate still
+#                                              # runs, and a regression or a setup
+#                                              # failure still stops it)
 #   ./tools/scripts/run_benchmarks.sh smoke    # benches/latency smoke gate (~minutes)
 #   ./tools/scripts/run_benchmarks.sh full     # benches/latency full sweep (hours; Linux + Docker)
 #   ./tools/scripts/run_benchmarks.sh latency  # CI latency threshold test

@@ -850,10 +850,15 @@ fn the_watched_accessor_set_matches_the_singletons_own_doors() {
 /// cannot read — e.g. a sharding script that derives package names from a
 /// matrix variable rather than naming them on the `run:` line.
 ///
-/// Empty today. The walk already treats a `run:` line that invokes a
-/// `scripts/*.sh` AND names the package as serial (the script owns the flag),
-/// so this list is only for the case where the package name never appears in
-/// the workflow text at all.
+/// Empty today, and NOT the mechanism for a script invocation. A workflow line
+/// naming `tools/scripts/<name>.sh` or `scripts/<name>.sh` (a leading `./` is
+/// stripped) is read, not assumed: the package comes from `-p` or, for a
+/// `ci_test_shard.sh` line, from the first token after the script that is a
+/// bare name (no leading `-`, none of `$ { } .`, not a number), and the POLICY
+/// comes from `script_thread_policy`, which reads that script's own text. So
+/// `ci_test_shard.sh` classifies its package as NEXTEST, not serial. This list
+/// is consulted only where the walk reached NEITHER verdict: no line named the
+/// package, or every line that did read as parallel.
 const SERIAL_BY_RUNNER: &[(&str, &str)] = &[];
 
 /// `tests/` HELPER modules that call the singleton, with why that is safe.
