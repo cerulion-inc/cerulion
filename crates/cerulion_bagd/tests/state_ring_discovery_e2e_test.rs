@@ -41,8 +41,8 @@ use cerulion_bagd::{run_bagd, BagdConfig, BagdError, BagdSummary, StateCoverage,
 use cerulion_core::state::StateSink;
 use cerulion_core::state_arm::MappedStateArm;
 use cerulion_core::state_ring::{
-    encode_record, state_ring_tag, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL,
-    STATE_RING_RESERVED_RANK,
+    encode_record, state_ring_tag, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL_V2,
+    STATE_RECORD_FORMAT_VERSION, STATE_RING_RESERVED_RANK,
 };
 use cerulion_core::transport::TransportManager;
 
@@ -137,6 +137,15 @@ struct Rank {
     /// Held so the ring's SHM name survives for the rank's lifetime — its drop
     /// unlinks it.
     _owner: StateRingOwner,
+    /// The POSIX SHM OBJECT name of this rank's ring, taken from the owner at
+    /// arming time.
+    ///
+    /// This is the name the recorder hands on into the capture manifest, so it
+    /// is what `StateNodeCoverage::ring` and the keys of `ring_ranks` hold. It
+    /// is NOT the arm tag `state_ring_tag` builds: that tag is hashed into a
+    /// fixed length object name, and the two never compare equal. A test that
+    /// wants to pin the manifest to the ring it armed has to hold this name.
+    ring_name: String,
     rank: u32,
     run_id: u64,
 }
@@ -147,10 +156,12 @@ impl Rank {
         let ring_tag = state_ring_tag(tag, rank).expect("an ordinary rank names a ring");
         let mut owner = StateRingOwner::create(&ring_tag, RING_RECORDS, rank, run_id, &[node_id])
             .expect("create this rank's state ring");
+        let ring_name = owner.name().to_string();
         let producer = owner.producer().expect("the single producer");
         Self {
             producer,
             _owner: owner,
+            ring_name,
             rank,
             run_id,
         }
@@ -238,8 +249,10 @@ impl Rank {
                 step,
                 node_idx: 0,
                 part: 0,
-                kind: RECORD_KIND_FINAL,
+                kind: RECORD_KIND_FINAL_V2,
                 len: payload.len() as u32,
+                rank: self.rank,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &payload,
         )
@@ -325,6 +338,64 @@ fn ranks_armed_before_and_after_bag_creation_are_all_discovered_by_name() {
         "the manifest must say WHICH ranks this recording's anchors came from"
     );
     assert!(cov.ranks_missing.is_empty());
+    // The ring-to-rank JOIN: a record names its rank and a node entry names its
+    // ring, and this is what ties the two. Its keys are the DECLARED names, the
+    // same names `StateNodeCoverage::ring` carries.
+    //
+    // The WHOLE MAP, not the sorted values. A sorted value list says only that
+    // the three ranks appear once each, so it passes on a join that gives rank
+    // 0's ring rank 2 and rank 2's ring rank 0, which is the one wrong answer
+    // this map exists to prevent, since the reader uses it to decide whose
+    // records a ring's anchors are.
+    //
+    // ITS KEYS ARE THE RING'S POSIX SHM OBJECT NAMES, the names
+    // `StateRingOwner::name` hands the recorder, which are minted by hashing
+    // the arm tag into a fixed length name. The arm tag `state_ring_tag`
+    // builds is the INPUT to that hash and never equals the name, so nothing
+    // here may compare the manifest against an arm tag.
+    //
+    // The pairing is therefore anchored to the ARMING above rather than
+    // restated from the manifest it is checking: `Rank::arm(&tag, 0, "n0")`
+    // armed rank 0's ring and `r0.ring_name` is the object name that ring was
+    // created under, so that name is rank 0's, and the same for r1 and r2.
+    let expected_ring_ranks: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::from([
+            (r0.ring_name.clone(), 0u32),
+            (r1.ring_name.clone(), 1u32),
+            (r2.ring_name.clone(), 2u32),
+        ]);
+    assert_eq!(
+        expected_ring_ranks.len(),
+        3,
+        "three distinct rings, or the hand map collapsed and asserts nothing: {:?}",
+        cov.nodes
+    );
+    assert_eq!(
+        cov.ring_ranks, expected_ring_ranks,
+        "WHICH ring is WHICH rank, not merely that all three ranks appear: {:?}",
+        cov.ring_ranks
+    );
+    // And the node join on top of it, so the manifest is pinned to the rank
+    // each ring was armed under AND to the node that lives on it, neither one
+    // standing in for the other.
+    for (rank, id, armed) in [(0u32, "n0", &r0), (1, "n1", &r1), (2, "n2", &r2)] {
+        assert_eq!(
+            armed.rank, rank,
+            "the ring being named here is the one armed under rank {rank}"
+        );
+        assert_eq!(
+            cov.nodes[id].ring, armed.ring_name,
+            "node {id} sits on the ring this test armed under rank {rank}"
+        );
+        assert_eq!(
+            cov.ring_ranks[&armed.ring_name], rank,
+            "and the join reads that ring back as rank {rank}"
+        );
+    }
+    assert_eq!(
+        cov.state_record_format_version,
+        Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION)
+    );
     assert_eq!(
         cov.rings_declared, 0,
         "nothing was declared — every ring here was found by name"
@@ -493,8 +564,10 @@ fn a_ring_at_the_departure_sentinels_name_is_never_adopted() {
                 step: 10,
                 node_idx: 0,
                 part: 0,
-                kind: RECORD_KIND_FINAL,
+                kind: RECORD_KIND_FINAL_V2,
                 len: payload.len() as u32,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &payload,
         );

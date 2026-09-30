@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """leak_scan.py: the in-tree leak guard.
 
-Keeps machine names, addresses, home paths, logins, people and location
-metadata out of everything this repository publishes: file contents, file and
-branch names, commit messages and identities, pull request text, and media
-containers.
+Keeps machine names, addresses, home paths, logins, people, co-author trailers
+and location metadata out of everything this repository publishes: file
+contents, file and branch names, commit messages and identities, pull request
+text, and media containers.
 
 Two tiers:
   GENERIC classes ship here. They are SHAPES only (a home path, an address in
@@ -153,10 +153,15 @@ TAGS = ('host', 'device', 'person', 'login', 'lan', 'nickname', 'slug', 'hygiene
 # The reference classes are here too: when a reference is unopenable BECAUSE the
 # repository is closed, the slug it names is itself the secret, and a CI log
 # outlives the force-push that scrubs the branch.
+# The attribution trailer is here for the same reason. Its match reaches one
+# character past the colon, so what it would print is the trailer and the
+# author's INITIAL; on a public pull request that initial arrives with a file
+# and a line number beside it, which is more of a person than a log should
+# carry. Masked, the finding still says where and what.
 IDENTITY_CLASSES = frozenset((
     'lan-addr', 'cgnat-addr', 'home-mac', 'home-linux', 'home-win', 'home-tilde', 'temp-root',
     'login-at-host', 'mdns-local', 'host-field', 'overlay-dns', 'email-personal', 'acl-tag',
-    'ref-unopenable', 'ref-unverified'))
+    'ref-unopenable', 'ref-unverified', 'attribution-trailer'))
 MASK_RX = re.compile(r'[^\W_]')
 # What is HARD on a CONVERSATION surface: an issue body, an issue comment, a
 # review comment. Exactly the classes whose finding is a value a reader should
@@ -165,6 +170,9 @@ MASK_RX = re.compile(r'[^\W_]')
 # prose is a house style note about text WE write, and turning it into a label,
 # an ask and a red run on a contributor's thread is the guard crying wolf on a
 # page that leaks nothing. The private tier stays hard here as everywhere.
+# The attribution trailer is one of them: a pull request BODY is scanned as a
+# conversation, and a trailer there names a second author on this repository's
+# own record, which is an identity statement rather than a house style note.
 CONVERSATION_HARD = IDENTITY_CLASSES
 
 # Published placeholder vocabularies. Explicit sets, never a length rule.
@@ -597,6 +605,17 @@ def build_classes(neuter=None):
         [DASH_EN, DASH_EM, DASH_ESCAPE], None,
         {'tree': _sev_dash, 'diff': _sev_dash, 'messages': 'HARD', 'names': 'REPORT'},
         'range 3' + DASH_EN + '5', what='an en dash or an em dash')
+    # A co-author trailer names a second author on a commit this repository
+    # publishes under one identity, and a squash concatenates every message it
+    # folds, so one trailer reaches main as text on a commit nobody can attach
+    # it to. The shape is assembled from fragments, like every literal here.
+    # A real trailer is a git trailer: it STARTS its line and names someone. Prose
+    # explaining the format mid-sentence is not one, and an authorless template
+    # is not one either, so the match is anchored and needs a name after the
+    # colon. Both shapes appear in documentation and neither is an attribution.
+    add('attribution-trailer', '^[ \t]*co-?' + 'authored-by' + r'[ \t]*:[ \t]*\S',
+        ['authored-by'], None, CONTENT_HARD,
+        'Co-' + 'authored-by' + ': A Contributor', what='a co-author trailer')
     return out
 
 
@@ -3162,7 +3181,7 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 236
+EXPECTED_ARMS = 238
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
@@ -4755,6 +4774,22 @@ def self_test(out, base_env, argv0):
         arm('conversation-the-same-body-is-still-hard-on-a-commit-surface',
             rc == EXIT_HIT and any(c == 'style-dash' for c, p, n in hits(lines)),
             'rc=%d' % rc)
+        # An attribution trailer is an identity statement, so a pull request BODY,
+        # which is scanned as a conversation, is still refused for one; a trailer
+        # with no author after the colon is a worked example of the format.
+        trailer_body = 'a change worth making\n\n' + 'Co-' + 'authored-by' + ': A Contributor\n'
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'pr-body',
+                         '--conversation', '--no-allow'] + mine,
+                        dict(refenv, LG_BODY=trailer_body), repo_ref)
+        arm('conversation-an-attribution-trailer-is-still-hard',
+            rc == EXIT_HIT and any(c == 'attribution-trailer' for c, p, n in hits(lines)),
+            'rc=%d' % rc)
+        empty_body = 'the format is ' + 'Co-' + 'authored-by' + ': followed by a name\n'
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'pr-body',
+                         '--conversation', '--no-allow'] + mine,
+                        dict(refenv, LG_BODY=empty_body), repo_ref)
+        arm('conversation-an-authorless-trailer-example-is-not-a-finding',
+            not any(c == 'attribution-trailer' for c, p, n in hits(lines)), 'rc=%d' % rc)
         # ... and a value in the same body is still hard WITH --conversation
         rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
                          '--conversation', '--no-allow'] + mine,
@@ -4764,8 +4799,9 @@ def self_test(out, base_env, argv0):
         arm('conversation-keeps-the-identity-and-reference-classes-hard',
             rc == EXIT_HIT and {'home-mac', REF_DEFECT} <= got and 'style-dash' not in got,
             str(sorted(got)))
-        arm('conversation-hard-set-is-the-identity-classes',
+        arm('conversation-hard-set-is-the-identity-classes-and-the-trailer',
             CONVERSATION_HARD == IDENTITY_CLASSES
+            and 'attribution-trailer' in CONVERSATION_HARD
             and 'style-dash' not in CONVERSATION_HARD
             and 'overlay-word' not in CONVERSATION_HARD
             and REF_DEFECT in CONVERSATION_HARD and REF_UNVERIFIED in CONVERSATION_HARD)

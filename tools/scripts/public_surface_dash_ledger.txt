@@ -73,7 +73,7 @@
 7 crates/cerulion_cli_engine/src/replay_inject.rs
 11 crates/cerulion_cli_engine/src/replay_rank.rs
 27 crates/cerulion_cli_engine/src/replay_rederive.rs
-10 crates/cerulion_cli_engine/src/replay_state.rs
+9 crates/cerulion_cli_engine/src/replay_state.rs
 13 crates/cerulion_cli_engine/src/resim_cmd.rs
 2 crates/cerulion_cli_engine/src/robot_cmd.rs
 43 crates/cerulion_cli_engine/src/ros2_cmd.rs

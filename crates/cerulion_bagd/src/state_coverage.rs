@@ -40,8 +40,8 @@
 use std::collections::BTreeMap;
 
 use cerulion_core::state_ring::{
-    SkipCause, StateRecordHeader, RECORD_KIND_FINAL, RECORD_KIND_SKIP, STATE_RECORD_HEADER_SIZE,
-    STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE,
+    SkipCause, StateRecordHeader, RECORD_KIND_FINAL_V2, RECORD_KIND_SKIP_V2,
+    STATE_RECORD_HEADER_SIZE, STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,7 +49,18 @@ use serde::{Deserialize, Serialize};
 pub const STATE_COVERAGE_ATTACHMENT: &str = "__cerulion/state_coverage.json";
 
 /// The [`StateCoverage`] wire version.
-pub const STATE_COVERAGE_VERSION: u32 = 1;
+///
+/// It went from 1 to 2 when the manifest gained
+/// [`state_record_format_version`](StateCoverage::state_record_format_version).
+/// That key is the BAG LEVEL discriminator for the record layout, and it is what
+/// a reader gates on: a state record written before format version 1 carries no
+/// version of its own, so the only place the backward direction can be answered
+/// is the bag.
+///
+/// It is a DIFFERENT constant from `cerulion_core::state_ring`'s
+/// `STATE_RECORD_FORMAT_VERSION`. This one versions the MANIFEST; that one
+/// versions the RECORD.
+pub const STATE_COVERAGE_VERSION: u32 = 2;
 
 // ===========================================================================
 // The ledger — pure, header-only
@@ -176,7 +187,7 @@ impl StateAnchorLedger {
 
     /// Offer one whole record's BYTES, in ring order.
     ///
-    /// Reads the 32-byte header (and, for a SKIP, its 4-byte cause word) and
+    /// Reads the 40-byte header (and, for a SKIP, its 4-byte cause word) and
     /// nothing else — the payload is never retained.
     pub fn feed(&mut self, record: &[u8]) {
         if record.len() < STATE_RECORD_SIZE as usize {
@@ -213,7 +224,7 @@ impl StateAnchorLedger {
         self.records += 1;
         let key = (header.run_id, header.step, header.node_idx);
 
-        if header.kind == RECORD_KIND_SKIP {
+        if header.kind == RECORD_KIND_SKIP_V2 {
             // A skip is self-contained and AUTHORITATIVE: whatever was in flight
             // for this anchor is void, and the writer just said why.
             self.open.remove(&key);
@@ -236,7 +247,7 @@ impl StateAnchorLedger {
             return;
         }
 
-        let is_final = header.kind == RECORD_KIND_FINAL;
+        let is_final = header.kind == RECORD_KIND_FINAL_V2;
         match self.open.get_mut(&key) {
             None => {
                 if header.part != 0 {
@@ -520,6 +531,39 @@ pub struct StateCoverage {
     pub armed: Option<StateArmCoverage>,
     /// State rings this recorder was ASKED to drain.
     pub rings_declared: usize,
+    /// Ring SHM name to the producer RANK that owned it.
+    ///
+    /// This is what lets a reader build a per-rank index table: a record names
+    /// its rank, a node coverage entry names its `ring`, and this map is the
+    /// join between them. Without it a bag with several rings still cannot say
+    /// which ring a given rank's records came off, which is the ambiguity the
+    /// restore engine refuses on.
+    ///
+    /// EMPTY is not a refusal and not a hole. A capture that carried no
+    /// checkpoint has no rings to name, and the continuous seed is taken at bag
+    /// creation before the sweep has found any, so both write an empty map and
+    /// the continuous one fills it at finalize. A reader meeting an empty map on
+    /// a bag declaring at most one ring falls back to the single-ring table it
+    /// used before this key existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ring_ranks: BTreeMap<String, u32>,
+    /// The state RECORD format this bag's records were written under
+    /// (`cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION` at the writer).
+    ///
+    /// `None` means the bag was written before the key existed, which is
+    /// exactly what a reader needs to know: those records are laid out
+    /// differently, they carry no version of their own, and there is no checksum
+    /// to catch a decode from the wrong offset. So the key is OPTIONAL on the
+    /// wire and REQUIRED by the reader: an absent one is refused BY NAME rather
+    /// than read as version 0, because a manifest that predates the key and a
+    /// manifest whose writer forgot it are the same bytes and the safe reading
+    /// of both is a refusal.
+    ///
+    /// It is written by every manifest THIS build produces, including a capture
+    /// that carried no checkpoint at all: the key states what layout this
+    /// writer's records use, not whether any record exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_record_format_version: Option<u32>,
     /// The producer RANKS whose state rings this recording actually
     /// drained, ascending.
     ///
@@ -656,6 +700,7 @@ impl StateCoverage {
     pub fn for_capture(
         armed: Option<StateArmCoverage>,
         rings_declared: usize,
+        ring_ranks: BTreeMap<String, u32>,
         records: u64,
         nodes: BTreeMap<String, StateNodeCoverage>,
         unattributed_indices: BTreeMap<String, BTreeMap<u32, StateNodeCoverage>>,
@@ -666,6 +711,14 @@ impl StateCoverage {
             attached_mid_run: false,
             armed,
             rings_declared,
+            // A capture's rings ARE embedded in it, so the join a reader needs
+            // is a fact this manifest can state.
+            ring_ranks,
+            // What THIS writer's records are laid out as, which is a claim about
+            // the writer rather than about whether any record exists.
+            state_record_format_version: Some(
+                cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION,
+            ),
             // A capture makes no claim about a run's RANK SPACE: it walked no
             // rank space, so it can witness neither density nor a hole. Empty is
             // the correct answer, not zero-ranks-found.
@@ -924,7 +977,9 @@ pub fn skip_cause_name(raw: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cerulion_core::state_ring::{encode_record, encode_skip_record, RECORD_KIND_CHUNK};
+    use cerulion_core::state_ring::{
+        encode_record, encode_skip_record, RECORD_KIND_CHUNK_V2, STATE_RECORD_FORMAT_VERSION,
+    };
 
     const RUN: u64 = 0xABCD_1234;
 
@@ -938,6 +993,8 @@ mod tests {
                 part,
                 kind,
                 len: len as u32,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &payload,
         )
@@ -948,8 +1005,8 @@ mod tests {
     #[test]
     fn a_two_part_anchor_completes_and_carries_its_step_and_bytes() {
         let mut l = StateAnchorLedger::passthrough();
-        l.feed(&rec(10, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-        l.feed(&rec(10, 0, 1, RECORD_KIND_FINAL, 7));
+        l.feed(&rec(10, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(10, 0, 1, RECORD_KIND_FINAL_V2, 7));
         l.finish();
         let t = &l.nodes()[&0];
         assert_eq!(t.complete, 1);
@@ -964,7 +1021,7 @@ mod tests {
     #[test]
     fn a_zero_length_anchor_is_one_complete_record() {
         let mut l = StateAnchorLedger::passthrough();
-        l.feed(&rec(3, 1, 0, RECORD_KIND_FINAL, 0));
+        l.feed(&rec(3, 1, 0, RECORD_KIND_FINAL_V2, 0));
         l.finish();
         assert_eq!(l.nodes()[&1].complete, 1);
         assert_eq!(l.nodes()[&1].bytes, 0);
@@ -975,10 +1032,10 @@ mod tests {
     #[test]
     fn two_interleaved_node_streams_are_tallied_independently() {
         let mut l = StateAnchorLedger::passthrough();
-        l.feed(&rec(5, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-        l.feed(&rec(5, 1, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-        l.feed(&rec(5, 1, 1, RECORD_KIND_FINAL, 1));
-        l.feed(&rec(5, 0, 1, RECORD_KIND_FINAL, 2));
+        l.feed(&rec(5, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(5, 1, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(5, 1, 1, RECORD_KIND_FINAL_V2, 1));
+        l.feed(&rec(5, 0, 1, RECORD_KIND_FINAL_V2, 2));
         l.finish();
         assert_eq!(l.nodes()[&0].complete, 1);
         assert_eq!(l.nodes()[&1].complete, 1);
@@ -990,11 +1047,11 @@ mod tests {
     #[test]
     fn a_lost_part_tears_the_anchor_exactly_once() {
         let mut l = StateAnchorLedger::passthrough();
-        l.feed(&rec(8, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(8, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
         // part 1 is lost
-        l.feed(&rec(8, 0, 2, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-        l.feed(&rec(8, 0, 3, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-        l.feed(&rec(8, 0, 4, RECORD_KIND_FINAL, 1));
+        l.feed(&rec(8, 0, 2, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(8, 0, 3, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(8, 0, 4, RECORD_KIND_FINAL_V2, 1));
         l.finish();
         let t = &l.nodes()[&0];
         assert_eq!(t.torn, 1, "one broken anchor is ONE verdict");
@@ -1007,7 +1064,13 @@ mod tests {
     #[test]
     fn a_short_non_final_chunk_tears_the_anchor() {
         let mut l = StateAnchorLedger::passthrough();
-        l.feed(&rec(9, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD - 1));
+        l.feed(&rec(
+            9,
+            0,
+            0,
+            RECORD_KIND_CHUNK_V2,
+            STATE_RECORD_PAYLOAD - 1,
+        ));
         l.finish();
         assert_eq!(l.nodes()[&0].torn, 1);
     }
@@ -1017,7 +1080,7 @@ mod tests {
     #[test]
     fn an_anchor_left_open_at_finish_is_torn_and_counted_truncated() {
         let mut l = StateAnchorLedger::passthrough();
-        l.feed(&rec(11, 2, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(11, 2, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
         assert_eq!(l.truncated(), 0, "not yet — the stream has not ended");
         l.finish();
         assert_eq!(l.truncated(), 1);
@@ -1032,8 +1095,15 @@ mod tests {
     #[test]
     fn a_skip_voids_the_anchor_in_flight_and_names_its_cause() {
         let mut l = StateAnchorLedger::passthrough();
-        l.feed(&rec(12, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-        l.feed(&encode_skip_record(RUN, 12, 0, SkipCause::Contended, "n"));
+        l.feed(&rec(12, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&encode_skip_record(
+            RUN,
+            12,
+            0,
+            0,
+            SkipCause::Contended,
+            "n",
+        ));
         l.finish();
         let t = &l.nodes()[&0];
         assert_eq!(t.skipped, 1);
@@ -1061,14 +1131,14 @@ mod tests {
     fn an_armed_ledger_discards_the_partial_head_then_judges_everything() {
         let mut l = StateAnchorLedger::armed();
         // The tail of an anchor whose head was committed before the attach.
-        l.feed(&rec(20, 0, 3, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-        l.feed(&rec(20, 0, 4, RECORD_KIND_FINAL, 5));
+        l.feed(&rec(20, 0, 3, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(20, 0, 4, RECORD_KIND_FINAL_V2, 5));
         assert!(l.is_armed(), "still discarding — no part 0 has arrived");
         assert_eq!(l.discarded(), 2);
         assert!(l.nodes().is_empty(), "a discarded head tallies NOTHING");
         // The next whole anchor is judged normally.
-        l.feed(&rec(21, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-        l.feed(&rec(21, 0, 1, RECORD_KIND_FINAL, 4));
+        l.feed(&rec(21, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(21, 0, 1, RECORD_KIND_FINAL_V2, 4));
         l.finish();
         assert!(!l.is_armed());
         assert_eq!(
@@ -1091,8 +1161,8 @@ mod tests {
     #[test]
     fn a_passthrough_ledger_tears_the_same_headless_anchor_the_armed_one_discards() {
         let mut l = StateAnchorLedger::passthrough();
-        l.feed(&rec(20, 0, 3, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-        l.feed(&rec(20, 0, 4, RECORD_KIND_FINAL, 5));
+        l.feed(&rec(20, 0, 3, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(20, 0, 4, RECORD_KIND_FINAL_V2, 5));
         l.finish();
         assert_eq!(l.discarded(), 0);
         assert_eq!(l.nodes()[&0].torn, 1);
@@ -1206,9 +1276,9 @@ mod tests {
             (
                 "two whole anchors",
                 [
-                    rec(10, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    rec(10, 0, 1, RECORD_KIND_FINAL, 7),
-                    rec(11, 1, 0, RECORD_KIND_FINAL, 0),
+                    rec(10, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    rec(10, 0, 1, RECORD_KIND_FINAL_V2, 7),
+                    rec(11, 1, 0, RECORD_KIND_FINAL_V2, 0),
                 ]
                 .into(),
                 false,
@@ -1216,9 +1286,9 @@ mod tests {
             (
                 "a lost part tears exactly once",
                 [
-                    rec(8, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    rec(8, 0, 2, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    rec(8, 0, 3, RECORD_KIND_FINAL, 1),
+                    rec(8, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    rec(8, 0, 2, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    rec(8, 0, 3, RECORD_KIND_FINAL_V2, 1),
                 ]
                 .into(),
                 false,
@@ -1226,29 +1296,29 @@ mod tests {
             (
                 "a skip voids what was in flight",
                 [
-                    rec(12, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    encode_skip_record(RUN, 12, 0, SkipCause::Contended, "n").to_vec(),
+                    rec(12, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    encode_skip_record(RUN, 12, 0, 0, SkipCause::Contended, "n").to_vec(),
                 ]
                 .into(),
                 false,
             ),
             (
                 "an anchor the stream stopped inside",
-                [rec(11, 2, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD)].into(),
+                [rec(11, 2, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD)].into(),
                 false,
             ),
             (
                 "a malformed record is counted, not swallowed",
-                [malformed.clone(), rec(3, 0, 0, RECORD_KIND_FINAL, 2)].into(),
+                [malformed.clone(), rec(3, 0, 0, RECORD_KIND_FINAL_V2, 2)].into(),
                 false,
             ),
             (
                 "the mid-run attach discards its partial head",
                 [
-                    rec(20, 0, 3, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    rec(20, 0, 4, RECORD_KIND_FINAL, 5),
-                    rec(21, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    rec(21, 0, 1, RECORD_KIND_FINAL, 4),
+                    rec(20, 0, 3, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    rec(20, 0, 4, RECORD_KIND_FINAL_V2, 5),
+                    rec(21, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    rec(21, 0, 1, RECORD_KIND_FINAL_V2, 4),
                 ]
                 .into(),
                 true,
@@ -1260,11 +1330,11 @@ mod tests {
             (
                 "a re-sent anchor after a torn one is judged, not swallowed",
                 [
-                    rec(30, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    rec(30, 0, 2, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    rec(30, 0, 3, RECORD_KIND_FINAL, 1),
-                    rec(30, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    rec(30, 0, 1, RECORD_KIND_FINAL, 6),
+                    rec(30, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    rec(30, 0, 2, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    rec(30, 0, 3, RECORD_KIND_FINAL_V2, 1),
+                    rec(30, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    rec(30, 0, 1, RECORD_KIND_FINAL_V2, 6),
                 ]
                 .into(),
                 false,
@@ -1274,9 +1344,9 @@ mod tests {
             (
                 "an out-of-order FINAL leaves no tombstone",
                 [
-                    rec(40, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD),
-                    rec(40, 0, 9, RECORD_KIND_FINAL, 3),
-                    rec(40, 0, 0, RECORD_KIND_FINAL, 4),
+                    rec(40, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD),
+                    rec(40, 0, 9, RECORD_KIND_FINAL_V2, 3),
+                    rec(40, 0, 0, RECORD_KIND_FINAL_V2, 4),
                 ]
                 .into(),
                 false,
@@ -1284,9 +1354,9 @@ mod tests {
             (
                 "a short non-final chunk still tears, and its FINAL still closes",
                 [
-                    rec(50, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD - 1),
-                    rec(50, 0, 1, RECORD_KIND_FINAL, 2),
-                    rec(50, 0, 0, RECORD_KIND_FINAL, 5),
+                    rec(50, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD - 1),
+                    rec(50, 0, 1, RECORD_KIND_FINAL_V2, 2),
+                    rec(50, 0, 0, RECORD_KIND_FINAL_V2, 5),
                 ]
                 .into(),
                 false,
@@ -1316,10 +1386,10 @@ mod tests {
     fn a_finished_anchors_tombstone_does_not_outlive_it() {
         let mut l = StateAnchorLedger::passthrough();
         for step in 0..64u64 {
-            l.feed(&rec(step, 0, 0, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
+            l.feed(&rec(step, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
             // The part that breaks it, and then the FINAL that closes it.
-            l.feed(&rec(step, 0, 7, RECORD_KIND_CHUNK, STATE_RECORD_PAYLOAD));
-            l.feed(&rec(step, 0, 8, RECORD_KIND_FINAL, 1));
+            l.feed(&rec(step, 0, 7, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+            l.feed(&rec(step, 0, 8, RECORD_KIND_FINAL_V2, 1));
             assert!(
                 l.open_keys_for_test() <= 1,
                 "step {step}: a closed anchor must not be carried forever"
@@ -1339,6 +1409,10 @@ mod tests {
                 first_anchor_step: 1,
             }),
             rings_declared: 1,
+            ring_ranks: BTreeMap::new(),
+            state_record_format_version: Some(
+                cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION,
+            ),
             ranks_discovered: Vec::new(),
             ranks_missing: Vec::new(),
             rings_unavailable: BTreeMap::new(),
@@ -1637,6 +1711,8 @@ mod tests {
                     part: 0,
                     kind,
                     len: len as u32,
+                    rank: 0,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
                 },
                 &vec![0x5A; len],
             )
@@ -1644,10 +1720,11 @@ mod tests {
         }
 
         let mut l = StateAnchorLedger::passthrough();
-        l.feed(&rec_for(RUN, 5, 0, RECORD_KIND_FINAL, 8));
+        l.feed(&rec_for(RUN, 5, 0, RECORD_KIND_FINAL_V2, 8));
         l.feed(&encode_skip_record(
             OTHER,
             5,
+            0,
             0,
             SkipCause::Contended,
             "other run",
@@ -1675,10 +1752,11 @@ mod tests {
         // The SAME-run skip at the same key is still the precedence note, so the guard
         // has not simply disabled the rule.
         let mut same = StateAnchorLedger::passthrough();
-        same.feed(&rec_for(RUN, 5, 0, RECORD_KIND_FINAL, 8));
+        same.feed(&rec_for(RUN, 5, 0, RECORD_KIND_FINAL_V2, 8));
         same.feed(&encode_skip_record(
             RUN,
             5,
+            0,
             0,
             SkipCause::Contended,
             "same run",
@@ -1847,5 +1925,142 @@ mod tests {
         assert!(!logs_contain(
             "every node the drained rings declare has an anchor"
         ));
+    }
+
+    /// The recorder's OWN ledger reads the record family the encoder mints.
+    ///
+    /// This is the arm that catches the silent half of a kind change. `header.kind`
+    /// is a `u32` tested against a `u32`, so a ledger left on the format version 0
+    /// constants COMPILES and lies: no anchor would ever complete, every one would
+    /// tear, and a shipped manifest would report zero complete anchors on a healthy
+    /// recording.
+    #[test]
+    fn the_ledger_reads_the_kinds_the_encoder_mints_rather_than_the_previous_format() {
+        // Arm (a), a CHUNK then a FINAL: one anchor completes and nothing tears.
+        let mut l = StateAnchorLedger::passthrough();
+        l.feed(&rec(70, 0, 0, RECORD_KIND_CHUNK_V2, STATE_RECORD_PAYLOAD));
+        l.feed(&rec(70, 0, 1, RECORD_KIND_FINAL_V2, 9));
+        l.finish();
+        let t = &l.nodes()[&0];
+        assert_eq!(t.complete, 1, "a v1 FINAL must COMPLETE the anchor");
+        assert_eq!(t.torn, 0, "and nothing may tear");
+        assert_eq!(l.malformed(), 0);
+
+        // Arm (b), a SKIP: it lands on `skipped` with its cause word decoded.
+        let mut l = StateAnchorLedger::passthrough();
+        l.feed(&encode_skip_record(
+            RUN,
+            71,
+            0,
+            0,
+            SkipCause::LowMemory,
+            "no room",
+        ));
+        l.finish();
+        let t = &l.nodes()[&0];
+        assert_eq!(t.skipped, 1, "a v1 SKIP must be read as a skip");
+        assert_eq!(
+            t.skip_causes.get(&SkipCause::LowMemory.as_wire()),
+            Some(&1),
+            "and its cause word decoded, not read out of the rank bytes"
+        );
+
+        // THE CONTROL, which is what stops this reading as a pass on a decoder
+        // widened to accept BOTH families: a record in the PREVIOUS layout (a
+        // 32-byte header's worth of fields with a format version 0 kind at bytes 24
+        // to 28) is MALFORMED here, never tallied.
+        let mut old = vec![0u8; STATE_RECORD_SIZE as usize];
+        old[0..8].copy_from_slice(&RUN.to_le_bytes());
+        old[8..16].copy_from_slice(&72u64.to_le_bytes());
+        old[24..28].copy_from_slice(&2u32.to_le_bytes()); // the v0 FINAL kind
+        old[28..32].copy_from_slice(&8u32.to_le_bytes());
+        let mut l = StateAnchorLedger::passthrough();
+        l.feed(&old);
+        l.finish();
+        assert_eq!(l.malformed(), 1, "a previous-format record is refused");
+        assert!(
+            l.nodes().is_empty(),
+            "and contributes to no node's tally: {:?}",
+            l.nodes()
+        );
+    }
+
+    /// A manifest written BEFORE the two new keys existed still PARSES, with both
+    /// reading as absent.
+    ///
+    /// This is the shape the whole backward story rests on. Declared without
+    /// `#[serde(default)]` the two keys would be REQUIRED, an older manifest would
+    /// take the parse's error arm, and the reader would report it MALFORMED and
+    /// return nothing. The operator would then get the wrong diagnosis (the
+    /// manifest is not malformed, it is older) and, worse, a path this change does
+    /// not claim to touch would silently lose the catch-up clamp, which reads the
+    /// same bytes.
+    #[test]
+    fn a_manifest_written_before_the_two_new_keys_still_parses_with_both_absent() {
+        // The JSON a version 1 writer produced, byte for byte in shape: no
+        // `ring_ranks`, no `state_record_format_version`.
+        let previous = r#"{
+            "version": 1,
+            "rings_declared": 1,
+            "records": 4,
+            "nodes": {
+                "a": { "ring": "r0", "node_idx": 0, "anchors_complete": 1 }
+            }
+        }"#;
+        let cov: StateCoverage =
+            serde_json::from_str(previous).expect("a version 1 manifest must still parse");
+        assert_eq!(cov.version, 1);
+        assert_eq!(
+            cov.state_record_format_version, None,
+            "absent, which is what makes the reader's refusal possible at all"
+        );
+        assert!(cov.ring_ranks.is_empty(), "absent, not a claim of no rings");
+        // The fields a version 1 manifest DID carry are unchanged, so the parse
+        // is a real parse rather than a shape that swallowed everything.
+        assert_eq!(cov.rings_declared, 1);
+        assert_eq!(cov.records, 4);
+        assert_eq!(cov.nodes["a"].node_idx, Some(0));
+        assert_eq!(cov.nodes["a"].anchors_complete, 1);
+    }
+
+    /// This build's manifest round trips, and an UNKNOWN key from a newer writer
+    /// is ignored rather than fatal.
+    ///
+    /// The forward direction stays tolerant on purpose: the type carries no
+    /// `deny_unknown_fields`, so a newer manifest's extra keys are ignorable by
+    /// construction, and refusing a readable bag on a version bump would turn
+    /// every additive field into a compatibility break.
+    #[test]
+    fn this_builds_manifest_round_trips_and_a_newer_writers_extra_key_is_ignored() {
+        let mut cov = coverage_of(&[("a", 1, 0)], false);
+        cov.ring_ranks = BTreeMap::from([("r0".to_string(), 0u32), ("r1".to_string(), 3u32)]);
+        let json = serde_json::to_string(&cov).expect("serializes");
+        assert_eq!(
+            serde_json::from_str::<StateCoverage>(&json).expect("round trips"),
+            cov
+        );
+
+        // A key this build has never heard of, beside the ones it has.
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        value["a_key_from_a_newer_bagd"] = serde_json::json!({ "anything": 1 });
+        let read: StateCoverage =
+            serde_json::from_value(value).expect("an unknown key must be IGNORED, never fatal");
+        assert_eq!(read, cov);
+        assert_eq!(read.ring_ranks["r1"], 3);
+    }
+
+    /// The manifest version is a LITERAL, pinned, because a reader gates on it.
+    ///
+    /// Left at what it was, a bag carrying the two new keys would announce itself
+    /// as the version that predates them, and the forward warn at the reader
+    /// (`replay_state`'s `read_state_coverage_reporting`) would stay silent on a
+    /// manifest it genuinely does not know. A version constant that only ever
+    /// compares against itself is a version constant that never moves.
+    #[test]
+    fn the_manifest_version_is_the_documented_literal() {
+        assert_eq!(
+            STATE_COVERAGE_VERSION, 2,
+            "it went to 2 when the manifest gained the state record format version"
+        );
     }
 }

@@ -982,8 +982,11 @@ fn indent_of(line: &str) -> usize {
 /// unreadable form carries. `rest` is the text after the `key:` token on
 /// `lines[at]`, and `key_column` is the column that token starts at: a scalar
 /// CONTINUES on the following lines indented deeper than it, and stops at the
-/// first non-blank line that is not. A blank line does not stop it, because
-/// comments are blanked before this walk sees the file.
+/// first non-blank line that is not. A blank line does not stop it: a block
+/// scalar may span one, and the PR-blocking callers blank each comment to a
+/// blank line before this reader sees it. The container-shell caller
+/// ([`all_workflow_texts`]) is the exception and feeds RAW text, where a
+/// comment inside a `run:` block is script content and folds in as such.
 ///
 /// The forms: a plain scalar on the key's own line, a single- or double-quoted
 /// one, a folded or literal block scalar (`>`, `>-`, `>+`, `|`, `|-`, `|+`),
@@ -6040,4 +6043,317 @@ fn a_trigger_block_row_that_is_no_event_name_fails_the_walk() {
 #[should_panic(expected = "no trigger was read out of its `on:` block")]
 fn an_empty_trigger_block_fails_the_walk() {
     workflow_trigger_events("w.yml", "jobs:\n  j:\n    runs-on: ubuntu-latest\n");
+}
+
+// Container-job shell discipline.
+//
+// WHY THIS EXISTS. A `run:` step with no `shell:` uses the runner's default
+// shell. On a hosted runner that default is bash; inside a `container:` it is
+// the image's `/bin/sh`, which is dash on the `ros:<distro>-ros-base` images.
+// dash rejects `set -o pipefail` (a bash extension) and the `[[ ... ]]`
+// conditional, so a container step written in bash but not DECLARING bash dies
+// at its first such line with `set: Illegal option -o pipefail`. That is what
+// took every `rmw distro lanes` job on the older images red on each push to
+// main from 2026-09-28 on: the cache-prune-tools step ran `set -euo pipefail`
+// under the container default sh. The lyrical image alone happened to answer
+// with a pipefail-capable sh, which is exactly why a per-image default is not
+// something to rely on.
+//
+// SCOPE. Only jobs that declare `container:` are judged. A host job's default
+// shell is bash, so its `set -euo pipefail` works with no `shell:` line, and
+// the workspace has many such steps; flagging them would be a false demand.
+// A container job that genuinely wants sh can still write `shell: sh`, and then
+// a bash-only construct in it is a real defect this walk reports.
+//
+// The oracle is the branch order of `run:` text against the declared shell,
+// derived here from string tokens, never from the workflow it checks; the
+// synthetic case in `the_container_bash_shell_walk_discriminates` reddens and
+// greens it on input that is not the real tree.
+
+/// Substring markers for constructs a container step's default shell (dash on
+/// the ROS base images) may not accept. `pipefail` is a bash extension dash
+/// refuses (as in `set -euo pipefail`); the `set -o` marker is deliberately
+/// conservative, matching the POSIX options dash DOES run (`errexit` and the
+/// like) too, since flagging one of those only asks the step to name
+/// `shell: bash`, which is always safe. The bash `[[ ... ]]` conditional is a
+/// third construct dash refuses; it is matched by [`run_uses_bash_test_bracket`],
+/// not a substring, because a bare `[[` can also begin a POSIX class (`[[:`).
+const BASH_ONLY_MARKERS: &[&str] = &["pipefail", "set -o"];
+
+/// Does the run script use the bash `[[ ... ]]` conditional? A plain `[[`
+/// substring will not do: a POSIX bracket expression such as `[[:space:]]` (a
+/// character class dash runs) also contains `[[`. The bash conditional writes
+/// `[[` before whitespace or the start of its expression; a POSIX class writes
+/// `[[:`. So a `[[` counts unless the byte right after it is `:`.
+fn run_uses_bash_test_bracket(run: &str) -> bool {
+    let bytes = run.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' && bytes.get(i + 2) != Some(&b':') {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Does a step's `run:` script use a construct only bash accepts? The `pipefail`
+/// and `set -o` markers are matched as substrings, so one inside a shell comment
+/// or a string in the script still counts (the fail-safe direction: the only
+/// consequence is asking the step to name `shell: bash`, which is always safe);
+/// the bash `[[ ... ]]` conditional is matched by [`run_uses_bash_test_bracket`],
+/// which does not mistake a POSIX class for it.
+fn run_needs_bash(run: &str) -> bool {
+    BASH_ONLY_MARKERS.iter().any(|marker| run.contains(marker)) || run_uses_bash_test_bracket(run)
+}
+
+/// Does a `shell:` value name a bash-family shell? Its first word is `bash`
+/// (`shell: bash`, `shell: bash -e {0}`), so a build's own bash invocation is
+/// honoured while `shell: sh`, `shell: dash` and `shell: pwsh` are not.
+fn shell_is_bash(shell: Option<&str>) -> bool {
+    shell.is_some_and(|value| value.split_whitespace().next() == Some("bash"))
+}
+
+/// Does this job block declare a `container:` at its own key indent?
+///
+/// Read at four-space indent (the job id sits at two, its keys at four), so a
+/// `container:` word inside a `run:` script or a comment declares nothing.
+fn job_has_container(block: &str) -> bool {
+    block.lines().any(|line| {
+        indent_of(line) == JOB_KEY_INDENT.len() && line.trim_start().starts_with("container:")
+    })
+}
+
+/// The `<key>:` scalar of one step block, folded, or `None` when the step has
+/// no such key. `Err` for a scalar form [`read_scalar_value`] cannot classify,
+/// which the caller turns into a failure rather than into "no value".
+fn step_scalar_of(block: &[&str], key: &str) -> Result<Option<String>, String> {
+    let Some(first) = block.first() else {
+        return Ok(None);
+    };
+    let step_indent = indent_of(first);
+    let token = format!("{key}:");
+    for (i, line) in block.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let rest = if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix(token.as_str())
+        } else if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix(token.as_str()))
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            return read_scalar_value(key, rest, block, i, step_indent + 2).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The container run steps judged, and every step whose script needs bash but
+/// does not declare it, for one workflow's text. `Err` for a `run:` or `shell:`
+/// scalar the reader cannot classify (fails the caller, never a silent pass).
+fn container_shell_findings(name: &str, text: &str) -> Result<(usize, Vec<String>), String> {
+    let mut judged = 0usize;
+    let mut violations = Vec::new();
+    for (job, block) in jobs_of(text) {
+        if !job_has_container(&block) {
+            continue;
+        }
+        for step in step_blocks(&block) {
+            let Some(run) = step_scalar_of(&step, "run")? else {
+                continue; // a `uses:` step runs no shell of ours.
+            };
+            judged += 1;
+            if !run_needs_bash(&run) {
+                continue;
+            }
+            if shell_is_bash(step_scalar_of(&step, "shell")?.as_deref()) {
+                continue;
+            }
+            let step_name = step_name_of(&step).unwrap_or_else(|| "<unnamed>".to_string());
+            violations.push(format!(
+                "  {name} / job `{job}` / step \"{step_name}\": the run script uses a \
+                 bash-only construct (pipefail, `set -o`, or `[[`) but the step sets \
+                 no `shell: bash`, so it runs under the container image's default \
+                 shell (dash on the ROS base images), which refuses it"
+            ));
+        }
+    }
+    Ok((judged, violations))
+}
+
+/// Every container `run:` step that uses bash-only syntax names `shell: bash`.
+///
+/// The failure this pins shipped: the rmw distro jobs were red on every push to
+/// main for days because a container step ran `set -euo pipefail` under the
+/// image's default sh. It was invisible on ordinary pull requests because the
+/// step runs only on the main branch (or an opt-in same-repo pull request) and
+/// never in the merge queue, and the per-distro jobs are not required checks, so
+/// a red job blocked nothing.
+#[test]
+fn every_container_run_step_with_bash_syntax_declares_bash_shell() {
+    let texts = all_workflow_texts();
+    let mut judged = 0usize;
+    let mut container_workflows = 0usize;
+    let mut violations = Vec::new();
+    for (name, text) in &texts {
+        let (step_count, found) =
+            container_shell_findings(name, text).unwrap_or_else(|why| panic!("{name}: {why}"));
+        if jobs_of(text)
+            .iter()
+            .any(|(_, block)| job_has_container(block))
+        {
+            container_workflows += 1;
+        }
+        judged += step_count;
+        violations.extend(found);
+    }
+
+    // Rule 37: report what was judged, and treat judging nothing as a finding.
+    // A zero here is not a clean tree: it is a container workflow that lost its
+    // run steps to a parser change, or the last container workflow removed. Both
+    // want a human, so the walk fails rather than passing vacuously.
+    eprintln!(
+        "container-shell walk: judged {judged} container run step(s) across \
+         {container_workflows} container workflow(s) of {} total",
+        texts.len()
+    );
+    assert!(
+        judged > 0,
+        "the container-shell walk judged ZERO run steps: either the step parser \
+         found nothing in the container jobs (a broken walk) or no workflow \
+         declares `container:` any more (update this floor deliberately). Total \
+         workflows read: {}",
+        texts.len()
+    );
+    assert!(
+        violations.is_empty(),
+        "{} container run step(s) use bash-only syntax without `shell: bash`, so \
+         they run under the image default shell (dash on the ROS base images) and \
+         die on the first such line:\n{}\n\n(judged {judged} container run steps)",
+        violations.len(),
+        violations.join("\n"),
+    );
+}
+
+/// The walk reddens on a bad step and greens on a good one, on SYNTHETIC input
+/// so its own correctness does not depend on the tree it guards.
+#[test]
+fn the_container_bash_shell_walk_discriminates() {
+    // A container step with a bash-only construct and no shell is a violation.
+    let bad = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+               - name: install tools\n        run: |\n          set -euo pipefail\n          \
+               echo hi\n";
+    let (judged, found) = container_shell_findings("bad.yml", bad).expect("classifies");
+    assert_eq!(judged, 1, "the container run step is judged");
+    assert_eq!(
+        found.len(),
+        1,
+        "a pipefail step under a container default shell is a violation: {found:?}"
+    );
+
+    // The same script naming `shell: bash` is fine.
+    let good = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                - name: install tools\n        shell: bash\n        run: |\n          \
+                set -euo pipefail\n          echo hi\n";
+    let (_judged, found) = container_shell_findings("good.yml", good).expect("classifies");
+    assert!(
+        found.is_empty(),
+        "the same script under `shell: bash` is fine: {found:?}"
+    );
+
+    // An explicit non-bash shell with a bash-only construct is still a violation
+    // (it is exactly the shape that broke: the image default is such a shell).
+    let explicit_sh = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                       - name: install tools\n        shell: sh\n        run: |\n          \
+                       set -euo pipefail\n          echo hi\n";
+    let (_judged, found) = container_shell_findings("sh.yml", explicit_sh).expect("classifies");
+    assert_eq!(
+        found.len(),
+        1,
+        "a bash-only construct under an explicit non-bash shell is a violation: {found:?}"
+    );
+
+    // A container step with no bash-only construct needs no shell.
+    let plain = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                 - name: run a script\n        run: bash tools/x.sh\n";
+    let (judged, found) = container_shell_findings("plain.yml", plain).expect("classifies");
+    assert_eq!(judged, 1, "the plain run step is judged");
+    assert!(
+        found.is_empty(),
+        "a run with no bash-only construct needs no shell: {found:?}"
+    );
+
+    // A HOST job (no container) with the same bash-only construct is NOT judged:
+    // its default shell is bash. This pins the container scope.
+    let host = "jobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      \
+                - name: classify\n        run: |\n          set -euo pipefail\n          \
+                echo hi\n";
+    let (judged, found) = container_shell_findings("host.yml", host).expect("classifies");
+    assert_eq!(
+        judged, 0,
+        "a host job is outside the scope, so nothing is judged"
+    );
+    assert!(
+        found.is_empty(),
+        "and nothing is reported for it: {found:?}"
+    );
+
+    // A POSIX character class (`[[:space:]]`) contains `[[` but is not the bash
+    // `[[ ... ]]` conditional; dash runs it, so a container step using one is
+    // not flagged.
+    let posix_class = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                       - name: grep\n        run: grep -E '[[:space:]]' file\n";
+    let (judged, found) = container_shell_findings("posix.yml", posix_class).expect("classifies");
+    assert_eq!(judged, 1, "the container run step is judged");
+    assert!(
+        found.is_empty(),
+        "a POSIX character class is not the bash conditional and must not be flagged: {found:?}"
+    );
+
+    // The bash `[[ ... ]]` conditional under a container default shell IS flagged.
+    let bash_test = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                     - name: test\n        run: |\n          [[ -n \"$X\" ]] && echo ok\n";
+    let (_judged, found) = container_shell_findings("bashtest.yml", bash_test).expect("classifies");
+    assert_eq!(
+        found.len(),
+        1,
+        "the bash [[ ... ]] conditional with no shell: bash is a violation: {found:?}"
+    );
+}
+
+/// Every `.yml`/`.yaml` under `.github/workflows`, by file name, unmodified.
+///
+/// Unlike [`pr_blocking_workflow_texts`] this keeps comments and every trigger:
+/// the container-shell rule reads `run:` scripts, where a `#` is shell, not a
+/// YAML comment, and applies to workflows (like `rmw-distros.yml`) that run on
+/// push rather than on every pull request.
+fn all_workflow_texts() -> BTreeMap<String, String> {
+    let dir = repo_root().join(".github/workflows");
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .path();
+        let is_yaml = path
+            .extension()
+            .is_some_and(|ext| ext == "yml" || ext == "yaml");
+        if !is_yaml {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("a dir entry has a file name")
+            .to_string_lossy()
+            .into_owned();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        out.insert(name, text);
+    }
+    assert!(!out.is_empty(), "no workflow files under {}", dir.display());
+    out
 }

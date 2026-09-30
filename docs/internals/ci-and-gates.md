@@ -307,78 +307,6 @@ arm pinned both ways. "Found something" and "could not run" never share an exit 
 built-in control per class must hit before any scan, and an allowlist entry that matches no
 file or excused nothing fails a full-tree run. Contributor-facing detail: `docs/leak_guard.md`.
 
-## The public-surface review (`tools/review/public-surface-review.md`)
-
-`tools/scripts/check_public_surface.sh` refuses the wording it can NAME. A regex cannot
-see narrative, a stale claim, or a sentence that contradicts another page, and an
-independent audit of this tree found all three in files every pattern passed. The
-semantic half reads a pull request's DIFF for those. It is run locally, over the diff
-rather than the tree, and no CI job runs it.
-
-The prompt is fixed and in the tree at `tools/review/public-surface-review.md` (the
-eleven families of tell, the vocabulary that is legitimate and must be judged rather
-than reported, and the four severities LEAK, EMBARRASSING, CONFUSING, COSMETIC). The
-diff is handed over as a file, the reader needs `Read`, `Grep`, `Glob` and `Write` and
-no shell at all, and the output is ONE JSON verdict.
-
-`tools/review/render_public_surface_verdict.py` reads that verdict, renders the one pull
-request comment, and decides the exit, so the outcome never depends on the session
-choosing to call a tool: clean is a silent pass, a LEAK or EMBARRASSING finding FAILS,
-advisory findings pass with the comment, and a missing or unparseable verdict FAILS,
-because a semantic review that did not happen looks exactly like a clean one. Its
-`--self-test` runs in `lint` on every push and drives every arm, including a quoted pipe
-that must not add a table column and a blocking finding past the table's row cap.
-
-RUNNING IT, on the branch, before the pull request is opened, by whoever opened it:
-
-```bash
-# 1. Prepare the diff. The stale working files go FIRST, so a preparation that fails
-#    cannot leave an earlier diff or an earlier verdict standing in for this one.
-#    The steps are CHAINED, not run under errexit: a shell suspends `set -e` inside a
-#    command whose status is tested, an inner `set -e` included, so a guard written
-#    that way never fires.
-prepared=0
-rm -f pr.diff public-surface-review.json \
-  && git fetch -q https://github.com/cerulion-inc/cerulion.git main \
-  && base=$(git merge-base FETCH_HEAD HEAD) \
-  && git diff "$base..HEAD" > pr.diff \
-  && test -s pr.diff \
-  || prepared=$?
-echo "prepared: $prepared"
-
-# 2. With prepared 0, hand pr.diff and tools/review/public-surface-review.md to a local
-#    agent session holding Read, Grep, Glob and Write and no shell; it writes
-#    public-surface-review.json. Anything else and there is no diff to read.
-
-# 3. Read the verdict. A preparation that did not finish means there was nothing to
-#    review, which is 3 and never a clean pass, whatever file is lying around. A script
-#    that must FAIL on a blocking verdict ends `exit "$verdict"`.
-verdict=3
-if [ "$prepared" -eq 0 ]; then
-  verdict=0
-  python3 -B tools/review/render_public_surface_verdict.py public-surface-review.json || verdict=$?
-fi
-echo "verdict: $verdict"
-```
-
-The three steps fail CLOSED, the same way the renderer does: a fetch that does not land,
-a merge base that does not resolve, or an empty `pr.diff` leaves `prepared` non-zero and
-no file for step 2 to read, and step 3 over an absent verdict reports 3 rather than
-clean. Deleting both working files inside the chain is what makes that true a second
-time, because a verdict left over from the previous branch reads exactly like this one,
-and step 3 refuses to read any verdict at all unless `prepared` is 0, so a delete that
-does not happen cannot pass an old file off as this branch's result.
-Every status is captured rather than trapped, and no step relies on errexit, so none of
-the three can close a shell that already has it on.
-Neither working file is committed. The
-renderer's own status is the verdict, and `$verdict` is where the block keeps it, because
-a trailing `echo` would otherwise become the status a caller reads: 0 clean, 1 a LEAK or
-EMBARRASSING finding to fix before the branch lands, 2 advisory findings, 3 no verdict
-to read. The rendered comment is what goes on the pull request when it is 1 or 2.
-
-Its findings are ADVISORY: no required check on `main` carries them, so a finding is a
-review to read, not a block.
-
 ## The docs gate
 
 `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` is a blocking job, and the
@@ -687,7 +615,7 @@ before the checker reads the real files.
 | `tools/scripts/check_citation_release.sh` | citation version, calendar, and release-date window validation | n/a |
 | `crates/cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` | every member inherits the one lint table; the table's levels | no |
 | `crates/cerulion_cli_engine/tests/library_print_ban_test.rs` | every library crate carries the print ban | no |
-| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. The required names are read from `tools/ci/required_contexts.txt` | no |
+| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. The required names are read from `tools/ci/required_contexts.txt` | no |
 | `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches` or `examples`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |
