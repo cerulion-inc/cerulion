@@ -193,7 +193,7 @@ while the PR number is minted here once, so the same name on any other PR, or wi
 
 `tools/scripts/check_agents_md.sh` runs in the `lint` job. Context files are loaded by coding
 agents with SILENT truncation and nearest-file-wins chaining, so the repo must be the alarm.
-It enforces: per-file size budgets (root `AGENTS.md` <= 170 lines and <= 11500 bytes; every
+It enforces: per-file size budgets (root `AGENTS.md` <= 190 lines and <= 13000 bytes; every
 other <= 60 lines and <= 4096 bytes), a whole-chain byte budget, a `CLAUDE.md` shim beside
 every `AGENTS.md` (crate shims contain exactly `@AGENTS.md`), no symlinked context file (a
 symlink dodges every check while tools happily read the target), and a banned-token scan

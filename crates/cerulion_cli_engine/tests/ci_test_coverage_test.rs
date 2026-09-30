@@ -1876,8 +1876,9 @@ fn the_ci_shard_matrix_agrees_with_the_shard_count_argument() {
     }
 
     // BOTH sharded jobs: `test-linux` (4) and `test-macos` (3) run on every
-    // pull request and neither carries a job-level `if:`, so the walk above
-    // reaches both and each one's matrix is checked against its OWN count. The
+    // pull request; each carries the job-level `if: ${{ !cancelled() }}` that
+    // `job_is_gated` above treats as no gate, so the walk reaches both and each
+    // one's matrix is checked against its OWN count. The
     // floor is 2 rather than 1, so losing either job's shard step (which would
     // leave the other vouching for the pair) fails here instead of passing
     // quietly.

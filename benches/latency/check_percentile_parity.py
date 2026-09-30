@@ -3592,7 +3592,7 @@ def check_smoke_exit_contract() -> int:
 # of this arm.
 _SMOKE_RESTORE_MUTABLE = {
     "_CLI_SOURCE_FLOOR_CACHE",     # memoised source-floor mtime
-    "_MACHINE_HASH_CACHE",         # memoised host identity (bench.py:1543)
+    "_MACHINE_HASH_CACHE",         # memoised host identity (bench.py:1568)
 }
 
 
