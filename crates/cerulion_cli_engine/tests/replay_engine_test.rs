@@ -4204,6 +4204,11 @@ fn failing_outcome_skeleton() -> ReplayOutcome {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
         coordination: replay_engine::CoordinationReport {
@@ -4362,6 +4367,11 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
         coordination: replay_engine::CoordinationReport {
@@ -4977,6 +4987,11 @@ fn render_verdict_trace_divergence_section_exact_lines() {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
         coordination: replay_engine::CoordinationReport {
@@ -5079,6 +5094,11 @@ fn render_verdict_trace_divergence_non_positional_exact_lines() {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::FreeRun,
             inferred: false,
@@ -11952,6 +11972,11 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
         coordination: replay_engine::CoordinationReport {
@@ -17766,13 +17791,13 @@ fn a_zero_delta_replay_is_deterministic_across_replays() {
 // re-derives" — never a self-compare.
 //
 // Mutation targets:
-// 1. Wiring the verifier into the verdict (`passed` /= exit) fails
-//    `read_log_tamper_is_detected_loudly_but_never_verdicted`'s
-//    passed/violations/trace_divergence asserts on the tampered bag.
+// 1. Unwiring the verifier FROM the verdict (`passed`, the exit code) fails
+//    `read_log_tamper_is_the_exit_6_schedule_verdict`'s
+//    verdict/exit-code asserts on the tampered bag.
 // 2. Dropping `popped` from the compare tuple fails
-//    `read_log_popped_tamper_is_detected` (its tamper touches ONLY popped).
+//    `read_log_popped_tamper_is_the_exit_6_schedule_verdict` (its tamper touches ONLY popped).
 // 3. Warning per RECORD instead of per EDGE fails the flood pin in
-//    `read_log_tamper_is_detected_loudly_but_never_verdicted`: every one of
+//    `read_log_tamper_is_the_exit_6_schedule_verdict`: every one of
 //    the STEPS records on the edge is tampered, so a per-record warn emits
 //    STEPS lines where the pin requires exactly ONE.
 
@@ -17872,6 +17897,85 @@ fn assert_clean_verdict_with_declines(outcome: &ReplayOutcome, label: &str) {
     assert!(
         outcome.node_failures.is_empty(),
         "{label}: no node failures: {outcome:?}"
+    );
+    // The read log's own exit-6 verdict is ABSENT on a clean bag. Asserted in
+    // the helper every healthy arm already calls, which is what makes the
+    // promotion provably narrow: a bag whose reads all reproduced must reach
+    // exit 0 with this field empty.
+    assert!(
+        outcome.read_log_verdict.is_none(),
+        "{label}: no read-log verdict: {:?}",
+        outcome.read_log_verdict
+    );
+    // …and the ENFORCEMENT says which of the three things it did, never nothing.
+    match &outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::NotApplicable
+        | replay_engine::ReadLogEnforcement::Lockstep => {}
+        // A stage the core cannot gate must NAME its reason: a status that said
+        // "not gateable" with no reason would be the silence this field exists
+        // to replace.
+        replay_engine::ReadLogEnforcement::NotGateable { stages, reasons } => assert!(
+            *stages > 0 && reasons.len() == *stages,
+            "{label}: one reason per ungated stage: {:?}",
+            outcome.read_log_enforcement
+        ),
+        replay_engine::ReadLogEnforcement::Enforced {
+            frames_admitted, ..
+        } => assert!(
+            *frames_admitted > 0,
+            "{label}: an armed gate that admitted NOTHING cannot claim it enforced: {:?}",
+            outcome.read_log_enforcement
+        ),
+    }
+}
+
+/// Assert the EXIT-6 EDGE-READ verdict: the read log's own schedule verdict is
+/// present, NO other class fired, and the CLI's own classifier exits 6.
+///
+/// The twin of [`assert_clean_verdict`] for the promoted class. Every arm that
+/// used to assert "detected loudly, never verdicted" calls this instead, and its
+/// crafted bag is unchanged: the bag is the oracle, and only the claim about it
+/// moved.
+fn assert_edge_read_verdict(outcome: &ReplayOutcome, label: &str) {
+    let v = outcome.read_log_verdict.as_ref().unwrap_or_else(|| {
+        panic!("{label}: the read log must carry the exit-6 verdict: {outcome:?}")
+    });
+    assert!(
+        !v.edges.is_empty() || !v.unmet.is_empty(),
+        "{label}: a verdict names the edges it found: {v:?}"
+    );
+    assert!(
+        !outcome.passed,
+        "{label}: a diverged read schedule is not a pass: {outcome:?}"
+    );
+    // The OTHER two classes did NOT fire: this is the exit-1 against exit-6
+    // boundary, so a data divergence can never be reported as a schedule one and
+    // the reverse.
+    assert!(
+        outcome.violations.is_empty(),
+        "{label}: no data violations: {outcome:?}"
+    );
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{label}: no fire-schedule divergence: {outcome:?}"
+    );
+    assert!(
+        outcome.node_failures.is_empty(),
+        "{label}: no node failures: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.divergence_classes,
+        vec![replay_engine::DivergenceClass::EdgeRead],
+        "{label}: the edge-read class, and only it: {:?}",
+        outcome.divergence_classes
+    );
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(outcome),
+            true
+        ),
+        6,
+        "{label}: the CLI's own classifier exits 6: {outcome:?}"
     );
 }
 
@@ -17974,20 +18078,21 @@ fn read_log_clean_bag_verifies_clean_with_no_warns() {
     );
 }
 
-/// (b) TAMPERED SERVED SEQ → DETECTED, NEVER VERDICTED — the load-bearing
-/// "redundant" pin. Every kind-6 record on the one edge is tampered (+1000 on
-/// the served seq), so:
+/// (b) TAMPERED SERVED SEQ → the exit-6 SCHEDULE VERDICT. Every kind-6 record on
+/// the one edge is tampered (+1000 on the served seq), so:
 /// - the report names exactly that edge, its FIRST diverging step (0), and
 ///   both outcomes;
-/// - the verdict fields are byte-identical to the clean bag's replayed in the
-///   SAME test (leaving the verifier unwired from `passed`/exit
-///   fails exactly these asserts);
+/// - the verdict is exit 6 and NOTHING else fired: the steps re-executed and the
+///   topics compared are byte-identical to the clean bag's replayed in the SAME
+///   test, so the promotion moved the verdict and nothing else;
 /// - the warn fires EXACTLY ONCE though all `steps` records diverge (a
-///   per-record warn would instead emit `steps` lines, breaking flood discipline).
+///   per-record warn would instead emit `steps` lines, breaking flood
+///   discipline), and the run-level finding adds no second line carrying the
+///   class marker.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
-fn read_log_tamper_is_detected_loudly_but_never_verdicted() {
+fn read_log_tamper_is_the_exit_6_schedule_verdict() {
     let steps = 6;
     let mut rec =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
@@ -18063,10 +18168,12 @@ fn read_log_tamper_is_detected_loudly_but_never_verdicted() {
         "replayed side: {e:?}"
     );
 
-    // NEVER VERDICTED (mutation target 1): the tampered bag's verdict fields
-    // are byte-identical to the clean baseline's.
-    assert_clean_verdict(&outcome, "tampered read log");
-    assert_eq!(outcome.passed, clean.passed);
+    // VERDICTED (mutation target 1): the tampered bag is the exit-6 schedule
+    // verdict, and everything the read log does NOT judge is byte-identical to
+    // the clean baseline's: the same steps re-executed, the same topics
+    // compared and credited.
+    assert_edge_read_verdict(&outcome, "tampered read log");
+    assert!(clean.passed && !outcome.passed);
     assert_eq!(outcome.ticks_replayed, clean.ticks_replayed);
     assert_eq!(outcome.topics_checked, clean.topics_checked);
     assert_eq!(outcome.topics_passed, clean.topics_passed);
@@ -18107,13 +18214,19 @@ fn read_log_tamper_is_detected_loudly_but_never_verdicted() {
         "relay"
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
-    assert!(verdict.contains("replay PASS"), "verdict: {verdict}");
+    assert!(!verdict.contains("replay PASS"), "verdict: {verdict}");
     assert!(
         // The read-log class renders under its
         // operator phrase, and the phrase NAMES THE EDGE — which is the whole
         // reason the class was promoted out of a generic exit 6.
         verdict.contains("EDGE-READ DIVERGENCE") && verdict.contains("edge relay.inp"),
         "verdict NOTE: {verdict}"
+    );
+    // …and the block no longer carries the report-only clause it did while the
+    // class had no exit code of its own.
+    assert!(
+        !verdict.contains("UNAFFECTED)"),
+        "the verdict block is the verdict, not a note beside it: {verdict}"
     );
     // The status says DIVERGED (report + JSON + verdict line).
     assert_eq!(outcome.read_log, replay_engine::ReadLogStatus::Diverged);
@@ -18256,7 +18369,10 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
             )),
         }
     });
-    assert_clean_verdict(&o5, "a role divergence is report-only");
+    // A recorded role the re-execution did not reproduce is a read the recorded
+    // schedule holds and this replay does not, so it is the exit-6 verdict. The
+    // SUFFIX this arm is about is unchanged, and the frames still match.
+    assert_edge_read_verdict(&o5, "a believed role divergence");
 
     // ── LEG 2: the IDENTICAL bytes with NO recorder attachment. The kind field
     //    is still read at the NARROW width, so the role still decodes to
@@ -18294,7 +18410,7 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
 /// arm catches exactly that gap. Verdict untouched as always.
 #[test]
 #[serial]
-fn read_log_popped_tamper_is_detected() {
+fn read_log_popped_tamper_is_the_exit_6_schedule_verdict() {
     let steps = 6;
     let mut rec =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
@@ -18344,7 +18460,7 @@ fn read_log_popped_tamper_is_detected() {
         e.replayed.as_ref().unwrap().served_seq,
         "the tamper touched ONLY popped — the seqs must still agree: {e:?}"
     );
-    assert_clean_verdict(&outcome, "popped tamper");
+    assert_edge_read_verdict(&outcome, "popped tamper");
     assert_eq!(outcome.read_log, replay_engine::ReadLogStatus::Diverged);
 }
 
@@ -18619,7 +18735,7 @@ fn read_log_missing_recorded_record_reports_recorded_none() {
     write_bag(&rec, &bag, None);
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "deleted recorded record");
+    assert_edge_read_verdict(&outcome, "deleted recorded record");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -18650,7 +18766,7 @@ fn read_log_missing_recorded_record_reports_recorded_none() {
 /// verifier reports foreign wire values, never refuses them.
 #[test]
 #[serial]
-fn read_log_unknown_kind_is_labeled_and_never_refused() {
+fn read_log_unknown_kind_is_labeled_and_is_the_exit_6_verdict() {
     let steps = 6;
     let mut rec =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
@@ -18667,7 +18783,7 @@ fn read_log_unknown_kind_is_labeled_and_never_refused() {
     write_bag(&rec, &bag, None);
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "unknown kind");
+    assert_edge_read_verdict(&outcome, "unknown kind");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -18724,7 +18840,7 @@ fn read_log_two_edges_tampered_counts_edges_and_steps_distinctly() {
     write_bag(&rec, &bag, None);
 
     let outcome = replay(&bag, two_source_fusion_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "two tampered edges");
+    assert_edge_read_verdict(&outcome, "two tampered edges");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -18815,7 +18931,7 @@ fn read_log_two_rank_tamper_is_attributed_to_the_rank1_edge() {
         },
     );
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "rank-1 read-log tamper");
+    assert_edge_read_verdict(&outcome, "rank-1 read-log tamper");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -19148,7 +19264,7 @@ fn read_log_a_tampered_read_inside_the_window_still_diverges_on_a_ragged_bag() {
     });
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "ragged bag with a tampered in-window read");
+    assert_edge_read_verdict(&outcome, "ragged bag with a tampered in-window read");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -19319,7 +19435,7 @@ fn read_log_a_replayed_read_the_recording_lost_inside_the_window_still_diverges(
         });
 
         let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-        assert_clean_verdict(&outcome, "ragged bag with a lost in-window record");
+        assert_edge_read_verdict(&outcome, "ragged bag with a lost in-window record");
         let rl = outcome.read_log_divergence.as_ref().unwrap_or_else(|| {
             panic!(
                 "a read the recording LOST at step {lost_step} — INSIDE its own recorded \
@@ -19492,7 +19608,7 @@ fn a_quarantine_does_not_erase_divergences_found_on_other_nodes() {
         Some(report.clone()),
     )
     .expect("replay runs");
-    assert_clean_verdict(&outcome, "quarantine + divergence bag");
+    assert_edge_read_verdict(&outcome, "quarantine + divergence bag");
 
     // A's divergence is REPORTED, and the verifier RAN TO COMPLETION — which
     // is the difference from the stand-down: `Diverged` means every step was
@@ -20156,7 +20272,7 @@ fn the_fold_is_deterministic_across_runs() {
 }
 
 /// The OTHER direction — a recorded run that does NOT match
-/// the replayed one is a genuine divergence, and it is REPORTED.
+/// the replayed one is a genuine divergence, and it is the exit-6 verdict.
 ///
 /// Without this the implementation could be "expand nothing on either side", which also
 /// makes the arm above pass.
@@ -20186,7 +20302,9 @@ fn a_recorded_run_longer_than_the_replayed_one_is_reported() {
         "one extra recorded OCCURRENCE is a real difference and must be \
          reported — a compare that ignores run counts sees two equal streams"
     );
-    assert_clean_verdict(&outcome, "a run-count skew is report-only");
+    // One extra recorded occurrence is a read the re-execution did not
+    // reproduce, which is what exit 6 names.
+    assert_edge_read_verdict(&outcome, "a run-count skew");
 }
 
 /// A recorded run this binary cannot MATERIALISE stands its
@@ -23346,7 +23464,10 @@ fn a_lockstep_bag_carrying_overflow_markers_replays_and_labels_the_hole() {
     );
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "overflow marker");
+    // The marked hole has no replayed counterpart, so the recorded read schedule
+    // did not replay: exit 6, with the marker still LABELLED rather than
+    // rendered as an unknown kind.
+    assert_edge_read_verdict(&outcome, "overflow marker");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -24561,6 +24682,11 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         }),
         read_log: replay_engine::ReadLogStatus::Diverged,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: false,
@@ -24629,6 +24755,10 @@ fn exit_codes_and_precedence_are_unchanged_by_the_rename() {
             vec![]
         },
         trace_diverged: trace,
+        // The read log's own half of exit 6, held at `false` here so this arm
+        // keeps pinning the FIRE comparator's path to the same code; the
+        // read-log path to 6 is pinned by its own arm below.
+        read_log_diverged: false,
         violations: if violations {
             vec![("/t".to_string(), "byte 32".to_string())]
         } else {
@@ -24835,6 +24965,12 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
         "replay_input_shortfalls",
         "injection_anomalies",
         "rank_execution",
+        // The read log's own SCHEDULE verdict, `skip_serializing_if`-absent on a
+        // clean bag, and the read-gate STATUS, which is serialized on every path
+        // for the reason `read_log` is: a positive claim must be machine
+        // checkable rather than inferred from an absence.
+        "read_log_verdict",
+        "read_log_enforcement",
         // The PARTIAL-report marker — `skip_serializing_if`-absent
         // on every COMPLETED run, so it never appears on a corpus bag; declared
         // so the key-set walk below knows it when a bag does abort.
@@ -25107,10 +25243,18 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
             trace_diverged: false,
         },
         Case {
+            // The FRAMES replay byte-exact (`violations: 0`) and the FIRE
+            // schedule matches, which is what this corpus gate exists for. Its
+            // READ LOG does not: the records were written by the modern packer
+            // and this case declares the ARCHIVED format, where the kind is read
+            // over the full 16 bits and the role bits decode as a kind no reader
+            // can know. That is the exit-6 read-log verdict, pinned in full by
+            // `the_readcmp_path_decodes_the_kind_at_its_bags_own_width` over the
+            // same two formats.
             label: "stamped lockstep, ARCHIVED format 3",
             bag: bag_archived,
             factories: source_relay_factories,
-            passed: true,
+            passed: false,
             violations: 0,
             trace_diverged: false,
         },
@@ -29492,7 +29636,10 @@ fn an_impossible_read_shape_is_reported_without_moving_the_verdict() {
 
     // (1) THE VERDICT IS UNTOUCHED — the four fields the exit code is a pure
     // function of.
-    assert_clean_verdict(&outcome, "impossible read shape");
+    // A shape no recorder can produce can never equal a replayed read, so it is
+    // the exit-6 verdict. The claim this arm makes is the NOTE beside it, which
+    // names the node and the cause.
+    assert_edge_read_verdict(&outcome, "impossible read shape");
     // Anti-vacuity: a replay that checked NOTHING also carries a clean verdict.
     assert!(
         outcome.topics_checked >= 1 && outcome.topics_passed == outcome.topics_checked,
@@ -29538,8 +29685,9 @@ fn an_impossible_read_shape_is_reported_without_moving_the_verdict() {
         "the corruption rides `rederivation_notes` — no new top-level key: {json}"
     );
     assert_eq!(
-        json["passed"], true,
-        "and the report's own verdict is unchanged: {json}"
+        json["passed"], false,
+        "and the report carries the exit-6 read-log verdict beside the note, since a \
+         shape no recorder can produce can never equal a replayed read: {json}"
     );
     // (4) AND IT CARRIES ITS OWN MACHINE TOKEN. `detail` is a rewordable
     // sentence; `code` is what a CI job greps. A per-node stand-down DOES have
@@ -29848,7 +29996,10 @@ fn a_per_set_sync_descent_is_folded_from_its_head_not_declined() {
     );
     // (2) The VERDICT is clean — the fold took the LAST `Drain` record (the
     // promotion, which is the head at fire time) rather than a peek.
-    assert_clean_verdict(&outcome, "per-set Sync descent");
+    // As above: the crafted descent's peek record is a recorded read the
+    // re-execution did not reproduce, and the fold claim this arm makes rides
+    // the fire schedule.
+    assert_edge_read_verdict(&outcome, "per-set Sync descent");
     assert!(
         outcome.topics_checked >= 1 && outcome.topics_passed == outcome.topics_checked,
         "and the replay really compared this bag's topics: {outcome:?}"
@@ -29915,7 +30066,10 @@ fn a_non_improving_peek_is_ignored_by_the_fold_while_a_drain_is_not() {
          report: {:?}",
         opeek.trace_divergence
     );
-    assert_clean_verdict(&opeek, "non-improving peek");
+    // The crafted peek record has no replayed counterpart, so the read log is the
+    // exit-6 verdict. What this arm pins is unchanged: the SYNC stamp fold
+    // ignores the peek, which is the absent fire divergence above.
+    assert_edge_read_verdict(&opeek, "non-improving peek");
     assert!(
         !has_stand_down(
             &opeek,
@@ -30051,10 +30205,10 @@ fn the_readcmp_path_decodes_the_kind_at_its_bags_own_width() {
         "…and the class is reported: {:?}",
         o4.divergence_classes
     );
-    // REPORT-ONLY: the read log has never cost a replay its verdict, and a
-    // corrupt-kind divergence must not be the first to. Assertable HERE
+    // THE VERDICT: a corrupt kind can never equal a real replayed one, so the
+    // recorded read schedule did not replay and the run exits 6. Assertable HERE
     // precisely because the lockstep path has no steering to perturb.
-    assert_clean_verdict(&o4, "format-4 bag whose role bits are a foreign kind");
+    assert_edge_read_verdict(&o4, "format-4 bag whose role bits are a foreign kind");
 
     // ── FORMAT 5, THE IDENTICAL BYTES: the bits ARE the role there, the kind is
     //    4, and the tuple matches its replayed partner. The two bags differ
@@ -30154,6 +30308,8 @@ fn a_format_5_corpus_bag_replays_byte_exact_including_its_report() {
         "replay_input_shortfalls",
         "injection_anomalies",
         "rank_execution",
+        "read_log_verdict",
+        "read_log_enforcement",
         // The PARTIAL-report marker, absent on a completed run.
         "aborted",
     ];
@@ -34204,7 +34360,14 @@ fn a_recorded_per_set_sync_burst_replays_without_a_schedule_divergence() {
         "…and the frames must still match byte-for-byte: {:?}",
         outcome.violations
     );
-    assert!(outcome.passed, "{outcome:?}");
+    // The burst's recorded reads are staged at the per-set matcher's own site,
+    // which the re-derivation re-derives as body reads, so the read log is the
+    // exit-6 verdict on this fixture. The claim this arm makes is the one above:
+    // the FIRE schedule did not diverge, and the frames match.
+    assert!(
+        outcome.read_log_verdict.is_some() && !outcome.passed,
+        "{outcome:?}"
+    );
 
     // The per-set rederivation report on a REAL burst is a
     // deterministic function of the bag — two runs, byte-identical in the full
@@ -34492,8 +34655,12 @@ fn c6_a_sync_node_with_a_late_context_input_replays_clean_on_carried_heads() {
          recorded fire, exit 6: {:?}",
         outcome.trace_divergence
     );
+    // The context input's recorded reads are re-derived at a different site on
+    // this per-set Sync fixture, so the read log is the exit-6 verdict; the
+    // widening this arm pins is the carried-heads note below and the absent fire
+    // divergence above.
     assert!(
-        outcome.violations.is_empty() && outcome.passed,
+        outcome.violations.is_empty() && outcome.read_log_verdict.is_some() && !outcome.passed,
         "{:?}",
         outcome.violations
     );
@@ -35037,5 +35204,223 @@ fn c6d_d1_a_narrowed_candidate_window_convicts_once_the_phantom_head_is_evicted(
     assert!(
         !narrow.passed,
         "a fire-schedule divergence forces the pass to fail"
+    );
+}
+
+// ===========================================================================
+// The read log is ENFORCED on a graph-produced edge
+// ===========================================================================
+
+/// A DIVERGED read log is the exit-6 SCHEDULE verdict, and the verdict NAMES the
+/// edge, the step and the sequence.
+///
+/// The promotion's headline. The crafted bag is a clean recording with ONE
+/// kind-6 record's served sequence rewritten by hand, so the recorded reads and
+/// the replay's own disagree at exactly one known position while the frames and
+/// the fires are untouched: no data violation, no fire-schedule divergence, and
+/// the only finding is the edge read.
+///
+/// MUTATION TARGETS, both reachable from this arm alone: reverting the
+/// `|| report.read_log_diverged` in `resim_exit_code` makes it read exit 1, and
+/// reverting the `read_log_verdict.is_none()` conjunct in `passed` makes it read
+/// exit 0.
+#[test]
+#[serial]
+fn a_diverged_read_log_is_the_exit_6_schedule_verdict_naming_edge_step_and_sequence() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    // HAND ORACLE on the recording first: the relay's unified trigger drain
+    // pops the source's one frame per step, seq k at step k, popped 1.
+    let expected: Vec<(u64, u32, u16, u16, u64, u32)> = (0..steps as u64)
+        .map(|k| (k, 1, 0, READ_OUTCOME_DRAINED_BATCH, k, 1))
+        .collect();
+    assert_eq!(kind6_records(&rec), expected, "the recording's read log");
+
+    // ONE record, at a step chosen by hand, claiming a sequence chosen by hand.
+    const TAMPERED_STEP: u64 = 3;
+    const CLAIMED_SEQ: u64 = 4242;
+    let target = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == TAMPERED_STEP)
+        .expect("the step-3 kind-6 record exists");
+    target.fire_time_ns = CLAIMED_SEQ;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_verdict.mcap");
+    write_bag(&rec, &bag, None);
+    let report = dir.path().join("report.json");
+    let outcome = replay(&bag, source_relay_factories, None, Some(report.clone()))
+        .expect("the replay RUNS: a diverged read log is a verdict, not a refusal");
+
+    assert_edge_read_verdict(&outcome, "one tampered read");
+    let v = outcome.read_log_verdict.as_ref().unwrap();
+    assert_eq!(v.edges.len(), 1, "one edge diverged: {v:?}");
+    let e = &v.edges[0];
+    assert_eq!(
+        (e.node_id.as_str(), e.input.as_str(), e.step),
+        ("relay", "inp", TAMPERED_STEP),
+        "the verdict names the EDGE and the STEP: {e:?}"
+    );
+    assert_eq!(
+        e.recorded.as_ref().unwrap().served_seq,
+        Some(CLAIMED_SEQ),
+        "the recorded side carries the hand-written sequence: {e:?}"
+    );
+    assert_eq!(
+        e.replayed.as_ref().unwrap().served_seq,
+        Some(TAMPERED_STEP),
+        "the replayed side carries what the re-execution really served: {e:?}"
+    );
+    assert!(
+        v.detail.contains("relay") && v.detail.contains("inp"),
+        "the one-line verdict names the edge: {}",
+        v.detail
+    );
+
+    // The rendered verdict, which is what an operator reads.
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(
+        verdict.contains("EDGE-READ DIVERGENCE")
+            && verdict.contains("edge relay.inp")
+            && verdict.contains(&TAMPERED_STEP.to_string())
+            && verdict.contains(&CLAIMED_SEQ.to_string()),
+        "the block names the class, the edge, the step and the sequence: {verdict}"
+    );
+    assert!(
+        !verdict.contains("replay PASS"),
+        "a diverged read schedule is not a pass: {verdict}"
+    );
+
+    // The machine report carries the verdict additively.
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(parsed["read_log_verdict"]["edges"][0]["node_id"], "relay");
+    assert_eq!(parsed["divergence_classes"][0], "edge-read divergence");
+}
+
+/// A FREE-RUN bag whose rank both PRODUCES and CONSUMES a topic is GATED on its
+/// recorded reads, and the report says so POSITIVELY.
+///
+/// The positive control for the two refusal arms below, and the only arm that
+/// proves the gate ADMITS: the same recording replays byte-exact with the gate
+/// armed, and the report names how many stages were gated and how many frames
+/// they admitted. Without the `frames_admitted > 0` assertion the arm would pass
+/// identically on a binary where the gate was never armed.
+#[test]
+#[serial]
+fn a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_enforced_free_run.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let outcome = replay(&bag, source_relay_factories, None, None).expect("the replay runs");
+    assert_clean_verdict(&outcome, "a gated free-run bag");
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            stages,
+            steps: gated_steps,
+            frames_admitted,
+            ..
+        } => {
+            assert_eq!(stages, 1, "the relay's one drain stage is gated");
+            assert_eq!(gated_steps, steps as u64, "a quota per replayed step");
+            assert_eq!(
+                frames_admitted, steps as u64,
+                "one recorded frame admitted per step"
+            );
+        }
+        other => panic!("the rank consumes what it produces, so it is GATED: {other:?}"),
+    }
+}
+
+/// A read log that covers NO gated stage is an exit-2 refusal naming the cause.
+///
+/// The bag is the positive control's own recording with every kind-6 record
+/// restamped as a PRODUCER annotation: the records are still there (so the bag
+/// makes a claim about its reads) and not one of them plans an admission, so the
+/// gated edge would replay on whatever its queue happened to hold. That is
+/// refused rather than run.
+///
+/// THE NARROWNESS CONTROL is the arm above: the same recording, unrestamped,
+/// exits 0 with the gate armed. Without it the refusal could widen to every bag
+/// and nothing would notice.
+#[test]
+#[serial]
+fn an_uncovered_read_log_on_a_produced_edge_is_an_exit_2_refusal() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let mut restamped = 0;
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+    {
+        // input_idx 0 (the relay's one input), the PRODUCER annotation kind, no
+        // site claim: an annotation names the publisher of the read that follows
+        // it and occupies no position in the pop stream.
+        r.global_level = pack_read_outcome_meta(
+            0,
+            cerulion_core::trace_ring::READ_OUTCOME_PRODUCER,
+            ReadSiteRole::Unstamped,
+        );
+        restamped += 1;
+    }
+    assert_eq!(restamped, steps, "every record restamped");
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_uncovered_free_run.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let err = replay(&bag, source_relay_factories, None, None)
+        .expect_err("a gated edge with no recorded read must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_no_coverage") && msg.contains("Re-record"),
+        "the refusal names the cause token and the remedy: {msg}"
+    );
+}
+
+/// TWO indices resolving to ONE recorded input name is an exit-2 refusal naming
+/// the node, the name and both indices.
+///
+/// A record naming that input addresses two stages, so the gate cannot tell
+/// which one read the frame. The manifest is crafted rather than the graph: the
+/// condition is a fact about what the RECORDING says its inputs are, which is
+/// exactly what the gate resolves a record through.
+#[test]
+#[serial]
+fn two_indices_resolving_to_one_manifest_input_name_is_an_exit_2_refusal() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    rec.input_names
+        .as_mut()
+        .expect("a read-log recording carries the manifest input table")
+        .insert(
+            "relay".to_string(),
+            vec!["inp".to_string(), "inp".to_string()],
+        );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_duplicate_input_name.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let err = replay(&bag, source_relay_factories, None, None)
+        .expect_err("an ambiguous input name on a gated edge must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_input_name_duplicated")
+            && msg.contains("relay")
+            && msg.contains("'inp'")
+            && msg.contains("index 0")
+            && msg.contains("index 1"),
+        "the refusal names the node, the repeated name and both indices: {msg}"
     );
 }

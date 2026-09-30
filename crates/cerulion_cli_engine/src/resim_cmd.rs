@@ -414,6 +414,14 @@ pub struct ResimReport {
     pub node_failures: Vec<(String, String)>,
     /// The re-executed fire schedule diverged from the recording.
     pub trace_diverged: bool,
+    /// The recorded EDGE READS did not reproduce: the redundant per-edge
+    /// verifier retained a divergence, or the read gate reported a recorded read
+    /// the re-execution never produced. Exit 6 beside
+    /// [`Self::trace_diverged`], and a FIELD of its own rather than a widening
+    /// of that one, because the two name different evidence and a reader keying
+    /// on the fire comparator must not be told a fire schedule diverged when the
+    /// finding is an edge read.
+    pub read_log_diverged: bool,
     /// Every data violation the engine recorded, as `(topic, detail)`.
     ///
     /// Carried because the topic TALLY cannot express all of them, and the
@@ -507,6 +515,7 @@ impl ResimReport {
                 .map(|f| (f.node_id.clone(), f.reason.clone()))
                 .collect(),
             trace_diverged: o.trace_divergence.is_some(),
+            read_log_diverged: o.read_log_verdict.is_some(),
             violations: o
                 .violations
                 .iter()
@@ -540,7 +549,8 @@ impl ResimReport {
 /// Pick the exit code for a completed re-execution.
 ///
 /// A NEUTRAL resim declines exactly the two COMPARISON outcomes: byte
-/// violations (exit 1) and the structural trace divergence (exit 6). Both are
+/// violations (exit 1) and a SCHEDULE divergence (exit 6), which is either the
+/// fire comparator's or the read log's. Both are
 /// answers to "does this match the recording", a question a bare `--resim` did
 /// not ask. Everything else keeps its code in both modes — see the module docs.
 pub fn resim_exit_code(report: &ResimReport, verify: bool) -> u8 {
@@ -553,7 +563,10 @@ pub fn resim_exit_code(report: &ResimReport, verify: bool) -> u8 {
     if !verify {
         return EXIT_PASS;
     }
-    if report.trace_diverged {
+    // Either SCHEDULE divergence takes exit 6: the fire comparator's, and the
+    // read log's. Exit 1 is untouched, so a data divergence can never be
+    // reported as a schedule one.
+    if report.trace_diverged || report.read_log_diverged {
         return EXIT_TRACE_DIVERGENCE;
     }
     if report.passed {
@@ -1298,6 +1311,10 @@ mod tests {
         ResimReport {
             node_failures: vec![],
             trace_diverged: diverged,
+            // The OTHER exit-6 half, stated at every oracle rather than
+            // defaulted: a new verdict field needs a value here, and a default
+            // would let it be silently absent.
+            read_log_diverged: false,
             // One per DIFFERING topic, so the tally and the violation list
             // agree the way a real outcome's do.
             violations: (0..violations)
