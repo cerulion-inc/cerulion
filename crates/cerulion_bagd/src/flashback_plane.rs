@@ -4273,7 +4273,9 @@ mod tests {
                     // multi-process deployment provisions.
                     rank_space_walked: true,
                 },
-                "no rank",
+                // The stored reason says what a record carries from format
+                // version 1 and what is still rankless: the reader.
+                "What is rankless is the READER",
             ),
             (ResimGap::NoBoundary, "no step-boundary record"),
             (
