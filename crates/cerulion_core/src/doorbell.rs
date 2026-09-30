@@ -519,9 +519,9 @@ mod imp {
         /// ring on the new page would be heard by nobody.
         ///
         /// macOS `EINVAL`s a re-`ftruncate` of a POSIX SHM object (Linux does
-        /// not), which is why the size is set only on the branch that really
-        /// created it. A racing creator can be seen between its `shm_open` and its
-        /// `ftruncate`, so an object that is still short is waited out.
+        /// not), so the size is asked for on BOTH branches and the rc is read off
+        /// the object's size rather than off the call: whichever side gets there
+        /// first wins, and the loser's `EINVAL` is the outcome this wants.
         ///
         /// ONE first-wins race is recoverable and is retried rather than reported:
         /// the name is claimed when this call sees `EEXIST` and unlinked by its
@@ -538,7 +538,8 @@ mod imp {
             let name = CString::new(doorbell_shm_name(ns, topic))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             // One retry for the race, plus the attempt that meets it. Bounded so a
-            // pathological peer reports rather than spins.
+            // pathological peer reports rather than spins. Every attempt that
+            // exhausts it lost the name race, which is the only non-fatal shape.
             const OPEN_ATTEMPTS: u32 = 3;
             let mut races = 0u32;
             for _ in 0..OPEN_ATTEMPTS {
@@ -557,11 +558,9 @@ mod imp {
             ))
         }
 
-        /// One pass of the first-wins open sequence. See [`Doorbell::open`] for
-        /// the two recoverable shapes it reports.
+        /// One pass of the first-wins open sequence. See [`Doorbell::open`] for the
+        /// one recoverable shape it reports.
         fn open_once(name: &CString, owns_name: bool) -> Result<Self, OpenAttempt> {
-            // How long to wait out a racing creator's `ftruncate`. The window is
-            // two adjacent syscalls, so this is generous by orders of magnitude;
             let mut created = false;
             // SAFETY: FFI to POSIX named SHM. `name` is a valid C string; mode
             // 0o600 restricts the object to the owner. `mode_t` is `u16` on macOS
@@ -753,9 +752,10 @@ mod imp {
         /// thread reaches the kernel, it is held across a block the parker skips,
         /// and a consumer killed inside its block leaves it set for good, so a
         /// healthy run reaches the kernel with nobody there many times a second.
-        /// `EFAULT` and `ENOMEM` are documented as transient on the same family.
-        /// Logging any of the three would put a line on the publish path of a
-        /// working run.
+        /// Logging it would put a line on the publish path of a working run. It is
+        /// the ONLY errno treated that way; everything else, the header's transient
+        /// `ENOMEM` and `EFAULT` included, reaches the flood latch, because a
+        /// transient fault that persists is exactly what an operator needs told.
         ///
         /// An unrecoverable errno does NOT latch the shared os_sync family from
         /// here. The family latch means "this kernel primitive is unusable", and
@@ -782,10 +782,15 @@ mod imp {
             #[cfg(test)]
             super::note_wake_syscall_for_test();
             if rc >= 0 {
-                // A wake that reached a waiter closes any open regime, so the
-                // latch can report what it suppressed instead of staying open for
-                // the life of the process.
-                super::note_wake_recovered();
+                // A wake that reached a waiter closes an OPEN regime, so the latch
+                // can report what it suppressed instead of staying open for the
+                // life of the process. Gated on a relaxed load, never on the lock:
+                // this is the arm every publish to a parked topic takes, and taking
+                // a process-global mutex here would serialize a producer's
+                // publishes across every topic it owns.
+                if super::wake_regime_is_open() {
+                    super::note_wake_recovered();
+                }
                 return;
             }
             let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -883,20 +888,15 @@ mod imp {
             let mut cur = parked.load(Ordering::Acquire);
             loop {
                 debug_assert!(cur != 0, "park_exit without a matching park_enter");
-                if cur == 0 {
+                let Some(next) = super::parked_decrement(cur) else {
                     // Unreachable through the guard, so reaching it means the
                     // shared count was written by something else. Saying nothing
                     // would leave a peer's missed wake with no evidence at all in
                     // a release build, where the assertion above is compiled out.
                     super::note_parked_gate_underflow();
                     return;
-                }
-                match parked.compare_exchange_weak(
-                    cur,
-                    cur - 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
+                };
+                match parked.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => return,
                     Err(seen) => cur = seen,
                 }
@@ -1181,13 +1181,17 @@ fn wake_latch(
     &LATCH
 }
 
-/// Close the wake regime after a wake that reached a waiter, so the latch can
-/// report what it suppressed rather than staying open for the life of the
-/// process. Returns the suppressed count when a regime really closed.
+/// Close the wake regime after a wake that reached a waiter, and log what it
+/// suppressed rather than leaving the regime open for the life of the process.
+///
+/// Called only when [`wake_regime_is_open`] says there is a regime to close, so
+/// the lock stays off the healthy publish path.
 #[cfg(target_os = "macos")]
 fn note_wake_recovered() {
     use crate::transport::failure_regime_latch::lock_regime_latch;
-    if let Some(suppressed) = lock_regime_latch(wake_latch()).on_success() {
+    let suppressed = lock_regime_latch(wake_latch()).on_success();
+    WAKE_REGIME_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    if let Some(suppressed) = suppressed {
         tracing::warn!(
             suppressed,
             "doorbell wake word os_sync_wake_by_address is succeeding again"
@@ -1214,6 +1218,17 @@ fn note_wait_errno() -> crate::transport::failure_regime_latch::RegimeDecision {
     lock_regime_latch(&LATCH).on_failure()
 }
 
+/// What a park exit does with the claim count it observed: one fewer, or `None`
+/// when the count was already zero and a decrement would wrap it.
+///
+/// Pure and split out because the arm it decides is unreachable through the guard,
+/// so the `debug_assert` beside it can never fire in a test build, and the warn it
+/// guards is the only evidence a release build would leave.
+#[cfg(any(target_os = "macos", test))]
+fn parked_decrement(cur: u32) -> Option<u32> {
+    cur.checked_sub(1)
+}
+
 /// Say ONCE that a doorbell page's `parked` count was decremented below zero.
 ///
 /// Unreachable through [`ParkedDoorbellGuard`], so reaching it means the count in
@@ -1232,10 +1247,26 @@ fn note_parked_gate_underflow() {
     }
 }
 
+/// Whether the wake regime is open, as a relaxed load the publish path can afford.
+///
+/// The recovery call takes the flood latch's mutex, and a producer publishing to a
+/// parked topic reaches it on EVERY publish, so the lock cannot be the thing that
+/// decides there is nothing to recover from. A stale read costs at most one late
+/// recovery line.
+#[cfg(target_os = "macos")]
+static WAKE_REGIME_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Is a wake regime open? Read on the publish path, so it is one relaxed load.
+#[cfg(target_os = "macos")]
+fn wake_regime_is_open() -> bool {
+    WAKE_REGIME_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Record one failing wake-word WAKE, in the wake side's own regime.
 #[cfg(target_os = "macos")]
 fn note_wake_errno() -> crate::transport::failure_regime_latch::RegimeDecision {
     use crate::transport::failure_regime_latch::lock_regime_latch;
+    WAKE_REGIME_OPEN.store(true, std::sync::atomic::Ordering::Relaxed);
     lock_regime_latch(wake_latch()).on_failure()
 }
 
@@ -1279,7 +1310,7 @@ pub fn wake_syscall_count_for_test() -> u64 {
 /// iteration, so by the time a wait could report it the wait is no longer
 /// reached.
 #[cfg(target_os = "macos")]
-pub fn note_tier_inactive() {
+pub(crate) fn note_tier_inactive() {
     if doorbell_os_sync_kill_switch() {
         return;
     }
@@ -1622,6 +1653,31 @@ mod tests {
             );
             assert!(n.starts_with("/cer_db_"), "family prefix: {n}");
         }
+    }
+
+    /// Both sides of the cap the compact shape exists to clear, with the boundary
+    /// DERIVED from the constant rather than from the number in the module's prose,
+    /// so the arithmetic that justifies the shape cannot drift from it.
+    #[test]
+    fn the_verbose_shape_overruns_the_macos_cap_one_character_past_the_longest_fit() {
+        // "/cer_db_" (8) + ns + "_" (1) + 16 hex = 25 + len(ns).
+        const FIXED: usize = 25;
+        let longest_fit = "u".repeat(PSHM_NAME_MAX - FIXED);
+        let one_more = "u".repeat(PSHM_NAME_MAX - FIXED + 1);
+        assert_eq!(
+            doorbell_shm_name_verbose(&longest_fit, "t").len(),
+            PSHM_NAME_MAX,
+            "the longest fitting namespace lands exactly on the cap"
+        );
+        assert!(
+            doorbell_shm_name_verbose(&one_more, "t").len() > PSHM_NAME_MAX,
+            "one character more overruns it, which is the whole reason the compact \
+             shape hashes both components"
+        );
+        assert!(
+            doorbell_shm_name_compact(&one_more, "t").len() <= PSHM_NAME_MAX,
+            "and the compact shape clears the cap for that same namespace"
+        );
     }
 
     /// The 0x1F unit separator is what makes the two-component hash
@@ -2394,38 +2450,119 @@ mod tests {
         // SAFETY: FFI open-only probe of the fixture name.
         let probe = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert!(probe >= 0, "the name must not have been unlinked");
-        // SAFETY: `probe_st` is zeroed first; `fstat` fills it on success.
-        let mut probe_st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: FFI fstat on the probe descriptor.
-        assert_eq!(unsafe { libc::fstat(probe, &mut probe_st) }, 0);
-        assert_eq!(
-            (st.st_dev, st.st_ino),
-            (probe_st.st_dev, probe_st.st_ino),
-            "the name must still resolve to the very object that was there"
-        );
+        // SAFETY: close the probe descriptor.
+        unsafe { libc::close(probe) };
 
-        // And a peer attaching afterwards shares the page the sizing produced.
-        let peer = Doorbell::open_owned(&ns, topic).expect("a later open attaches");
-        peer.ring();
+        // The SAME page, proven by a write THROUGH the fixture's own descriptor
+        // showing up in the mapping this open made. This is what says no name was
+        // deleted and no second object created, and it is the only way to say it:
+        // MEASURED, `fstat` reports `(st_dev, st_ino)` as `(0, 0)` for every POSIX
+        // shared-memory object on this target, so an inode comparison between two
+        // descriptors is vacuous here.
+        // SAFETY: map the fixture's own descriptor, which the sizing above made
+        // mappable, and write the ring counter's first word through it.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                doorbell_page_bytes_for_test(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                dead,
+                0,
+            )
+        };
+        assert_ne!(
+            mapped,
+            libc::MAP_FAILED,
+            "the object the fixture created must be mappable, which it is only \
+             because the open sized it in place"
+        );
+        // SAFETY: `mapped` is a live MAP_SHARED mapping of at least 8 bytes, and
+        // the doorbell's ring counter is an AtomicU64 at offset 0 of the same page.
+        let ring_through_fixture = unsafe { &*(mapped as *const std::sync::atomic::AtomicU64) };
+        ring_through_fixture.fetch_add(7, std::sync::atomic::Ordering::Release);
         assert_eq!(
             bell.seq(),
-            1,
-            "a later opener's ring shows through the page this open mapped"
+            7,
+            "a store through the FIXTURE's own descriptor must show in the mapping \
+             this open made, or the two are on different pages and a name was \
+             replaced under a live peer"
         );
+        // SAFETY: unmap the mapping this test made.
+        unsafe { libc::munmap(mapped, doorbell_page_bytes_for_test()) };
 
-        // SAFETY: close the descriptors this test opened.
-        unsafe { libc::close(probe) };
-        // SAFETY: as above.
+        // SAFETY: close the descriptor this test opened.
         unsafe { libc::close(dead) };
-        drop(peer);
         drop(bell);
         cleanup(&ns, &[topic]);
     }
 
+    /// The two wake-word flood regimes are SEPARATE, and the wake one closes.
+    ///
+    /// A shared regime would give the loud head to whichever half failed first and
+    /// downgrade the other's, so an operator chasing a failing WAKE would read a
+    /// line about the WAIT and act on the wrong remedy. Driven directly, because
+    /// both are module-private functions over pure latch state: no syscall, no env,
+    /// no thread.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial(doorbell_wake_regimes)]
+    #[tracing_test::traced_test]
+    fn the_wake_and_wait_regimes_are_separate_and_the_wake_one_closes() {
+        use crate::transport::failure_regime_latch::RegimeDecision;
+        // Each half opens its OWN regime, so each gets its own loud head.
+        assert!(matches!(note_wake_errno(), RegimeDecision::Loud));
+        assert!(matches!(note_wait_errno(), RegimeDecision::Loud));
+        // A repeat on the wake side is downgraded, and the count it reports is the
+        // wake side's alone.
+        assert!(matches!(
+            note_wake_errno(),
+            RegimeDecision::Suppressed { suppressed: 1 }
+        ));
+        // The publish path's gate says there is something to close, which is what
+        // keeps the lock off it while nothing is failing.
+        assert!(wake_regime_is_open(), "a failing wake opens the regime");
+        note_wake_recovered();
+        assert!(
+            !wake_regime_is_open(),
+            "a recovery closes it, so the next publish takes one relaxed load"
+        );
+        assert!(
+            logs_contain("os_sync_wake_by_address is succeeding again"),
+            "the recovery reports what it suppressed"
+        );
+        // The WAIT regime is untouched by the wake side's recovery: its next repeat
+        // is still a repeat.
+        assert!(matches!(
+            note_wait_errno(),
+            RegimeDecision::Suppressed { suppressed: 1 }
+        ));
+        // And the wake side's next failure is LOUD again, or its regime never
+        // really closed.
+        assert!(matches!(note_wake_errno(), RegimeDecision::Loud));
+        note_wake_recovered();
+    }
+
+    /// The parked gate's underflow arm: the decision is pure, so both sides of it
+    /// are pinned here rather than left to a `debug_assert` that is compiled out of
+    /// every build where the warn is the only evidence.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_parked_count_of_zero_at_exit_is_an_underflow() {
+        assert_eq!(
+            parked_decrement(0),
+            None,
+            "zero at exit means the shared count was written by something else, and \
+             the peer whose wake it costs cannot see that"
+        );
+        assert_eq!(parked_decrement(1), Some(0));
+        assert_eq!(parked_decrement(u32::MAX), Some(u32::MAX - 1));
+    }
+
     /// An object at EXACTLY one cache line is ATTACHED, not replaced: the other
-    /// side of the bound the heal above pins, with the fixture derived from the
-    /// same constant (and reported by the kernel as a whole page, per the note on
-    /// that test).
+    /// side of the bound `an_unsized_doorbell_object_is_sized_in_place` pins, with
+    /// the fixture derived from the same constant (and reported by the kernel as a
+    /// whole page, per the note on that test).
     ///
     /// Attaching rather than replacing is the whole first-wins contract, so it is
     /// proven by a ring on a second handle showing through the page this open

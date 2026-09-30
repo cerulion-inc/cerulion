@@ -605,10 +605,16 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
     // that inverts under load. A rung that never woke on a ring still fails,
     // because then the timer ends every window.
     assert!(
-        doorbell > timeout,
-        "a ring must end more park windows than the timer does - got \
-         {doorbell} ring wakes against {timeout} timeouts across {entries} park \
-         entries"
+        timeout <= 1,
+        "a park window with a ring every 200 microseconds inside it must be ended \
+         by a ring, not by its own 50 millisecond timeout; one starved window on a \
+         loaded runner is a host fact and is the whole budget - got {timeout} \
+         timeouts across {entries} park entries"
+    );
+    assert!(
+        doorbell + 1 >= entries,
+        "and all but at most one entry must be ring-ended - got {doorbell} ring \
+         wakes across {entries} park entries"
     );
     assert_eq!(
         fires.load(Ordering::Relaxed),

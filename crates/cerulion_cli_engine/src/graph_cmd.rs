@@ -36200,6 +36200,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     /// `--no-monitor-wait` (`Disabled`) → off(), even with both env vars forced
     /// on and the primitive available. The flag wins over everything.
     #[test]
+    #[tracing_test::traced_test]
     fn resolve_mw_disabled_off_even_with_env_force() {
         let p = resolve_monitor_wait_policy(MonitorWaitInputs {
             mode: MonitorWaitMode::Disabled,
@@ -36212,6 +36213,21 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         });
         assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
         assert!(!p.monitor_wait() && !p.doorbell());
+        // Both explicit requests were refused, and an explicit request is never
+        // dropped in silence: each names the variable it refused and the flag that
+        // won, because the remedy is to drop the flag.
+        assert!(
+            logs_contain("--no-monitor-wait wins over every env override"),
+            "an explicit CERULION_MONITOR_WAIT=1 the flag overrode must be told so"
+        );
+        assert!(
+            logs_contain("Drop --no-monitor-wait to honour the env value"),
+            "the remedy is the half the operator acts on"
+        );
+        assert!(
+            logs_contain("--no-monitor-wait turns the live-loop park off outright"),
+            "and the doorbell request gets its own line, since it has its own remedy"
+        );
     }
 
     // The no-primitive DEGRADED park tier, default-ON.
@@ -36477,6 +36493,11 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             !logs_contain("doorbell FORCED OFF"),
             "a near-miss is not an explicit request, so the downgrade warn must \
              not fire"
+        );
+        assert!(
+            !logs_contain("--no-monitor-wait wins over every env override"),
+            "nothing was requested on the park variable, so nothing was refused \
+             there either"
         );
     }
 

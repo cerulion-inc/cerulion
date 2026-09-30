@@ -356,4 +356,40 @@ mod tests {
             );
         }
     }
+
+    /// The WAKE side's own classifier: `ENOENT` alone is expected, and everything
+    /// else reaches the caller's flood latch.
+    ///
+    /// Both directions matter and in opposite ways. Dropping `ENOENT` from the
+    /// expected set puts a log line on the publish path of every healthy run,
+    /// because a `parked`-gated wake reaches the kernel with nobody there whenever
+    /// a claim is set and its thread has not blocked yet, a parker skipped its
+    /// block, or a killed consumer left its claim behind. Adding anything else
+    /// silences a fault that leaves every consumer of that topic unwoken, which
+    /// only the producer can see.
+    #[test]
+    fn wake_errno_classification_oracle() {
+        assert!(
+            os_sync_wake_errno_is_expected(libc::ENOENT),
+            "ENOENT is the header's 'no waiter(s) found waiting on the @addr': the \
+             gate's own race, not a fault"
+        );
+        for errno in [
+            libc::EINVAL,
+            libc::ENOTSUP,
+            libc::EFAULT,
+            libc::ENOMEM,
+            libc::ETIMEDOUT,
+            libc::EINTR,
+            libc::EAGAIN,
+            libc::EPERM,
+            0,
+        ] {
+            assert!(
+                !os_sync_wake_errno_is_expected(errno),
+                "errno {errno} is not the no-waiter race, so it must reach the \
+                 flood latch and be told to an operator"
+            );
+        }
+    }
 }
