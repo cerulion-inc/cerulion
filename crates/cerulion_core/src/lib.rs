@@ -663,8 +663,8 @@ pub mod wire;
 /// - v23: `CerulionSubscriber` carries one more field,
 ///   `replay_plan: Option<Arc<read_outcome::ReadPlanStage>>`, the REPLAY read
 ///   gate for this input's stage, installed at graph wiring time and armed only
-///   by a replay. The field sits at the end of the struct, so every field
-///   before it keeps its offset and every field after it has none; that is not
+///   by a replay. `CerulionSubscriber` is `repr(Rust)`, so nothing pins where
+///   the new field lands or what the fields around it keep; that is not
 ///   an additive change, because `NodeContext` owns this struct through
 ///   `AnySubscriber` and a v22 cdylib would index the struct at stale offsets.
 ///   The plan's own chain (`ReadPlanStage`, `PlanInner`, `DueRead`,

@@ -173,9 +173,9 @@ BOTH of these hold, and reports nothing about it otherwise:
 
 A role divergence therefore means what it says: both sides named a site and they
 named DIFFERENT ones; the candidate read the frame somewhere the recording did
-not. Like every retained read-log finding it is LOUD and it is the verdict: a
-recorded read the re-execution did not reproduce takes exit 6, the schedule
-divergence, and never exit 1.
+not. Like every read-log finding the quarantine does not cover it is LOUD and it
+is the verdict: a recorded read the re-execution did not reproduce takes exit 6,
+the schedule divergence, and never exit 1.
 
 **Reading it offline:** a role of `1` on a `Served`, `Held` or `NoFrame` record
 is a `(kind, role)` pair no mint site can produce (those three are staged only
@@ -605,10 +605,10 @@ log finding is never exit 1:
 
 | exit | what it means for the read log |
 |---|---|
-| 0 | every gated stage admitted the frames the recording popped, at the steps it popped them, and the redundant per-edge verifier found nothing it retained. `read_log_enforcement.status` says which stages those were: `enforced` gates every stage of every produced-and-consumed edge that CAN be gated, while `not_gateable`, `not_enforced` and `enforced.stages_not_gateable` each name stages that were not, and exit 0 says nothing about their intra-step arrival |
+| 0 | every gated stage admitted the frames the recording popped, at the steps it popped them, and the redundant per-edge verifier retained nothing outside the read-log quarantine's scope (a quarantined finding stays in `read_log_divergence` and reaches no verdict, so an exit-0 run can still list the class). `read_log_enforcement.status` says which stages those were: `enforced` gates every stage of every produced-and-consumed edge that CAN be gated, while `not_gateable`, `not_enforced` and the `stages_not_gateable` count beside an `enforced` status each name stages that were not, and exit 0 says nothing about their intra-step arrival |
 | 1 | frame CONTENT diverged. No read-log condition reaches this code |
-| 2 | the recording's read log cannot be enforced on a gated edge, so the run is refused rather than gated on a claim it cannot trust. The message names the cause token (`read_log_no_coverage`, `read_log_record_dropped`, `read_log_edge_not_gateable`, `read_log_unenforceable_record`, `read_log_input_name_unresolved`, `read_log_input_name_duplicated`, `read_log_budget_declined`, `read_log_verdict_incomplete`), the stage and the remedy |
-| 6 | a recorded EDGE READ the re-execution did not reproduce: a frame due at a step that never arrived, a surviving sequence that does not match, or a divergence the per-edge verifier retained. It shares exit 6 with the fire comparator because both say the same thing, the re-executed SCHEDULE is not the recorded one |
+| 2 | the recording's read log cannot be enforced on a gated edge, so the run is refused rather than gated on a claim it cannot trust. The message names the cause token (`read_log_no_coverage`, `read_log_record_dropped`, `read_log_edge_not_gateable`, `read_log_unenforceable_record`, `read_log_input_name_unresolved`, `read_log_input_name_duplicated`, `read_log_budget_declined`, `read_log_verdict_incomplete`), the stage on the per-stage arms or the topics or the rank on the whole-topic and whole-rank ones, and the remedy. Seven of the eight are minted at prepare, before the first step; `read_log_verdict_incomplete` is minted after the step loop, when the gate's bounded per-stage violation list overflowed and no verdict would name every finding |
+| 6 | a recorded EDGE READ the re-execution did not reproduce: a frame due at a step that never arrived, a surviving sequence that does not match, or a divergence the per-edge verifier retained outside the read-log quarantine's scope. `resim_exit_code` returns 6 for it and for the fire comparator alike: both say the re-executed SCHEDULE is not the recorded one |
 
 The terminal block for the last of those is headed `EDGE-READ DIVERGENCE` and
 names the edge, the step and both sequences.

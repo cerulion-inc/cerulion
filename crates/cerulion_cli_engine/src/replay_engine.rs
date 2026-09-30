@@ -308,10 +308,11 @@ pub struct ReplayOutcome {
     /// The REDUNDANT per-edge read-log verifier's findings — the
     /// first divergence per (consumer, input) edge between the bag's kind-6
     /// READ-OUTCOME records and the read outcomes the monolith replay
-    /// re-derived (see [`ReadLogDivergenceReport`]). A retained divergence here
-    /// is a SCHEDULE divergence: it is carried into
-    /// [`Self::read_log_verdict`], clears [`Self::passed`] and takes exit 6
-    /// beside the fire comparator's. `None` when the verifier found
+    /// re-derived (see [`ReadLogDivergenceReport`]). A divergence here that
+    /// [`Self::read_log_quarantine`] does not cover is a SCHEDULE divergence: it
+    /// is carried into [`Self::read_log_verdict`], clears [`Self::passed`] and
+    /// takes exit 6 beside the fire comparator's. One the quarantine covers stays
+    /// in this report and reaches no verdict. `None` when the verifier found
     /// nothing — a clean run, AND every bag with no kind-6 records (every
     /// `trace_format` <= 2 bag) or with kind-6 records but no usable manifest
     /// input table AT PREPARE (loud-warned, disabled before anything
@@ -748,8 +749,12 @@ pub enum ReadLogStatus {
     },
     /// At least one edge diverged and the verifier RAN TO COMPLETION — see
     /// [`ReplayOutcome::read_log_divergence`] for the retained first
-    /// divergence per edge. Those divergences are the exit-6 read-log verdict
-    /// ([`ReplayOutcome::read_log_verdict`]). Note: divergences
+    /// divergence per edge. Those of them OUTSIDE the quarantine's scope are
+    /// the exit-6 read-log verdict
+    /// ([`ReplayOutcome::read_log_verdict`]); this status is set from the
+    /// divergence list alone, so a `Diverged` whose every divergence the
+    /// quarantine excludes leaves that verdict `None` and the run at exit 0.
+    /// Note: divergences
     /// found BEFORE a mid-run stand-down do NOT produce this status — they
     /// are salvaged into the report while the status stays
     /// [`Self::Disabled`] (the verifier cannot claim a verification it did
@@ -2054,9 +2059,11 @@ pub struct UnmetReadReport {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ReadLogEnforcement {
-    /// No graph-produced input edge runs inside one rank on this recording, or
-    /// the bag carries no read log to enforce. Nothing was gated, and the replay
-    /// took today's drain byte for byte.
+    /// No graph-produced input edge runs inside one rank on this recording.
+    /// Selected from an EMPTY enforce set, so a rank that holds such an edge and
+    /// gated nothing reports [`Self::NotEnforced`] instead, whether the bag
+    /// carries a read log or not. Nothing was gated, and the replay took today's
+    /// drain byte for byte.
     #[default]
     NotApplicable,
     /// A LOCKSTEP replay arms no gate: one gating clock orders every rank's

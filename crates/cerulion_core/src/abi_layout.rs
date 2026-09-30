@@ -414,10 +414,11 @@ static EXPECTED: &[Expected] = &[
             "held_head_reoffers",
             "held_head_warned",
             "served_sequence",
-            // v23: the REPLAY read gate for this input's stage. A pointer that
-            // moves nothing before it and everything after it, NOT an additive
-            // change: `NodeContext` owns this struct through `AnySubscriber`,
-            // so a v22 cdylib would index it at stale offsets (the v23 lib.rs
+            // v23: the REPLAY read gate for this input's stage. A pointer
+            // added to a `repr(Rust)` struct, whose field placement this row
+            // does not pin (it is `FieldSetOnly`), NOT an additive change:
+            // `NodeContext` owns this struct through `AnySubscriber`, so a v22
+            // cdylib would index it at stale offsets (the v23 lib.rs
             // paragraph).
             "replay_plan",
         ],

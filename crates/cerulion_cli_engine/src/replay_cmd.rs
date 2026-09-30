@@ -63,7 +63,9 @@
 //! replays to exit 0). 0/1/3(execution)/6 are the engine's [`ReplayOutcome`]
 //! verdict, with precedence 3 > 6 > 1 (root cause over symptoms — a crashed
 //! candidate explains both a diverged schedule and missing frames; the
-//! verdict still renders every block). Exit 6 fires when
+//! verdict still renders every block). Exit 6 fires when either that outcome's
+//! [`ReplayOutcome::read_log_verdict`](crate::replay_engine::ReplayOutcome::read_log_verdict)
+//! or its
 //! [`ReplayOutcome::trace_divergence`](crate::replay_engine::ReplayOutcome::trace_divergence)
 //! is populated — it takes precedence over exit 1. The typed 2–5 error
 //! mapping is pinned by an oracle-vector test so the contract cannot drift
@@ -717,14 +719,18 @@ pub enum ReplayError {
     /// Exit 2, the not-replay-grade class: the fault is in what the RECORDING
     /// can support, not in the candidate.
     ///
-    /// It fires at PREPARE, before the first step of the first rank whose plan
-    /// cannot be built, so no partial verdict is reported.
+    /// Every arm but one fires at PREPARE, before the first step of the first
+    /// rank whose plan cannot be built, so no partial verdict is reported. The
+    /// exception is `read_log_verdict_incomplete`, minted after the step loop
+    /// when the gate's bounded per-stage violation list overflowed: that run
+    /// completed, and the refusal stands in for a verdict the report cannot
+    /// state in full.
     #[error("{}", render_read_log_not_enforceable(.edge, .cause, .detail))]
     ReadLogNotEnforceable {
         /// `<node>[<idx>]/<role>`, `StageKey::label`'s own shape, or
         /// `node.input` on the arms that fire before a stage is resolved.
-        /// `None` only on the whole-topic and whole-rank arms, which name every
-        /// stage in `detail`.
+        /// `None` on the whole-topic and whole-rank arms, which name the
+        /// topics or the rank in `detail` in place of a stage.
         edge: Option<String>,
         /// The stable token, one per cause.
         cause: String,
