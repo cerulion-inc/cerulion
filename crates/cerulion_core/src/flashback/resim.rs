@@ -757,8 +757,9 @@ pub const RESIM_COVERED_THROUGH_CLAUSE: &str =
 /// it to one of them would publish a verdict whose scope depends on which arm it
 /// took.
 ///
-/// `covered_through_ns` is `None` when the capture carries no
-/// authoritative-rank step boundary to end a range at. That capture is refused
+/// `covered_through_ns` is `None` when NO rank kept a step boundary to end a
+/// range at, which is what the writer's fold over the ranks answers. That
+/// capture is refused
 /// separately (`ResimGap::NoBoundary`), so the arm is reachable only from a
 /// from-start claim whose trace the trim kept whole — and the base sentence
 /// alone is then the accurate one: it promises re-execution and states no range
@@ -1076,8 +1077,8 @@ mod tests {
             );
 
             // …and with NO range measured, the sentence claims none. Reachable
-            // only for a capture whose trace carries no authoritative-rank
-            // boundary — which `NoBoundary` refuses — so the correct rendering is
+            // only for a capture whose trace carries no step boundary on ANY
+            // rank, which `NoBoundary` refuses, so the correct rendering is
             // the base sentence alone rather than a fabricated endpoint.
             let without = resimmable_reason(from_start, None);
             assert_eq!(without, base);

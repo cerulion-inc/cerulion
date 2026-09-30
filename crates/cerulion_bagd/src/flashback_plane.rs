@@ -2062,8 +2062,10 @@ pub(crate) struct CaptureManifest<'a> {
     /// to be.
     pub anchor_target_ns: Option<u64>,
     /// The gating-clock instant this capture's `resimmable` claim
-    /// extends TO — the target of the last authoritative-rank step boundary its
-    /// trace carries.
+    /// extends TO: the MINIMUM over the ranks that kept a boundary of each
+    /// rank's last kept step-boundary target. It is rank 0's own last target
+    /// only when no rank was trimmed or ended shorter than rank 0, because a
+    /// resume covers the graph only as far as its slowest rank.
     ///
     /// The range's OTHER endpoint is already stated: `anchor_target_ns` for a
     /// resume, or the run's own step 0 for a from-start capture. What was
@@ -2956,7 +2958,7 @@ mod tests {
     // renderer's own branches reachable at all: `MultiRing` needs several state
     // rings, i.e. a real multi-process supervisor, and `NoBoundary` needs a
     // torn ring head. The lineage is stated in this repo's own vocabulary at
-    // `cerulion_viz/bin/cerulion_vizd/tests/vizd_e2e_test.rs:112` — "a RECORDING
+    // `cerulion_viz/bin/cerulion_vizd/tests/vizd_e2e_test.rs:117`: "a RECORDING
     // spy `DemandPlane` (a DI test double — Principle #13, not fake data)".
     //
     // Second: a gap these arms cannot close on their own is real:
@@ -4929,8 +4931,9 @@ mod tests {
     /// The rule itself is oracle-tested in `trace_window`; this is the WIRING —
     /// without it the recovery exists and nothing calls it, and every arm over
     /// there stays green (the inert-shipping shape). The straddle it drives is
-    /// the ordinary one: `AnchorWindow::select` picks the newest checkpoint at
-    /// or before the deadline, and the eligible band's lower edge IS the floor,
+    /// the ordinary one: `AnchorWindow::select` returns an `AnchorSelection`,
+    /// the newest eligible checkpoint for EACH ring at or before the deadline,
+    /// and the eligible band's lower edge IS the floor,
     /// so a boundary drained one pass before its own anchor sits below it.
     #[test]
     fn select_trace_recovers_an_anchor_target_drained_below_the_capture_floor() {

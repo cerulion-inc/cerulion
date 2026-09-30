@@ -51,10 +51,13 @@
 //! # Bounds, and which of them is a promise
 //!
 //! Same split as the frame window. The SPAN is the promise: keep every
-//! checkpoint the window still covers, plus the single newest one that fell out
-//! of it (the CARRY — see [`AnchorWindow::evict`]). At cadence `C` over a span
-//! `W` that is `⌈W/C⌉ + 1` checkpoints, DERIVED from the window rather than from
-//! a second copy of the cadence knob the graph process owns.
+//! checkpoint GENERATION the window still covers, plus the single newest
+//! generation that fell out of it (the CARRY, see [`AnchorWindow::evict`]). A
+//! generation is the cross-rank set at one `(run_id, step)`, one entry per rank,
+//! and eviction takes whole generations by identity. At cadence `C` over a span
+//! `W` that is `⌈W/C⌉ + 1` generations, so up to `k` times that many ENTRIES on
+//! a run of `k` ranks, DERIVED from the window rather than from a second copy of
+//! the cadence knob the graph process owns.
 //!
 //! The BYTE ceiling is the backstop, and **the rule is strict about what
 //! reaching it costs**. A robot whose checkpoints do not
@@ -1049,8 +1052,9 @@ impl AnchorWindow {
     ///
     /// # The CARRY
     ///
-    /// The newest checkpoint that has aged out is KEPT, and that is the `+1` in
-    /// `⌈W/C⌉ + 1`. Without it a checkpoint that ages out microseconds before a
+    /// The newest GENERATION that has aged out is KEPT, and that is the `+1` in
+    /// `⌈W/C⌉ + 1`: `generations_to_age` withholds it, so the whole cross-rank
+    /// set stays. Without it a generation that ages out microseconds before a
     /// trigger leaves the capture with only checkpoints NEWER than its claimed
     /// pre-window start — so the capture would resume from a later instant than
     /// it could have, purely because of where the eviction pass fell. Keeping one

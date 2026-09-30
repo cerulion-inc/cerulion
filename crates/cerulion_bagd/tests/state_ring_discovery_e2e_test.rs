@@ -474,9 +474,9 @@ fn an_unarmed_recorder_adopts_nothing_even_with_the_rings_present() {
 /// incomplete.
 ///
 /// Ranks are dense, so rank 1 being absent while rank 2 is present is not missing
-/// information — it is information. And because a graph-wide anchor is
-/// all-or-nothing across ranks, that one rank voids every anchor of the
-/// run, which is why it escalates rather than sitting in a field nobody reads.
+/// information, it is information. And because an anchor is graph-wide, every
+/// anchor of the run LACKS that rank's records, which is why it escalates rather
+/// than sitting in a field nobody reads.
 #[test]
 #[serial_test::serial]
 fn a_rank_that_published_no_ring_is_reported_and_makes_the_recording_incomplete() {

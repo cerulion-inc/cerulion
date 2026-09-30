@@ -8986,9 +8986,12 @@ fn map_ring_err(ring_name: &str, e: ShmRingError) -> BagdError {
 /// # The two facts this has to get right
 ///
 /// `rings_declared` is the number of DISTINCT rings the checkpoint's anchors came
-/// from, because a restore engine refuses `> 1` — a state record carries a
-/// `node_idx` and no rank, so two workers both numbering their nodes from zero
-/// are genuinely ambiguous. Reporting the recorder's ring COUNT instead would
+/// from, because a restore engine refuses `> 1`: from state record format
+/// version 1 a state record carries its producer's rank, but the restore
+/// reader's index table is keyed by `node_idx` alone and its assembler groups
+/// parts by `(run_id, step, node_idx)`, so two workers both numbering their
+/// nodes from zero collide in THOSE keys before the coverage manifest's ring to
+/// rank join can be consulted. Reporting the recorder's ring COUNT instead would
 /// make a single-ring capture off a multi-rank run look ambiguous, and a
 /// multi-ring one look exact.
 ///
@@ -9831,7 +9834,7 @@ fn judge_capture_resimmable(
             // resim refuses at `BagMissingAttachment`.
             // USABLE, not merely named — and `usable` means every step
             // `run_replay` takes on this attachment before anything runs, which
-            // is UTF-8 -> parse -> VALIDATE (`replay_cmd.rs:553-583`), each
+            // is UTF-8 -> parse -> VALIDATE (`replay_cmd.rs:1371-1401`), each
             // failing as `BagInvalidAttachment`.
             //
             // The predicate has now been one gate short TWICE, in the same

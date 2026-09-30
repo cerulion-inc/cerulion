@@ -456,14 +456,19 @@ pub struct StateNodeCoverage {
     ///
     /// RESIDUAL, relevant to the restore engine and deliberately NOT closed
     /// here: with `rings_declared > 1` the `node_idx → node` mapping is still
-    /// ambiguous BAG-SIDE, because a record carries no rank. Two workers' rings
+    /// ambiguous to the RESTORE READER, whose index table is keyed by `node_idx`
+    /// alone; from state record format version 1 the record itself carries its
+    /// producer's rank. Two workers' rings
     /// both number their nodes from 0, so a record with `node_idx = 0` could be
-    /// either ring's first node and nothing in the bag disambiguates it — the
+    /// either ring's first node and the reader's keys do not disambiguate it:
+    /// the
     /// [`ring`](Self::ring) field answers "which ring is this NODE in", not
     /// "which ring did this RECORD come from". The restore engine REFUSES a
-    /// multi-ring bag for now; this field makes the single-ring case — every
-    /// shipping shape today — exact. Closing it needs a rank on the record or on
-    /// the channel, which is a wire change and belongs with the restore work.
+    /// multi-ring bag for now; this field makes the single-ring case, every
+    /// shipping shape today, exact. Closing it needs the restore reader to carry
+    /// the record's rank through its own keys, which is a read-side change and
+    /// belongs with the restore work; the wire half landed at state record
+    /// format version 1.
     ///
     /// A node id declared by TWO rings at DIFFERENT indices serves `None`: the
     /// index is then not a fact this bag can state, and the alternative is
@@ -689,8 +694,10 @@ impl StateCoverage {
     ///   Claiming a mid-run attach would make it DISCARD the head of the very
     ///   anchor the capture exists to carry.
     /// * `rings_declared` — the number of DISTINCT rings the embedded anchors
-    ///   came from. A restore engine refuses `> 1` because `node_idx` carries no
-    ///   rank, so this is an explicit refusal rather than an ambiguous read.
+    ///   came from. A restore engine refuses `> 1` because its OWN keys carry no
+    ///   rank, `node_idx` alone in the index table and `(run_id, step,
+    ///   node_idx)` in the assembler, so this is an explicit refusal rather than
+    ///   an ambiguous read.
     /// * `armed` — the graph's cadence, carried through so a capture says what
     ///   plane produced it.
     ///
