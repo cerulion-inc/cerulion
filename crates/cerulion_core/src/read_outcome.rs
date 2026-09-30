@@ -2151,7 +2151,7 @@ impl std::fmt::Display for ReadPlanRefusal {
 pub struct ReadEdgeCapability {
     /// The stage this row describes.
     pub key: StageKey,
-    /// Whether [`ReadPlanStage::arm`] would succeed.
+    /// Whether `ReadPlanStage::arm` would succeed.
     pub enforceable: bool,
     /// Why not, when `enforceable` is false.
     pub reason: Option<ReadPlanRefusal>,
