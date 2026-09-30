@@ -1374,11 +1374,14 @@ pub enum GraphAction {
         ///
         /// A single-process run records real cumulative fire times, so the
         /// graph's own topics replay identically. A multi-process run is
-        /// recorded into ONE bag covering every worker, and its fire times are
-        /// lockstep logical time rather than wall time; `--single-process`
-        /// forces the single-process recording instead. Live clock only:
-        /// combining `--record` with `--time-source virtual|external` is
-        /// rejected. Unix-only.
+        /// recorded into ONE bag covering every worker. By DEFAULT (free-run)
+        /// each rank records its OWN wall-faithful timeline from a shared
+        /// epoch; under the `CERULION_EXECUTION_MODE=lockstep` opt-out the
+        /// recorded fire times are that mode's gating quantum rather than wall
+        /// time. The bag's `coordination` stamp says which.
+        /// `--single-process` forces the single-process recording instead.
+        /// Live clock only: combining `--record` with
+        /// `--time-source virtual|external` is rejected. Unix-only.
         // `String`-typed, so the original `PathBuf` sweep missed
         // it and it would have completed NOTHING. Found by the structural
         // walk in `completion_wiring_tests`.

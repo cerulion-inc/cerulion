@@ -41,11 +41,30 @@
 //! 5. **THE CO-TENANT** and the D4 run-half (`a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts`,
 //!    `a_run_writes_its_window_recorder_decision_into_run_json`); see their docs.
 //! 6. **THE ONE-RANK FREE-RUN LOOP** (`a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant`):
-//!    the same run under `CERULION_EXECUTION_MODE=free_run` (the free-run
-//!    default is not on `main` yet, so the opt-in is set explicitly), a capture taken
-//!    MID-RUN, `bag play --resim all --verify` exit 0 twice with one report, and the
-//!    perturbed ticker caught at exit 1 naming its topic. The negative control is
-//!    the base tree: without the admission the same arm exits 2 by name at the resim.
+//!    the same run under the explicit `CERULION_EXECUTION_MODE=free_run`
+//!    spelling, a capture taken MID-RUN, `bag play --resim all --verify` exit 0
+//!    twice with one report, and the perturbed ticker caught at exit 1 naming
+//!    its topic. The negative control is the base tree: without the admission
+//!    the same arm exits 2 by name at the resim.
+//! 7. **THE DEFAULT TWIN** (`a_default_one_rank_capture_free_runs_and_resims_and_verifies_byte_exact`):
+//!    arm 6 with the variable REMOVED from the run's environment. Free-run is
+//!    the default for a multi-process run, so the capture must stamp
+//!    `coordination: free_run`, the run must read `gating: recorded_wall`, and
+//!    the whole loop must hold with nothing exported. A default that fell back
+//!    to lockstep fails it at the stamp.
+//! 8. **THE OPT-OUT TWIN** (`a_lockstep_opt_out_one_rank_capture_stamps_lockstep_and_resims_and_verifies_byte_exact`):
+//!    the same loop under `CERULION_EXECUTION_MODE=lockstep`: the capture
+//!    stamps `coordination: lockstep`, the run reads `gating: quantum`, and the
+//!    mid-run resume is the ordinary lockstep one. Arms 7 and 8 are each
+//!    other's positive control: both read the stamp and the label, and the two
+//!    answers differ.
+//!
+//! Arms 1, 3 and 5 drive the DEFAULT execution mode and SAY SO
+//! (`DEFAULT_MODE_ENV`) rather than leaving it to whatever a plain run happens
+//! to resolve to, and each derives its frame-stamp rule from the `gating`
+//! label that mode implies. A multi-process run free-runs, so a capture off
+//! any of them may legitimately carry a bounded catch-up burst, which the
+//! strict lockstep rule forbids.
 //!
 //! # What each arm alone catches
 //!
@@ -425,6 +444,12 @@ fn spawn_run(
     let mut args = vec!["graph", "run", "plainrun", "--no-validate"];
     args.extend_from_slice(extra);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    // HERMETIC on the execution mode: the supervisor reads
+    // `CERULION_EXECUTION_MODE` from ITS environment, which this spawn
+    // forwards, so a value exported by the developer's shell would otherwise
+    // decide every arm. Removed first; an arm that names a mode passes it in
+    // `env`, which is applied after this line.
+    cmd.env_remove("CERULION_EXECUTION_MODE");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -529,15 +554,61 @@ const MAX_CATCH_UP_BURST_FRAMES: usize = 8;
 /// blind to a fault the stricter one catches. See [`gating_stamp_violation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gating {
-    /// A plain `graph run`: the quantum is the TIGHTEST period in the graph, so
-    /// a step never owes a `period_ms` node a second fire and every frame
-    /// carries its own boundary target.
+    /// `CERULION_EXECUTION_MODE=lockstep`, the OPT-OUT: the quantum is the
+    /// TIGHTEST period in the graph, so a step never owes a `period_ms` node a
+    /// second fire and every frame carries its own boundary target.
     Lockstep,
     /// `CERULION_EXECUTION_MODE=free_run`: the rank's controlled clock advances
     /// ONCE per step by the measured wall elapsed and is CONSTANT within the
     /// step.
     FreeRun,
 }
+
+/// The frame-stamp rule implied by the `gating` label an arm states.
+///
+/// ONE source for the two halves of the same fact. A shared arm body already
+/// says which gating clock it expects `run.json` to name (`want_gating`), and
+/// the stamp rule is a PROPERTY of that clock rather than an independent
+/// choice: `quantum` is the tightest period, so a step never owes a
+/// `period_ms` node a second fire and every frame carries its own boundary
+/// target; `recorded_wall` is constant within a step, so it admits the bounded
+/// catch-up burst. Deriving the rule here is what stops a body shared by arms
+/// of DIFFERENT modes from judging one of them under the other's rule, which
+/// is strictly weaker (see [`gating_stamp_violation`]) and would pass a fault
+/// the strict rule catches.
+///
+/// An unknown label PANICS rather than defaulting: a new gating clock has to
+/// state its stamp contract, and a silent fallback to the loose rule is the
+/// exact hole this exists to close.
+fn stamp_rule_for(want_gating: &str) -> Gating {
+    match want_gating {
+        "quantum" => Gating::Lockstep,
+        "recorded_wall" => Gating::FreeRun,
+        other => panic!(
+            "no frame-stamp rule is stated for the gating label `{other}`: name its \
+             contract in `stamp_rule_for`, never judge it under whichever rule happens to \
+             be the default"
+        ),
+    }
+}
+
+/// **THE DEFAULT EXECUTION MODE, SPELLED OUT**, and the `gating` label
+/// `run.json` reads under it.
+///
+/// A multi-process `graph run` FREE-RUNS unless the operator opts out, so this
+/// pair is what a plain run resolves to. An arm whose subject is the recorder
+/// plane rather than the coordination contract hands `spawn_run` this env
+/// instead of an empty one, so it STATES the mode it executes under, and it
+/// derives its frame-stamp rule from [`DEFAULT_MODE_GATING`] through
+/// [`stamp_rule_for`] rather than naming a [`Gating`] variant by hand. The two
+/// halves therefore move together, which is the property a hand-written
+/// `Gating::Lockstep` on a plain run did not have: the mode flipped to free
+/// run under it, the strict rule stayed, and the first machine slow enough to
+/// produce a catch-up burst failed an arm about recording.
+const DEFAULT_MODE_ENV: &[(&str, &str)] = &[("CERULION_EXECUTION_MODE", "free_run")];
+
+/// The `gating` label [`DEFAULT_MODE_ENV`] implies; see its doc.
+const DEFAULT_MODE_GATING: &str = "recorded_wall";
 
 /// **THE GATING-CLOCK STAMP RULE**, as a pure function over one topic's stamps
 /// so that BOTH of its sides can be pinned by hand oracles rather than by a run
@@ -685,9 +756,12 @@ fn gating_stamp_violation(stamps: &[u64], gating: Gating) -> Option<String> {
 /// `gating` is the coordination contract the run under test executed under, and
 /// it decides the STAMP rule: strictly increasing under lockstep, strictly
 /// increasing except a bounded catch-up burst under free run. The caller states
-/// it rather than the bag, so an arm that drives a lockstep run keeps the strict
-/// rule even though this helper is shared with the free-run arm; see
-/// [`gating_stamp_violation`] for what the loose rule cannot catch.
+/// it rather than the bag, and every caller driving a real run derives it from
+/// the `gating` label that run's execution mode implies (see
+/// [`stamp_rule_for`]), so the arm that opts out to lockstep keeps the strict
+/// rule while the arms on the default are judged under the rule their clock
+/// actually obeys. See [`gating_stamp_violation`] for what the loose rule
+/// cannot catch.
 fn assert_frames_match_the_fixture_oracle(
     bag: &Path,
     prefix: &str,
@@ -904,7 +978,7 @@ fn the_stamp_rule_refuses_a_decreasing_pair_under_both_modes() {
 
 /// **THE MODE IS LOAD-BEARING.** The very burst the free-run rule admits is a
 /// FAILURE under lockstep, which is what makes passing the mode in worth doing:
-/// the three lockstep callers keep the strict rule the free-run arm cannot.
+/// the opt-out arm keeps a strict rule the default arms cannot be held to.
 #[test]
 #[serial]
 fn the_stamp_rule_refuses_under_lockstep_the_burst_it_admits_under_free_run() {
@@ -1580,8 +1654,10 @@ fn a_capture_taken_off_a_plain_run_is_a_bag_bag_play_resim_accepts() {
     std::fs::create_dir_all(&flashbacks).unwrap();
 
     // ------------------------------------------------------------------ leg 1
-    // A PLAIN run. No `--record`, no `--single-process`, no `--no-rings`.
-    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], &[]);
+    // A PLAIN run. No `--record`, no `--single-process`, no `--no-rings`. The
+    // execution mode is STATED, not inherited: this arm's subject is the
+    // recorder plane, so it runs the DEFAULT and says which one that is.
+    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], DEFAULT_MODE_ENV);
     wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
 
     // Let the window fill: the ticker is `period_ms = 50`, so a second of run
@@ -1635,8 +1711,12 @@ fn a_capture_taken_off_a_plain_run_is_a_bag_bag_play_resim_accepts() {
 
     // ------------------------------------------------- the oracle, then the CLAIM
     let foreign = assert_the_capture_accounts_for_every_topic_it_holds(&capture, &prefix);
-    let frames =
-        assert_frames_match_the_fixture_oracle(&capture, &prefix, "the capture", Gating::Lockstep);
+    let frames = assert_frames_match_the_fixture_oracle(
+        &capture,
+        &prefix,
+        "the capture",
+        stamp_rule_for(DEFAULT_MODE_GATING),
+    );
     assert!(
         frames > 0,
         "a capture over a live window carries frames from both graph topics"
@@ -1904,7 +1984,10 @@ fn a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts() {
     let stranger_topic = format!("/{}/stranger", unique_prefix("cotenant"));
     let stranger = CoTenant::spawn(&stranger_topic);
 
-    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], &[]);
+    // The DEFAULT execution mode, stated (see `DEFAULT_MODE_ENV`): this arm's
+    // subject is a co-tenant's topic inside the window, not the coordination
+    // contract, so it runs the mode a plain run resolves to and names it.
+    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], DEFAULT_MODE_ENV);
     wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
 
     // RENDEZVOUS on the tap, then fill. The arm's verdict needs the stranger's
@@ -1984,8 +2067,12 @@ fn a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts() {
 
     // The run's OWN frames still match the fixtures' hand oracle, so exit 0
     // below is a claim about real data.
-    let frames =
-        assert_frames_match_the_fixture_oracle(&capture, &prefix, "the capture", Gating::Lockstep);
+    let frames = assert_frames_match_the_fixture_oracle(
+        &capture,
+        &prefix,
+        "the capture",
+        stamp_rule_for(DEFAULT_MODE_GATING),
+    );
     assert!(frames > 0, "a capture over a live window carries frames");
 
     let (code, resim_err) = resim(root, &capture, &[], "resim");
@@ -2189,7 +2276,10 @@ fn a_bag_record_run_attach_to_a_plain_run_carries_its_trace() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&flashbacks).unwrap();
 
-    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], &[]);
+    // The DEFAULT execution mode, stated (see `DEFAULT_MODE_ENV`): this arm's
+    // subject is the LATE consumer of the run's trace rings, not the
+    // coordination contract, so it runs the mode a plain run resolves to.
+    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], DEFAULT_MODE_ENV);
     wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
     // THE MID-RUN RENDEZVOUS. `WINDOW_HELD` is the SUPERVISOR's landmark and says
     // nothing about the worker, so without this the recorder can open the trace
@@ -2268,7 +2358,12 @@ fn a_bag_record_run_attach_to_a_plain_run_carries_its_trace() {
     );
 
     // …and the frames it did capture are the ones these fixtures produce.
-    assert_frames_match_the_fixture_oracle(&out, &prefix, "the attach bag", Gating::Lockstep);
+    assert_frames_match_the_fixture_oracle(
+        &out,
+        &prefix,
+        "the attach bag",
+        stamp_rule_for(DEFAULT_MODE_GATING),
+    );
 
     // The declined-plane refusal — THE CONSEQUENCE, measured rather than
     // assumed.
@@ -2614,8 +2709,8 @@ fn a_run_writes_its_window_recorder_decision_into_run_json() {
 /// `0.0`, the CI stand-in for "rebuild the node with a changed constant".
 const PERTURBED_FIXTURE: &str = "test_node_macro_period_perturbed_cdylib";
 
-/// How many run+capture attempts arm 6 makes to obtain a capture its oracle can
-/// judge, before failing loudly.
+/// How many run+capture attempts arms 6 to 8 make to obtain a capture their
+/// oracle can judge, before failing loudly.
 ///
 /// TWO preconditions are the machine's rather than the candidate's, and both
 /// are retried here rather than weakened:
@@ -2623,16 +2718,16 @@ const PERTURBED_FIXTURE: &str = "test_node_macro_period_perturbed_cdylib";
 /// * LOSS-FREE. A window tap that overflowed on a busy machine drops frames the
 ///   re-execution then reproduces, which `--verify` reports as a divergence.
 /// * MID-RUN. The capture must begin past step 0, or `plan_restore` answers
-///   `FromStart` and the arm never reaches the admission it exists to pin. That
-///   is a race with the window's head trim, not a property of the code.
+///   `FromStart` and the arm never reaches the mid-run resume it exists to pin.
+///   That is a race with the window's head trim, not a property of the code.
 ///
 /// A fresh attempt, never a weaker oracle (the `--record` siblings do the same).
 const CLEAN_CAPTURE_ATTEMPTS: usize = 3;
 
-/// How many ticker frames arm 6 waits out before taking its capture.
+/// How many ticker frames arms 6 to 8 wait out before taking their capture.
 ///
 /// [`WORKER_STEPPED_FRAMES`] proves the worker is PAST its first step, which is
-/// all arm 3's attach needs. This arm needs the run FURTHER along: the rolling
+/// all arm 3's attach needs. These arms need the run FURTHER along: the rolling
 /// window must hold a deep enough suffix that its head is genuinely trimmed, or
 /// the capture's first rank-0 boundary is step 0. A CONDITION rather than a
 /// sleep, for the usual reason and in the usual direction: a fixed span loses
@@ -3051,30 +3146,34 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
     Some(reported)
 }
 
-/// **ARM 6: THE ONE-RANK FREE-RUN LOOP (the mid-run resume).**
+/// **ARMS 6 to 8: THE ONE-RANK LOOP (the mid-run resume), under each execution mode.**
 ///
-/// The SAME plain 1-group run as arm 1, executed under
-/// `CERULION_EXECUTION_MODE=free_run`, set EXPLICITLY here because the
-/// free-run DEFAULT is not on `main` yet (that flip rebases onto this change);
-/// on `main` the env opt-in is what selects the free-run supervisor path for a
-/// `process_groups` graph. What the capture then is: `coordination: free_run`,
-/// ONE worker rank, a recording that begins MID-RUN (the capture is taken after
-/// the worker has stepped, and the window trims the head), and a complete
-/// anchor at `S`: exactly the one-worker-rank bag `resolve_resume` admits by rank count
+/// The SAME plain 1-group run as arm 1, executed under `env` (arm 6: the
+/// explicit `CERULION_EXECUTION_MODE=free_run` spelling; arm 7: the variable
+/// REMOVED, the default; arm 8: the `lockstep` opt-out). What a free-run
+/// capture then is: `coordination: free_run`, ONE worker rank, a recording
+/// that begins MID-RUN (the capture is taken after the worker has stepped, and
+/// the window trims the head), and a complete anchor at `S`: exactly the
+/// one-worker-rank bag `resolve_resume` admits by rank count
 /// (`FreeRunResumeUnsupported`) while the capture's own manifest claimed
 /// `resimmable: true`. For one worker rank the three assumptions that refusal
-/// named hold trivially, so the bag now takes the ordinary resume.
+/// named hold trivially, so the bag takes the ordinary resume, the same one a
+/// lockstep capture (arm 8) takes.
 ///
-/// The claims, in the order the sibling arms settled on: the recorded frames
-/// match the fixture HAND ORACLE; the capture is genuinely free-run AND
-/// genuinely mid-run (a lockstep or from-start capture would pass the rest of
-/// this arm without exercising the admission) AND claims `resimmable: true`;
-/// then `bag play --resim all --verify` exits 0 TWICE with byte-identical
-/// `--report` JSON whose `resume` block names the anchor step the capture's own
-/// first boundary implies (the restore, the seed, the clock placement and the
-/// prefix skip are functions of the recording); and (the anti-tautology) the
-/// SAME capture re-executed against the PERTURBED ticker exits 1 with a
-/// `FRAME-CONTENT DIVERGENCE` naming the ticker's topic.
+/// The claims, in the order the sibling arms settled on: the run's `run.json`
+/// reads the `gating` label the mode implies (`want_gating`); the recorded
+/// frames match the fixture HAND ORACLE, under the frame-stamp rule that label
+/// implies (see [`stamp_rule_for`], so the `lockstep` arm is judged under the
+/// STRICT rule); the capture stamps the coordination the mode implies
+/// (`want_coordination`) AND is genuinely mid-run (a
+/// from-start capture would pass the rest of this arm without exercising the
+/// resume) AND claims `resimmable: true`; then `bag play --resim all --verify`
+/// exits 0 TWICE with byte-identical `--report` JSON whose `resume` block names
+/// the anchor step the capture's own first boundary implies (the restore, the
+/// seed, the clock placement and the prefix skip are functions of the
+/// recording); and (the anti-tautology) the SAME capture re-executed against
+/// the PERTURBED ticker exits 1 with a `FRAME-CONTENT DIVERGENCE` naming the
+/// ticker's topic.
 ///
 /// `--verify` IS driven here, unlike arm 1, and arm 1's reason for not driving
 /// it does not apply: that arm's capture may begin at step 0 with a lossy head,
@@ -3095,14 +3194,17 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
 /// BOTH halves of the change: the engine's admission and the worker's clock.
 ///
 /// Prerequisite beyond the file's: `cargo build -p test_node_macro_period_perturbed_cdylib`.
-#[test]
-#[serial]
-fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant() {
+fn one_rank_capture_resims_and_verifies_under(
+    stem: &str,
+    env: &[(&str, &str)],
+    want_coordination: &str,
+    want_gating: &str,
+) {
     let mut last_retry = String::new();
     for attempt in 1..=CLEAN_CAPTURE_ATTEMPTS {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
-        let prefix = unique_prefix("plainfr");
+        let prefix = unique_prefix(stem);
         build_workspace(root, &prefix);
         let home = root.join("home");
         let flashbacks = root.join("flashbacks");
@@ -3110,14 +3212,8 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         std::fs::create_dir_all(&flashbacks).unwrap();
 
         // ------------------------------------------------------------ leg 1
-        // The run, opted into free-run EXPLICITLY (the flip is not on main).
-        let (mut run, stderr_path) = spawn_run(
-            root,
-            &home,
-            &flashbacks,
-            &[],
-            &[("CERULION_EXECUTION_MODE", "free_run")],
-        );
+        // The run, under this arm's execution-mode environment.
+        let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], env);
         wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
         // THE MID-RUN RENDEZVOUS (arm 3's, deepened): a capture whose trace
         // begins at step 0 needs no anchor and would not exercise the
@@ -3125,19 +3221,32 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         // its first step rather than sleeping out a span that a loaded machine
         // would spend doing nothing.
         await_the_worker_has_published(&format!("/{prefix}/ticker/cmd"), FREE_RUN_MID_RUN_FRAMES);
-        // run.json's `gating` label follows the SAME predicate the
-        // worker keys its clock discipline on ("this run mints trace rings"),
-        // so a plain free-run run reads `recorded_wall` -- never `wall`, the
-        // read-only RealClock arm that is now `--no-rings` only. Read while the
-        // run is LIVE (`live_run_manifest`: the directory goes on exit). This
-        // is the one place the supervisor's call site is observable, so it is
-        // what kills a call site that hands the classifier `--record`.
+        // run.json's `gating` label is not a second evaluation of the
+        // predicate the worker keys its clock discipline on. The descriptor
+        // is rendered BEFORE dispatch, when no ring exists and the only fact
+        // available is whether rings were asked for, so that first write
+        // carries the INTENT; the supervisor classifies again the moment its
+        // trace plane is decided, off the ring tags it really stamped into
+        // the worker plans, and RE-STAMPS the field (`restamp_run_gating`).
+        // That second read is the same plan field each rank resolves its own
+        // build path from, so the label and every rank's clock discipline
+        // come off ONE fact. A plain free-run run therefore reads
+        // `recorded_wall`, never `wall`, the read-only RealClock arm that is
+        // now `--no-rings` only, and a lockstep run reads `quantum`; a plane
+        // the `/dev/shm` free-space gate refused stamps no tags, every rank
+        // takes the ring-less shape, and the label truthfully reads `wall`.
+        // Read after the mid-run rendezvous above, so the re-stamp has
+        // landed, and while the run is LIVE (`live_run_manifest`: the
+        // directory goes on exit). This is the one place the supervisor's
+        // call site is observable, so it is what kills a call site that hands
+        // the classifier `--record`, and what kills a default that resolved
+        // the wrong mode.
         let run_json = live_run_manifest(&home);
         assert_eq!(
             run_json["gating"],
-            serde_json::json!("recorded_wall"),
-            "a plain free-run run mints its trace rings, so every rank runs the controlled \
-             wall-following clock and run.json must say so: {run_json}"
+            serde_json::json!(want_gating),
+            "run.json must name the gating clock the execution mode implies (env={env:?}): \
+             {run_json}"
         );
 
         // ------------------------------------------------------------ leg 2
@@ -3164,8 +3273,8 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
             .unwrap_or_else(|| panic!("`cerulion flashback` never returned"));
         assert!(
             flash_status.success(),
-            "a free-run `graph run` holds a rolling window too, so `cerulion flashback` must \
-             capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}\nrun log:\n{}",
+            "a `graph run` holds a rolling window under either execution mode, so `cerulion \
+             flashback` must capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}\nrun log:\n{}",
             read_file(&root.join("flash.stdout")),
             read_file(&root.join("flash.stderr")),
             read_file(&stderr_path)
@@ -3201,8 +3310,8 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         assert_frames_match_the_fixture_oracle(
             &capture,
             &prefix,
-            "the free-run capture",
-            Gating::FreeRun,
+            &format!("the {want_coordination} capture"),
+            stamp_rule_for(want_gating),
         );
 
         let reader = cerulion_bag::BagReader::open(&capture).expect("open the capture");
@@ -3216,9 +3325,9 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         .expect("the recorder identity is valid JSON");
         assert_eq!(
             recorder["coordination"],
-            serde_json::json!("free_run"),
-            "this arm is about the FREE-RUN capture; a lockstep stamp here means the env \
-             opt-in did not reach the supervisor: {recorder}"
+            serde_json::json!(want_coordination),
+            "the capture must stamp the coordination the execution mode implies (env={env:?}); \
+             a wrong stamp means the resolver chose the other mode: {recorder}"
         );
         let first = first_rank0_boundary_step(&capture)
             .expect("a capture with a trace carries a rank-0 STEP_BOUNDARY");
@@ -3229,8 +3338,8 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
             // the code under test made it come out that way.
             last_retry = format!(
                 "attempt {attempt}: the capture's first rank-0 STEP_BOUNDARY is step 0, so it \
-                 begins FROM START and `plan_restore` would answer `FromStart`; the admission \
-                 under test is never reached"
+                 begins FROM START and `plan_restore` would answer `FromStart`; the mid-run \
+                 resume under test is never reached"
             );
             eprintln!("{last_retry}");
             continue;
@@ -3263,11 +3372,11 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         assert_eq!(
             code,
             Some(0),
-            "THE ADMISSION: a one-rank free-run capture beginning mid-run (first rank-0 \
-             boundary {first}) must resume and verify byte-exact. Exit 2 naming \
-             `coordination: free_run` is the refusal of every free-run mid-run bag itself; exit 1 is a \
-             frame the re-execution produced that the capture does not hold (foreign \
-             topics: {foreign:?}).\nstderr:\n{resim_err}"
+            "THE RESUME: a one-rank capture beginning mid-run (first rank-0 boundary \
+             {first}, coordination {want_coordination}) must resume and verify byte-exact. \
+             Exit 2 naming `coordination: free_run` is the refusal of every free-run mid-run \
+             bag itself; exit 1 is a frame the re-execution produced that the capture does \
+             not hold (foreign topics: {foreign:?}).\nstderr:\n{resim_err}"
         );
         assert!(
             executed_steps(&resim_err) > 0,
@@ -3310,7 +3419,7 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         );
         assert_eq!(
             report["coordination"]["mode"],
-            serde_json::json!("free_run"),
+            serde_json::json!(want_coordination),
             "the contract applied is the one the capture stamped: {report}"
         );
         assert_eq!(
@@ -3350,5 +3459,41 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
     panic!(
         "could not obtain a LOSS-FREE, MID-RUN capture in {CLEAN_CAPTURE_ATTEMPTS} attempts; \
          REFUSING to weaken the `--verify` exit-0 oracle. Last: {last_retry}"
+    );
+}
+
+/// Arm 6: the explicit `free_run` spelling.
+#[test]
+#[serial]
+fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant() {
+    one_rank_capture_resims_and_verifies_under(
+        "plainfr",
+        &[("CERULION_EXECUTION_MODE", "free_run")],
+        "free_run",
+        "recorded_wall",
+    );
+}
+
+/// Arm 7: the DEFAULT. Nothing exported, and the loop must read exactly as
+/// arm 6 does: free-run is the default for a multi-process run, so the stamp
+/// is `free_run` and the label `recorded_wall`. A default that resolved
+/// lockstep fails at the label, before any capture is taken.
+#[test]
+#[serial]
+fn a_default_one_rank_capture_free_runs_and_resims_and_verifies_byte_exact() {
+    one_rank_capture_resims_and_verifies_under("plaindef", &[], "free_run", "recorded_wall");
+}
+
+/// Arm 8: the `lockstep` OPT-OUT, arm 7's positive control. The same loop
+/// reads the other answer at both witnesses (`lockstep`, `quantum`), and the
+/// mid-run resume is the ordinary lockstep one.
+#[test]
+#[serial]
+fn a_lockstep_opt_out_one_rank_capture_stamps_lockstep_and_resims_and_verifies_byte_exact() {
+    one_rank_capture_resims_and_verifies_under(
+        "plainls",
+        &[("CERULION_EXECUTION_MODE", "lockstep")],
+        "lockstep",
+        "quantum",
     );
 }

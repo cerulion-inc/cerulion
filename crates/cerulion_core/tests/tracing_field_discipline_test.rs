@@ -328,17 +328,6 @@ const DECLARED_SITES: &[Declared] = &[
                  intended motion",
     },
     Declared {
-        path: "cerulion_cli_engine/src/multiprocess.rs",
-        interpolation: 1,
-        pass_through: 0,
-        messages: &["this partition SPLITS a same-level non-trigger edge across p#40255334"],
-        reason: "DEBT (CLI operator surface): lines splicing a runtime \
-                 value into the message. Not migrated — several \
-                 are matched by real-binary e2e oracles (`--peer-loss is ignored`,\
-                 `could not be acquired`), so each rewrite needs a paired test edit. The\
-                 count is EXACT; lowering it is the intended motion",
-    },
-    Declared {
         path: "cerulion_cli_engine/src/node_cmd.rs",
         interpolation: 2,
         pass_through: 0,

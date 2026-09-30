@@ -33,6 +33,7 @@ cerulion_cli_engine	go2_tf_source	crate-path	crates/cerulion_cli_engine/tests/de
 cerulion_cli_engine	native_ros2_messages	crate-path	crates/cerulion_cli_engine/src/workspace.rs
 cerulion_cli_engine	rmw_cerulion	dlopen	crates/cerulion_cli_engine/src/ros2_cmd.rs
 cerulion_core	all	whole-tree	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
+cerulion_core	cerulion_bag	crate-path	crates/cerulion_core/tests/state_record_framing_scan_test.rs
 cerulion_core	cerulion_bagd	crate-path	crates/cerulion_core/tests/doc_attachment_discipline_test.rs
 cerulion_core	cerulion_cli_engine	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
 cerulion_core	cerulion_macros	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
