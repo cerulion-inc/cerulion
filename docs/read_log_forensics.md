@@ -173,8 +173,9 @@ BOTH of these hold, and reports nothing about it otherwise:
 
 A role divergence therefore means what it says: both sides named a site and they
 named DIFFERENT ones; the candidate read the frame somewhere the recording did
-not. Like every read-log finding it is LOUD and REPORT-ONLY; the verdict and the
-exit code are untouched.
+not. Like every retained read-log finding it is LOUD and it is the verdict: a
+recorded read the re-execution did not reproduce takes exit 6, the schedule
+divergence, and never exit 1.
 
 **Reading it offline:** a role of `1` on a `Served`, `Held` or `NoFrame` record
 is a `(kind, role)` pair no mint site can produce (those three are staged only
@@ -533,8 +534,10 @@ stopped comparing, and the reason. Steps BEFORE that step were compared normally
 The offline join inherits the same rule: it can answer for the prefix and must
 decline for the rest.
 
-**A refused read log never blames the candidate.** The read log is REPORT-ONLY:
-no read-log condition produces a data violation. That holds even where the read
+**A refused read log never blames the candidate.** No read-log condition
+produces a DATA violation: a retained read-log finding is the exit 6 schedule
+verdict and a read log that cannot be enforced is exit 2, and neither is exit 1.
+That holds even where the read
 log STEERS something else, the cross-rank injection window, because the
 fallback can misplace a frame by a fire, and comparing that against the
 candidate's own output would invent a divergence the candidate did not cause.
@@ -578,6 +581,30 @@ read. So a node with "no coverage" in a `--report` quarantine list is not a node
 whose records are missing; check the trace before concluding anything about
 what the recorder wrote. The row above is about the OTHER condition: a node with
 genuinely zero kind-6 records in the bag.
+
+## What a replay does with the read log, and what each exit code means
+
+On a FREE RUN bag the replay does not only compare the read log, it ENFORCES it.
+Every edge whose producer and consumer sit on one rank is gated: a frame the
+producer has already published is withheld from the consumer's pop until the step
+the recording read it at, so which step a read lands at is the recording's fact
+rather than the replay host's timing. A LOCKSTEP bag arms no gate, because one
+gating clock already orders every publish against every step. The `--report` JSON
+states which of the two happened in `read_log_enforcement`, with the gated stage
+count, the frames admitted and the frames held.
+
+Enforcement splits the read log's findings across three exit codes, and a read
+log finding is never exit 1:
+
+| exit | what it means for the read log |
+|---|---|
+| 0 | every gated edge admitted the frames the recording popped, at the steps it popped them, and the redundant per-edge verifier found nothing it retained |
+| 1 | frame CONTENT diverged. No read-log condition reaches this code |
+| 2 | the recording's read log cannot be enforced on a gated edge, so the run is refused rather than gated on a claim it cannot trust. The message names the cause token (`read_log_no_coverage`, `read_log_record_dropped`, `read_log_truncated`, `read_log_unenforceable_record`, `read_log_input_name_unresolved`, `read_log_input_name_duplicated`), the stage and the remedy |
+| 6 | a recorded EDGE READ the re-execution did not reproduce: a frame due at a step that never arrived, a surviving sequence that does not match, or a divergence the per-edge verifier retained. It shares exit 6 with the fire comparator because both say the same thing, the re-executed SCHEDULE is not the recorded one |
+
+The terminal block for the last of those is headed `EDGE-READ DIVERGENCE` and
+names the edge, the step and both sequences.
 
 ## Where the mechanism is documented
 

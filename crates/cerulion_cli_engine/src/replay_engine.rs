@@ -406,8 +406,8 @@ pub struct ReplayOutcome {
     /// the read log steering their producer's input stream was refused, carrying
     /// the violations that were therefore NOT reported.
     ///
-    /// The read log is report-only, so a refusal must not surface as a data
-    /// verdict — see [`DeclinedFrameComparison`] for why the violation would be an
+    /// A read-log condition never produces a DATA verdict, so a refusal must not
+    /// surface as one, see [`DeclinedFrameComparison`] for why the violation would be an
     /// accusation against a candidate that did nothing wrong, and for the exact
     /// granularity. A non-empty array means `passed`/`violations` are reporting a
     /// SMALLER comparison than usual, and it names every topic left out.
@@ -2148,8 +2148,9 @@ impl ReadLogEnforcement {
 ///
 /// # Why this exists, and why it is not a [`Violation`]
 ///
-/// The read log is REPORT-ONLY — no read-log condition produces a data verdict
-/// (`replay_rederive.rs`: REPORT-ONLY, like every other stand-down).
+/// No read-log condition produces a DATA verdict: a retained read-log finding is
+/// the exit 6 schedule verdict and a read log that cannot be enforced on a gated
+/// edge is exit 2, and neither is a [`Violation`].
 /// But on a multi-process bag the read log also STEERS something the verdict does
 /// depend on: the cross-rank injection window. When it is refused, that steering
 /// falls back to the recorded-clock window, which can place an injected frame a

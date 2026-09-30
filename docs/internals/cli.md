@@ -104,7 +104,8 @@ Rules that must not drift:
   is dropped, not reported, which keeps every pre-existing multi-rank bag's outcome
   and report byte-identical.
 - **A refused read log DECLINES the frame comparison it steered; it never fails
-  it.** The read log is report-only, and on a multi-process bag it also steers
+  it.** A read-log condition never produces a data violation, and on a
+  multi-process bag the read log also steers
   the cross-rank injection window. When it is refused for **a rank whose
   read-log-steered injection fell back**, that fallback can hand an injected
   frame to a fire early or late, so the rank's producers legitimately emit

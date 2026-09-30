@@ -35755,3 +35755,179 @@ fn an_overflow_marker_on_a_gated_stage_is_an_exit_2_refusal() {
         "the refusal names the cause token, the stage, the count and the remedy: {msg}"
     );
 }
+
+/// A read log MISSING its last step's record, on a bag whose FIRE log says the
+/// consumer fired there, is the fire-schedule verdict naming that step.
+///
+/// The craft removes the last step's kind-6 record and leaves the fire log and
+/// every frame alone, so the bag contradicts itself: its fires say the relay
+/// consumed a frame at the last step, its reads say the relay read nothing there.
+/// The gate follows the READ log and withholds the frame, and the fire comparator
+/// reads the contradiction back as that node's FIFO pop count at that step, zero
+/// fires re-derived against one recorded.
+///
+/// This is the shape that makes the enforcement observable from the fire log
+/// alone. Without the gate the relay drains whatever its queue holds and fires,
+/// and the bag's own contradiction goes unreported, which is what the LOCKSTEP leg
+/// at the bottom measures: the same craft on a bag that arms no gate leaves the
+/// fire schedule clean.
+///
+/// NOT a refusal. `read_log_truncated` is the planner's answer to a stream that
+/// stops below the rank's AUTHORITATIVE last boundary, which a one-rank free-run
+/// bag does not present; that token stays pinned by
+/// `every_admission_refusal_names_its_cause_and_its_edge` in `replay_inject.rs`.
+#[test]
+#[serial]
+fn a_read_log_missing_its_last_step_is_the_fire_schedule_verdict() {
+    let steps = 6;
+    const LAST_STEP: u64 = 5;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let before = kind6_records(&rec);
+    assert_eq!(
+        before.len(),
+        steps,
+        "the reference recording reads once per step"
+    );
+    rec.trace
+        .retain(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == LAST_STEP));
+    assert_eq!(
+        kind6_records(&rec),
+        before[..before.len() - 1].to_vec(),
+        "only the last step's read record is gone, by hand"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_short_stream.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let outcome = replay(&bag, source_relay_factories, None, None)
+        .expect("a self-contradicting bag is a verdict, never a refusal");
+    assert!(
+        !outcome.passed,
+        "the contradiction is reported: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .divergence_classes
+            .contains(&replay_engine::DivergenceClass::FireSchedule),
+        "the fire comparator is the reporter: {:?}",
+        outcome.divergence_classes
+    );
+    let detail = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("a withheld frame leaves the recorded fire unbanked")
+        .detail
+        .clone();
+    assert!(
+        detail.contains("relay") && detail.contains(&format!("step {LAST_STEP}")),
+        "the divergence names the node and the step: {detail}"
+    );
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced { frames_held, .. } => assert_eq!(
+            frames_held, 1,
+            "the gate withheld exactly the frame the missing record does not admit: {:?}",
+            outcome.read_log_enforcement
+        ),
+        other => panic!("the free-run rank is gated: {other:?}"),
+    }
+
+    // THE SCOPE CONTROL: one gating clock orders every publish against every
+    // step, so a lockstep pass arms no gate, withholds nothing, and the same
+    // crafted bag banks the recorded fire.
+    let bag_lockstep = dir.path().join("readlog_short_stream_lockstep.mcap");
+    write_bag_with_coordination(
+        &rec,
+        &bag_lockstep,
+        replay_engine::CoordinationMode::Lockstep,
+    );
+    let lockstep = replay(&bag_lockstep, source_relay_factories, None, None)
+        .expect("the lockstep replay runs");
+    assert_eq!(
+        lockstep.read_log_enforcement,
+        replay_engine::ReadLogEnforcement::Lockstep,
+        "the control turns the ARMING off, not the craft: {lockstep:?}"
+    );
+    assert!(
+        lockstep.trace_divergence.is_none(),
+        "and with nothing withheld the fire schedule is clean: {:?}",
+        lockstep.trace_divergence
+    );
+}
+
+/// A record that CONSUMED frames while naming no sequence is an exit-2 refusal
+/// naming the shape.
+///
+/// A pop count with no surviving sequence pins how many frames left the queue and
+/// nothing about which, so the gate could admit two frames and mint no
+/// `SequenceMismatch` however far the replay had drifted. The craft rewrites ONE
+/// verified record into that shape and leaves every frame and every other record
+/// alone.
+///
+/// TWO NARROWNESS CONTROLS. The positive arm
+/// `a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so`, whose
+/// identical recording carries the real record and exits 0 with the gate armed,
+/// and the lockstep leg in this body, which arms no gate and is therefore not
+/// refused. Without the second the refusal could widen to every bag carrying the
+/// shape and only the gated path is meant to see it.
+#[test]
+#[serial]
+fn a_popped_record_that_names_no_sequence_is_an_exit_2_refusal() {
+    let steps = 6;
+    const SHAPELESS_STEP: u64 = 2;
+    const POPPED: u64 = 2;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let shapeless = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == SHAPELESS_STEP)
+        .expect("the step-2 kind-6 record exists");
+    shapeless.global_level =
+        pack_read_outcome_meta(0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain);
+    shapeless.fire_time_ns = READ_OUTCOME_NO_FRAME;
+    shapeless.duration_ns = POPPED;
+    assert_eq!(
+        kind6_records(&rec)[SHAPELESS_STEP as usize],
+        (
+            SHAPELESS_STEP,
+            1,
+            0,
+            READ_OUTCOME_DRAINED_BATCH,
+            READ_OUTCOME_NO_FRAME,
+            POPPED as u32
+        ),
+        "the crafted record, by hand: two frames popped and no sequence named"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_shapeless_record.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let err = replay(&bag, source_relay_factories, None, None)
+        .expect_err("a pop count with no sequence must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_unenforceable_record")
+            && msg.contains("popped_without_sequence")
+            && msg.contains("relay")
+            && msg.contains("Re-record"),
+        "the refusal names the cause token, the shape, the stage and the remedy: {msg}"
+    );
+
+    // THE SCOPE CONTROL, as above.
+    let bag_lockstep = dir.path().join("readlog_shapeless_record_lockstep.mcap");
+    write_bag_with_coordination(
+        &rec,
+        &bag_lockstep,
+        replay_engine::CoordinationMode::Lockstep,
+    );
+    let lockstep = replay(&bag_lockstep, source_relay_factories, None, None);
+    assert!(
+        lockstep.is_ok(),
+        "the same craft on a bag that arms no gate is NOT a refusal: {:?}",
+        lockstep.err().map(|e| (e.exit_code(), e.to_string()))
+    );
+}
