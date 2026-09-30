@@ -21,8 +21,8 @@
 //!
 //! - **`rings_declared > 1`.** From state record format version 1 a state
 //!   record carries its producer's RANK, and the coverage manifest carries the
-//!   ring to rank join, so a recording of that format does say which ring a
-//!   record came from. What is still rankless is this READER: its
+//!   ring to rank join, so a bag of that format does say which ring a record
+//!   came from. What is still rankless is this READER: its
 //!   index table is keyed by `node_idx` alone, and [`StateAssembler`] groups
 //!   parts by `(run_id, step, node_idx)`, which carries no rank either. Every
 //!   ring numbers its own nodes from 0, so with two declared rings two
@@ -173,14 +173,13 @@ pub enum AnchorReadRefusal {
     #[error(
         "this {} drained {rings} state rings{}. From state record format version 1 a state \
          record carries its producer's rank and the coverage manifest carries the ring to rank \
-         join, so a recording of that format does say which ring each record came from; {}. \
+         join, so a bag of that format does say which ring each record came from; {}. \
          What is rankless in either case is this READER: its index table is keyed by node index \
          alone, and its assembler groups parts by run, step and node index, and neither of those \
          keys carries a rank. Every ring numbers its own nodes from 0, so two producers' first \
          nodes would collide before any join could be consulted, and applying one node's recorded \
          state to another would produce a confident divergence report about an execution that \
-         never happened. Fix: replay a recording of a single rank (`cerulion graph run --record \
-         --single-process`)",
+         never happened. {}",
         bag_noun(*from_a_capture),
         render_rank_hole(ranks_missing, manifest_roster(*from_a_capture)),
         match state_record_format {
@@ -193,6 +192,12 @@ pub enum AnchorReadRefusal {
                  claim about its own records",
                 bag_noun(*from_a_capture)
             ),
+        },
+        if *from_a_capture {
+            "Fix: capture a single-process run to get a resimmable bag"
+        } else {
+            "Fix: replay a recording of a single rank (`cerulion graph run --record \
+             --single-process`)"
         }
     )]
     MultiRingAmbiguous {
@@ -1292,9 +1297,32 @@ mod tests {
             !refusal.contains("this recording"),
             "and never a recording in the same breath: {refusal}"
         );
+        // And the REMEDY is the capture's own. The absence assertion above
+        // passes on a sentence that calls the bag a capture twice and then
+        // prescribes a recording, because "replay a recording of a single rank"
+        // never contains the words "this recording", so the remedy is pinned
+        // positively here and the recording's remedy is pinned in the control.
+        assert!(
+            refusal.contains("a single-process run to get a resimmable bag"),
+            "a capture is told how to get a resimmable capture: {refusal}"
+        );
+        assert!(
+            !refusal.contains("replay a recording of a single rank"),
+            "and never the recording remedy: {refusal}"
+        );
+        // And the CLAUSE in the middle says "a bag", not "a recording": it is
+        // one sentence about one bag, and the noun that is right for both shapes
+        // is the general one. Pinned for the capture here and for the recording
+        // in the control, so a re-noun of either slot cannot quietly take this
+        // clause with it.
+        assert!(
+            refusal.contains("so a bag of that format does say which ring each record came from"),
+            "the format's own clause names a bag, not a recording: {refusal}"
+        );
 
         // THE PARITY, which is the point: the stored reason for the same bag
-        // opens with the same words, so the operator journey carries one noun.
+        // opens with the same words, so the operator journey carries one noun,
+        // and after the refusal's remedy was nouned they carry one remedy too.
         let stored = cerulion_core::flashback::resim::ResimGap::MultiRing {
             rings: 2,
             ranks_missing: Vec::new(),
@@ -1303,9 +1331,13 @@ mod tests {
         .reason();
         let opening = "this capture drained 2 state rings";
         assert!(stored.starts_with(opening), "{stored}");
+        assert!(
+            stored.contains("a single-process run to get a resimmable bag"),
+            "and the same remedy, so the journey carries one: {stored}"
+        );
 
-        // THE CONTROL: a RECORDING keeps its own noun, so this is not a rename
-        // of one word everywhere.
+        // THE CONTROL: a RECORDING keeps its own noun and its own remedy, so
+        // this is not a rename of one word everywhere.
         let recording = AnchorReadRefusal::MultiRingAmbiguous {
             rings: 2,
             state_record_format: Some(1),
@@ -1316,6 +1348,18 @@ mod tests {
         assert!(
             recording.starts_with("this recording drained 2 state rings"),
             "{recording}"
+        );
+        assert!(
+            recording.contains("replay a recording of a single rank"),
+            "a recording keeps the remedy it always had: {recording}"
+        );
+        assert!(
+            !recording.contains("to get a resimmable bag"),
+            "and is not sent to make a capture: {recording}"
+        );
+        assert!(
+            recording.contains("so a bag of that format does say which ring each record came from"),
+            "and the clause reads the same for a recording: {recording}"
         );
     }
 

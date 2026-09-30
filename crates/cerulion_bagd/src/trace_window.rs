@@ -362,12 +362,15 @@ pub(crate) struct TrimmedTrace {
     /// Which of those two shapes a run has is set by its execution mode. Under
     /// the `CERULION_EXECUTION_MODE=lockstep` opt-out the replay engine's
     /// `validate_step_boundaries` phase 2 refuses a bag whose peer targets
-    /// differ from rank 0's at a shared step, so the minimum and rank 0's own
-    /// last target are one number. Under the FREE-RUN default that phase is
-    /// mode-gated off, each rank's gating clock wall-follows on its own from the
-    /// shared epoch, and the targets differ by design: the minimum is then the
-    /// only instant every rank has a boundary at or before, and a peer's records
-    /// can carry later ones.
+    /// differ from rank 0's at a shared step, so each rank's targets agree with
+    /// rank 0's at every step it shares with rank 0; the minimum is then the
+    /// target at the earliest last kept step, which is rank 0's own last target
+    /// whenever no rank was trimmed or ended shorter than rank 0, and can still
+    /// be that number when one was, because equal consecutive targets are legal.
+    /// Under the FREE-RUN default that phase is mode-gated off, each rank's
+    /// gating clock wall-follows on its own from the shared epoch, and the
+    /// targets differ by design: the minimum is then the only instant every rank
+    /// has a boundary at or before, and a peer's records can carry later ones.
     ///
     /// `None` when the kept records carry no such boundary, which is exactly the
     /// state resim refuses separately (`BagNoStepBoundaries`): a capture with no
@@ -609,10 +612,14 @@ fn walk(
             // Mode does not change the fold, only what the minimum comes out
             // to: under the `CERULION_EXECUTION_MODE=lockstep` opt-out
             // `validate_step_boundaries` phase 2 refuses a bag whose peer
-            // targets differ from rank 0's at a shared step, so it is rank 0's
-            // own last target; under the free-run default that phase is
-            // mode-gated off and the targets differ by design, so it is the
-            // slowest rank's.
+            // targets differ from rank 0's at a shared step, so each rank's
+            // targets agree with rank 0's at every step it shares with rank 0;
+            // the minimum is then the target at the earliest last kept step,
+            // which is rank 0's own last target whenever no rank was trimmed or
+            // ended shorter than rank 0, and can still be that number when one
+            // was, because equal consecutive targets are legal. Under the
+            // free-run default that phase is mode-gated off and the targets
+            // differ by design, so it is the slowest rank's.
         }
         if rec.record_type == RECORD_TYPE_FIRE {
             // Resolved through THIS rank's own manifest. A `node_idx` names a

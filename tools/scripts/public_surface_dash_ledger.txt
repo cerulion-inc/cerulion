@@ -120,7 +120,7 @@
 16 crates/cerulion_core/src/flashback.rs
 16 crates/cerulion_core/src/flashback/channel.rs
 5 crates/cerulion_core/src/flashback/machine_mem.rs
-10 crates/cerulion_core/src/flashback/resim.rs
+9 crates/cerulion_core/src/flashback/resim.rs
 1 crates/cerulion_core/src/flashback/retention.rs
 1 crates/cerulion_core/src/flashback/switch.rs
 3 crates/cerulion_core/src/flashback/trigger.rs

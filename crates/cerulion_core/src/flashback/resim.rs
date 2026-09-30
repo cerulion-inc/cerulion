@@ -698,10 +698,14 @@ impl ResimGap {
                 ranks_missing,
                 rank_space_walked,
             } => format!(
-                "this capture drained {rings} state rings{}, and a state record carries a node \
-                 index but no rank — every ring numbers its own nodes from 0, so nothing in the \
-                 bag says which ring a record came from. Capture a single-process run \
-                 to get a resimmable bag",
+                "this capture drained {rings} state rings{}. From state record format version 1 \
+                 a state record carries its producer's rank and the coverage manifest carries the \
+                 ring to rank join, so a bag of that format does say which ring each record came \
+                 from. What is rankless is the READER: its index table is keyed by node \
+                 index alone, and its assembler groups parts by run, step and node index, and \
+                 neither of those keys carries a rank. Every ring numbers its own nodes from 0, \
+                 so two producers' first nodes would collide before any join could be consulted. \
+                 Capture a single-process run to get a resimmable bag",
                 render_rank_hole(ranks_missing, recorder_roster(*rank_space_walked))
             ),
             Self::AmbiguousRun { runs } => format!(
@@ -1876,8 +1880,13 @@ mod tests {
             "no hole, no clause: {clean}"
         );
         assert!(
-            clean.contains("drained 2 state rings, and a state record"),
+            clean.contains("drained 2 state rings. From state record format version 1 a state"),
             "and the sentence is otherwise the one it always was: {clean}"
+        );
+        assert!(
+            clean.contains("so a bag of that format"),
+            "and the clause names a bag, so this capture's sentence never calls \
+             the bag it read a recording: {clean}"
         );
 
         // THE SECOND CONTROL: the clause is reached only through the RING arm.

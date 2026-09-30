@@ -1512,7 +1512,7 @@ fn a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares() 
         .as_str()
         .expect("a refusal states its reason");
     assert!(
-        reason.contains("state rings") && reason.contains("no rank"),
+        reason.contains("state rings") && reason.contains("carries its producer's rank"),
         "the verdict must report the RING ambiguity the bag declares — the gap resim reaches \
          first — rather than an anchor-shaped reason: {reason}"
     );
