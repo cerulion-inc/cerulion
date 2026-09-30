@@ -470,8 +470,8 @@ fn doorbell_data_graph_builds_registry_and_flows_data() {
         // park and exit via its LISTENER poll (the event is queued before the
         // drive). The DOORBELL counter must stay 0 on EVERY platform: this
         // producer is OUT-OF-GRAPH (never `enable_doorbell`ed, so it never
-        // rings), and off-Linux the ring is a stub besides — so a doorbell
-        // attribution here would mean the wake causes are cross-wired.
+        // rings) on any target, so a doorbell attribution here would mean the
+        // wake causes are cross-wired.
         let (entries, listener, doorbell, _timeout) = runtime.park_wake_counts();
         assert!(
             entries > 0,

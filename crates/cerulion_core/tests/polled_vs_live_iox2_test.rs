@@ -973,9 +973,9 @@ fn parked_live_seam_is_byte_identical_to_oracle_and_unparked() {
     const N: u64 = 6;
 
     // Park ON: monitor_wait + doorbell. doorbell ON → the consumer
-    // `DoorbellRegistry` is built + the producers' owned doorbells ring; on macOS
-    // the ring is a stub no-op, so the data still flows via real iceoryx2 and the
-    // listener poll wakes the loop.
+    // `DoorbellRegistry` is built + the producers' owned doorbells ring; where the
+    // target maps no real doorbell page the ring is a no-op stub, so the data still
+    // flows via real iceoryx2 and the listener poll wakes the loop.
     let (parked_seq, parked_vals) = run_chain_parked(
         cerulion_core::MonitorWaitPolicy::new(true, true, "pvl".into()),
         N,

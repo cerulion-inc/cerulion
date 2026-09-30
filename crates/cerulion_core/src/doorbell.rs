@@ -608,11 +608,11 @@ mod imp {
                 let err = io::Error::last_os_error();
                 // SAFETY: `fd` is the descriptor we opened.
                 unsafe { libc::close(fd) };
-                // NOT unlinked, even on the branch that created the name. By this
-                // point the object is SIZED, so a peer that met `EEXIST` may already
-                // have mapped it, and removing the name would send the next opener to
-                // a fresh page while that peer rings this one. An object nobody maps
-                // is the bounded orphan this module documents as reused in place.
+                // NOT unlinked, even on the branch that created the name: the sizing
+                // step has run, so a peer that met `EEXIST` may already have sized and
+                // mapped it, and removing the name would send the next opener to a
+                // fresh page while that peer rings this one. An object nobody maps is
+                // the bounded orphan this module documents as reused in place.
                 return Err(OpenAttempt::Fatal(err));
             }
             if st.st_size < DOORBELL_BYTES as libc::off_t {
@@ -1949,7 +1949,8 @@ mod tests {
     fn any_advanced_since_shorter_baseline_and_equal_snapshot() {
         // Coverage for the conservative SHORTER-baseline branch + the equal-
         // snapshot no-advance branch — both run on any OS (the stub's seq()≡0 is
-        // fine here; on Linux these are the no-ring cases). Without this, a no-op
+        // fine here; where a real page is mapped these are the no-ring
+        // cases). Without this, a no-op
         // `any_advanced_since` impl would pass every other test.
         let ns = test_ns("any_adv_shorter");
         let topics = ["a", "b"].map(String::from);
@@ -2633,7 +2634,7 @@ mod tests {
     /// no thread.
     #[cfg(target_os = "macos")]
     #[test]
-    #[serial_test::serial(doorbell_wake_regimes)]
+    #[serial_test::serial]
     #[tracing_test::traced_test]
     fn the_wake_and_wait_regimes_are_separate_and_the_wake_one_closes() {
         use crate::transport::failure_regime_latch::RegimeDecision;

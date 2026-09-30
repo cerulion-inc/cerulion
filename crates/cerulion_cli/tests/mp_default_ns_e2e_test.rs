@@ -9,7 +9,7 @@
 //! `graph run` deployment. The data plane was moved to the machine's resolved
 //! global config (`Config::global_config()` — the DEFAULT namespace, prefix
 //! `iox2_` on a config-file-free box); only infra stays run-scoped (barrier `cerdep_*`, trace
-//! rings `cer_rec_*`/`cer_rg_*`, doorbells `/cer_db_<user>_*`, and the
+//! rings `cer_rec_*`/`cer_rg_*`, doorbells `cer_db_*`, and the
 //! supervisor's `cer_p_*` PLANNING namespace).
 //!
 //! Two subprocess-level pins over the REAL binary:
