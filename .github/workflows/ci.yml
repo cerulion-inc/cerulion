@@ -2869,9 +2869,17 @@ jobs:
       # The three credit death arms ahead of the shard's normal list, so the
       # sampler window around them is short. `CLI binary tests` below runs the
       # whole binary again, these three included.
+      # NO `-- --test-threads=1`. Under this step's `c7_` filter only three arms
+      # run and all three carry `#[serial]`, so the flag added no exclusion they
+      # did not already have. What it did add was a signal: naming a package
+      # beside it tells `serial_discipline_test` that CI serialises
+      # `cerulion_cli` WHOLESALE, which exempted every singleton-touching
+      # `cerulion_cli` test file from the per-file rule before it could enter the
+      # covered set, and emptied the set that gate's floor requires to be
+      # non-empty.
       - name: Credit death arms first (shard 0)
         if: matrix.shard == 0
-        run: cargo test -p cerulion_cli --test credit_death_e2e_test c7_ -- --test-threads=1
+        run: cargo test -p cerulion_cli --test credit_death_e2e_test c7_
 
       # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
       # observes the whole tree, so the shard runner does the intersection.
