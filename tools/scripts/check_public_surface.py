@@ -1318,11 +1318,12 @@ def check_numbers(root, files):
 
 # The two names an agent instruction file is spelled with, and the token shape
 # that finds one named inside a page. A path separator or an include marker may
-# sit in front of the token (`crates/x/AGENTS.md`, `@AGENTS.md`), a filename
-# character may not: `MY_AGENTS.md` and `AGENTS.mdown` are other files. The two
-# guards are ASYMMETRIC about `.`: the lookbehind refuses it, so `x.AGENTS.md`
-# is another file, and the lookahead permits it, so a sentence-final
-# `AGENTS.md.` is the token and `AGENTS.md.bak` carries it too.
+# sit in front of the token (`crates/x/AGENTS.md`, `@AGENTS.md`); a letter,
+# digit, underscore, dot or hyphen may not: `MY_AGENTS.md` and `AGENTS.mdown`
+# are other files. The two guards are ASYMMETRIC about `.`: the lookbehind
+# refuses it, so `x.AGENTS.md` is another file, and the lookahead permits it,
+# so a sentence-final `AGENTS.md.` is the token and `AGENTS.md.bak` carries it
+# too.
 AGENT_FILE_NAMES = ("AGENTS.md", "CLAUDE.md")
 AGENT_FILE_RE = re.compile(r"(?<![A-Za-z0-9_.-])(" + "|".join(re.escape(n) for n in AGENT_FILE_NAMES)
                            + r")(?![A-Za-z0-9_-])")

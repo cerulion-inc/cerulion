@@ -82,8 +82,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-# The shipped configuration — the ONE place the defaults live, so `--check`
-# and the CI matrix cannot describe different partitions.
+# The shipped defaults: the package and the Linux shard count. A bare `--check`
+# (the Lint step) partitions at these; the macOS lane passes its own count, 3,
+# on its `run:` line, and the coverage test in cerulion_cli_engine checks each
+# lane's matrix against the count that lane passes.
 DEFAULT_PACKAGE=cerulion_core
 DEFAULT_SHARD_COUNT=4
 

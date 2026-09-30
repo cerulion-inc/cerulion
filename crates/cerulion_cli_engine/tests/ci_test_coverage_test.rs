@@ -1875,7 +1875,7 @@ fn the_ci_shard_matrix_agrees_with_the_shard_count_argument() {
         }
     }
 
-    // BOTH sharded jobs: `test-linux` (4) and `test-macos` (2) run on every
+    // BOTH sharded jobs: `test-linux` (4) and `test-macos` (3) run on every
     // pull request and neither carries a job-level `if:`, so the walk above
     // reaches both and each one's matrix is checked against its OWN count. The
     // floor is 2 rather than 1, so losing either job's shard step (which would
