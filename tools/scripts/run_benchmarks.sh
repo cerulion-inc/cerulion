@@ -2,15 +2,15 @@
 # run_benchmarks.sh — Run Cerulion benchmark entry points
 #
 # Usage:
-#   ./scripts/run_benchmarks.sh          # smoke + CI latency gate (the default;
+#   ./tools/scripts/run_benchmarks.sh          # smoke + CI latency gate (the default;
 #                                        # on a host with no captured smoke
 #                                        # baseline the smoke gate is SKIPPED
 #                                        # loudly and the latency gate still
 #                                        # runs — a regression or a setup
 #                                        # failure still stops it)
-#   ./scripts/run_benchmarks.sh smoke    # benches/latency smoke gate (~minutes)
-#   ./scripts/run_benchmarks.sh full     # benches/latency full sweep (hours; Linux + Docker)
-#   ./scripts/run_benchmarks.sh latency  # CI latency threshold test
+#   ./tools/scripts/run_benchmarks.sh smoke    # benches/latency smoke gate (~minutes)
+#   ./tools/scripts/run_benchmarks.sh full     # benches/latency full sweep (hours; Linux + Docker)
+#   ./tools/scripts/run_benchmarks.sh latency  # CI latency threshold test
 #
 # The public latency suite is benches/latency/ — driven by
 # benches/latency/bench.py. This wrapper exists for discoverability; the
@@ -20,7 +20,7 @@
 # (benches/shm_fast, the removed in-process transport) and are gone.
 #
 # One-command reproduction with prerequisite checks + baseline capture:
-#   ./scripts/benchmarks/reproduce.sh
+#   ./tools/scripts/benchmarks/reproduce.sh
 
 set -euo pipefail
 
@@ -113,7 +113,7 @@ case "${1:-all}" in
         else
             green "=== Latency gate passed (smoke gate skipped — no baseline) ==="
         fi
-        echo "For the full campaign: ./scripts/run_benchmarks.sh full"
+        echo "For the full campaign: ./tools/scripts/run_benchmarks.sh full"
         ;;
     *)
         echo "Usage: $0 {smoke|full|latency|all}"

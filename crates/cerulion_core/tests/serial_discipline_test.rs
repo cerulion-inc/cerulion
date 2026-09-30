@@ -1188,7 +1188,7 @@ fn weaker(a: RunnerPolicy, b: RunnerPolicy) -> RunnerPolicy {
     }
 }
 
-/// The package a `scripts/ci_test_shard.sh` invocation names POSITIONALLY.
+/// The package a `tools/scripts/ci_test_shard.sh` invocation names POSITIONALLY.
 ///
 /// The lane that actually runs `cerulion_core`'s `tests/` files on a pull
 /// request is `./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4`
@@ -1198,7 +1198,7 @@ fn weaker(a: RunnerPolicy, b: RunnerPolicy) -> RunnerPolicy {
 /// it in the lane that runs the files instead.
 ///
 /// Such a line runs under NEXTEST, and it is read from the script rather than
-/// assumed: `script_thread_policy` opens `scripts/ci_test_shard.sh` and finds
+/// assumed: `script_thread_policy` opens `tools/scripts/ci_test_shard.sh` and finds
 /// its `exec cargo nextest run --profile … "$@"`. (A policy stated in this
 /// comment would be true until the script changed and false after, which is
 /// exactly why
@@ -1249,7 +1249,7 @@ fn shard_script_package(line: &str) -> Option<String> {
 /// nightly mirrors kept outside this tree), none carrying
 /// `--test-threads=1`. Folded in, they flip `cerulion_core` to PARALLEL and the
 /// gate reports ~20 files as violations — every one of which CI really does run
-/// single-threaded, through `scripts/ci_test_shard.sh` (which applies the flag
+/// single-threaded, through `tools/scripts/ci_test_shard.sh` (which applies the flag
 /// unconditionally at its `exec cargo test "$@" -- --test-threads=1`).
 ///
 /// Deliberately NARROW: it excludes one INVOCATION FORM that provably cannot

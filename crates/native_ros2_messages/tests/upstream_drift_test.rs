@@ -48,7 +48,7 @@
 //!
 //! **What it CANNOT catch:** upstream itself changing
 //! after the snapshot was taken. Detecting that requires network and is the
-//! job of the deliberate refresh (`scripts/refresh_upstream_msg_manifest.sh`),
+//! job of the deliberate refresh (`tools/scripts/refresh_upstream_msg_manifest.sh`),
 //! whose output is a reviewable diff of this manifest. The tradeoff is
 //! intentional: it makes the corpus immutable-without-review in CI, and
 //! makes "we adopted an upstream change" an explicit, reviewed act rather
@@ -112,7 +112,7 @@
 //! # Refreshing
 //!
 //! ```text
-//! ./scripts/refresh_upstream_msg_manifest.sh          # re-fetch + rewrite
+//! ./tools/scripts/refresh_upstream_msg_manifest.sh          # re-fetch + rewrite
 //! git diff native_ros2_messages/upstream_msg_manifest.txt   # review it
 //! ```
 
@@ -384,7 +384,7 @@ fn parse_manifest(text: &str) -> Result<Manifest, String> {
                  existed to suppress the 'recorded upstream signature has no vendored .msg' \
                  error, but the refresh rebuilds the body from the vendored tree, so that block \
                  disappears on its own. Delete this line and re-run \
-                 ./scripts/refresh_upstream_msg_manifest.sh. (Upstream messages we deliberately \
+                 ./tools/scripts/refresh_upstream_msg_manifest.sh. (Upstream messages we deliberately \
                  do not vendor are recorded as prose in the manifest header — they need no \
                  directive, because nothing in the manifest refers to them.)"
             ));
@@ -516,7 +516,7 @@ fn adjudicate(corpus: &BTreeMap<(String, String), String>, m: &Manifest) -> Vec<
                     "{key}: vendored but has NO recorded upstream signature. Most likely the \
                      package is pinned to a distro that does not ship this message — check its \
                      '!source' line and re-pin if so (that was the original drift's actual root cause), or \
-                     re-run ./scripts/refresh_upstream_msg_manifest.sh if the pin is right and \
+                     re-run ./tools/scripts/refresh_upstream_msg_manifest.sh if the pin is right and \
                      the snapshot is merely stale. Only if the message is genuinely ours alone, \
                      record '!accept-fields {key} <reason>' — that waiver compares NOTHING for \
                      this message, fields included, so it is the last resort, not the first."
@@ -589,7 +589,7 @@ fn adjudicate(corpus: &BTreeMap<(String, String), String>, m: &Manifest) -> Vec<
         problems.push(format!(
             "{key}: recorded upstream signature has no vendored .msg — a message was deleted \
              or renamed. If that was INTENDED, re-run \
-             ./scripts/refresh_upstream_msg_manifest.sh: it rebuilds the body from the vendored \
+             ./tools/scripts/refresh_upstream_msg_manifest.sh: it rebuilds the body from the vendored \
              tree, so the stale block disappears and the manifest matches reality again. If it \
              was NOT intended, restore the .msg — this gate is telling you the corpus lost a \
              message."
@@ -636,7 +636,7 @@ fn vendored_corpus_matches_recorded_upstream_signatures() {
         panic!(
             "upstream drift gate cannot read its manifest {}: {e}\n\
              This gate must fail closed — regenerate it with \
-             ./scripts/refresh_upstream_msg_manifest.sh",
+             ./tools/scripts/refresh_upstream_msg_manifest.sh",
             path.display()
         )
     });
@@ -652,7 +652,7 @@ fn vendored_corpus_matches_recorded_upstream_signatures() {
          ours, and `walk_by_hash` then refuses the frame at the hash gate — the topic silently \
          renders nothing. In order of preference: fix the .msg file to match upstream; re-pin \
          the package's '!source' distro if upstream simply is not where we are looking; re-run \
-         ./scripts/refresh_upstream_msg_manifest.sh and review the diff if upstream genuinely \
+         ./tools/scripts/refresh_upstream_msg_manifest.sh and review the diff if upstream genuinely \
          changed. A waiver is the LAST resort — it buys silence, which is what hid the fork \
          this gate was built for.\n\n{}\n\n{} problem(s).",
         problems.join("\n\n"),
@@ -1302,7 +1302,7 @@ fn manifest_parser_fails_closed_on_malformed_input() {
 /// Regenerate the manifest from a local tree of upstream `.msg` files.
 ///
 /// NOT part of the CI gate (`#[ignore]`d): it needs upstream text that CI
-/// does not have. Driven by `scripts/refresh_upstream_msg_manifest.sh`,
+/// does not have. Driven by `tools/scripts/refresh_upstream_msg_manifest.sh`,
 /// which fetches the pinned upstream refs and lays them out as
 /// `<root>/<package>/<Name>.msg`.
 ///
@@ -1318,7 +1318,7 @@ fn manifest_parser_fails_closed_on_malformed_input() {
 fn refresh_manifest_from_upstream_tree() {
     let root = std::env::var("UPSTREAM_REFRESH_FROM").expect(
         "set UPSTREAM_REFRESH_FROM=<dir> laid out as <dir>/<package>/<Name>.msg \
-         (use scripts/refresh_upstream_msg_manifest.sh)",
+         (use tools/scripts/refresh_upstream_msg_manifest.sh)",
     );
     let root = Path::new(&root);
     let existing = std::fs::read_to_string(manifest_path()).unwrap_or_else(|e| {

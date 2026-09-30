@@ -23,7 +23,7 @@
 # bare one, which would silently delete every one of those judgements.
 #
 # USAGE
-#   ./scripts/refresh_upstream_msg_manifest.sh
+#   ./tools/scripts/refresh_upstream_msg_manifest.sh
 #   git diff crates/native_ros2_messages/upstream_msg_manifest.txt   # REVIEW THIS
 #
 # PINNED REFS — one DISTRO PIN PER PACKAGE

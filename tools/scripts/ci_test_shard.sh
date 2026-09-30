@@ -690,7 +690,7 @@ printf 'ci_test_shard: shard %s/%s of %s\n' "$INDEX" "$COUNT" "$PACKAGE"
 # rather than cargo's bare "no such command: nextest".
 command -v cargo-nextest >/dev/null 2>&1 || die \
     "cargo-nextest is not installed — this shard runs under nextest now.
-Install the pinned version with:  ./scripts/install_nextest.sh
+Install the pinned version with:  ./tools/scripts/install_nextest.sh
 (see .config/nextest.toml for the serial fence it applies)"
 # NO `--test-threads=1`. nextest runs each test in its own PROCESS, so the
 # process-global hazards that flag was defending (the cdylib `NODES` registry,

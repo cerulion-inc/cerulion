@@ -14,8 +14,8 @@
 # to build a >=2-fire-level graph. So `graph/` and `scheduler/` are scanned too.
 #
 # Usage:
-#   ./scripts/check_hot_path_allocs.sh        # exit 0 = clean, 1 = findings
-#   ./scripts/check_hot_path_allocs.sh --self-test
+#   ./tools/scripts/check_hot_path_allocs.sh        # exit 0 = clean, 1 = findings
+#   ./tools/scripts/check_hot_path_allocs.sh --self-test
 #                                             # drive the classifier over
 #                                             # synthetic fixtures with hand
 #                                             # oracles (the annotation grammar

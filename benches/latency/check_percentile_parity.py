@@ -3176,7 +3176,7 @@ def check_smoke_exit_contract() -> int:
     A baseline is per (machine_hash, variant) and is captured on the
     machine, so a fresh clone cannot have one — a normal first-run state,
     not a failure. It has its own exit code precisely so
-    `scripts/run_benchmarks.sh` can SKIP the smoke gate without also
+    `tools/scripts/run_benchmarks.sh` can SKIP the smoke gate without also
     tolerating a build failure. That makes the number a contract spanning a
     Python module and a shell script, written as a literal in each; a
     one-sided edit is silent and total, so the two literals are compared.
