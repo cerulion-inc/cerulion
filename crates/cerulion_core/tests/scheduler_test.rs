@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use cerulion_core::clock::{Clock, VirtualClock};
 use cerulion_core::error::TransportError;
-use cerulion_core::scheduler::{NodeConfig, Scheduler, TraceEntry, TriggerPolicy};
+use cerulion_core::scheduler::{
+    NodeConfig, RefillEmptyCause, RefillOutcome, Scheduler, TraceEntry, TriggerPolicy,
+};
 use serial_test::serial;
 use tracing_test::traced_test;
 
@@ -1707,10 +1709,17 @@ fn the_per_step_fire_cap_bounds_a_refilled_burst_and_the_remainder_reports_due_n
         .set_trigger_refill("sink", "inp", move || {
             let left = remaining_hook.load(Ordering::Relaxed);
             if left == 0 {
-                (0, None)
+                // No read plan drives this hand-built hook, so an empty answer
+                // is always the QUEUE's, the fail-safe every non-gate path
+                // returns.
+                RefillOutcome::empty_queue()
             } else {
                 remaining_hook.store(left - 1, Ordering::Relaxed);
-                (1, Some(left))
+                RefillOutcome {
+                    popped: 1,
+                    latest_ts: Some(left),
+                    empty_cause: RefillEmptyCause::NotEmpty,
+                }
             }
         })
         .unwrap();
@@ -1807,10 +1816,17 @@ fn a_fully_served_refilled_burst_raises_no_wake_hint() {
         .set_trigger_refill("sink", "inp", move || {
             let left = remaining_hook.load(Ordering::Relaxed);
             if left == 0 {
-                (0, None)
+                // No read plan drives this hand-built hook, so an empty answer
+                // is always the QUEUE's, the fail-safe every non-gate path
+                // returns.
+                RefillOutcome::empty_queue()
             } else {
                 remaining_hook.store(left - 1, Ordering::Relaxed);
-                (1, Some(left))
+                RefillOutcome {
+                    popped: 1,
+                    latest_ts: Some(left),
+                    empty_cause: RefillEmptyCause::NotEmpty,
+                }
             }
         })
         .unwrap();

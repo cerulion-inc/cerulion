@@ -268,7 +268,55 @@ struct WatchdogTracker {
 #[derive(Clone)]
 struct TriggerRefill {
     input: Arc<str>,
-    drain: Arc<dyn Fn() -> (u64, Option<u64>) + Send + Sync>,
+    drain: Arc<dyn Fn() -> RefillOutcome + Send + Sync>,
+}
+
+/// What one refill did, and WHY it found nothing when it found nothing.
+///
+/// The hook returned `(popped, latest_ts)` until the replay read gate existed.
+/// The pair was enough while the only reason a refill could come back empty was
+/// an empty queue; under enforcement an empty answer has a second cause, the
+/// gate withheld a frame that is queued and not yet due, and the two must not
+/// be reported as one, because the shortfall line says the recording holds a
+/// consumed frame this replay's input stream does not, which is FALSE for a
+/// withheld frame.
+///
+/// The cause is decided by the party that PERFORMED the drain, not probed for
+/// afterwards: an optional probe hook would make two authorities for one fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefillOutcome {
+    /// Frames the refill consumed.
+    pub popped: u64,
+    /// The surviving frame's wire timestamp, `None` when nothing was consumed.
+    pub latest_ts: Option<u64>,
+    /// Why `popped` is 0, when it is.
+    pub empty_cause: RefillEmptyCause,
+}
+
+/// Why a refill came back empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefillEmptyCause {
+    /// It did not: `popped > 0`.
+    NotEmpty,
+    /// The queue held no frame the refill could take.
+    Queue,
+    /// The REPLAY READ GATE withheld a queued frame that is not yet due. Not a
+    /// shortfall: the recording's read at this position consumed nothing, and
+    /// the gate reproducing that is the enforcement working.
+    EnforcedByReadPlan,
+}
+
+impl RefillOutcome {
+    /// The empty answer a caller that consumed nothing and blames the QUEUE
+    /// gives, the fail-safe every non-gate path returns.
+    #[must_use]
+    pub fn empty_queue() -> Self {
+        Self {
+            popped: 0,
+            latest_ts: None,
+            empty_cause: RefillEmptyCause::Queue,
+        }
+    }
 }
 
 /// The transport ops the per-set Sync matcher demands through its
@@ -545,6 +593,13 @@ struct ScheduledNode {
     /// read via [`Scheduler::replay_refill_shortfalls`]. Zero on every live path
     /// (nothing but the Replay arm touches it).
     replay_refill_shortfalls: u64,
+    /// Refills whose empty answer the REPLAY READ GATE caused, a queued frame
+    /// the recording had not read yet. Split out from
+    /// [`Self::replay_refill_shortfalls`] rather than folded into it because
+    /// that counter's whole meaning is "the recording holds a consumed frame
+    /// this replay's input stream does not", which is false here. Read via
+    /// [`Scheduler::replay_enforced_empty_refills`]; zero on every live path.
+    replay_enforced_empty_refills: u64,
 
     /// This node's installed INTRA-STEP pauses for the current
     /// replayed step — see [`NodeReplayPauses`] for the contract and for why
@@ -2327,6 +2382,7 @@ impl Scheduler {
             throttle_ns: None,
             // Only a trace-driven replay burst ever bumps this.
             replay_refill_shortfalls: 0,
+            replay_enforced_empty_refills: 0,
             // No pauses until a replay engine installs some.
             replay_pauses: NodeReplayPauses::default(),
             // Inherit whatever hook is installed NOW, so a node
@@ -2661,6 +2717,18 @@ impl Scheduler {
     /// `ScheduledNode::replay_refill_shortfalls`. `None` for an unknown id.
     pub fn replay_refill_shortfalls(&self, node_id: &str) -> Option<u64> {
         self.nodes.get(node_id).map(|n| n.replay_refill_shortfalls)
+    }
+
+    /// How many times this node's trace-driven burst asked its refill hook for
+    /// the next FIFO frame and the REPLAY READ GATE withheld one, see
+    /// `ScheduledNode::replay_enforced_empty_refills`. `None` for an unknown id.
+    ///
+    /// A nonzero value is NOT a shortfall. Reporting it as one would name a
+    /// missing frame on an edge whose frame is present and correctly held.
+    pub fn replay_enforced_empty_refills(&self, node_id: &str) -> Option<u64> {
+        self.nodes
+            .get(node_id)
+            .map(|n| n.replay_enforced_empty_refills)
     }
 
     /// Install the engine's INTRA-STEP injection callback — the
@@ -4144,7 +4212,7 @@ impl Scheduler {
         drain: F,
     ) -> TransportResult<()>
     where
-        F: Fn() -> (u64, Option<u64>) + Send + Sync + 'static,
+        F: Fn() -> RefillOutcome + Send + Sync + 'static,
     {
         let node = self
             .nodes
@@ -7269,11 +7337,14 @@ impl Scheduler {
                 let Some(r) = refill.as_ref() else {
                     break; // Separate binding: the signalled count WAS the burst.
                 };
-                let (popped, latest_ts) = (r.drain)();
-                if popped == 0 {
-                    break; // queue empty — the burst is fully served
+                let outcome = (r.drain)();
+                if outcome.popped == 0 {
+                    // queue empty, the burst is fully served. The LIVE burst
+                    // does not read `empty_cause`: no gate is armed on a live
+                    // run, so the only cause reachable here is the queue.
+                    break;
                 }
-                Self::note_trigger_arrival(node, &r.input, latest_ts);
+                Self::note_trigger_arrival(node, &r.input, outcome.latest_ts);
                 remaining = 1; // the drain's pop-one contract
                 refilled_unfired = true;
             }
@@ -7388,20 +7459,36 @@ impl Scheduler {
         for i in 0..fire_count {
             if i > 0 {
                 if let Some(r) = refill.as_ref() {
-                    let (popped, latest_ts) = (r.drain)();
-                    if popped == 0 {
-                        node.replay_refill_shortfalls =
-                            node.replay_refill_shortfalls.saturating_add(1);
-                        tracing::debug!(
-                            node_id = %id,
-                            step,
-                            fire_index = i,
-                            "trace-driven fire found no frame to refill — the recording holds \
-                             a consumed frame this replay's input stream does not; firing \
-                             anyway (the fire schedule is the recording's)"
-                        );
-                    } else {
-                        Self::note_trigger_arrival(node, &r.input, latest_ts);
+                    let outcome = (r.drain)();
+                    match outcome.empty_cause {
+                        RefillEmptyCause::NotEmpty => {
+                            Self::note_trigger_arrival(node, &r.input, outcome.latest_ts);
+                        }
+                        RefillEmptyCause::Queue => {
+                            node.replay_refill_shortfalls =
+                                node.replay_refill_shortfalls.saturating_add(1);
+                            tracing::debug!(
+                                node_id = %id,
+                                step,
+                                fire_index = i,
+                                "trace-driven fire found no frame to refill, the recording holds \
+                                 a consumed frame this replay's input stream does not; firing \
+                                 anyway (the fire schedule is the recording's)"
+                            );
+                        }
+                        RefillEmptyCause::EnforcedByReadPlan => {
+                            node.replay_enforced_empty_refills =
+                                node.replay_enforced_empty_refills.saturating_add(1);
+                            tracing::debug!(
+                                node_id = %id,
+                                step,
+                                fire_index = i,
+                                "trace-driven fire found no frame to refill because the REPLAY \
+                                 READ GATE withheld one, the recording's read at this position \
+                                 consumed nothing; firing anyway (the fire schedule is the \
+                                 recording's)"
+                            );
+                        }
                     }
                 }
             }

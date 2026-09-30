@@ -963,6 +963,24 @@ struct DrainOutcome {
     decimated: bool,
 }
 
+impl DrainOutcome {
+    /// The gate REFUSED the pop: nothing left the queue, so the drain reports
+    /// the shape a genuinely empty queue reports.
+    ///
+    /// That identity is what keeps a withheld drain staging the same read
+    /// outcome an empty one stages (a silent drain records nothing), so the
+    /// redundant read-log verifier cannot read the hold-back as a missing
+    /// replayed read.
+    fn withheld() -> Self {
+        Self {
+            slot: FrozenSlot::Empty,
+            popped: 0,
+            latest_ts: None,
+            decimated: false,
+        }
+    }
+}
+
 /// A received message with zero-copy payload access.
 ///
 /// The `header` is an owned copy (32 bytes on stack, from alignment-safe deserialization).
@@ -1395,6 +1413,22 @@ pub struct CerulionSubscriber {
     /// bump. The field itself is unconditional for FFI struct-layout stability
     /// (never `#[cfg]`-gate a field — the SIGSEGV lesson).
     served_sequence: Option<Arc<AtomicU64>>,
+    /// The REPLAY read plan for this input's stage, `Some` on every
+    /// GRAPH-WIRED subscriber, installed DISARMED at wiring time exactly like
+    /// [`Self::read_stage`], and armed only by
+    /// `GraphRuntime::arm_replay_read_plan`. `None` for direct / introspection
+    /// subscribers, which are never part of the read log.
+    ///
+    /// While the plan is unarmed every gated site pays one null-pointer test
+    /// plus one `Acquire` bool load and then takes today's code path unchanged:
+    /// the same cost class [`Self::read_capture_armed`] documents for its own
+    /// field, and the reason the gated bodies live in `#[inline(never)]`
+    /// functions.
+    ///
+    /// Field is unconditional (never `#[cfg]`-gate a field, the FFI
+    /// struct-layout lesson); adding it moved the FFI-crossed `NodeContext`
+    /// layout, which is the v23 ABI bump.
+    replay_plan: Option<Arc<crate::read_outcome::ReadPlanStage>>,
 }
 
 /// Consecutive re-offers of one unserved FIFO head that constitute
@@ -1496,6 +1530,7 @@ impl CerulionSubscriber {
             held_head_reoffers: 0,
             held_head_warned: false,
             served_sequence: None,
+            replay_plan: None,
         }
     }
 
@@ -1516,6 +1551,46 @@ impl CerulionSubscriber {
     /// merge both happen through that side.
     pub(crate) fn set_read_outcome_stage(&mut self, stage: Arc<ReadOutcomeStage>) {
         self.read_stage = Some(stage);
+    }
+
+    /// Install this input's shared REPLAY read plan (the enforcement twin of
+    /// [`Self::set_read_outcome_stage`]). Called by the graph runtime at WIRING
+    /// time, before the context moves into the node entry, which is why the
+    /// handle is wired this early: there is no post-move path to a subscriber
+    /// that does not add an FFI export. The runtime retains a clone; arming,
+    /// the per-step install and the end-of-step sweep all happen through that
+    /// side.
+    pub(crate) fn set_replay_read_plan(&mut self, plan: Arc<crate::read_outcome::ReadPlanStage>) {
+        self.replay_plan = Some(plan);
+    }
+
+    /// The ARMED replay gate for this input, or `None`.
+    ///
+    /// One null-pointer test plus one `Acquire` bool load, then the caller takes
+    /// today's path. This is the whole live-path cost of the enforcement.
+    #[inline]
+    fn replay_gate(&self) -> Option<&crate::read_outcome::ReadPlanStage> {
+        self.replay_plan.as_deref().filter(|p| p.is_armed())
+    }
+
+    /// One gate consult, OUT OF LINE so the hot path keeps its instruction
+    /// sequence and its zero-allocation profile.
+    ///
+    /// Answers `None` when the plan is armed but admits nothing here, and
+    /// `Some(due)` with the admission to spend. The caller has already
+    /// established that a gate is armed, so `Ungated` cannot come back.
+    #[inline(never)]
+    fn gate_admission(
+        gate: &crate::read_outcome::ReadPlanStage,
+    ) -> Option<crate::read_outcome::DueRead> {
+        match gate.admit() {
+            crate::read_outcome::GateAnswer::Exact(due) => Some(due),
+            // `Ungated` is unreachable from an armed gate; withholding on it
+            // keeps the two answers that mean "pop nothing" on one arm rather
+            // than adding a fall-through to a live pop.
+            crate::read_outcome::GateAnswer::Withhold
+            | crate::read_outcome::GateAnswer::Ungated => None,
+        }
     }
 
     /// Is read-outcome capture LIVE on this subscriber — a stage is
@@ -2591,9 +2666,27 @@ impl CerulionSubscriber {
     where
         F: FnMut(ReceivedMessage<'_>),
     {
+        // The SECOND of the two interception points, consulted at the top of
+        // the body for the same reason as `drain_with_accounting_impl`'s: this
+        // is the other body a graph-wired subscriber's pops funnel through.
+        //
+        // `&self` is not an obstacle, the plan's state lives behind the `Arc`
+        // with an interior `Mutex`, which is the discipline
+        // `ReadOutcomeStage` uses at this same site for the same reason.
+        let granted = match self.replay_gate() {
+            None => None,
+            Some(gate) => match Self::gate_admission(gate) {
+                Some(due) => Some(due),
+                None => return Ok(0),
+            },
+        };
         let sub = &self.subscriber;
         let topic = &self.topic;
-        let mut count = 0usize;
+        // DELIVERED frames. A `Cell` rather than a plain counter because the
+        // receive closure reads it to stop after the granted pops while the
+        // per-sample closure writes it, and the two capture it immutably.
+        let count = std::cell::Cell::new(0usize);
+        let pop_bound: usize = granted.map_or(usize::MAX, |due| due.pop_count() as usize);
         // The LEGACY batch-drain read outcome — this is the
         // `TriggerSubscriber::try_receive_timestamps` path (Separate
         // data-trigger + Sync drains) and the accumulate-all
@@ -2621,6 +2714,9 @@ impl CerulionSubscriber {
         // see the next comment).
         let drain_result = drain_with_block_accounting(
             || {
+                if count.get() >= pop_bound {
+                    return Ok(None);
+                }
                 // The SAME fire-once test fault as
                 // `drain_to_latest_with_accounting`'s receive loop — a `None`
                 // `Cell` read in production, so one branch on the hot path.
@@ -2647,7 +2743,7 @@ impl CerulionSubscriber {
             // `block` mirror tracks queue REMOVALS, not deliveries.
             |sample| {
                 if deliver_raw_frame(topic, sample.payload(), callback) {
-                    count += 1;
+                    count.set(count.get() + 1);
                     if capture {
                         if let Some(seq) = wire_sequence(sample.payload()) {
                             newest_seq = Some(seq);
@@ -2674,6 +2770,7 @@ impl CerulionSubscriber {
         // never wrote (a false read-log divergence at exactly the fault
         // moment). An all-or-nothing Err (nothing delivered) still records
         // nothing, matching every other drain site's Err posture.
+        let count = count.get();
         if capture && count > 0 {
             match newest_origin {
                 Some(origin) => self.stage_read_outcome_with_producer(
@@ -2690,6 +2787,15 @@ impl CerulionSubscriber {
                     role,
                 ),
             }
+        }
+        // The settle compares DELIVERED frames against the quota, which is the
+        // same quantity the `DrainedBatch` record above stages, and the served
+        // sequence against the batch's newest, the two fields the recording
+        // carries for this site. It runs BEFORE the mid-drain `Err` propagates
+        // for the same reason the staging does: the frames delivered so far
+        // really reached the callback.
+        if let (Some(gate), Some(due)) = (self.replay_gate(), granted) {
+            gate.settle(due, count as u64, newest_seq);
         }
         drain_result?;
         Ok(count)
@@ -2987,8 +3093,59 @@ impl CerulionSubscriber {
     }
 
     /// The single drain-and-account implementation behind BOTH consume modes
-    /// (`limit_one = false` ⇒ drain-to-latest; `true` ⇒ pop-one FIFO).
+    /// (`limit_one = false` ⇒ drain-to-latest; `true` ⇒ pop-one FIFO),
+    /// wrapped by the REPLAY READ GATE.
+    ///
+    /// The gate is consulted ONCE, at the top, before anything pops: a frame
+    /// that is not yet due stays in its OWN queue, in arrival order, with its
+    /// bytes never read. Nothing pops an iceoryx2 queue except a drain, and on a
+    /// graph-wired subscriber every drain funnels into this body or into
+    /// [`Self::drain_samples`], so refusing the pop here is the whole hold-back
+    /// mechanism, no frame is retained as a borrowed sample, which would spend
+    /// one unit of the connection's `subscriber_max_borrowed_samples` budget per
+    /// held frame against a value baked at SERVICE CREATION.
+    ///
+    /// With no armed gate the answer is `Ungated` and the body below runs byte
+    /// for byte as it does today.
     fn drain_with_accounting_impl(&mut self, limit_one: bool) -> DrainOutcome {
+        let granted = match self.replay_gate() {
+            None => None,
+            Some(gate) => match Self::gate_admission(gate) {
+                Some(due) => Some(due),
+                None => {
+                    // The stale EVENT drain still runs: it pops the iceoryx2
+                    // LISTENER, not the data queue, so skipping it would leave
+                    // notifications queued for a reason that has nothing to do
+                    // with which frame is due.
+                    self.drain_stale_events();
+                    return DrainOutcome::withheld();
+                }
+            },
+        };
+        let outcome = self.drain_with_accounting_body(limit_one, granted.map(|d| d.pop_count()));
+        if let (Some(gate), Some(due)) = (self.replay_gate(), granted) {
+            // The surviving frame's own wire sequence, read off the slot the
+            // body kept. `Empty` and `Err` carry none, and a DECIMATED drain's
+            // survivor is nothing either, its recorded `served_seq` names the
+            // last ACCEPTED sequence rather than what the read popped, which is
+            // what `identity_unstated` suppresses.
+            let surviving_seq = match &outcome.slot {
+                FrozenSlot::Sample(sample) => wire_sequence(sample.payload()),
+                FrozenSlot::Held | FrozenSlot::Empty | FrozenSlot::Err(_) => None,
+            };
+            gate.settle(due, outcome.popped, surviving_seq);
+        }
+        outcome
+    }
+
+    /// The pop body itself. `pop_budget` is `Some(n)` under an armed gate that
+    /// granted `n` pops and `None` otherwise, in which case the consume mode
+    /// supplies the bound it always had.
+    fn drain_with_accounting_body(
+        &mut self,
+        limit_one: bool,
+        pop_budget: Option<u32>,
+    ) -> DrainOutcome {
         self.drain_stale_events();
 
         // Drain to the latest message ("latest wins": drop older
@@ -3032,12 +3189,27 @@ impl CerulionSubscriber {
         // errors mid-drain (bypassing the decrement would permanently
         // inflate the mirror — the same deadlock guarded in `drain_samples`).
         let mut fault_inject = self.fault_inject_receive_after.get();
-        // FIFO pop-one: the per-sample closure flips this after the first
-        // pop; the receive closure then reports the queue as drained, so
-        // exactly one sample leaves the queue per call and older frames
-        // survive for later reads (per-message delivery). `Cell` because the
-        // receive and per-sample closures both capture it immutably.
-        let stop_after_first = std::cell::Cell::new(false);
+        // How many DELIVERED frames this drain may still take. The
+        // per-sample closure counts each frame it keeps and the receive closure
+        // reports the queue as drained once the count reaches the bound, so
+        // older frames survive for later reads (per-message delivery). `Cell`
+        // because the receive and per-sample closures both capture it
+        // immutably.
+        //
+        // The bound is a COUNT rather than the bool it replaced because the
+        // FIFO pop-one mode and the gate's admit-exactly-N differ only in the
+        // number: `limit_one` is the `1` case of it, an ungated latest-wins
+        // drain is the unbounded case, and an armed gate names its own. The
+        // counted quantity is DELIVERED frames and not queue removals, which is
+        // the same quantity `StagedReadOutcome::popped` carries at this site,
+        // comparing removals would mint a false shortfall on any edge carrying
+        // one corrupt frame.
+        let delivered = std::cell::Cell::new(0u64);
+        let pop_bound: u64 = match pop_budget {
+            Some(pops) => u64::from(pops),
+            None if limit_one => 1,
+            None => u64::MAX,
+        };
         // Corrupt (undersized) frames skipped by the FIFO pop — they are
         // real queue removals (block-mirror-accounted) but must not mint a
         // fire, so the returned `popped` (the trigger's signal count)
@@ -3045,7 +3217,7 @@ impl CerulionSubscriber {
         let junk_skipped = std::cell::Cell::new(0u64);
         let drain_result = drain_with_block_accounting(
             || {
-                if limit_one && stop_after_first.get() {
+                if delivered.get() >= pop_bound {
                     return Ok(None);
                 }
                 // Test-only fire-once receive fault (see the
@@ -3121,7 +3293,7 @@ impl CerulionSubscriber {
                     return;
                 }
                 latest = Some(sample);
-                stop_after_first.set(true);
+                delivered.set(delivered.get() + 1);
             },
             |removed| {
                 removed_in_drain.set(removed);
@@ -4908,7 +5080,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             consume_mode,
             held_head_reoffers,
             held_head_warned,
-            served_sequence
+            served_sequence,
+            replay_plan
         }),
         abi_pin_struct!(SampleGate {
             interval_ns,

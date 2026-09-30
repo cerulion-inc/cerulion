@@ -105,8 +105,8 @@
 //! (`GraphRuntime::read_outcome_dropped_report`, surfaced beside the
 //! trace-ring unmapped count) remains the run-level total.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The SLOTS a stage keeps above the deepest burst one level
 /// execution can hand it — the `+ H` term of [`derive_stage_capacity`], and
@@ -1881,6 +1881,807 @@ impl ReadOutcomeStage {
     }
 }
 
+// ===========================================================================
+// THE ENFORCEMENT SIDE: what the RECORDING says a stage's reads were, and the
+// gate that admits exactly those.
+//
+// Everything below is the twin of the capture side above. The capture stage
+// answers "what did this read do"; the plan stage answers "what did the
+// recording's read at this position do, and how much of that step's quota is
+// unspent". The two share `StageKey`, `derive_stage_capacity` and
+// `StagedReadOutcome`, so a field added to the capture record joins the
+// enforcement key by construction instead of collapsing a distinction on one
+// side only.
+// ===========================================================================
+
+/// What ONE recorded read at this stage did, in the THREE shapes a bag can
+/// state. The shape is a variant and not a count, because a count admits one
+/// state for two different facts: "the read consumed nothing and served
+/// nothing" and "the read served a frame and consumed nothing" both write zero.
+///
+/// # The third shape is already in the tree
+///
+/// A SERVED read that popped nothing is recorded today as a `DrainedBatch` with
+/// `popped == 0`, the hand off a promotion mints, which the engine's injection
+/// folder already skips as occupying no position in the pop stream. Collapsing
+/// it onto [`Self::Nothing`] would withhold a frame at the step the recording
+/// says it was SERVED, mint neither a never-arrives nor a shortfall for it (an
+/// unspent none owes nothing, and a settle of 0 against 0 agrees), and let the
+/// divergence surface downstream as a byte difference charged to the candidate:
+/// a silent wrong verdict. Refusing the whole run on the shape is not the answer
+/// either, since that would make every graph carrying a promotion unreplayable.
+///
+/// # These three are the WHOLE vocabulary
+///
+/// A future [`ReadOutcomeKind`] that maps to none of them has no admission
+/// meaning here, and an unknown kind reaching a verdict is an exit 6 schedule
+/// divergence rather than a silent fourth meaning. So adding a kind is a TRACE
+/// FORMAT bump, with this enum's arms as the cost: a new kind must state which
+/// of the three it is, or declare a fourth here and take the format bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DueShape {
+    /// The recorded read CONSUMED `pops` frames off the queue.
+    Pops {
+        /// Frames this read must consume. Never 0, a pop of nothing is one of
+        /// the two shapes below.
+        pops: u32,
+        /// True only for a recorded [`ReadOutcomeKind::Decimated`] read, whose
+        /// served sequence names the last ACCEPTED sequence and not what this
+        /// read popped, so the COUNT is enforced and the identity is not.
+        identity_unstated: bool,
+    },
+    /// The recorded read served NOTHING and consumed nothing: a recorded none,
+    /// or a held read that took no new frame. It is a POSITION a gated consult
+    /// really occupied, the recording's drain ran there and got nothing, so
+    /// the gate withholds at it and never scans past it.
+    Nothing,
+    /// The recorded read SERVED its sequence and consumed nothing: the frame
+    /// reached the consumer WITHOUT a dequeue, at a site that pops nothing (a
+    /// promotion), or the serving site is another stage and this record is
+    /// COVERED there.
+    ///
+    /// Either way it occupies no position in this gate's pop stream, so it is
+    /// TRANSPARENT: a consult skips past it to the next real entry, and the
+    /// end-of-step sweep never mints for it. Neither withheld nor swept.
+    ServedWithoutPop,
+}
+
+/// One recorded read at this stage: its shape and the sequence it served.
+///
+/// The fields are PRIVATE with named constructors, so a pop count of zero on
+/// the [`DueShape::Pops`] arm and a `served_seq` on an arm that serves nothing
+/// are unconstructible rather than documented as not happening.
+///
+/// It carries one sequence and not a list because the recording carries one: a
+/// batch's record names its NEWEST sequence and its pop count, never the
+/// sequences in between, so naming a range here would state an order the bag
+/// does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DueRead {
+    /// Which of the three shapes this read is.
+    shape: DueShape,
+    /// The sequence the recorded read SERVED (`None` = it served no frame).
+    served_seq: Option<u32>,
+}
+
+impl DueRead {
+    /// A read that consumed `pops` frames, the LAST surviving of which carried
+    /// `served_seq`. A `pops` of 0 is NOT this shape and is normalised to
+    /// [`Self::nothing`] or [`Self::served_without_pop`] by what it served, so
+    /// a caller folding a record cannot mint a pop of nothing.
+    #[must_use]
+    pub fn pops(pops: u32, served_seq: Option<u32>) -> Self {
+        Self::pops_with_identity(pops, served_seq, false)
+    }
+
+    /// [`Self::pops`] for a recorded [`ReadOutcomeKind::Decimated`] read: the
+    /// count is enforced and the identity is not.
+    #[must_use]
+    pub fn decimated(pops: u32, last_accepted: Option<u32>) -> Self {
+        Self::pops_with_identity(pops, last_accepted, true)
+    }
+
+    /// A read that served nothing and consumed nothing.
+    #[must_use]
+    pub const fn nothing() -> Self {
+        Self {
+            shape: DueShape::Nothing,
+            served_seq: None,
+        }
+    }
+
+    /// A read that SERVED `served_seq` and consumed nothing (a hand off).
+    #[must_use]
+    pub const fn served_without_pop(served_seq: Option<u32>) -> Self {
+        Self {
+            shape: DueShape::ServedWithoutPop,
+            served_seq,
+        }
+    }
+
+    /// Which of the three shapes this read is.
+    #[must_use]
+    pub fn shape(&self) -> DueShape {
+        self.shape
+    }
+
+    /// The sequence the recorded read served.
+    #[must_use]
+    pub fn served_seq(&self) -> Option<u32> {
+        self.served_seq
+    }
+
+    /// Frames this read must consume: 0 on both pop-less shapes.
+    #[must_use]
+    pub fn pop_count(&self) -> u32 {
+        match self.shape {
+            DueShape::Pops { pops, .. } => pops,
+            DueShape::Nothing | DueShape::ServedWithoutPop => 0,
+        }
+    }
+
+    fn pops_with_identity(pops: u32, served_seq: Option<u32>, identity_unstated: bool) -> Self {
+        if pops == 0 {
+            // A pop of nothing is one of the two pop-less shapes, decided by
+            // what the record SERVED. Normalising here is what keeps
+            // `DueShape::Pops { pops: 0 }` out of the type entirely.
+            return match served_seq {
+                Some(_) => Self::served_without_pop(served_seq),
+                None => Self::nothing(),
+            };
+        }
+        Self {
+            shape: DueShape::Pops {
+                pops,
+                identity_unstated,
+            },
+            served_seq,
+        }
+    }
+}
+
+/// One gated stage's admissions for ONE step, in RECORDED ORDER.
+///
+/// An EMPTY slice is a DECLARATION ("this stage reads nothing this step"), and
+/// an armed stage the per-step call OMITS is the same declaration. The two are
+/// never observably different because the engine installs an entry for every
+/// armed stage at every step.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadPlanEdge<'a> {
+    /// Which stage this step's admissions belong to.
+    pub key: &'a StageKey,
+    /// This step's reads at this stage, in RECORDED ORDER.
+    pub due: &'a [DueRead],
+}
+
+/// Why a wired stage can never be GATED, decided from WIRING facts at build
+/// time and fixed for the run.
+///
+/// It is a two-variant enum on the stage rather than a pair of bools because
+/// the census renders exactly one reason per stage, and two bools admit a
+/// fourth state (both set) nothing would choose between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateBlocker {
+    /// A per-set `Sync` trigger input. Its pops leave the two gated drain
+    /// bodies: `sync_peek_next_stamp` and `sync_discard_head` remove frames
+    /// from the queue through the matcher's ops, so a gate installed here
+    /// would be bypassed rather than enforced.
+    PerSetSyncEdge,
+    /// A `multi_publisher_topics` edge. The wire sequence is a PER-PUBLISHER
+    /// counter, so the due frame is not necessarily the head and a served seq
+    /// names no producer.
+    MultiPublisherEdge,
+}
+
+impl GateBlocker {
+    /// The stable token an operator-facing refusal carries.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::PerSetSyncEdge => "per_set_sync_edge",
+            Self::MultiPublisherEdge => "multi_publisher_edge",
+        }
+    }
+}
+
+/// What the core refuses to GATE, on WIRING facts alone. Every arm names the
+/// stage; the engine renders the input name from its own manifest.
+///
+/// A bag fact is NOT in this vocabulary: the core cannot see a bag, so no
+/// coverage, a truncated stream, a dropped record and every unenforceable
+/// record shape are refused by the engine's planner before step 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadPlanRefusal {
+    /// No wired stage carries this key.
+    UnknownKey(StageKey),
+    /// The same key appeared twice in one call.
+    DuplicateKey(StageKey),
+    /// See [`GateBlocker::PerSetSyncEdge`].
+    PerSetSyncEdge(StageKey),
+    /// See [`GateBlocker::MultiPublisherEdge`].
+    MultiPublisherEdge(StageKey),
+    /// The gate's mutex was poisoned by a panic; the stage refuses every later
+    /// admission rather than falling back to a live pop.
+    GateUnusable(StageKey),
+}
+
+impl ReadPlanRefusal {
+    /// The refused stage.
+    #[must_use]
+    pub fn key(&self) -> &StageKey {
+        match self {
+            Self::UnknownKey(k)
+            | Self::DuplicateKey(k)
+            | Self::PerSetSyncEdge(k)
+            | Self::MultiPublisherEdge(k)
+            | Self::GateUnusable(k) => k,
+        }
+    }
+
+    /// The stable token, one per cause.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownKey(_) => "unknown_key",
+            Self::DuplicateKey(_) => "duplicate_key",
+            Self::PerSetSyncEdge(_) => GateBlocker::PerSetSyncEdge.code(),
+            Self::MultiPublisherEdge(_) => GateBlocker::MultiPublisherEdge.code(),
+            Self::GateUnusable(_) => "gate_unusable",
+        }
+    }
+}
+
+impl std::fmt::Display for ReadPlanRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stage {} refuses the read gate ({})",
+            self.key().label(),
+            self.code()
+        )
+    }
+}
+
+/// One wired stage's answer to "can this edge be gated", read BEFORE step 0.
+///
+/// The census is a read-only walk so the engine can refuse the whole run
+/// before a single step, which is what keeps a refusal whole-run rather than
+/// per-pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadEdgeCapability {
+    /// The stage this row describes.
+    pub key: StageKey,
+    /// Whether [`ReadPlanStage::arm`] would succeed.
+    pub enforceable: bool,
+    /// Why not, when `enforceable` is false.
+    pub reason: Option<ReadPlanRefusal>,
+}
+
+/// A recorded read the re-execution did not reproduce.
+///
+/// Three kinds for what an operator reads as one story, kept apart because
+/// they distinguish "the drain never ran" from "the drain ran and the queue
+/// was short" from "the drain ran and the head was a different frame", which
+/// is the difference between a missing fire, a missing frame and a reordered
+/// stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayReadViolationKind {
+    /// A [`DueRead`] with `pops > 0` that no drain consulted this step.
+    NeverArrived {
+        /// The sequence the recording read at that position.
+        sequence: Option<u32>,
+    },
+    /// A drain ran and delivered fewer frames than the quota.
+    PoppedShortfall {
+        /// The recorded pop count.
+        expected: u32,
+        /// What the drain actually delivered.
+        admitted: u32,
+    },
+    /// The surviving frame carried a different sequence.
+    SequenceMismatch {
+        /// The recorded surviving sequence.
+        expected: Option<u32>,
+        /// The sequence the replay's surviving frame carried.
+        observed: Option<u32>,
+    },
+}
+
+impl ReplayReadViolationKind {
+    /// The stable token the engine renders and keys its JSON on.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NeverArrived { .. } => "never_arrived",
+            Self::PoppedShortfall { .. } => "popped_shortfall",
+            Self::SequenceMismatch { .. } => "sequence_mismatch",
+        }
+    }
+}
+
+/// One divergence between the recording's read and the replay's, naming the
+/// stage and the step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayReadViolation {
+    /// The stage that diverged.
+    pub key: StageKey,
+    /// The step it diverged at.
+    pub step: u64,
+    /// How it diverged.
+    pub kind: ReplayReadViolationKind,
+}
+
+/// What one gate consult answers.
+///
+/// `Ungated` and `Withhold` are two different facts and not one: `Ungated`
+/// means no plan is armed on this edge at all, so the drain takes today's path
+/// byte for byte, while `Withhold` means an armed plan's recorded read at this
+/// position popped nothing. Collapsing them would make an unarmed edge and a
+/// zero-quota step indistinguishable, and the live path could then no longer be
+/// proven untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateAnswer {
+    /// No armed plan: take today's path.
+    Ungated,
+    /// An armed plan admits nothing here. The frame, if any, stays in its own
+    /// queue in arrival order with its bytes never read.
+    Withhold,
+    /// Pop exactly this admission.
+    Exact(DueRead),
+}
+
+/// The enforcement twin of [`ReadOutcomeStage`]: what the RECORDING says this
+/// stage's reads were for the step being replayed, and how much of that step's
+/// quota is unspent.
+///
+/// # Why it lives on the subscriber and not on the capture stage
+///
+/// Hanging the plan off [`ReadOutcomeStage`] needs the same ABI bump (the read
+/// outcome chain is in the same FFI-covered closure) and makes `armed` mean two
+/// things, one armed by the recording and one by the replay.
+#[derive(Debug)]
+pub struct ReadPlanStage {
+    /// node + `input_idx` + [`ReadStageRole`], the same key the capture twin
+    /// is enumerated by, fixed at creation.
+    key: StageKey,
+    /// The bound on one step's admissions and on the retained violation list,
+    /// the SAME number the capture twin derives, so a step whose plan names
+    /// more reads than the recording's own stage could hold is refusable
+    /// rather than silently truncated.
+    rim: u32,
+    /// Why this stage can never be gated, from wiring facts (see
+    /// [`GateBlocker`]). `None` on a gateable stage.
+    blocker: Option<GateBlocker>,
+    /// False until `arm` names this key. An unarmed stage is UNGATED for the
+    /// whole run.
+    armed: AtomicBool,
+    /// The step the RUNTIME is executing, written once per step by
+    /// `GraphRuntime::step_live` through the clone every plan stage shares.
+    ///
+    /// The consult reads it rather than taking a step argument because the
+    /// drain sites it is called from do not carry one: a subscriber knows its
+    /// queue and nothing about the schedule. One shared cell is also what makes
+    /// the stale check a single integer compare instead of a per-site
+    /// parameter thread.
+    now_step: Arc<AtomicU64>,
+    /// Uncontended, replay only, and mirroring [`ReadOutcomeStage`]'s own
+    /// interior mutability for the same reason: `drain_samples` takes `&self`.
+    inner: Mutex<PlanInner>,
+}
+
+/// One gated stage's mutable half.
+#[derive(Debug, Default)]
+struct PlanInner {
+    /// The step this quota belongs to.
+    step: u64,
+    /// A step with no install is a ZERO quota, not a stale one.
+    installed: bool,
+    /// This step's reads at this stage, in RECORDED ORDER, runs expanded.
+    /// Retained across steps (cleared and refilled), so a gated steady state
+    /// allocates nothing.
+    due: Vec<DueRead>,
+    /// The next unspent [`DueRead`].
+    cursor: usize,
+    /// Frames admitted at this stage this step.
+    admitted_this_step: u32,
+    /// Frames admitted over the run: a MONOTONE witness, never reset.
+    lifetime_admitted: u64,
+    /// Pops the gate refused over the run: the other monotone witness, and the
+    /// one the refill classifier reads to tell an enforced empty from an empty
+    /// queue.
+    lifetime_held: u64,
+    /// Retained divergences, bounded by [`ReadPlanStage::rim`].
+    violations: Vec<ReplayReadViolation>,
+    /// Divergences the rim dropped. Nonzero means the report is INCOMPLETE,
+    /// which the engine turns into a refusal rather than a silent truncation.
+    violations_dropped: u64,
+    /// Consults that found a plan installed for a DIFFERENT step. A harness
+    /// fault, counted here and never carried in the violation list, because a
+    /// candidate divergence and an install bug are two report classes.
+    mismatches: u64,
+    /// Set when the mutex was found poisoned. The stage then refuses every
+    /// later admission instead of falling back to a live pop.
+    unusable: bool,
+}
+
+impl ReadPlanStage {
+    /// A DISARMED plan stage for `key` at `rim`, sharing the runtime's step
+    /// cell. `pub(crate)` with the other mutators, the same rule
+    /// [`ReadOutcomeStage::new`] states: the stage's lifecycle is owned by the
+    /// runtime wiring, and only the POD types and the read-side accessors are
+    /// crate-external surface.
+    ///
+    /// The rim is PASSED here rather than derived, because the caller derives
+    /// it ONCE per edge through [`derive_stage_capacity`] and hands the same
+    /// number to both twins: deriving it twice would let the plan and the
+    /// capture disagree about a rim that is the same edge's.
+    pub(crate) fn new(
+        key: StageKey,
+        rim: u32,
+        blocker: Option<GateBlocker>,
+        now_step: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            key,
+            rim,
+            blocker,
+            armed: AtomicBool::new(false),
+            now_step,
+            inner: Mutex::new(PlanInner::default()),
+        }
+    }
+
+    /// This stage's key.
+    #[must_use]
+    pub fn key(&self) -> &StageKey {
+        &self.key
+    }
+
+    /// The bound on one step's admissions and on the retained violation list.
+    #[must_use]
+    pub fn rim(&self) -> u32 {
+        self.rim
+    }
+
+    /// Can this edge be gated, and why not. Read BEFORE step 0.
+    #[must_use]
+    pub fn capability(&self) -> ReadEdgeCapability {
+        let reason = self.wiring_refusal();
+        ReadEdgeCapability {
+            key: self.key.clone(),
+            enforceable: reason.is_none(),
+            reason,
+        }
+    }
+
+    /// Arm the gate. An unarmed stage is UNGATED for the whole run.
+    pub(crate) fn arm(&self) -> Result<(), ReadPlanRefusal> {
+        if let Some(reason) = self.wiring_refusal() {
+            return Err(reason);
+        }
+        self.armed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Disarm the gate (the `clear_replay_fire_plan` twin's per-stage half).
+    /// The step's quota goes with it, so a re-arm cannot spend a retired one.
+    pub(crate) fn disarm(&self) {
+        self.armed.store(false, Ordering::Release);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.installed = false;
+            inner.due.clear();
+            inner.cursor = 0;
+            inner.admitted_this_step = 0;
+        }
+    }
+
+    /// Is the gate armed (Principle #3; false on a virgin runtime).
+    #[inline]
+    #[must_use]
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
+    /// Write this step's quota, retiring the previous step's wholesale.
+    ///
+    /// `Err(())` when `due` is longer than the rim: a step whose plan names
+    /// more reads than the recording's own stage could hold is proof the log is
+    /// foreign or truncated, and the caller turns it into a named install
+    /// error.
+    pub(crate) fn install_step(&self, step: u64, due: &[DueRead]) -> Result<(), RimExceeded> {
+        if due.len() as u64 > u64::from(self.rim) {
+            return Err(RimExceeded {
+                named: due.len(),
+                rim: self.rim,
+            });
+        }
+        let mut inner = self.lock_plan()?;
+        inner.step = step;
+        inner.installed = true;
+        inner.due.clear();
+        inner.due.extend_from_slice(due);
+        inner.cursor = 0;
+        inner.admitted_this_step = 0;
+        Ok(())
+    }
+
+    /// One consult: take `due[cursor]` AS IT STANDS and advance.
+    ///
+    /// It never scans forward past an entry a drain can spend. That is what
+    /// makes the recorded order load bearing: a step whose first recorded read
+    /// at this stage served nothing admits nothing at the first consult even
+    /// with a frame queued, and the second consult gets the second recorded
+    /// read.
+    ///
+    /// The ONE entry the cursor walks past without answering is
+    /// [`DueShape::ServedWithoutPop`]: that recorded read reached its consumer
+    /// without a dequeue, so no drain consults for it and it occupies no
+    /// position in this gate's pop stream. Withholding at it would hold back
+    /// the frame the recording served, and the divergence would then reach a
+    /// verdict as a byte difference charged to the candidate.
+    #[inline(never)]
+    pub(crate) fn admit(&self) -> GateAnswer {
+        let now = self.now_step.load(Ordering::Acquire);
+        let Ok(mut inner) = self.lock_plan() else {
+            return GateAnswer::Withhold;
+        };
+        // The NOT-INSTALLED test comes FIRST, and the order is load bearing. An
+        // armed stage the step's install omitted has a ZERO quota for that step;
+        // it remembers whatever step number its last install carried, so a step
+        // compare placed ahead of this arm would report every omitted edge as a
+        // STALE PLAN, which is a harness fault and not the declaration ruling 5
+        // makes it. A stale plan is only meaningful while one IS installed.
+        if !inner.installed {
+            inner.lifetime_held = inner.lifetime_held.saturating_add(1);
+            return GateAnswer::Withhold;
+        }
+        if inner.step != now {
+            inner.mismatches = inner.mismatches.saturating_add(1);
+            return GateAnswer::Withhold;
+        }
+        loop {
+            let Some(due) = inner.due.get(inner.cursor).copied() else {
+                inner.lifetime_held = inner.lifetime_held.saturating_add(1);
+                return GateAnswer::Withhold;
+            };
+            inner.cursor += 1;
+            match due.shape() {
+                // Transparent: the recorded read served its frame without a
+                // dequeue, so this consult belongs to the next entry.
+                DueShape::ServedWithoutPop => continue,
+                DueShape::Nothing => {
+                    inner.lifetime_held = inner.lifetime_held.saturating_add(1);
+                    return GateAnswer::Withhold;
+                }
+                DueShape::Pops { pops, .. } => {
+                    inner.lifetime_admitted =
+                        inner.lifetime_admitted.saturating_add(u64::from(pops));
+                    inner.admitted_this_step = inner.admitted_this_step.saturating_add(pops);
+                    return GateAnswer::Exact(due);
+                }
+            }
+        }
+    }
+
+    /// Compare what the drain DID against the admission it was granted.
+    ///
+    /// `delivered` is the drain's own pop count, which is the same quantity
+    /// [`StagedReadOutcome::popped`] carries: a malformed frame is popped off
+    /// the queue and skipped, and neither side counts it. `surviving_seq` is
+    /// the wire sequence of the frame the drain kept.
+    ///
+    /// The enforcement never fabricates a frame, so this leaves the drain's own
+    /// answer alone and only mints.
+    #[inline(never)]
+    pub(crate) fn settle(&self, granted: DueRead, delivered: u64, surviving_seq: Option<u32>) {
+        let step = self.now_step.load(Ordering::Acquire);
+        let expected = granted.pop_count();
+        let delivered_u32 = u32::try_from(delivered).unwrap_or(u32::MAX);
+        if delivered_u32 != expected {
+            self.mint(
+                step,
+                ReplayReadViolationKind::PoppedShortfall {
+                    expected,
+                    admitted: delivered_u32,
+                },
+            );
+        }
+        // A DECIMATED record's served sequence names the last ACCEPTED sequence
+        // and not what this read popped, so its count is compared and its
+        // identity is not.
+        let identity_unstated = matches!(
+            granted.shape(),
+            DueShape::Pops {
+                identity_unstated: true,
+                ..
+            }
+        );
+        if !identity_unstated && surviving_seq != granted.served_seq() {
+            self.mint(
+                step,
+                ReplayReadViolationKind::SequenceMismatch {
+                    expected: granted.served_seq(),
+                    observed: surviving_seq,
+                },
+            );
+        }
+    }
+
+    /// End of step: turn every unspent [`DueShape::Pops`] admission into a
+    /// [`ReplayReadViolationKind::NeverArrived`], then retire the step.
+    ///
+    /// A leftover on either POP LESS shape mints nothing and is discarded: a
+    /// [`DueShape::Nothing`] entry declares a read that consumed nothing, and a
+    /// [`DueShape::ServedWithoutPop`] entry declares one served elsewhere, so a
+    /// drain that never ran owes nothing for either. An edge whose producer
+    /// sits in a LATER level legitimately reads next step, and its recorded
+    /// quota for this step is then empty.
+    #[inline(never)]
+    pub(crate) fn sweep(&self, step: u64) {
+        let Ok(mut inner) = self.lock_plan() else {
+            return;
+        };
+        if inner.installed && inner.step == step {
+            let rim = self.rim as usize;
+            let key = &self.key;
+            // Destructured so the unspent slice and the violation list are two
+            // disjoint borrows of one guard; `&mut *inner` would otherwise hold
+            // the whole struct for the walk.
+            let PlanInner {
+                due,
+                cursor,
+                violations,
+                violations_dropped,
+                ..
+            } = &mut *inner;
+            for unspent in &due[(*cursor).min(due.len())..] {
+                if unspent.pop_count() == 0 {
+                    continue;
+                }
+                if violations.len() >= rim {
+                    *violations_dropped = violations_dropped.saturating_add(1);
+                    continue;
+                }
+                violations.push(ReplayReadViolation {
+                    key: key.clone(),
+                    step,
+                    kind: ReplayReadViolationKind::NeverArrived {
+                        sequence: unspent.served_seq(),
+                    },
+                });
+            }
+        }
+        // Retire the step. An install is what DECLARES a step's quota, so a
+        // step the engine installs nothing for reads nothing rather than
+        // spending the previous step's.
+        inner.installed = false;
+        inner.due.clear();
+        inner.cursor = 0;
+        inner.admitted_this_step = 0;
+    }
+
+    /// Drain the retained divergences, so nothing accumulates across the
+    /// engine's step loop.
+    pub(crate) fn take_violations(&self) -> Vec<ReplayReadViolation> {
+        match self.lock_plan() {
+            Ok(mut inner) => std::mem::take(&mut inner.violations),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Frames admitted over the run (a monotone witness).
+    #[must_use]
+    pub fn admitted(&self) -> u64 {
+        self.lock_plan().map_or(0, |i| i.lifetime_admitted)
+    }
+
+    /// Pops the gate refused over the run (a monotone witness).
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        self.lock_plan().map_or(0, |i| i.lifetime_held)
+    }
+
+    /// Frames admitted at this stage in the step currently installed.
+    #[must_use]
+    pub fn admitted_this_step(&self) -> u32 {
+        self.lock_plan().map_or(0, |i| i.admitted_this_step)
+    }
+
+    /// Consults that found a plan installed for a DIFFERENT step (a harness
+    /// fault, never a candidate divergence).
+    #[must_use]
+    pub fn mismatches(&self) -> u64 {
+        self.lock_plan().map_or(0, |i| i.mismatches)
+    }
+
+    /// Divergences the rim dropped. Nonzero means the report is incomplete.
+    #[must_use]
+    pub fn violations_dropped(&self) -> u64 {
+        self.lock_plan().map_or(0, |i| i.violations_dropped)
+    }
+
+    /// The wiring refusal, or the poison one, or none.
+    fn wiring_refusal(&self) -> Option<ReadPlanRefusal> {
+        match self.blocker {
+            Some(GateBlocker::PerSetSyncEdge) => {
+                return Some(ReadPlanRefusal::PerSetSyncEdge(self.key.clone()))
+            }
+            Some(GateBlocker::MultiPublisherEdge) => {
+                return Some(ReadPlanRefusal::MultiPublisherEdge(self.key.clone()))
+            }
+            None => {}
+        }
+        match self.lock_plan() {
+            Ok(inner) if inner.unusable => Some(ReadPlanRefusal::GateUnusable(self.key.clone())),
+            Ok(_) => None,
+            Err(_) => Some(ReadPlanRefusal::GateUnusable(self.key.clone())),
+        }
+    }
+
+    /// Retain one divergence, or count it against the rim.
+    fn mint(&self, step: u64, kind: ReplayReadViolationKind) {
+        let rim = self.rim as usize;
+        let Ok(mut inner) = self.lock_plan() else {
+            return;
+        };
+        if inner.violations.len() >= rim {
+            inner.violations_dropped = inner.violations_dropped.saturating_add(1);
+            return;
+        }
+        inner.violations.push(ReplayReadViolation {
+            key: self.key.clone(),
+            step,
+            kind,
+        });
+    }
+
+    /// The uncontended lock, poison-INTOLERANT, the one place this type
+    /// departs from its capture twin.
+    ///
+    /// [`ReadOutcomeStage::lock_inner`] recovers a poisoned lock because a
+    /// capture stage is a diagnostic plane whose records are POD and
+    /// structurally valid whatever the panicking thread was doing. A gate is
+    /// not a diagnostic plane: it DECIDES whether a frame leaves a queue, and a
+    /// cursor a panic left mid-advance would admit a read the recording did not
+    /// hold. So the poison latches, `wiring_refusal` reports
+    /// [`ReadPlanRefusal::GateUnusable`], and every later consult withholds.
+    fn lock_plan(&self) -> Result<std::sync::MutexGuard<'_, PlanInner>, GatePoisoned> {
+        match self.inner.lock() {
+            Ok(g) => Ok(g),
+            Err(poisoned) => {
+                let mut g = poisoned.into_inner();
+                g.unusable = true;
+                Err(GatePoisoned)
+            }
+        }
+    }
+}
+
+/// A step plan naming more reads than the stage's rim can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RimExceeded {
+    /// How many reads the step named.
+    pub named: usize,
+    /// The stage's rim.
+    pub rim: u32,
+}
+
+/// The gate's mutex was poisoned by a panic. Carries no data: the ONE answer
+/// every caller gives is to withhold, and the reason reaches an operator
+/// through [`ReadPlanRefusal::GateUnusable`] in the census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatePoisoned;
+
+impl From<GatePoisoned> for RimExceeded {
+    /// A poisoned gate cannot accept an install either, and the install site
+    /// has exactly one error type. The rim is reported as the stage's own with
+    /// `named` at 0, so the message never claims a count the caller did not
+    /// pass.
+    fn from(_: GatePoisoned) -> Self {
+        Self { named: 0, rim: 0 }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // This module's half of the ABI LAYOUT PIN (see `crate::abi_layout`).
 //
@@ -1950,6 +2751,49 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
         abi_pin_enum!(ReadOutcomeKind { ReadOutcomeKind::Served, ReadOutcomeKind::Held, ReadOutcomeKind::NoFrame, ReadOutcomeKind::DrainedBatch, ReadOutcomeKind::Decimated, ReadOutcomeKind::Truncated, ReadOutcomeKind::Producer }),
         abi_pin_enum!(ReadSiteRole { ReadSiteRole::Unstamped, ReadSiteRole::Drain, ReadSiteRole::Body, ReadSiteRole::Peek }),
         abi_pin_enum!(ReadStageRole { ReadStageRole::Body, ReadStageRole::Drain }),
+        // ABI v23: the ENFORCEMENT side. The subscriber owns a
+        // `ReadPlanStage` through a crate-owned `Arc`, which `abi_layout`'s
+        // covered closure reaches, so the plan's own chain is pinned on the
+        // same rule the capture chain above is: the records a cdylib's code can
+        // index are pinned by FIELD SET and by offset, and the stage that holds
+        // them by field set alone (it embeds a `std::sync::Mutex`).
+        abi_pin_struct!(ReadPlanStage {
+            key,
+            rim,
+            blocker,
+            armed,
+            now_step,
+            inner
+        }),
+        abi_pin_struct!(PlanInner {
+            step,
+            installed,
+            due,
+            cursor,
+            admitted_this_step,
+            lifetime_admitted,
+            lifetime_held,
+            violations,
+            violations_dropped,
+            mismatches,
+            unusable
+        }),
+        abi_pin_struct!(DueRead { shape, served_seq }),
+        abi_pin_enum!(DueShape {
+            DueShape::Pops { .. },
+            DueShape::Nothing,
+            DueShape::ServedWithoutPop
+        }),
+        abi_pin_struct!(ReplayReadViolation { key, step, kind }),
+        abi_pin_enum!(ReplayReadViolationKind {
+            ReplayReadViolationKind::NeverArrived { .. },
+            ReplayReadViolationKind::PoppedShortfall { .. },
+            ReplayReadViolationKind::SequenceMismatch { .. }
+        }),
+        abi_pin_enum!(GateBlocker {
+            GateBlocker::PerSetSyncEdge,
+            GateBlocker::MultiPublisherEdge
+        }),
     ]
 }
 

@@ -660,7 +660,22 @@ pub mod wire;
 ///   `cerulion_node_pump_history` bump established for a missing symbol.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 22;
+/// - v23: `CerulionSubscriber` carries one more field,
+///   `replay_plan: Option<Arc<read_outcome::ReadPlanStage>>`, the REPLAY read
+///   gate for this input's stage, installed at graph wiring time and armed only
+///   by a replay. The field sits at the end of the struct, so every field
+///   before it keeps its offset and every field after it has none; that is not
+///   an additive change, because `NodeContext` owns this struct through
+///   `AnySubscriber` and a v22 cdylib would index the struct at stale offsets.
+///   The plan's own chain (`ReadPlanStage`, `PlanInner`, `DueRead`,
+///   `ReplayReadViolation` and its kind) is reached through a crate-owned
+///   `Arc` from that field, so those rows enter the `abi_layout` table at this
+///   version too. `Scheduler::set_trigger_refill`'s closure return widens from
+///   `(u64, Option<u64>)` to `RefillOutcome`, which is host-side only: the
+///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 23;
 
 // Re-export commonly used types
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};
@@ -679,8 +694,8 @@ pub use message::ShmMessage;
 pub use monitor_wait::MonitorWaitPolicy;
 pub use rustc_fingerprint::{rustc_fingerprint_cstr, RUSTC_FINGERPRINT, RUSTC_RELEASE};
 pub use scheduler::{
-    merge_partition_traces, AlignOutcome, NodeConfig, NodeHandle, ProcessTrace, Scheduler,
-    SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
+    merge_partition_traces, AlignOutcome, NodeConfig, NodeHandle, ProcessTrace, RefillEmptyCause,
+    RefillOutcome, Scheduler, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
 };
 pub use transport::bridge::{DemandSignal, TopicBridgeManager};
 pub use transport::cerulion_q::{
