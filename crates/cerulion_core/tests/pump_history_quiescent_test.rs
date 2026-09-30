@@ -267,3 +267,91 @@ fn a_net_zero_listener_swap_still_delivers_history_once_the_idle_deadline_passes
         );
     }
 }
+
+/// The idle deadline's arming is SPENDABLE at the cadence an idle loop runs.
+///
+/// The gate's promise is that a publisher with no listener transitions pays one
+/// relaxed load per call, and the deadline has to re-arm without taking that
+/// promise back. It arms a budget spent one per call, so an arming LARGER than
+/// the calls that fit in one interval is never spendable: the drain the gate
+/// exists to remove runs on every call for the life of the process, and every
+/// arm in this file still passes, because they all assert that history IS
+/// delivered.
+///
+/// A quarter second interval against a 20ms pump is about twelve calls, and
+/// against a 100ms live step about two, so the count change's budget of 64
+/// cannot be reused here. The deadline arms its own small one, and since the
+/// slower cadence is the harder case, both are driven.
+///
+/// Deterministic, with no sleeping: `pump_history_at` takes the instant, so the
+/// cadence is dialled rather than waited for. The count change's larger budget
+/// is spent first (no subscriber ever attaches, so nothing zeroes it early),
+/// then the arm walks past many deadlines and counts the passes that find the
+/// arming spent against what the intervals allow.
+#[test]
+fn the_idle_deadline_arming_is_spendable_at_an_idle_loops_cadence() {
+    // TWO cadences, because spendability gets HARDER as the cadence slows: the
+    // arming is spendable only where more calls than it fall inside one deadline
+    // interval. 20ms is the rmw pump's throttle, about twelve passes per quarter
+    // second interval. 100ms is a slow live step, about two. A budget that only
+    // cleared the first would leave a slow graph permanently armed, which is the
+    // defect this arm exists for.
+    for step_ms in [20_u64, 100] {
+        let topic = unique_topic(&format!("idle_arming_{step_ms}"));
+        let tt = cerulion_core::testing::TestTransport::with_buffer_size(8);
+        let mut publisher = tt.publisher(&topic, MaxSliceLen::const_new(256), 3);
+        let step = Duration::from_millis(step_ms);
+        let t0 = std::time::Instant::now();
+        // 400 passes: eight seconds of dialled time at 20ms, forty at 100ms, so
+        // both walk past many deadlines.
+        let passes = 400_u32;
+
+        let mut zeroed_at = None;
+        let mut zero_passes = 0_u32;
+        for i in 0..passes {
+            publisher.pump_history_at(t0 + step * i);
+            if publisher.self_drains_armed_for_test() == 0 {
+                zero_passes += 1;
+                if zeroed_at.is_none() {
+                    zeroed_at = Some(i);
+                }
+            }
+        }
+
+        let first = zeroed_at.unwrap_or_else(|| {
+            panic!(
+                "at one pass every {step_ms}ms the arming was NEVER spent down to \
+                 zero across {passes} passes: the deadline is re-arming more calls \
+                 than fit in its own interval, so the listener drain this gate \
+                 exists to remove runs on every pass forever"
+            )
+        });
+        // DERIVED, and derived as a RANGE because the cadence moves it by one: the
+        // count change arms 64 on the first pass, which spends one, so 63 passes
+        // of spending remain. A deadline landing on the pass where one is left
+        // takes the arming back to two and adds a pass, and where deadlines land
+        // depends on the step. Measured: 63 at 20ms, 64 at 100ms.
+        //
+        // The range is what makes this fail if the count change's own budget is
+        // shrunk, which a "greater than one" assertion would not.
+        assert!(
+            (63..=65).contains(&first),
+            "at one pass every {step_ms}ms the arming first read zero on pass \
+             {first}, outside 63 to 65: the count change's budget of 64, spent one \
+             per pass from the pass that armed it, is what fixes that number"
+        );
+        // DERIVED: after those 64 are spent, each interval re-arms the small budget
+        // and spends it in that interval's first calls, so the non-zero passes are
+        // 63 plus about one per interval. Four passes of slack for where the
+        // interval boundary falls.
+        let intervals = (passes * step_ms as u32).div_ceil(250);
+        let floor = passes - 63 - intervals - 4;
+        assert!(
+            zero_passes >= floor,
+            "at one pass every {step_ms}ms only {zero_passes} of {passes} passes \
+             found the arming spent, under the {floor} that {intervals} intervals \
+             allow: the steady state of a publisher with no listener transitions \
+             is the cheap load, not the drain"
+        );
+    }
+}

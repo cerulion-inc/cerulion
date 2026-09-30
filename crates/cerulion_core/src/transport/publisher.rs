@@ -104,6 +104,9 @@ const SELF_DRAIN_ARMED_CALLS: u8 = 64;
 
 /// How long a quiescent publisher may go without re-arming its self drain.
 ///
+/// The call budget it arms is [`SELF_DRAIN_IDLE_CALLS`], not the count change's
+/// larger one, for the reason recorded there.
+///
 /// The call budget above is edge triggered on a listener COUNT, which is not
 /// monotonic: a subscriber leaving while another joins reads as no change, and
 /// the arming never fires. It is also spent in CALLS, so 64 idle passes can
@@ -113,11 +116,43 @@ const SELF_DRAIN_ARMED_CALLS: u8 = 64;
 ///
 /// The repair is a deadline, and it is deliberately NOT on the publish path:
 /// the defect only exists while nothing publishes, so the wake has to come from
-/// whatever runs when nothing publishes. `pump_history` is that caller, driven
-/// once per `live_step`, and it is the only place this deadline is read. A
-/// clock read per loan would be a cost on the measured hot path buying nothing,
-/// since a publishing publisher already re-arms on its own events.
+/// whatever runs when nothing publishes. `pump_history` is that caller: the
+/// graph runtime drives it once per `live_step`, and the rmw runtime drives it
+/// from `rmw_wait`'s throttled pump. It is the only place this deadline is
+/// read. A clock read per loan would be a cost on the measured hot path buying
+/// nothing, because a publisher that keeps sending has its late joiners
+/// serviced by iceoryx2 itself: `send_sample` calls `update_connections`, which
+/// delivers the retained history to every newly connected subscriber.
 const SELF_DRAIN_IDLE_REARM: Duration = Duration::from_millis(250);
+
+/// The number of drains the idle deadline arms, where a listener COUNT change
+/// arms [`SELF_DRAIN_ARMED_CALLS`].
+///
+/// The two numbers answer different questions and the count's cannot be reused
+/// here. A count change arms 64 because the count rises when a subscriber's
+/// listener is created and the `SubscriberConnected` notify lands after it, so
+/// the arming has to outlive that gap without knowing how long it is. The
+/// deadline knows: it repeats, so the SECOND call covers that same gap one pass
+/// later, and a connect still missed is picked up at the next interval.
+///
+/// Reusing 64 here did not merely overpay, it disarmed the gate. The budget is
+/// spent one per call, so a caller slower than `SELF_DRAIN_ARMED_CALLS` per
+/// `SELF_DRAIN_IDLE_REARM`, which is every cadence below about 256 Hz, is
+/// re-armed before it can ever spend down to zero: a 100 Hz live step spends 25
+/// of 64 per window and the drain this gate exists to remove runs on every
+/// publish forever.
+///
+/// Two is spendable wherever at least two passes fall inside one interval, which
+/// is every cadence above about 8 Hz. Slower than that each pass re-arms and the
+/// gate stays armed, which is the pre-existing behaviour and costs a drain per
+/// pass at a few passes a second.
+///
+/// The trade this makes: a connect landing just after an interval's two calls are
+/// spent waits for the next deadline, so the worst case for a joiner the COUNT
+/// never moved for goes from one idle pass, which is what a permanently armed
+/// gate gave, to one `SELF_DRAIN_IDLE_REARM` plus a pass. An ordinary late joiner
+/// is untouched, because the count moves and arms 64.
+const SELF_DRAIN_IDLE_CALLS: u8 = 2;
 
 /// Zero-copy publisher for a single topic.
 ///
@@ -2265,6 +2300,16 @@ impl CerulionPublisher {
     /// Public for transport integrators: the service layer and the
     /// rmw bridge publish via `publish_raw` / `send_raw_loan` + notify and
     /// must drain their own listener to service late joiners.
+    ///
+    /// This is the PUBLISH-path drain, and it belongs beside a send. A caller
+    /// on a CADENCE, one that drains without sending, must call
+    /// [`Self::pump_history_at`] instead: the gate below is edge triggered on
+    /// the listener count and spent in calls, so a detach plus a replacement
+    /// attach that restores the count arms nothing and a spent budget drains
+    /// nothing. Beside a send that gap is closed by iceoryx2 itself
+    /// (`send_sample` calls `update_connections`, which delivers retained
+    /// history to every newly connected subscriber); on a cadence nothing
+    /// closes it but the deadline `pump_history_at` carries.
     pub fn check_subscriber_events(&mut self) {
         // iceoryx2 0.10: gate the drain on the topic's LIVE listener count.
         //
@@ -2365,7 +2410,9 @@ impl CerulionPublisher {
         match self.next_self_drain_rearm {
             Some(due) if now < due => {}
             _ => {
-                self.self_drains_armed = SELF_DRAIN_ARMED_CALLS;
+                // `max`, so a count change's larger arming is never cut short by
+                // an idle pass that happens to land inside it.
+                self.self_drains_armed = self.self_drains_armed.max(SELF_DRAIN_IDLE_CALLS);
                 self.next_self_drain_rearm = Some(now + SELF_DRAIN_IDLE_REARM);
             }
         }
@@ -2380,6 +2427,15 @@ impl CerulionPublisher {
     pub fn pump_history_past_the_idle_deadline_for_test(&mut self) {
         self.next_self_drain_rearm = None;
         self.pump_history();
+    }
+
+    /// Test seam: the listener count the gate last RECORDED, which is what it
+    /// compares a live count against. A stage that means to hold the count still
+    /// has to assert against this and not against a second live read, which
+    /// would compare two reads of the same thing.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn last_listener_count_for_test(&self) -> usize {
+        self.last_listener_count
     }
 
     /// Test seam: the armed self drain count, so an arm can show the budget
