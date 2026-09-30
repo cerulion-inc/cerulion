@@ -2514,7 +2514,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// checks — the DESIGNED protection, not a silent overlap. Only the
 /// deployment's INFRA stays run-scoped elsewhere: the barrier (`cerdep_*` POSIX
 /// SHM), the trace rings (`cer_rec_*`/`cer_rg_*` POSIX SHM), the doorbells
-/// (`cer_db_*`, already `$USER`-scoped through the namespace they hash), and
+/// (`cer_db_*`, already `$USER`-scoped through their namespace), and
 /// the supervisor's
 /// `cer_p_{hex}` PLANNING namespace (see [`planning_ix_config`]).
 pub fn mint_deployment_ix_config(

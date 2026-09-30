@@ -2040,30 +2040,6 @@ fn set_nonblocking(raw: std::os::unix::io::RawFd, node_id: &Arc<str>) -> bool {
 /// recheck — the timer backstop bounds it to ≤recheck, the same discipline as an
 /// ignored listener `try_wait_one` error; it is never mistaken for a wake and
 /// never panics.
-/// Does the DOORBELL rung of the park's `!performed` arm apply at all?
-///
-/// Every term is a separate reason for the rung to decline, and the caller maps
-/// a `false` here to `AddrParkOutcome::Unavailable`:
-/// - the policy did not arm the doorbell, so the producer never rings;
-/// - this host has no wake word a consumer can kernel-block on;
-/// - the graph has no doorbell registry, so no page is mapped;
-/// - no baseline snapshot was taken, so a ring cannot be re-derived;
-/// - the registry is empty, so there is no primary line to watch.
-///
-/// Pure and compiled on every OS so the table is pinned where the rung itself is
-/// not built: on a target where the rung is compiled out, a term deleted here is
-/// invisible to every macOS test that could have caught it.
-#[cfg(any(target_os = "macos", test))]
-fn doorbell_rung_applies(
-    policy_doorbell: bool,
-    wake_word_available: bool,
-    has_registry: bool,
-    has_baseline: bool,
-    has_primary: bool,
-) -> bool {
-    policy_doorbell && wake_word_available && has_registry && has_baseline && has_primary
-}
-
 fn park_poll_fd_ready(raw: std::os::unix::io::RawFd) -> bool {
     let mut pfd = libc::pollfd {
         fd: raw,
@@ -2079,6 +2055,30 @@ fn park_poll_fd_ready(raw: std::os::unix::io::RawFd) -> bool {
         return false;
     }
     pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+}
+
+/// Does the DOORBELL rung of the park's `!performed` arm apply at all?
+///
+/// Every term is a separate reason for the rung to decline, and the caller maps
+/// a `false` here to `AddrParkOutcome::Unavailable`:
+/// - the policy did not arm the doorbell, so the producer never rings;
+/// - this host has no wake word a consumer can kernel-block on;
+/// - the graph has no doorbell registry, so no page is mapped;
+/// - no baseline snapshot was taken, so a ring cannot be re-derived;
+/// - the registry is empty, so there is no primary line to watch.
+///
+/// Pure and compiled unconditionally: the rung itself is macOS-only, so a term
+/// deleted here would otherwise be invisible to every test on every other
+/// target, and the worker's wait-policy line reads the same function on every
+/// target rather than re-typing a subset of it.
+fn doorbell_rung_applies(
+    policy_doorbell: bool,
+    wake_word_available: bool,
+    has_registry: bool,
+    has_baseline: bool,
+    has_primary: bool,
+) -> bool {
+    policy_doorbell && wake_word_available && has_registry && has_baseline && has_primary
 }
 
 /// Tier-2 in-process doorbell for a blocking-SDK source. A DETACHED
@@ -12389,13 +12389,24 @@ impl GraphRuntime {
     ) -> crate::monitor_wait::AddrParkOutcome {
         use crate::monitor_wait::AddrParkOutcome;
         let reg = self.doorbell_registry.as_ref();
+        let wake_word = crate::doorbell::wake_word_block_primitive_available();
+        let has_primary = reg.is_some_and(|r| r.primary().is_some());
         if !doorbell_rung_applies(
             self.monitor_wait_policy.doorbell(),
-            crate::doorbell::wake_word_block_primitive_available(),
+            wake_word,
             reg.is_some(),
             baseline.is_some(),
-            reg.is_some_and(|r| r.primary().is_some()),
+            has_primary,
         ) {
+            // The WAKE-WORD term is the one an operator cannot see coming: the
+            // policy armed the doorbell, this graph has a line to watch, and the
+            // tier went off anyway, which on this plane means the shared os_sync
+            // family latched after a sibling's unrecoverable errno. The gate is
+            // re-evaluated every iteration, so the wait is never reached to
+            // report it; this is the site that observes it.
+            if !wake_word && self.monitor_wait_policy.doorbell() && has_primary {
+                crate::doorbell::note_tier_inactive();
+            }
             return AddrParkOutcome::Unavailable;
         }
         let (Some(reg), Some(base)) = (reg, baseline) else {
@@ -12410,13 +12421,12 @@ impl GraphRuntime {
         // wait come off the GUARD, so the three statements cannot be written out
         // of order.
         let guard = crate::doorbell::ParkedDoorbellGuard::enter(bell);
-        let snap = guard.snapshot();
         if reg.any_advanced_since(base) {
             // A ring is already in hand: skip the block AND the nap; the loop-top
             // re-poll returns with it immediately.
             return AddrParkOutcome::RingPending;
         }
-        guard.wait(snap, cap)
+        guard.wait(cap)
     }
 
     /// The shallow monitor-wait replacement for the blocking WaitSet
@@ -13040,16 +13050,17 @@ impl GraphRuntime {
                 // a free-run rank has no barrier participant, and a credit word
                 // exists only where an input declares `block`.
                 //
-                // Tried LAST of the three because a process can block on exactly
-                // ONE address and the earlier two are PACING planes that must not
-                // be displaced: a credit-deferred producer is waiting for the peer
-                // that frees it, and a barrier participant must hear the cohort's
-                // arrival or the step-start signal collapses to the slice cadence.
-                // Only when neither applies is DATA the thing this context waits
-                // for.
+                // Tried LAST because a process can block on exactly ONE address,
+                // and the earlier two words are what THIS context is waiting for
+                // when they apply: a credit-deferred producer cannot proceed until
+                // the peer drains, and a barrier participant cannot start its step
+                // until the cohort arrives. Only when neither applies is DATA the
+                // thing this context waits for.
                 //
-                // Compiled out entirely off macOS: `wake_word_block_primitive_available`
-                // is a compile-time `false` there, and a Linux consumer wakes on
+                // Compiled out entirely off macOS:
+                // `crate::doorbell::wake_word_block_primitive_available` (not the
+                // barrier's function of the same name, which answers the opposite
+                // on Linux) is a compile-time `false` there, and a Linux consumer wakes on
                 // this very same doorbell line through the CPU monitor-wait
                 // primitive armed above - a hardware park reached on the
                 // `performed == true` path this arm never sees.
@@ -13357,18 +13368,28 @@ impl GraphRuntime {
         // surface the same fact here where the live loop actually decides how to
         // idle (the observability gap an earlier investigation fell into).
         //
-        // `data_wake` is the fact the macOS doorbell rung turns on, stated here
-        // because it is decided per process: the supervisor resolves the policy
-        // and stamps it, and the shared os_sync family can latch off in THIS
-        // process after that. Without it the run's only statement about the wake
-        // word is the CLI's resolution line, which a worker never prints.
+        // `data_wake` is the macOS doorbell rung's own gate, read through the
+        // function the rung reads, so the line cannot claim a rung that would
+        // decline (a registry built for a graph with no data-trigger topics is
+        // present but EMPTY, which the three obvious terms do not catch). Stated
+        // here because the decision is per process: the supervisor resolves the
+        // policy and stamps it, and the shared os_sync family can latch off in
+        // THIS process afterwards. Without it the run's only statement about the
+        // wake word is the CLI's resolution line, which a worker never prints.
         tracing::info!(
             graph = %self.config.identity(),
             park_active = self.park_active(),
             doorbell = self.doorbell_registry.is_some(),
-            data_wake = self.monitor_wait_policy.doorbell()
-                && self.doorbell_registry.is_some()
-                && crate::doorbell::wake_word_block_primitive_available(),
+            data_wake = doorbell_rung_applies(
+                self.monitor_wait_policy.doorbell(),
+                crate::doorbell::wake_word_block_primitive_available(),
+                self.doorbell_registry.is_some(),
+                // The baseline is taken per park entry, never here.
+                true,
+                self.doorbell_registry
+                    .as_ref()
+                    .is_some_and(|r| r.primary().is_some()),
+            ),
             barrier = self.barrier_participant.is_some(),
             credit_edges = self.credit_park_edges.len(),
             primary_topic = tracing::field::display(

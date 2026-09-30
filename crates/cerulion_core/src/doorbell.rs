@@ -61,8 +61,9 @@
 //! module only guarantees it does not make that worse.
 //!
 //! On macOS a POSIX SHM object has no filesystem path, so an orphan there is
-//! neither listable nor removable by hand the way a `/dev/shm` entry is: it is
-//! reclaimed by the next `O_CREAT` under the same name, or by a reboot.
+//! neither listable nor removable by hand the way a `/dev/shm` entry is. It is
+//! REUSED in place by the next `O_CREAT` under the same name, and its 64 bytes
+//! are freed only by an owner's `shm_unlink` or a reboot.
 //!
 //! A CONSUMER-ONLY topic (an absolute external `source:` / cross-process
 //! producer with NO in-process [`Doorbell::open_owned`] producer to
@@ -84,8 +85,9 @@
 //! # Targets
 //!
 //! - `linux`: real POSIX named SHM (`shm_open`/`mmap`/`shm_unlink` via `libc`),
-//!   rung by a plain store and heard by the CPU monitor-wait primitive
-//!   (`UMONITOR`/`WFE`) armed on the same line.
+//!   rung by one `Release` atomic increment, heard by the CPU monitor-wait
+//!   primitive (`UMONITOR`/`WFE`) armed on the same line where the CPU carries
+//!   one, and otherwise by the park's loop-top poll within one recheck.
 //! - `macos`: real POSIX named SHM too, plus a KERNEL WAKE WORD. There is no CPU
 //!   monitor-wait primitive on this target, so a plain store is heard by nobody
 //!   and a parked consumer would only re-poll at its pacing chunk. The page
@@ -125,9 +127,10 @@ use std::time::Duration;
 ///   (an `ls /dev/shm` names the deployment).
 /// - **non-linux (macos)**, [`doorbell_shm_name_compact`]:
 ///   `/cer_db_<fnv1a64(ns 0x1f topic):016x>`, 24 chars. macOS caps POSIX SHM
-///   names at 31 chars (`PSHMNAMLEN`, the leading slash included) and a `$USER`
-///   namespace alone already pushes the verbose form to the edge of it, so BOTH
-///   components are hashed into one fixed-width token.
+///   names at 31 chars (`PSHMNAMLEN`, the leading slash included), and the
+///   verbose form is `25 + len(ns)` chars, so it overruns that cap at a
+///   seven-character `$USER`. BOTH components are therefore hashed into one
+///   fixed-width token.
 ///
 /// Either shape preserves the tenant partition (a different `ns` gives a
 /// different name; the compact form separates `ns` from `topic` with a 0x1F unit
@@ -213,7 +216,7 @@ fn dedup_topics(topics: &[String]) -> Vec<String> {
 /// `"cerulion"` when `USER` is unset/empty (containers, systemd units). Both a
 /// producer ([`Doorbell::open_owned`]) and a consumer ([`DoorbellRegistry`]) in
 /// the same process derive the SAME value, so they agree on the object name
-/// [`doorbell_shm_name`] derives and map the same page. `$USER`-based (not
+/// `doorbell_shm_name` derives and map the same page. `$USER`-based (not
 /// graph-name-based) so it is also stable across a single user's processes —
 /// forward-compatible with the p4 cross-process doorbell. A different `$USER`
 /// gives a different name under either shape, which kills cross-tenant
@@ -472,10 +475,6 @@ mod imp {
         /// The name was claimed at `shm_open(O_EXCL)` and gone by the attach:
         /// its owner unlinked in between, so the name is free to create.
         RaceLostName,
-        /// A zero-length object sits under the name and nothing will ever size
-        /// it. The name is unlinked and the sequence restarts; this error is
-        /// what the caller sees if the restart fails too.
-        DeadName(io::Error),
     }
 
     /// A process-shared SHM doorbell with a kernel wake word.
@@ -524,54 +523,38 @@ mod imp {
         /// created it. A racing creator can be seen between its `shm_open` and its
         /// `ftruncate`, so an object that is still short is waited out.
         ///
-        /// TWO first-wins races are recoverable and are retried rather than
-        /// reported, because both are ordinary at a graph's startup and each
-        /// otherwise costs the whole run its data-wake path (the registry
-        /// returns the first error for every topic, and a publisher that fails
-        /// here never arms its bell again):
+        /// ONE first-wins race is recoverable and is retried rather than reported:
+        /// the name is claimed when this call sees `EEXIST` and unlinked by its
+        /// owner's `Drop` before the attach, so the attach reports `ENOENT`. It is
+        /// ordinary at a graph's startup and otherwise costs the whole run its
+        /// data-wake path, because the registry returns the first error for every
+        /// topic and a publisher that fails here never arms its bell again.
         ///
-        /// - the name is claimed when this call sees `EEXIST` and unlinked by its
-        ///   owner's `Drop` before the attach, so the attach reports `ENOENT`;
-        /// - a creator killed between its `shm_open` and its `ftruncate` leaves a
-        ///   ZERO-LENGTH object under a good name. Nothing re-sizes it, so every
-        ///   later opener would refuse that topic for the life of the machine.
-        ///   The name is unlinked and the sequence restarts, which is safe
-        ///   because a process still holding a zero-length object cannot use it.
-        ///   Pinned by `an_unsized_doorbell_object_is_healed_rather_than_wedging_the_topic`.
-        ///
-        /// The error both shapes report once the attempts are spent needs a peer
-        /// re-creating the name unsized on every pass, which no test can arrange
-        /// against a bounded loop; the reachable halves of the bound are pinned by
-        /// that test and by
-        /// `a_doorbell_object_at_exactly_one_cache_line_opens`.
+        /// An object left UNSIZED by a creator killed between its two syscalls is
+        /// not a race at all: whichever side gets there next sizes it in place.
+        /// See the sizing step in [`Doorbell::open_once`], which is why no opener
+        /// ever has to decide whether to delete a name a live peer may hold.
         fn open(ns: &str, topic: &str, owns_name: bool) -> io::Result<Self> {
             let name = CString::new(doorbell_shm_name(ns, topic))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            // One retry per recoverable race, plus the attempt that meets it.
-            // Bounded so a pathological loop reports rather than spins.
+            // One retry for the race, plus the attempt that meets it. Bounded so a
+            // pathological peer reports rather than spins.
             const OPEN_ATTEMPTS: u32 = 3;
-            let mut last = None;
+            let mut races = 0u32;
             for _ in 0..OPEN_ATTEMPTS {
                 match Self::open_once(&name, owns_name) {
                     Ok(db) => return Ok(db),
                     Err(OpenAttempt::Fatal(e)) => return Err(e),
-                    Err(OpenAttempt::RaceLostName) => continue,
-                    Err(OpenAttempt::DeadName(e)) => {
-                        // SAFETY: best-effort unlink of a name whose object is
-                        // unusable by anyone; removing it lets the next attempt
-                        // create a sized one.
-                        unsafe { libc::shm_unlink(name.as_ptr()) };
-                        last = Some(e);
-                    }
+                    Err(OpenAttempt::RaceLostName) => races += 1,
                 }
             }
-            Err(last.unwrap_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "doorbell open lost the first-wins race on every attempt (a peer is \
-                     creating and unlinking this name in a loop)",
-                )
-            }))
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "doorbell open lost the first-wins name race on all {races} attempts, so a \
+                     peer is creating and unlinking this name in a loop"
+                ),
+            ))
         }
 
         /// One pass of the first-wins open sequence. See [`Doorbell::open`] for
@@ -579,10 +562,6 @@ mod imp {
         fn open_once(name: &CString, owns_name: bool) -> Result<Self, OpenAttempt> {
             // How long to wait out a racing creator's `ftruncate`. The window is
             // two adjacent syscalls, so this is generous by orders of magnitude;
-            // it is bounded so a truly broken object reports rather than spins.
-            const SIZE_RETRIES: u32 = 100;
-            const SIZE_RETRY_SLEEP: Duration = Duration::from_micros(200);
-
             let mut created = false;
             // SAFETY: FFI to POSIX named SHM. `name` is a valid C string; mode
             // 0o600 restricts the object to the owner. `mode_t` is `u16` on macOS
@@ -597,18 +576,6 @@ mod imp {
             };
             if fd >= 0 {
                 created = true;
-                // SAFETY: size the object we just created exclusively; `fd` is
-                // the descriptor just opened.
-                if unsafe { libc::ftruncate(fd, DOORBELL_BYTES as libc::off_t) } < 0 {
-                    let err = io::Error::last_os_error();
-                    // SAFETY: `fd` is the descriptor we opened.
-                    unsafe { libc::close(fd) };
-                    // A half-made object under a good name would wedge every
-                    // later opener, so remove the name we just claimed.
-                    // SAFETY: best-effort unlink of the name THIS call created.
-                    unsafe { libc::shm_unlink(name.as_ptr()) };
-                    return Err(OpenAttempt::Fatal(err));
-                }
             } else {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() != Some(libc::EEXIST) {
@@ -628,38 +595,59 @@ mod imp {
                 }
             }
 
-            if !created {
-                // Wait out the creator's `ftruncate`. Mapping a short object is
-                // refused by macOS with an errno that names nothing, so the size is
-                // checked here, where the error can say what it found.
-                let mut ok = false;
-                for _ in 0..SIZE_RETRIES {
-                    // SAFETY: `st` is zeroed first so a failed `fstat` leaves no
-                    // uninitialised read; `fstat` fills it on success.
-                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                    // SAFETY: FFI fstat on the descriptor we hold.
-                    if unsafe { libc::fstat(fd, &mut st) } < 0 {
-                        let err = io::Error::last_os_error();
-                        // SAFETY: `fd` is the descriptor we opened.
-                        unsafe { libc::close(fd) };
-                        return Err(OpenAttempt::Fatal(err));
-                    }
-                    if st.st_size >= DOORBELL_BYTES as libc::off_t {
-                        ok = true;
-                        break;
-                    }
-                    std::thread::sleep(SIZE_RETRY_SLEEP);
+            // Size the object, whether this call created it or attached to it.
+            //
+            // MEASURED on macOS: a POSIX SHM object accepts its FIRST `ftruncate`
+            // from ANY descriptor, and refuses every later one with `EINVAL`. So
+            // both sides can ask, exactly one wins, and both end on the same page.
+            // That is what makes a creator killed between its `shm_open` and its
+            // `ftruncate` harmless: nothing else would ever size the object it
+            // left, and the next opener sizes it in place rather than having to
+            // decide whether to delete a name a live peer may still be holding.
+            // A wait-and-see loop was the alternative and it cannot work, because
+            // `fstat` on a POSIX SHM object reports every timestamp as zero on this
+            // target, so a dead orphan and a descheduled creator are
+            // indistinguishable.
+            //
+            // `EINVAL` here means somebody sized it first, which is the outcome
+            // this wants; the check below reads the size rather than the rc.
+            // SAFETY: FFI ftruncate on the descriptor this call holds.
+            unsafe { libc::ftruncate(fd, DOORBELL_BYTES as libc::off_t) };
+            // SAFETY: `st` is zeroed first so a failed `fstat` leaves no
+            // uninitialised read; `fstat` fills it on success.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: FFI fstat on the descriptor this call holds.
+            if unsafe { libc::fstat(fd, &mut st) } < 0 {
+                let err = io::Error::last_os_error();
+                // SAFETY: `fd` is the descriptor we opened.
+                unsafe { libc::close(fd) };
+                if created {
+                    // SAFETY: best-effort unlink of the name THIS call created; a
+                    // failed create must not orphan a named segment.
+                    unsafe { libc::shm_unlink(name.as_ptr()) };
                 }
-                if !ok {
-                    // SAFETY: `fd` is the descriptor we opened.
-                    unsafe { libc::close(fd) };
-                    return Err(OpenAttempt::DeadName(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "doorbell segment stayed shorter than one cache line on every \
-                         attempt; the dead name was unlinked each time, so a peer is \
-                         re-creating it unsized in a loop",
-                    )));
+                return Err(OpenAttempt::Fatal(err));
+            }
+            if st.st_size < DOORBELL_BYTES as libc::off_t {
+                // Neither side could size it. Mapping a short object is refused
+                // with an errno that names nothing, so the refusal is made here
+                // where it can say what it found; the caller warns and the park
+                // keeps its recheck timer.
+                // SAFETY: `fd` is the descriptor we opened.
+                unsafe { libc::close(fd) };
+                if created {
+                    // SAFETY: best-effort unlink of the name THIS call created.
+                    unsafe { libc::shm_unlink(name.as_ptr()) };
                 }
+                return Err(OpenAttempt::Fatal(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the object under this doorbell name is {} bytes, short of the one \
+                         cache line the page needs, and neither this process nor its peer \
+                         could size it",
+                        st.st_size
+                    ),
+                )));
             }
 
             // SAFETY: map the shared page read/write. `MAP_SHARED` is what makes a
@@ -714,9 +702,12 @@ mod imp {
         ///
         /// # Cost on the publish path
         ///
-        /// Two `Release` stores into one cache line, a `SeqCst` fence, and a
-        /// `Relaxed` load. The fence is a store-buffer drain (`dmb ish` on this
-        /// target, tens of cycles when the buffer is dirty) and it is the
+        /// Two `Release` atomic increments into one cache line, a `SeqCst` fence,
+        /// and a `Relaxed` load. On the arm where the wake syscall itself fails
+        /// with something unexpected, add an errno read, a mutex acquisition and
+        /// one log event; the errnos a healthy run produces return before any of
+        /// that. The fence is a store-buffer drain (`dmb ish` on this
+        /// target) and it is the
         /// RINGER's half of the store-buffer litmus pair: ringer = {bump the
         /// epoch; load `parked`}, parker = {claim `parked`; re-derive the ring
         /// delta}, each with a `SeqCst` fence between its store and its load.
@@ -753,9 +744,25 @@ mod imp {
         /// The rc is CLASSIFIED rather than discarded. A host whose wake is
         /// refused while its wait works leaves every consumer blocked for the
         /// whole cap and woken by nothing, and the producer is the only process
-        /// that can see the errno: an unrecoverable one latches the family so
-        /// both halves degrade together, and anything else warns through the
-        /// crate's flood latch.
+        /// that can see the errno, so the ones that say something are logged and
+        /// the ones the gate's own race produces are not.
+        ///
+        /// MEASURED against Apple's header: `ENOENT` on this family means "no
+        /// waiter(s) found waiting on the @addr", which is the ORDINARY outcome
+        /// of a `parked`-gated wake rather than a fault. A claim is set before its
+        /// thread reaches the kernel, it is held across a block the parker skips,
+        /// and a consumer killed inside its block leaves it set for good, so a
+        /// healthy run reaches the kernel with nobody there many times a second.
+        /// `EFAULT` and `ENOMEM` are documented as transient on the same family.
+        /// Logging any of the three would put a line on the publish path of a
+        /// working run.
+        ///
+        /// An unrecoverable errno does NOT latch the shared os_sync family from
+        /// here. The family latch means "this kernel primitive is unusable", and
+        /// the WAIT side is where that is established; the wake side's `EINVAL` is
+        /// documented as flags, size, address, or kernel state inconsistent at
+        /// THIS address, so latching from here would disable the barrier's
+        /// step-start wake, the credit park and the park nap over one page.
         #[inline]
         fn wake_word_wake(&self) {
             let Some(backend) = os_sync_backend() else {
@@ -775,22 +782,18 @@ mod imp {
             #[cfg(test)]
             super::note_wake_syscall_for_test();
             if rc >= 0 {
+                // A wake that reached a waiter closes any open regime, so the
+                // latch can report what it suppressed instead of staying open for
+                // the life of the process.
+                super::note_wake_recovered();
                 return;
             }
             let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if os_sync_errno_is_unrecoverable(errno) {
-                if crate::os_sync::latch_os_sync_disabled() {
-                    tracing::warn!(
-                        errno,
-                        "doorbell wake word os_sync_wake_by_address returned an unrecoverable \
-                         errno (EINVAL/ENOTSUP); disabling the os_sync tier process-wide, so \
-                         consumers stop blocking on a word nothing can wake"
-                    );
-                }
+            if crate::os_sync::os_sync_wake_errno_is_expected(errno) {
                 return;
             }
             use crate::transport::failure_regime_latch::RegimeDecision;
-            match super::note_wake_word_errno() {
+            match super::note_wake_errno() {
                 RegimeDecision::Loud => tracing::warn!(
                     errno,
                     "doorbell wake word os_sync_wake_by_address failed; a consumer blocked on \
@@ -881,6 +884,11 @@ mod imp {
             loop {
                 debug_assert!(cur != 0, "park_exit without a matching park_enter");
                 if cur == 0 {
+                    // Unreachable through the guard, so reaching it means the
+                    // shared count was written by something else. Saying nothing
+                    // would leave a peer's missed wake with no evidence at all in
+                    // a release build, where the assertion above is compiled out.
+                    super::note_parked_gate_underflow();
                     return;
                 }
                 match parked.compare_exchange_weak(
@@ -934,7 +942,6 @@ mod imp {
                 return AddrParkOutcome::Unavailable;
             }
             if !super::doorbell_os_sync_tier_active() {
-                super::note_tier_inactive();
                 return AddrParkOutcome::Unavailable;
             }
             let Some(backend) = os_sync_backend() else {
@@ -985,7 +992,7 @@ mod imp {
                 return AddrParkOutcome::Parked;
             }
             use crate::transport::failure_regime_latch::RegimeDecision;
-            match super::note_wake_word_errno() {
+            match super::note_wait_errno() {
                 RegimeDecision::Loud => tracing::warn!(
                     errno,
                     "doorbell wake word os_sync_wait_on_address failed; this park takes its \
@@ -1085,10 +1092,12 @@ pub use imp::Doorbell;
 /// Kill switch for the doorbell's macOS kernel wake word: `=0` disables the
 /// block and the wake, leaving the park on its bounded sleep-recheck pacing.
 ///
-/// Its OWN switch, not the barrier's or the park nap's, for the reason those two
-/// are separate from each other: the env names are consumer-facing surface, and
-/// one switch silently disabling an unrelated tier is the misleading-name class
-/// this repo rejects. All of them still ride ONE backend and ONE
+/// Its OWN switch, not the barrier's, the credit word's or the park nap's, for
+/// the reason those three are separate from each other: the env names are
+/// consumer-facing surface, and one switch silently disabling an unrelated tier
+/// is the misleading-name class this repo rejects. The credit plane's coupling to
+/// the barrier's switch shipped once, which is why this one carries an
+/// independence test of its own. All of them still ride ONE backend and ONE
 /// unrecoverable-errno latch, so the FACT is read from one place while the
 /// DECISION stays per consumer.
 pub const DOORBELL_OS_SYNC_ENV: &str = "CERULION_DOORBELL_OS_SYNC";
@@ -1159,22 +1168,75 @@ pub fn wake_word_block_primitive_available() -> bool {
     }
 }
 
-/// Record one wake-word syscall failure and say how the caller should log it:
-/// a loud head per regime, downgraded repeats, and a loud re-announcement each
+/// The wake side's flood regime. One latch per condition, which is the latch
+/// module's own rule: a failing wait and a failing wake have different remedies,
+/// and a shared regime would report whichever failed second at `debug` while the
+/// operator's only loud line named the other.
+#[cfg(target_os = "macos")]
+fn wake_latch(
+) -> &'static std::sync::Mutex<crate::transport::failure_regime_latch::FailureRegimeLatch> {
+    use crate::transport::failure_regime_latch::FailureRegimeLatch;
+    static LATCH: std::sync::Mutex<FailureRegimeLatch> =
+        std::sync::Mutex::new(FailureRegimeLatch::new());
+    &LATCH
+}
+
+/// Close the wake regime after a wake that reached a waiter, so the latch can
+/// report what it suppressed rather than staying open for the life of the
+/// process. Returns the suppressed count when a regime really closed.
+#[cfg(target_os = "macos")]
+fn note_wake_recovered() {
+    use crate::transport::failure_regime_latch::lock_regime_latch;
+    if let Some(suppressed) = lock_regime_latch(wake_latch()).on_success() {
+        tracing::warn!(
+            suppressed,
+            "doorbell wake word os_sync_wake_by_address is succeeding again"
+        );
+    }
+}
+
+/// Record one failing wake-word WAIT and say how the caller should log it: a
+/// loud head per regime, downgraded repeats, and a loud re-announcement each
 /// decade of the running total.
 ///
 /// The crate's shared flood latch, never a hand-rolled errno compare, so this
 /// site cannot drift from the discipline every other flood site in the crate
-/// keeps. The DECISION comes back rather than a formatted line, because each
-/// call site's message is a different fact about a different half of the pair:
-/// a failing WAIT leaves this process pacing, a failing WAKE leaves every peer
-/// blocked on this topic until its cap expires.
+/// keeps. The DECISION comes back rather than a formatted line, because the
+/// message is the caller's.
+///
+/// The wait side's own regime; see [`wake_latch`] for why the two are not
+/// shared.
 #[cfg(target_os = "macos")]
-fn note_wake_word_errno() -> crate::transport::failure_regime_latch::RegimeDecision {
+fn note_wait_errno() -> crate::transport::failure_regime_latch::RegimeDecision {
     use crate::transport::failure_regime_latch::{lock_regime_latch, FailureRegimeLatch};
     static LATCH: std::sync::Mutex<FailureRegimeLatch> =
         std::sync::Mutex::new(FailureRegimeLatch::new());
     lock_regime_latch(&LATCH).on_failure()
+}
+
+/// Say ONCE that a doorbell page's `parked` count was decremented below zero.
+///
+/// Unreachable through [`ParkedDoorbellGuard`], so reaching it means the count in
+/// a page every peer maps was written by something else. The consequence lands on
+/// a PEER (its ringer's gate reads the wrong value and a real waiter is never
+/// woken), so the process that sees it is the only one that can report it.
+#[cfg(target_os = "macos")]
+fn note_parked_gate_underflow() {
+    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "a doorbell page's parked count was already zero at park exit: the count is shared \
+             with every peer that maps the topic, so a ringer may now read it wrong and leave a \
+             blocked consumer unwoken for its whole park slice"
+        );
+    }
+}
+
+/// Record one failing wake-word WAKE, in the wake side's own regime.
+#[cfg(target_os = "macos")]
+fn note_wake_errno() -> crate::transport::failure_regime_latch::RegimeDecision {
+    use crate::transport::failure_regime_latch::lock_regime_latch;
+    lock_regime_latch(wake_latch()).on_failure()
 }
 
 /// The doorbell page size, for a test that builds a fixture object at and below
@@ -1208,11 +1270,16 @@ pub fn wake_syscall_count_for_test() -> u64 {
 /// The shared os_sync family latches off for the whole process the first time
 /// ANY of its consumers meets an unrecoverable errno, so the barrier's or the
 /// credit word's failure silences this one, and that peer's warn names its own
-/// plane. Without this line the run keeps printing that the wake word is armed
-/// while every park is pacing. An operator who set the kill switch asked for
-/// exactly this and is not told again.
+/// plane. Without this line the run's only statement about the wake word stays
+/// the one it printed at startup, while every park paces. An operator who set
+/// the kill switch asked for exactly this and is not told at all.
+///
+/// Called by the PARK, from the branch where its own gate declined on the
+/// wake-word term with everything else in place: the gate is re-evaluated every
+/// iteration, so by the time a wait could report it the wait is no longer
+/// reached.
 #[cfg(target_os = "macos")]
-fn note_tier_inactive() {
+pub fn note_tier_inactive() {
     if doorbell_os_sync_kill_switch() {
         return;
     }
@@ -1231,37 +1298,47 @@ fn note_tier_inactive() {
 /// exit path including an unwind, so a ringer can never be left issuing a wake
 /// syscall for a consumer that is no longer blocked.
 ///
-/// It is also the ONLY route to the block. The claim, the epoch snapshot and
-/// the wait are three statements that must run in that order, and a caller that
-/// blocks without the claim is never woken by a ringer (the gate reads zero, so
-/// no wake syscall is issued) and waits out its whole cap in silence. Taking the
-/// snapshot and the wait off the guard makes the wrong order unwritable.
+/// It is also the only route to the block from OUTSIDE this module: the claim,
+/// the epoch read and the wait are all `pub(super)` on the handle, so a caller
+/// elsewhere in the crate cannot block without the claim, and cannot hand the
+/// block a compare value the claim did not precede. A caller that blocked without
+/// the claim would never be woken by a ringer (the gate reads zero, so no wake
+/// syscall is issued) and would wait out its whole cap in silence. Inside this
+/// module the order is a convention the guard makes obvious, not one the compiler
+/// checks.
 #[cfg(target_os = "macos")]
 #[must_use = "the parked claim is released on drop - bind the guard for the block's lifetime"]
 pub struct ParkedDoorbellGuard<'a> {
     bell: &'a Doorbell,
+    /// The kernel compare value, read AFTER the claim and its fence. Held here
+    /// rather than passed in: a caller handing over a stale value gets an
+    /// immediate kernel value-mismatch, which returns a non-negative rc that
+    /// reads as a completed block, so the park would skip its nap and spin the
+    /// window at full CPU.
+    snapshot: u32,
 }
 
 #[cfg(target_os = "macos")]
 impl<'a> ParkedDoorbellGuard<'a> {
-    /// Claim the gate for the duration of one kernel block.
+    /// Claim the gate for the duration of one kernel block, and read the compare
+    /// value the block will use.
     pub fn enter(bell: &'a Doorbell) -> Self {
         bell.park_enter();
-        Self { bell }
+        let snapshot = bell.wake_seq_snapshot();
+        Self { bell, snapshot }
     }
 
-    /// The kernel compare value, taken AFTER the claim and its fence, and
-    /// handed back to [`wait`](Self::wait). Any ring landing after it fails the
-    /// compare, so a ring can never be lost inside the snapshot-to-block window.
+    /// The compare value this guard read at [`enter`](Self::enter). Read-only:
+    /// the block uses the stored value, never one a caller hands over.
     pub fn snapshot(&self) -> u32 {
-        self.bell.wake_seq_snapshot()
+        self.snapshot
     }
 
-    /// Kernel-block on the wake word until a ring bumps the epoch past
-    /// `snapshot` or `cap` expires. See [`Doorbell::park_wait_ring`] for the
-    /// three outcomes.
-    pub fn wait(&self, snapshot: u32, cap: Duration) -> crate::monitor_wait::AddrParkOutcome {
-        self.bell.park_wait_ring(snapshot, cap)
+    /// Kernel-block on the wake word until a ring bumps the epoch past the value
+    /// read at [`enter`](Self::enter), or `cap` expires. See
+    /// `Doorbell::park_wait_ring` (private) for the three outcomes.
+    pub fn wait(&self, cap: Duration) -> crate::monitor_wait::AddrParkOutcome {
+        self.bell.park_wait_ring(self.snapshot, cap)
     }
 }
 
@@ -1372,6 +1449,11 @@ impl DoorbellRegistry {
     /// macOS data-wake park blocks on (the same line
     /// [`primary_addr`](Self::primary_addr) hands the hardware monitor). `None`
     /// when the registry is empty.
+    ///
+    /// The handle it hands back can `ring()`, and every handle in this registry is
+    /// a CONSUMER's: a ring from here would be a data wake with no data behind it,
+    /// which the park would attribute to the doorbell and act on. The park reads
+    /// it to block, never to ring.
     pub fn primary(&self) -> Option<&Doorbell> {
         self.doorbells.first()
     }
@@ -1453,7 +1535,7 @@ mod tests {
         assert_eq!(n1, n2, "same (ns,topic) → identical name (the dedup key)");
         assert!(
             n1.starts_with("/cer_db_"),
-            "every shape carries the prefix-free family token: {n1}"
+            "every shape carries the `/cer_db_` family prefix: {n1}"
         );
         #[cfg(target_os = "linux")]
         assert!(
@@ -1498,7 +1580,9 @@ mod tests {
     #[test]
     fn the_compact_name_shape_is_byte_stable() {
         // Hand oracle, an independent Python FNV-1a-64 over the unit-separated
-        // key, the same reference the Linux shape's literals come from:
+        // key. The first two are the values `shm_map`'s own oracle pins over the
+        // same keys; the third is hand-computed here, since the bare separator is
+        // not among them:
         //   fnv1a64(b"g\x1fa") = 0xd4c07218fa8dad0e
         //   fnv1a64(b"g\x1fb") = 0xd4c07118fa8dab5b
         //   fnv1a64(b"\x1f")   = 0xaf63d24c8601db8e
@@ -1929,9 +2013,8 @@ mod tests {
         };
 
         let guard = ParkedDoorbellGuard::enter(&consumer);
-        let snap = guard.snapshot();
         let t0 = std::time::Instant::now();
-        let outcome = guard.wait(snap, CAP);
+        let outcome = guard.wait(CAP);
         let waited = t0.elapsed();
         ringer.join().expect("ringer thread panicked");
 
@@ -1988,15 +2071,25 @@ mod tests {
             "a ring with nobody parked must not reach the kernel at all"
         );
 
-        // The positive control: with the gate held the same ring DOES issue one,
-        // so the assertion above is about the gate and not about a counter that
-        // never moves.
+        // The positive control: with the gate held the same ring DOES issue one
+        // wherever the backend resolved, so the assertion above is about the gate
+        // and not about a counter that can never move. Where it did not resolve
+        // there is no syscall to count, which is judged rather than skipped.
         let guard = ParkedDoorbellGuard::enter(&consumer);
         owner.ring();
-        assert!(
-            wake_syscall_count_for_test() > before,
-            "a ring with a consumer parked must issue the wake syscall"
-        );
+        if crate::os_sync::os_sync_backend().is_some() {
+            assert!(
+                wake_syscall_count_for_test() > before,
+                "a ring with a consumer parked must issue the wake syscall"
+            );
+        } else {
+            assert_eq!(
+                wake_syscall_count_for_test(),
+                before,
+                "with no resolved backend there is no wake syscall to issue, so \
+                 the count cannot move in either direction"
+            );
+        }
         drop(guard);
 
         drop(consumer);
@@ -2019,14 +2112,14 @@ mod tests {
         let consumer = Doorbell::open_unowned(&ns, topic).expect("consumer open_unowned");
 
         let guard = ParkedDoorbellGuard::enter(&consumer);
-        let snap = guard.snapshot();
-        // The ring lands between the snapshot and the block. The guard is held,
-        // so a wake syscall IS issued; what this pins is that the compare alone
-        // would have sufficed, because the call returns without blocking.
+        // The ring lands after the guard read its compare value and before the
+        // block. The guard is held, so a wake syscall IS issued; what this pins
+        // is that the compare alone would have sufficed, because the call returns
+        // without blocking.
         owner.ring();
 
         let t0 = std::time::Instant::now();
-        let outcome = guard.wait(snap, CAP);
+        let outcome = guard.wait(CAP);
         let waited = t0.elapsed();
 
         // Both arms are judged, as in the wake test above. RingPending, not
@@ -2074,12 +2167,12 @@ mod tests {
         let owner = Doorbell::open_owned(&ns, topic).expect("owner open_owned");
         let guard = ParkedDoorbellGuard::enter(&owner);
         assert_eq!(
-            guard.wait(guard.snapshot(), Duration::ZERO),
+            guard.wait(Duration::ZERO),
             AddrParkOutcome::Unavailable,
             "a zero cap has nothing to block for"
         );
         assert_eq!(
-            guard.wait(guard.snapshot(), Duration::from_micros(1)),
+            guard.wait(Duration::from_micros(1)),
             if wake_word_block_primitive_available() {
                 AddrParkOutcome::Parked
             } else {
@@ -2222,30 +2315,15 @@ mod tests {
         cleanup(&ns, &["first", "second"]);
     }
 
-    /// An UNSIZED doorbell object is HEALED, not mapped and not left to wedge
-    /// the topic: the dead name is unlinked and the next attempt sizes a fresh
-    /// page.
-    ///
-    /// This is the shape a creator killed between its `shm_open` and its
-    /// `ftruncate` leaves behind. Nothing else ever re-sizes such an object, so
-    /// before the unlink-and-retry every later open of that topic failed for the
-    /// life of the machine.
-    ///
-    /// MEASURED, and why the fixture is unsized rather than one byte short:
-    /// macOS reports a POSIX SHM object's size ROUNDED UP to a page, so an
-    /// `ftruncate` to `page_bytes() - 1` fstats as 16384 and the open attaches to
-    /// it correctly. Zero is therefore the only short size the open path can
-    /// observe on this target, and it is also the only one a crash produces.
+    /// Claim a doorbell name and leave the object UNSIZED, exactly as a creator
+    /// killed between its `shm_open` and its `ftruncate` does. Returns the
+    /// descriptor, which the caller holds so the object stays alive and readable.
     #[cfg(target_os = "macos")]
-    #[test]
-    fn an_unsized_doorbell_object_is_healed_rather_than_wedging_the_topic() {
-        let ns = test_ns("short_obj");
-        let topic = "scan";
-        let name = std::ffi::CString::new(doorbell_shm_name(&ns, topic))
-            .expect("name has no interior nul");
-        // SAFETY: claim the name and leave it UNSIZED, exactly as a creator
-        // killed before its `ftruncate` does.
-        let dead = unsafe {
+    fn unsized_fixture(ns: &str, topic: &str) -> (std::ffi::CString, libc::c_int) {
+        let name =
+            std::ffi::CString::new(doorbell_shm_name(ns, topic)).expect("name has no interior nul");
+        // SAFETY: claim a pid-scoped name and do NOT size it.
+        let fd = unsafe {
             libc::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
@@ -2253,55 +2331,87 @@ mod tests {
             )
         };
         assert!(
-            dead >= 0,
+            fd >= 0,
             "the fixture name must be free in this test's namespace"
         );
         // The premise: the kernel really reports this object as shorter than the
         // page, so the open path has something to judge.
         // SAFETY: `st` is zeroed first; `fstat` fills it on success.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: FFI fstat on the descriptor this test opened.
-        assert_eq!(
-            unsafe { libc::fstat(dead, &mut st) },
-            0,
-            "fstat the fixture"
-        );
+        // SAFETY: FFI fstat on the descriptor just opened.
+        assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0, "fstat the fixture");
         assert!(
             (st.st_size as usize) < doorbell_page_bytes_for_test(),
-            "precondition: an unsized object must fstat below the page, or this \
-             test judges nothing"
+            "precondition: an unsized object must fstat below the page, or the \
+             tests below judge nothing"
         );
+        (name, fd)
+    }
+
+    /// An UNSIZED object under a doorbell name is SIZED IN PLACE, so the topic is
+    /// not wedged and no name is deleted: the opener and the peer that left it end
+    /// on the SAME page.
+    ///
+    /// This is the shape a creator killed between its `shm_open` and its
+    /// `ftruncate` leaves behind, and before the sizing step nothing else ever
+    /// re-sized it, so every later open of that topic failed for the life of the
+    /// machine.
+    ///
+    /// MEASURED, and why the fixture is unsized rather than one byte short: macOS
+    /// reports a POSIX SHM object's size ROUNDED UP to a page, so an `ftruncate` to
+    /// `page_bytes() - 1` fstats as 16384 and the open attaches to it correctly.
+    /// Zero is the only short size the open path can observe on this target, and it
+    /// is also the only one a crash produces.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unsized_doorbell_object_is_sized_in_place() {
+        let ns = test_ns("unsized");
+        let topic = "scan";
+        let (name, dead) = unsized_fixture(&ns, topic);
 
         let bell = Doorbell::open_unowned(&ns, topic)
-            .expect("an unsized object must be healed, not refused");
-        assert_eq!(bell.seq(), 0, "the healed page is fresh, so it reads zero");
+            .expect("an unsized object must be sized in place, not refused");
+        assert_eq!(bell.seq(), 0, "a freshly sized page reads zero");
 
-        // The object the caller was handed is NOT the dead one: this test still
-        // holds a descriptor on it, and its size is unchanged. Mapping a short
-        // page is what the bound exists to prevent, and re-sizing one in place is
-        // what macOS refuses.
+        // The SAME object, not a replacement: the descriptor this test still holds
+        // on the object the fixture created now reports the page size, and the name
+        // still resolves to it. Deleting the name instead would put a peer that was
+        // merely descheduled on a different page from every consumer, with nothing
+        // reported anywhere.
+        // SAFETY: `st` is zeroed first; `fstat` fills it on success.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: FFI fstat on the descriptor this test opened.
-        assert_eq!(
-            unsafe { libc::fstat(dead, &mut st) },
-            0,
-            "fstat the fixture"
-        );
+        assert_eq!(unsafe { libc::fstat(dead, &mut st) }, 0, "fstat the fixture");
         assert!(
-            (st.st_size as usize) < doorbell_page_bytes_for_test(),
-            "the dead object must be left as it was, never re-sized in place"
+            (st.st_size as usize) >= doorbell_page_bytes_for_test(),
+            "the object the fixture created must itself have been sized, so the \
+             peer that left it maps the same page"
         );
-        // And the name now carries a usable page, so a later opener attaches to
-        // the healed one instead of failing.
+        // SAFETY: FFI open-only probe of the fixture name.
+        let probe = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(probe >= 0, "the name must not have been unlinked");
+        // SAFETY: `probe_st` is zeroed first; `fstat` fills it on success.
+        let mut probe_st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: FFI fstat on the probe descriptor.
+        assert_eq!(unsafe { libc::fstat(probe, &mut probe_st) }, 0);
+        assert_eq!(
+            (st.st_dev, st.st_ino),
+            (probe_st.st_dev, probe_st.st_ino),
+            "the name must still resolve to the very object that was there"
+        );
+
+        // And a peer attaching afterwards shares the page the sizing produced.
         let peer = Doorbell::open_owned(&ns, topic).expect("a later open attaches");
         peer.ring();
         assert_eq!(
             bell.seq(),
             1,
-            "the healed name is what a later opener attaches to, so its ring shows \
-             through the page the heal mapped"
+            "a later opener's ring shows through the page this open mapped"
         );
 
-        // SAFETY: close the descriptor this test opened.
+        // SAFETY: close the descriptors this test opened.
+        unsafe { libc::close(probe) };
+        // SAFETY: as above.
         unsafe { libc::close(dead) };
         drop(peer);
         drop(bell);

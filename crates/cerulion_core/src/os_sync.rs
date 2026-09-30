@@ -7,7 +7,7 @@
 //! OLDER macOS degrades to a sleep fallback instead of dyld-aborting at launch
 //! — never a direct `extern` reference.
 //!
-//! FOUR consumers share this ONE backend (the no-two-copies rule):
+//! The consumers below share this ONE backend (the no-two-copies rule):
 //!
 //! - [`crate::barrier`]: the barrier boundary wait + the step-start
 //!   park wake word — cross-process SHM words, `OS_SYNC_*_SHARED`, woken by a
@@ -31,10 +31,10 @@
 //! `CERULION_PARK_OS_SYNC`): the
 //! env names are consumer-facing surface, and one switch silently disabling an
 //! unrelated tier is the misleading-name class this repo rejects. The pure
-//! `=0`/`=1`/garbage grammar ([`parse_os_sync_kill_switch`]) IS shared, so the
-//! two switches cannot drift in what they accept, and
-//! that grammar LIVES in [`crate::kill_switch`], platform-neutral, with the
-//! credit plane's two switches sharing it as well. This module re-exports it
+//! `=0`/`=1`/garbage grammar ([`parse_os_sync_kill_switch`]) IS shared, so no
+//! switch can drift from another in what it accepts, and
+//! that grammar LIVES in [`crate::kill_switch`], platform-neutral, shared by
+//! every switch listed there. This module re-exports it
 //! under its own name; it owns the FFI backend and the latch, not the grammar.
 //!
 //! Whole module `#[cfg(target_os = "macos")]` (registered as such in
@@ -180,6 +180,21 @@ pub(crate) fn os_sync_errno_is_benign(errno: i32) -> bool {
 /// Pure.
 pub(crate) fn os_sync_errno_is_unrecoverable(errno: i32) -> bool {
     matches!(errno, libc::EINVAL | libc::ENOTSUP)
+}
+
+/// Classify a failing `os_sync_wake_by_address_all` errno as EXPECTED: the
+/// wake found nobody to wake.
+///
+/// `ENOENT` is documented by the header as "No waiter(s) found waiting on the
+/// @addr", and it is the ORDINARY outcome of a `parked`-gated wake rather than
+/// an anomaly: every claim is set before its thread reaches the kernel, a claim
+/// held across a skipped block has no waiter behind it at all, and a consumer
+/// killed inside its block leaves its claim set for good. Logging it would put a
+/// line on the publish path for a healthy run.
+///
+/// Pure, so the classification is oracle-testable without a syscall seam.
+pub(crate) fn os_sync_wake_errno_is_expected(errno: i32) -> bool {
+    errno == libc::ENOENT
 }
 
 /// Is the shared os_sync BACKEND usable on this host — resolved,

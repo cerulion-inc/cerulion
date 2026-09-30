@@ -832,7 +832,10 @@ Measured on macOS: a stable and lower median wake latency than the
 plain blocking wait, whose median was unstable from run to run.
 On macOS 14.4 and later the park also kernel-blocks on the data doorbell's wake
 word, so a producer's publish wakes a consuming worker directly instead of at the
-next recheck. Opt out with
+next recheck. That is the rung for a worker whose only wake source is data: a
+process blocks on one address, so a `lockstep` barrier participant blocks on the
+barrier's word instead, and a producer held at a `block` gate on that edge's
+credit word. Opt out with
 `CERULION_MONITOR_WAIT=0` or `--no-monitor-wait` (or with
 `CERULION_DOORBELL_OS_SYNC=0`, which drops the data wake on macOS alone); see "Live-loop tuning" under
 "Environment variables" in [`docs/user-api.md`](user-api.md).

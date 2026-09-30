@@ -20,8 +20,8 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   notifies to self); skipping it saturates the socket, floods logs.
 - New flood-suppression sites reuse `transport::failure_regime_latch`, never hand-rolled;
   totals log as `total_failures=`, site keys as `topic=`/`service=`.
-- Sync fires ONCE PER COMPLETE ALIGNED SET, in order, each trigger consumed by at most one set,
-  never per alignment on the freshest frames; verdicts from pure `scheduler/sync_match.rs`.
+- Sync fires ONCE PER COMPLETE ALIGNED SET, each trigger consumed by at most one set; verdicts
+  from pure `sync_match.rs`; in-order consumption and arrived-set preservation inviolable.
 - Graph YAML denies unknown fields - a typo'd key is a loud parse error, never a silent
   default; a new field needs round-trip + rejection oracle arms.
 - Replay = Live: `external_source()` is queried once at `run_live` entry, never under

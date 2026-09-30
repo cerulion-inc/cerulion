@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 /// - `ns`: the SHM doorbell namespace ([`crate::doorbell::default_namespace`]),
 ///   so a producer's owned doorbell and the consumer's registry derive the SAME
 ///   object name and map the same page. The name's shape is per-OS; the one
-///   statement of it is [`crate::doorbell::doorbell_shm_name`].
+///   statement of it is `doorbell_shm_name`, in [`crate::doorbell`].
 ///
 /// All-false / empty `ns` ([`MonitorWaitPolicy::off`] / `Default`) is the
 /// inert production-off state (the live loop runs the existing blocking-WaitSet
@@ -408,7 +408,9 @@ pub enum AddrParkOutcome {
     /// The lost-wakeup guard detected a ring since the caller's snapshot and
     /// skipped the park entirely — a WAKE in flight, not a slice.
     RingPending,
-    /// No primitive on this target — the caller takes its sleep fallback.
+    /// NOTHING blocked: no primitive on this target, or a rung that declined
+    /// (nothing armed, no page to watch, a zero cap, or a failing syscall). The
+    /// caller takes its sleep fallback.
     Unavailable,
 }
 
@@ -591,15 +593,17 @@ fn monitor_wait_until_addr_with_backend(
 //
 // **SHAPE (the design fork, decided):** this is the TIMED-NAP
 // replacement, NOT a full wait-on-address on a condition word. It is what the
-// `!performed` arm reaches when no wake-word rung applies, and the two sources
-// that reach it cannot wake an os_sync waiter: iceoryx2 listener notification
-// queues (AF_UNIX socket state, no address) and external raw fds (`poll(2)`).
-// The three sources that CAN are blocked on in the rungs above this nap, each
-// on its own shared word and each woken by an `os_sync_wake_by_address_*`
-// syscall the peer issues behind a `parked` gate: the credit word, barrier
-// arrival, and the data doorbell (whose macOS page carries a 4-byte wake epoch
-// beside the ring counter, so a producer's ring is a store plus a gated wake:
-// `crate::doorbell`). So the nap has NO waker by construction, the recheck
+// `!performed` arm reaches when no wake-word rung applies, and nothing that
+// reaches it can wake an os_sync waiter: iceoryx2 listener notification queues
+// (AF_UNIX socket state, no address), external raw fds (`poll(2)`), and every
+// doorbell line no rung is blocked on, which is the non-primary topics always and
+// the primary one whenever a sibling rung took the address first. The words that
+// CAN wake a waiter are blocked on in the rungs above this nap, each woken by an
+// `os_sync_wake_by_address_*` syscall the peer issues behind a `parked` gate: the
+// credit word, barrier arrival, and the data doorbell (whose macOS page carries a
+// 4-byte wake epoch beside the ring counter, so a producer's ring is an increment
+// plus a gated wake: `crate::doorbell`). So the nap has NO waker by construction,
+// the recheck
 // CADENCE is unchanged (listener/doorbell/fd observation is never later than
 // today's sleep chunk), and the whole win is the tighter timeout slop.
 // Record-only (Principle #7): the nap changes only WHEN the park re-polls,
@@ -651,7 +655,8 @@ pub fn park_nap_os_sync_available() -> bool {
 
 /// ONE degraded-park nap, bounded by `cap` — the pacing wait of the
 /// park's `!performed` arm, reached when no CPU monitor-wait primitive exists
-/// and none of the three wake-word rungs (credit, barrier, doorbell) applies.
+/// and no wake-word rung applies (the credit word, barrier arrival, and on macOS
+/// the data doorbell).
 /// macOS ≥ 14.4 kernel-blocks on the os_sync timed wait
 /// (half the `nanosleep` coalescing slop — see the section comment); every
 /// other target and every fallback is `thread::sleep(cap)`, byte-identical to

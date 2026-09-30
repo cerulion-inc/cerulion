@@ -12,7 +12,7 @@
 //! here, in a platform-neutral module, and `os_sync` re-exports it under its
 //! own name for the two macOS switches that predate this move.
 //!
-//! One definition is the point. Five switches parse through this fn:
+//! One definition is the point. Every switch below parses through this fn:
 //! `CERULION_BARRIER_OS_SYNC` ([`crate::barrier`]), `CERULION_PARK_OS_SYNC`
 //! ([`crate::monitor_wait`]), `CERULION_CREDIT_WAKE` and
 //! `CERULION_CREDIT_OS_SYNC` ([`crate::credit`]), and
@@ -54,7 +54,7 @@ mod tests {
     /// Moved here from `os_sync`: the shared kill-switch
     /// GRAMMAR. Pure oracle over `(disabled, was_garbage)` — no env mutation.
     ///
-    /// All five consumers' resolve wrappers parse through THIS fn, so this is
+    /// Every consumer's resolve wrapper parses through THIS fn, so this is
     /// the one place the grammar is pinned. It runs on every platform now; in
     /// `os_sync` it was macOS-gated along with the module, which left the
     /// grammar that governs a Linux-first switch (`CERULION_CREDIT_WAKE`)

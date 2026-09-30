@@ -114,8 +114,7 @@ fn child_prints_doorbell_primitive_availability() {
     let bell = cerulion_core::doorbell::Doorbell::open_owned(&ns, "/indep/data")
         .expect("the child owns its own doorbell page");
     let guard = cerulion_core::doorbell::ParkedDoorbellGuard::enter(&bell);
-    let snap = guard.snapshot();
-    let outcome = guard.wait(snap, std::time::Duration::from_millis(2));
+    let outcome = guard.wait(std::time::Duration::from_millis(2));
     println!(
         "PARKWAIT={}",
         outcome == cerulion_core::monitor_wait::AddrParkOutcome::Parked

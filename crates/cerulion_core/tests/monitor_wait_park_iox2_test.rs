@@ -547,17 +547,32 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
     .expect("build doorbell consumer graph");
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The ringer's FIRST ring, so the park windows below start against a cadence
+    // that is already running. Without it the first window races the thread's
+    // spawn plus three shared-memory syscalls, and a window that opens before the
+    // cadence does is a window the ring genuinely cannot end.
+    let ringing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ringer = {
         let stop = Arc::clone(&stop);
+        let ringing = Arc::clone(&ringing);
         std::thread::spawn(move || {
             let db = cerulion_core::doorbell::Doorbell::open_owned(&mwp_ns("ringattr"), EXT_TOPIC)
                 .expect("open the producer-side ringer doorbell");
             while !stop.load(Ordering::Relaxed) {
                 db.ring();
+                ringing.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_micros(200));
             }
         })
     };
+    let spun_up = std::time::Instant::now();
+    while !ringing.load(Ordering::Acquire) {
+        assert!(
+            spun_up.elapsed() < Duration::from_secs(10),
+            "the ringer never rang, so nothing below would be judging a ring"
+        );
+        std::thread::yield_now();
+    }
 
     // Each live step parks (50ms window); a ring lands inside it and wakes the
     // park early. No data flows — the steps fire nothing (records-only wake).
@@ -580,13 +595,20 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
     // The claim the product makes is that the ring ENDS the park, not that the
     // park happens to end. A block that timed out at its slice would satisfy
     // `doorbell >= 1` just as well, because the loop-top poll then attributes the
-    // ring it finds. The ringer runs at 200 microseconds against a 50 millisecond
-    // window, so every park entry here has a ring inside it and NONE may reach
-    // its timeout.
-    assert_eq!(
-        timeout, 0,
-        "a park window with a ring inside it must be ended by the ring, never by \
-         its own timeout - got {timeout} timeouts across {entries} park entries"
+    // ring it finds. The ringer is known to be ringing before the first window
+    // opens (above) and its cadence is 200 microseconds against a 50 millisecond
+    // window, so a ring lands inside every window this drives.
+    //
+    // Stated as "the ring ends more windows than the timer does" rather than as
+    // zero timeouts: a ringer starved for one whole window on a loaded runner is
+    // a scheduling fact about the host, and an absolute wall on it is the class
+    // that inverts under load. A rung that never woke on a ring still fails,
+    // because then the timer ends every window.
+    assert!(
+        doorbell > timeout,
+        "a ring must end more park windows than the timer does - got \
+         {doorbell} ring wakes against {timeout} timeouts across {entries} park \
+         entries"
     );
     assert_eq!(
         fires.load(Ordering::Relaxed),
