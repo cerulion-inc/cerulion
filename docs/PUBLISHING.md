@@ -111,12 +111,18 @@ Run from the workspace root, in order:
       workspace inheritance resolves.
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] The per-package test steps in `.github/workflows/ci.yml`, for every
-      crate the release touches (`./tools/scripts/ci_test_shard.sh cerulion_core
-      <shard> 4` for the four `cerulion_core` shards), plus the serial
-      iceoryx2 test lists in the per-crate `AGENTS.md` files. **Not `cargo test --workspace`**:
-      it deadlocks on iceoryx2's shared-memory singleton, which is why every
-      test step in `ci.yml` enumerates its packages explicitly.
+- [ ] The per-package test steps in `.github/workflows/ci.yml`, run as written
+      there, for every crate the release touches. The four `cerulion_core`
+      shards are `./tools/scripts/ci_test_shard.sh cerulion_core <shard> 4`;
+      the script runs `cargo nextest run --profile ci`, which applies the
+      serial fence in `.config/nextest.toml` to the `cerulion_core` test
+      binaries it names (`crates/cerulion_core/tests/serial_discipline_test.rs`
+      asserts that membership against its declared inventory), and
+      `tools/scripts/install_nextest.sh` installs the pinned nextest the
+      script requires. Doctests are outside nextest, so `cargo test -p
+      cerulion_core --doc` is its own step. **Not `cargo test --workspace`**:
+      it deadlocks on iceoryx2's shared-memory singleton, which is why the
+      test steps in `ci.yml` name this workspace's packages one by one.
 - [ ] For each publishable crate:
       `cargo package --list -p <crate> --allow-dirty` and verify:
   - `README.md` is present in every listing.
