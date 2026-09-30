@@ -115,7 +115,6 @@
 3 our-machines crates/cerulion_viz/lib/cerulion_viz/tests/openh264_live_fetch_test.rs
 1 history-voice crates/cerulion_wsd/AGENTS.md
 1 history-voice crates/native_ros2_messages/tests/state_corpus_test.rs
-3 our-machines crates/rmw_cerulion/tests/rclpy_xproc_test.rs
 1 our-machines crates/rmw_cerulion/tests/rmw_adopt_take_linux_test.rs
 1 plan-step crates/test_fixtures/test_node_failing_cdylib/src/lib.rs
 5 plan-step crates/test_fixtures/test_node_state_liar_cdylib/src/lib.rs
