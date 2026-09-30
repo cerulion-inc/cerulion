@@ -21285,12 +21285,139 @@ fn a_range_declared_above_the_traces_last_boundary_is_refused_as_a_skew() {
                 detail.contains("resim_covered_through_ns")
                     && detail.contains(&declared.to_string())
                     && detail.contains(&covered.to_string())
-                    && detail.contains("last STEP_BOUNDARY"),
+                    && detail.contains("last recorded STEP_BOUNDARY"),
                 "the refusal must name the manifest, both numbers and the real \
                  disagreement (declared {declared}), got: {detail}"
             ),
             other => panic!("expected RecordingInconsistent, got {other:?}"),
         }
+    }
+}
+
+/// The reader's covered range is the RECORDER's fold, not rank 0's endpoint.
+///
+/// Three arms over one contract. The recorder writes
+/// `resim_covered_through_ns` as the MINIMUM, over the ranks that kept a
+/// boundary, of each rank's last kept target, and the reader derives the same
+/// minimum from the bag's own trace. The reader used to adjudicate against rank
+/// 0's last target alone, which on a capture whose PEER ended shorter answered an
+/// instant that rank's trace carries no boundary for.
+///
+/// Every expected instant below is WRITTEN DOWN. The fixture's four steps have
+/// boundary targets 5, 10, 15 and 20 ms, so trimming a rank to `step <= 2`
+/// leaves that rank ending at 15 ms while the untrimmed rank ends at 20 ms.
+/// Nothing here reads an endpoint back out of the code under test.
+#[test]
+#[serial]
+fn a_k1_captures_declared_range_is_its_own_last_boundary() {
+    // k = 1 through the real recorder: one rank, so the fold is over one value
+    // and the declared value, the fold and rank 0's last target are one number.
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 5);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("k1_full_coverage.mcap");
+    write_capture_bag(&rec, &bag, Some(25_000_000));
+
+    let outcome = replay(&bag, source_relay_factories, None, None)
+        .expect("a capture declaring exactly what its trace backs replays clean");
+    assert_clean_verdict(&outcome, "k=1 declared range");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert!(!range.derived, "the bag declared this range");
+    assert_eq!(
+        range.through_ns, 25_000_000,
+        "five uniform steps end at the 25 ms boundary target, and on one rank the \
+         fold and that rank's last target are the same number"
+    );
+    assert!(
+        range.trailing_frames.is_empty(),
+        "nothing is outside a range that covers the whole trace: {:?}",
+        range.trailing_frames
+    );
+}
+
+/// k > 1 with a PEER ending shorter: the reader covers to the DECLARED minimum,
+/// and a frame between it and rank 0's last target is outside the range.
+///
+/// Rank 1's trace is trimmed to `step <= 2`, so rank 1 ends at 15 ms while rank 0
+/// runs on to 20 ms. The recorder's fold writes 15 ms. The old reader answered
+/// rank 0's 20 ms and so claimed the 15 to 20 ms band, which rank 1 has no
+/// boundary in.
+#[test]
+#[serial]
+fn a_peer_ending_shorter_holds_the_covered_range_at_the_declared_minimum() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_peer_shorter_declared.mcap");
+    write_multi_rank_bag_with_declared_range(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        // Rank 1 stopped after step 2; rank 0 keeps its full 0..=3 stream.
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        15_000_000,
+    );
+
+    let outcome = replay(&bag, mp_slow_b_factories, None, None)
+        .expect("a capture declaring its own fold is honoured, never refused");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert!(!range.derived, "the bag declared this range");
+    assert_eq!(
+        range.through_ns, 15_000_000,
+        "the endpoint is the EARLIEST rank's last kept target, not rank 0's 20 ms"
+    );
+    // The 20 ms frames are in the bag, readable, and outside the range: the
+    // band rank 1 has no boundary in is reported rather than claimed.
+    let beyond: usize = range.trailing_frames.values().sum();
+    assert!(
+        beyond > 0,
+        "a frame stamped between the declared 15 ms and rank 0's 20 ms must be \
+         counted beyond coverage: {:?}",
+        range.trailing_frames
+    );
+}
+
+/// A manifest ABOVE the fold's minimum but AT OR BELOW rank 0's last target is
+/// REFUSED BY NAME.
+///
+/// This is the arm the old reader had no answer for: 18 ms is not above rank 0's
+/// 20 ms, so the old guard passed it and the old clamp answered 20 ms. Against
+/// the fold it is an overstatement, because rank 1 stopped at 15 ms.
+#[test]
+#[serial]
+fn a_claim_above_the_folds_minimum_is_refused_even_below_rank_zeros_last() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_over_the_fold.mcap");
+    write_multi_rank_bag_with_declared_range(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        18_000_000,
+    );
+
+    let err = replay(&bag, mp_slow_b_factories, None, None)
+        .expect_err("a claim no rank can back is refused, never clamped");
+    assert_eq!(err.exit_code(), 2);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => assert!(
+            detail.contains("resim_covered_through_ns")
+                && detail.contains("18000000")
+                && detail.contains("15000000")
+                && detail.contains("EARLIEST last"),
+            "the refusal must name the manifest, the claim, the fold's minimum and \
+             what the minimum is, got: {detail}"
+        ),
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
     }
 }
 
