@@ -1923,6 +1923,65 @@ jobs:
       # runner intersects its own package with the selection instead of a step
       # condition and prints one `selection:` line when the intersection is
       # empty, so the decision and its log line live in one place.
+      # The waiver gate asks OTHER test binaries what libtest will do with the
+      # arms it declares waived. A shard builds only its own files, so on the
+      # shard that runs the gate those binaries are absent, or are a
+      # cache-restored copy from before the waiver, and the gate refuses to
+      # answer from one of those rather than answering wrongly. This builds
+      # exactly what it asks, and only on the shard that asks.
+      #
+      # `--list` prints the shard's cargo arguments ONE PER LINE, so the gate's
+      # own name is matched as a whole line. Matching `--test <name>` as one
+      # string never matches and made the first version of this step exit early
+      # on every shard, building nothing.
+      #
+      # The inventory spans TWO crates, so the names are derived and built per
+      # crate: `-p cerulion_core --test <a cli_engine target>` is not a target
+      # and would fail. The names come from the inventory file the gate itself
+      # reads, so the two cannot drift, and each crate's count is floored so a
+      # parse that matched nothing fails here instead of building nothing.
+      #
+      # COST, stated because it is not measured: this puts a
+      # `cerulion_cli_engine` lib build plus two of its test binaries on shard 0,
+      # which otherwise builds that crate on shard 2 alone, on a different runner
+      # with its own target directory. The added wall on a runner is NOT measured
+      # here and is owed; the shard map above is packed against measured walls, so
+      # the figure belongs beside its other terms once one run has it.
+      - name: Build the binaries the waiver gate asks (its shard only)
+        run: |
+          set -euo pipefail
+          args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 4)
+          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+            echo "this shard does not run the waiver gate; nothing to build"
+            exit 0
+          fi
+          inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
+          total=0
+          for crate in cerulion_core cerulion_cli_engine; do
+            # `|| true` so a zero-match parse reaches the floor below instead of
+            # dying here under `pipefail` with nothing said.
+            names=$(grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" "$inventory" \
+              | sed 's#.*/##; s#\.rs"##' | sort -u || true)
+            n=$(printf '%s\n' "$names" | grep -c . || true)
+            # Per crate the floor is ONE, because the split between the two is
+            # the inventory's to decide and today it is 16 and 2. The total is
+            # floored below, which is what catches a parse that stopped reaching
+            # the file.
+            if [ "$n" -lt 1 ]; then
+              echo "::error::derived no waived test binaries for $crate: the parse is not reaching the inventory"
+              exit 1
+            fi
+            total=$((total + n))
+            echo "building $n waived test binaries for $crate"
+            printf '%s\n' "$names" | sed 's/^/--test /' \
+              | xargs cargo test --locked -p "$crate" --no-run
+          done
+          if [ "$total" -lt 10 ]; then
+            echo "::error::derived only $total waived test binaries across both crates, expected at least 10"
+            exit 1
+          fi
+          echo "built $total waived test binaries for the gate"
+
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
@@ -2883,6 +2942,65 @@ jobs:
 
       # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
       # observes the whole tree, so the shard runner does the intersection.
+      # The waiver gate asks OTHER test binaries what libtest will do with the
+      # arms it declares waived. A shard builds only its own files, so on the
+      # shard that runs the gate those binaries are absent, or are a
+      # cache-restored copy from before the waiver, and the gate refuses to
+      # answer from one of those rather than answering wrongly. This builds
+      # exactly what it asks, and only on the shard that asks.
+      #
+      # `--list` prints the shard's cargo arguments ONE PER LINE, so the gate's
+      # own name is matched as a whole line. Matching `--test <name>` as one
+      # string never matches and made the first version of this step exit early
+      # on every shard, building nothing.
+      #
+      # The inventory spans TWO crates, so the names are derived and built per
+      # crate: `-p cerulion_core --test <a cli_engine target>` is not a target
+      # and would fail. The names come from the inventory file the gate itself
+      # reads, so the two cannot drift, and each crate's count is floored so a
+      # parse that matched nothing fails here instead of building nothing.
+      #
+      # COST, stated because it is not measured: this puts a
+      # `cerulion_cli_engine` lib build plus two of its test binaries on shard 0,
+      # which otherwise builds that crate on shard 2 alone, on a different runner
+      # with its own target directory. The added wall on a runner is NOT measured
+      # here and is owed; the shard map above is packed against measured walls, so
+      # the figure belongs beside its other terms once one run has it.
+      - name: Build the binaries the waiver gate asks (its shard only)
+        run: |
+          set -euo pipefail
+          args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 3)
+          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+            echo "this shard does not run the waiver gate; nothing to build"
+            exit 0
+          fi
+          inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
+          total=0
+          for crate in cerulion_core cerulion_cli_engine; do
+            # `|| true` so a zero-match parse reaches the floor below instead of
+            # dying here under `pipefail` with nothing said.
+            names=$(grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" "$inventory" \
+              | sed 's#.*/##; s#\.rs"##' | sort -u || true)
+            n=$(printf '%s\n' "$names" | grep -c . || true)
+            # Per crate the floor is ONE, because the split between the two is
+            # the inventory's to decide and today it is 16 and 2. The total is
+            # floored below, which is what catches a parse that stopped reaching
+            # the file.
+            if [ "$n" -lt 1 ]; then
+              echo "::error::derived no waived test binaries for $crate: the parse is not reaching the inventory"
+              exit 1
+            fi
+            total=$((total + n))
+            echo "building $n waived test binaries for $crate"
+            printf '%s\n' "$names" | sed 's/^/--test /' \
+              | xargs cargo test --locked -p "$crate" --no-run
+          done
+          if [ "$total" -lt 10 ]; then
+            echo "::error::derived only $total waived test binaries across both crates, expected at least 10"
+            exit 1
+          fi
+          echo "built $total waived test binaries for the gate"
+
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
