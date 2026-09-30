@@ -11,11 +11,11 @@ document; when a row and the file's own header disagree, the header wins; fix th
   program). Run per crate, and shared-memory binaries individually.
 - `cargo test -p cerulion_core` runs binaries one after another, but each binary's tests
   run on parallel threads; that is exactly what the `tt1` rows cannot tolerate.
-- CI SHARDS this crate 4 ways on Linux and 2 ways on macOS.
+- CI SHARDS this crate 4 ways on Linux and 3 ways on macOS.
   `./tools/scripts/ci_test_shard.sh cerulion_core <n> <count>` enumerates `tests/*.rs` at
   depth 1 and takes every file whose position is `index mod count`, so a new test file
   joins a shard with nothing to edit, with ONE named exception: the script PINS
-  `macro_compile_fail_test` to shard `PINNED_SHARD % count` (2 of 4 on Linux, 0 of 2 on
+  `macro_compile_fail_test` to shard `PINNED_SHARD % count` (2 of 4 on Linux, 2 of 3 on
   macOS), because that trybuild harness is the serial tail: one test that is essentially the
   whole of whichever quarter holds it. Unpinned, its position shifts whenever any unrelated
   test file is added, moving which runner is the critical path. Its SIZE is a per-run
@@ -25,7 +25,7 @@ document; when a row and the file's own header disagree, the header wins; fix th
   `cargo nextest run --profile ci` (install: `tools/scripts/install_nextest.sh`). It does
   NOT pass `--test-threads=1`, and the absence is deliberate: nextest gives each test its
   own PROCESS, and what genuinely cannot run beside a sibling is fenced BY NAME in
-  `.config/nextest.toml` instead. Every shard (four on Linux, two on macOS) is the
+  `.config/nextest.toml` instead. Every shard (four on Linux, three on macOS) is the
   pre-merge bar; one shard is a targeted smoke check.
 - Most binaries here mint a per-test SHM root (`init_for_test` / `generate_isolated_config`
   / `build_for_test`) and share no namespace with anything, so they run in parallel under
