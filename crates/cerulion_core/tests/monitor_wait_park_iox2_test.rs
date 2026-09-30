@@ -71,7 +71,7 @@ const EXT_TOPIC: &str = "/mwp/ext";
 ///
 /// # Why this exists
 ///
-/// A doorbell's backing object is named `/cer_db_{ns}_{fnv(topic)}` — a PURE
+/// A doorbell's backing object is named from `(ns, topic)` alone, by a PURE
 /// function of `(ns, topic)`, carrying no pid and no randomness. With one
 /// hardcoded `ns` (say `"mwp"`) every test here would map the SAME
 /// physical page.
@@ -872,15 +872,18 @@ fn run_live_emits_wait_policy_line_with_active_park() {
 // The DEGRADED park tier is the macOS/no-primitive DEFAULT.
 //
 // Under that default the CLI resolver arms `MonitorWaitPolicy::new(true,
-// false, ns)` (park ON, doorbell FORCED OFF) by default for live runs on
-// no-primitive targets — exactly the policy this test builds with. On such a target
-// the park degrades to the CHUNKED ~100µs bounded sleep-recheck (never a
+// false, ns)` (park ON, doorbell FORCED OFF) for a live run on a no-primitive
+// target where NO consumer can kernel-block on a doorbell, exactly the policy
+// this test builds with. On macOS 14.4 and later the resolver arms the doorbell
+// too, which is a different shape and the park test's own arms cover it. On this
+// one the park degrades to the CHUNKED ~100µs bounded sleep-recheck (never a
 // busy-spin; a single-sleep alternative measures a timer-coalesced NULL on
 // macOS — chunked is the only production shape).
 // ===========================================================================
 
 /// End-to-end: a LIVE runtime under the no-primitive DEFAULT policy shape
-/// (park ON, doorbell OFF — what the CLI resolver emits on a no-primitive target) PARKS
+/// (park ON, doorbell OFF, what the CLI resolver emits on a no-primitive target
+/// with no wake word to block on) PARKS
 /// (`park_entry_count_for_test > 0`) and still fires + DELIVERS: the consumer
 /// observes the hand oracle `1.0..=N` (never a self-compare). The park is a
 /// WAIT primitive — it must change WHEN the loop wakes, never WHAT fires.

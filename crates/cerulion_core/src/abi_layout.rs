@@ -98,7 +98,7 @@
 //!   cdylib are built together on one machine. Pinning their sizes here would
 //!   pin the platform, not the ABI.
 //! - **`crate::doorbell::Doorbell`** (held by value as `Option<Doorbell>` in
-//!   `CerulionPublisher`) — it has TWO `#[cfg]`-selected definitions with
+//!   `CerulionPublisher`) has THREE `#[cfg]`-selected definitions with
 //!   different field sets, so a portable field-set pin would need per-platform
 //!   tables. Its parent's field set is pinned; its own is not.
 //! - **The closure BELOW `TransportManager`.** The manager itself IS pinned
@@ -290,8 +290,8 @@ const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
      modules";
 const IOX2_PORTS_AND_DOORBELL: &str =
-    "embeds iceoryx2 port types by value AND `Option<crate::doorbell::Doorbell>`, which has two \
-     `#[cfg]`-selected definitions";
+    "embeds iceoryx2 port types by value AND `Option<crate::doorbell::Doorbell>`, which has \
+     several `#[cfg]`-selected definitions";
 const IOX2_SAMPLE: &str = "embeds an iceoryx2 `Sample` / `UniquePublisherId` by value";
 const STD_MUTEX: &str = "embeds `std::sync::Mutex`, whose inner lock is platform-specific";
 const IOX2_NODE_AND_MUTEXES: &str =

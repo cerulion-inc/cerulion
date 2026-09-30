@@ -185,12 +185,18 @@ pub(crate) fn os_sync_errno_is_unrecoverable(errno: i32) -> bool {
 /// Classify a failing `os_sync_wake_by_address_all` errno as EXPECTED: the
 /// wake found nobody to wake.
 ///
-/// `ENOENT` is documented by the header as "No waiter(s) found waiting on the
-/// @addr", and it is the ORDINARY outcome of a `parked`-gated wake rather than
-/// an anomaly: every claim is set before its thread reaches the kernel, a claim
-/// held across a skipped block has no waiter behind it at all, and a consumer
-/// killed inside its block leaves its claim set for good. Logging it would put a
-/// line on the publish path for a healthy run.
+/// MEASURED rather than read off the header, because the header does not settle
+/// it: it lists `ENOENT` ("No waiter(s) found waiting on the @addr") under
+/// `os_sync_wake_by_address_any` only, and under `_all`, the symbol this backend
+/// resolves, it defers to `os_sync_wait_on_address`'s list, which omits `ENOENT`.
+/// A probe waking `_all` with nobody waiting returns `ENOENT` on this target, so
+/// `_all` behaves like `_any` here.
+///
+/// It is the ORDINARY outcome of a `parked`-gated wake rather than an anomaly:
+/// every claim is set before its thread reaches the kernel, a claim held across a
+/// skipped block has no waiter behind it at all, and a consumer killed inside its
+/// block leaves its claim set for good. Logging it would put a line on the publish
+/// path of a healthy run.
 ///
 /// Pure, so the classification is oracle-testable without a syscall seam.
 pub(crate) fn os_sync_wake_errno_is_expected(errno: i32) -> bool {

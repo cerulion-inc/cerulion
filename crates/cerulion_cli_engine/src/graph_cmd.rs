@@ -6123,9 +6123,11 @@ pub fn graph_run(
             // (mirrors `env_lock`/`env_us` above). On a non-WAITPKG / non-Linux
             // host (e.g. aarch64 macOS) `monitor_wait_available()` is
             // false and the resolver arms the DEGRADED park,
-            // default-ON for live: monitor_wait per the arm-3 flag ladder,
-            // doorbell forced off; the runtime park runs the chunked ~100µs
-            // bounded sleep-recheck (never a busy-spin).
+            // default-ON for live: monitor_wait per the arm-3 flag ladder, and
+            // the doorbell where a consumer can kernel-block on one. The
+            // runtime park blocks on the doorbell's wake word where it armed,
+            // and otherwise runs the chunked ~100µs bounded sleep-recheck
+            // (never a busy-spin).
             let env_monitor_wait = std::env::var(MONITOR_WAIT_ENV).ok();
             let env_doorbell = std::env::var(DOORBELL_ENV).ok();
             let mw_policy = resolve_monitor_wait_policy(MonitorWaitInputs {

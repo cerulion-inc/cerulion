@@ -166,7 +166,8 @@ fn unique_suffix() -> u64 {
         .expect("clock")
         .as_nanos() as u64;
     // The pid term is LOAD-BEARING, not decoration: doorbell pages are
-    // `/cer_db_{ns}_{fnv(topic)}` under the SHARED `default_namespace()`,
+    // a pure function of the namespace and the topic under the SHARED
+    // `default_namespace()`,
     // and under nextest each test is its own concurrent PROCESS — so
     // cross-process page uniqueness rides the TOPIC, which this suffix
     // makes pid-scoped by construction (the serial-discipline walk's

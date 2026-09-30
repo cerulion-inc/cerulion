@@ -2330,7 +2330,7 @@ fn the_doctest_reader_finds_only_the_blocks_that_execute() {
 //
 // Everything above this point is about ONE machine-global namespace: the
 // DEFAULT iceoryx2 SHM root. There is a SECOND, and it bit before this gate
-// existed. A doorbell's backing object is `/cer_db_{ns}_{fnv(topic)}` and a
+// existed. A doorbell's backing object is named from `(ns, topic)` alone and a
 // barrier's is `/cer_bar_{fnv(ns/topic)}` — pure functions of the namespace
 // string, carrying no pid and no randomness — so two PROCESSES that pass the
 // same `ns` map the same `/dev/shm` page no matter how carefully isolated
@@ -2339,10 +2339,12 @@ fn the_doctest_reader_finds_only_the_blocks_that_execute() {
 // Under `cargo test -- --test-threads=1` that was unreachable: one binary is
 // one process running its tests in sequence. Under nextest each test is its
 // own process and they run CONCURRENTLY, which is how
-// `monitor_wait_park_iox2_test`'s Linux-only doorbell RINGER (ringing every
+// `monitor_wait_park_iox2_test`'s doorbell RINGER (ringing every
 // 200 us) came to share a page with the sibling test that asserts the doorbell
-// counter is ZERO: 2 CI failures out of 2, byte-identical, never reproducible
-// on macOS — where the ring is a stub and the ringer is `cfg`-compiled out.
+// counter is ZERO: 2 CI failures out of 2, byte-identical. It was Linux-only
+// when it was found, because the ringer was compiled out elsewhere; the ringer
+// now runs wherever a real page is mapped, so the collision is reachable on
+// macOS too.
 //
 // The repo already knew the rule and wrote it down TWICE — `doorbell.rs`'s own
 // `test_ns` and `barrier_park_wake_iox2_test.rs`'s `barrier_ns`, both
@@ -2729,7 +2731,7 @@ const SHM_NS_EXEMPTIONS: &[(&str, &str)] = &[
          lifecycle for the stale-bell re-map pin) — a pid-scoped namespace would unlink a \
          page nobody armed and the pin would never fire. Cross-process page uniqueness rides \
          the TOPIC instead: the file's `unique_suffix()` embeds `process::id()`, so the \
-         `/cer_db_{ns}_{fnv(topic)}` name is pid-scoped through its topic term",
+         `cer_db_*` name is pid-scoped through its topic term",
     ),
 ];
 
@@ -3117,12 +3119,13 @@ fn a_posix_shm_namespace_is_pid_scoped_or_declared_unique() {
     assert!(
         violations.is_empty(),
         "a POSIX-SHM namespace in a `tests/` file is not pid-scoped:\n{}\n\nA doorbell object is \
-         `/cer_db_{{ns}}_{{fnv(topic)}}` and a barrier's is `/cer_bar_{{fnv(ns/topic)}}` — pure \
+         named from `(ns, topic)` and a barrier's is `/cer_bar_{{fnv(ns/topic)}}`: pure \
          functions of the namespace, with no pid in them. Under nextest each test is its own \
          PROCESS running CONCURRENTLY with its siblings, so two tests passing the same namespace \
          map the SAME `/dev/shm` page however isolated their iceoryx2 roots are. That is not \
          hypothetical: it is what made `monitor_wait_park_iox2_test`'s doorbell ringer collide \
-         with the sibling asserting the doorbell counter is ZERO — 2 of 2 CI runs, Linux only.\
+         with the sibling asserting the doorbell counter is ZERO, 2 of 2 CI runs, on Linux, \
+         and reachable wherever a real page is mapped.\
          \n\nFIX: derive the namespace from `std::process::id()`, as `doorbell.rs`'s `test_ns` \
          and `barrier_park_wake_iox2_test.rs`'s `barrier_ns` already do:\n\n    fn my_ns(tag: \
          &str) -> String {{ format!(\"mine_{{}}_{{tag}}\", std::process::id()) }}\n\nA per-test \

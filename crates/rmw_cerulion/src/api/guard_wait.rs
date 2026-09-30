@@ -345,8 +345,8 @@ enum Phase {
 pub enum ParkHorizon {
     /// No park tier: every block is the fd/`ppoll` kernel wait. The x86
     /// default (measured faster at 2 ms and 10 ms), Linux without a
-    /// primitive (a sleep-recheck park is pointless), and off Linux (the
-    /// doorbell is a stub).
+    /// primitive (a sleep-recheck park is pointless), and off Linux, where no
+    /// ring wakes this park (see [`RING_WAKES_THE_PARK`]).
     NoPark,
     /// Park ONCE per call, for at most the ladder's first rung, then hand
     /// the rest of the idle to the fd/ppoll kernel block. The shape a
@@ -362,7 +362,7 @@ pub enum ParkHorizon {
 
 /// The shipped PLATFORM default (compile-time: Linux aarch64 is always
 /// `WFE`; Linux x86_64 is `UMWAIT` or nothing, both measured slower than
-/// the kernel wait; off Linux the doorbell is a stub).
+/// the kernel wait; off Linux no ring wakes this park).
 pub fn park_policy() -> ParkHorizon {
     if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         ParkHorizon::ThroughRung
