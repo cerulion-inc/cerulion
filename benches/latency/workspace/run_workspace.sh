@@ -529,7 +529,11 @@ SIZES_RAW=(${CER_BENCH_PAYLOAD_SIZES:-$DEFAULT_SIZES})
 PAYLOAD_CEILING_BYTES=16777216
 MAX_SIZE_DIGITS=10
 SIZES=()
-for tok in "${SIZES_RAW[@]}"; do
+# Guarded like the three below. A whitespace-only `CER_BENCH_PAYLOAD_SIZES` is
+# non-empty, so `:-` does not substitute and the split yields zero tokens; under
+# bash 3.2 the unguarded form then aborted here with `SIZES_RAW[@]: unbound
+# variable`, BEFORE the refusal written for exactly that input a few lines down.
+for tok in ${SIZES_RAW[@]+"${SIZES_RAW[@]}"}; do
     case "$tok" in
         ''|*[!0-9]*)
             echo "run_workspace.sh: CER_BENCH_PAYLOAD_SIZES entry '$tok' is not a decimal integer" >&2
@@ -1043,8 +1047,11 @@ run_size_once() {
     # separate process that parks at zero demand and is not part of the
     # measured SHM chain; suppressing it would measure a shape no flagless
     # user gets. The env below is measurement INSTRUMENTATION only, never
-    # run SHAPE. IOX2_LOG_LEVEL=error keeps the connection-flood needle at
-    # a surfaced level for the guard below. DMA_ENV is the ONE deliberate
+    # run SHAPE. IOX2_LOG_LEVEL=error pins iceoryx2's level so an ambient
+    # setting cannot perturb the measurement. It does NOT keep the
+    # connection-flood needle visible for the guard below, and that guard is
+    # INERT as a result: every emission of the needle is warn or debug level,
+    # both below error, so the count it scans for is always zero. Filed. DMA_ENV is the ONE deliberate
     # host-tuning toggle (CER_BENCH_DMA_LOCK, resolved once above): present
     # = the graph holds the C-state cap; absent = stock mode.
     # CER_BENCH_TARGET_SAMPLES = MEASURED (G1): the latency node collects
@@ -1063,7 +1070,16 @@ run_size_once() {
         CER_BENCH_RAW_DUMP_DIR="$CER_BENCH_RAW_DUMP_DIR"
         CER_BENCH_RAW_NAME="$CER_BENCH_RAW_NAME"
         IOX2_LOG_LEVEL=error
-        "$CERULION" graph run "$GRAPH" --release "${LEG_FLAGS[@]}" "${PACING_FLAGS[@]}")
+        # Guarded like `DMA_ENV` above, and for the same reason: under `set -u`
+        # bash 3.2, which is the only bash on a stock macOS host, refuses
+        # `"${ARR[@]}"` when ARR is EMPTY. `PACING_FLAGS` is empty for a pacing
+        # mode that takes no flag and `LEG_FLAGS` for a leg that takes none, so
+        # the unguarded form made this script unrunnable on any Mac without a
+        # Homebrew bash. That is a SEPARATE blocker from the `timeout` the
+        # watchdog needs above, which this does not supply.
+        "$CERULION" graph run "$GRAPH" --release \
+            ${LEG_FLAGS[@]+"${LEG_FLAGS[@]}"} \
+            ${PACING_FLAGS[@]+"${PACING_FLAGS[@]}"})
 
     # Usage sidecar (CER_BENCH_USAGE=1): start the sampler right before the
     # run so the ONLY descendants of this shell in its window are the
@@ -1093,7 +1109,11 @@ run_size_once() {
             > "$RUN_LOG" 2>&1
         RUN_STATUS=$?
     else
-        "$TIMEOUT_BIN" --kill-after=10 "$WATCHDOG_SECS" "${CHRT_PREFIX[@]}" \
+        # `CHRT_PREFIX` is EMPTY on the DEFAULT path, every host included: it is
+        # populated only when `CER_BENCH_CHRT` asks for it. So this expansion
+        # needs the same bash 3.2 guard.
+        "$TIMEOUT_BIN" --kill-after=10 "$WATCHDOG_SECS" \
+            ${CHRT_PREFIX[@]+"${CHRT_PREFIX[@]}"} \
             "${RUN_CMD[@]}" \
             > "$RUN_LOG" 2>&1
         RUN_STATUS=$?
