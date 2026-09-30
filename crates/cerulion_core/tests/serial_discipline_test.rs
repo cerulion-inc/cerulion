@@ -1249,8 +1249,11 @@ fn shard_script_package(line: &str) -> Option<String> {
 /// nightly mirrors kept outside this tree), none carrying
 /// `--test-threads=1`. Folded in, they flip `cerulion_core` to PARALLEL and the
 /// gate reports ~20 files as violations — every one of which CI really does run
-/// single-threaded, through `tools/scripts/ci_test_shard.sh` (which applies the flag
-/// unconditionally at its `exec cargo test "$@" -- --test-threads=1`).
+/// under nextest, through `tools/scripts/ci_test_shard.sh`, whose policy
+/// `script_thread_policy` reads out of the script's own text: it strips each
+/// line's comment, folds every line that runs tests and keeps the WEAKEST, and
+/// the one such line there is `exec cargo nextest run --profile … "$@"`, which
+/// gives each test its own process.
 ///
 /// Deliberately NARROW: it excludes one INVOCATION FORM that provably cannot
 /// reach a `tests/` file. It exempts no package and no file — a genuinely

@@ -17,7 +17,7 @@ document; when a row and the file's own header disagree, the header wins; fix th
   joins a shard with nothing to edit, with ONE named exception: the script PINS
   `macro_compile_fail_test` to shard `PINNED_SHARD % count` (2 of 4 on Linux, 2 of 3 on
   macOS), because that trybuild harness is the serial tail: one test that is essentially the
-  whole of whichever quarter holds it. Unpinned, its position shifts whenever any unrelated
+  whole of whichever shard holds it. Unpinned, its position shifts whenever any unrelated
   test file is added, moving which runner is the critical path. Its SIZE is a per-run
   measurement this doc does not restate: the reading lives in `PINNED_TEST` in that script,
   which is also where the bar for adding a second pinned name lives. `--check` proves the

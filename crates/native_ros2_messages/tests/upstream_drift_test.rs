@@ -112,8 +112,8 @@
 //! # Refreshing
 //!
 //! ```text
-//! ./tools/scripts/refresh_upstream_msg_manifest.sh          # re-fetch + rewrite
-//! git diff native_ros2_messages/upstream_msg_manifest.txt   # review it
+//! ./tools/scripts/refresh_upstream_msg_manifest.sh                 # re-fetch + rewrite
+//! git diff crates/native_ros2_messages/upstream_msg_manifest.txt   # review it
 //! ```
 
 use cerulion_core::codegen::{parse_rosmsg, FieldType};

@@ -218,13 +218,13 @@
 #                         file: the token `AGENTS.md` or `CLAUDE.md` in the
 #                         RAW text of README.md, CHANGELOG.md, docs/ outside
 #                         docs/internals/, a .md under examples/ or .github/,
-#                         or a crates/*/README.md. Raw text and not the prose
-#                         view: such a path ships backticked. A file whose own
-#                         basename is one of the two names is out of the scan
-#                         BY NAME, whatever it holds, so `docs/AGENTS.md` and
-#                         the `docs/CLAUDE.md` include shim are silent. One
-#                         finding per line, and the summary line says how many
-#                         files the rule ran over.
+#                         or a README.md anywhere under crates/. Raw text and
+#                         not the prose view: such a path ships backticked. A
+#                         file whose own basename is one of the two names is
+#                         out of the scan BY NAME, whatever it holds, so
+#                         `docs/AGENTS.md` and the `docs/CLAUDE.md` include
+#                         shim are silent. One finding per line, and the
+#                         summary line says how many files the rule ran over.
 #   string-literal-rewrite This one cannot be a tree check. A bulk edit that
 #                         strips a token turns "/cer561pos/producer/out" into
 #                         "/producer/out" inside a test's string literal and

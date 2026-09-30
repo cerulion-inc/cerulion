@@ -1319,8 +1319,10 @@ def check_numbers(root, files):
 # The two names an agent instruction file is spelled with, and the token shape
 # that finds one named inside a page. A path separator or an include marker may
 # sit in front of the token (`crates/x/AGENTS.md`, `@AGENTS.md`), a filename
-# character may not, on either side: `MY_AGENTS.md` and `AGENTS.mdown` are other
-# files.
+# character may not: `MY_AGENTS.md` and `AGENTS.mdown` are other files. The two
+# guards are ASYMMETRIC about `.`: the lookbehind refuses it, so `x.AGENTS.md`
+# is another file, and the lookahead permits it, so a sentence-final
+# `AGENTS.md.` is the token and `AGENTS.md.bak` carries it too.
 AGENT_FILE_NAMES = ("AGENTS.md", "CLAUDE.md")
 AGENT_FILE_RE = re.compile(r"(?<![A-Za-z0-9_.-])(" + "|".join(re.escape(n) for n in AGENT_FILE_NAMES)
                            + r")(?![A-Za-z0-9_-])")
@@ -1897,6 +1899,9 @@ def build_fixture(root):
     _put(root, "docs/AGENTS.md", "This guide points at `crates/x/AGENTS.md`.\n")
     # docs/internals/ is outside is_user_facing, so the same mention is silent.
     _put(root, "docs/internals/gates.md", "The gate list is in `crates/cerulion_core/AGENTS.md`.\n")
+    # Excluded by BASENAME, at a path no hand-written path list would hold: an
+    # implementation comparing whole paths reports this file and fails its arm.
+    _put(root, ".github/nested/deep/AGENTS.md", "A nested guide names `crates/y/AGENTS.md`.\n")
     _put(root, "docs/PERFORMANCE.md", "# Performance\n\nThe 64 B p50 is 4.08 µs.\n")
     _put(root, "docs/media/used.svg", "<svg/>\n")
     _put(root, "docs/media/orphan.png", "PNG-ish text\n")
@@ -2043,10 +2048,13 @@ def self_test(out=sys.stdout):
         and not any(is_user_facing(f) for f in ("AGENTS.md", "docs/internals/design.md", "examples/go2/nodes/n/src/lib.rs", "crates/cerulion_bag/AGENTS.md",
                                                 "crates/cerulion_bag/src/lib.rs", ".github/workflows/ci.yml", "tools/scripts/install.sh")))
     # The token is a whole filename: a path separator or an include marker may
-    # sit in front of it, a filename character may not, on either side.
-    agent_probe = "crates/x/AGENTS.md @AGENTS.md AGENTS.md docs/CLAUDE.md MY_AGENTS.md AGENTS.mdown xCLAUDE.md"
+    # sit in front of it, a filename character may not, and `.` is refused in
+    # front and permitted behind.
+    agent_probe = ("crates/x/AGENTS.md @AGENTS.md AGENTS.md docs/CLAUDE.md MY_AGENTS.md AGENTS.mdown xCLAUDE.md"
+                   " AGENTS.md. x.AGENTS.md AGENTS.md.bak")
     arm("agent-file-token-oracle",
-        [m.group(1) for m in AGENT_FILE_RE.finditer(agent_probe)] == ["AGENTS.md", "AGENTS.md", "AGENTS.md", "CLAUDE.md"],
+        [m.group(1) for m in AGENT_FILE_RE.finditer(agent_probe)]
+        == ["AGENTS.md", "AGENTS.md", "AGENTS.md", "CLAUDE.md", "AGENTS.md", "AGENTS.md"],
         repr([m.group(0) for m in AGENT_FILE_RE.finditer(agent_probe)]))
     arm("work-state-exclusions",
         all(WORKSTATE_EXCLUDE_RE.search(f) for f in ("docs/benchmarks/results/pkg/run.log", "Cargo.lock", "examples/go2/Cargo.lock", "docs/legal/HISTORY.md",
@@ -2188,6 +2196,15 @@ def self_test(out=sys.stdout):
         [x.group(0) for x in legal_name_mentions("Acme Robotics Co., Ltd.").finditer("Acme Robotics Co., Ltd.")]
         == ["Acme Robotics Co., Ltd."])
     arm("one-sig-fig", all(ONE_SIG_FIG_RE.match(x) for x in ("100", "10", "2", "500")) and not any(ONE_SIG_FIG_RE.match(x) for x in ("87", "104", "4.08", "311")))
+    # The shell header opens with the class count as a WORD, hand-written beside
+    # `len(CLASSES)`. The arm reads that line and maps the word through a table;
+    # a word the table does not hold is a failure, not a pass.
+    count_words = {"seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+    header_line = open(os.path.join(here_root, "tools/scripts/check_public_surface.sh"), encoding="utf-8").read().split("\n")[3]
+    header_words = header_line.split()
+    arm("the-shell-header-counts-the-classes-the-table-holds",
+        len(header_words) > 1 and count_words.get(header_words[1].lower()) == len(CLASSES),
+        "%r against %d classes" % (header_line, len(CLASSES)))
     with tempfile.TemporaryDirectory(prefix="public-surface-selftest-") as tmp:
         root = os.path.join(tmp, "tree")
         os.makedirs(root)
@@ -2213,7 +2230,8 @@ def self_test(out=sys.stdout):
                      "crates/lib_ledgered/src/lib.rs", "crates/lib_clean/src/lib.rs", "crates/lib_clean/tests/it.rs",
                      "crates/test_fixtures/fx/src/lib.rs", "crates/lib_new/Cargo.toml", "CHANGELOG.md", "docs/media/used.svg",
                      "docs/benchmarks/results/pkg-cited", "benches/latency", "docs/PERFORMANCE.md", "examples/good_ws/README.md",
-                     "docs/CLAUDE.md", "docs/AGENTS.md", "docs/internals/gates.md"):
+                     "docs/CLAUDE.md", "docs/AGENTS.md", "docs/internals/gates.md",
+                     ".github/nested/deep/AGENTS.md"):
             arm("control:" + path, not any(l.startswith(path + ":") for l in findings), "\n" + text)
         # A control is a substring that must NOT appear in the findings. Deleting
         # the fixture text it controls would make it pass while proving nothing,
@@ -2231,7 +2249,8 @@ def self_test(out=sys.stdout):
                           ("Acme Systems Corp.", "crates/lib_clean/tests/it.rs"),
                           ("@AGENTS.md", "docs/CLAUDE.md"),
                           ("crates/x/AGENTS.md", "docs/AGENTS.md"),
-                          ("crates/cerulion_core/AGENTS.md", "docs/internals/gates.md")):
+                          ("crates/cerulion_core/AGENTS.md", "docs/internals/gates.md"),
+                          ("crates/y/AGENTS.md", ".github/nested/deep/AGENTS.md")):
             body = open(os.path.join(root, ctl_rel), encoding="utf-8").read()
             arm("control-text-is-in-the-fixture:" + ctl_text.strip()[:34], ctl_text.strip() in body, ctl_rel)
         for sub in ("`cerulion graph run`", "`cerulion graph validate`", "`cerulion graph run-worker`", "`cerulion ros`", "`cerulion viz`",
@@ -2240,7 +2259,7 @@ def self_test(out=sys.stdout):
                     "Eclipse Foundation", "Willow Garage", "MyAcme", "Incidentally", "Acme Systems Corp.",
                     "Co-operative", "works with Foo", "Acme Robotics Systems", "Acme Robotics Inc.",
                     "git revert <this commit>", "does not reverse this commit",
-                    "docs/CLAUDE.md", "crates/x/AGENTS.md", "docs/internals/"):
+                    "docs/CLAUDE.md", "docs/AGENTS.md:", "docs/internals/"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
         # its own key, and the legitimate neighbour fires no key at all.
@@ -2469,7 +2488,8 @@ def self_test(out=sys.stdout):
             and "docs/" not in regenerated.split("#")[-1] and "ws_gone" not in regenerated, regenerated)
     out.write("check_public_surface --self-test: OK (%d arms: %d expected findings, the negative controls, the verb-tree oracle, the lexer, the fail-closed and ledger arms, "
               "and for work-state every key caught and their neighbours silent, the ledger at, above and below its count, the user-facing page nobody may ledger, "
-              "for agent-file-ref the planted mentions, the two files excluded by name beside the same line under another name and the internals page outside the rule, "
+              "for agent-file-ref the planted mentions, the files excluded by name (two beside the same line under another name, one at a nested path) and the internals page "
+              "outside the rule, the shell header's class count against the class tuple, "
               "the malformed and the missing pattern file, the allow list before the count, and the pool against one process [%s])\n" % (arms, len(EXPECTED), pooled_mode))
     return 0
 
