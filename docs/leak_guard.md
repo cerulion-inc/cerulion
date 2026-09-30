@@ -5,12 +5,14 @@ file and branch names, commit messages, commit identities, pull request titles a
 bodies, and the images and clips under `docs/media`. The leak guard is one scanner,
 `tools/scripts/leak_scan.py` (stdlib Python 3, no dependencies), that keeps machine
 names, addresses, home paths, logins, people and location metadata out of all of it.
-It runs in three places: the git hooks on your machine, the `lint` job of the main CI
-workflow, and the `Leak guard` workflow on every pull request, merge queue batch and
-push to `main`, and on every issue and comment body as it is written or edited. The
-messages job scans in two runs that both always happen and whose results combine: the
-commit range and the pull request title under the full hard set, and the pull request body
-under the conversation hard set.
+It runs in four places: the git hooks on your machine, the `lint` job of the main CI
+workflow, the tree, names, messages and media scans in the `Leak guard` workflow
+(`.github/workflows/leak-guard.yml`) on every pull request, merge queue batch and push
+to `main`, and the issue and comment body scan in the `Leak guard (issue and comment
+bodies)` job of `.github/workflows/leak-guard-conversation.yml` as a body is written or
+edited. The messages job scans in two runs that both always happen and whose results
+combine: the commit range and the pull request title under the full hard set, and the
+pull request body under the conversation hard set.
 
 A body is public the moment it is written and no check runs before it is, so that last
 job cannot block anything. It reads EVERY author, bots included. A bot restates a diff and

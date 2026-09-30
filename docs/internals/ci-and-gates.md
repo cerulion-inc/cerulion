@@ -282,14 +282,19 @@ reaches by `path`.
 `tools/scripts/leak_scan.py` keeps machine names, addresses, home paths, logins, people and
 location metadata out of everything the repository publishes: file contents, path and branch
 names, commit messages and identities, pull request text, and media containers. It runs in
-three places. The `lint` job runs its self-test and then a whole-tree scan with the GENERIC
+four places. The `lint` job runs its self-test and then a whole-tree scan with the GENERIC
 classes only (`--no-private`, because that job holds no secret); both steps block CI.
 `.github/workflows/leak-guard.yml` runs with the private tier as a repository secret mapped
 at step level:
 changed files and added names, commit messages plus pull request title and body (through
 environment variable names, never interpolated), and media metadata, on every pull request,
-merge queue batch, push to `main` and manual run. The git hooks (`tools/hooks`, installed by
-`tools/scripts/install_hooks.sh`) run the same scanner before a commit exists.
+merge queue batch and push to `main`. Its three job names are required contexts and every
+run writes a check run under each of them, so it triggers on those three events and on no
+other. `.github/workflows/leak-guard-conversation.yml` runs the
+`Leak guard (issue and comment bodies)` job on `issues`, `issue_comment` and
+`pull_request_review_comment`, scanning the body the event carries; that name is required
+by nothing, which is what lets it run on those events. The git hooks (`tools/hooks`,
+installed by `tools/scripts/install_hooks.sh`) run the same scanner before a commit exists.
 
 The two-tier shape is the agent-docs gate's, with one stricter output contract: a private hit
 prints the file, the line number and the pattern INDEX and nothing else, a generic hit on a line
@@ -354,17 +359,19 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 `merge_group` events like everything else: there is no cost gate, no routing expression
 and no stub job standing in for a skipped required check.
 
-`lint` gates six jobs: `docs` and `netd-wan`, which carry no condition of their own, and `fuzz`,
-`miri`, `test-latency` and `cli-e2e-latency`, which no pull request and no queued batch runs; a
-red `lint` saves their runner minutes. `crate-tests` and `viz-tests` depend on `lint` as well
-but are not gated by it: their `!cancelled()` guard replaces the implicit `success()` over the
-whole `needs:` set; GitHub offers no per-dependency form, so both run and report through a red
-`lint`, and the dependency buys the ordering alone. It does NOT gate the two that set the wall:
-`test-linux` and `test-macos`. Both list `changes` and nothing else in `needs:`, so both start
-after the classifier, which is a checkout and a path classification, about a minute, and no
-build. No REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so
-nothing in front of either job is a data dependency for compilation. A `lint` verdict was never
-one either, and while it gated them the wall was `lint` plus the longest test job instead of the
+`lint` gates the four push-only jobs that depend on it (`fuzz`, `miri`, `test-latency` and
+`cli-e2e-latency`), which no pull request and no queued batch runs; a red `lint` saves their
+runner minutes, and none of the four reports a required context. It gates none of the four
+dependants that DO report one (`docs`, `netd-wan`, `crate-tests`, `viz-tests`): each carries
+the `!cancelled()` guard, which replaces the implicit `success()` over the whole `needs:` set;
+GitHub offers no per-dependency form, so all four run and report through a red `lint`, and the
+dependency buys the ordering alone. A skipped required context counts as satisfied, which is
+what the guard is there to stop. It does NOT gate the two that set the wall: `test-linux` and
+`test-macos`. Both list `changes` and nothing else in `needs:`, so both start after the
+classifier, which is a checkout and a path classification, about a minute, and no build. No
+REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so nothing
+in front of either job is a data dependency for compilation. A `lint` verdict was never one
+either, and while it gated them the wall was `lint` plus the longest test job instead of the
 longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
@@ -608,7 +615,7 @@ before the checker reads the real files.
 | `tools/scripts/check_citation_release.sh` | citation version, calendar, and release-date window validation | n/a |
 | `crates/cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` | every member inherits the one lint table; the table's levels | no |
 | `crates/cerulion_cli_engine/tests/library_print_ban_test.rs` | every library crate carries the print ban | no |
-| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero | no |
+| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. The required names are read from `tools/ci/required_contexts.txt` | no |
 | `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches` or `examples`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |
