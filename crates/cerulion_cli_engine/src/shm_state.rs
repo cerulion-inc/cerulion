@@ -2576,7 +2576,7 @@ mod tests {
 
     /// The headline. Every `.shm_state` file MEASURED on a real desk
     /// (2,018 of 2,018) is a `<prefix><id>_node.<version>.global_mgmt`, the one
-    /// management segment an iceoryx2 NAMESPACE shares — so the creating pid is
+    /// management segment an iceoryx2 NAMESPACE shares. So the creating pid is
     /// merely whichever process opened the namespace first and says nothing at
     /// all about whether the segment is still in use. A namespace with a node
     /// registered must be refused; one with none stays reclaimable, which is

@@ -12,7 +12,7 @@
 //!
 //! iceoryx2 delivers an event notification over a per-listener `AF_UNIX
 //! SOCK_DGRAM` doorbell, and, because `notify_with_custom_event_id` passes
-//! `skip_self_deliver = false` — a publisher's notify is delivered to EVERY
+//! `skip_self_deliver = false`, a publisher's notify is delivered to EVERY
 //! listener on the topic's event service, **including the publisher's own**
 //! (each [`CerulionPublisher`](super::publisher::CerulionPublisher) owns one,
 //! to hear `SubscriberConnected`).

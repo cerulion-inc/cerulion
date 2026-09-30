@@ -2020,7 +2020,7 @@ fn generate_fixed_section_default_impl(
 /// Emit `Deref` / `DerefMut` for `<Name>Shm<'a>` targeting
 /// `<Name>FixedSection`, plus a static assertion that the FixedSection's
 /// alignment is `≤ 8` (so the post-WireHeader payload pointer, 8-aligned
-/// via the align-8 per-sample header whose size is a multiple of 8 plus the
+/// via the align-8 per-sample header, whose size is a multiple of 8, plus the
 /// 32-byte WireHeader, is always sufficient).
 fn generate_variable_shm_deref_impls(out: &mut String, shm_name: &str, fixed_section_name: &str) {
     // Static assertion: align(FixedSection) must be ≤ 8. The post-header

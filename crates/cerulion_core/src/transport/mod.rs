@@ -6980,8 +6980,11 @@ mod tests {
             "the JSON path reads the same full identity as the struct path"
         );
         // Hand oracle for the well-known iceoryx2 defaults, unchanged on the
-        // linked release, every
-        // discovery-keying field, so a codegen/default drift fails here loudly.
+        // linked release. Eight of the identity's nine fields are asserted here,
+        // so an upstream default change fails loudly. `root_path` is not
+        // hand-pinned: a rename of its JSON field is caught by the struct
+        // against JSON assert above, and an upstream change to its default value
+        // is caught by neither.
         assert_eq!(got.prefix, "iox2_", "default segment prefix");
         assert_eq!(got.service_dir, "services", "default service directory");
         assert_eq!(got.node_dir, "nodes", "default node directory");

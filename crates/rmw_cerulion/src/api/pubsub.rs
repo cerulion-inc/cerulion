@@ -3940,7 +3940,7 @@ unsafe fn take_loaned_impl(
         // but the subscriber-side loan contract is read-only: the mapping IS
         // read-only (iceoryx2 opens subscriber data segments
         // `AccessMode::Read`), so a caller writing through it faults loudly
-        // rather than corrupting the frame every other subscriber reads. That is
+        // rather than corrupting the frame every other subscriber reads —
         // inherent to the rmw loan ABI, not specific to this implementation.
         inner.pending_takes.push(runtime::PendingTake {
             key: ros_ptr as usize,

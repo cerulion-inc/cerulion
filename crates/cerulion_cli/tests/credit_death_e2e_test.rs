@@ -168,10 +168,15 @@ fn wait_until_live(stdout: &Path, stderr: &Path) {
 /// iceoryx2 lines.
 const IOX2_LEVEL: (&str, &str) = ("IOX2_LOG_LEVEL", "debug");
 
-/// The `tracing` directive that lets the bridged lines through. `info` is the
-/// default a runtime verb already runs at (`log_verb_class` in `main.rs`, where
-/// one-shot verbs take `warn` and long-running ones keep `info`), so only the
-/// iceoryx2 target moves.
+/// The `tracing` directive that lets the bridged lines through.
+///
+/// It is NOT the baseline plus one target. The runtime's own default is
+/// `cerulion=info` under a global ERROR floor (`log_verb_class` in `main.rs`,
+/// where one-shot verbs take `warn` and long-running ones keep `info`), and the
+/// baseline these two arms replace is the harness's per-crate spec, so besides
+/// moving iceoryx2 to debug this directive brings every target the baseline does
+/// not name up to `info`. The three the harness names are already there, and
+/// `zenoh::api::admin` is not lifted because the filter builder pins it off.
 const IOX2_FILTER: (&str, &str) = ("RUST_LOG", "info,iceoryx2=debug");
 
 /// The credit-word NAMESPACE this run created its words in, read from the

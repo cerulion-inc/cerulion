@@ -95,8 +95,8 @@ enum NotifyListenerCount {
 /// transition clears the arming immediately.
 ///
 /// The bound is what stops the opposite failure. A listener that attaches or
-/// dies WITHOUT ever sending a transition, a foreign observer, a consumer that
-/// crashed, would otherwise arm every publish for the life of the process.
+/// dies WITHOUT ever sending a transition (a foreign observer, a consumer that
+/// crashed) would otherwise arm every publish for the life of the process.
 /// While armed the cost is what every publish paid before this gate existed, so
 /// the budget is set well past any plausible create-then-notify gap rather than
 /// trimmed: it is spent only when the listener count actually moves.

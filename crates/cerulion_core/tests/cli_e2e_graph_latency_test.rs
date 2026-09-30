@@ -715,12 +715,17 @@ fn cerulion_bin_path(repo_root: &Path) -> PathBuf {
 /// A binary↔cdylib iceoryx2 VERSION SKEW (e.g. binary 0.9.1 vs a cdylib
 /// fresh-resolved to 0.9.2; see the Cargo.lock pin in step 3) breaks the
 /// shared-memory event protocol — the binary's Notifier cannot establish
-/// event connections to the cdylib's Listeners, emitting this exact
-/// error line at iceoryx2 ERROR level, often 100k+ times, while ZERO
-/// data flows. We KEEP `IOX2_LOG_LEVEL=error` on the child precisely so
-/// this error-level spam still surfaces, then assert (in `run_mode`) that
-/// the captured child stderr carries no flood of it. A handful during
-/// startup is tolerable; hundreds+ is the bug.
+/// event connections to the cdylib's Listeners, emitting this exact line
+/// many times while ZERO data flows, and `run_mode` asserts the captured
+/// child stderr carries no flood of it.
+///
+/// The assertion is INERT as the child is run today, and that is filed
+/// rather than fixed here. Every emission of this line is `warn!`, or
+/// `fail!`, which expands to `debug!`; the child is pinned at
+/// `IOX2_LOG_LEVEL=error`, which is below both, so the line never reaches
+/// stderr and the count is always zero. An earlier version of this comment
+/// had it the other way round, claiming the level is what makes the flood
+/// visible.
 const IOX2_CONN_FAIL_NEEDLE: &str = "Unable to establish connection";
 
 /// Max tolerated count of [`IOX2_CONN_FAIL_NEEDLE`] lines in the child's
@@ -813,9 +818,17 @@ fn run_mode(
         // run is permissive-by-default; the kill-switch env keeps this latency
         // gate LOCAL-ONLY so no network overlay perturbs the measurement).
         .env("CERULION_NETWORK", "off")
-        // Quiet iceoryx2's per-notification WARN spam on the CHILD only —
-        // but KEEP error level so the version-skew connection-failure flood
-        // (asserted-absent below) still surfaces in the captured stderr.
+        // Pin iceoryx2 at error on the CHILD so an ambient `IOX2_LOG_LEVEL`
+        // cannot perturb the measurement. It is NOT what makes the skew flood
+        // visible: every emission of this test's needle is `warn!` or `fail!`,
+        // which expands to `debug!`, so `error` suppresses the needle at
+        // iceoryx2's own level gate and the no-flood assertion below cannot
+        // fail. That is filed, not fixed here.
+        //
+        // The per-notification spam this env was first written for belonged to
+        // 0.9.1, where a notify into a full datagram socket took the failure
+        // path and warned per connection; 0.10 returns Ok for a full buffer and
+        // emits nothing.
         .env("IOX2_LOG_LEVEL", "error")
         .env("CER_BENCH_TARGET_SAMPLES", TARGET_SAMPLES.to_string())
         .env("CER_BENCH_WARMUP", WARMUP.to_string())
