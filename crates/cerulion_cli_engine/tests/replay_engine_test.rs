@@ -18251,6 +18251,185 @@ fn read_log_tamper_is_the_exit_6_schedule_verdict() {
     );
 }
 
+/// **The DIVERGED line and the block it points at are one claim.** One
+/// recording, one tamper, ONE re-tagged record apart: leg A's divergence is
+/// outside every quarantine and is the exit-6 verdict; leg B's is inside a
+/// node quarantine's scope, so it is reported, charged to nobody, and the run
+/// exits 0 with no DIVERGED line and no block. Leg A repeats the stimulus
+/// `read_log_tamper_is_the_exit_6_schedule_verdict` already pins, deliberately:
+/// it is leg B's control, and it is what makes the ONE re-tagged record the only
+/// difference between exit 6 and exit 0.
+///
+/// The line reads "read log: DIVERGED (see the EDGE-READ DIVERGENCE block
+/// above, which is this replay's exit-6 verdict)". While the status was set
+/// from the raw divergence list and the verdict filtered the quarantine, leg B
+/// printed exactly that sentence with no block above it and exited 0: the
+/// shape this arm makes unreachable by reading both off ONE filter.
+///
+/// THE CRAFT, and why it is the shape a real bag reaches. Both legs tamper
+/// EVERY kind-6 record's served seq, so the verifier retains exactly one
+/// divergence (an edge closes at its first) on `relay.inp` at step 0. Leg B
+/// then re-tags the step-3 record's `input_idx` to 1: the fixture's manifest
+/// list for `relay` is `["inp"]`, so index 1 is the uncoverable one, the
+/// mixed-version hole a bag whose manifest lost entries carries, and the
+/// verifier QUARANTINES the node at that step. Steps 0..3 were compared
+/// normally, which is where the divergence was already retained, so the report
+/// and the quarantine really do overlap. Neither bag carries a recorder
+/// attachment, so both replay as INFERRED lockstep: the read GATE is not armed
+/// on either, and the only thing that reads these records is the compare under
+/// test (no unmet read can supply the verdict leg B must not have).
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_divergence_the_quarantine_excludes_renders_no_diverged_line_and_exits_0() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+
+    let relay_idx = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let k6 = kind6_records(&rec);
+    assert!(
+        k6.iter().any(|r| r.1 == relay_idx && r.0 == 0) && k6.iter().any(|r| r.0 == 3),
+        "precondition (hand oracle): the fixture records relay at step 0, the \
+         step the divergence lands on, and at step 3, the step the re-tag \
+         quarantines from: {k6:?}"
+    );
+    let mut tampered = 0;
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+    {
+        r.fire_time_ns += 1000;
+        tampered += 1;
+    }
+    assert_eq!(tampered, steps, "every step's record tampered");
+
+    // ── LEG A: the divergence is outside every quarantine ⇒ DIVERGED, exit 6.
+    let bag_a = dir.path().join("readlog_unquarantined.mcap");
+    write_bag(&rec, &bag_a, None);
+    let a = replay(&bag_a, source_relay_factories, None, None).expect("leg A replays");
+    assert_edge_read_verdict(&a, "an unquarantined divergence");
+    assert_eq!(a.read_log, replay_engine::ReadLogStatus::Diverged);
+    assert!(
+        a.read_log_quarantine.is_empty(),
+        "leg A excludes nothing: {:?}",
+        a.read_log_quarantine
+    );
+    let verdict_a = replay_engine::render_verdict(&a, &bag_a);
+    assert!(
+        verdict_a.contains("read log: DIVERGED") && verdict_a.contains("EDGE-READ DIVERGENCE"),
+        "the status line and the block it points at render TOGETHER: {verdict_a}"
+    );
+
+    // ── LEG B: the same divergence, now inside a node quarantine's scope.
+    let mut retagged = 0;
+    for r in rec.trace.iter_mut().filter(|r| {
+        r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx && r.step == 3
+    }) {
+        let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
+        assert_eq!(
+            input_idx, 0,
+            "precondition: the fixture's one input is index 0, so 1 is the \
+             index its manifest list cannot cover"
+        );
+        r.global_level = pack_read_outcome_meta(1, kind, read_site_role(r.global_level));
+        retagged += 1;
+    }
+    assert_eq!(
+        retagged, 1,
+        "one record per step on this fixture's one edge"
+    );
+
+    let bag_b = dir.path().join("readlog_all_quarantined.mcap");
+    write_bag(&rec, &bag_b, None);
+    let report = dir.path().join("report.json");
+    let b =
+        replay(&bag_b, source_relay_factories, None, Some(report.clone())).expect("leg B replays");
+
+    // The finding is REPORTED, unfiltered, exactly as in leg A…
+    let rl = b
+        .read_log_divergence
+        .as_ref()
+        .expect("a quarantined finding still reaches the report");
+    assert_eq!(rl.diverging_edges, 1, "{rl:?}");
+    let e = &rl.edges[0];
+    assert_eq!(
+        (e.node_id.as_str(), e.input.as_str(), e.step),
+        ("relay", "inp", 0),
+        "the SAME edge and step leg A convicted on: {e:?}"
+    );
+    // …the quarantine covers it, dated at the re-tagged record's step…
+    assert_eq!(b.read_log_quarantine.len(), 1, "one quarantine entry");
+    let q = &b.read_log_quarantine[0];
+    assert_eq!(
+        (q.node_id.as_str(), q.input.as_ref(), q.step),
+        ("relay", None, 3),
+        "a NODE quarantine, dated at the record the manifest cannot resolve: {q:?}"
+    );
+    assert!(
+        logs_contain("read-log verifier is QUARANTINING this NODE"),
+        "the exclusion is LOUD, not a silent skip"
+    );
+    // …so it is charged to nobody: no verdict, exit 0, and a SCOPED clean claim.
+    assert_clean_verdict(&b, "a divergence the quarantine excludes");
+    assert_eq!(
+        b.read_log,
+        replay_engine::ReadLogStatus::VerifiedClean {
+            edges_compared: 1,
+            quarantined_nodes: 1,
+            quarantined_edges: 0,
+        },
+        "the edge WAS compared (over steps 0..3) and the claim is scoped by the \
+         node it stopped comparing: {:?}",
+        b.read_log
+    );
+    let verdict_b = replay_engine::render_verdict(&b, &bag_b);
+    assert!(
+        !verdict_b.contains("read log: DIVERGED"),
+        "the DIVERGED line must not render over a verdict-less run: {verdict_b}"
+    );
+    assert!(
+        !verdict_b.contains("EDGE-READ DIVERGENCE"),
+        "the block that line points at never renders here, which is why the \
+         line must not either: {verdict_b}"
+    );
+    assert!(
+        verdict_b.contains(
+            "read log: verified clean (1 edge(s) compared; 1 node(s) and 0 edge(s) QUARANTINED"
+        ),
+        "the clean claim RENDERS its scope: {verdict_b}"
+    );
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&b),
+            true
+        ),
+        0,
+        "the CLI's own classifier exits 0: {b:?}"
+    );
+    // The CLASS is still listed at exit 0, the documented pairing
+    // (`ReplayOutcome::divergence_classes`): the findings are in the report and
+    // the excluded rows in the quarantine, which is what the class points at.
+    assert_eq!(
+        b.divergence_classes,
+        vec![replay_engine::DivergenceClass::EdgeRead],
+        "{:?}",
+        b.divergence_classes
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(parsed["read_log"]["status"], "verified_clean");
+    assert_eq!(parsed["read_log"]["quarantined_nodes"], 1);
+    assert!(
+        parsed.get("read_log_verdict").is_none(),
+        "no verdict key on an exit-0 report: {parsed}"
+    );
+    assert_eq!(parsed["read_log_divergence"]["diverging_edges"], 1);
+    assert_eq!(parsed["read_log_quarantine"][0]["node_id"], "relay");
+}
+
 /// Re-stamp EXACTLY ONE kind-6 record's role — the first `DrainedBatch` on the
 /// `source_relay` fixture's `(relay, inp)` edge — leaving every other record's
 /// REAL role in place, and return the role it replaced.

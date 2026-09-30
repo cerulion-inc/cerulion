@@ -8369,21 +8369,16 @@ impl GraphRuntime {
                 match node_arc.lock() {
                     Ok(mut guard) => {
                         let (popped, latest_ts) = guard.refill_trigger_input(&refill_input);
-                        let empty_cause = if popped > 0 {
-                            crate::scheduler::RefillEmptyCause::NotEmpty
-                        } else if refill_gate
+                        // The WITNESS, not the cause: `drained` decides the
+                        // cause from the pop count and reads this only at a pop
+                        // of 0. This drain consults the gate once, before
+                        // anything pops, so a rise here already means nothing
+                        // popped; deriving the cause keeps that fact in ONE
+                        // place instead of restating it per caller.
+                        let withheld = refill_gate
                             .as_ref()
-                            .is_some_and(|g| g.refused_consults() > held_before)
-                        {
-                            crate::scheduler::RefillEmptyCause::EnforcedByReadPlan
-                        } else {
-                            crate::scheduler::RefillEmptyCause::Queue
-                        };
-                        crate::scheduler::RefillOutcome {
-                            popped,
-                            latest_ts,
-                            empty_cause,
-                        }
+                            .is_some_and(|g| g.refused_consults() > held_before);
+                        crate::scheduler::RefillOutcome::drained(popped, latest_ts, withheld)
                     }
                     Err(_) => {
                         // FAIL-SAFE: a poisoned node lock reports "nothing

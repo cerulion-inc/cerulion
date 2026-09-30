@@ -10,9 +10,7 @@ use std::time::Duration;
 
 use cerulion_core::clock::{Clock, VirtualClock};
 use cerulion_core::error::TransportError;
-use cerulion_core::scheduler::{
-    NodeConfig, RefillEmptyCause, RefillOutcome, Scheduler, TraceEntry, TriggerPolicy,
-};
+use cerulion_core::scheduler::{NodeConfig, RefillOutcome, Scheduler, TraceEntry, TriggerPolicy};
 use serial_test::serial;
 use tracing_test::traced_test;
 
@@ -1715,11 +1713,9 @@ fn the_per_step_fire_cap_bounds_a_refilled_burst_and_the_remainder_reports_due_n
                 RefillOutcome::empty_queue()
             } else {
                 remaining_hook.store(left - 1, Ordering::Relaxed);
-                RefillOutcome {
-                    popped: 1,
-                    latest_ts: Some(left),
-                    empty_cause: RefillEmptyCause::NotEmpty,
-                }
+                // No read plan drives this hook, so the withhold witness is
+                // false and the pop count decides the cause.
+                RefillOutcome::drained(1, Some(left), false)
             }
         })
         .unwrap();
@@ -1822,11 +1818,9 @@ fn a_fully_served_refilled_burst_raises_no_wake_hint() {
                 RefillOutcome::empty_queue()
             } else {
                 remaining_hook.store(left - 1, Ordering::Relaxed);
-                RefillOutcome {
-                    popped: 1,
-                    latest_ts: Some(left),
-                    empty_cause: RefillEmptyCause::NotEmpty,
-                }
+                // No read plan drives this hook, so the withhold witness is
+                // false and the pop count decides the cause.
+                RefillOutcome::drained(1, Some(left), false)
             }
         })
         .unwrap();
@@ -1887,11 +1881,7 @@ fn a_planned_fire_over_an_enforced_empty_refill_counts_neither_a_shortfall() {
     scheduler
         .set_trigger_refill("sink", "inp", move || {
             calls_hook.fetch_add(1, Ordering::Relaxed);
-            RefillOutcome {
-                popped: 0,
-                latest_ts: None,
-                empty_cause: RefillEmptyCause::EnforcedByReadPlan,
-            }
+            RefillOutcome::withheld_by_read_plan()
         })
         .unwrap();
     scheduler

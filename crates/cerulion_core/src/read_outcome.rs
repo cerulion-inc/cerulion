@@ -2457,8 +2457,9 @@ impl ReadPlanStage {
         // armed stage the step's install omitted has a ZERO quota for that step;
         // it remembers whatever step number its last install carried, so a step
         // compare placed ahead of this arm would report every omitted edge as a
-        // STALE PLAN, which is a harness fault and not the declaration ruling 5
-        // makes it. A stale plan is only meaningful while one IS installed.
+        // STALE PLAN, a harness fault, where the omission is instead the
+        // declaration that this stage reads nothing this step. A stale plan is
+        // only meaningful while one IS installed.
         if !inner.installed {
             inner.refused_consults = inner.refused_consults.saturating_add(1);
             inner.unplanned_consults = inner.unplanned_consults.saturating_add(1);
@@ -5390,8 +5391,8 @@ mod tests {
         plan.settle(granted, 2, Some(99));
         assert!(plan.take_violations().is_empty());
 
-        // A different COUNT still mints, which is the residual this ruling
-        // leaves pinned rather than assumed.
+        // A different COUNT still mints: the count is the part of a decimated
+        // record the gate does compare, pinned here rather than assumed.
         at_step(&now, 10);
         plan.install_step(10, &[decimated]).unwrap();
         let GateAnswer::Exact(granted) = plan.admit() else {

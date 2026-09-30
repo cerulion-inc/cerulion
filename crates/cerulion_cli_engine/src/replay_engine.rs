@@ -691,10 +691,21 @@ pub fn divergence_classes_for(
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ReadLogStatus {
     /// The verifier ran to completion and every compared edge matched the
-    /// re-derivation. `edges_compared` is always `> 0` here:
+    /// re-derivation, OUTSIDE what the quarantine excluded.
+    /// `edges_compared` is always `> 0` here:
     /// an active verifier that paired ZERO reads finalizes to
     /// [`Self::NotExercised`] instead — a clean claim must say what it
     /// actually compared.
+    ///
+    /// The exclusion is why the two counts below are part of the claim and not
+    /// a footnote: an edge that diverged on a step compared BEFORE its node was
+    /// quarantined keeps its row in
+    /// [`ReplayOutcome::read_log_divergence`] and reaches no verdict
+    /// (`divergence_is_quarantined`: the finding is evidence about the
+    /// RECORDING, whose input table this engine has just found unusable), and
+    /// this status is what the rest of the compare earned. Such a finding
+    /// always leaves a quarantine row behind it, so a `verified_clean` with both
+    /// counts ZERO excluded nothing.
     VerifiedClean {
         /// Distinct edges with at least one compared read.
         edges_compared: usize,
@@ -747,13 +758,21 @@ pub enum ReadLogStatus {
         #[serde(skip_serializing_if = "Option::is_none")]
         stood_down_at_step: Option<u64>,
     },
-    /// At least one edge diverged and the verifier RAN TO COMPLETION — see
+    /// At least one edge diverged OUTSIDE the quarantine's scope and the
+    /// verifier RAN TO COMPLETION; see
     /// [`ReplayOutcome::read_log_divergence`] for the retained first
-    /// divergence per edge. Those of them OUTSIDE the quarantine's scope are
-    /// the exit-6 read-log verdict
-    /// ([`ReplayOutcome::read_log_verdict`]); this status is set from the
-    /// divergence list alone, so a `Diverged` whose every divergence the
-    /// quarantine excludes leaves that verdict `None` and the run at exit 0.
+    /// divergence per edge. Those unquarantined divergences ARE the exit-6
+    /// read-log verdict ([`ReplayOutcome::read_log_verdict`]): this status and
+    /// that verdict read ONE filter over one list
+    /// (`divergence_is_quarantined`), so this status never renders its DIVERGED
+    /// line without the divergence block and the exit 6 the line points at.
+    /// (The reverse is not a claim: the enforcement half's unmet reads take
+    /// exit 6 on their own, under whatever status the VERIFIER earned.) A run whose every retained divergence the quarantine excludes
+    /// is therefore NOT this status: the findings stay in
+    /// [`ReplayOutcome::read_log_divergence`] with the excluded rows in
+    /// [`ReplayOutcome::read_log_quarantine`], the status is the one the rest
+    /// of the compare earned ([`Self::VerifiedClean`], whose own counts scope
+    /// it), and the run exits 0.
     /// Note: divergences
     /// found BEFORE a mid-run stand-down do NOT produce this status — they
     /// are salvaged into the report while the status stays
@@ -1984,10 +2003,13 @@ pub struct ReadLogEdgeDivergence {
 
 /// The REDUNDANT per-edge read-log verifier's findings:
 /// a second, edge-keyed streaming compare beside the exit-6
-/// fire comparator — LOUD (one `warn!` per diverging edge + this report),
-/// NEVER VERDICTED (`ReplayOutcome::passed` and the exit code are untouched).
+/// fire comparator, and LOUD (one `warn!` per diverging edge + this report).
 /// What it adds is attribution: it names
 /// the diverging EDGE, where the positional fire compare names only a position.
+/// A row the read-log quarantine does not cover clears
+/// `ReplayOutcome::passed` and takes exit 6 through
+/// [`ReplayOutcome::read_log_verdict`]; a row it covers stays here and reaches
+/// no verdict (`divergence_is_quarantined`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReadLogDivergenceReport {
     /// Distinct (consumer, input) edges with a retained divergence.
@@ -4680,6 +4702,41 @@ fn assemble_outcome(
     }
 }
 
+/// Is this divergence inside the QUARANTINE's scope, i.e. excluded from every
+/// claim the read-log plane makes about the candidate?
+///
+/// A quarantined node's records could not be placed at all, so the compare ran
+/// against a recorded stream this engine thinned: "recorded <none> vs replayed <a
+/// read>" there is evidence about the RECORDING, and charging it to the candidate
+/// is the false accusation the whole read-log plane is written to avoid. The
+/// quarantine is the SCOPE of every claim the verifier makes, so a finding inside
+/// it is excluded here rather than at the compare, where the report still carries
+/// it.
+///
+/// ONE spelling, read by the exit-6 verdict ([`build_read_log_verdict`]) and by
+/// the status the verdict must agree with ([`ReadLog::finalize`],
+/// [`fold_read_log_outcomes`]). Two spellings is what let a run print
+/// `read log: DIVERGED (see the EDGE-READ DIVERGENCE block above ...)` above no
+/// block at all and exit 0: the status counted the raw divergence list while the
+/// verdict counted this filter's survivors.
+fn divergence_is_quarantined(e: &ReadLogEdgeDivergence, quarantine: &[ReadLogQuarantine]) -> bool {
+    quarantine
+        .iter()
+        .any(|q| q.node_id == e.node_id && q.input.as_ref().is_none_or(|input| *input == e.input))
+}
+
+/// Does this divergence list hold a finding the quarantine does NOT cover, i.e.
+/// one that reaches the exit-6 verdict? The `Diverged` status's own condition,
+/// read through [`divergence_is_quarantined`].
+fn has_unquarantined_divergence(
+    divergences: &[ReadLogEdgeDivergence],
+    quarantine: &[ReadLogQuarantine],
+) -> bool {
+    divergences
+        .iter()
+        .any(|e| !divergence_is_quarantined(e, quarantine))
+}
+
 /// Fold the read-log plane's two halves into ONE exit-6 verdict, or `None` when
 /// every recorded read reproduced.
 ///
@@ -4694,21 +4751,14 @@ fn build_read_log_verdict(
     unmet: Vec<UnmetReadReport>,
     unmet_total: usize,
 ) -> Option<ReadLogVerdict> {
-    // A divergence inside the QUARANTINE's scope is not a verdict. A quarantined
-    // node's records could not be placed at all, so the compare ran against a
-    // recorded stream this engine thinned: "recorded <none> vs replayed <a read>"
-    // there is evidence about the RECORDING, and charging it to the candidate is
-    // the false accusation the whole read-log plane is written to avoid. The
-    // quarantine is the SCOPE of every claim the verifier makes, so a finding
-    // inside it is excluded here rather than at the compare, where the report
-    // still carries it.
-    let excluded = |e: &ReadLogEdgeDivergence| {
-        quarantine.iter().any(|q| {
-            q.node_id == e.node_id && q.input.as_ref().is_none_or(|input| *input == e.input)
-        })
-    };
     let edges: Vec<ReadLogEdgeDivergence> = divergence
-        .map(|d| d.edges.iter().filter(|e| !excluded(e)).cloned().collect())
+        .map(|d| {
+            d.edges
+                .iter()
+                .filter(|e| !divergence_is_quarantined(e, quarantine))
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default();
     if edges.is_empty() && unmet.is_empty() {
         return None;
@@ -7474,15 +7524,22 @@ struct PassOutcome {
 /// weakest per-rank answer is the strongest claim the whole bag supports:
 /// a `Disabled` rank means part of the bag went uncompared, and a clean claim
 /// must never be assembled out of one rank's silence.
+///
+/// The folded DIVERGENCES are every pass's, concatenated, and the folded
+/// `Diverged` is read off them through [`has_unquarantined_divergence`] rather
+/// than OR-ed from the per-pass status words. Both for the same reason the
+/// per-pass status has: the verdict is built from THIS report and THIS
+/// quarantine list ([`build_read_log_verdict`]), so a status derived from
+/// anything else can contradict it. Keeping only the first pass's report also
+/// dropped a later rank's findings off the wire entirely.
 fn fold_read_log_outcomes(outcomes: Vec<ReadLogOutcome>) -> ReadLogOutcome {
     let mut folded: Option<ReadLogOutcome> = None;
     let mut quarantine: Vec<ReadLogQuarantine> = Vec::new();
-    let mut divergence: Option<ReadLogDivergenceReport> = None;
+    let mut edges: Vec<ReadLogEdgeDivergence> = Vec::new();
     let mut edges_compared = 0usize;
     let mut quarantined_nodes = 0usize;
     let mut quarantined_edges = 0usize;
     let mut disabled: Option<ReadLogStatus> = None;
-    let mut diverged = false;
     let mut any_clean = false;
     let mut any_not_exercised = false;
     let mut any_inert = false;
@@ -7493,8 +7550,8 @@ fn fold_read_log_outcomes(outcomes: Vec<ReadLogOutcome>) -> ReadLogOutcome {
             break;
         }
         quarantine.extend(o.quarantine);
-        if divergence.is_none() {
-            divergence = o.divergence;
+        if let Some(d) = o.divergence {
+            edges.extend(d.edges);
         }
         match o.status {
             ReadLogStatus::VerifiedClean {
@@ -7507,7 +7564,10 @@ fn fold_read_log_outcomes(outcomes: Vec<ReadLogOutcome>) -> ReadLogOutcome {
                 quarantined_nodes += n;
                 quarantined_edges += q;
             }
-            ReadLogStatus::Diverged => diverged = true,
+            // A diverged pass carries no counts to fold: the folded status is
+            // taken from the folded findings below, which is the pair the
+            // verdict reads.
+            ReadLogStatus::Diverged => {}
             ReadLogStatus::NotExercised => any_not_exercised = true,
             ReadLogStatus::Inert => any_inert = true,
             d @ ReadLogStatus::Disabled { .. } => {
@@ -7520,9 +7580,26 @@ fn fold_read_log_outcomes(outcomes: Vec<ReadLogOutcome>) -> ReadLogOutcome {
     if let Some(one) = folded {
         return one;
     }
+    // `diverging_steps` is the DISTINCT step count of the folded edges: a step
+    // enters a pass's own set exactly when an edge's first divergence is pushed
+    // (`ActiveReadLog::feed_step` does both in one place), so that per-pass
+    // count is this same distinct count and the union is the whole bag's
+    // answer. Node ids are unique across ranks, so no two passes name one edge.
+    let divergence = (!edges.is_empty()).then(|| ReadLogDivergenceReport {
+        diverging_edges: edges.len(),
+        diverging_steps: edges
+            .iter()
+            .map(|e| e.step)
+            .collect::<BTreeSet<u64>>()
+            .len(),
+        edges,
+    });
     let status = if let Some(d) = disabled {
         d
-    } else if diverged {
+    } else if divergence
+        .as_ref()
+        .is_some_and(|d| has_unquarantined_divergence(&d.edges, &quarantine))
+    {
         ReadLogStatus::Diverged
     } else if any_clean {
         ReadLogStatus::VerifiedClean {
@@ -11177,10 +11254,9 @@ fn run_rank_pass(
             if cap.enforceable || !keys.contains(&cap.key) {
                 continue;
             }
-            let reason = cap.reason.map_or_else(
-                || cerulion_core::read_outcome::ReadPlanRefusal::GateUnusable(cap.key.clone()),
-                |r| r,
-            );
+            let reason = cap.reason.unwrap_or_else(|| {
+                cerulion_core::read_outcome::ReadPlanRefusal::GateUnusable(cap.key.clone())
+            });
             return Err(read_log_edge_not_gateable(&cap.key, &reason));
         }
         if let Err(reason) = runtime.arm_replay_read_plan(&keys) {
@@ -21081,7 +21157,14 @@ impl<'a> ReadLogVerifier<'a> {
                 // A clean claim is SCOPED by what it declined to
                 // compare, so the counts ride the status itself rather than
                 // living only in a sibling field a reader may not have joined.
-                let status = if !a.divergences.is_empty() {
+                //
+                // `Diverged` reads the divergences the VERDICT will read,
+                // through the one filter both share: a finding inside the
+                // quarantine's scope reaches no verdict and no exit code, so a
+                // status set from the raw list printed a DIVERGED line
+                // pointing at a block that never rendered, over exit 0. The
+                // findings themselves are unfiltered in the report below.
+                let status = if has_unquarantined_divergence(&a.divergences, &a.quarantine) {
                     ReadLogStatus::Diverged
                 } else if a.edges_seen.is_empty() {
                     ReadLogStatus::NotExercised
@@ -23399,6 +23482,251 @@ mod divergence_vocabulary_tests {
                 "edge-read divergence"
             ]
         );
+    }
+}
+
+/// The read log's STATUS word and its exit-6 VERDICT are two readings of ONE
+/// list, and the FOLD is where several ranks' lists meet.
+///
+/// These arms drive `fold_read_log_outcomes` and `build_read_log_verdict`
+/// directly, on hand-built outcomes, because the pairing they pin needs two
+/// PASSES of one bag and the integration arm that crafts one
+/// (`read_log_two_rank_tamper_is_attributed_to_the_rank1_edge`) has a single
+/// consumer, so only one of its passes can carry findings at all.
+#[cfg(test)]
+mod read_log_status_and_verdict_agreement_tests {
+    use super::*;
+
+    fn edge(node: &str, input: &str, step: u64) -> ReadLogEdgeDivergence {
+        ReadLogEdgeDivergence {
+            node_id: node.to_string(),
+            input: input.to_string(),
+            step,
+            recorded: None,
+            replayed: None,
+            detail: format!("step {step}, hand-built"),
+        }
+    }
+
+    /// A per-NODE quarantine (no input named), the shape a manifest input table
+    /// this engine cannot resolve produces.
+    fn node_quarantine(node: &str, step: u64) -> ReadLogQuarantine {
+        ReadLogQuarantine {
+            node_id: node.to_string(),
+            input: None,
+            step,
+            reason: "its manifest input list is missing, empty, or shorter".to_string(),
+        }
+    }
+
+    fn pass(
+        edges: Vec<ReadLogEdgeDivergence>,
+        quarantine: Vec<ReadLogQuarantine>,
+        status: ReadLogStatus,
+    ) -> ReadLogOutcome {
+        ReadLogOutcome {
+            divergence: (!edges.is_empty()).then(|| ReadLogDivergenceReport {
+                diverging_edges: edges.len(),
+                diverging_steps: edges
+                    .iter()
+                    .map(|e| e.step)
+                    .collect::<BTreeSet<u64>>()
+                    .len(),
+                edges,
+            }),
+            status,
+            quarantine,
+        }
+    }
+
+    /// The verdict the engine would build from a folded outcome, with no unmet
+    /// reads: the ENFORCEMENT half is empty here, so what these arms read is the
+    /// verifier half alone.
+    fn verdict_of(folded: &ReadLogOutcome) -> Option<ReadLogVerdict> {
+        build_read_log_verdict(
+            folded.divergence.as_ref(),
+            &folded.quarantine,
+            Vec::new(),
+            0,
+        )
+    }
+
+    /// A pass whose EVERY finding the quarantine covers folds to a SCOPED clean
+    /// claim, not to `Diverged`: the verdict excludes those rows, so a
+    /// `Diverged` here would print the DIVERGED line above a block that never
+    /// renders, at exit 0.
+    #[test]
+    fn a_fold_whose_every_divergence_is_quarantined_is_not_diverged_and_has_no_verdict() {
+        let folded = fold_read_log_outcomes(vec![
+            pass(
+                vec![edge("relay", "inp", 0)],
+                vec![node_quarantine("relay", 3)],
+                ReadLogStatus::VerifiedClean {
+                    edges_compared: 1,
+                    quarantined_nodes: 1,
+                    quarantined_edges: 0,
+                },
+            ),
+            pass(
+                Vec::new(),
+                Vec::new(),
+                ReadLogStatus::VerifiedClean {
+                    edges_compared: 2,
+                    quarantined_nodes: 0,
+                    quarantined_edges: 0,
+                },
+            ),
+        ]);
+        // The finding is still on the wire, unfiltered.
+        assert_eq!(
+            folded.divergence.as_ref().map(|d| d.diverging_edges),
+            Some(1),
+            "the report keeps a quarantined finding: {:?}",
+            folded.divergence
+        );
+        assert_eq!(
+            folded.status,
+            ReadLogStatus::VerifiedClean {
+                edges_compared: 3,
+                quarantined_nodes: 1,
+                quarantined_edges: 0,
+            },
+            "the clean claim is the two passes' counts, SCOPED by the quarantine"
+        );
+        assert!(
+            verdict_of(&folded).is_none(),
+            "and it agrees with the verdict the engine builds from the same pair"
+        );
+    }
+
+    /// A SECOND pass's unquarantined finding survives the fold and is the
+    /// verdict, while the first pass's quarantined one is reported and not
+    /// charged. Keeping only the first `Some` report dropped this finding off
+    /// the wire while the status still said `Diverged`.
+    #[test]
+    fn a_later_passs_unquarantined_divergence_survives_the_fold_and_is_the_verdict() {
+        let folded = fold_read_log_outcomes(vec![
+            pass(
+                vec![edge("relay", "inp", 0)],
+                vec![node_quarantine("relay", 3)],
+                ReadLogStatus::VerifiedClean {
+                    edges_compared: 1,
+                    quarantined_nodes: 1,
+                    quarantined_edges: 0,
+                },
+            ),
+            pass(
+                vec![edge("fuse", "b", 7)],
+                Vec::new(),
+                ReadLogStatus::Diverged,
+            ),
+        ]);
+        let d = folded
+            .divergence
+            .as_ref()
+            .expect("both passes' findings are reported");
+        assert_eq!(
+            (d.diverging_edges, d.diverging_steps),
+            (2, 2),
+            "both edges, at their two distinct steps: {d:?}"
+        );
+        assert_eq!(folded.status, ReadLogStatus::Diverged);
+        let v = verdict_of(&folded).expect("the unquarantined finding is the verdict");
+        assert_eq!(
+            v.edges
+                .iter()
+                .map(|e| e.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fuse"],
+            "the quarantined row is reported, never charged: {v:?}"
+        );
+    }
+
+    /// `diverging_steps` is the UNION over passes, not their sum: two ranks that
+    /// diverge at the same step diverged at ONE step.
+    #[test]
+    fn the_folded_diverging_step_count_is_the_union_not_the_sum() {
+        let folded = fold_read_log_outcomes(vec![
+            pass(
+                vec![edge("relay", "inp", 4)],
+                Vec::new(),
+                ReadLogStatus::Diverged,
+            ),
+            pass(
+                vec![edge("relayb", "inp", 4)],
+                Vec::new(),
+                ReadLogStatus::Diverged,
+            ),
+        ]);
+        let d = folded.divergence.as_ref().expect("two findings");
+        assert_eq!(
+            (d.diverging_edges, d.diverging_steps),
+            (2, 1),
+            "two edges, one step: {d:?}"
+        );
+    }
+
+    /// The single-pass fold is the IDENTITY, which is what keeps every lockstep
+    /// report byte-unchanged: the status the pass finalized is the status the
+    /// outcome carries, filtered already.
+    #[test]
+    fn a_single_pass_folds_to_itself() {
+        let one = pass(
+            vec![edge("relay", "inp", 2)],
+            vec![node_quarantine("relay", 5)],
+            ReadLogStatus::VerifiedClean {
+                edges_compared: 1,
+                quarantined_nodes: 1,
+                quarantined_edges: 0,
+            },
+        );
+        let folded = fold_read_log_outcomes(vec![one]);
+        assert_eq!(
+            folded.status,
+            ReadLogStatus::VerifiedClean {
+                edges_compared: 1,
+                quarantined_nodes: 1,
+                quarantined_edges: 0,
+            }
+        );
+        assert_eq!(
+            folded.divergence.as_ref().map(|d| d.diverging_edges),
+            Some(1)
+        );
+        assert!(verdict_of(&folded).is_none());
+    }
+
+    /// A per-EDGE quarantine covers ONE input, not the node: the same node's
+    /// other edge is still charged. The filter both the status and the verdict
+    /// read is what this pins.
+    #[test]
+    fn a_per_edge_quarantine_excludes_that_input_alone() {
+        let quarantine = vec![ReadLogQuarantine {
+            node_id: "fuse".to_string(),
+            input: Some("a".to_string()),
+            step: 2,
+            reason: "an unresolvable producer token".to_string(),
+        }];
+        assert!(divergence_is_quarantined(
+            &edge("fuse", "a", 0),
+            &quarantine
+        ));
+        assert!(!divergence_is_quarantined(
+            &edge("fuse", "b", 0),
+            &quarantine
+        ));
+        assert!(!divergence_is_quarantined(
+            &edge("other", "a", 0),
+            &quarantine
+        ));
+        assert!(has_unquarantined_divergence(
+            &[edge("fuse", "a", 0), edge("fuse", "b", 1)],
+            &quarantine
+        ));
+        assert!(!has_unquarantined_divergence(
+            &[edge("fuse", "a", 0)],
+            &quarantine
+        ));
     }
 }
 

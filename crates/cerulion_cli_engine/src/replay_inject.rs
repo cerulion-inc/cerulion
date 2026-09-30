@@ -1939,8 +1939,9 @@ pub enum AdmissionPlan {
     /// (`a_co_located_multi_publisher_topic_replays_byte_exact_per_writer`,
     /// `a_per_set_sync_descent_is_folded_from_its_head_not_declined` and the
     /// `sy_bounded` / `co_factories` / `cp3` families), and each one exits 2 under
-    /// that answer. Whether that class stops being replayable in free run is a
-    /// product ruling, not a fixer's call.
+    /// that answer. This answer is what keeps them replaying: the stages take
+    /// today's drain and the report NAMES them, which is the behaviour those
+    /// fifteen arms pin.
     NotGateable(Vec<(StageKey, String)>),
     /// This recording cannot be enforced on this topic.
     Refused(AdmissionRefusal),
@@ -4566,7 +4567,7 @@ mod tests {
     /// (`AdmissionRefusalReason::EdgeNotGateable`) is NOT what this answers, and
     /// the cost of making it so is measured: fifteen arms of `replay_engine_test`
     /// replay bags of exactly these two shapes today and every one of them exits
-    /// 2 under that answer. Which way that class goes is a product ruling.
+    /// 2 under that answer. This arm pins the answer that keeps them replaying.
     #[test]
     fn a_stage_the_core_refuses_to_gate_is_ungated_and_never_a_refusal() {
         let key = StageKey {

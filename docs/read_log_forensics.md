@@ -535,8 +535,9 @@ The offline join inherits the same rule: it can answer for the prefix and must
 decline for the rest.
 
 **A refused read log never blames the candidate.** No read-log condition
-produces a DATA violation: a retained read-log finding is the exit 6 schedule
-verdict and a read log that cannot be enforced is exit 2, and neither is exit 1.
+produces a DATA violation: a retained read-log finding outside the quarantine's
+scope is the exit 6 schedule verdict and a read log that cannot be enforced is
+exit 2, and neither is exit 1.
 That holds even where the read
 log STEERS something else, the cross-rank injection window, because the
 fallback can misplace a frame by a fire, and comparing that against the

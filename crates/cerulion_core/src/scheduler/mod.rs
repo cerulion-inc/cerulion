@@ -283,14 +283,28 @@ struct TriggerRefill {
 ///
 /// The cause is decided by the party that PERFORMED the drain, not probed for
 /// afterwards: an optional probe hook would make two authorities for one fact.
+///
+/// For the same reason the cause is DERIVED from the pop count rather than
+/// carried beside it: the field is private and every constructor goes through
+/// [`Self::drained`], which computes the cause from the very count the callers
+/// read, so an outcome with `popped > 0` cannot carry an empty cause. While the
+/// two fields were independent, an outcome pairing a pop with an empty cause was
+/// a served frame to the LIVE burst (which breaks on `popped == 0`) and an input
+/// SHORTFALL to the REPLAY burst (which branched on the cause alone), i.e. two
+/// answers for one drain. The shipped transport never minted that pair, and that
+/// is what made the disagreement invisible rather than harmless: the gate is
+/// consulted ONCE per drain before anything pops
+/// (`CerulionSubscriber::drain_with_accounting_impl`), so a refusal returns with
+/// nothing popped. What can mint it is any other hook answering for itself,
+/// which is what a refill hook is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefillOutcome {
     /// Frames the refill consumed.
     pub popped: u64,
     /// The surviving frame's wire timestamp, `None` when nothing was consumed.
     pub latest_ts: Option<u64>,
-    /// Why `popped` is 0, when it is.
-    pub empty_cause: RefillEmptyCause,
+    /// Why `popped` is 0, when it is. Private: see [`Self::drained`].
+    empty_cause: RefillEmptyCause,
 }
 
 /// Why a refill came back empty.
@@ -307,15 +321,49 @@ pub enum RefillEmptyCause {
 }
 
 impl RefillOutcome {
+    /// What a refill that RAN answers. The ONE place the cause is decided:
+    /// `withheld_by_read_plan` is the caller's own witness that the replay read
+    /// gate refused a consult during this drain (the graph runtime reads the
+    /// gate's monotone refused-consult counter across the call), and it is
+    /// consulted only where it can mean anything, at a pop count of 0. So a
+    /// count above 0 is [`RefillEmptyCause::NotEmpty`] whatever the witness
+    /// says, and no caller can hand the bursts a pop that claims an empty cause.
+    #[must_use]
+    pub fn drained(popped: u64, latest_ts: Option<u64>, withheld_by_read_plan: bool) -> Self {
+        let empty_cause = if popped > 0 {
+            RefillEmptyCause::NotEmpty
+        } else if withheld_by_read_plan {
+            RefillEmptyCause::EnforcedByReadPlan
+        } else {
+            RefillEmptyCause::Queue
+        };
+        Self {
+            popped,
+            latest_ts,
+            empty_cause,
+        }
+    }
+
     /// The empty answer a caller that consumed nothing and blames the QUEUE
     /// gives, the fail-safe every non-gate path returns.
     #[must_use]
     pub fn empty_queue() -> Self {
-        Self {
-            popped: 0,
-            latest_ts: None,
-            empty_cause: RefillEmptyCause::Queue,
-        }
+        Self::drained(0, None, false)
+    }
+
+    /// The empty answer the replay read gate's WITHHOLD gives: the recording's
+    /// read at this position consumed nothing, so this empty is the enforcement
+    /// working and never an input shortfall.
+    #[must_use]
+    pub fn withheld_by_read_plan() -> Self {
+        Self::drained(0, None, true)
+    }
+
+    /// Why this refill came back empty. Meaningful only at
+    /// `popped == 0`, which is the only place the bursts ask.
+    #[must_use]
+    pub fn empty_cause(&self) -> RefillEmptyCause {
+        self.empty_cause
     }
 }
 
@@ -7340,7 +7388,7 @@ impl Scheduler {
                 let outcome = (r.drain)();
                 if outcome.popped == 0 {
                     // queue empty, the burst is fully served. The LIVE burst
-                    // does not read `empty_cause`: no gate is armed on a live
+                    // does not read the cause: no gate is armed on a live
                     // run, so the only cause reachable here is the queue.
                     break;
                 }
@@ -7460,11 +7508,18 @@ impl Scheduler {
             if i > 0 {
                 if let Some(r) = refill.as_ref() {
                     let outcome = (r.drain)();
-                    match outcome.empty_cause {
-                        RefillEmptyCause::NotEmpty => {
+                    // The POP COUNT first, exactly as the live burst reads it,
+                    // and the cause only where a zero pop leaves something to
+                    // explain. `NotEmpty` cannot pair with a zero pop outside
+                    // this module: the cause field is private and `drained`
+                    // mints that variant only above zero. So its arm is folded
+                    // into the queue's rather than given a fourth behaviour
+                    // nothing can reach.
+                    match (outcome.popped, outcome.empty_cause()) {
+                        (1.., _) => {
                             Self::note_trigger_arrival(node, &r.input, outcome.latest_ts);
                         }
-                        RefillEmptyCause::Queue => {
+                        (0, RefillEmptyCause::Queue | RefillEmptyCause::NotEmpty) => {
                             node.replay_refill_shortfalls =
                                 node.replay_refill_shortfalls.saturating_add(1);
                             tracing::debug!(
@@ -7476,7 +7531,7 @@ impl Scheduler {
                                  anyway (the fire schedule is the recording's)"
                             );
                         }
-                        RefillEmptyCause::EnforcedByReadPlan => {
+                        (0, RefillEmptyCause::EnforcedByReadPlan) => {
                             node.replay_enforced_empty_refills =
                                 node.replay_enforced_empty_refills.saturating_add(1);
                             tracing::debug!(
@@ -10079,6 +10134,133 @@ mod tests {
             .expect_err("the placeable check refuses the same clock");
         assert!(err.to_string().contains("no CONTROLLED"), "{err}");
         assert_eq!(clock.now_ns(), 0);
+    }
+
+    /// **A refill that POPPED is never counted a shortfall, on either burst,
+    /// even when the outcome CLAIMS an empty cause.**
+    ///
+    /// [`RefillOutcome`] carried the pop count and the empty cause as two
+    /// independent fields, and the two bursts read them from opposite ends: the
+    /// LIVE burst continues while `popped > 0`, while the REPLAY burst branched
+    /// on the cause alone. One outcome was therefore a served frame to one burst
+    /// and an input SHORTFALL to the other, and a shortfall names the HARNESS
+    /// for a frame the recording read and this replay served.
+    ///
+    /// The disagreeing pair is minted BY HAND here, with the struct literal only
+    /// this module can still write: [`RefillOutcome::drained`] derives the cause
+    /// from the count, so no caller outside `scheduler` can build it at all.
+    /// Leg 1 pins that derivation and legs 2 and 3 drive the two bursts over the
+    /// hand-minted pair, which is what keeps the two guards separately tested: a
+    /// cause-first match passes leg 1, and a constructor that took the witness
+    /// first passes legs 2 and 3.
+    #[test]
+    fn a_refill_that_popped_is_no_shortfall_on_either_burst() {
+        // The pair the constructor refuses to mint: a pop carrying the QUEUE's
+        // empty cause. A plain item, not a closure, so both legs can call it.
+        fn disagreeing_pop() -> RefillOutcome {
+            RefillOutcome {
+                popped: 1,
+                latest_ts: Some(7),
+                empty_cause: RefillEmptyCause::Queue,
+            }
+        }
+
+        // ── LEG 1: the constructor derives the cause from the count.
+        assert_eq!(
+            RefillOutcome::drained(1, Some(42), true).empty_cause(),
+            RefillEmptyCause::NotEmpty,
+            "a pop is not an empty answer, whatever the withhold witness says"
+        );
+        assert_eq!(
+            RefillOutcome::drained(0, None, true).empty_cause(),
+            RefillEmptyCause::EnforcedByReadPlan,
+            "the witness decides only where a zero pop leaves something to explain"
+        );
+        assert_eq!(
+            RefillOutcome::drained(0, None, false).empty_cause(),
+            RefillEmptyCause::Queue,
+            "and an empty drain no gate withheld from is the queue's"
+        );
+
+        // ── LEG 2: the REPLAY burst over that pair. The two counters are the
+        // oracle: neither an input shortfall nor a gate-emptied refill.
+        let mut replay = Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+        add_data(&mut replay, "sink");
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_hook = Arc::clone(&calls);
+        replay
+            .set_trigger_refill("sink", "inp", move || {
+                calls_hook.fetch_add(1, Ordering::Relaxed);
+                disagreeing_pop()
+            })
+            .unwrap();
+        replay
+            .set_replay_fire_plan(
+                0,
+                &[ReplayFire {
+                    node_id: "sink",
+                    first_fire_ns: 1_000_000,
+                    fire_count: 3,
+                    interval_ns: 1_000_000,
+                }],
+            )
+            .unwrap();
+        replay.step(Duration::from_millis(10));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "the refill is asked once per fire after the first"
+        );
+        assert_eq!(
+            replay.replay_refill_shortfalls("sink"),
+            Some(0),
+            "a refill that POPPED is no shortfall: naming the harness here blames \
+             it for a frame the recording read and this replay served"
+        );
+        assert_eq!(
+            replay.replay_enforced_empty_refills("sink"),
+            Some(0),
+            "and no gate-emptied refill either: the drain delivered"
+        );
+
+        // ── LEG 3: the LIVE burst's side of the same fact. It must keep reading
+        // the COUNT: a supply of two disagreeing pops behind one signalled
+        // arrival serves three fires, where a burst that read the cause would
+        // stop at the first of them.
+        let fires = Arc::new(AtomicU64::new(0));
+        let fires_cb = Arc::clone(&fires);
+        let mut live = Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+        live.add_node(NodeConfig {
+            id: "sink".to_string(),
+            policy: TriggerPolicy::Data,
+            callback: Box::new(move || {
+                fires_cb.fetch_add(1, Ordering::Relaxed);
+            }),
+        })
+        .unwrap();
+        let left = Arc::new(AtomicU64::new(2));
+        let left_hook = Arc::clone(&left);
+        live.set_trigger_refill("sink", "inp", move || {
+            if left_hook.load(Ordering::Relaxed) == 0 {
+                return RefillOutcome::empty_queue();
+            }
+            left_hook.fetch_sub(1, Ordering::Relaxed);
+            disagreeing_pop()
+        })
+        .unwrap();
+        live.signal_data("sink").unwrap();
+        live.step(Duration::from_millis(1));
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            3,
+            "one signalled arrival plus the two refilled frames: the live burst \
+             reads the pop count and a popped frame is a frame"
+        );
+        assert_eq!(
+            left.load(Ordering::Relaxed),
+            0,
+            "the supply really was drained by the burst, not left behind"
+        );
     }
 }
 
