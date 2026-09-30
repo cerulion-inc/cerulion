@@ -1299,8 +1299,11 @@ enum ResimSummary {
 /// NEUTRAL renderer's crash line) are not classes and are named here.
 ///
 /// The head must be the WHOLE of what precedes the first `": "`, which is what
-/// keeps the report-only `NOTE: EDGE-READ DIVERGENCE (...)` line — rendered on
-/// the pass path too, and never a verdict — out: its head is `NOTE`.
+/// keeps a `NOTE:` line carrying a class header out: its head is `NOTE`. The read
+/// log's own notes are that shape, `NOTE: read-log enforcement: ...` and
+/// `NOTE: read-log quarantine ...`, rendered on the pass path; a RETAINED
+/// read-log divergence is a verdict with its own `EDGE-READ DIVERGENCE` header,
+/// which this parser reads as one.
 fn fail_verdict(line: &str) -> Option<&str> {
     let (head, _) = line.split_once(": ")?;
     let is_class = cerulion_cli_engine::replay_engine::DivergenceClass::ALL
@@ -1449,7 +1452,9 @@ fn a_failing_verify_verdict_is_named_rather_than_read_as_a_missing_summary() {
         "the verdict must be NAMED: {why}"
     );
     // The panic-class block and the neutral renderer's crash line are verdicts
-    // too, and the report-only `NOTE:` line that carries a class header is NOT.
+    // too, and a `NOTE:` line that carries a class header is NOT. The line below is
+    // SYNTHETIC: the rule is about the HEAD, and no renderer emits that wording
+    // any more, because a retained read-log divergence now takes the verdict.
     assert_eq!(
         classify_resim_line("NODE FAILURE: /cap.mcap"),
         Some(ResimSummary::Failed("NODE FAILURE: /cap.mcap".to_string()))
@@ -1464,7 +1469,7 @@ fn a_failing_verify_verdict_is_named_rather_than_read_as_a_missing_summary() {
              code are UNAFFECTED): 2 edge(s) diverged across 3 step(s):"
         ),
         None,
-        "a report-only note on the PASS path must never read as a verdict"
+        "a `NOTE:`-headed line must never read as a verdict, whatever it carries"
     );
 }
 
@@ -3175,6 +3180,18 @@ fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
 /// the PERTURBED ticker exits 1 with a `FRAME-CONTENT DIVERGENCE` naming the
 /// ticker's topic.
 ///
+/// The gate is the claim leg 3 adds. The fixture's relay consumes the ticker's
+/// topic and both nodes sit in ONE process group, so a free-run capture carries a
+/// graph-produced edge inside one rank and the read gate is armed on it: the
+/// relay drains a ticker frame at the step the recording drained it, whatever
+/// this host's timing offers. `read_log_enforcement.status` is asserted to be
+/// `enforced` with `frames_admitted > 0` on the two free-run arms and `lockstep`
+/// on the opt-out arm, because a binary that never armed the gate reaches every
+/// other assertion in this arm identically. Leg 4 asserts the boundary from the
+/// other side: a changed constant is `FRAME-CONTENT DIVERGENCE` and NOT
+/// `EDGE-READ DIVERGENCE`, so a data divergence can never be reported as a
+/// schedule one.
+///
 /// `--verify` IS driven here, unlike arm 1, and arm 1's reason for not driving
 /// it does not apply: that arm's capture may begin at step 0 with a lossy head,
 /// so the re-execution produces frames the window dropped; this arm's capture
@@ -3199,6 +3216,7 @@ fn one_rank_capture_resims_and_verifies_under(
     env: &[(&str, &str)],
     want_coordination: &str,
     want_gating: &str,
+    want_enforcement: &str,
 ) {
     let mut last_retry = String::new();
     for attempt in 1..=CLEAN_CAPTURE_ATTEMPTS {
@@ -3422,6 +3440,28 @@ fn one_rank_capture_resims_and_verifies_under(
             serde_json::json!(want_coordination),
             "the contract applied is the one the capture stamped: {report}"
         );
+        // THE GATE, stated positively. The fixture's relay consumes the ticker's
+        // topic and both nodes sit in one process group, so a FREE-RUN capture
+        // carries a graph-produced edge inside one rank and the read gate is armed
+        // on it: the relay's drain of a ticker frame happens at the step the
+        // recording drained it, not at whichever step this host's timing offers.
+        // That is what makes legs 3 and 4 deterministic rather than lucky, so the
+        // arm asserts the arming rather than inferring it from its own exit 0,
+        // which a binary that never armed the gate reaches identically.
+        assert_eq!(
+            report["read_log_enforcement"]["status"],
+            serde_json::json!(want_enforcement),
+            "the enforcement the coordination implies: {report}"
+        );
+        if want_enforcement == "enforced" {
+            let admitted = report["read_log_enforcement"]["frames_admitted"]
+                .as_u64()
+                .expect("an enforced replay reports the frames its gates admitted");
+            assert!(
+                admitted > 0,
+                "an armed gate that admitted NOTHING gated nothing: {report}"
+            );
+        }
         assert_eq!(
             report["resume"]["first_replay_step"],
             serde_json::json!(first),
@@ -3454,6 +3494,15 @@ fn one_rank_capture_resims_and_verifies_under(
             resim_err_p.contains("FRAME-CONTENT DIVERGENCE") && resim_err_p.contains(&ticker_topic),
             "the verdict names the data-divergence class and the ticker's topic:\n{resim_err_p}"
         );
+        // The exit-1 against exit-6 boundary: a changed CONSTANT is a data
+        // divergence, and the read gate holds the relay's drain at the recorded
+        // step whatever the ticker publishes, so no edge read moved. A candidate
+        // that reported this as a schedule divergence would take exit 6 and blame
+        // the wrong half of the recording.
+        assert!(
+            !resim_err_p.contains("EDGE-READ DIVERGENCE"),
+            "a data divergence must never be reported as a schedule one:\n{resim_err_p}"
+        );
         return;
     }
     panic!(
@@ -3471,6 +3520,7 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
         &[("CERULION_EXECUTION_MODE", "free_run")],
         "free_run",
         "recorded_wall",
+        "enforced",
     );
 }
 
@@ -3481,7 +3531,13 @@ fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_chan
 #[test]
 #[serial]
 fn a_default_one_rank_capture_free_runs_and_resims_and_verifies_byte_exact() {
-    one_rank_capture_resims_and_verifies_under("plaindef", &[], "free_run", "recorded_wall");
+    one_rank_capture_resims_and_verifies_under(
+        "plaindef",
+        &[],
+        "free_run",
+        "recorded_wall",
+        "enforced",
+    );
 }
 
 /// Arm 8: the `lockstep` OPT-OUT, arm 7's positive control. The same loop
@@ -3495,5 +3551,6 @@ fn a_lockstep_opt_out_one_rank_capture_stamps_lockstep_and_resims_and_verifies_b
         &[("CERULION_EXECUTION_MODE", "lockstep")],
         "lockstep",
         "quantum",
+        "lockstep",
     );
 }
