@@ -250,9 +250,11 @@ fn big_blueprint_chunk(store_id: &StoreId) -> LogMsg {
 /// the broadcast and a drop is arithmetically inevitable. At 2_779_552 encoded
 /// bytes a frame that is 48.3 frames of absorption from COLD, which a pressure
 /// phase never pays: [`flood_until_budget_engages`] does not return until that
-/// sink is within one frame of full and the queue is over the 8 MiB budget, so a
-/// phase starts with no sink headroom to fill, in the state where every frame it
-/// feeds is dropped.
+/// sink is within a frame or two of full and the queue is over the 8 MiB budget, so
+/// a phase starts with no sink headroom left to fill. It need not start in the
+/// dropping state: the forwarding task still takes whatever fits before it parks,
+/// at most two frames, which leaves the queue that much under the budget, so a
+/// phase can admit one or two frames before it drops every frame after.
 ///
 /// 120 is ~2.5x the cold worst case it can no longer inherit, and ~25x what a
 /// phase has actually been measured to need (3-5 frames, 70-90 ms).
@@ -515,6 +517,12 @@ const FLOOD_DEADLINE: Duration = Duration::from_secs(120);
 /// receiver, so the task absorbs this many bytes and then BLOCKS inside the push
 /// for the rest of the arm: from that instant nothing takes bytes out of the
 /// broadcast, occupancy only grows, and every temporal frame is dropped.
+///
+/// The quota is charged on the DECODED message the task pushes (`to_application`
+/// runs first, and the channel sizes what it is handed), while every number
+/// compared against it here is LZ4-encoded proto bytes, so the comparison is an
+/// approximation: on this fixture's incompressible pixels the two differ by well
+/// under one frame across the whole sink, and 48 frames fit either way.
 const FORWARDER_SINK_BYTES: u64 = 128 * 1024 * 1024;
 
 /// What one flood of an UNDRAINED proxy observed on its way to the live budget.
@@ -522,17 +530,25 @@ const FORWARDER_SINK_BYTES: u64 = 128 * 1024 * 1024;
 struct Flood {
     /// Whether the proxy's OWN accounting ever reported a temporal drop.
     engaged: bool,
-    /// Whether the forwarding task's sink is within one frame of full, so its next
-    /// push BLOCKS and nothing takes bytes out of the broadcast again.
+    /// Whether the sink is within a FRAME OR TWO of full, which is as exact as the
+    /// available readings allow (see `absorbed`). What it establishes is not the
+    /// instant of the block but that only that much pulling is left between the
+    /// forwarding task and the push it cannot fit.
     sink_full: bool,
-    /// Bytes the forwarding task has pulled out of the broadcast, derived from the
+    /// Bytes the forwarding task has taken out of the broadcast, derived from the
     /// frames fed against the two buckets the proxy reports them in: what it
-    /// DROPPED and what is still RESIDENT. Every frame is flushed, so at most one
-    /// fed frame is in neither bucket yet.
+    /// DROPPED and what is still RESIDENT.
+    ///
+    /// An UPPER bound on what is IN the sink, over-stating it by about a frame and
+    /// a half. The broadcast releases a message's bytes when the task RECEIVES it,
+    /// one step before the push that charges the sink, so a frame in flight between
+    /// the two counts here; and `capture_memory` hands back the snapshot from the
+    /// event loop's previous pass, so the subtrahends lag the frames fed.
     absorbed: u64,
     /// What the live queue accounts for ONE of the camera frames this flood sent,
-    /// measured on those frames rather than quoted, because it is the divisor the
-    /// sink arithmetic uses.
+    /// measured on those frames rather than quoted: the stop condition multiplies it
+    /// by the frames fed to price what was delivered, and adds one of it as the
+    /// headroom the sink has to have fallen under.
     frame_bytes: u64,
     /// Frames fed. Each was flushed, so this is also (up to a constant) the
     /// number the proxy INGESTED — the distinction this whole helper exists for.
@@ -581,9 +597,9 @@ struct Flood {
 /// accumulate. At 2_779_552 encoded bytes a frame, 48 frames fit in the sink and
 /// the 49th does not, so the task blocks inside that push; 4 more then sit
 /// resident, taking the queue over the 8 MiB budget, and the frame after those is
-/// the first the gate drops. 54 frames, which is the ~52-55 the stop condition
-/// below costs, and the old loop's 60 was a coin toss the moment delivery fell
-/// behind.
+/// the first the gate drops. That is 54 frames, the ~52-55 the stop condition below
+/// costs when the task keeps perfect pace, and the old loop's 60 was a coin toss
+/// the moment delivery fell behind.
 ///
 /// And it does fall behind, because SENT and DELIVERED were different numbers.
 /// `re_grpc_client`'s command queue is bounded at **100 messages** with no byte
@@ -638,21 +654,27 @@ struct Flood {
 /// then keeps pressing frames would otherwise have that park land INSIDE its own
 /// measurement, taking a worker out from under a viewer that is already streaming
 /// and leaving the arm to spend its delivery wall waiting on a receiver that
-/// cannot be polled. Returning only once the park has happened puts it before the
-/// viewer exists, and leaves occupancy monotone from there.
+/// cannot be polled. Exiting once the sink is a frame or two from full, with the
+/// broadcast holding more frames than the task can still take, puts that park in
+/// the settle after this call rather than inside the caller's measurement. The
+/// guarantee does not rest on which frame the park lands on, only on its being
+/// ahead of the viewer.
 ///
 /// So the loop exits only once all three of these hold, each read off the proxy's
 /// own accounting rather than off a frame count:
 ///
-///  * the forwarding task has pulled within one frame of [`FORWARDER_SINK_BYTES`]
-///    out of the broadcast, so its next push blocks. Every frame is flushed, so
-///    the frames fed price the bytes DELIVERED; dropped and resident are the two
+///  * the forwarding task has taken within a frame or two of
+///    [`FORWARDER_SINK_BYTES`] out of the broadcast. Every frame is flushed, so the
+///    frames fed price the bytes DELIVERED; dropped and resident are the two
 ///    buckets those bytes can still be sitting in, and the remainder is what the
-///    task took;
+///    task took, as the upper bound the `absorbed` field documents;
 ///  * `live_dropped > 0`, so the gate itself has fired at least once;
-///  * the final reading is OVER the budget, so the resident frames a parked task
-///    will never take are already there, and with no consumer anywhere occupancy
-///    cannot fall back under the budget again.
+///  * the final reading is OVER the budget, which takes at least four camera frames
+///    at this size, so the broadcast holds more than the task can still absorb. It
+///    parks on whichever of those pushes overflows the sink, during the settle that
+///    follows and before `re_grpc_client::stream` is reached; occupancy dips by the
+///    at most two frames it still takes and then only grows, since the park leaves
+///    no consumer anywhere.
 ///
 /// Load can only make this spend more frames: a frame the gate drops while the
 /// task lags is a frame that never entered the sink, so it is replaced by a
@@ -679,10 +701,10 @@ fn flood_until_budget_engages(
         last: Usage::default(),
     };
     while flood.frames < FLOOD_FRAME_CEILING && start.elapsed() < FLOOD_DEADLINE {
-        // Built once and PRICED before it is sent, so the sink arithmetic divides
-        // the size of the frames this flood really put on the wire rather than a
-        // number from a comment. The running max covers every sequence reached
-        // instead of standing in for them with frame 0's.
+        // Built once and PRICED before it is sent, so the stop condition prices the
+        // frames this flood really put on the wire rather than a number from a
+        // comment. The running max covers every sequence reached instead of
+        // standing in for them with frame 0's.
         let frame = image_frame(store, "cam/video/rendition", flood.frames as i64, rgb, w, h);
         flood.frame_bytes = flood.frame_bytes.max(accounted_size(&frame));
         prod.send_blocking(frame);
@@ -696,10 +718,14 @@ fn flood_until_budget_engages(
         // Each frame was flushed before this read, so the frames fed price the
         // bytes the proxy has handled, to within the one that may still be in its
         // event queue. Of those bytes it reports what it dropped and what is still
-        // resident in the broadcast; the remainder is in the forwarding task's own
-        // sink. `sink_full` LATCHES: the subtraction reads two numbers sampled an
-        // instant apart, while the quantity it stands for only grows, because
-        // nothing drains that sink.
+        // resident in the broadcast; the remainder is what the forwarding task took,
+        // counted as an UPPER bound on what its sink holds (a frame in flight
+        // between the broadcast's release and the sink's charge is in neither
+        // bucket, and the reading is one event-loop pass old). The one-frame
+        // headroom term is the same order as that over-count, so the latch fires
+        // with the sink within a frame or two of full, never at a known instant.
+        // It LATCHES because the quantity it stands for only grows: nothing drains
+        // that sink.
         flood.absorbed = (flood.frames as u64 * flood.frame_bytes)
             .saturating_sub(flood.last.live_dropped + flood.last.broadcast);
         flood.sink_full |= FORWARDER_SINK_BYTES < flood.absorbed + flood.frame_bytes;
@@ -1414,6 +1440,30 @@ fn entity_path(s: &str) -> re_log_types::EntityPath {
     re_log_types::EntityPath::from(s)
 }
 
+/// Wait for the viewer's own acknowledgement that its subscribe landed: the
+/// [`VIEWER_CONNECTED`] row its drainer appends when the proxy serves the retained
+/// skeleton.
+///
+/// `false` means it never came, and the caller must retire its drainer BEFORE it
+/// fails on that: a panic with that thread still reading abandons it on a gRPC
+/// stream to a proxy the caller is about to drop.
+///
+/// Returns the moment the drainer reports the stream dead, because the row is
+/// appended by that same drainer: once it has broken out, no row can appear and the
+/// rest of the wall buys nothing but a later failure message.
+fn viewer_acknowledged(connected: impl Fn() -> bool, stream_dead: &AtomicBool) -> bool {
+    let deadline = Instant::now() + VIEWER_CONNECT_DEADLINE;
+    loop {
+        if connected() {
+            return true;
+        }
+        if stream_dead.load(Ordering::Relaxed) || deadline <= Instant::now() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn a_plot_sample_survives_a_queue_full_of_camera_frames() {
     with_runtime(|| {
@@ -1626,7 +1676,7 @@ fn a_plot_sample_survives_a_queue_full_of_camera_frames() {
             }
         });
 
-        // ROUND 0 STARTS ON THE VIEWER'S OWN ACKNOWLEDGEMENT, not on a sleep.
+        // THE FIRST SAMPLE WAITS ON THE VIEWER'S OWN ACKNOWLEDGEMENT, not on a sleep.
         // `re_grpc_client::stream` returns its receiver BEFORE the tonic connect,
         // which runs in a task it spawns, so a sleep here gates on the runner: it
         // can expire with the subscribe still unsent, and the first sample then
@@ -1635,18 +1685,15 @@ fn a_plot_sample_survives_a_queue_full_of_camera_frames() {
         // could receive however long the wait. The acknowledgement is one message
         // the proxy serves out of retained history, so it is available the instant
         // the subscribe lands and gates on nothing else.
-        let connect_deadline = Instant::now() + VIEWER_CONNECT_DEADLINE;
-        let mut acknowledged = false;
-        while !acknowledged && Instant::now() < connect_deadline {
-            acknowledged = seen
-                .lock()
-                .expect("the seen log is not poisoned")
-                .iter()
-                .any(|(e, _)| e == VIEWER_CONNECTED);
-            if !acknowledged {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
+        let acknowledged = viewer_acknowledged(
+            || {
+                seen.lock()
+                    .expect("the seen log is not poisoned")
+                    .iter()
+                    .any(|(e, _)| e == VIEWER_CONNECTED)
+            },
+            &stream_dead,
+        );
         if !acknowledged {
             // Retired BEFORE the panic, for the reason every verdict below is
             // checked after the join: a panic with the drainer still running
@@ -1909,10 +1956,11 @@ fn a_plot_sample_survives_a_queue_full_of_camera_frames() {
         );
         // WHAT THE VIEWER ACTUALLY SAW. `final_seen` is already built for the order
         // premise, and a liveness failure that does not print it cannot be
-        // attributed from the output alone: the connect row by itself is a viewer
-        // that subscribed and was handed nothing after it, earlier rounds' entities
-        // with this round's missing is a viewer that stopped mid-stream, and an
-        // empty log is a stream that never delivered one byte.
+        // attributed from the output alone. Two classes, not three: the connect row
+        // by itself is a viewer that subscribed and was handed nothing after it, and
+        // earlier probes' entities with this one's missing is a viewer that stopped
+        // mid-stream. A log with nothing in it cannot reach here at all, because the
+        // start gate above refuses to proceed without the connect row.
         let viewer_tail = final_seen
             .iter()
             .rev()
@@ -2233,12 +2281,13 @@ const VIEWER_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Rows a failure prints from the tail of the viewer's log.
 ///
-/// That log holds the connect row plus at most two messages a round, the sample
-/// and its sentinel: every camera frame is dropped while the budget holds, so none
-/// of them ever reach a viewer. Eight rows therefore carry this round's pair
-/// against the three before it, which is what separates a viewer that stopped
-/// mid-stream from one that never received anything.
-const VIEWER_LOG_TAIL: usize = 8;
+/// Sized from what one pass through the loop can leave in that log: its sample and
+/// its sentinel, plus the at most two camera frames each of its two pressure phases
+/// can admit before the queue is back over the budget and every later frame is
+/// dropped. Six rows, so sixteen carries the failing pass and the two before it,
+/// which is what separates a viewer that stopped mid-stream from one that was
+/// handed nothing after its connect.
+const VIEWER_LOG_TAIL: usize = 16;
 
 /// The entity `a_plot_sample_...` logs its ORDER SENTINEL under.
 ///
@@ -2885,23 +2934,35 @@ fn measure_plot_sample_delivery_under_pressure() {
         let drainer = std::thread::spawn(move || {
             while !drain_stop.load(Ordering::Relaxed) {
                 match consumer.recv_timeout(Duration::from_millis(50)) {
-                    Ok(sm) => {
-                        if let Some(re_log_channel::DataSourceMessage::LogMsg(LogMsg::ArrowMsg(
-                            _,
-                            arrow,
-                        ))) = sm.into_data()
-                        {
-                            match re_chunk::Chunk::from_arrow_msg(&arrow) {
-                                Ok(chunk) => drain_seen
+                    // The connect acknowledgement, recorded for the same reason the
+                    // arm records it: it is what the start gate below waits on. It
+                    // is one row in `seen`, ahead of every round's own slice, so it
+                    // enters no round's columns and only the total below counts it.
+                    Ok(sm) => match sm.into_data() {
+                        Some(re_log_channel::DataSourceMessage::LogMsg(LogMsg::SetStoreInfo(
+                            info,
+                        ))) => {
+                            if info.info.store_id.kind() == StoreKind::Recording {
+                                drain_seen
                                     .lock()
                                     .expect("the seen log is not poisoned")
-                                    .push(chunk.entity_path().to_string()),
-                                Err(_) => {
-                                    drain_decode_failures.fetch_add(1, Ordering::Relaxed);
-                                }
+                                    .push(VIEWER_CONNECTED.to_owned());
                             }
                         }
-                    }
+                        Some(re_log_channel::DataSourceMessage::LogMsg(LogMsg::ArrowMsg(
+                            _,
+                            arrow,
+                        ))) => match re_chunk::Chunk::from_arrow_msg(&arrow) {
+                            Ok(chunk) => drain_seen
+                                .lock()
+                                .expect("the seen log is not poisoned")
+                                .push(chunk.entity_path().to_string()),
+                            Err(_) => {
+                                drain_decode_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        },
+                        _ => {}
+                    },
                     Err(_) => {
                         if !consumer.is_connected() {
                             drain_stream_dead.store(true, Ordering::Relaxed);
@@ -2911,7 +2972,32 @@ fn measure_plot_sample_delivery_under_pressure() {
                 }
             }
         });
-        std::thread::sleep(Duration::from_millis(500));
+
+        // The arm's START GATE, not a sleep, and for the same reason: `stream`
+        // returns before its tonic connect, so a fixed wait can expire with the
+        // subscribe unsent and time the delivery of probes no viewer had subscribed
+        // for. This function's numbers are what the arm's delivery wall is set
+        // against, so it must wait on the same acknowledgement the arm does.
+        let acknowledged = viewer_acknowledged(
+            || {
+                seen.lock()
+                    .expect("the seen log is not poisoned")
+                    .iter()
+                    .any(|e| e == VIEWER_CONNECTED)
+            },
+            &stream_dead,
+        );
+        if !acknowledged {
+            stop.store(true, Ordering::Relaxed);
+            drainer.join().expect("the viewer drainer does not panic");
+            panic!(
+                "the viewer never acknowledged its subscribe within \
+                 {VIEWER_CONNECT_DEADLINE:?}, so every wall measured below would be the wall of \
+                 a viewer that was never subscribed. stream alive: {}. The flood that preceded \
+                 it: {flood:?}",
+                !stream_dead.load(Ordering::Relaxed)
+            );
+        }
 
         let pressure = Pressure {
             prod: &prod,
