@@ -1155,8 +1155,9 @@ fn script_named(line: &str) -> Option<String> {
 /// That is deliberately not read as parallel (see the call site); an unreadable
 /// runner leaves the package to its other evidence.
 ///
-/// EVERY test-running line in the script is folded in, and the WEAKEST wins:
-/// one unserialised `cargo test` is enough to flake, so `Parallel` beats
+/// EVERY test-running line that can reach a `tests/` file is folded in (a
+/// `--doc` line is skipped), and the WEAKEST wins: one unserialised
+/// `cargo test` is enough to flake, so `Parallel` beats
 /// `Nextest` beats `LibtestSerial`. A script that runs tests two ways is only
 /// as strong as its weakest line.
 fn script_thread_policy(root: &Path, rel: &str) -> Option<RunnerPolicy> {
