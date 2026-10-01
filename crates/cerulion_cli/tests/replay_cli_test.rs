@@ -325,6 +325,7 @@ fn help_lists_the_whole_re_execution_surface() {
         "--verify",
         "--report",
         "--tolerance",
+        "--record-out",
         "--rate",
         "--duration",
         "--start-offset",
@@ -2000,4 +2001,236 @@ fn a_playback_start_offset_reaches_the_player_not_the_resim_surface() {
         stderr.contains("--start-offset"),
         "…and the refusal must name it; stderr: {stderr}"
     );
+}
+
+// ===========================================================================
+// `--record-out`: the re-executed frames, written to a new bag.
+// ===========================================================================
+
+/// Read a `--record-out` bag back: its finalized state, its user channels as
+/// `(topic, schema name)`, and every message as `(topic, sequence, log_time,
+/// payload)`.
+type RecordedOut = (Vec<(String, String)>, Vec<(String, u32, u64, Vec<u8>)>);
+
+fn read_record_out(path: &Path) -> RecordedOut {
+    let reader = cerulion_bag::BagReader::open(path).expect("the output bag opens");
+    assert!(
+        matches!(
+            reader.completeness().expect("completeness"),
+            cerulion_bag::BagCompleteness::Finalized
+        ),
+        "the output bag must be finalized"
+    );
+    let channels = reader
+        .channels()
+        .expect("channels")
+        .into_iter()
+        .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
+        .map(|c| (c.topic, c.schema_name))
+        .collect();
+    let messages = reader
+        .messages()
+        .expect("messages")
+        .map(|m| m.expect("a readable message"))
+        .filter(|m| !m.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
+        .map(|m| (m.topic, m.sequence, m.log_time, m.data))
+        .collect();
+    (channels, messages)
+}
+
+/// The end-to-end pin for `--record-out`, over the real binary and a real
+/// cdylib: the output bag holds exactly the frames the re-executed graph
+/// published, on a channel copied from the input, in BOTH modes, and the report
+/// names it.
+///
+/// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
+#[test]
+#[serial]
+fn record_out_writes_the_re_executed_frames_in_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}ro", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let topic = format!("/{prefix}/ticker/cmd");
+
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    // The oracle, computed from the frames themselves: one message per frame, on
+    // the topic, carrying the wire header's own sequence and timestamp and the
+    // whole frame as its payload.
+    let expected: Vec<(String, u32, u64, Vec<u8>)> = frames
+        .iter()
+        .map(|f| {
+            let h = WireHeader::read_from_buf(f).expect("frame header");
+            (topic.clone(), h.sequence, h.timestamp_ns, f.clone())
+        })
+        .collect();
+
+    // VERIFY mode, with a report.
+    let out_verify = root.join("out_verify.mcap");
+    let report = root.join("report.json");
+    let run = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .args(RESIM_VERIFY_ARGV)
+        .arg(&bag)
+        .arg("--report")
+        .arg(&report)
+        .arg("--record-out")
+        .arg(&out_verify)
+        .current_dir(root)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("failed to spawn cerulion binary");
+    let stderr = stderr_of(&run);
+    assert_eq!(run.status.code(), Some(0), "stderr: {stderr}");
+    let (channels, messages) = read_record_out(&out_verify);
+    assert_eq!(
+        channels,
+        vec![(topic.clone(), "geometry_msgs/Vector3".to_string())],
+        "one channel per produced topic, copied from the input bag"
+    );
+    assert_eq!(messages, expected, "the re-executed frames, unchanged");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&read_file(&report)).expect("the report is JSON");
+    assert_eq!(
+        parsed["record_out"],
+        out_verify.display().to_string(),
+        "the report names the written bag"
+    );
+    assert_eq!(parsed["passed"], true);
+
+    // NEUTRAL mode: legal, and the same frames.
+    let out_neutral = root.join("out_neutral.mcap");
+    let run =
+        run_resim_bin_in_workspace(root, &bag, &["--record-out", out_neutral.to_str().unwrap()]);
+    let stderr = stderr_of(&run);
+    assert_eq!(run.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("no verdict"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("re-executed frames written to"),
+        "the surface says where the bag went; stderr: {stderr}"
+    );
+    assert_eq!(read_record_out(&out_neutral).1, expected);
+
+    // ANTI-TAUTOLOGY: without the flag nothing is written and the report has no
+    // `record_out` key, so a run that did not ask is byte-for-byte what it was.
+    let plain_report = root.join("plain.json");
+    let run = run_replay_bin_in_workspace_with_report(root, &bag, &plain_report);
+    assert_eq!(run.status.code(), Some(0), "stderr: {}", stderr_of(&run));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&read_file(&plain_report)).expect("the report is JSON");
+    assert!(
+        parsed.get("record_out").is_none(),
+        "a run without `--record-out` must not grow the key: {parsed}"
+    );
+}
+
+/// What the output is FOR: against a bag the candidate no longer matches, the
+/// output holds what the NEW code produced, not what was recorded.
+#[test]
+#[serial]
+fn record_out_holds_the_candidates_frames_not_the_recordings() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}rd", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    let mut recorded = frames.clone();
+    recorded[1][WireHeader::SIZE] ^= 0xFF;
+    let bag = root.join("flipped.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &recorded, &trace);
+
+    let out = root.join("out.mcap");
+    let run = run_resim_bin_in_workspace(root, &bag, &["--record-out", out.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(0), "stderr: {}", stderr_of(&run));
+    let payloads: Vec<Vec<u8>> = read_record_out(&out)
+        .1
+        .into_iter()
+        .map(|(_, _, _, data)| data)
+        .collect();
+    assert_eq!(
+        payloads, frames,
+        "the output is the candidate's own output (the unflipped frames)"
+    );
+    assert_ne!(
+        payloads, recorded,
+        "and it is not a copy of the input bag's divergent frames"
+    );
+}
+
+/// An output path that already exists is refused with exit 2 and the file is
+/// never touched, including when the path is the input bag itself.
+#[test]
+#[serial]
+fn record_out_never_overwrites_an_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}rx", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+    let before = std::fs::read(&bag).unwrap();
+
+    // The input bag as the output: the worst collision.
+    let run = run_resim_bin_in_workspace(root, &bag, &["--record-out", bag.to_str().unwrap()]);
+    let stderr = stderr_of(&run);
+    assert_eq!(run.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("already exists"), "stderr: {stderr}");
+    assert_eq!(
+        std::fs::read(&bag).unwrap(),
+        before,
+        "the input is untouched"
+    );
+
+    // Any other existing file.
+    let other = root.join("other.mcap");
+    std::fs::write(&other, b"keep me").unwrap();
+    let run = run_resim_bin_in_workspace(root, &bag, &["--record-out", other.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(2), "stderr: {}", stderr_of(&run));
+    assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
+}
+
+/// A path whose directory does not exist fails loud (exit 5) and leaves nothing
+/// behind; and `--record-out` without `--resim` is a usage error naming the
+/// working spelling, as every other resim-only flag is.
+#[test]
+#[serial]
+fn record_out_failures_are_loud_and_leave_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}rf", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    let missing_dir = root.join("no_such_dir").join("out.mcap");
+    let run =
+        run_resim_bin_in_workspace(root, &bag, &["--record-out", missing_dir.to_str().unwrap()]);
+    let stderr = stderr_of(&run);
+    assert_eq!(run.status.code(), Some(5), "stderr: {stderr}");
+    assert!(
+        stderr.contains("--record-out cannot create"),
+        "stderr: {stderr}"
+    );
+    assert!(!missing_dir.exists());
+
+    let out = root.join("never.mcap");
+    let run = run_bin(&[
+        "bag",
+        "play",
+        bag.to_str().unwrap(),
+        "--record-out",
+        out.to_str().unwrap(),
+    ]);
+    let stderr = stderr_of(&run);
+    assert_eq!(run.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("--record-out") && stderr.contains("needs `--resim`"),
+        "stderr: {stderr}"
+    );
+    assert!(!out.exists(), "a refused invocation writes nothing");
 }

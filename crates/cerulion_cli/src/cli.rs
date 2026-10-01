@@ -1910,6 +1910,18 @@ pub enum BagAction {
         /// claim about the recording, so a plain `--resim all` honours it too.
         #[arg(long)]
         strict_state: bool,
+        /// With `--resim`: write the re-executed frames to a new bag at this
+        /// path. One channel per graph-produced topic, copied from the input
+        /// bag's channel table, holding every frame the re-executed graph
+        /// published on it. The recorded external inputs are not copied (they
+        /// are unchanged and already in the input bag), and the output carries
+        /// no scheduler trace, so it is a recording to read or index, not a bag
+        /// `--resim` can re-execute. The path must not exist: an existing file
+        /// is refused with exit 2 and never overwritten. Valid in BOTH resim
+        /// modes: it shapes what the run produces, not the comparison. With
+        /// `--report`, the JSON gains a `record_out` field naming the path.
+        #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+        record_out: Option<PathBuf>,
     },
     /// Show what a bag holds (topics, frame counts, schemas, time span) without
     /// publishing anything.
@@ -4399,6 +4411,32 @@ mod verb_log_class_tests {
             assert!(strict_state, "{argv:?} must carry --strict-state");
             assert_eq!(verify, want_verify, "{argv:?}");
             assert_eq!(resim.as_deref(), Some("all"), "{argv:?}");
+        }
+    }
+
+    /// `--record-out` parses onto `bag play` in both resim modes and carries its
+    /// path, so a `main` destructure that dropped it fails here rather than
+    /// silently writing no bag.
+    #[test]
+    fn bag_play_parses_record_out_in_both_resim_modes() {
+        for verify in [false, true] {
+            let mut argv = vec!["cerulion", "bag", "play", "b.mcap", "--resim", "all"];
+            if verify {
+                argv.push("--verify");
+            }
+            argv.extend(["--record-out", "out.mcap"]);
+            let cli = Cli::try_parse_from(&argv).expect("must parse");
+            let Commands::Bag {
+                action: BagAction::Play { record_out, .. },
+            } = cli.command
+            else {
+                panic!("expected `bag play`");
+            };
+            assert_eq!(
+                record_out.as_deref(),
+                Some(std::path::Path::new("out.mcap")),
+                "{argv:?}"
+            );
         }
     }
 

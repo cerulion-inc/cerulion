@@ -15,7 +15,7 @@ Related user-facing docs: `docs/cli_completions.md`, `docs/schema_resolution.md`
 ## 1. `cerulion bag play --resim`: exit-code contract
 
 The surface is `cerulion bag play <bag> --resim all [--verify] [-u|--duration D]
-[--strict-state] [--report FILE] [--tolerance YAML]`. `resim_cmd.rs` owns flag legality and
+[--strict-state] [--record-out FILE] [--report FILE] [--tolerance YAML]`. `resim_cmd.rs` owns flag legality and
 the neutral renderer, `replay_cmd.rs` the entry gates and the stable exit-code surface, and
 `replay_engine.rs` the deterministic re-execution itself. The bag is the golden: it carries
 the graph, env snapshot, recorded frames, and scheduler trace, and the run re-executes the
@@ -32,7 +32,11 @@ and carries the whole contract below. Neutrality scopes EXACTLY the two comparis
 (1 and 6); 2, 3 and 5 mean the re-execution could not be performed and stay loud in both
 modes. `--duration D` bounds the run in SECONDS OF BAG TIME and is legal in both modes (a
 per-rank resim has k step axes and no shared step number, which is why there is no tick
-bound); `--report` and `--tolerance` REQUIRE `--verify`. Every misuse exits 2, never 1:
+bound); `--record-out` shapes what the run PRODUCES and is legal in both modes
+(`resim_record_out.rs` owns the file: `create_new`, one channel per produced topic copied
+from the input bag, a partial file removed on any run that does not finish, and the
+engine's `ReplayOutcome.record_out` names it in the report); `--report` and `--tolerance`
+REQUIRE `--verify`. Every misuse exits 2, never 1:
 under `--verify` 1 means "your code diverged", so a malformed invocation reported as 1
 would make CI announce a regression that does not exist.
 

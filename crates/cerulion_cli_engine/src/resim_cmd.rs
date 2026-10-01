@@ -30,15 +30,17 @@
 //! swallowed those would report "exit 0" for a run that never happened, which
 //! is the silent-failure class this repo has a rule against.
 //!
-//! # Reserved, deliberately not foreclosed
+//! # `--record-out`, and what stays reserved
 //!
-//! `--record-out PATH` (capture the re-executed run's own output to a fresh,
-//! chainable bag) and `--score-topic TOPIC[:FIELD]` (a scalar trajectory over a
-//! re-executed topic) are RESERVED fork-mode flags. They compose on the NEUTRAL
-//! dial — they are the answer to "what did a no-verdict resim produce" — and
-//! neither name, short flag, nor value shape is taken by anything here.
-//! `--resim <node,...>` (a partial cut) is likewise reserved and refused by name
-//! today; see [`ResimSelection::parse`].
+//! `--record-out PATH` writes the re-executed run's own output (the frames of
+//! every graph-produced topic) to a fresh bag, and the `--report` JSON names it
+//! as `record_out`. It shapes what the run PRODUCES, not the comparison, so it
+//! is legal in BOTH modes, like `--duration` and `--strict-state`.
+//!
+//! `--score-topic TOPIC[:FIELD]` (a scalar trajectory over a re-executed
+//! topic) is a RESERVED fork-mode flag: no name, short flag or value shape for
+//! it is taken by anything here. `--resim <node,...>` (a partial cut) is
+//! likewise reserved and refused by name today; see [`ResimSelection::parse`].
 //!
 //! # Platform gating — deliberately NOT inherited from the callee
 //!
@@ -114,6 +116,8 @@ pub struct ResimOptions {
     /// `--strict-state` — refuse the re-execution unless every executed node's
     /// state restored (carried across from `cerulion replay`).
     pub strict_state: bool,
+    /// `--record-out PATH` (legal in both modes).
+    pub record_out_path: Option<PathBuf>,
 }
 
 /// Which nodes re-execute.
@@ -174,6 +178,8 @@ pub struct PlayFlags {
     pub tolerance: Option<PathBuf>,
     /// `--strict-state` — resim only, in EITHER mode.
     pub strict_state: bool,
+    /// `--record-out PATH`: resim only, in EITHER mode.
+    pub record_out: Option<PathBuf>,
 }
 
 /// What a legal `bag play` invocation resolved to.
@@ -256,6 +262,11 @@ const RESIM_ONLY: &[(&str, &str)] = &[
         "there is no node state to restore: playback re-publishes recorded frames \
          and executes nothing",
     ),
+    (
+        "--record-out",
+        "plain playback republishes the recorded frames and re-executes nothing, so \
+         there is no re-executed output to write",
+    ),
 ];
 
 /// Resolve a `bag play` invocation, refusing every illegal flag combination
@@ -290,6 +301,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         report,
         tolerance,
         strict_state,
+        record_out,
     } = flags;
     // Both bounds are BAG-TIME SECONDS, so both are validated the same way and
     // before anything else: a bound nobody can act on is a usage error, not a
@@ -299,7 +311,13 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
 
     let Some(raw) = resim else {
         // Playback. Refuse every resim-only flag, in declaration order.
-        let present: [bool; 4] = [verify, report.is_some(), tolerance.is_some(), strict_state];
+        let present: [bool; 5] = [
+            verify,
+            report.is_some(),
+            tolerance.is_some(),
+            strict_state,
+            record_out.is_some(),
+        ];
         if let Some((flag, why)) = RESIM_ONLY
             .iter()
             .zip(present)
@@ -358,6 +376,19 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         }
     }
 
+    // `--record-out` shapes what the run PRODUCES, so it is legal in both modes.
+    // One file cannot be both the verdict and the bag: refuse the collision by
+    // name rather than let the second writer clobber the first.
+    if let (Some(out), Some(rep)) = (&record_out, &report) {
+        if out == rep {
+            return Err(format!(
+                "`--record-out` and `--report` name the same file ({}). The report is a JSON \
+                 verdict and the output is a bag; give each its own path.",
+                out.display()
+            ));
+        }
+    }
+
     Ok(PlayMode::Resim {
         selection,
         verify,
@@ -366,6 +397,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
             report_path: report,
             tolerance_path: tolerance,
             strict_state,
+            record_out_path: record_out,
         },
     })
 }
@@ -755,6 +787,18 @@ pub fn run_resim(
     options: ResimOptions,
 ) -> u8 {
     let ResimSelection::All = selection;
+    // An existing file is never overwritten, and least of all the input bag. A
+    // path that is already there is a usage error, refused before any work.
+    if let Some(out) = &options.record_out_path {
+        if out.exists() {
+            eprintln!(
+                "Error: `--record-out {}` already exists. Give it a path that does not, so a \
+                 recording is never overwritten.",
+                out.display()
+            );
+            return EXIT_USAGE;
+        }
+    }
     match replay_cmd::run_replay(bag, engine_options(options)) {
         Ok(outcome) => {
             let report = ResimReport::from_outcome(&outcome);
@@ -762,6 +806,9 @@ pub fn run_resim(
                 eprint!("{}", replay_cmd::render_verdict(&outcome, bag));
             } else {
                 eprint!("{}", render_resim_summary(&report, bag));
+            }
+            if let Some(out) = &outcome.record_out {
+                eprintln!("re-executed frames written to {out}");
             }
             resim_exit_code(&report, verify)
         }
@@ -789,12 +836,14 @@ fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
         report_path,
         tolerance_path,
         strict_state,
+        record_out_path,
     } = o;
     replay_cmd::ReplayOptions {
         duration_bound_ns,
         report_path,
         tolerance_path,
         strict_state,
+        record_out_path,
     }
 }
 
@@ -1115,6 +1164,7 @@ mod tests {
                     report_path: Some(PathBuf::from("/tmp/r.json")),
                     tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
                     strict_state: true,
+                    record_out_path: None,
                 },
             }
         );
@@ -1153,6 +1203,77 @@ mod tests {
                 if verify { "verify" } else { "neutral" }
             );
         }
+    }
+
+    /// `--record-out` shapes what the run PRODUCES, not the comparison, so it
+    /// is legal in BOTH modes and reaches the engine's options in each.
+    #[test]
+    fn record_out_is_legal_in_both_resim_modes_and_reaches_the_options() {
+        for verify in [false, true] {
+            let PlayMode::Resim { options, .. } = resolve_play_mode(PlayFlags {
+                verify,
+                record_out: Some(PathBuf::from("/tmp/o.mcap")),
+                ..resim("all")
+            })
+            .unwrap() else {
+                panic!("expected a resim");
+            };
+            assert_eq!(
+                options.record_out_path,
+                Some(PathBuf::from("/tmp/o.mcap")),
+                "`--record-out` must survive the resolver (verify={verify})"
+            );
+        }
+        // The negative: nobody asked, so nothing is invented.
+        let PlayMode::Resim { options, .. } = resolve_play_mode(resim("all")).unwrap() else {
+            panic!("expected a resim");
+        };
+        assert_eq!(options.record_out_path, None);
+    }
+
+    /// One path cannot be both the JSON verdict and the bag.
+    #[test]
+    fn record_out_and_report_may_not_name_the_same_file() {
+        let err = resolve_play_mode(PlayFlags {
+            verify: true,
+            report: Some(PathBuf::from("/tmp/same")),
+            record_out: Some(PathBuf::from("/tmp/same")),
+            ..resim("all")
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--record-out") && err.contains("--report") && err.contains("/tmp/same"),
+            "{err}"
+        );
+        // ANTI-TAUTOLOGY: two different paths are fine.
+        assert!(resolve_play_mode(PlayFlags {
+            verify: true,
+            report: Some(PathBuf::from("/tmp/r.json")),
+            record_out: Some(PathBuf::from("/tmp/o.mcap")),
+            ..resim("all")
+        })
+        .is_ok());
+    }
+
+    /// An output path that already exists is a usage error (exit 2), refused
+    /// before the bag is even opened, and the file is left exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_record_out_is_refused_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("keep.mcap");
+        std::fs::write(&existing, b"precious").unwrap();
+        let code = run_resim(
+            &dir.path().join("no_such_input.mcap"),
+            &ResimSelection::All,
+            false,
+            ResimOptions {
+                record_out_path: Some(existing.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(code, EXIT_USAGE);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"precious");
     }
 
     #[test]
@@ -1210,7 +1331,14 @@ mod tests {
 
     #[test]
     fn every_resim_flag_is_refused_without_resim_with_its_own_reason() {
-        let cases: [(&str, PlayFlags); 4] = [
+        let cases: [(&str, PlayFlags); 5] = [
+            (
+                "--record-out",
+                PlayFlags {
+                    record_out: Some(PathBuf::from("/tmp/o.mcap")),
+                    ..Default::default()
+                },
+            ),
             (
                 "--verify",
                 PlayFlags {
@@ -1670,8 +1798,14 @@ mod tests {
             report_path: Some(PathBuf::from("/tmp/r.json")),
             tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
             strict_state: true,
+            record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
         });
         assert_eq!(got.duration_bound_ns, Some(7_000_000_000));
+        assert_eq!(
+            got.record_out_path.as_deref(),
+            Some(Path::new("/tmp/o.mcap")),
+            "`--record-out` must reach the engine"
+        );
         assert_eq!(got.report_path.as_deref(), Some(Path::new("/tmp/r.json")));
         assert_eq!(
             got.tolerance_path.as_deref(),
@@ -1690,6 +1824,7 @@ mod tests {
         assert!(none.report_path.is_none());
         assert!(none.tolerance_path.is_none());
         assert!(!none.strict_state);
+        assert!(none.record_out_path.is_none());
     }
 
     #[test]

@@ -1282,6 +1282,10 @@ pub struct ReplayOptions {
     ///
     /// Inert on a from-start replay (nothing is restored there by design).
     pub strict_state: bool,
+    /// `--record-out PATH`: write the re-executed frames of every graph-produced
+    /// topic to a fresh bag here. `None` writes nothing. The path must not
+    /// exist; the surface refuses one that does.
+    pub record_out_path: Option<PathBuf>,
 }
 
 /// Run `cerulion bag play --resim` end-to-end against `bag`.
@@ -1763,6 +1767,24 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
     //     problems reports the tolerance error first.
     detect_schema_drift(&reader, &recorded_messages, &config, &workspace_root)?;
 
+    // `--record-out`: the output copies each produced topic's channel from this
+    // bag's table, so read it while the reader is still here.
+    let record_out = opts
+        .record_out_path
+        .map(|path| {
+            let channels = reader
+                .channels()
+                .map_err(|source| ReplayError::BagOpen {
+                    path: bag.to_path_buf(),
+                    source,
+                })?
+                .into_iter()
+                .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
+                .collect();
+            Ok(crate::resim_record_out::RecordOutPlan { path, channels })
+        })
+        .transpose()?;
+
     let trace = replay_engine::RecordedTrace::new(reader);
     tracing::info!(
         bag = ?bag,
@@ -1786,6 +1808,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         tolerance,
         strict_state: opts.strict_state,
         ros2_entries_skipped,
+        record_out,
     };
     let nodes = ReplayNodes::Cdylib {
         workspace_root,
