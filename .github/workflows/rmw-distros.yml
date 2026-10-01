@@ -6,7 +6,9 @@ name: rmw distro lanes
 # refused).
 # Each lane asserts the distro's KNOWN state through tools/ci/rmw-distros/gate.sh, so the lane is
 # green while the state is true and turns red the moment the truth moves in either direction.
-# The per-distro lanes run on PRs and pushes to main that touch the rmw path (the crate, its in-tree dependencies, the workspace manifests); the emulated aarch64 Foxy job runs on manual dispatch only. No lane is a required context on main, so a
+# The per-distro lanes run on PRs and pushes to main that touch the rmw path (the crate, its
+# in-tree dependencies, the workspace manifests); the emulated aarch64 Foxy job runs on manual
+# dispatch only. No lane is a required context on main, so a
 # path-filtered lane that does not run can never leave a PR pending.
 
 on:
@@ -193,8 +195,9 @@ jobs:
     permissions:
       contents: read
     # QEMU user-mode runs arm64 at roughly 5-20x slowdown; a from-scratch
-    # clang+bindgen+rustc build of the whole dep tree plus the serial suite and
-    # three exchanges fits comfortably under this ceiling (GitHub caps at 6 h).
+    # clang+bindgen+rustc build of the whole dep tree, the exchange test-target
+    # pre-build and the three exchanges (the in-process serial suite is deferred on
+    # this leg) fit under this ceiling (GitHub caps at 6 h; this run measured ~65 min).
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -294,7 +297,9 @@ jobs:
           # the wrong-payload self-test. The in-process serial suite is skipped
           # (RMW_GATE_SKIP_SERIAL_SUITE=1); the POLICY line names the two tests
           # that drove the skip, so the gate reports what it judged.
-          echo "POLICY: emulated aarch64 Foxy runs build + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + the wrong-payload self-test; the in-process serial suite is skipped because two tests are timing-sensitive under emulation and both pass on the amd64 foxy lane in the same run: rmw_wait_event_test::a_nine_entity_hop_drains_and_probes_only_what_fired (the selective-drain oracle assumes events arrive separately) and rmw_shadow_take_test::c_copied_then_malformed_frame_retires_the_shadow_instead_of_recycling_it (adopt-take SHM segment registration returns rc -4 under emulation)."
+          echo "POLICY: emulated aarch64 Foxy runs build + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + the wrong-payload self-test; the in-process serial suite is deferred (two of its tests behave differently under emulation; both pass on the amd64 foxy lane in the same run)."
+          echo "POLICY detail: rmw_wait_event_test::a_nine_entity_hop_drains_and_probes_only_what_fired breaches its per-hop drain budget under emulation (timing-sensitive)."
+          echo "POLICY detail: rmw_shadow_take_test::c_copied_then_malformed_frame_retires_the_shadow_instead_of_recycling_it terminates the harness by SIGBUS under emulation (undiagnosed, under investigation)."
           bash tools/ci/rmw-distros/gate.sh foxy </dev/null
 
           # [rule 46 + teeth] the freshly built .so must be an AArch64 ELF --
@@ -332,5 +337,15 @@ jobs:
             || { echo "::error::QEMU teeth: the container never confirmed uname -m=aarch64"; exit 1; }
           grep -qE '^ELF TEETH OK: .*AArch64$' "$plain" \
             || { echo "::error::teeth: the built .so was not confirmed AArch64"; exit 1; }
+
+          # 4) [N2/N6] the in-process serial suite must NOT have run on this emulated
+          #    leg, and the skip + policy lines must be present: the deferral is proven,
+          #    not assumed, and the policy line that names the deferred tests cannot be
+          #    dropped (or the skip flipped on elsewhere) without reddening here.
+          if grep -qE '== rmw serial suite on foxy \(' "$plain"; then echo "::error::the in-process serial suite RAN on the emulated leg; the skip did not take effect"; exit 1; fi
+          grep -qE '== in-process serial suite SKIPPED on foxy ' "$plain" \
+            || { echo "::error::the serial-suite skip line is absent; the deferral is unproven"; exit 1; }
+          grep -qE '^POLICY: emulated aarch64 Foxy ' "$plain" \
+            || { echo "::error::the POLICY line that names the deferred tests is absent"; exit 1; }
 
           echo "Foxy aarch64 (QEMU) PASSED: planted-failure self-test + real arm64 compile + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + wrong-payload self-test (glibc 2.31, aarch64)."

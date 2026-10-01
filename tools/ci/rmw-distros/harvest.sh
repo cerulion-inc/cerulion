@@ -148,3 +148,12 @@ rclpy_timed_out() {
     fi
     return 1
 }
+
+# serial_suite_runs [arch]: exit 0 (TRUE, run the in-process serial suite) unless the caller asked
+# to skip it (RMW_GATE_SKIP_SERIAL_SUITE=1) AND the lane is not x86_64. The x86_64 lanes always run
+# it BY CONSTRUCTION, so a skip variable leaked into a shared env can never empty their floors. The
+# optional arch arg (default `uname -m`) lets gate_selftest drive both lanes without a real machine.
+serial_suite_runs() {
+    local arch="${1:-$(uname -m)}"
+    [ "${RMW_GATE_SKIP_SERIAL_SUITE:-0}" != "1" ] || [ "$arch" = "x86_64" ]
+}
