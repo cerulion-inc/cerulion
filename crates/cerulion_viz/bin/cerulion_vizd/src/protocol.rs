@@ -557,7 +557,7 @@ pub enum Request {
         /// How many of the newest messages to return, 1 to 20. Omitted means 5;
         /// a larger number is clamped to 20; `0` is refused.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        n: Option<u32>,
+        n: Option<u64>,
     },
 }
 
@@ -4115,6 +4115,20 @@ mod tests {
         );
         assert_eq!(parsed.id(), 32);
         assert_eq!(parsed.to_json_line(), counted);
+
+        // A count past u32 still parses (the daemon clamps it to 20).
+        assert_eq!(
+            parse_request(r#"{"method":"sample","id":34,"topic":"/imu","n":4294967296}"#)
+                .expect("parses"),
+            Request::Sample {
+                id: 34,
+                topic: "/imu".to_string(),
+                n: Some(4_294_967_296)
+            }
+        );
+        // Negative and fractional counts are still refused.
+        assert!(parse_request(r#"{"method":"sample","id":35,"topic":"/imu","n":-1}"#).is_err());
+        assert!(parse_request(r#"{"method":"sample","id":36,"topic":"/imu","n":1.5}"#).is_err());
 
         // Forward compatible: a field this daemon predates is ignored.
         assert!(

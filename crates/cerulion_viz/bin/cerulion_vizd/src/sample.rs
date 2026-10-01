@@ -261,10 +261,16 @@ fn row_for(sample: RawSample, walker: &FrameWalker) -> SampleRow {
     }
 }
 
-/// A decoded message as a JSON object, `{field: value}` in wire order.
+/// A decoded message as a JSON object, `{field: value}`. Once the value budget
+/// is spent the remaining fields are dropped and one `"..."` entry marks the cut,
+/// so a very wide schema cannot widen the reply past the bound.
 fn fields_json(value: &FrameValue<'_>, depth: usize, budget: &mut usize) -> Value {
     let mut map = Map::new();
     for field in &value.fields {
+        if *budget == 0 {
+            map.insert("...".to_string(), cut());
+            break;
+        }
         map.insert(field.name.clone(), kind_json(&field.value, depth, budget));
     }
     Value::Object(map)
@@ -293,8 +299,8 @@ fn kind_json(kind: &FrameValueKind<'_>, depth: usize, budget: &mut usize) -> Val
         FrameValueKind::F32(v) => f32_json(*v),
         FrameValueKind::F64(v) => float_json(*v),
         FrameValueKind::Str(s) => Value::String(truncate_chars(s, FIELD_MAX_STR)),
-        FrameValueKind::Bytes(b) => array_json(b.len(), b.iter().map(|x| Value::from(*x))),
-        FrameValueKind::PrimArray(a) => prim_array_json(a),
+        FrameValueKind::Bytes(b) => array_json(b.len(), b.iter().map(|x| Value::from(*x)), budget),
+        FrameValueKind::PrimArray(a) => prim_array_json(a, budget),
         FrameValueKind::Nested(inner) => {
             if depth >= FIELD_MAX_DEPTH {
                 cut()
@@ -321,7 +327,7 @@ fn kind_json(kind: &FrameValueKind<'_>, depth: usize, budget: &mut usize) -> Val
     }
 }
 
-fn prim_array_json(a: &PrimArray<'_>) -> Value {
+fn prim_array_json(a: &PrimArray<'_>, budget: &mut usize) -> Value {
     let width = a.elem.size();
     let items = a.bytes.chunks_exact(width).take(a.count);
     // Each element is read at its own width, so a 64-bit integer keeps every bit
@@ -344,12 +350,17 @@ fn prim_array_json(a: &PrimArray<'_>) -> Value {
             ])),
         }
     };
-    array_json(a.count, items.map(elem))
+    array_json(a.count, items.map(elem), budget)
 }
 
-/// An array of `len` items as its first [`FIELD_MAX_ARRAY`] values.
-fn array_json(len: usize, items: impl Iterator<Item = Value>) -> Value {
-    wrap_array(len, items.take(FIELD_MAX_ARRAY).collect())
+/// An array of `len` items as its first [`FIELD_MAX_ARRAY`] values, each one
+/// charged to the frame's value budget (the array itself was charged by the
+/// caller), so many short arrays cannot exceed [`FIELD_MAX_NODES`].
+fn array_json(len: usize, items: impl Iterator<Item = Value>, budget: &mut usize) -> Value {
+    let take = FIELD_MAX_ARRAY.min(*budget);
+    let head: Vec<Value> = items.take(take).collect();
+    *budget -= head.len();
+    wrap_array(len, head)
 }
 
 /// A short array renders as itself; a longer one as `{"len":N,"head":[...]}`,
@@ -412,6 +423,12 @@ fn summarize(value: &FrameValue<'_>, fields: &Value) -> String {
     if more > 0 {
         line.push_str(&format!(" (+{more} more)"));
     }
+    // A decoded string may hold a newline or other control character; the
+    // summary stays one line whatever the message says.
+    let line: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     truncate_chars(&line, SUMMARY_MAX_CHARS)
 }
 
@@ -434,13 +451,32 @@ fn brief(v: &Value) -> String {
     }
 }
 
-/// A float to three significant figures, trailing zeros dropped.
+/// A float to three significant figures, trailing zeros dropped. Magnitudes
+/// below 1e-4 or from 1e3 up use scientific notation (`1.5e-10`, `1.23e4`), so a
+/// tiny nonzero value never reads as `0` and a large one is still three figures.
 fn sig3(f: f64) -> String {
     if f == 0.0 {
         return "0".to_string();
     }
+    if !f.is_finite() {
+        return f.to_string();
+    }
     let magnitude = f.abs().log10().floor() as i32;
-    let decimals = (2 - magnitude).clamp(0, 9) as usize;
+    if !(-4..3).contains(&magnitude) {
+        let text = format!("{f:.2e}");
+        return match text.split_once('e') {
+            Some((m, e)) => {
+                let m = if m.contains('.') {
+                    m.trim_end_matches('0').trim_end_matches('.')
+                } else {
+                    m
+                };
+                format!("{m}e{e}")
+            }
+            None => text,
+        };
+    }
+    let decimals = (2 - magnitude).clamp(0, 6) as usize;
     let text = format!("{f:.decimals$}");
     if text.contains('.') {
         text.trim_end_matches('0').trim_end_matches('.').to_string()
@@ -764,11 +800,40 @@ mod tests {
         let v = msg("t/Wide", fields);
         let got = json_of(&v);
         let obj = got.as_object().unwrap();
-        assert_eq!(obj.len(), FIELD_MAX_NODES + 50, "every name is kept");
+        assert_eq!(
+            obj.len(),
+            FIELD_MAX_NODES + 1,
+            "the budget, then one marker"
+        );
         let real = obj.values().filter(|x| x.is_number()).count();
-        let cut_count = obj.values().filter(|x| x.is_string()).count();
         assert_eq!(real, FIELD_MAX_NODES);
-        assert_eq!(cut_count, 50);
+        assert_eq!(obj.get("..."), Some(&Value::String("...".to_string())));
+    }
+
+    #[test]
+    fn many_short_arrays_stay_inside_the_node_budget() {
+        let bytes = [7u8; FIELD_MAX_ARRAY];
+        let fields: Vec<NamedValue<'_>> = (0..FIELD_MAX_NODES)
+            .map(|i| nv(&format!("a{i:04}"), FrameValueKind::Bytes(&bytes)))
+            .collect();
+        let v = msg("t/Arrays", fields);
+        let got = json_of(&v);
+        let mut values = 0usize;
+        for arr in got.as_object().unwrap().values() {
+            values += 1;
+            if let Some(a) = arr.as_array() {
+                values += a.len();
+            }
+        }
+        assert!(values <= FIELD_MAX_NODES + 1, "{values} values emitted");
+    }
+
+    #[test]
+    fn a_newline_in_a_string_field_keeps_the_summary_on_one_line() {
+        let v = msg("t/Text", vec![nv("s", FrameValueKind::Str("a\nb\r\tc"))]);
+        let line = summarize(&v, &json_of(&v));
+        assert_eq!(line, "t/Text: s=a b  c");
+        assert!(!line.chars().any(char::is_control));
     }
 
     #[test]
@@ -784,7 +849,7 @@ mod tests {
         let fields = json_of(&v);
         assert_eq!(
             summarize(&v, &fields),
-            "geometry_msgs/Vector3: x=1.23, y=1235, z=0"
+            "geometry_msgs/Vector3: x=1.23, y=1.23e3, z=0"
         );
     }
 
@@ -804,7 +869,12 @@ mod tests {
         assert_eq!(sig3(1.0), "1");
         assert_eq!(sig3(0.000123456), "0.000123");
         assert_eq!(sig3(-45.678), "-45.7");
-        assert_eq!(sig3(99999.9), "100000");
+        assert_eq!(sig3(99999.9), "1e5");
+        assert_eq!(sig3(1.0e-10), "1e-10");
+        assert_eq!(sig3(-1.5e-10), "-1.5e-10");
+        assert_eq!(sig3(12345.0), "1.23e4");
+        assert_eq!(sig3(999.0), "999");
+        assert_eq!(sig3(0.0001), "0.0001");
     }
 
     #[test]

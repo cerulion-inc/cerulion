@@ -2674,7 +2674,11 @@ frame, the frame is larger than 16 KiB (an image or a point cloud keeps `seq`,
 `ts_ns` and `size` only), or it did not decode; `summary` is a one line label, or
 the reason `fields` is `null`. An array of more than 16 elements is
 `{"len":N,"head":[first 16]}`, and NaN and the infinities are the strings `"NaN"`,
-`"inf"` and `"-inf"`. The daemon keeps frames for a topic only while it is being
+`"inf"` and `"-inf"`. One decoded frame emits at most 512 values; past that the
+remaining fields are replaced by one `"..."` entry. A byte array (`uint8[]` and
+`int8[]`) is shown as unsigned values from 0 to 255. The `summary` shows a number
+to three significant figures, in scientific notation outside 1e-4 up to 1e3. The
+daemon keeps frames for a topic only while it is being
 sampled: the first `sample` of a topic starts a ring and returns the frames that
 arrive after it (so it is usually empty), and the ring is dropped five seconds
 after the last `sample` that named the topic, so poll a few times a second. At most

@@ -244,7 +244,7 @@ impl Client {
         assert_eq!(r["ok"].as_bool(), Some(true), "attach {topic}: {r}");
     }
 
-    fn sample(&mut self, topic: &str, n: u32) -> Value {
+    fn sample(&mut self, topic: &str, n: u64) -> Value {
         self.request(&format!(
             r#"{{"id":7,"method":"sample","topic":"{topic}","n":{n}}}"#
         ))
@@ -252,7 +252,7 @@ impl Client {
 
     /// Poll `sample` until it returns at least `want` rows (the ring is armed by the
     /// first call and fed by the poll thread), within a bound. Returns that reply.
-    fn sample_until(&mut self, topic: &str, n: u32, want: usize) -> Value {
+    fn sample_until(&mut self, topic: &str, n: u64, want: usize) -> Value {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let r = self.sample(topic, n);
@@ -403,6 +403,11 @@ fn n_is_clamped_to_twenty_and_zero_is_refused() {
         let r = client.sample(topic, 1000);
         assert!(rows(&r).len() <= 20, "never more than 20 rows: {r}");
     }
+
+    // A count beyond u32 is still a request, clamped like any other large one.
+    let huge = client.sample(topic, 4_294_967_296);
+    assert_eq!(huge["ok"].as_bool(), Some(true), "{huge}");
+    assert!(rows(&huge).len() <= 20, "{huge}");
 
     // Omitting `n` gives the default of five.
     let default = client.request(&format!(

@@ -1733,7 +1733,7 @@ impl Ctx {
     /// shared handles to the newest frames, and decodes them AFTER the lock is
     /// released, so a slow decode never stalls the poll thread. Opens nothing: a
     /// topic with no tap is refused rather than attached.
-    fn sample(&self, id: u64, topic: String, n: Option<u32>) -> Response {
+    fn sample(&self, id: u64, topic: String, n: Option<u64>) -> Response {
         let n = match n {
             None => SAMPLE_DEFAULT_ROWS,
             Some(0) => {
