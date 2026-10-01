@@ -233,6 +233,90 @@ pub fn node_create_with_options(
     Ok(())
 }
 
+/// Resolve the trigger policy for `cerulion node create` (and `cerulion-wsd`'s `node.create`) from the
+/// `--policy` flag, the `-T` flag, and the regular `-i` inputs.
+///
+/// Defaulting rules (when `--policy` is absent):
+/// - `-T` set: `DataTrigger { input_name: <T's name> }`
+///   (an explicit `-T` declares the trigger, so the policy is
+///   threaded through as `data_trigger=NAME`).
+/// - 0 inputs (no `-i` and no `-T`): error, a source-only node
+///   must declare a non-data policy explicitly
+///   (`--policy period_ms=N` or `--policy external`).
+/// - 1+ inputs via `-i` only: `None` (the source emits no
+///   node-level policy attribute; the runtime fires on any input
+///   arrival and emits a warning at graph-build time so the
+///   user notices). The warning is intentional: a user might want
+///   a different policy (Sync, data_trigger on a
+///   specific input), and silence would let unintended firing
+///   behavior ship.
+///
+/// When `--policy` is present:
+/// - `--policy data_trigger=NAME` and `-T NAME'` must agree on the
+///   trigger input.
+/// - `--policy data_trigger=NAME` requires NAME to match exactly
+///   one of the `-i` or `-T` inputs.
+/// - Non-data policies (Period/Sync/External) ignore the
+///   `-T` / `-i` set and use the explicit policy as-is. `-T` is
+///   incompatible with non-data policies, so the caller errors.
+pub fn resolve_create_policy(
+    explicit: Option<&cerulion_core::MacroPolicy>,
+    trigger_input: Option<&(String, String)>,
+    regular_inputs: &[(String, String)],
+) -> CliResult<Option<cerulion_core::MacroPolicy>> {
+    use cerulion_core::MacroPolicy;
+    match (explicit, trigger_input) {
+        (Some(MacroPolicy::DataTrigger { input_name }), Some((_, t_name))) => {
+            if input_name != t_name {
+                return Err(CliError::Validation(format!(
+                    "`--policy data_trigger={input_name}` and `-T <SCHEMA> {t_name}` disagree \
+                     on the trigger input"
+                )));
+            }
+            Ok(Some(MacroPolicy::DataTrigger {
+                input_name: input_name.clone(),
+            }))
+        }
+        (Some(_non_data), Some(_)) => Err(CliError::Validation(
+            "`-T` declares a data-trigger input, which conflicts with a non-data `--policy`. \
+             Drop `-T` or change the policy."
+                .to_string(),
+        )),
+        (Some(MacroPolicy::DataTrigger { input_name }), None) => {
+            let matches_input = regular_inputs.iter().any(|(_, n)| n == input_name);
+            if !matches_input {
+                return Err(CliError::Validation(format!(
+                    "`--policy data_trigger={input_name}` requires `-i SCHEMA {input_name}` \
+                     (or `-T SCHEMA {input_name}`) to declare the trigger input"
+                )));
+            }
+            Ok(Some(MacroPolicy::DataTrigger {
+                input_name: input_name.clone(),
+            }))
+        }
+        (Some(p), None) => Ok(Some(p.clone())),
+        (None, Some((_, name))) => Ok(Some(MacroPolicy::DataTrigger {
+            input_name: name.clone(),
+        })),
+        (None, None) => {
+            if regular_inputs.is_empty() {
+                Err(CliError::Validation(
+                    "source-only nodes (no `-i` or `-T`) must declare a non-data trigger policy. \
+                     Pass `--policy period_ms=N` or `--policy external`."
+                        .to_string(),
+                ))
+            } else {
+                // 1+ inputs with no explicit `--policy` or `-T`:
+                // emit no node-level policy attribute. The runtime
+                // fires on any input arrival and emits a warning
+                // at graph-build time so the user notices and can
+                // pick a more specific policy if desired.
+                Ok(None)
+            }
+        }
+    }
+}
+
 /// Delete a node type from the workspace.
 pub fn node_delete(
     nodes_dir: &Path,
@@ -803,6 +887,68 @@ pub fn node_build_with_progress(
     on_report: &mut dyn FnMut(&str),
     on_cargo_start: &mut dyn FnMut(&str),
 ) -> CliResult<NodeBuildOutcome> {
+    build_node(
+        workspace_root,
+        node_type,
+        release,
+        on_report,
+        on_cargo_start,
+        None,
+    )
+}
+
+/// [`node_build_with_progress`] with cargo's machine-readable output handed
+/// to `on_message` as it is produced, one `--message-format=json` line per
+/// call, instead of captured and shown only on failure.
+///
+/// This is what `cerulion-wsd`'s `node.build` streams to Studio. Everything
+/// before cargo runs is the same function as the CLI's build: the unknown-node
+/// and malformed-metadata refusals, the optional-system-dependency probe and
+/// notice, the PATH compiler advisory. `on_cargo_start` is called exactly
+/// once, immediately before cargo is spawned, so a caller can tell a build
+/// that was refused up front (an `Err` before the call) from one that ran and
+/// failed (an `Err` after it).
+///
+/// Setting `cancel` (from any thread; Unix hosts) kills cargo and everything
+/// it spawned within a fraction of a second, whether or not cargo is printing, and the
+/// call returns [`CliError::BuildFailed`] with a `reason` of `cancelled`. On a
+/// cargo failure the `reason` is cargo's own stderr (status lines and errors
+/// that are not compiler messages; the compiler messages went to
+/// `on_message`), capped at 1 MiB.
+pub fn node_build_streaming(
+    workspace_root: &Path,
+    node_type: &str,
+    release: bool,
+    on_report: &mut dyn FnMut(&str),
+    on_cargo_start: &mut dyn FnMut(&str),
+    on_message: &mut dyn FnMut(&str),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> CliResult<NodeBuildOutcome> {
+    build_node(
+        workspace_root,
+        node_type,
+        release,
+        on_report,
+        on_cargo_start,
+        Some((on_message, cancel)),
+    )
+}
+
+/// Cargo's stderr is kept only for the failure reason; the streaming build
+/// reads it on its own thread so a full pipe can never stall cargo.
+const STREAMING_STDERR_CAP: usize = 1024 * 1024;
+
+/// The message sink and cancel flag of a streaming build.
+type StreamingBuild<'a> = (&'a mut dyn FnMut(&str), &'a std::sync::atomic::AtomicBool);
+
+fn build_node(
+    workspace_root: &Path,
+    node_type: &str,
+    release: bool,
+    on_report: &mut dyn FnMut(&str),
+    on_cargo_start: &mut dyn FnMut(&str),
+    streaming: Option<StreamingBuild<'_>>,
+) -> CliResult<NodeBuildOutcome> {
     let nodes_dir = workspace_root.join("nodes");
     let node_dir = nodes_dir.join(node_type);
     if !node_dir.exists() {
@@ -888,10 +1034,17 @@ pub fn node_build_with_progress(
     cmd.current_dir(workspace_root);
 
     on_cargo_start(&node_build_progress_line(node_type));
-    let output = cmd.output().map_err(|e| CliError::BuildFailed {
+    let spawn_failure = |e: std::io::Error| CliError::BuildFailed {
         target: node_type.to_string(),
         reason: cargo_spawn_failure_reason(&e, workspace_root),
-    })?;
+    };
+    let output = match streaming {
+        None => cmd.output().map_err(spawn_failure)?,
+        Some((on_message, cancel)) => {
+            cmd.arg("--message-format=json");
+            run_cargo_streaming(cmd, on_message, cancel, node_type, spawn_failure)?
+        }
+    };
 
     if !output.status.success() {
         return Err(CliError::BuildFailed {
@@ -907,6 +1060,97 @@ pub fn node_build_with_progress(
         notice,
     })
 }
+
+/// Run `cmd` (stdout and stderr piped), handing each stdout line to
+/// `on_message` as it arrives. The returned `Output` carries cargo's stderr
+/// and an EMPTY stdout: the lines already went to the callback. `cancel`
+/// kills cargo's whole process group.
+fn run_cargo_streaming(
+    mut cmd: std::process::Command,
+    on_message: &mut dyn FnMut(&str),
+    cancel: &std::sync::atomic::AtomicBool,
+    node_type: &str,
+    spawn_failure: impl FnOnce(std::io::Error) -> CliError,
+) -> CliResult<std::process::Output> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Cargo gets its own process group so a cancel ends it and every compiler
+    // it spawned with one signal.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().map_err(spawn_failure)?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let pid = child.id();
+    let output_closed = AtomicBool::new(false);
+
+    let stderr = std::thread::scope(|scope| {
+        // Its own thread, so a full stderr pipe can never stall cargo. Reading
+        // continues past the cap; only the first STREAMING_STDERR_CAP bytes
+        // are kept.
+        let stderr_reader = scope.spawn(move || {
+            let mut kept = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while let Ok(read) = stderr.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                let room = STREAMING_STDERR_CAP.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..read.min(room)]);
+            }
+            kept
+        });
+        // Cargo may be silent for minutes (a long compile, a build script), so
+        // the stdout loop below cannot be the one to notice a cancel.
+        let watcher = scope.spawn(|| {
+            while !output_closed.load(Ordering::Acquire) {
+                if cancel.load(Ordering::Acquire) {
+                    kill_process_group(pid);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
+        for line in BufReader::new(stdout).split(b'\n') {
+            let Ok(line) = line else { break };
+            on_message(&String::from_utf8_lossy(&line));
+        }
+        // Cargo's output has ended, so nothing is left to cancel; stop the
+        // watcher before the child is reaped and its pid can be reused.
+        output_closed.store(true, Ordering::Release);
+        let _ = watcher.join();
+        stderr_reader.join().unwrap_or_default()
+    });
+    let status = child.wait()?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: "cancelled".to_string(),
+        });
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // SAFETY: `killpg` takes a process-group id and touches no memory; the
+    // group is the one `process_group(0)` made for this child.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 /// Probe PATH's `rustc -vV` in the workspace directory. Rustup's directory
 /// selection is honored, but Cargo-specific compiler overrides need not match
