@@ -19,7 +19,7 @@
 # WHY THE BRANCH RULE FORBIDS A TRACKER ID. A branch name is permanent, public
 # and quoted in every merge commit, while a tracker id means nothing to anyone
 # outside the tracker — and the repo's own agent-docs gate
-# (`scripts/check_agents_md.sh`) already treats that token shape as internal
+# (`tools/scripts/check_agents_md.sh`) already treats that token shape as internal
 # vocabulary that must not ship in public documentation. The id belongs in the
 # PR BODY, where it links, is editable, and is not baked into history.
 #
@@ -38,7 +38,7 @@
 # action is code this repo executes with its own token; the two the ecosystem
 # offers for this are a hundred lines of JavaScript each for a regex. It is
 # also runnable locally (`--self-test`, or just pass a title and a branch),
-# reviewable as a diff, and covered by `shellcheck scripts/*.sh`.
+# reviewable as a diff, and covered by `shellcheck tools/scripts/*.sh`.
 #
 # USAGE
 #   check_pr_title.sh --title "<title>" --branch "<branch>" [--pr <number>]

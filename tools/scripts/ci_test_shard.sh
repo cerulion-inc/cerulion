@@ -82,8 +82,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-# The shipped configuration — the ONE place the defaults live, so `--check`
-# and the CI matrix cannot describe different partitions.
+# The shipped defaults: the package and the Linux shard count. A bare `--check`
+# (the Lint step) partitions at these; the macOS lane passes its own count, 3,
+# on its `run:` line, and the coverage test in cerulion_cli_engine checks each
+# lane's matrix against the count that lane passes.
 DEFAULT_PACKAGE=cerulion_core
 DEFAULT_SHARD_COUNT=4
 
@@ -112,7 +114,7 @@ DEFAULT_SHARD_COUNT=4
 # 227.0 s of that 228.7. Earlier: 545.2 s and 559.3 s
 # on two green main runs, ~97 % of that wall. The
 # RATIO is what has held across every sample — this one test is essentially the
-# whole of whichever quarter holds it, against 20-38 s for every other shard's.
+# whole of whichever shard holds it, against 20-38 s for every other shard's.
 # That cost is not addressable here: splitting it by expectation WITHIN the
 # same job costs +158 s of trybuild work and +2.4 min of shard-step wall,
 # so it stays whole.
@@ -120,7 +122,7 @@ DEFAULT_SHARD_COUNT=4
 # WHY PIN IT rather than let the round-robin place it. The round-robin is over
 # the SORTED file list, so the tail's shard is a function of how many
 # `cerulion_core/tests/*.rs` sort before it — i.e. adding ANY test file has a
-# ~1-in-4 chance of moving that whole block onto a different runner. It sat on
+# ~1-in-`count` chance of moving that whole block to another runner. It sat on
 # shard 1 for both runs above and moved to shard 2 on ONE added file. That
 # makes the fleet's critical path a lottery: no package-to-shard map can be
 # balanced against a load that relocates on an unrelated PR, and the observed
@@ -128,7 +130,7 @@ DEFAULT_SHARD_COUNT=4
 # Pinning converts the tail from a variable into a constant, which is what lets
 # the workflow's package map be packed around it: the tail is one FIXED term of
 # shard 2's measured wall, and the package steps are placed largest-first
-# around all four shards' fixed terms. See the map and its measurement in
+# around every shard's fixed term. See the map and its measurement in
 # `.github/workflows/ci.yml` above the package steps.
 #
 # WHAT IS NOT CHANGED. New test files still round-robin, automatically, with no
@@ -142,8 +144,10 @@ DEFAULT_SHARD_COUNT=4
 # that, the answer is the round-robin.
 #
 # PINNED_SHARD is taken `% count`, so the pin is always a valid index for any
-# shard count (the shipped count is 4; `--check cerulion_core 2` still
-# partitions). It is inert for any package that does not contain the file, so
+# shard count: `--check cerulion_core 2` still partitions. TWO counts ship, 4 on
+# Linux and 3 on macOS (each lane's `shard:` matrix and the count it passes to
+# this script in `.github/workflows/ci.yml`), and `2 % 4` and `2 % 3` both land
+# on shard 2. It is inert for any package that does not contain the file, so
 # `ci_test_shard.sh cerulion_bag …` is unaffected.
 PINNED_TEST=macro_compile_fail_test
 PINNED_SHARD=2
@@ -690,7 +694,7 @@ printf 'ci_test_shard: shard %s/%s of %s\n' "$INDEX" "$COUNT" "$PACKAGE"
 # rather than cargo's bare "no such command: nextest".
 command -v cargo-nextest >/dev/null 2>&1 || die \
     "cargo-nextest is not installed — this shard runs under nextest now.
-Install the pinned version with:  ./scripts/install_nextest.sh
+Install the pinned version with:  ./tools/scripts/install_nextest.sh
 (see .config/nextest.toml for the serial fence it applies)"
 # NO `--test-threads=1`. nextest runs each test in its own PROCESS, so the
 # process-global hazards that flag was defending (the cdylib `NODES` registry,
