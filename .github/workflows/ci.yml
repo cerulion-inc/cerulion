@@ -1175,7 +1175,8 @@ jobs:
   # (`cerulion_core` calls `try_update` on the integer atomics, stable since
   # 1.95); the dependency tree floors lower, the `rerun` 0.34 SDK (pulled by the
   # `cerulion_viz` / `cerulion-vizd` members) at 1.93 through its transitive
-  # `fixed` 1.31.0 dep, above the pre-viz 1.88 floor. `--workspace` deliberately
+  # `fixed` 1.31.0 dep, above the non-viz tree's 1.91 floor (`iroh` 1.0.2 and its
+  # companion crates). `--workspace` deliberately
   # INCLUDES the viz members (they are excluded from `default-members` for lean
   # builds, NOT from `--workspace`), so this job also proves rerun compiles on
   # the floor.

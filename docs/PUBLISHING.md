@@ -159,8 +159,8 @@ Run from the workspace root, in order:
 - **MSRV** (`rust-version = "1.95"`, workspace-inherited): set by Cerulion's own
   code, `try_update` on the integer atomics in `crates/cerulion_core` (stable since
   1.95; Rust 1.99 deprecates its former name `fetch_update`). The dependency tree
-  floors lower: the tree without the viz members at 1.88
-  (darling/time/time-core/home/instability declare rust-version 1.88), and the
+  floors lower: the tree without the viz members at 1.91
+  (`iroh` 1.0.2 and its companion crates declare rust-version 1.91), and the
   `rerun` 0.34 SDK pulled by the `cerulion_viz` / `cerulion-vizd` members at 1.93
   through its transitive `fixed` 1.31.0. ENFORCED: the `msrv` CI job runs
   `cargo +1.95.0 check --workspace --all-targets` on every push to `main`

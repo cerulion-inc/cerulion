@@ -364,8 +364,8 @@ homepage = "https://github.com/cerulion-inc/cerulion"
 # VERIFIED + ENFORCED: the `msrv` CI job in .github/workflows/ci.yml runs
 # `cargo +1.95.0 check --workspace --all-targets` on every push to `main` (it is
 # skipped on `pull_request`), so this value is a build-proven floor, not a survey.
-# The dependency tree floors lower: the non-viz tree at 1.88 (darling/time/
-# time-core/home/instability declare rust-version 1.88), and the `rerun` 0.34
+# The dependency tree floors lower: the non-viz tree at 1.91 (`iroh` 1.0.2 and
+# its companion crates declare rust-version 1.91), and the `rerun` 0.34
 # SDK pulled by the `cerulion_viz` / `cerulion-vizd` members at 1.93 (`rerun`
 # declares 1.92; its transitive `fixed` 1.31.0 declares 1.93, the highest
 # rust-version in the lockfile). The release compiler
