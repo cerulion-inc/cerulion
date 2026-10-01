@@ -172,8 +172,14 @@ lockstep with the rest of the `re_*` graph).
   bump in the root manifest, never a bare version edit here. The fork repo's
   README and patch doc carry the procedure.
 - The exit condition (recorded beside the pin and in `deny.toml`): drop the
-  fork only when upstream ships BOTH capabilities; they bound two different
-  buffers on the same path, and either alone is not enough.
+  fork only when upstream ships BOTH capabilities and runs the `spawn_with_recv`
+  forwarder's send off its runtime workers; the two capabilities bound two
+  different buffers on the same path, and either alone is not enough.
+- The fork also carries one test-only change: the forwarder behind
+  `spawn_with_recv` runs on a blocking-pool thread, since its push into the
+  receiver it hands back is a thread-blocking send that parked a runtime worker
+  whenever that receiver was left undrained; vizd hosts through
+  `serve_from_channel` and is unaffected.
 - Landmine: the added `ServerOptions` fields are safe only because rerun's
   `clap`/`run`/`web_viewer` features (which construct `ServerOptions` with
   explicit-field literals) are not compiled in our sdk+server build. Re-check
