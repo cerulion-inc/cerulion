@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cerulion-wsd` creates and builds. `graph.create`, `node.create` and `schema.create` do what `cerulion graph create`, `node create` and `schema create` do and answer with the `version` of the file they wrote, so the next edit can be a compare-and-swap. `node.build` runs `cerulion node build` and streams cargo's compiler messages as structured `diagnostic` events (file, line, column, level, message, code), then a `done` event; a client that closes its connection cancels the build. The protocol version is unchanged: an older daemon answers the new verbs with `unknown_verb`, and every existing verb is as it was. `cerulion_cli_engine` gains `node_cmd::node_build_streaming`, and `node create`'s trigger-policy defaulting moved from the `cerulion` binary into `node_cmd::resolve_create_policy` so the daemon applies the same rules.
+
 ## [1.0.0] - 2026-09-21
 
 The first release of Cerulion. Its crates, binaries and Debian packages come from this tree.

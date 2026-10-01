@@ -2,6 +2,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
@@ -31,6 +32,9 @@ pub const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 /// the socket singleton.
 pub const HARD_EXIT_ENV: &str = "CERULION_WSD_HARD_EXIT_MS";
 const DEFAULT_HARD_EXIT_MS: u64 = 5000;
+
+/// How many reply lines a request may have queued ahead of the socket writer.
+const REPLY_LINES_IN_FLIGHT: usize = 256;
 
 fn hard_exit_deadline() -> Duration {
     match std::env::var(HARD_EXIT_ENV) {
@@ -341,41 +345,90 @@ async fn handle_connection(
                 continue;
             }
         };
+        let mut watching_for_eof = protocol::cancels_on_hangup(&line);
         let request_guard = Arc::clone(&socket_guard);
         let request_inspector = Arc::clone(&inspector);
-        let response = match tokio::task::spawn_blocking(move || {
-            let response = {
+        // The handler runs on a blocking thread and hands each line it
+        // produces over a bounded channel (a client that reads slowly slows a
+        // build down instead of growing memory). `cancelled` is how a closed
+        // connection reaches a build in progress.
+        let (lines, mut produced) = tokio::sync::mpsc::channel::<String>(REPLY_LINES_IN_FLIGHT);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let handler_cancelled = Arc::clone(&cancelled);
+        // A connection task aborted mid-request (shutdown) stops its build too.
+        let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
+        let handler = tokio::task::spawn_blocking(move || {
+            {
                 let _socket_guard = request_guard;
                 #[cfg(test)]
                 notify_blocking_request_started();
-                protocol::handle_line(&line, request_inspector.as_ref())
-            };
+                protocol::handle_line_streaming(
+                    &line,
+                    request_inspector.as_ref(),
+                    &mut |value| match serde_json::to_string(&value) {
+                        Ok(encoded) => {
+                            if lines.blocking_send(encoded).is_err() {
+                                handler_cancelled.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "failed to encode workspace daemon response");
+                            handler_cancelled.store(true, Ordering::Release);
+                        }
+                    },
+                    &handler_cancelled,
+                );
+            }
             #[cfg(test)]
             notify_blocking_request_finished();
-            response
-        })
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::error!(error = %error, "workspace daemon request task failed");
-                break;
+        });
+        let mut client_gone = false;
+        loop {
+            tokio::select! {
+                encoded = produced.recv() => match encoded {
+                    Some(encoded) => {
+                        if !client_gone
+                            && writer
+                                .write_all(format!("{encoded}\n").as_bytes())
+                                .await
+                                .is_err()
+                        {
+                            client_gone = true;
+                            cancelled.store(true, Ordering::Release);
+                        }
+                    }
+                    None => break,
+                },
+                // `node.build` only: the client keeps its connection open
+                // until `done`, so an end of file here is it hanging up (or
+                // half-closing), which cancels the build. Every other verb
+                // keeps answering a client that has closed its write side.
+                // Bytes (a pipelined next request) are left unread.
+                ready = reader.fill_buf(), if watching_for_eof => {
+                    watching_for_eof = false;
+                    if matches!(ready, Ok([]) | Err(_)) {
+                        client_gone = true;
+                        cancelled.store(true, Ordering::Release);
+                    }
+                }
             }
-        };
-        let encoded = match serde_json::to_string(&response) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                tracing::error!(error = %error, "failed to encode workspace daemon response");
-                break;
-            }
-        };
-        if writer
-            .write_all(format!("{encoded}\n").as_bytes())
-            .await
-            .is_err()
-        {
+        }
+        if let Err(error) = handler.await {
+            tracing::error!(error = %error, "workspace daemon request task failed");
             break;
         }
+        if client_gone {
+            break;
+        }
+    }
+}
+
+/// Sets the flag when dropped: the request is over, or its task was aborted.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
