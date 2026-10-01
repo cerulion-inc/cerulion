@@ -1931,17 +1931,16 @@ pub enum AdmissionPlan {
     /// has to say which of the two it was, and an empty plan would read as "the
     /// gate ran and held nothing".
     ///
-    /// A whole-run REFUSAL here instead
-    /// ([`AdmissionRefusalReason::EdgeNotGateable`], which no site constructs)
-    /// would make every free-run bag whose co-located consumer is a per-set
-    /// `Sync` input or a `multi_publisher_topics` edge unreplayable: fifteen arms
-    /// of `replay_engine_test` replay exactly those shapes today
+    /// A whole-run REFUSAL here instead would make every free-run bag whose
+    /// co-located consumer is a per-set `Sync` input or a
+    /// `multi_publisher_topics` edge unreplayable: fifteen arms of
+    /// `replay_engine_test` replay exactly those shapes today
     /// (`a_co_located_multi_publisher_topic_replays_byte_exact_per_writer`,
     /// `a_per_set_sync_descent_is_folded_from_its_head_not_declined` and the
     /// `sy_bounded` / `co_factories` / `cp3` families), and each one exits 2 under
-    /// that answer. This answer is what keeps them replaying: the stages take
-    /// today's drain and the report NAMES them, which is the behaviour those
-    /// fifteen arms pin.
+    /// that answer. So [`AdmissionRefusalReason`] carries no arm for an
+    /// ungateable edge: these stages take today's drain and the report NAMES
+    /// them, which is the behaviour those fifteen arms pin.
     NotGateable(Vec<(StageKey, String)>),
     /// This recording cannot be enforced on this topic.
     Refused(AdmissionRefusal),
@@ -2045,13 +2044,6 @@ pub enum AdmissionRefusalReason {
         /// The second.
         second_idx: u16,
     },
-    /// The core's pre-step census refuses to gate the stage.
-    EdgeNotGateable {
-        /// The stage.
-        key: StageKey,
-        /// The core's own reason.
-        reason: ReadPlanRefusal,
-    },
 }
 
 impl AdmissionRefusalReason {
@@ -2065,7 +2057,6 @@ impl AdmissionRefusalReason {
             Self::UnenforceableRecord { .. } => "read_log_unenforceable_record",
             Self::InputNameUnresolved { .. } => "read_log_input_name_unresolved",
             Self::InputNameDuplicated { .. } => "read_log_input_name_duplicated",
-            Self::EdgeNotGateable { .. } => "read_log_edge_not_gateable",
         }
     }
 
@@ -2076,9 +2067,7 @@ impl AdmissionRefusalReason {
             Self::NoCoverage { .. }
             | Self::InputNameUnresolved { .. }
             | Self::InputNameDuplicated { .. } => None,
-            Self::RecordDropped { key, .. }
-            | Self::UnenforceableRecord { key, .. }
-            | Self::EdgeNotGateable { key, .. } => Some(key),
+            Self::RecordDropped { key, .. } | Self::UnenforceableRecord { key, .. } => Some(key),
         }
     }
 
@@ -2148,13 +2137,6 @@ impl fmt::Display for AdmissionRefusalReason {
                 "node '{node}' records the input name '{name}' twice (index {first_idx} and \
                  index {second_idx}), so every record naming it addresses two stages and the \
                  gate cannot tell which one read the frame. Re-record the bag with this binary"
-            ),
-            Self::EdgeNotGateable { key, reason } => write!(
-                f,
-                "stage {} cannot be gated: {reason}. Re-record the bag with a graph whose \
-                 producer and consumer sit on different ranks, or replay it under \
-                 CERULION_EXECUTION_MODE=lockstep",
-                key.label()
             ),
         }
     }
@@ -4563,11 +4545,11 @@ mod tests {
     /// gated rank does, and the answer names them so the report never implies
     /// coverage the run did not have.
     ///
-    /// The whole-run refusal the vocabulary carries a reason for
-    /// (`AdmissionRefusalReason::EdgeNotGateable`) is NOT what this answers, and
-    /// the cost of making it so is measured: fifteen arms of `replay_engine_test`
-    /// replay bags of exactly these two shapes today and every one of them exits
-    /// 2 under that answer. This arm pins the answer that keeps them replaying.
+    /// A whole-run refusal is NOT what this answers, and the refusal vocabulary
+    /// carries no arm for one: the cost of that answer is measured, fifteen arms
+    /// of `replay_engine_test` replay bags of exactly these two shapes today and
+    /// every one of them exits 2 under it. This arm pins the answer that keeps
+    /// them replaying.
     #[test]
     fn a_stage_the_core_refuses_to_gate_is_ungated_and_never_a_refusal() {
         let key = StageKey {
