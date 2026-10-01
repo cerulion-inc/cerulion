@@ -317,12 +317,15 @@ async fn handle_connection(
         return;
     }
     let mut reader = BufReader::new(reader);
+    // Bytes a client sent behind a running `node.build`: set aside so the
+    // read half can keep watching for a hangup, and answered afterwards.
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         if *shutdown.borrow() {
             break;
         }
         let line = tokio::select! {
-            result = read_bounded_line(&mut reader) => match result {
+            result = read_bounded_line(&mut reader, &mut pending) => match result {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(error) => {
@@ -403,14 +406,26 @@ async fn handle_connection(
                 // until `done`, so an end of file here is it hanging up (or
                 // half-closing), which cancels the build. Every other verb
                 // keeps answering a client that has closed its write side.
-                // Bytes (a pipelined next request) are left unread.
-                ready = reader.fill_buf(), if watching_for_eof => {
-                    watching_for_eof = false;
-                    if matches!(ready, Ok([]) | Err(_)) {
+                // Bytes (a pipelined next request) are set aside, not lost,
+                // and watching goes on behind them.
+                ready = reader.fill_buf(), if watching_for_eof => match ready {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        let taken = bytes.len();
+                        if pending.len() + taken > MAX_REQUEST_LINE_BYTES {
+                            watching_for_eof = false;
+                            client_gone = true;
+                            cancelled.store(true, Ordering::Release);
+                        } else {
+                            pending.extend_from_slice(bytes);
+                            reader.consume(taken);
+                        }
+                    }
+                    _ => {
+                        watching_for_eof = false;
                         client_gone = true;
                         cancelled.store(true, Ordering::Release);
                     }
-                }
+                },
             }
         }
         if let Err(error) = handler.await {
@@ -432,42 +447,44 @@ impl Drop for CancelOnDrop {
     }
 }
 
-async fn read_bounded_line<R>(reader: &mut R) -> io::Result<Option<String>>
+/// Read one request line. `pending` holds bytes already taken off the socket
+/// but not yet consumed as a request (a client that pipelined a request behind
+/// a `node.build`), and keeps whatever follows the returned line.
+async fn read_bounded_line<R>(reader: &mut R, pending: &mut Vec<u8>) -> io::Result<Option<String>>
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut line = Vec::new();
+    let too_long = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request line exceeds maximum length",
+        )
+    };
+    let invalid = |error| io::Error::new(io::ErrorKind::InvalidData, error);
     loop {
+        if let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            if newline > MAX_REQUEST_LINE_BYTES {
+                return Err(too_long());
+            }
+            let rest = pending.split_off(newline + 1);
+            let mut line = std::mem::replace(pending, rest);
+            line.pop();
+            return String::from_utf8(line).map(Some).map_err(invalid);
+        }
+        if pending.len() > MAX_REQUEST_LINE_BYTES {
+            return Err(too_long());
+        }
         let buffer = reader.fill_buf().await?;
         if buffer.is_empty() {
-            return if line.is_empty() {
+            return if pending.is_empty() {
                 Ok(None)
             } else {
-                String::from_utf8(line)
+                String::from_utf8(std::mem::take(pending))
                     .map(Some)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                    .map_err(invalid)
             };
         }
-        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-            if line.len() + newline > MAX_REQUEST_LINE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "request line exceeds maximum length",
-                ));
-            }
-            line.extend_from_slice(&buffer[..newline]);
-            reader.consume(newline + 1);
-            return String::from_utf8(line)
-                .map(Some)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
-        }
-        if line.len() + buffer.len() > MAX_REQUEST_LINE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request line exceeds maximum length",
-            ));
-        }
-        line.extend_from_slice(buffer);
+        pending.extend_from_slice(buffer);
         let consumed = buffer.len();
         reader.consume(consumed);
     }

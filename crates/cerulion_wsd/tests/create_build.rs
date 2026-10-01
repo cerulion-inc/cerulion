@@ -383,6 +383,19 @@ async fn schema_create_returns_the_version_and_the_schema_is_listed() {
     .await;
     assert_eq!(error_code(&escaping), "bad_request", "{escaping}");
     assert!(!fixture.root.join("escape.yaml").exists());
+    // A name that is not an identifier would write a YAML key that cannot be read.
+    for (offset, name) in ["foo: bar", "foo\nbar", "1scan", "", "scan-2"]
+        .into_iter()
+        .enumerate()
+    {
+        let refused = call(
+            &fixture.socket,
+            json!({"id": 10 + offset, "verb": "schema.create", "root": root,
+                   "spec": {"name": name}}),
+        )
+        .await;
+        assert_eq!(error_code(&refused), "bad_request", "{name:?}: {refused}");
+    }
     fixture.stop().await;
 }
 
@@ -519,6 +532,43 @@ async fn node_build_refusals_before_cargo_starts_are_ordinary_errors() {
 
 #[tokio::test]
 async fn closing_the_connection_cancels_a_build_and_the_daemon_keeps_serving() {
+    cancelled_by_hangup(false).await;
+}
+
+#[tokio::test]
+async fn closing_the_connection_cancels_a_build_with_a_request_queued_behind_it() {
+    cancelled_by_hangup(true).await;
+}
+
+#[tokio::test]
+async fn a_request_queued_behind_a_build_is_answered_after_done() {
+    let fixture = build_fixture("pub fn ok() {}\n", None).await;
+    let root = fixture.root.to_str().unwrap();
+    let (mut reader, mut writer) = connect(&fixture.socket).await;
+    send(
+        &mut writer,
+        json!({"id": 1, "verb": "node.build", "root": root, "node_type": fixture.node}),
+    )
+    .await;
+    send(
+        &mut writer,
+        json!({"id": 2, "verb": "workspace.info", "root": root}),
+    )
+    .await;
+    let lines = build_lines(&mut reader).await;
+    assert_eq!(
+        *lines.last().unwrap(),
+        json!({"id": 1, "event": "done", "ok": true})
+    );
+    let info = read_line(&mut reader).await;
+    assert_eq!(info["id"], 2, "{info}");
+    assert_eq!(info["ok"], true, "{info}");
+    fixture.stop().await;
+}
+
+/// A client hangs up mid-build; `queue_next` first sends another request
+/// behind the build, which must not hide the hangup.
+async fn cancelled_by_hangup(queue_next: bool) {
     // The build script records its pid, then outlasts the test unless cancelled.
     let build_rs = r#"fn main() {
     let dir = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../..");
@@ -534,6 +584,14 @@ async fn closing_the_connection_cancels_a_build_and_the_daemon_keeps_serving() {
         json!({"id": 1, "verb": "node.build", "root": root, "node_type": fixture.node}),
     )
     .await;
+
+    if queue_next {
+        send(
+            &mut writer,
+            json!({"id": 3, "verb": "workspace.info", "root": root}),
+        )
+        .await;
+    }
 
     // The two waits below poll an OTHER process's observable state (its pid
     // file, its existence) under a deadline: nothing signals either event.

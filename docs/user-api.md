@@ -2682,15 +2682,17 @@ did not change the protocol version: a daemon that lacks one answers
 
 | Request | Result |
 |---|---|
-| `{"verb":"graph.create","root":R,"name":"main","prefix":"bot"}` | `{"version":"<sha256>"}` of the new `graphs/main.yaml`. `prefix` is optional, as `graph create -n`. |
-| `{"verb":"node.create","root":R,"spec":{"node_type":"camera","outputs":[{"schema":"sensor_msgs::Image","name":"image"}],"policy":{"kind":"period","period_ms":50}}}` | `{"version":"<sha256>"}` of the new `nodes/camera/src/lib.rs`. `spec` takes the flags of `node create` as data: `inputs` (`-i`), `trigger_input` (`-T`), `outputs` (`-o`), `policy` (`--policy`, the `kind` vocabulary of `node.info`) and `raw_ffi`; every field but `node_type` is optional. The CLI's own defaulting and refusals apply, so a node with no input and no `policy` is `invalid_request`. |
-| `{"verb":"schema.create","root":R,"spec":{"name":"lidar_scan"}}` | `{"version":"<sha256>"}` of the new `schemas/lidar_scan.yaml`. |
-| `{"verb":"node.build","root":R,"node_type":"camera","release":false}` | A stream, below. `release` is optional. |
+| `{"id":1,"verb":"graph.create","root":R,"name":"main","prefix":"bot"}` | `{"version":"<sha256>"}` of the new `graphs/main.yaml`. `prefix` is optional, as `graph create -n`. |
+| `{"id":1,"verb":"node.create","root":R,"spec":{"node_type":"camera","outputs":[{"schema":"sensor_msgs::Image","name":"image"}],"policy":{"kind":"period","period_ms":50}}}` | `{"version":"<sha256>"}` of the new `nodes/camera/src/lib.rs`. `spec` takes the flags of `node create` as data: `inputs` (`-i`), `trigger_input` (`-T`), `outputs` (`-o`), `policy` (`--policy`, the `kind` vocabulary of `node.info`) and `raw_ffi`; every field but `node_type` is optional. The CLI's own defaulting and refusals apply, so a node with no input and no `policy` is `invalid_request`. |
+| `{"id":1,"verb":"schema.create","root":R,"spec":{"name":"lidar_scan"}}` | `{"version":"<sha256>"}` of the new `schemas/lidar_scan.yaml`. The name is an identifier (a letter, then letters, digits and underscores); any other is `bad_request`. |
+| `{"id":1,"verb":"node.build","root":R,"node_type":"camera","release":false}` | A stream, below. `release` is optional. |
 
-Creating a graph, node type or schema that already exists is `invalid_request`.
-The create verbs take the same exclusive workspace lock as every other
-mutation; the `version` they return can be sent as `expect_version` to the next
-edit of that file.
+Every request carries a numeric `id`, which the reply echoes. Creating a graph,
+node type or schema that already exists is `invalid_request`. The create verbs
+take the same exclusive workspace lock as every other mutation. The `version`
+of a created graph or node type can be sent as `expect_version` to
+`graph.stage_node` or `node.modify`; protocol 1 has no verb that edits a
+schema, so a schema's `version` is a fingerprint of the file only.
 
 `node.build` answers with one line per event, each carrying the request `id`:
 zero or more `{"id":1,"event":"diagnostic","file":"nodes/camera/src/lib.rs","line":9,"col":18,"end_line":9,"end_col":24,"level":"error","message":"mismatched types","code":"E0308","rendered":"..."}`
@@ -2711,6 +2713,8 @@ with no `done`, so a client reads lines for its `id` until one has `error` or
 holds the workspace lock only to open the workspace, not while cargo runs. A client that closes its end of the connection cancels the build in
 progress (cargo and every compiler it started are killed), so keep the
 connection open until `done`; no other verb treats a closed write side that way.
+A request sent behind a running `node.build` on the same connection is held and
+answered once the build is done.
 
 | Variable | Meaning |
 |---|---|

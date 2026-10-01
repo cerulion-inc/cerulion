@@ -369,7 +369,7 @@ pub fn handle_line_streaming(
 /// as cargo runs, so the daemon reads the client closing its end as a cancel.
 pub fn cancels_on_hangup(line: &str) -> bool {
     line.contains("node.build")
-        && serde_json::from_str::<Value>(line)
+        && serde_json::from_slice::<Value>(line.as_bytes())
             .is_ok_and(|value| value.get("verb").and_then(Value::as_str) == Some("node.build"))
 }
 
@@ -523,7 +523,7 @@ fn dispatch(
         }
     }
     if let Request::SchemaCreate { spec, .. } = &request {
-        if !is_safe_component(&spec.name) {
+        if !is_schema_name(&spec.name) {
             return Err((id, "bad_request", "invalid schema name".to_string()));
         }
     }
@@ -661,6 +661,16 @@ fn request_node_type(request: &Request) -> Option<&str> {
         | Request::GraphCreate { .. }
         | Request::SchemaCreate { .. } => None,
     }
+}
+
+/// A schema name is written into the new file as a YAML key, so it is an ASCII
+/// identifier: a letter first, then letters, digits and underscores.
+fn is_schema_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn is_safe_component(value: &str) -> bool {
@@ -1073,7 +1083,7 @@ fn diagnostic_event(
 /// events already say. Position fields are rustc's own: 1-based, the primary
 /// span, relative to the workspace root for workspace members.
 fn compiler_message_event(id: u64, line: &str) -> Option<Value> {
-    let value: Value = serde_json::from_str(line).ok()?;
+    let value: Value = serde_json::from_slice(line.as_bytes()).ok()?;
     if value["reason"] != "compiler-message" {
         return None;
     }

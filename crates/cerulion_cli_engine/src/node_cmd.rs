@@ -905,7 +905,8 @@ pub fn node_build_with_progress(
 /// before cargo runs is the same function as the CLI's build: the unknown-node
 /// and malformed-metadata refusals, the optional-system-dependency probe and
 /// notice, the PATH compiler advisory. `on_cargo_start` is called exactly
-/// once, immediately before cargo is spawned, so a caller can tell a build
+/// once, as soon as cargo has been spawned (a spawn that fails never calls
+/// it), so a caller can tell a build
 /// that was refused up front (an `Err` before the call) from one that ran and
 /// failed (an `Err` after it).
 ///
@@ -934,8 +935,9 @@ pub fn node_build_streaming(
     )
 }
 
-/// Cargo's stderr is kept only for the failure reason; the streaming build
-/// reads it on its own thread so a full pipe can never stall cargo.
+/// Cargo's stderr is kept only for the failure reason (its LAST bytes, where a
+/// failure is reported); the streaming build reads it on its own thread so a
+/// full pipe can never stall cargo.
 const STREAMING_STDERR_CAP: usize = 1024 * 1024;
 
 /// The message sink and cancel flag of a streaming build.
@@ -1033,16 +1035,26 @@ fn build_node(
     cmd.args(cargo_build_args(node_type, release, &features));
     cmd.current_dir(workspace_root);
 
-    on_cargo_start(&node_build_progress_line(node_type));
+    let progress_line = node_build_progress_line(node_type);
     let spawn_failure = |e: std::io::Error| CliError::BuildFailed {
         target: node_type.to_string(),
         reason: cargo_spawn_failure_reason(&e, workspace_root),
     };
     let output = match streaming {
-        None => cmd.output().map_err(spawn_failure)?,
+        None => {
+            on_cargo_start(&progress_line);
+            cmd.output().map_err(spawn_failure)?
+        }
         Some((on_message, cancel)) => {
             cmd.arg("--message-format=json");
-            run_cargo_streaming(cmd, on_message, cancel, node_type, spawn_failure)?
+            run_cargo_streaming(
+                cmd,
+                &mut || on_cargo_start(&progress_line),
+                on_message,
+                cancel,
+                node_type,
+                spawn_failure,
+            )?
         }
     };
 
@@ -1063,10 +1075,12 @@ fn build_node(
 
 /// Run `cmd` (stdout and stderr piped), handing each stdout line to
 /// `on_message` as it arrives. The returned `Output` carries cargo's stderr
-/// and an EMPTY stdout: the lines already went to the callback. `cancel`
-/// kills cargo's whole process group.
+/// and an EMPTY stdout: the lines already went to the callback. `on_spawned`
+/// runs once cargo has actually started. `cancel` kills cargo's whole process
+/// group.
 fn run_cargo_streaming(
     mut cmd: std::process::Command,
+    on_spawned: &mut dyn FnMut(),
     on_message: &mut dyn FnMut(&str),
     cancel: &std::sync::atomic::AtomicBool,
     node_type: &str,
@@ -1084,14 +1098,15 @@ fn run_cargo_streaming(
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn().map_err(spawn_failure)?;
+    on_spawned();
     let stdout = child.stdout.take().expect("stdout was piped");
     let mut stderr = child.stderr.take().expect("stderr was piped");
     let pid = child.id();
     let output_closed = AtomicBool::new(false);
 
-    let stderr = std::thread::scope(|scope| {
+    let (status, stderr) = std::thread::scope(|scope| {
         // Its own thread, so a full stderr pipe can never stall cargo. Reading
-        // continues past the cap; only the first STREAMING_STDERR_CAP bytes
+        // continues past the cap; only the last STREAMING_STDERR_CAP bytes
         // are kept.
         let stderr_reader = scope.spawn(move || {
             let mut kept = Vec::new();
@@ -1100,8 +1115,14 @@ fn run_cargo_streaming(
                 if read == 0 {
                     break;
                 }
-                let room = STREAMING_STDERR_CAP.saturating_sub(kept.len());
-                kept.extend_from_slice(&chunk[..read.min(room)]);
+                kept.extend_from_slice(&chunk[..read]);
+                // Trim in batches, so a long log costs one copy per cap's worth.
+                if kept.len() > 2 * STREAMING_STDERR_CAP {
+                    kept.drain(..kept.len() - STREAMING_STDERR_CAP);
+                }
+            }
+            if kept.len() > STREAMING_STDERR_CAP {
+                kept.drain(..kept.len() - STREAMING_STDERR_CAP);
             }
             kept
         });
@@ -1120,13 +1141,28 @@ fn run_cargo_streaming(
             let Ok(line) = line else { break };
             on_message(&String::from_utf8_lossy(&line));
         }
-        // Cargo's output has ended, so nothing is left to cancel; stop the
-        // watcher before the child is reaped and its pid can be reused.
+        // Closed stdout does not mean cargo is done (it can close the pipe and
+        // keep running), so cancel is still honoured until the child is
+        // reaped. The watcher stops first, so only one thread ever signals,
+        // and nothing signals a reaped pid.
         output_closed.store(true, Ordering::Release);
         let _ = watcher.join();
-        stderr_reader.join().unwrap_or_default()
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if cancel.load(Ordering::Acquire) {
+                        kill_process_group(pid);
+                        break child.wait();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        (status, stderr_reader.join().unwrap_or_default())
     });
-    let status = child.wait()?;
+    let status = status?;
     if cancel.load(Ordering::Acquire) {
         return Err(CliError::BuildFailed {
             target: node_type.to_string(),
@@ -2835,5 +2871,83 @@ mod tests {
         // `release:` is always `<major>.<minor>.<patch>` optionally suffixed
         // (`-nightly`, `-beta.N`): never empty, never containing a space.
         assert!(!detected.contains(' '), "{detected}");
+    }
+    #[cfg(unix)]
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[cfg(unix)]
+    fn stream(
+        cmd: std::process::Command,
+        started: &mut bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> CliResult<std::process::Output> {
+        run_cargo_streaming(
+            cmd,
+            &mut || *started = true,
+            &mut |_| {},
+            cancel,
+            "n",
+            |e| CliError::BuildFailed {
+                target: "n".to_string(),
+                reason: e.to_string(),
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_streaming_build_that_cannot_spawn_never_reports_started() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut started = false;
+        let result = stream(
+            std::process::Command::new("cerulion-no-such-program"),
+            &mut started,
+            &cancel,
+        );
+        assert!(result.is_err());
+        assert!(!started);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_streaming_build_keeps_the_end_of_a_long_stderr() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut started = false;
+        let output = stream(
+            sh("head -c 3000000 /dev/zero | tr '\\0' x >&2; echo final-error >&2; exit 1"),
+            &mut started,
+            &cancel,
+        )
+        .expect("ran");
+        assert!(started);
+        assert!(!output.status.success());
+        assert!(output.stderr.len() <= STREAMING_STDERR_CAP);
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .trim_end()
+            .ends_with("final-error"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_still_kills_a_build_that_closed_its_stdout() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut started = false;
+        let began = std::time::Instant::now();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            });
+            stream(sh("exec 1>&-; sleep 60"), &mut started, &cancel)
+        });
+        assert!(matches!(
+            result,
+            Err(CliError::BuildFailed { ref reason, .. }) if reason == "cancelled"
+        ));
+        assert!(began.elapsed() < std::time::Duration::from_secs(30));
     }
 }
