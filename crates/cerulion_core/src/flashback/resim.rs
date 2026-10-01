@@ -126,8 +126,9 @@ pub struct ResimFacts<'a> {
     /// by [`ResimGap::NoTrace`] before this arm is reached anyway.
     ///
     /// Kept apart from [`first_recorded_step`](Self::first_recorded_step), which
-    /// is the first STEP-BOUNDARY record's step — the value `resolve_resume`
-    /// derives a resume point from. These two are over ALL records including
+    /// is the AUTHORITATIVE rank's first kept STEP-BOUNDARY step, the value
+    /// `resolve_resume` derives a resume point from. These two are over ALL
+    /// records including
     /// fires, because a hole is a hole in the record stream whatever kind of
     /// record sits either side of it.
     pub min_recorded_step: Option<u64>,
