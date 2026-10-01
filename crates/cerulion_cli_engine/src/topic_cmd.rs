@@ -2927,6 +2927,9 @@ pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool)
     if topics.is_empty() {
         let has_presence =
             !disc.robots.is_empty() || disc.peers.iter().any(|p| p.rung == DiscoveryRung::Mdns);
+        if !out.is_empty() {
+            out.push('\n');
+        }
         out.push_str(&render_remote_none_discovered(has_presence, had_endpoints));
         return out;
     }
