@@ -453,19 +453,28 @@ impl Drop for CancelOnDrop {
 const MAX_QUEUED_BYTES: usize = 8 * MAX_REQUEST_LINE_BYTES;
 
 /// Would taking `incoming` into `pending` queue too much: more than
-/// [`MAX_QUEUED_BYTES`] in all, or one unfinished line past the line limit?
+/// [`MAX_QUEUED_BYTES`] in all, or any one line (counting the unfinished one
+/// `pending` ends with) past the line limit?
 fn queue_overflows(pending: &[u8], incoming: &[u8]) -> bool {
-    let unfinished = match incoming.iter().rposition(|byte| *byte == b'\n') {
-        Some(newline) => incoming.len() - newline - 1,
-        None => {
-            let held = pending
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map_or(0, |at| at + 1);
-            pending.len() - held + incoming.len()
+    if pending.len() + incoming.len() > MAX_QUEUED_BYTES {
+        return true;
+    }
+    let mut line_len = pending.len()
+        - pending
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |at| at + 1);
+    for byte in incoming {
+        if *byte == b'\n' {
+            line_len = 0;
+        } else {
+            line_len += 1;
+            if line_len > MAX_REQUEST_LINE_BYTES {
+                return true;
+            }
         }
-    };
-    pending.len() + incoming.len() > MAX_QUEUED_BYTES || unfinished > MAX_REQUEST_LINE_BYTES
+    }
+    false
 }
 
 /// Read one request line. `pending` holds bytes already taken off the socket
@@ -540,6 +549,11 @@ mod tests {
         assert!(queue_overflows(&[], &long));
         let half = vec![b'x'; MAX_REQUEST_LINE_BYTES / 2 + 1];
         assert!(queue_overflows(&half, &half));
+        // A line that crosses the boundary between what is held and what
+        // arrives, with a newline in the new bytes, is still one line.
+        let mut ends = half.clone();
+        ends.push(b'\n');
+        assert!(queue_overflows(&half, &ends));
         // A finished line behind a long unfinished one does not reset it.
         assert!(!queue_overflows(&line(10), &half));
         // Nor is the total unbounded.
