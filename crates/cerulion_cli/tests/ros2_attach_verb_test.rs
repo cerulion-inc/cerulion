@@ -49,6 +49,23 @@ fn run(args: &[&str], home: &Path, cwd: &Path) -> Output {
         .expect("run cerulion")
 }
 
+/// `run` with the child's `TMPDIR` pinned INSIDE this test's tempdir, so
+/// (a) the workspace-less `--dry-run` creates its exclusive root under a
+/// directory the test owns (the leftover scan below then asserts about this
+/// test's own files, never the machine's shared `/tmp` — the same hermetic
+/// rule the `cerulion clean` tests follow), and (b) the child is isolated
+/// from an ambient `TMPDIR` a CI host might set.
+fn run_with_pinned_tmp(args: &[&str], home: &Path, cwd: &Path, tmp_root: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .args(args)
+        .env("HOME", home)
+        .env("TMPDIR", tmp_root)
+        .env("IOX2_LOG_LEVEL", "error")
+        .current_dir(cwd)
+        .output()
+        .expect("run cerulion")
+}
+
 fn isolated() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path().join("home");
@@ -215,7 +232,12 @@ fn the_new_spelling_serves_help_and_reaches_the_engine_path() {
     // `10.0.0.7` is not a local interface, so discovery itself refuses. That
     // refusal is what shows the command got past the workspace gate. The
     // window is short so the arm stays bounded if a bind does wait.
-    let dry = run(
+    // `TMPDIR` is pinned inside this test's tempdir, so the exclusive root
+    // the verb creates lands where the leftover scan below can see it (and
+    // only it).
+    let pinned_tmp = tmp.path().join("pinned-tmp");
+    std::fs::create_dir_all(&pinned_tmp).expect("pinned tmpdir");
+    let dry = run_with_pinned_tmp(
         &[
             "ros2",
             "attach",
@@ -227,6 +249,7 @@ fn the_new_spelling_serves_help_and_reaches_the_engine_path() {
         ],
         &home,
         tmp.path(),
+        &pinned_tmp,
     );
     let dry_err = String::from_utf8_lossy(&dry.stderr);
     let dry_out = String::from_utf8_lossy(&dry.stdout);
@@ -235,10 +258,43 @@ fn the_new_spelling_serves_help_and_reaches_the_engine_path() {
         "`ros2 attach --dry-run` outside a workspace must not be a workspace \
          error or the old spelling; stderr:\n{dry_err}"
     );
+    // A COMPLETE-OUTCOME oracle, not the old disjunction with "any stdout":
+    // the original `|| !dry_out.is_empty()` accepted ANY non-empty stdout, so
+    // an unrelated early exit (one that prints something and never reaches
+    // discovery) passed as the dry-run working. Instead, exactly two
+    // completions are legitimate, each pinned with its own evidence —
+    // (a) discovery REFUSED: exit 1, the refusal names DDS, no report; or
+    // (b) discovery COMPLETED (e.g. an empty window): exit 0, the report
+    // printed, ending with the automatic MIGRATION section every attach
+    // report carries. An early exit (workspace error, clap usage exit 2, a
+    // crash) matches neither arm.
+    let code = dry.status.code();
+    let refused = code == Some(1) && dry_err.contains("DDS discovery failed") && dry_out.is_empty();
+    let completed = code == Some(0) && dry_out.contains("MIGRATION — what could run natively");
     assert!(
-        dry_err.contains("DDS discovery failed") || !dry_out.is_empty(),
-        "`ros2 attach --dry-run` must reach discovery (a failure naming DDS, \
-         or a report). stderr:\n{dry_err}\nstdout:\n{dry_out}"
+        refused || completed,
+        "`ros2 attach --dry-run` outside a workspace must either refuse AT discovery \
+         (exit 1, DDS named, no report) or complete and print the report (exit 0, with \
+         its MIGRATION tail); got code={code:?}\nstderr:\n{dry_err}\nstdout:\n{dry_out}"
+    );
+    // The exclusively created temp root is dropped again on the failure
+    // path: no `cerulion-attach-dry-run-*` entry may remain under the
+    // PINNED temp dir (this test's own directory, never the machine's
+    // shared temp) for a PID-reusing successor to read.
+    let leftovers: Vec<_> = std::fs::read_dir(&pinned_tmp)
+        .expect("pinned tempdir must still be listable")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("cerulion-attach-dry-run-"))
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the workspace-less dry-run must remove its temporary root on every \
+         exit path; found: {:?}",
+        leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
     );
 }
 
