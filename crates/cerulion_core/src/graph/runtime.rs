@@ -2081,6 +2081,32 @@ fn doorbell_rung_applies(
     policy_doorbell && wake_word_available && has_registry && has_baseline && has_primary
 }
 
+/// Order a park's doorbell topics so the FIRST is one a peer process produces,
+/// and report how many of them are.
+///
+/// A kernel wake armed on a topic this runtime's own nodes produce waits for a
+/// write only the blocked thread can make: the ring arrives when this thread
+/// publishes, which it cannot do while it is blocked. The topics produced here
+/// STAY in the list, after the others, because the park's poll-all scan reads
+/// every topic's ring counter on each recheck and only the ARMED line has to be
+/// a peer's. Declared order is preserved within each class.
+///
+/// A zero count means no line on this runtime is armable, so the park keeps its
+/// bounded recheck.
+fn rung_topic_order(
+    declared: &[String],
+    produced_here: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, usize) {
+    let (peer, here): (Vec<String>, Vec<String>) = declared
+        .iter()
+        .cloned()
+        .partition(|t| !produced_here.contains(t));
+    let peer_count = peer.len();
+    let mut ordered = peer;
+    ordered.extend(here);
+    (ordered, peer_count)
+}
+
 /// Tier-2 in-process doorbell for a blocking-SDK source. A DETACHED
 /// helper thread drives the node's `FnMut() -> bool`: each `true` bumps `rings`
 /// and notifies (waking the live loop via `listener`); the sweep observes
@@ -3172,13 +3198,21 @@ pub struct GraphRuntime {
     /// non-policy build path. Read by `live_step`/`park_active`.
     monitor_wait_policy: crate::monitor_wait::MonitorWaitPolicy,
     /// Consumer-side SHM doorbell registry over the data-trigger + sync
-    /// input topics (first-declared order), built only when `policy.doorbell`.
+    /// input topics, built only when `policy.doorbell`. Ordered by
+    /// [`rung_topic_order`]: the topics a peer process produces come first in
+    /// declared order, then the ones a node here produces.
     /// `monitor_wait_block` arms the hardware monitor on its `primary_addr` and
     /// poll-all-scans it for non-primary rings. `None` when the doorbell path is
     /// off. (The registry is NOT re-mapped via `DoorbellRegistry::reopen` on a
     /// producer-reconnect LivelinessEvent; the ≤100µs timer backstop
     /// keeps correctness in that case.)
     doorbell_registry: Option<crate::doorbell::DoorbellRegistry>,
+    /// Whether the registry's first topic is one a PEER process produces, the
+    /// only kind a kernel wake may arm. False when every declared trigger topic
+    /// of this graph is produced by a node this runtime owns, which is the
+    /// single-process shape and any rank whose own trigger topic is produced
+    /// in-rank. Set once at build from [`rung_topic_order`].
+    doorbell_peer_primary: bool,
     /// Count of [`Self::monitor_wait_block`] ENTRIES — incremented once
     /// per call, BEFORE its park loop. The observable test seam pinning the
     /// park-entry ROUTING: an empty-`sources` (pure-Period) graph under an active
@@ -8427,12 +8461,14 @@ impl GraphRuntime {
         )?;
 
         // Under an active doorbell policy, build the CONSUMER-side
-        // doorbell registry over this graph's data-trigger + sync input topics
-        // (first-declared order). `monitor_wait_block` arms the hardware monitor
+        // doorbell registry over this graph's data-trigger + sync input topics,
+        // ordered by `rung_topic_order` so the armed slot holds a topic a peer
+        // process produces. `monitor_wait_block` arms the hardware monitor
         // on its `primary_addr` and poll-all-scans it for non-primary rings. A
         // failed open is non-fatal: the live loop then falls back to the
         // timer-only park (the ≤100µs recheck still bounds wake latency). Built
         // BEFORE `config` is moved into `Self` so the warn can read the identity.
+        let mut doorbell_peer_primary = false;
         let doorbell_registry = if policy.doorbell() {
             debug_assert!(
                 !policy.ns().is_empty(),
@@ -8444,6 +8480,21 @@ impl GraphRuntime {
                 .map(|b| b.topic.to_string())
                 .collect();
             topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
+            // Every topic a node of THIS runtime publishes, under the same
+            // resolution the graph build uses, so a declared `topic:` override
+            // is compared by its resolved name rather than by the node path.
+            let prefix: &str = &config.prefix;
+            let produced_here: std::collections::BTreeSet<String> = config
+                .nodes
+                .iter()
+                .flat_map(|n| {
+                    n.outputs
+                        .iter()
+                        .map(|o| crate::graph::resolve_output_topic(prefix, &n.id, o))
+                })
+                .collect();
+            let (topics, peer_count) = rung_topic_order(&topics, &produced_here);
+            doorbell_peer_primary = peer_count > 0;
             match crate::doorbell::DoorbellRegistry::open(policy.ns(), &topics) {
                 Ok(r) => Some(r),
                 Err(e) => {
@@ -8508,6 +8559,7 @@ impl GraphRuntime {
             // consumer-side doorbell registry built from it above.
             monitor_wait_policy: policy,
             doorbell_registry,
+            doorbell_peer_primary,
             // Park-entry routing counter (see field doc) — starts at 0.
             park_entries: std::sync::atomic::AtomicU64::new(0),
             // Park wake-cause counters (record-only) — all start at 0.
@@ -12115,6 +12167,28 @@ impl GraphRuntime {
     /// telemetry line's job (it logs deltas from an entry snapshot); callers
     /// wanting a windowed view should snapshot-and-subtract the same way.
     ///
+    /// Whether this runtime holds a doorbell line a PEER process produces, the
+    /// only kind a kernel wake may arm. False when the registry is absent, empty,
+    /// or built entirely from topics a node here publishes.
+    fn has_peer_primary(&self) -> bool {
+        self.doorbell_peer_primary
+            && self
+                .doorbell_registry
+                .as_ref()
+                .is_some_and(|r| r.primary().is_some())
+    }
+
+    /// The topic a kernel wake would arm on, or `None`. The one site that answers
+    /// it: the park's rung, the wait policy line and the test seam all read here.
+    fn armed_primary_topic(&self) -> Option<&str> {
+        if !self.has_peer_primary() {
+            return None;
+        }
+        self.doorbell_registry
+            .as_ref()
+            .and_then(|r| r.primary_topic())
+    }
+
     /// The `data_wake` term this runtime resolved: the park's doorbell rung
     /// decision, read from the one decision site the rung and the wait policy
     /// line both take.
@@ -12128,19 +12202,14 @@ impl GraphRuntime {
             crate::doorbell::wake_word_block_primitive_available(),
             self.doorbell_registry.is_some(),
             true,
-            self.doorbell_registry
-                .as_ref()
-                .is_some_and(|r| r.primary().is_some()),
+            self.has_peer_primary(),
         )
     }
 
     /// The topic the park would arm a kernel wake on, or `None` when this
     /// runtime has no such line. Read-only.
     pub fn doorbell_primary_topic_for_test(&self) -> Option<String> {
-        self.doorbell_registry
-            .as_ref()
-            .and_then(|r| r.primary_topic())
-            .map(str::to_string)
+        self.armed_primary_topic().map(str::to_string)
     }
 
     /// The barrier-arrival wake counter is NOT part of this tuple
@@ -12418,7 +12487,7 @@ impl GraphRuntime {
         use crate::monitor_wait::AddrParkOutcome;
         let reg = self.doorbell_registry.as_ref();
         let wake_word = crate::doorbell::wake_word_block_primitive_available();
-        let has_primary = reg.is_some_and(|r| r.primary().is_some());
+        let has_primary = self.has_peer_primary();
         if !doorbell_rung_applies(
             self.monitor_wait_policy.doorbell(),
             wake_word,
@@ -12632,11 +12701,12 @@ impl GraphRuntime {
         // yield fires per REAL slice; see monitor_wait::PARK_RECHECK.)
         let hw_recheck = crate::monitor_wait::PARK_RECHECK;
 
-        // The single hardware-armed line: the registry's PRIMARY (first-declared)
-        // doorbell. Non-primary topics are caught by the record-only poll-all
+        // The single hardware-armed line: the registry's PRIMARY, which
+        // `rung_topic_order` made the first declared topic a PEER process
+        // produces. Non-primary topics are caught by the record-only poll-all
         // (`any_advanced_since`) on each recheck. `None` unless the doorbell path
-        // is active and the registry has ≥1 topic.
-        let doorbell_addr: Option<*const u64> = if self.monitor_wait_policy.doorbell() {
+        // is active and this runtime holds such a line at all.
+        let doorbell_addr: Option<*const u64> = if self.has_peer_primary() {
             self.doorbell_registry
                 .as_ref()
                 .and_then(|r| r.primary_addr())
@@ -13411,12 +13481,7 @@ impl GraphRuntime {
             data_wake = self.data_wake_rung_for_test(),
             barrier = self.barrier_participant.is_some(),
             credit_edges = self.credit_park_edges.len(),
-            primary_topic = tracing::field::display(
-                self.doorbell_registry
-                    .as_ref()
-                    .and_then(|r| r.primary_topic())
-                    .unwrap_or("none")
-            ),
+            primary_topic = tracing::field::display(self.armed_primary_topic().unwrap_or("none")),
             "live loop wait policy"
         );
 
@@ -17462,6 +17527,76 @@ mod tests {
                  and the caller must nap"
             );
         }
+    }
+
+    /// The park's topic ordering, over injected facts, pinned on every OS: the
+    /// selection decides whether a kernel wake arms at all, and on a target where
+    /// the macOS rung is compiled out the Linux hardware park reads the same
+    /// first topic, so a defect here is invisible to any single-target test.
+    #[test]
+    fn rung_topic_order_puts_a_peer_topic_first_and_counts_only_those() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let here = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        // Every declared topic is produced by a node here: nothing is armable, and
+        // the list still carries all of them for the poll-all scan.
+        let (ordered, peers) = rung_topic_order(
+            &t(&["/g/a/out", "/g/b/out"]),
+            &here(&["/g/a/out", "/g/b/out"]),
+        );
+        assert_eq!(
+            peers, 0,
+            "no peer produces either topic, so none is armable"
+        );
+        assert_eq!(
+            ordered,
+            t(&["/g/a/out", "/g/b/out"]),
+            "the scan still reads every ring, so no topic is dropped"
+        );
+
+        // None is produced here: declared order is untouched and all count.
+        let (ordered, peers) = rung_topic_order(&t(&["/ext/one", "/ext/two"]), &here(&[]));
+        assert_eq!(peers, 2);
+        assert_eq!(
+            ordered,
+            t(&["/ext/one", "/ext/two"]),
+            "declared order stands"
+        );
+
+        // Mixed, with the locally produced topic declared FIRST: the peer topic
+        // moves to the armed slot and the local one keeps its place behind it.
+        let (ordered, peers) = rung_topic_order(
+            &t(&["/g/a/out", "/ext/one", "/g/b/out"]),
+            &here(&["/g/a/out", "/g/b/out"]),
+        );
+        assert_eq!(peers, 1);
+        assert_eq!(
+            ordered,
+            t(&["/ext/one", "/g/a/out", "/g/b/out"]),
+            "the armed slot is the peer topic; the two local ones follow in \
+             declared order"
+        );
+
+        // Two peer topics among local ones: relative declared order holds within
+        // each class, so the armed line is the FIRST-declared peer topic.
+        let (ordered, peers) = rung_topic_order(
+            &t(&["/g/a/out", "/ext/two", "/g/b/out", "/ext/one"]),
+            &here(&["/g/a/out", "/g/b/out"]),
+        );
+        assert_eq!(peers, 2);
+        assert_eq!(
+            ordered,
+            t(&["/ext/two", "/ext/one", "/g/a/out", "/g/b/out"])
+        );
+
+        // Empty declaration: no topics, nothing armable.
+        let (ordered, peers) = rung_topic_order(&t(&[]), &here(&["/g/a/out"]));
+        assert_eq!(peers, 0);
+        assert!(ordered.is_empty());
     }
 
     /// Build an `OutputMeta` with an explicit schema-default
