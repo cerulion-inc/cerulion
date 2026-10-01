@@ -2800,9 +2800,12 @@ fn dry_run_on_an_empty_root_reports_and_writes_nothing() {
     );
     // PointCloud2 is a built-in: on an empty root the type still resolves
     // (builtins-only), so the report classifies the topic RESOLVABLE —
-    // proving the workspace-less run does not degrade the verdict.
+    // proving the workspace-less run does not degrade the verdict. The
+    // full section header, never the bare word: `RESOLVABLE` is a substring
+    // of `UNRESOLVABLE`, so a misclassification into the wrong section
+    // would still satisfy a bare-word search.
     assert!(
-        report.report.contains("RESOLVABLE"),
+        report.report.contains("RESOLVABLE (1)"),
         "the dry-run report must classify the built-in PointCloud2 topic as \
          resolvable without any workspace schemas; report:\n{}",
         report.report

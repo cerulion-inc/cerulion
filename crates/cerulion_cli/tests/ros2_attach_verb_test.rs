@@ -270,7 +270,12 @@ fn the_new_spelling_serves_help_and_reaches_the_engine_path() {
     // crash) matches neither arm.
     let code = dry.status.code();
     let refused = code == Some(1) && dry_err.contains("DDS discovery failed") && dry_out.is_empty();
-    let completed = code == Some(0) && dry_out.contains("MIGRATION — what could run natively");
+    // The completed arm requires the report's HEADLINE too, not just its
+    // MIGRATION tail: an implementation that printed only the tail with no
+    // discovery report must not pass as "completed".
+    let completed = code == Some(0)
+        && dry_out.contains("DISCOVERED DDS TOPICS")
+        && dry_out.contains("MIGRATION — what could run natively");
     assert!(
         refused || completed,
         "`ros2 attach --dry-run` outside a workspace must either refuse AT discovery \
