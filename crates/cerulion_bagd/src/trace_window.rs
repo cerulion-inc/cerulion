@@ -338,8 +338,22 @@ pub(crate) struct TrimmedTrace {
     /// Counted here rather than re-derived at the verdict, so the number the
     /// manifest reports and the number the verdict judges are the same walk.
     pub departures: usize,
-    /// The step of the FIRST step-boundary record kept — what `resolve_resume`
-    /// will derive the resume point from.
+    /// The step of the AUTHORITATIVE rank's first kept step-boundary record: what
+    /// `resolve_resume` will derive the resume point from.
+    ///
+    /// The two endpoints this struct carries fold in OPPOSITE directions, and the
+    /// difference is which side each one has to be safe for:
+    ///
+    /// - the covered range's END ([`last_boundary_target_ns`](Self::last_boundary_target_ns))
+    ///   is the EARLIEST last kept boundary across the ranks that kept one, because
+    ///   a resume covers the graph only as far as its slowest rank can back it;
+    /// - the resume's START is rank 0's own first kept boundary, because the replay
+    ///   window is rank 0's boundary stream by construction and that is the step a
+    ///   resume actually begins at.
+    ///
+    /// Rank-blind, this would be the first boundary in retained order, which on a
+    /// capture whose peer carries no anchor is the peer's step 0 and makes the
+    /// verdict claim a from-start resume the reader refuses.
     pub first_recorded_step: Option<u64>,
     /// The gating-clock value at the ANCHOR step's own boundary — `target(S−1)`.
     ///
@@ -595,9 +609,6 @@ fn walk(
                 per.first_recorded_step = Some(rec.step);
             }
             per.last_boundary_target_ns = Some(rec.fire_time_ns);
-            if out.first_recorded_step.is_none() {
-                out.first_recorded_step = Some(rec.step);
-            }
             // The covered range's upper endpoint is measured PER RANK here and
             // folded into the scalar after the walk. See the fold at the end of
             // this function for why the scalar is the earliest rank's.
@@ -666,6 +677,28 @@ fn walk(
     {
         out.last_boundary_target_ns = Some(earliest);
     }
+    // The RESUME's start, and the fold here is the opposite shape to the one
+    // above: the AUTHORITATIVE rank's own first kept boundary, not the first
+    // boundary in retained order and not a minimum over the ranks.
+    //
+    // The replay window IS rank 0's boundary stream by construction
+    // (`resolve_resume` reads `first_recorded_boundary`, which walks
+    // `AUTHORITATIVE_TRACE_RANK` only), so rank 0's first kept boundary is the
+    // step a resume actually begins at. Read rank-blind, this scalar took
+    // whichever rank's boundary the retention happened to bank first: on a
+    // capture where rank 0 resumes from a mid-run anchor and a peer carries no
+    // anchor at all, the peer's step-0 boundary is retained and lands first, the
+    // scalar read 0, and `judge_resimmable` stamped the capture resimmable FROM
+    // START while the replay resolved rank 0's later boundary into a mid-run
+    // resume and refused it. The verdict promised a resume the reader rejects.
+    //
+    // `None` when rank 0 kept no boundary, which is the same bag
+    // `first_recorded_boundary` answers `None` for and
+    // `validate_step_boundaries` refuses as `BagNoStepBoundaries`.
+    out.first_recorded_step = out
+        .per_rank
+        .get(&AUTHORITATIVE_TRACE_RANK)
+        .and_then(|r| r.first_recorded_step);
     out
 }
 
@@ -1137,6 +1170,63 @@ mod tests {
         let mut r = fire(step, node_idx);
         r.reserved = rank;
         r
+    }
+
+    /// A PEER with no anchor does not make the capture claim a from-start resume.
+    ///
+    /// The shape, which is an ordinary multi rank capture and not a crafted one:
+    /// rank 0 resumes from a MID RUN anchor, so its records below the resume are
+    /// discarded, while rank 1 carries NO anchor and keeps everything including its
+    /// step 0 boundary. Retained order then puts rank 1's step 0 boundary FIRST.
+    ///
+    /// Read rank-blind, the scalar took that 0 and `judge_resimmable` returned on
+    /// its step 0 arm, stamping the capture resimmable FROM START. The replay does
+    /// not agree: `resolve_resume` reads `first_recorded_boundary`, which walks
+    /// rank 0 only, resolves rank 0's step 42 into a mid run resume, needs an
+    /// anchor for it, and for k>1 refuses the recording. The verdict promised a
+    /// resume the reader rejects.
+    ///
+    /// HAND ORACLE. Rank 0 keeps from 42, rank 1 keeps from 0, so the scalar is 42,
+    /// which is above 0 and therefore NOT the from-start arm. 0 is asserted absent
+    /// from the scalar, which is the number the rank-blind read produced, so a
+    /// return to it fails here rather than in a replay.
+    #[test]
+    fn a_peers_step_zero_boundary_does_not_make_the_resume_claim_from_start() {
+        let out = trim_to_anchor(
+            vec![
+                // Rank 1 has no anchor, so its step 0 boundary is KEPT and, banked
+                // first, is the first boundary in retained order.
+                ranked_boundary(1, 0, 100),
+                ranked_fire(1, 0, 0),
+                // Rank 0's own stream resumes from its mid run anchor at 41.
+                ranked_boundary(0, 41, 41_000),
+                ranked_boundary(0, 42, 42_000),
+                ranked_fire(0, 42, 0),
+            ]
+            .into_iter(),
+            // Rank 0 alone carries an anchor; rank 1 is absent from the cut table,
+            // which is `Keep::All` for it.
+            &BTreeMap::from([(AUTHORITATIVE_TRACE_RANK, 41u64)]),
+            &ranked_nodes(),
+        );
+        assert_eq!(
+            out.per_rank[&1].first_recorded_step,
+            Some(0),
+            "PRECONDITION: rank 1 really did keep its step 0 boundary, which is the \
+             whole shape of this arm"
+        );
+        assert_eq!(
+            out.first_recorded_step,
+            Some(42),
+            "the resume's START is rank 0's own first kept boundary, which is the \
+             step `resolve_resume` will reach for"
+        );
+        assert_ne!(
+            out.first_recorded_step,
+            Some(0),
+            "and never the peer's step 0, which is what made the verdict claim a \
+             from-start resume the reader refuses"
+        );
     }
 
     /// The two ranks' own manifests, DIFFERENT lists at the same indices, which
