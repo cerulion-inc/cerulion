@@ -10012,6 +10012,61 @@ fn topic_admission_for(
     }
 }
 
+/// Could the CORE refuse to GATE this consuming input's stages on WIRING facts,
+/// answered from the GRAPH before any runtime exists?
+///
+/// The pre-pass needs this and the census cannot give it: a topic whose only
+/// consuming stages are wiring-blocked and which carries no recorded read must
+/// NOT be refused for no coverage, because the pass reports `not_gateable` and
+/// replays it. The two blocker classes are derived from graph facts, which is why
+/// the question is answerable here at all:
+///
+/// * a `multi_publisher_topics` edge, from the topic table
+///   (`GraphConfig::is_multi_publisher`, the same call the admission's own
+///   `TopicAdmission::multi_publisher` field is built from). The core's own term
+///   adds a producer-less EXTERNAL topic, which a produced-and-consumed topic is
+///   not, so this one is exact for the gated set.
+/// * a per-set `Sync` TRIGGER input, from the node's macro-declared policy and
+///   its declared input marks ([`cerulion_core::graph::NodeInfo::policy`] and
+///   `input_meta[].trigger`, read out of the factory map before the runtime takes
+///   the entries).
+///
+/// CONSERVATIVE on the per-set term: the core also requires the node's per-set
+/// CAPABILITY (its sync head-op symbols, a unified trigger drain, and no
+/// `CERULION_DRAIN_DISCIPLINE=separate`), which lives in the loaded entry and not
+/// in its declared metadata. Dropping those terms can only answer "blocked" where
+/// the core would gate, and that direction is safe: such a stage is judged by the
+/// PASS against the real census, so its refusal lands before that rank's first
+/// step instead of before the first. The other direction would refuse a replay the
+/// pass would run, which is the bug this answer exists to prevent.
+fn wiring_may_block_the_gate(
+    config: &GraphConfig,
+    node_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
+    topic: &str,
+    node: &str,
+    input: &str,
+) -> bool {
+    if config.is_multi_publisher(topic) {
+        return true;
+    }
+    let Some(info) = node_infos.get(node) else {
+        // No declared metadata for this member: the conservative answer, for the
+        // same reason the stand-down notes exist (a node nobody could read is
+        // never covered by a claim).
+        return true;
+    };
+    let per_set_policy = matches!(
+        info.policy(),
+        Some(cerulion_core::graph::node::MacroPolicy::Sync { .. })
+            | Some(cerulion_core::graph::node::MacroPolicy::UnboundedSync)
+    );
+    per_set_policy
+        && info
+            .input_meta()
+            .iter()
+            .any(|m| m.name == input && m.trigger)
+}
+
 /// What the PRE-PASS planned for ONE rank from the recording alone.
 struct RankBagSide {
     /// Topic to the stages the RECORDING staged, with their per-step
@@ -10061,10 +10116,6 @@ fn plan_bag_side_admissions(
     let Some(rows) = rims.per_edge else {
         return Ok(BTreeMap::new());
     };
-    let stages = replay_inject::StageTable::from_recorded_stages(
-        &recorded_inputs,
-        rows.keys().cloned().collect::<Vec<_>>(),
-    );
     let mut out: BTreeMap<u32, RankBagSide> = BTreeMap::new();
     for plan in plans {
         let enforce_topics = rank_enforce_topics(plan, classes);
@@ -10110,6 +10161,26 @@ fn plan_bag_side_admissions(
                 });
         }
         let (node_infos, _notes) = collect_pass_node_infos(plan, factories);
+        // The table is built PER RANK because the wiring answer reads this rank's
+        // own declared node metadata. The topic a blocked input consumes is the
+        // one `consumed` names it under, which is also the only vocabulary the
+        // multi-publisher table speaks.
+        let topic_of: BTreeMap<(String, String), String> = consumed
+            .iter()
+            .map(|(topic, node, input)| ((node.clone(), input.clone()), topic.clone()))
+            .collect();
+        let blocked = |node: &str, input: &str| {
+            topic_of
+                .get(&(node.to_string(), input.to_string()))
+                .is_some_and(|topic| {
+                    wiring_may_block_the_gate(config, &node_infos, topic, node, input)
+                })
+        };
+        let stages = replay_inject::StageTable::from_recorded_stages(
+            &recorded_inputs,
+            rows.keys().cloned().collect::<Vec<_>>(),
+            &blocked,
+        );
         let mut admission: BTreeMap<String, Vec<replay_inject::StageAdmission>> = BTreeMap::new();
         for topic in &enforce_topics {
             let planned = topic_admission_for(topic, &consumed, &node_infos, &per_input, config);
@@ -11173,6 +11244,35 @@ fn prepare_pass_verification(
                     |r| r.to_string(),
                 );
                 ungateable.push((stage.key.clone(), reason));
+            }
+            // The stages the PRE-PASS never planned because this build's wiring
+            // blocks them, named from THIS census (which carries the core's own
+            // reason, where the pre-pass's conservative answer carries none). A
+            // blocked stage the report does not name is the silence the
+            // `not_gateable` status exists to replace, and the pre-pass plan
+            // excludes those stages by construction, so they can only be found
+            // here.
+            for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
+                let Ok((input_idx, roles)) = stages.resolve(node, input) else {
+                    continue;
+                };
+                for role in roles.wired() {
+                    let key = cerulion_core::read_outcome::StageKey {
+                        node: node.clone(),
+                        input_idx,
+                        role,
+                    };
+                    if stages.stage_gateable(&key) == Some(true)
+                        || ungateable.iter().any(|(k, _)| *k == key)
+                    {
+                        continue;
+                    }
+                    let reason = stages.refusal(&key).map_or_else(
+                        || "the core refuses to gate this stage".to_string(),
+                        |r| r.to_string(),
+                    );
+                    ungateable.push((key, reason));
+                }
             }
             for (key, reason) in &ungateable {
                 tracing::warn!(

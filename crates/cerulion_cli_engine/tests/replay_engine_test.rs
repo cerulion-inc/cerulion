@@ -32538,6 +32538,109 @@ fn co_assert_premise(rec: &Recording) {
     );
 }
 
+/// **A topic whose only consuming stages the WIRING cannot gate, carrying NO
+/// recorded read, replays with the report-only note: the pre-pass must never
+/// refuse what the pass runs.**
+///
+/// The co-located shared bus is a `multi_publisher_topics` topic produced AND
+/// consumed on one rank, so the core refuses to gate its consuming stage and the
+/// pass reports `not_gateable` and replays, which is the only answer those two
+/// edge classes have until they are gated. The BAG SIDE is planned
+/// before pass 0, where no census exists, so without the same wiring answer there
+/// the pre-pass judged COVERAGE over a stage the gate will never drive and refused
+/// the whole run for no coverage (exit 2, no report) over a bag the pass replays.
+///
+/// THE CRAFT is that exact shape: the sink's recorded reads are all restamped as
+/// PRODUCER annotations, so the topic carries records and not one of them plans an
+/// admission, and the manifest states its staging rows so the pre-pass really runs
+/// over them. Dropping the wiring answer from the pre-pass reds this arm on exit
+/// 2 (measured).
+#[test]
+#[serial]
+fn a_wiring_blocked_topic_with_no_recorded_read_replays_with_the_note() {
+    let mut rec = record_uniform_with_read_log(co_yaml(), co_factories, &[], CO_STEPS);
+    co_assert_premise(&rec);
+    let labels = co_labels(&rec);
+    let publishers = co_publishers(&rec);
+    let sink_idx = rec.node_ids.iter().position(|n| n == "sink").unwrap() as u32;
+    let mut restamped = 0;
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink_idx)
+    {
+        r.global_level = pack_read_outcome_meta(
+            0,
+            cerulion_core::trace_ring::READ_OUTCOME_PRODUCER,
+            ReadSiteRole::Unstamped,
+        );
+        restamped += 1;
+    }
+    assert!(
+        restamped > 0,
+        "PRECONDITION: the sink records reads on the shared bus to restamp"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("co_wiring_blocked_no_read.mcap");
+    // The sink's ONE body stage, at the ordinary rim: the rows the recorder
+    // stamps, which is what makes the pre-pass plan from them.
+    let staging =
+        |_rank: u32| Some(serde_json::json!({"capacities": {"sink": [[0, 0, 64]]}, "scalar": 0}));
+    write_multi_rank_bag_impl(
+        &rec,
+        |_| 0,
+        1,
+        MpLayout::PerStepBatches,
+        &bag,
+        |_| {},
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(publishers),
+            labels: &labels,
+        },
+        Some(&staging),
+        &[],
+    );
+    let report = dir.path().join("report.json");
+
+    let outcome = replay(&bag, co_factories, None, Some(report.clone()))
+        .expect("a wiring-blocked topic with no recorded read must REPLAY, never be refused");
+    // THE CLAIM IS THE ABSENCE OF A REFUSAL, and it is scoped: restamping the
+    // sink's reads also removes what the FIRE re-derivation counts a FIFO edge's
+    // fires from, so this bag reaches a verdict of its own. That is the read log
+    // driving the re-derivation and not this arm's subject; what this arm pins is
+    // that the run is not REFUSED for no coverage over a stage the gate will never
+    // drive, and that the report says so by name.
+    assert!(
+        outcome.violations.is_empty(),
+        "no frame-content divergence: {:?}",
+        outcome.violations
+    );
+    match &outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::NotGateable { stages, reasons } => {
+            assert!(
+                *stages > 0 && reasons.len() == *stages,
+                "the report NAMES every stage the wiring blocked: {:?}",
+                outcome.read_log_enforcement
+            );
+            assert!(
+                reasons.iter().any(|r| r.contains("multi_publisher")),
+                "and names the blocker the core gave: {reasons:?}"
+            );
+        }
+        other => panic!("a wiring-blocked topic reports not_gateable, never a refusal: {other:?}"),
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the report is written")).unwrap();
+    assert_eq!(parsed["read_log_enforcement"]["status"], "not_gateable");
+}
+
 /// THE PER-WRITER PROOF: a CO-LOCATED `multi_publisher_topics` topic records and
 /// replays BYTE-EXACT, per writer.
 ///

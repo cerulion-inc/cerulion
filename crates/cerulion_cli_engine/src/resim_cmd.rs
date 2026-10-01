@@ -739,8 +739,27 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
         if report.trace_diverged {
             s.push_str("  observation: the re-executed fire schedule differs from the recording\n");
         }
-        if differing == 0 && report.violations.is_empty() && !report.trace_diverged {
-            // Reached only via `topics_checked == 0`.
+        // The read log's own half of exit 6, OBSERVED here for the same reason
+        // the fire schedule's is: a bare `--resim` makes no verdict, and a
+        // divergence it never mentions is one an operator reading this summary
+        // does not know about. The frames can match byte for byte while it fires
+        // (the divergence is in WHEN a read happened), so no other line here can
+        // stand in for it.
+        if report.read_log_diverged {
+            s.push_str(
+                "  observation: a recorded edge READ did not reproduce (the read schedule \
+                 differs from the recording)\n",
+            );
+        }
+        if differing == 0
+            && report.violations.is_empty()
+            && !report.trace_diverged
+            && !report.read_log_diverged
+        {
+            // Reached only via `topics_checked == 0`, which the four conjuncts
+            // above make true: without the read-log one this line printed
+            // "NOTHING was compared" over a run whose read log DID compare and
+            // diverged, under a header that counts the produced topics.
             s.push_str(
                 "  observation: no produced topic carried a frame, so NOTHING was compared \
                  against the recording\n",
@@ -1435,6 +1454,39 @@ mod tests {
             !out.contains(MATCH),
             "the trace half still withholds it: {out}"
         );
+
+        // THE NOTHING-COMPARED FALLBACK, the other way this summary can speak
+        // falsely: with no topic compared it says so, and that sentence is only
+        // true while no OTHER gate found something. A read-log divergence IS
+        // something found, so the fallback must give way to the read log's own
+        // observation rather than print "NOTHING was compared" beside a
+        // divergence the verb exits 6 on.
+        const NOTHING: &str = "no produced topic carried a frame, so NOTHING was compared";
+        const READ_LOG: &str = "a recorded edge READ did not reproduce";
+        let mut nothing = report(true, 0, false);
+        nothing.topics_checked = 0;
+        nothing.topics_passed = 0;
+        let out = render_resim_summary(&nothing, bag);
+        assert!(
+            out.contains(NOTHING) && !out.contains(READ_LOG),
+            "with nothing compared and nothing found, the fallback is the whole truth: {out}"
+        );
+
+        let mut nothing_diverged = report(false, 0, false);
+        nothing_diverged.topics_checked = 0;
+        nothing_diverged.topics_passed = 0;
+        nothing_diverged.read_log_diverged = true;
+        let out = render_resim_summary(&nothing_diverged, bag);
+        assert!(
+            !out.contains(NOTHING),
+            "a read-log divergence is a finding: the nothing-compared fallback must give \
+             way to it: {out}"
+        );
+        assert!(
+            out.contains(READ_LOG),
+            "and the read log's own observation must be MADE, not merely withheld: {out}"
+        );
+        assert!(!out.contains(MATCH), "{out}");
     }
 
     /// A resim of a Flashback capture SAYS how far it covered, and
