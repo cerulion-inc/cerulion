@@ -411,7 +411,7 @@ async fn handle_connection(
                 ready = reader.fill_buf(), if watching_for_eof => match ready {
                     Ok(bytes) if !bytes.is_empty() => {
                         let taken = bytes.len();
-                        if pending.len() + taken > MAX_REQUEST_LINE_BYTES {
+                        if queue_overflows(&pending, bytes) {
                             watching_for_eof = false;
                             client_gone = true;
                             cancelled.store(true, Ordering::Release);
@@ -445,6 +445,27 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
     }
+}
+
+/// Requests a client may queue behind a running `node.build`, in bytes. Each
+/// line is still held to [`MAX_REQUEST_LINE_BYTES`]; this bounds how many such
+/// lines the daemon keeps in memory while it waits for the build to end.
+const MAX_QUEUED_BYTES: usize = 8 * MAX_REQUEST_LINE_BYTES;
+
+/// Would taking `incoming` into `pending` queue too much: more than
+/// [`MAX_QUEUED_BYTES`] in all, or one unfinished line past the line limit?
+fn queue_overflows(pending: &[u8], incoming: &[u8]) -> bool {
+    let unfinished = match incoming.iter().rposition(|byte| *byte == b'\n') {
+        Some(newline) => incoming.len() - newline - 1,
+        None => {
+            let held = pending
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |at| at + 1);
+            pending.len() - held + incoming.len()
+        }
+    };
+    pending.len() + incoming.len() > MAX_QUEUED_BYTES || unfinished > MAX_REQUEST_LINE_BYTES
 }
 
 /// Read one request line. `pending` holds bytes already taken off the socket
@@ -498,6 +519,33 @@ mod tests {
     use cerulion_cli_engine::workspace_lock::WorkspaceLock;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
+
+    #[test]
+    fn queued_requests_are_limited_per_line_and_in_total() {
+        let line = |len: usize| {
+            let mut bytes = vec![b'x'; len];
+            bytes.push(b'\n');
+            bytes
+        };
+        // Several valid lines that together pass one line's limit are fine.
+        let mut pending = Vec::new();
+        for _ in 0..4 {
+            let incoming = line(MAX_REQUEST_LINE_BYTES / 2);
+            assert!(!queue_overflows(&pending, &incoming));
+            pending.extend_from_slice(&incoming);
+        }
+        assert!(pending.len() > MAX_REQUEST_LINE_BYTES);
+        // One unfinished line past the limit is not.
+        let long = vec![b'x'; MAX_REQUEST_LINE_BYTES + 1];
+        assert!(queue_overflows(&[], &long));
+        let half = vec![b'x'; MAX_REQUEST_LINE_BYTES / 2 + 1];
+        assert!(queue_overflows(&half, &half));
+        // A finished line behind a long unfinished one does not reset it.
+        assert!(!queue_overflows(&line(10), &half));
+        // Nor is the total unbounded.
+        let full = vec![b'\n'; MAX_QUEUED_BYTES];
+        assert!(queue_overflows(&full, b"\n"));
+    }
 
     #[tokio::test]
     async fn shutdown_during_in_flight_mutation_keeps_singleton_until_it_commits() {

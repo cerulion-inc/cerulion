@@ -2713,8 +2713,9 @@ with no `done`, so a client reads lines for its `id` until one has `error` or
 holds the workspace lock only to open the workspace, not while cargo runs. A client that closes its end of the connection cancels the build in
 progress (cargo and every compiler it started are killed), so keep the
 connection open until `done`; no other verb treats a closed write side that way.
-A request sent behind a running `node.build` on the same connection is held and
-answered once the build is done.
+Requests sent behind a running `node.build` on the same connection are held and
+answered once the build is done; each is held to the usual line limit, and
+queueing more than 8 MiB in all cancels the build.
 
 | Variable | Meaning |
 |---|---|
