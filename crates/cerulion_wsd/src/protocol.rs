@@ -29,9 +29,9 @@
 //! The graph edit verbs (`graph.wire`, `graph.unwire`, `graph.unstage`) add two
 //! refusal codes, only ever sent in answer to those verbs, and an optional
 //! `error.data` object that carries the structured detail of a refusal:
-//! * `schema_mismatch` — the output and the input name different schemas;
+//! * `schema_mismatch`: the output and the input name different schemas;
 //!   `data` is `{"expected": <input schema>, "found": <output schema>}`.
-//! * `would_break` — `graph.unstage` of a node other nodes read from, without
+//! * `would_break`: `graph.unstage` of a node other nodes read from, without
 //!   `force`; `data` is `{"wires": [{"from": {node, port}, "to": {node, port}}]}`.
 //!   Nothing was written; resend with `force: true` to remove the node and
 //!   those wires together.
