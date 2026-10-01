@@ -2927,10 +2927,7 @@ pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool)
     if topics.is_empty() {
         let has_presence =
             !disc.robots.is_empty() || disc.peers.iter().any(|p| p.rung == DiscoveryRung::Mdns);
-        out.push_str(&render_remote_none_discovered(
-            has_presence,
-            had_endpoints,
-        ));
+        out.push_str(&render_remote_none_discovered(has_presence, had_endpoints));
         return out;
     }
     out.push_str("\nREMOTE TOPICS\n");
@@ -5598,12 +5595,6 @@ mod tests {
         // A discovered robot is presence evidence without configured endpoints.
         let out = render_remote_topics_section(&disc, false);
         let window_ms = REMOTE_QUERY_GATHER_WINDOW.as_millis();
-        let hint = format!(
-            "none discovered within the {window_ms} ms gather window — a discovered robot \
-             did not advertise a topic in time. \
-             Robots may still exist: a slow or busy peer can miss the window (retry), and \
-             liveliness tokens exist only while a networked publisher is alive\n"
-        );
         assert_eq!(
             out,
             format!(
