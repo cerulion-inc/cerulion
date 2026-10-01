@@ -779,9 +779,10 @@ fn flood_until_budget_engages(
 ///  * a drop with the sink still short of full: the forwarding task was behind
 ///    rather than blocked, so the loop ran out of frames or wall before the state
 ///    the caller needs existed. The gate is not implicated.
-///  * the sink full and the gate fired, but the final reading under budget: with
-///    the task parked there is no consumer, so the two constants the arithmetic
-///    rests on are what moved.
+///  * the sink full and the gate fired, but the final reading under budget: the flood
+///    breaks on all three together, so that is a run which spent its frames or its
+///    wall with the queue below the budget, and the two constants the arithmetic rests
+///    on no longer describe the fork.
 fn assert_budget_engaged(f: &Flood) {
     if f.engaged && f.sink_full && LIVE_TEMPORAL_BUDGET_BYTES < f.last.broadcast {
         return;
@@ -1486,9 +1487,11 @@ struct Parked {
     /// Messages the receiver the arm holds reports in the forwarding task's sink,
     /// which is that sink's own count rather than a byte estimate of it.
     sink_frames: usize,
-    /// Frames that FIT in that sink, derived from [`FORWARDER_SINK_BYTES`] and the
-    /// measured frame size.
-    sink_fits: usize,
+    /// The LEAST count that sink may report: the frames that fit in
+    /// [`FORWARDER_SINK_BYTES`] at the measured frame size, less one of allowance. One
+    /// fewer than fit, so the comparison cannot fail on the byte difference between
+    /// what the proxy reports and what the sink charges.
+    sink_floor: usize,
     /// Readings taken.
     polls: usize,
     /// Readings that differed from the one before, which is frames the task was
@@ -1517,10 +1520,11 @@ struct Parked {
 ///    three more before the push that cannot fit, since the frame it blocks on has
 ///    already left the broadcast (those bytes are freed at the receive). A drained
 ///    broadcast is the opposite reading and is refused below;
-///  * the receiver the arm holds reports at least the frames that FIT in
-///    [`FORWARDER_SINK_BYTES`]. That is the sink's own message count, which replaces
-///    the flood's byte estimate of the same quantity (the handshake the producer sent
-///    first is in the count too, which only adds to it).
+///  * the receiver the arm holds reports at least `sink_floor` messages, which is the
+///    frames that fit in [`FORWARDER_SINK_BYTES`] less one of allowance for the byte
+///    difference between what the proxy reports and what the sink charges. That count
+///    is the sink's own, and it replaces the flood's byte estimate of the same quantity
+///    (the handshake the producer sent first is in it too, which only adds to it).
 ///
 /// What this does NOT prove is that the push is blocked. A held reading cannot
 /// separate a parked task from one stalled between its last receive and its push:
@@ -1547,17 +1551,17 @@ fn wait_until_the_forwarder_is_parked(
     flood: &Flood,
 ) -> Parked {
     let start = Instant::now();
-    // The frames that fit, from the two constants rather than from a count, less one
-    // for the difference between the bytes the proxy reports and the bytes the sink
-    // charges: that difference is sub-percent, a quarter of a frame across the whole
-    // sink, so one frame of allowance covers it several times over while still
-    // refusing a sink that is half empty.
-    let fits = (FORWARDER_SINK_BYTES / flood.frame_bytes.max(1)).saturating_sub(1) as usize;
+    // The LEAST count the sink may report: the frames that fit, from the two constants
+    // rather than from a count, less one for the difference between the bytes the proxy
+    // reports and the bytes the sink charges. That difference is sub-percent, a quarter
+    // of a frame across the whole sink, so one frame of allowance covers it several
+    // times over while still refusing a sink that is half empty.
+    let sink_floor = (FORWARDER_SINK_BYTES / flood.frame_bytes.max(1)).saturating_sub(1) as usize;
     let mut parked = Parked {
         at_flood_exit: flood.last.broadcast,
         settled_at: usage(handle, Duration::from_secs(5)).broadcast,
         sink_frames: rx.len(),
-        sink_fits: fits,
+        sink_floor,
         polls: 1,
         changes: 0,
         elapsed: Duration::ZERO,
@@ -1565,8 +1569,8 @@ fn wait_until_the_forwarder_is_parked(
     let mut held = 1usize;
     loop {
         let a_frame_is_resident = flood.frame_bytes <= parked.settled_at;
-        let the_sink_is_full = fits <= parked.sink_frames;
-        if FORWARDER_PARK_HOLD_POLLS <= held && a_frame_is_resident && the_sink_is_full {
+        let the_sink_is_at_its_floor = sink_floor <= parked.sink_frames;
+        if FORWARDER_PARK_HOLD_POLLS <= held && a_frame_is_resident && the_sink_is_at_its_floor {
             break;
         }
         if FORWARDER_PARK_DEADLINE <= start.elapsed() {
@@ -1595,10 +1599,11 @@ fn wait_until_the_forwarder_is_parked(
                 )
             } else {
                 format!(
-                    "the reading held with {} message(s) in the sink, under the {fits} frames \
-                     that fit it. The task has not filled its sink, so the push that cannot fit \
-                     is still that many frames of taking away, and a reading that stopped \
-                     moving is a task stalled rather than parked",
+                    "the reading held with {} message(s) in the sink, under its floor of \
+                     {sink_floor}, one frame fewer than fit it. The task has not filled its \
+                     sink, so the push that cannot fit is still that many frames of taking \
+                     away, and a reading that stopped moving is a task stalled rather than \
+                     parked",
                     parked.sink_frames
                 )
             };
@@ -1622,11 +1627,11 @@ fn wait_until_the_forwarder_is_parked(
     parked.elapsed = start.elapsed();
     println!(
         "forwarder park: the live queue held {} bytes across {FORWARDER_PARK_HOLD_POLLS} readings \
-         {FORWARDER_PARK_POLL:?} apart, with {} of the {} frames that fit in the sink ({} \
-         readings, {} changes, {} bytes when the flood returned) in {:?}",
+         {FORWARDER_PARK_POLL:?} apart, with {} message(s) in the sink against its floor of {} \
+         ({} readings, {} changes, {} bytes when the flood returned) in {:?}",
         parked.settled_at,
         parked.sink_frames,
-        parked.sink_fits,
+        parked.sink_floor,
         parked.polls,
         parked.changes,
         parked.at_flood_exit,
