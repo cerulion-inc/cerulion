@@ -576,16 +576,33 @@ impl ResimReport {
 /// and `./out.mcap` compare equal; so do a path and a symlink to it.
 pub fn same_destination(a: &Path, b: &Path) -> bool {
     fn resolve(p: &Path) -> PathBuf {
-        if let Ok(full) = p.canonicalize() {
+        // Follow a symlink chain by hand: a DANGLING link cannot be
+        // canonicalized, yet a writer opening it creates its target.
+        let mut cur = p.to_path_buf();
+        for _ in 0..40 {
+            let is_link = cur
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            let Some(target) = is_link.then(|| std::fs::read_link(&cur).ok()).flatten() else {
+                break;
+            };
+            cur = if target.is_absolute() {
+                target
+            } else {
+                cur.parent().unwrap_or_else(|| Path::new("")).join(target)
+            };
+        }
+        if let Ok(full) = cur.canonicalize() {
             return full;
         }
-        let parent = p
+        let parent = cur
             .parent()
             .filter(|d| !d.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        match (parent.canonicalize(), p.file_name()) {
+        match (parent.canonicalize(), cur.file_name()) {
             (Ok(dir), Some(name)) => dir.join(name),
-            _ => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
+            _ => std::path::absolute(&cur).unwrap_or(cur),
         }
     }
     resolve(a) == resolve(b)
@@ -1317,6 +1334,12 @@ mod tests {
         std::fs::write(&plain, b"x").unwrap();
         std::os::unix::fs::symlink(&plain, d.join("link")).unwrap();
         assert!(same_destination(&plain, &d.join("link")));
+        // A DANGLING symlink still names its target: a writer opening it creates
+        // that file.
+        let target = d.join("future.mcap");
+        std::os::unix::fs::symlink(&target, d.join("dangling_report")).unwrap();
+        assert!(!target.exists());
+        assert!(same_destination(&d.join("dangling_report"), &target));
         // ANTI-TAUTOLOGY: different files are different.
         assert!(!same_destination(&plain, &d.join("other.mcap")));
         // The resolver refuses the aliased pair by name.
