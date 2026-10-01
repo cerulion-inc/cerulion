@@ -17220,7 +17220,7 @@ fn validate_no_silent_data_trigger(
              was built with an outdated version of the cerulion macros that did not carry the \
              trigger policy across the node-library boundary. Rebuild the node with a current \
              toolchain (`cerulion node build <type>`) so the `#[input(trigger)]` policy is \
-             propagated. See the `#[input(...)]` field attribute section in USER_API.md.",
+             propagated. See the `#[input(...)]` field attribute section in docs/user-api.md.",
             trigger_inputs.join(", ")
         ),
     })
