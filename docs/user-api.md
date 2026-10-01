@@ -2718,7 +2718,7 @@ untouched. Besides the codes above, they refuse with:
 - `schema_mismatch`: the output and the input name different schemas, by the
   same rule as `graph validate`. `error.data` is `{"expected": <input schema>,
   "found": <output schema>}`. When either side declares no schema name, the wire
-  is accepted and `graph.validate` is the full check.
+  is accepted and `graph.validate` is the check that follows.
 - `would_break`: `graph.unstage` of a node whose outputs feed other nodes.
   `error.data` is `{"wires": [{"from": {node, port}, "to": {node, port}}]}` and
   nothing is written. With `"force": true` the node and those inputs are
@@ -2729,8 +2729,8 @@ untouched. Besides the codes above, they refuse with:
 
 Loops, levelization and the trigger wiring a node type requires are not
 judged by these verbs (for example, unwiring a node's only trigger input
-succeeds); `graph.validate` is the full check, and `graph.levels` reports the
-levelization. A node named
+succeeds); `graph.validate` checks references, schemas and trigger wiring, and
+`graph.levels` reports the levelization and rejects trigger cycles. A node named
 in `process_groups` or `level_assignments` cannot be unstaged here: the edit is
 refused as `invalid_request` and the file is untouched. An input that reads a
 topic other nodes also publish (`multi_publisher_topics`) does not depend on
