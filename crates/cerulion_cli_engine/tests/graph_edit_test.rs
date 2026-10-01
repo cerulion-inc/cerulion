@@ -293,6 +293,7 @@ fn a_graph_without_a_prefix_line_can_be_wired_and_unstaged() {
     write_graph(&ws, &doc);
     let out = graph_wire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
     assert!(!out.raw.contains("prefix:"), "no prefix line is invented");
+    assert!(out.raw.contains("source: cam/image"), "{}", out.raw);
     let out = graph_unstage(&ws, "percep", "log", false).unwrap();
     assert!(!out.raw.contains("id: log"), "{}", out.raw);
 }
@@ -352,7 +353,28 @@ fn removing_the_only_input_keeps_a_comment_on_the_inputs_key() {
     );
     assert_eq!(out.raw, expected);
     // And it wires again.
-    graph_wire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    let again = graph_wire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    assert!(again.raw.contains("source: cam/image"), "{}", again.raw);
+}
+
+#[test]
+fn a_graph_without_a_prefix_line_resolves_an_absolute_host_topic_for_unstage() {
+    let tmp = TempDir::new().unwrap();
+    let ws = workspace(tmp.path());
+    let host = cerulion_core::graph::default_prefix("");
+    let doc = HAND_AUTHORED.replace("prefix: percep\n", "").replace(
+        "  - id: log\n    type: logger\n",
+        &format!(
+            "  - id: log\n    type: logger\n    inputs:\n      - name: frames\n        source: /{host}/cam/image\n"
+        ),
+    );
+    write_graph(&ws, &doc);
+    let err = graph_unstage(&ws, "percep", "cam", false).unwrap_err();
+    assert!(
+        matches!(err, GraphEditError::WouldBreak { .. }),
+        "the consumer of the host-prefixed topic blocks the unstage: {err:?}"
+    );
+    assert_eq!(read_graph(&ws), doc, "a refusal writes nothing");
 }
 
 #[test]

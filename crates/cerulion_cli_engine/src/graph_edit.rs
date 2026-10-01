@@ -30,7 +30,8 @@
 
 use cerulion_core::graph::config::{GraphConfig, InputDef};
 use cerulion_core::graph::{
-    parse_graph_raw, resolve_output_topic, resolve_source, validate_graph_with, ValidationOptions,
+    default_prefix, parse_graph_raw, resolve_output_topic, resolve_source, validate_graph_with,
+    ValidationOptions,
 };
 
 use crate::error::CliError;
@@ -282,16 +283,28 @@ fn check_schemas(
     })
 }
 
+/// The prefix the graph resolves topics under: its own `prefix:` line, else
+/// the host-derived default it runs with. Only for matching topics; the
+/// authored file never gains the line.
+fn effective_prefix(config: &GraphConfig) -> String {
+    if config.prefix.is_empty() {
+        default_prefix("")
+    } else {
+        config.prefix.clone()
+    }
+}
+
 /// The same validation `node stage` runs before it writes, with the engine's
 /// refusal text carried as a refusal rather than a transport fault.
 fn validate_after_edit(config: &GraphConfig) -> Result<(), GraphEditError> {
     // A graph that omits `prefix:` runs under a host-derived default, but the
     // reader here keeps it empty (so a rewrite never invents the line) and the
-    // validator refuses an empty prefix. Validate a copy under a stand-in.
+    // validator refuses an empty prefix. Validate a copy under the prefix the
+    // graph resolves to at run time.
     let resolved;
     let config = if config.prefix.is_empty() {
         let mut copy = config.clone();
-        copy.prefix = "graph".to_string();
+        copy.prefix = effective_prefix(config);
         resolved = copy;
         &resolved
     } else {
@@ -319,13 +332,13 @@ pub fn graph_unwire(
         raw, mut config, ..
     } = load(workspace, graph)?;
     let source = wire_source(&config, &from.node, &from.port)?;
-    let wanted = resolve_source(&config.prefix, &source);
+    let prefix = effective_prefix(&config);
+    let wanted = resolve_source(&prefix, &source);
     let to_index = config
         .nodes
         .iter()
         .position(|n| n.id == to.node)
         .ok_or_else(|| refuse(format!("node '{}' is not in this graph", to.node)))?;
-    let prefix = config.prefix.clone();
     let input_position = config.nodes[to_index]
         .inputs
         .iter()
@@ -358,7 +371,7 @@ pub fn graph_unstage(
         .iter()
         .position(|n| n.id == node)
         .ok_or_else(|| refuse(format!("node '{node}' is not in this graph")))?;
-    let prefix = config.prefix.clone();
+    let prefix = effective_prefix(&config);
     let produced: Vec<(String, String)> = config.nodes[index]
         .outputs
         .iter()

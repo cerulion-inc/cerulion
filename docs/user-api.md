@@ -2729,7 +2729,8 @@ untouched. Besides the codes above, they refuse with:
 
 Loops, levelization and the trigger wiring a node type requires are not
 judged by these verbs (for example, unwiring a node's only trigger input
-succeeds); `graph.validate` and `graph.levels` are the full check. A node named
+succeeds); `graph.validate` is the full check, and `graph.levels` reports the
+levelization. A node named
 in `process_groups` or `level_assignments` cannot be unstaged here: the edit is
 refused as `invalid_request` and the file is untouched. An input that reads a
 topic other nodes also publish (`multi_publisher_topics`) does not depend on
