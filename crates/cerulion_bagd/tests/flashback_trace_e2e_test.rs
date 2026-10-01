@@ -1552,6 +1552,85 @@ fn a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares() 
 /// to step 0 and nothing else, and reads `resimmable: true`. Two real
 /// recordings differing in the window alone are what pin the refusal to the
 /// WINDOW rather than to the ring count.
+/// A two rank capture whose PEER ended shorter renders the fold, and the sentence
+/// says which number it is.
+///
+/// The verdict an operator reads carries the covered range's endpoint, and that
+/// endpoint is the recorder's fold: the MINIMUM over the ranks that kept a
+/// boundary of each rank's last kept target. The sentence used to call it "the
+/// last step boundary this capture's trace carries", which on this bag names a
+/// DIFFERENT and later instant, so the rendered claim and the number beside it
+/// disagreed. This arm is the only thing in the tree that reads the rendered
+/// text, which is why the wording survived the fold.
+///
+/// The shape is reachable through the ordinary from start path: `judge_resimmable`
+/// returns on the step 0 arm before the multi ring gate, so a two rank capture
+/// renders a POSITIVE verdict with a range in it.
+///
+/// HAND ORACLE. `boundary(step)` stamps `1_000_000 + step * 4_000_000`, so rank 0
+/// keeping steps 0 to 3 ends at 13_000_000 and rank 1 keeping steps 0 and 1 ends
+/// at 5_000_000. The fold is 5_000_000 and the trace's own last boundary is
+/// 13_000_000. Both numbers are written down here, and the arm asserts the first
+/// is rendered and the second is ABSENT: a renderer that went back to rank 0's
+/// stream would print 13_000_000 and fail on the absence rather than on a
+/// recomputed expectation.
+#[test]
+fn a_peer_ending_shorter_renders_the_folds_instant_and_names_it_as_the_fold() {
+    let mut trace = Vec::new();
+    for step in 0..=3u64 {
+        trace.push(boundary(step));
+        trace.push(fire(step, 0));
+    }
+    // Rank 1's own stream, ending two steps EARLIER than rank 0's.
+    for step in 0..=1u64 {
+        let mut b = boundary(step);
+        b.reserved = 1;
+        trace.push(b);
+    }
+    let h = capture_with_extra_state_rings("peershorterrender", &trace, &[], 1);
+    assert_eq!(
+        h.state_ring_ranks,
+        vec![0, 1],
+        "PRECONDITION: two REAL ranks, the shape a multi-process run provisions"
+    );
+
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(
+        m["anchor"]["resimmable"],
+        serde_json::json!(true),
+        "PRECONDITION: the window reaches step 0, so the verdict is the POSITIVE \
+         one and carries a range at all: {m}"
+    );
+    let covered = m["anchor"]["resim_covered_through_ns"]
+        .as_u64()
+        .expect("a positive verdict carries its covered range");
+    assert_eq!(
+        covered, 5_000_000,
+        "PRECONDITION: the recorder wrote the FOLD, rank 1's last kept target, \
+         not rank 0's 13000000: {m}"
+    );
+
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a verdict states its reason");
+    // THE RENDERED TEXT, as an operator reads it.
+    assert!(
+        reason.contains(
+            "through gating-clock instant 5000000 ns (the earliest last kept step boundary \
+             across the ranks that kept one)"
+        ),
+        "the sentence names the instant AND says it is the fold over ranks: {reason}"
+    );
+    assert!(
+        !reason.contains("the last step boundary this capture's trace carries"),
+        "and never the pre-fold wording, which this bag makes false: {reason}"
+    );
+    assert!(
+        !reason.contains("13000000"),
+        "rank 0's own last target is not what the verdict promises: {reason}"
+    );
+}
+
 #[test]
 fn a_two_rank_capture_whose_window_reaches_step_zero_reads_resimmable() {
     let h = capture_with_extra_state_rings("stepzeromulti", &trace_from_step_zero(), &[], 1);

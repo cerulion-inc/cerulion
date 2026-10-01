@@ -71,10 +71,20 @@ pub struct ResimFacts<'a> {
     /// (the trimmed trace), so the two cannot disagree about whether a departure
     /// is present — the caller measures both in one pass.
     pub departure_records: usize,
-    /// The step of the FIRST step-boundary record in the trace, which is what
-    /// `resolve_resume` derives the resume point from.
+    /// The step of the AUTHORITATIVE rank's first kept step-boundary record, which
+    /// is what `resolve_resume` derives the resume point from.
     ///
-    /// `None` means the trace carries no boundary at all. That is NOT the same
+    /// The two ends of a resume fold in OPPOSITE directions on a multi rank
+    /// capture: the covered range's END is the earliest last kept boundary across
+    /// the ranks that kept one, what the slowest rank can back, while this START
+    /// is rank 0's own first kept boundary, because the replay window is rank 0's
+    /// boundary stream by construction (`resolve_resume` reads
+    /// `first_recorded_boundary`, which walks rank 0 only). Read rank-blind this
+    /// would be the first boundary in retained order, and on a capture whose peer
+    /// carries no anchor that is the peer's step 0, which made the judge stamp a
+    /// from-start resume the reader then refused.
+    ///
+    /// `None` means rank 0 kept no boundary. That is NOT the same
     /// as an empty trace (a trace of FIRE records with no boundary is possible
     /// on a torn head) and resim refuses it separately, so the two are kept
     /// apart here too.
@@ -757,13 +767,20 @@ pub const RESIM_COVERED_THROUGH_CLAUSE: &str =
 /// it to one of them would publish a verdict whose scope depends on which arm it
 /// took.
 ///
+/// The number the clause names is the recorder's fold, the MINIMUM over the ranks
+/// that kept a boundary of each rank's last kept target, so the sentence names it
+/// that way. Calling it the last boundary the trace carries was true only while
+/// one rank kept one: on a k>1 capture whose peer ended shorter the trace carries
+/// a LATER boundary than the instant printed beside the claim, and a from-start
+/// capture reaches this renderer with two ranks (`judge_resimmable` returns on
+/// the step-0 arm before the multi-ring gate).
+///
 /// `covered_through_ns` is `None` when NO rank kept a step boundary to end a
-/// range at, which is what the writer's fold over the ranks answers. That
-/// capture is refused
-/// separately (`ResimGap::NoBoundary`), so the arm is reachable only from a
-/// from-start claim whose trace the trim kept whole — and the base sentence
-/// alone is then the accurate one: it promises re-execution and states no range
-/// it did not measure.
+/// range at, which is what the writer's fold over the ranks answers. That is the
+/// same condition `ResimGap::NoBoundary` refuses on, and it is asked first, so no
+/// capture reaches this arm in production and its only callers are this module's
+/// own oracle arms. The base sentence alone is the accurate rendering there: it
+/// promises re-execution and states no range it did not measure.
 pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> String {
     let base = if from_start {
         RESIMMABLE_FROM_START_REASON
@@ -772,10 +789,10 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
     };
     match covered_through_ns {
         Some(ns) => format!(
-            "{base}{RESIM_COVERED_THROUGH_CLAUSE} {ns} ns (the last step boundary this capture's \
-             trace carries). Frames published after that instant are IN the bag and readable — \
-             they are outside the range a resume re-executes, because the capture's frame window \
-             and its trace window are closed independently"
+            "{base}{RESIM_COVERED_THROUGH_CLAUSE} {ns} ns (the earliest last kept step boundary \
+             across the ranks that kept one). Frames published after that instant are IN the bag \
+             and readable: they are outside the range a resume re-executes, because the capture's \
+             frame window and its trace window are closed independently"
         ),
         None => base.to_string(),
     }

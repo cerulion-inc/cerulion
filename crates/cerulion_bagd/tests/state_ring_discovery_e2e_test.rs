@@ -525,7 +525,7 @@ fn a_rank_that_published_no_ring_is_reported_and_makes_the_recording_incomplete(
     );
     assert!(
         cov.is_incomplete(),
-        "a missing rank voids every graph-wide anchor of the run, so the bag must say incomplete"
+        "every anchor of the run lacks that rank's records, so the bag must say incomplete"
     );
 }
 
