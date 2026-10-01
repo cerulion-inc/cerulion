@@ -5725,6 +5725,12 @@ pub fn graph_run(
             // ONE bag. `--single-process --record` never reaches this arm
             // (`resolve_deployment` routes it to `Monolith` → the
             // single-process recording dispatch below).
+            // This run's PAUSE PAGE, created HERE and held until the supervisor
+            // returns: every worker opens it by the tag stamped into its plan. A page
+            // that cannot be created leaves the run unpausable and otherwise
+            // unchanged.
+            #[cfg(unix)]
+            let _pause_page = create_run_pause_page(run_id, config.identity());
             return ros2_children.finish(graph_run_supervisor(
                 workspace_root,
                 graphs_dir,
@@ -5766,6 +5772,14 @@ pub fn graph_run(
                 // cannot be written still has a run to bind to.
                 #[cfg(unix)]
                 Some(run_id),
+                #[cfg(not(unix))]
+                None,
+                // The tag every worker plan carries so each rank opens the SAME
+                // page; `None` when the page could not be created.
+                #[cfg(unix)]
+                _pause_page
+                    .as_ref()
+                    .map(|_| cerulion_core::pause_page::pause_tag_for_run(run_id)),
                 #[cfg(not(unix))]
                 None,
                 &embed_config,
@@ -5908,6 +5922,10 @@ pub fn graph_run(
             #[cfg(not(unix))]
             run_dir: None,
             state_arm,
+            // The recording is a live run like any other: `graph pause` can hold it,
+            // and the pause then leaves no gap in the bag.
+            #[cfg(unix)]
+            pause: create_run_pause_page(run_id, graph_name),
         }));
     }
 
@@ -5998,6 +6016,12 @@ pub fn graph_run(
             // `ExternalClock`. No external time master is wired yet — the clock
             // starts at 0 and never advances without a `/clock` feeder, so
             // time-based triggers (period/deadline) will not fire. Warn loudly.
+            // This run's pause page, when the clock below is the pausable one.
+            // Declared before the clock so it outlives the runtime that reads it.
+            #[cfg(unix)]
+            let mut pause_page: Option<
+                Arc<cerulion_core::pause_page::MappedPausePage>,
+            > = None;
             let clock: Arc<dyn cerulion_core::clock::Clock> = match time_source {
                 TimeSource::External => {
                     tracing::warn!(
@@ -6006,6 +6030,20 @@ pub fn graph_run(
                     );
                     Arc::new(cerulion_core::ExternalClock::new())
                 }
+                // The real clock: the hardware clock, except that a run `graph pause`
+                // can reach reads the run clock, which stands still while paused.
+                // An external time master is not this process's to stop, so only the
+                // real clock is pausable.
+                #[cfg(unix)]
+                _ => match create_run_pause_page(run_id, graph_name) {
+                    Some(page) => {
+                        let clock = Arc::new(cerulion_core::PausableClock::new(Arc::clone(&page)));
+                        pause_page = Some(page);
+                        clock
+                    }
+                    None => Arc::new(cerulion_core::RealClock),
+                },
+                #[cfg(not(unix))]
                 _ => Arc::new(cerulion_core::RealClock),
             };
             let transport =
@@ -6099,6 +6137,11 @@ pub fn graph_run(
             // singleton. `Arc::clone` — `transport` stays owned by this scope so
             // the node outlives the runtime's ports (runtime drops first).
             runtime.set_live_transport(transport.clone());
+            // Let `graph pause` hold this run at a step boundary.
+            #[cfg(unix)]
+            if let Some(page) = pause_page.as_ref() {
+                runtime.attach_pause(Arc::clone(page));
+            }
             // Graph-aware CPU C-state cap (LIVE path). Derived
             // from the graph's own tightest timing (`tightest_timing_ns`) so
             // a latency-sensitive graph keeps a hot core (shallow C-states)
@@ -6527,8 +6570,37 @@ pub fn graph_run_worker(
     let controlled: Option<Arc<cerulion_core::VirtualClock>> = build_path
         .uses_controlled_clock()
         .then(|| Arc::new(cerulion_core::VirtualClock::new()));
+    // The run's PAUSE PAGE, opened by the tag the supervisor stamped. Every rank
+    // opens the same one, so a pause reaches the whole run. A page that cannot be
+    // opened leaves this rank unpausable and otherwise unchanged (loudly: a run
+    // that half-pauses is worse than one that says it cannot).
+    #[cfg(unix)]
+    let pause_page: Option<Arc<cerulion_core::pause_page::MappedPausePage>> =
+        plan.pause_tag.as_deref().and_then(|tag| {
+            match cerulion_core::pause_page::MappedPausePage::open_unowned(tag) {
+                Ok(page) => Some(Arc::new(page)),
+                Err(e) => {
+                    tracing::warn!(
+                        group = %plan.group,
+                        error = %e,
+                        "could not open this run's pause page, so this rank cannot be held by \
+                         `cerulion graph pause`; the rank itself is unaffected"
+                    );
+                    None
+                }
+            }
+        });
     let clock_dyn: Arc<dyn cerulion_core::clock::Clock> = match &controlled {
         Some(c) => Arc::clone(c) as Arc<dyn cerulion_core::clock::Clock>,
+        // A rank on the real clock reads the run clock, which stands still while the
+        // run is paused; a controlled-clock rank is advanced by its own step time,
+        // which excludes the pause.
+        #[cfg(unix)]
+        None => match &pause_page {
+            Some(page) => Arc::new(cerulion_core::PausableClock::new(Arc::clone(page))),
+            None => Arc::new(cerulion_core::clock::RealClock),
+        },
+        #[cfg(not(unix))]
         None => Arc::new(cerulion_core::clock::RealClock),
     };
 
@@ -6861,6 +6933,11 @@ pub fn graph_run_worker(
     // `TransportManager::get()` singleton) already resolves to it; parking makes
     // the wiring explicit and immune to a future non-singleton worker transport.
     runtime.set_live_transport(Arc::clone(&transport));
+    // Let `graph pause` hold this rank at a step boundary.
+    #[cfg(unix)]
+    if let Some(page) = pause_page.as_ref() {
+        runtime.attach_pause(Arc::clone(page));
+    }
 
     // (7.4) The clock discipline: the fourth branch point, governed by the
     // BUILD PATH ALONE and therefore placed here, immediately after the build
@@ -9609,6 +9686,10 @@ fn graph_run_supervisor(
     // Distinct in TYPE from every other parameter here, so the swap hazard the
     // signature's own comment warns about does not apply.
     run_id: Option<u128>,
+    // The tag of this run's pause page, created by `graph_run`, which is stamped
+    // into every worker plan so each rank opens the same one. `None`: this run
+    // cannot be paused.
+    pause_tag: Option<String>,
     // By design: the effective config cloned before the ros2 split
     // (graph_run, the caller, owns the split) — threaded to the recording path
     // so the bag embeds the whole run in authored node order.
@@ -10308,6 +10389,9 @@ fn graph_run_supervisor(
     // both must land BEFORE the plans are serialized, which is the ordering the
     // `stamp_state_arm_tag` structural pin already guards.
     stamp_run_dir(&mut plan, run_dir);
+    // Every worker opens the run's one pause page, so the tag is stamped the same
+    // way and for the same reason as the arm tag and the run directory above.
+    stamp_pause_tag(&mut plan, pause_tag.as_deref());
     // THE HEADLINE: every multi-process run stamps trace-ring tags,
     // not only a recording one.**
     //
@@ -17084,6 +17168,10 @@ struct RecordingRun<'a> {
     /// embeds, so the bag carries the WHOLE run in authored node order
     /// (a resim classifies-and-skips the entries).
     embed_config: &'a GraphConfig,
+    /// This run's pause page, created by `graph_run`, or `None` when it could not
+    /// be (the run is then unpausable and otherwise unchanged).
+    #[cfg(unix)]
+    pause: Option<Arc<cerulion_core::pause_page::MappedPausePage>>,
 }
 
 /// The recording run — build the runtime with recording
@@ -18880,6 +18968,40 @@ fn stamp_run_dir(plan: &mut crate::multiprocess::DeploymentPlan, run_dir: Option
     }
 }
 
+/// Stamp the run's pause-page tag into every worker plan, so every rank opens the
+/// SAME page: one pause must reach every rank, or the run is half held.
+fn stamp_pause_tag(plan: &mut crate::multiprocess::DeploymentPlan, tag: Option<&str>) {
+    for w in &mut plan.workers {
+        w.pause_tag = tag.map(str::to_string);
+    }
+}
+
+/// Create this run's pause page, or say why the run cannot be paused.
+///
+/// The page is the run's, named by its identity, and removed when the owner returns.
+/// A failure (no shared memory to create it in) is a DEGRADE, loudly: the run goes on
+/// exactly as before and `cerulion graph pause` then reports that this run has no
+/// page to flip.
+#[cfg(unix)]
+fn create_run_pause_page(
+    run_id: u128,
+    graph: &str,
+) -> Option<Arc<cerulion_core::pause_page::MappedPausePage>> {
+    let tag = cerulion_core::pause_page::pause_tag_for_run(run_id);
+    match cerulion_core::pause_page::MappedPausePage::create_owned(&tag) {
+        Ok(page) => Some(Arc::new(page)),
+        Err(e) => {
+            tracing::warn!(
+                graph = %graph,
+                error = %e,
+                "could not create this run's pause page, so `cerulion graph pause` cannot \
+                 hold this run; the run itself is unaffected"
+            );
+            None
+        }
+    }
+}
+
 /// Best-effort `shm_unlink` of every worker
 /// recording-ring NAME. A worker's `TraceRingOwner::drop` unlinks its own
 /// ring ONLY on a clean exit — a SIGKILLed worker (`--peer-loss fail` sibling
@@ -19376,6 +19498,8 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         run_dir,
         state_arm,
         embed_config,
+        #[cfg(unix)]
+        pause,
     } = run;
 
     // ---- (1) Resolve the recorded topic set + exact schemas BEFORE `config`
@@ -19488,6 +19612,13 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         .map(|arm| (tag.clone(), arm))
     });
     runtime.set_live_transport(transport.clone());
+    // Let `graph pause` hold this run. The gating clock here is the controlled one
+    // that follows the wall, so the run's own step time (which excludes the pause)
+    // is what advances it: the bag shows no gap across a pause.
+    #[cfg(unix)]
+    if let Some(page) = pause.as_ref() {
+        runtime.attach_pause(Arc::clone(page));
+    }
 
     // ---- (3) Create the scheduler-trace ring (rank 0, single-process Tier-0)
     // and install its producer on the runtime BEFORE step 0. The
@@ -37650,6 +37781,7 @@ mod worker_tests {
             state_arm_tag: None,
             run_dir: None,
             wedge_page: None,
+            pause_tag: None,
         }
     }
 
@@ -38798,6 +38930,7 @@ mod supervisor_tests {
             state_arm_tag: None,
             run_dir: None,
             wedge_page: None,
+            pause_tag: None,
         };
         DeploymentPlan {
             workers: vec![worker("a", 0), worker("b", 1)],
@@ -39148,6 +39281,47 @@ mod supervisor_tests {
             serde_json::from_str(&serde_json::to_string(&stamped.workers[0]).unwrap())
                 .expect("round-trip");
         assert_eq!(round.state_arm_tag.as_deref(), Some("cer_run_42"));
+    }
+
+    /// The pause tag is stamped identically into every worker plan, and a plan
+    /// written by a build without it (an old supervisor) still deserializes and reads
+    /// as "this run cannot be paused", which is what keeps a mid-upgrade pair of
+    /// binaries running.
+    #[test]
+    fn the_worker_plans_pause_tag_is_one_shared_value_and_additive_in_both_directions() {
+        let mut plan = bare_plan();
+        for w in &plan.workers {
+            assert_eq!(w.pause_tag, None, "the pure planner stamps nothing");
+        }
+        stamp_pause_tag(&mut plan, Some("00000000000000000000000000000abc"));
+        for w in &plan.workers {
+            assert_eq!(
+                w.pause_tag.as_deref(),
+                Some("00000000000000000000000000000abc"),
+                "every rank must open the SAME pause page"
+            );
+        }
+        stamp_pause_tag(&mut plan, None);
+        for w in &plan.workers {
+            assert_eq!(w.pause_tag, None, "a run with no page stamps none");
+        }
+
+        let mut json: serde_json::Value =
+            serde_json::to_value(&plan.workers[0]).expect("serialize a worker plan");
+        json.as_object_mut().unwrap().remove("pause_tag");
+        let old: crate::multiprocess::WorkerPlan =
+            serde_json::from_value(json).expect("an old plan file must still deserialize");
+        assert_eq!(
+            old.pause_tag, None,
+            "an absent key means the run cannot be paused"
+        );
+
+        let mut stamped = bare_plan();
+        stamp_pause_tag(&mut stamped, Some("tag"));
+        let round: crate::multiprocess::WorkerPlan =
+            serde_json::from_str(&serde_json::to_string(&stamped.workers[0]).unwrap())
+                .expect("round-trip");
+        assert_eq!(round.pause_tag.as_deref(), Some("tag"));
     }
 
     /// `stamp_execution_mode` writes the RESOLVED mode into

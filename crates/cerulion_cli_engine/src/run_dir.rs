@@ -923,6 +923,25 @@ pub fn restamp_run_gating(run_dir: &Path, gating: GatingClock) -> CliResult<()> 
     })
 }
 
+/// Record whether the run is paused, in the `run.json` the run already wrote.
+///
+/// A FOURTH in-place writer, and the first that is not the run's own process:
+/// `cerulion graph pause` and `resume` run in the operator's, which is why the
+/// shared rewrite shell serialises its amenders on the run directory (see
+/// `edit_run_manifest`). The key is `"paused"`, a boolean. A reader that finds no
+/// such key reads a run that has not been paused (an older manifest, or one never
+/// paused), and every key this does not own survives.
+///
+/// # Errors
+///
+/// The underlying I/O or JSON error. The verb treats it as a DEGRADE: the run's
+/// pause page is the truth, and the manifest is its mirror.
+pub fn declare_run_paused(run_dir: &Path, paused: bool) -> CliResult<()> {
+    edit_run_manifest(run_dir, "paused state", |obj| {
+        obj.insert("paused".to_string(), serde_json::Value::Bool(paused));
+    })
+}
+
 /// PURE-ish: read `run.json`, hand its object to `edit`, and write it back.
 ///
 /// Extracted so the writers that AMEND a run manifest in place — the gating
@@ -944,6 +963,18 @@ fn edit_run_manifest(
     what: &str,
     edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
 ) -> CliResult<()> {
+    // SERIALISE the amenders, across processes. The rewrite below is read, edit,
+    // rename: two amenders interleaving would each read the old document and the
+    // later rename would erase the earlier one's key. Until `graph pause` that could
+    // not happen, because every amender was the run's own process on one thread; the
+    // verb runs in the operator's process, so the exclusion has to be the kernel's.
+    // An exclusive `flock` on the run DIRECTORY (no file is created for it) is held
+    // for the whole read-modify-rename and released when the handle drops. A
+    // filesystem that cannot lock leaves the earlier behaviour: no exclusion.
+    #[cfg(unix)]
+    let _amend_lock = std::fs::File::open(run_dir)
+        .ok()
+        .filter(|dir| dir.lock().is_ok());
     let path = run_dir.join(RUN_MANIFEST_FILE);
     let bytes = std::fs::read(&path).map_err(|e| {
         CliError::Validation(format!(
@@ -3414,5 +3445,87 @@ mod tests {
             !tmp.join(format!("{RUN_MANIFEST_FILE}.tmp")).exists(),
             "the temp file must be renamed away, not left in the run directory"
         );
+    }
+
+    /// The paused state is one boolean key, written in place, and every key the run
+    /// wrote itself survives it.
+    #[test]
+    fn declare_run_paused_writes_a_boolean_and_keeps_every_other_key() {
+        let dir = tempfile::tempdir().expect("run dir");
+        std::fs::write(
+            dir.path().join(RUN_MANIFEST_FILE),
+            br#"{"version":1,"run_id":"0x1","gating":"wall","shm":[]}"#,
+        )
+        .expect("seed the manifest");
+
+        declare_run_paused(dir.path(), true).expect("pause lands");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(RUN_MANIFEST_FILE)).unwrap())
+                .expect("valid JSON");
+        assert_eq!(doc["paused"], serde_json::json!(true));
+        assert_eq!(doc["gating"], serde_json::json!("wall"));
+        assert_eq!(doc["run_id"], serde_json::json!("0x1"));
+
+        declare_run_paused(dir.path(), false).expect("resume lands");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(RUN_MANIFEST_FILE)).unwrap())
+                .expect("valid JSON");
+        assert_eq!(
+            doc["paused"],
+            serde_json::json!(false),
+            "a resume writes false rather than removing the key"
+        );
+    }
+
+    /// The paused state cannot be declared for a run that has no manifest, and the
+    /// refusal names the state it could not record.
+    #[test]
+    fn declare_run_paused_on_a_run_with_no_manifest_is_an_error_naming_the_state() {
+        let dir = tempfile::tempdir().expect("run dir");
+        let err = declare_run_paused(dir.path(), true).expect_err("no manifest");
+        assert!(format!("{err}").contains("paused state"), "{err}");
+    }
+
+    /// The reason the rewrite shell takes a lock on the run directory: the verbs run
+    /// in another process from the run, and two amenders interleaving read, edit and
+    /// rename would each start from the old document so the later rename erased the
+    /// earlier one's key. Many threads, each its own file description, stand in for the
+    /// processes; every writer's key must survive every interleaving.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_amenders_never_lose_each_others_keys() {
+        let dir = tempfile::tempdir().expect("run dir");
+        std::fs::write(
+            dir.path().join(RUN_MANIFEST_FILE),
+            br#"{"version":1,"run_id":"0x1"}"#,
+        )
+        .expect("seed the manifest");
+        let path = dir.path().to_path_buf();
+        std::thread::scope(|s| {
+            for round in 0..40 {
+                let p = &path;
+                s.spawn(move || {
+                    edit_run_manifest(p, "test key", |obj| {
+                        obj.insert(format!("k{round}"), serde_json::json!(round));
+                    })
+                    .expect("amend");
+                });
+                s.spawn(move || {
+                    declare_run_paused(p, round % 2 == 0).expect("amend paused");
+                });
+            }
+        });
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join(RUN_MANIFEST_FILE)).unwrap())
+                .expect("the manifest is still valid JSON");
+        for round in 0..40 {
+            assert_eq!(
+                doc[format!("k{round}")],
+                serde_json::json!(round),
+                "amender {round}'s key was lost to a concurrent rewrite"
+            );
+        }
+        assert!(doc["paused"].is_boolean(), "the paused key survives: {doc}");
+        assert_eq!(doc["run_id"], serde_json::json!("0x1"));
     }
 }

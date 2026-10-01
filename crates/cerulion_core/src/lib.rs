@@ -160,6 +160,12 @@ pub mod monitor_wait;
 // pub(crate): every consumer is in-crate; the module is macOS-only.
 #[cfg(target_os = "macos")]
 pub(crate) mod os_sync;
+// The cross-process PAUSE PAGE behind `cerulion graph pause`: one control word
+// that holds a live run at its next step boundary and stops its run clock. Real
+// POSIX SHM, hence `#[cfg(unix)]`; `pub` because the owner, the workers and the CLI
+// verb live in `cerulion_cli_engine`.
+#[cfg(unix)]
+pub mod pause_page;
 #[allow(missing_docs)]
 pub mod prelude;
 pub mod read_outcome;
@@ -663,6 +669,8 @@ pub mod wire;
 pub const CERULION_ABI_VERSION: u32 = 22;
 
 // Re-export commonly used types
+#[cfg(unix)]
+pub use clock::PausableClock;
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};
 pub use error::{InertReason, NodeNameRefusal, TransportError, TransportResult};
 #[cfg(any(test, feature = "test-helpers"))]

@@ -869,6 +869,16 @@ pub struct RunRow {
     pub graph_yaml: String,
     /// The run's `run.json` manifest, VERBATIM.
     pub run_json: String,
+    /// Whether `cerulion graph pause` is holding the run: its `run.json` says
+    /// `"paused": true`. A manifest that says nothing about it (an older run, a run
+    /// never paused, text that is not JSON) reads as `false`, so the field only
+    /// ever adds information.
+    ///
+    /// Omitted when `false`, which keeps the line of every run that is not paused
+    /// byte-for-byte what it was before the field existed: this is an additive
+    /// field, and a controller that does not know it ignores it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
 }
 
 /// What ONE source of the fold answered, and what its answer is
@@ -3770,6 +3780,7 @@ mod tests {
             state: RunEntryState::Live,
             graph_yaml: "name: perception\n".to_string(),
             run_json: r#"{"version":1}"#.to_string(),
+            paused: false,
         }
     }
 
@@ -3885,6 +3896,24 @@ mod tests {
             resp.to_json_line(),
             r#"{"id":21,"ok":true,"runs":[{"run_id":"0x0000000000000000000000000000002a","graph_name":"perception","run_started_at_ns":1700000000000000000,"state":"live","graph_yaml":"name: perception\n","run_json":"{\"version\":1}"},{"robot":"go2","run_id":"0x0000000000000000000000000000002b","graph_name":"nav","run_started_at_ns":1700000000000000000,"state":"live","graph_yaml":"name: perception\n","run_json":"{\"version\":1}"}],"completeness":{"kind":"settled"},"sources":[{"completeness":{"kind":"settled"}},{"robot":"go2","completeness":{"kind":"settled"}}],"discovery":"settled"}"#
         );
+    }
+
+    /// A paused run carries `"paused":true` as the LAST key of its row, and a run that
+    /// is not paused carries no such key at all: the line of every run that is not
+    /// paused is exactly what it was before the field existed, so an older controller
+    /// reads it unchanged, and a controller that does not know the key ignores it.
+    #[test]
+    fn a_paused_run_row_gains_one_trailing_key_and_an_unpaused_row_gains_none() {
+        let mut paused = run_row(None, "0x0000000000000000000000000000002a", "perception");
+        paused.paused = true;
+        let json = serde_json::to_string(&paused).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"run_id":"0x0000000000000000000000000000002a","graph_name":"perception","run_started_at_ns":1700000000000000000,"state":"live","graph_yaml":"name: perception\n","run_json":"{\"version\":1}","paused":true}"#
+        );
+        let running = run_row(None, "0x0000000000000000000000000000002a", "perception");
+        let json = serde_json::to_string(&running).expect("serialize");
+        assert!(!json.contains("paused"), "{json}");
     }
 
     /// The EMPTY answer a desk with nothing running and no robots serves.

@@ -240,6 +240,18 @@ fn main() -> ExitCode {
         return connect_exit_code(cli.command);
     }
 
+    // `cerulion graph pause|resume` address a LIVE RUN, not a workspace, so they
+    // run from anywhere (the generic `Graph` arm discovers a workspace first), and
+    // they own the exit-code contract the generic dispatch cannot express (4 = no
+    // such live run).
+    if let Commands::Graph { action } = &cli.command {
+        match action {
+            GraphAction::Pause { run_id } => return run_control_exit_code(run_id, true),
+            GraphAction::Resume { run_id } => return run_control_exit_code(run_id, false),
+            _ => {}
+        }
+    }
+
     // `cerulion pair` SPAWNS `cerulion-connectd pair` (it links iroh; the
     // `cerulion` CLI stays iroh-free) and forwards its 0–4 pairing exit code — the
     // generic run() dispatch (SUCCESS/FAILURE only) cannot express that, so
@@ -293,6 +305,40 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `cerulion graph pause|resume <RUN_ID>`: flip the run's pause page and report.
+///
+/// Exit 0 on success (including a run already in the requested state), 4 when no
+/// live run matches, 1 for everything else: an ambiguous name, a run with no pause
+/// page, an unreadable registry. The message goes to stderr; the one-line result of
+/// a success goes to stdout.
+#[cfg(unix)]
+fn run_control_exit_code(run_id: &str, pause: bool) -> ExitCode {
+    use cerulion_cli_engine::run_control::{run_control_verb, RunControlOp};
+    let op = if pause {
+        RunControlOp::Pause
+    } else {
+        RunControlOp::Resume
+    };
+    match run_control_verb(run_id, op, &mut std::io::stdout()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::from(e.exit_code())
+        }
+    }
+}
+
+/// Non-Unix: runs have no pause page there, so the verb says so.
+#[cfg(not(unix))]
+fn run_control_exit_code(_run_id: &str, pause: bool) -> ExitCode {
+    eprintln!(
+        "Error: `cerulion graph {}` is only supported on Unix platforms (a run's pause \
+         control is POSIX shared memory)",
+        if pause { "pause" } else { "resume" }
+    );
+    ExitCode::FAILURE
 }
 
 /// The usage refusal for a `bag play` resim-family invocation, or
@@ -1770,6 +1816,12 @@ fn run(cli: Cli) -> CliResult<()> {
                         }
                     }
                     Ok(())
+                }
+                GraphAction::Pause { .. } | GraphAction::Resume { .. } => {
+                    unreachable!(
+                        "`graph pause|resume` are dispatched in `main` before the workspace \
+                         lookup, because they address a live run"
+                    )
                 }
                 GraphAction::RunWorker { plan } => {
                     // Hidden verb: run ONE worker of a multi-process

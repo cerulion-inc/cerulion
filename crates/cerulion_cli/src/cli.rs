@@ -647,7 +647,9 @@ impl Commands {
                 | GraphAction::Validate { .. }
                 | GraphAction::List
                 | GraphAction::Levels { .. }
-                | GraphAction::Partition { .. } => OneShot,
+                | GraphAction::Partition { .. }
+                | GraphAction::Pause { .. }
+                | GraphAction::Resume { .. } => OneShot,
             },
             // `node run` is a runtime loop; every other node verb runs-and-exits.
             Commands::Node { action } => match action {
@@ -1639,6 +1641,40 @@ pub enum GraphAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Pause a live run: hold every process of it at its next step boundary and
+    /// stop its clock.
+    ///
+    /// Nothing steps while the run is paused, and the run's clock stands still,
+    /// so a timer neither skips ticks nor bursts on resume, and a recording of
+    /// the run shows no gap across the pause. Stopping the process instead
+    /// (`SIGSTOP`) does neither: the hardware clock keeps running, so the
+    /// timestamps jump by the length of the stop and the timers burst when it
+    /// resumes. A node that reads the hardware clock itself (`real_ns()`) still
+    /// sees it advance through a pause, and a source outside the graph keeps
+    /// publishing into its inputs' queues under their own backpressure policy.
+    ///
+    /// Name the run by its run id (`0x` and 32 hex digits, printed by `graph run` and recorded in the
+    /// run's `run.json`), or by its graph name when exactly one live run has it.
+    /// The run's `run.json` records `"paused": true` and the viz daemon's `runs`
+    /// reports it. Pausing a paused run succeeds and changes nothing. Exit 0 on
+    /// success, 4 when no live run matches ("not running"), 1 otherwise (a run
+    /// with no pause page, because an older build started it or it runs on
+    /// virtual time, is refused with the reason).
+    Pause {
+        /// The run to pause: a run id (`0x` and 32 hex digits) or a graph name
+        /// that matches exactly one live run
+        run_id: String,
+    },
+    /// Resume a paused run from the moment it stopped.
+    ///
+    /// The run clock continues from the value it was stopped at, and every process
+    /// of the run steps again. Resuming a run that is not paused succeeds and
+    /// changes nothing. Names the run, and exits, exactly as `graph pause` does.
+    Resume {
+        /// The run to resume: a run id (`0x` and 32 hex digits) or a graph name
+        /// that matches exactly one live run
+        run_id: String,
+    },
     /// HIDDEN: run ONE worker process of a multi-process deployment.
     ///
     /// NOT a user-facing verb. The multi-process supervisor behind
@@ -2107,6 +2143,64 @@ pub enum SchemaAction {
     },
     /// List all schemas: workspace-local (schemas/*.yaml) and built-in ROS 2 types by package
     List,
+}
+
+#[cfg(test)]
+mod graph_pause_dispatch_tests {
+    use super::*;
+
+    /// `graph pause <run>` and `graph resume <run>` parse to their own actions with the
+    /// run as the one positional argument.
+    #[test]
+    fn graph_pause_and_resume_parse_their_run() {
+        let id = "0x00000000000000000000000000000abc";
+        let cli = Cli::try_parse_from(["cerulion", "graph", "pause", id])
+            .expect("`graph pause <id>` must parse");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Pause { run_id },
+            } => assert_eq!(run_id, id),
+            _ => panic!("expected Graph::Pause"),
+        }
+        let cli = Cli::try_parse_from(["cerulion", "graph", "resume", "perception"])
+            .expect("`graph resume <name>` must parse");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Resume { run_id },
+            } => assert_eq!(run_id, "perception"),
+            _ => panic!("expected Graph::Resume"),
+        }
+    }
+
+    /// The run is a required positional: a bare verb is a usage error (clap exit 2),
+    /// never a guess at the one live run.
+    #[test]
+    fn graph_pause_and_resume_require_a_run() {
+        for verb in ["pause", "resume"] {
+            let err = Cli::try_parse_from(["cerulion", "graph", verb])
+                .err()
+                .unwrap_or_else(|| panic!("`graph {verb}` with no run must be a parse error"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{verb}"
+            );
+        }
+    }
+
+    /// Both are run-and-exit verbs: quiet by default, like every other `graph` verb that
+    /// does not run a loop.
+    #[test]
+    fn graph_pause_and_resume_are_one_shot_verbs() {
+        for verb in ["pause", "resume"] {
+            let cli = Cli::try_parse_from(["cerulion", "graph", verb, "x"]).expect("parse");
+            assert_eq!(
+                cli.command.log_verb_class(),
+                VerbLogClass::OneShot,
+                "{verb}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -201,6 +201,11 @@ pub mod run_lock;
 // The mp machinery is gated the same way for the same reason.
 #[cfg(unix)]
 pub mod run_sweep;
+// `cerulion graph pause|resume`: finds a live run in the registry, flips its pause
+// page and mirrors the state into `run.json`. `cfg(unix)` like the page itself and
+// like `bag_cmd`, whose run selection it reuses.
+#[cfg(unix)]
+pub mod run_control;
 // `cerulion ros2 attach` — DDS discovery report + bridge config/graph
 // generation. PURE over `cerulion_dds`'s DDS-free discovery types (the live
 // backend is a separate crate); fully oracle-testable without a DDS peer.

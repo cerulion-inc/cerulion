@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cerulion graph pause <RUN>` and `cerulion graph resume <RUN>` hold a live run at its next step boundary and stop its clock, so timers neither skip ticks nor burst on resume and a recording shows no gap across the pause. A run's `run.json` records `"paused"`, and the viz daemon's `runs` rows carry `"paused": true` while a run is held. A run that is never paused is unchanged.
+
 ## [1.0.0] - 2026-09-21
 
 The first release of Cerulion. Its crates, binaries and Debian packages come from this tree.
