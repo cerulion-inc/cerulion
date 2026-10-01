@@ -9964,18 +9964,6 @@ fn enforcement_blocked_by_decline(
     })
 }
 
-/// Build one FREE-RUN pass's verification inputs.
-///
-/// Every failure to LEARN something is answered with the pure modules' own
-/// "no coverage" shapes rather than with a guess, so a hole shows up as a
-/// reported stand-down instead of a schedule nobody can justify.
-#[allow(clippy::too_many_lines)]
-// Eight arguments: `roles_stamped` is a per-BAG contract term
-// resolved once at `run_engine` entry beside `coordination`, so it arrives the
-// same way every other pass input does. Bundling the seven other
-// borrows into a struct only to satisfy the ceiling would not make the
-// function clearer.
-#[allow(clippy::too_many_arguments)]
 /// One topic's consuming edges, as the admission planner takes them.
 ///
 /// ONE spelling with two callers (the pre-pass that plans the bag side and the
@@ -10094,6 +10082,13 @@ struct RankBagSide {
 /// own warn and its own report field, and reproducing them here would be a second
 /// spelling of each; the pass plans for itself only in the no-rows case, where
 /// there was nothing to plan from before pass 0.
+// NINE arguments, every one a BAG or GRAPH fact this planning needs and none of
+// them derivable from another: the plans, the trace and its rank tables, the
+// graph config, the factories the declared node metadata is read from, the topic
+// classes, and the three per-bag contract terms (the coordination mode, whether
+// the role bits may be believed, and the kind field's width). Bundling them into
+// a struct only to satisfy the ceiling would name the same nine values twice.
+#[allow(clippy::too_many_arguments)]
 fn plan_bag_side_admissions(
     plans: &[RankPlan],
     trace: &RecordedTrace,
@@ -10355,6 +10350,18 @@ fn decode_enforcement_read(
     }))
 }
 
+/// Build one FREE-RUN pass's verification inputs.
+///
+/// Every failure to LEARN something is answered with the pure modules' own
+/// "no coverage" shapes rather than with a guess, so a hole shows up as a
+/// reported stand-down instead of a schedule nobody can justify.
+#[allow(clippy::too_many_lines)]
+// THIRTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
+// at `run_engine` entry beside `coordination`, and `bag_side` is the pre-pass's
+// plan for THIS rank, so both arrive the same way every other pass input does.
+// Bundling the other borrows into a struct only to satisfy the ceiling would not
+// make the function clearer.
+#[allow(clippy::too_many_arguments)]
 fn prepare_pass_verification(
     plan: &RankPlan,
     trace: &RecordedTrace,
@@ -11203,7 +11210,7 @@ fn prepare_pass_verification(
                     Some(stages) => stages.clone(),
                     None => {
                         let planned =
-                            topic_admission_for(topic, &consumed, &node_infos, &per_input, config);
+                            topic_admission_for(topic, &consumed, node_infos, &per_input, config);
                         match replay_inject::plan_edge_admission(&planned, &stages) {
                             replay_inject::AdmissionPlan::Enforced { stages, .. } => stages,
                             replay_inject::AdmissionPlan::NotGateable(_) => Vec::new(),
