@@ -937,9 +937,100 @@ pub fn restamp_run_gating(run_dir: &Path, gating: GatingClock) -> CliResult<()> 
 /// The underlying I/O or JSON error. The verb treats it as a DEGRADE: the run's
 /// pause page is the truth, and the manifest is its mirror.
 pub fn declare_run_paused(run_dir: &Path, paused: bool) -> CliResult<()> {
-    edit_run_manifest(run_dir, "paused state", |obj| {
+    edit_run_manifest(run_dir, "paused state", paused_edit(paused))
+}
+
+/// The one edit that records the paused state in a manifest object.
+fn paused_edit(paused: bool) -> impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) {
+    move |obj| {
         obj.insert("paused".to_string(), serde_json::Value::Bool(paused));
-    })
+    }
+}
+
+/// The exclusive lock on a run directory that every amender of `run.json` holds for
+/// its read, edit and rename (see [`edit_run_manifest`]). `None` when the directory
+/// cannot be opened or its filesystem cannot lock, which leaves the earlier
+/// behaviour: no exclusion.
+#[cfg(unix)]
+fn lock_run_dir(run_dir: &Path) -> Option<std::fs::File> {
+    std::fs::File::open(run_dir)
+        .ok()
+        .filter(|dir| dir.lock().is_ok())
+}
+
+/// Run one pause or resume of the run in `run_dir` as ONE transaction: take the run
+/// directory lock, let `transition` flip the pause page and report the state it left
+/// the page in, and mirror that state into `run.json` before the lock is released.
+///
+/// The page is the truth and `run.json` its mirror, so two control commands that
+/// overlap must not interleave their page flips and their mirror writes: the slower
+/// writer would leave the manifest (and the viz badge) opposite to the page. Holding
+/// the lock across both makes each command's flip and mirror one step, and makes
+/// the page's own transitions one at a time too, which its lock-free resume relies on.
+///
+/// `transition` runs ONLY once `run_dir` is established as the directory of run
+/// `run_id`: named for it (a run directory is `<graph>-<run id as 32 hex digits>`),
+/// owned by the invoking user, and, when its `run.json` can be read, naming the same
+/// run. The run registry is a shared-memory service any local process can publish
+/// into, so a record's `run_dir` is a claim, not a fact, and this verb must not
+/// rewrite a file on the strength of one. (The check does not need the run directory
+/// root, so a verb run from a shell with another `CERULION_HOME` than the run's still
+/// finds the run's directory.)
+///
+/// Returns the transition's value and the mirror's outcome. The mirror failing is a
+/// DEGRADE (the page stands, and running the verb again repairs the manifest); the
+/// directory being untrustworthy or unlockable-to-open is an error and nothing is flipped.
+///
+/// # Errors
+///
+/// [`CliError::Validation`] when `run_dir` is not the directory of `run_id`, or
+/// cannot be opened.
+#[cfg(unix)]
+pub fn transition_run_paused<T>(
+    run_dir: &Path,
+    run_id: u128,
+    transition: impl FnOnce() -> (T, bool),
+) -> CliResult<(T, CliResult<()>)> {
+    let refuse = |why: &str| {
+        CliError::Validation(format!(
+            "`{}` is not the run directory of run 0x{run_id:032x} ({why}), so its state is \
+             left alone",
+            run_dir.display()
+        ))
+    };
+    let canon = run_dir
+        .canonicalize()
+        .map_err(|e| refuse(&format!("it cannot be opened: {e}")))?;
+    let named_for_run = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(&format!("-{run_id:032x}")));
+    if !named_for_run {
+        return Err(refuse("its name does not carry the run id"));
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    let owner = std::fs::metadata(&canon)
+        .map_err(|e| refuse(&format!("it cannot be read: {e}")))?
+        .uid();
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    if owner != unsafe { libc::geteuid() } {
+        return Err(refuse("it is not owned by the invoking user"));
+    }
+    let _lock = lock_run_dir(&canon);
+    // The manifest, when readable, must name this run. An unreadable one is the
+    // mirror's problem to report, not a reason to leave the run unpaused.
+    if let Some(named) = std::fs::read(canon.join(RUN_MANIFEST_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|d| d.get("run_id")?.as_str().map(str::to_string))
+    {
+        if u128::from_str_radix(named.trim_start_matches("0x"), 16).ok() != Some(run_id) {
+            return Err(refuse("its run.json names a different run"));
+        }
+    }
+    let (value, paused) = transition();
+    let mirrored = edit_run_manifest_locked(&canon, "paused state", paused_edit(paused));
+    Ok((value, mirrored))
 }
 
 /// PURE-ish: read `run.json`, hand its object to `edit`, and write it back.
@@ -972,9 +1063,18 @@ fn edit_run_manifest(
     // for the whole read-modify-rename and released when the handle drops. A
     // filesystem that cannot lock leaves the earlier behaviour: no exclusion.
     #[cfg(unix)]
-    let _amend_lock = std::fs::File::open(run_dir)
-        .ok()
-        .filter(|dir| dir.lock().is_ok());
+    let _amend_lock = lock_run_dir(run_dir);
+    edit_run_manifest_locked(run_dir, what, edit)
+}
+
+/// The read, edit, rename of [`edit_run_manifest`], for a caller that ALREADY holds
+/// the run directory lock ([`lock_run_dir`]): a second `flock` on the same directory
+/// through a new file description would wait on the first, which is this process.
+fn edit_run_manifest_locked(
+    run_dir: &Path,
+    what: &str,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> CliResult<()> {
     let path = run_dir.join(RUN_MANIFEST_FILE);
     let bytes = std::fs::read(&path).map_err(|e| {
         CliError::Validation(format!(

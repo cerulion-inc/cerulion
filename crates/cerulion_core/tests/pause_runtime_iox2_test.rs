@@ -107,11 +107,14 @@ struct Consumer {
     #[input(trigger)]
     inp: Vector3,
     fires: Arc<AtomicU64>,
+    /// The `x` of the last frame this node was stepped for: the identity of the frame.
+    last_x: Arc<AtomicU64>,
 }
 
 #[cerulion_node_impl]
 impl Consumer {
     fn tick(&mut self) -> Result<(), NodeError> {
+        self.last_x.store(self.inp.x as u64, Ordering::Relaxed);
         self.fires.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -121,6 +124,7 @@ fn consumer_graph(
     prefix: &str,
     topic: &str,
     fires: Arc<AtomicU64>,
+    last_x: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
         level_assignments: None,
@@ -148,6 +152,7 @@ fn consumer_graph(
         "consumer".to_string(),
         Box::new(ConsumerEntry::with_state(Consumer {
             fires,
+            last_x,
             ..Default::default()
         })),
     );
@@ -189,9 +194,15 @@ struct Observed {
     after: u64,
 }
 
+/// How many steps the node under test must have taken before the pause lands. The
+/// helper WAITS for this (a slow or loaded host reaches it late, not never), so a
+/// pause always catches a run that is demonstrably stepping.
+const RAN_BEFORE_PAUSE: u64 = 25;
+
 /// Drive the helper side of one pause against a runtime `run_live`-ing on the
 /// calling thread: let it run, pause it for `hold`, resume it, let it run `window`,
-/// stop it. `clock_now` reads the clock under test.
+/// stop it. `clock_now` reads the clock under test; `before_resume` runs once, at the
+/// end of the hold, just before the resume.
 fn pause_around(
     page: &MappedPausePage,
     running: &AtomicBool,
@@ -199,8 +210,14 @@ fn pause_around(
     clock_now: impl Fn() -> u64,
     hold: Duration,
     window: Duration,
+    before_resume: impl FnOnce(),
 ) -> Observed {
-    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    while fires.load(Ordering::Relaxed) < RAN_BEFORE_PAUSE
+        && started.elapsed() < Duration::from_secs(30)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     page.pause();
     // Long enough for a loop in the middle of an idle wait to reach its next step
     // boundary (a wait is at most 250 ms) and take the hold.
@@ -210,6 +227,7 @@ fn pause_around(
     std::thread::sleep(hold);
     let held_end = fires.load(Ordering::Relaxed);
     let clock_held_end = clock_now();
+    before_resume();
     page.resume();
     std::thread::sleep(window);
     let after = fires.load(Ordering::Relaxed);
@@ -250,8 +268,17 @@ fn a_paused_run_steps_no_node_and_resumes_without_skipping_or_bursting() {
     let hold = Duration::from_millis(1000);
     let window = Duration::from_millis(400);
     let observed = std::thread::scope(|s| {
-        let helper =
-            s.spawn(|| pause_around(&page, &running, &fires, || clock.now_ns(), hold, window));
+        let helper = s.spawn(|| {
+            pause_around(
+                &page,
+                &running,
+                &fires,
+                || clock.now_ns(),
+                hold,
+                window,
+                || {},
+            )
+        });
         rt.run_live(&running).expect("run_live");
         helper.join().expect("helper")
     });
@@ -293,14 +320,20 @@ fn a_paused_run_steps_no_node_and_resumes_without_skipping_or_bursting() {
 /// The hold is not only a stopped clock: a data-driven node is fed by frames that
 /// keep arriving from outside the graph, and a held loop must not step it for them.
 /// The frames wait in the input's queue, and the node fires on them after the resume.
+///
+/// The feed STOPS when the resume lands, so nothing published after the resume can
+/// make the node fire: a fire after it is a frame that was queued during the hold, and
+/// the last frame the node saw must be one published after the hold began.
 #[test]
 fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
     const TOPIC: &str = "/prtdata/ext/frames";
     let page = page("data");
     let clock: Arc<dyn Clock> = Arc::new(PausableClock::new(Arc::clone(&page)));
     let fires = Arc::new(AtomicU64::new(0));
+    let last_x = Arc::new(AtomicU64::new(0));
     let mgr = manager("pause_rt_data", Arc::clone(&clock));
-    let (config, factories) = consumer_graph("prtdata", TOPIC, Arc::clone(&fires));
+    let (config, factories) =
+        consumer_graph("prtdata", TOPIC, Arc::clone(&fires), Arc::clone(&last_x));
     let mut rt = GraphRuntime::build_live_free_run(
         config,
         factories,
@@ -317,15 +350,22 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
         .expect("an out-of-graph publisher attaches to the absolute external topic");
 
     let running = AtomicBool::new(true);
+    let feeding = AtomicBool::new(true);
+    // The identity (`x`) of the last frame the node was stepped for when the hold
+    // ended, and of the last frame the outside world published by the resume.
+    let seen_at_hold_end = AtomicU64::new(0);
+    let published_by_resume = AtomicU64::new(0);
+    let published = AtomicU64::new(0);
     let observed = std::thread::scope(|s| {
-        // The outside world: one frame every 5 ms for the whole test, paused or not.
+        // The outside world: one frame every 5 ms, paused or not, until the resume.
         let feeder = s.spawn(|| {
             let mut x = 0.0;
-            while running.load(Ordering::Relaxed) {
+            while feeding.load(Ordering::Relaxed) {
                 {
                     let mut proxy = publisher.loan_proxy::<Vector3>().expect("loan");
                     proxy.x = x;
                 }
+                published.store(x as u64, Ordering::Relaxed);
                 x += 1.0;
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -338,6 +378,11 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
                 || clock.now_ns(),
                 Duration::from_millis(1000),
                 Duration::from_millis(600),
+                || {
+                    seen_at_hold_end.store(last_x.load(Ordering::Relaxed), Ordering::Relaxed);
+                    feeding.store(false, Ordering::Relaxed);
+                    published_by_resume.store(published.load(Ordering::Relaxed), Ordering::Relaxed);
+                },
             )
         });
         rt.run_live(&running).expect("run_live");
@@ -347,7 +392,7 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
     rt.shutdown();
 
     assert!(
-        observed.held_start >= 20,
+        observed.held_start >= RAN_BEFORE_PAUSE,
         "the consumer ran on the frames before the pause: {observed:?}"
     );
     assert_eq!(
@@ -357,6 +402,18 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
     assert!(
         observed.after > observed.held_end,
         "the frames that queued during the hold are served after the resume: {observed:?}"
+    );
+    let before = seen_at_hold_end.load(Ordering::Relaxed);
+    let last = last_x.load(Ordering::Relaxed);
+    let by_resume = published_by_resume.load(Ordering::Relaxed);
+    // The hold was a second of a frame every 5 ms, so the frames published during it
+    // have identities well above the last one the node saw before it. The feed stopped
+    // at the resume, so the last frame the node saw can only be one of those.
+    assert!(
+        last > before + 1 && last <= by_resume + 1,
+        "after the resume the node must be stepped for a frame published DURING the hold \
+         (last seen before the hold: {before}; last published by the resume: {by_resume}; \
+         last seen at the end: {last}); {observed:?}"
     );
 }
 
@@ -388,8 +445,17 @@ fn a_clock_that_follows_the_wall_excludes_the_paused_time() {
     let hold = Duration::from_millis(1000);
     let window = Duration::from_millis(400);
     let observed = std::thread::scope(|s| {
-        let helper =
-            s.spawn(|| pause_around(&page, &running, &fires, || gating.now_ns(), hold, window));
+        let helper = s.spawn(|| {
+            pause_around(
+                &page,
+                &running,
+                &fires,
+                || gating.now_ns(),
+                hold,
+                window,
+                || {},
+            )
+        });
         rt.run_live(&running).expect("run_live");
         helper.join().expect("helper")
     });

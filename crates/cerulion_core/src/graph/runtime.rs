@@ -9225,18 +9225,34 @@ impl GraphRuntime {
     ///
     /// The boundary timeout exists to catch a peer that crashed or stalled. A peer
     /// that is HELD by a pause is neither, and a hold can last as long as an
-    /// operator likes, so a timeout that a pause overlaps is waited out again: the
-    /// peer may have started the step an instant before the pause reached it, and
-    /// then stands at the next boundary for the whole pause. Once no pause
+    /// operator likes, so the timeout budget restarts whenever a pause overlaps the
+    /// wait: the peer may have started the step an instant before the pause reached
+    /// it, and then stands at the next boundary for the whole pause. Once no pause
     /// overlaps a window, a timeout is the stall it has always meant.
+    ///
+    /// The wait is taken in slices so the rank's wedge-page progress word keeps moving
+    /// through a pause (the wedge alarm reads a word that stands still for five
+    /// seconds as a hang), and ONLY through a pause: a real stall leaves the word
+    /// still, so the alarm that names it still fires.
     fn barrier_wait(&self, barrier: &MappedBarrier, gen: u64) -> WaitOutcome {
         #[cfg(unix)]
         if let Some(page) = self.pause.as_ref() {
+            const SLICE: Duration = Duration::from_millis(500);
             let mut epoch = page.epoch();
+            let mut waited = Duration::ZERO;
             loop {
-                match barrier.wait(gen, BARRIER_BOUNDARY_TIMEOUT) {
-                    WaitOutcome::TimedOut if page.is_paused() || page.epoch() != epoch => {
-                        epoch = page.epoch();
+                match barrier.wait(gen, SLICE) {
+                    WaitOutcome::TimedOut => {
+                        if page.is_paused() || page.epoch() != epoch {
+                            epoch = page.epoch();
+                            waited = Duration::ZERO;
+                            self.scheduler.note_idle_progress();
+                        } else {
+                            waited += SLICE;
+                            if waited >= BARRIER_BOUNDARY_TIMEOUT {
+                                return WaitOutcome::TimedOut;
+                            }
+                        }
                     }
                     outcome => return outcome,
                 }

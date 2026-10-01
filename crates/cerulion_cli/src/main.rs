@@ -321,7 +321,7 @@ fn run_control_exit_code(run_id: &str, pause: bool) -> ExitCode {
     } else {
         RunControlOp::Resume
     };
-    match run_control_verb(run_id, op, &mut std::io::stdout()) {
+    match run_control_verb(run_id, op, &mut std::io::stdout(), &mut std::io::stderr()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {e}");

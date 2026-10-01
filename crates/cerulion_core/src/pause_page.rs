@@ -38,9 +38,10 @@
 //! The new offset is `real_ns() - frozen_ns`, which makes the clock continue from
 //! exactly the frozen value, so it never goes backwards and never jumps forward.
 //!
-//! Two resumes racing within a few microseconds can move the clock back by that
-//! much; two people typing `cerulion graph resume` at the same instant is not a
-//! case worth a lock.
+//! The page has no lock of its own, and two resumes racing could move the clock
+//! back. `cerulion graph pause` and `resume` therefore take turns: each holds a
+//! lock on the run directory across its flip of the page and its mirror into
+//! `run.json`. A caller that flips the page without that lock owns the exclusion.
 //!
 //! # Scope, stated
 //!
@@ -50,9 +51,9 @@
 //!
 //! It is a page-class object like [`crate::wedge_page`]: 4 KiB, named from the run
 //! identity, removed by its owner on a controlled exit. A run that is killed
-//! outright leaves the name behind, which is outside the reach of the run-directory
-//! sweep exactly as the wedge page is; a rerun of the same run identity cannot
-//! happen (the identity is minted per run), so the leak is bounded at one page.
+//! outright leaves the name behind, and the stale-run sweep unlinks it: the name is
+//! a function of the dead run's identity, so the sweep can derive it from the run
+//! directory it is already reclaiming, and no other run can own it.
 //!
 //! NOTE: this module is compiled only on Unix; the `#[cfg(unix)]` gate lives on its
 //! `pub mod pause_page;` declaration in `lib.rs`.

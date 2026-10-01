@@ -9,7 +9,8 @@
 //!    every 50 ms. Across a five-second pause the recorded timestamps of its
 //!    frames stay contiguous (the largest gap between two consecutive frames is a
 //!    fraction of the pause, not the pause), and no two frames land on top of each
-//!    other when the run resumes (the burst that follows a stopped process).
+//!    other when the run resumes (the burst that follows a stopped process). The
+//!    frame count also stands still for the whole hold.
 //! 2. **The counter-test: stopping the process does leave the gap.** The same run,
 //!    with `SIGSTOP` and `SIGCONT` in place of the verbs, records a gap about as
 //!    long as the stop. It is what makes the assertion above able to fail.
@@ -274,7 +275,21 @@ fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration) {
         again.stdout
     );
 
-    std::thread::sleep(hold);
+    // The hold publishes NOTHING: once the run has reached its boundary and the bag
+    // has caught up, the frame count stands still until the resume. Without this a
+    // runtime that ignored the page could keep publishing and still satisfy the
+    // spacing assertions that follow.
+    const SETTLE: Duration = Duration::from_secs(2);
+    assert!(hold > SETTLE, "the hold must outlast the settle");
+    std::thread::sleep(SETTLE);
+    let held_start = run.frames_on(topic);
+    std::thread::sleep(hold - SETTLE);
+    let held_end = run.frames_on(topic);
+    assert_eq!(
+        held_end, held_start,
+        "{topic}: a paused run must publish nothing, but the bag grew from {held_start} to \
+         {held_end} frames during the hold"
+    );
 
     let resumed = graph_verb("resume", &run.run_id);
     assert_eq!(resumed.code, Some(0), "resume: {}", resumed.stderr);

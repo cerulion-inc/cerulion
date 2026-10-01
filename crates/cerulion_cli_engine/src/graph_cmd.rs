@@ -5728,9 +5728,13 @@ pub fn graph_run(
             // This run's PAUSE PAGE, created HERE and held until the supervisor
             // returns: every worker opens it by the tag stamped into its plan. A page
             // that cannot be created leaves the run unpausable and otherwise
-            // unchanged.
+            // unchanged. The workers always run on the real clock whatever
+            // `--time-source` said (warned below), but a run the operator asked to be
+            // virtual is not one `graph pause` claims, so it gets no page.
             #[cfg(unix)]
-            let _pause_page = create_run_pause_page(run_id, config.identity());
+            let _pause_page = (time_source == TimeSource::Real)
+                .then(|| create_run_pause_page(run_id, config.identity(), !ros2_entries.is_empty()))
+                .flatten();
             return ros2_children.finish(graph_run_supervisor(
                 workspace_root,
                 graphs_dir,
@@ -5925,7 +5929,7 @@ pub fn graph_run(
             // The recording is a live run like any other: `graph pause` can hold it,
             // and the pause then leaves no gap in the bag.
             #[cfg(unix)]
-            pause: create_run_pause_page(run_id, graph_name),
+            pause: create_run_pause_page(run_id, graph_name, !ros2_entries.is_empty()),
         }));
     }
 
@@ -6035,7 +6039,7 @@ pub fn graph_run(
                 // An external time master is not this process's to stop, so only the
                 // real clock is pausable.
                 #[cfg(unix)]
-                _ => match create_run_pause_page(run_id, graph_name) {
+                _ => match create_run_pause_page(run_id, graph_name, !ros2_entries.is_empty()) {
                     Some(page) => {
                         let clock = Arc::new(cerulion_core::PausableClock::new(Arc::clone(&page)));
                         pause_page = Some(page);
@@ -6571,25 +6575,24 @@ pub fn graph_run_worker(
         .uses_controlled_clock()
         .then(|| Arc::new(cerulion_core::VirtualClock::new()));
     // The run's PAUSE PAGE, opened by the tag the supervisor stamped. Every rank
-    // opens the same one, so a pause reaches the whole run. A page that cannot be
-    // opened leaves this rank unpausable and otherwise unchanged (loudly: a run
-    // that half-pauses is worse than one that says it cannot).
+    // opens the same one, so a pause reaches the whole run.
     #[cfg(unix)]
     let pause_page: Option<Arc<cerulion_core::pause_page::MappedPausePage>> =
-        plan.pause_tag.as_deref().and_then(|tag| {
-            match cerulion_core::pause_page::MappedPausePage::open_unowned(tag) {
-                Ok(page) => Some(Arc::new(page)),
-                Err(e) => {
-                    tracing::warn!(
-                        group = %plan.group,
-                        error = %e,
-                        "could not open this run's pause page, so this rank cannot be held by \
-                         `cerulion graph pause`; the rank itself is unaffected"
-                    );
-                    None
-                }
-            }
-        });
+        match plan.pause_tag.as_deref() {
+            // A rank that cannot open the run's page would run while every other rank
+            // holds, and `graph pause` would report a pause that only part of the run
+            // took. So this is a failure BEFORE the rank reports ready, and the
+            // supervisor tears the deployment down.
+            Some(tag) => Some(Arc::new(
+                cerulion_core::pause_page::MappedPausePage::open_unowned(tag).map_err(|e| {
+                    CliError::Validation(format!(
+                        "graph run-worker: group '{}' could not open this run's pause page: {e}",
+                        plan.group
+                    ))
+                })?,
+            )),
+            None => None,
+        };
     let clock_dyn: Arc<dyn cerulion_core::clock::Clock> = match &controlled {
         Some(c) => Arc::clone(c) as Arc<dyn cerulion_core::clock::Clock>,
         // A rank on the real clock reads the run clock, which stands still while the
@@ -18981,12 +18984,22 @@ fn stamp_pause_tag(plan: &mut crate::multiprocess::DeploymentPlan, tag: Option<&
 /// The page is the run's, named by its identity, and removed when the owner returns.
 /// A failure (no shared memory to create it in) is a DEGRADE, loudly: the run goes on
 /// exactly as before and `cerulion graph pause` then reports that this run has no
-/// page to flip.
+/// page to flip. A graph with ROS 2 entries gets no page either: those entries are
+/// separate processes that never read it, so a pause could not hold the whole run.
 #[cfg(unix)]
 fn create_run_pause_page(
     run_id: u128,
     graph: &str,
+    has_ros2_entries: bool,
 ) -> Option<Arc<cerulion_core::pause_page::MappedPausePage>> {
+    if has_ros2_entries {
+        tracing::info!(
+            graph = %graph,
+            "this graph has ROS 2 entries, which `cerulion graph pause` cannot hold, so the \
+             run cannot be paused"
+        );
+        return None;
+    }
     let tag = cerulion_core::pause_page::pause_tag_for_run(run_id);
     match cerulion_core::pause_page::MappedPausePage::create_owned(&tag) {
         Ok(page) => Some(Arc::new(page)),
