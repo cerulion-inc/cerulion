@@ -2245,7 +2245,15 @@ fn run(cli: Cli) -> CliResult<()> {
                 robot_name,
             } => {
                 use std::io::IsTerminal as _;
-                let ws = discover_workspace()?;
+                // `--dry-run` prints the discovery report and writes nothing,
+                // so a missing workspace is not an error. A workspace that is
+                // present still supplies its `.msg` store. The write and run
+                // path still requires one.
+                let found = attach_workspace(dry_run)?;
+                let workspace_root = match &found {
+                    Some(ws) => ws.root.clone(),
+                    None => dry_run_without_workspace_root(),
+                };
                 let running = setup_ctrlc_handler()?;
                 // Resolve --topic-prefix at the CLI
                 // boundary (the resolve-and-report shape): a missing
@@ -2319,7 +2327,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 let report = ros_cmd::ros_attach_with_acquirer(
                     &discovery,
                     &chain,
-                    &ws.root,
+                    &workspace_root,
                     &opts,
                     is_tty,
                     &mut confirm,
@@ -2400,6 +2408,12 @@ fn run(cli: Cli) -> CliResult<()> {
                                     "ros2 attach: running `cerulion graph run {graph} \
                                      --single-process` (Ctrl+C to stop)"
                                 );
+                                let ws = found.ok_or_else(|| {
+                                    cerulion_cli_engine::error::CliError::Validation(
+                                        "ros2 attach: the write path ran without a workspace"
+                                            .to_string(),
+                                    )
+                                })?;
                                 graph_cmd::graph_run(
                                     &ws.root,
                                     &ws.graphs_dir,
@@ -2481,6 +2495,30 @@ fn ros_attach_confirm(preview: &str) -> CliResult<bool> {
 fn discover_workspace() -> CliResult<CerulionWorkspace> {
     let cwd = std::env::current_dir()?;
     CerulionWorkspace::discover(&cwd)
+}
+
+/// The workspace `ros2 attach` will use, if one was found.
+///
+/// The write and run path needs a workspace. `--dry-run` does not: a
+/// `WorkspaceNotFound` there becomes `None`. Any other error (a `Cargo.toml`
+/// that could not be read while walking) is still returned. A workspace that
+/// does exist is returned either way, so a dry-run inside one still sees
+/// that workspace's `.msg` store.
+fn attach_workspace(dry_run: bool) -> CliResult<Option<CerulionWorkspace>> {
+    match discover_workspace() {
+        Ok(ws) => Ok(Some(ws)),
+        Err(cerulion_cli_engine::error::CliError::WorkspaceNotFound { .. }) if dry_run => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Root handed to the engine when `--dry-run` has no workspace.
+///
+/// Never created. It has no `schemas/` and no `nodes/dds_bridge`, so type
+/// resolution stays on the built-in corpus and the vendored-bridge probe
+/// fails open.
+fn dry_run_without_workspace_root() -> PathBuf {
+    std::env::temp_dir().join(format!("cerulion-attach-dry-run-{}", std::process::id()))
 }
 
 /// `cerulion viz [TOPIC…] [--robot NAME] [--detach]` — the
