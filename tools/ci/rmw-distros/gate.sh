@@ -3,7 +3,12 @@
 #
 # Each distro has an expected state in the table below. `build` means rmw_cerulion must compile
 # against the distro's real headers (generated bindings, never the vendored fallback), must export
-# no symbol the distro's headers do not declare, and its serial test suite must pass. `refuse`
+# no symbol the distro's headers do not declare, and its serial test suite must pass. After the
+# suite, a `build` row also runs a REAL rclpy cross-process exchange over rmw_cerulion in this
+# distro's container (both directions, the three #[ignore]'d tests in rclpy_xproc_test.rs run
+# with --ignored against the freshly staged .so), with a wrong-payload self-test that must red
+# and a staged-vs-built digest check, so a green lane proves a real rclpy peer talks to native
+# Cerulion on this distro. `refuse`
 # means the build is expected to stop at a KNOWN place, and
 # the gate requires that exact marker in the build log: any other failure is a lane failure, and a
 # distro that silently starts building fails the lane too, so the table can never lag the truth.
@@ -143,6 +148,152 @@ case "$expect" in
             echo "GATE FAIL: $distro failing-test set differs from the pinned one."; echo "-- expected:"; echo "$expected"; echo "-- got:"; echo "$failed"
             echo "(a test that started passing or a new failure both land here; update the table in the PR that changes $distro)"; exit 1
         fi
+        # ===================================================================
+        # rclpy CROSS-PROCESS EXCHANGE (item: distro-lane rclpy step).
+        # A REAL python3 rclpy process talks to in-process native Cerulion over
+        # rmw_cerulion in BOTH directions, inside this distro's
+        # ros:<distro>-ros-base container. Reuses the three #[ignore]'d tests in
+        # crates/rmw_cerulion/tests/rclpy_xproc_test.rs (run with --ignored).
+        # Runs AFTER the serial suite, so the freshly built .so and the green
+        # in-process suite are both known-good first. The lane is never a
+        # required context (see .github/workflows/rmw-distros.yml), so this
+        # section reds a PR check without blocking anything.
+        # -------------------------------------------------------------------
+        RCLPY_TIMEOUT="${RCLPY_TIMEOUT:-600}"      # hard wall for one exchange run (s)
+        EXCHANGES_EXPECTED=3                        # both directions: A (1) + B twist+string (2); == the 3 #[ignore]'d exchange tests run with --ignored (NOT the #[test] count, which includes the non-ignored seam unit arm)
+        PREFIX="${RCLPY_PREFIX:-/tmp/rmw_prefix_${distro}}"
+        so_built="target/release/librmw_cerulion.so"
+        so_staged="$PREFIX/lib/librmw_cerulion.so"
+
+        # (pre) The build output must exist (the build check above asserted it; re-assert with
+        # a section-specific reason so a regression here names THIS step).
+        staged_so_present "$so_built" "$distro" || exit 1
+
+        # (Arm 2b) Stage the freshly built .so into an ament prefix and PROVE the
+        # staged copy is byte-identical to the build output: the exchange must load
+        # the .so THIS job just built, never a stale one left in $PREFIX. Combined
+        # with $PREFIX being FIRST on AMENT_PREFIX_PATH below, this pins which
+        # library rmw dlopens.
+        mkdir -p "$PREFIX/lib"
+        cp -f "$so_built" "$so_staged" || { echo "GATE FAIL: $distro rclpy exchange - could not stage $so_built -> $so_staged"; exit 1; }
+        dig_built=$(sha256sum "$so_built"  | cut -d' ' -f1)
+        dig_staged=$(sha256sum "$so_staged" | cut -d' ' -f1)
+        [ "$dig_built" = "$dig_staged" ] || { echo "GATE FAIL: $distro rclpy exchange - staged .so digest ($dig_staged) != build-output digest ($dig_built); the exchange would not run against the freshly built library"; exit 1; }
+        echo "STAGED .so DIGEST OK ($distro): $dig_built  ($so_staged == $so_built)"
+
+        # (pre) python3 + rclpy + the two message packages must import under the
+        # sourced ROS env (the sourced setup.bash sets PYTHONPATH). ros:<distro>-ros-base
+        # ships all three (rclpy and common_interfaces, which provides std_msgs and
+        # geometry_msgs, are in the ros-base package set, REP 2001). A missing one is
+        # a NAMED failure, never a silent skip.
+        py_probe=$(python3 -c 'import rclpy, std_msgs.msg, geometry_msgs.msg; print("ok")' 2>&1) || true
+        rclpy_probe_ok "$py_probe" "$distro" || exit 1
+
+        # (item 1) POSITIVE arm: run EACH ignored exchange test in its OWN cargo
+        # invocation (a FRESH process), so the process-global native
+        # TransportManager singleton is fresh for every direction and no live
+        # singleton is ever swept out from under a running test. RMW_IMPLEMENTATION
+        # is set and the staged prefix is FIRST on both search paths, under a hard
+        # wall. Clean iox SHM BEFORE EACH invocation (the previous invocation and
+        # the serial suite both leave services behind). The test binary was already
+        # compiled by the serial suite above, so each invocation here is a build-
+        # cache hit that only RUNS its one test. Each run logs to its OWN file and
+        # is judged off the colour-stripped copy (no truncating pipe on cargo).
+        # One passing invocation per name IS the identity proof (rule 37): its
+        # summary must read exactly `1 passed; 0 failed` AND its own
+        # `test <name> ... ok` line must be present - so the earlier separate
+        # identity-pin loop is SUBSUMED and removed.
+        exchanges_ok=0
+        for xt in \
+            direction_a_rclpy_string_talker_to_native_subscriber \
+            direction_b_native_twist_publisher_to_rclpy_listener \
+            direction_b_native_string_publisher_to_rclpy_listener; do
+            rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+            xlog="/tmp/rmw_rclpy_${distro}_${xt}.log"
+            echo "== rmw rclpy cross-process exchange on $distro: $xt (fresh process, --ignored) =="
+            timeout --kill-after=30 "$RCLPY_TIMEOUT" \
+                env RMW_IMPLEMENTATION=rmw_cerulion \
+                    AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH" \
+                    LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                cargo test --locked -p rmw_cerulion --release --test rclpy_xproc_test -- \
+                    --ignored --test-threads=1 --exact "$xt" 2>&1 | tee "$xlog"
+            rc_rclpy=${PIPESTATUS[0]}
+            # timeout returns 124 on TERM-at-deadline, 137 if it had to escalate to KILL.
+            rclpy_timed_out "$rc_rclpy" "$distro" "rclpy exchange '$xt'" "$RCLPY_TIMEOUT" && exit 1
+            plain_x="${xlog}.plain"; strip_ansi "$xlog" > "$plain_x"
+            if crashed "$plain_x"; then
+                echo "GATE FAIL: $distro rclpy exchange '$xt' crashed or its test target did not compile (rc=$rc_rclpy)"; exit 1
+            fi
+            # Prove it RAN (rule 37): --test selects exactly one binary and the
+            # single name filter selects exactly one test, so there is exactly one
+            # `test result:` line and it must read `1 passed; 0 failed`. A MISSING
+            # summary means the binary never ran.
+            summary_x="$(grep -E '^test result: ' "$plain_x" | tail -n 1)"
+            [ -n "$summary_x" ] || { echo "GATE FAIL: $distro rclpy exchange '$xt' printed NO 'test result:' summary - the binary did not run (rc=$rc_rclpy); last lines:"; tail -n 40 "$plain_x"; exit 1; }
+            passed_x=$(printf '%s\n' "$summary_x" | awk '{print $4}')   # "test result: ok. N passed; M failed; ..."
+            failed_x=$(printf '%s\n' "$summary_x" | awk '{print $6}')
+            # M5: REFUSE an unparseable passed OR failed count. A non-numeric failed
+            # count is NEVER coerced to 0 - that would pass a torn/partial summary.
+            case "$passed_x" in ''|*[!0-9]*) echo "GATE FAIL: $distro rclpy exchange '$xt' - unparseable passed count in: $summary_x"; exit 1 ;; esac
+            case "$failed_x" in ''|*[!0-9]*) echo "GATE FAIL: $distro rclpy exchange '$xt' - unparseable failed count in: $summary_x"; exit 1 ;; esac
+            [ "$rc_rclpy" -eq 0 ] || { echo "GATE FAIL: $distro rclpy exchange '$xt' exited rc=$rc_rclpy"; exit 1; }
+            [ "$failed_x" -eq 0 ] || { echo "GATE FAIL: $distro rclpy exchange '$xt' summary reports $failed_x failed"; exit 1; }
+            [ "$passed_x" -eq 1 ] || { echo "GATE FAIL: $distro rclpy exchange '$xt' summary reports $passed_x passed, expected exactly 1 (one name filter, one fresh process); a zero or other count is a non-run (rule 37): $summary_x"; exit 1; }
+            # Identity BY CONSTRUCTION: the named test's own pass line must be
+            # present, so a rename/drop reds here even if the count somehow held.
+            grep -qE "^test ${xt} \.\.\. ok$" "$plain_x" || { echo "GATE FAIL: $distro rclpy exchange '$xt' summary passed but the named '^test ${xt} ... ok' line is absent; the pass is not this exchange (rule 37)"; echo "-- test lines seen:"; grep -E "^test " "$plain_x" | head -20; exit 1; }
+            echo "EXCHANGE OK ($distro): $xt passed in its own fresh process (1 passed; 0 failed)"
+            exchanges_ok=$((exchanges_ok + 1))
+        done
+        # Belt-and-suspenders: the loop `exit 1`s on any failure, so reaching here
+        # means every named exchange passed; assert the count equals the pin so a
+        # future edit that shortens the name list cannot quietly pass fewer.
+        [ "$exchanges_ok" -eq "$EXCHANGES_EXPECTED" ] || { echo "GATE FAIL: $distro ran $exchanges_ok/$EXCHANGES_EXPECTED fresh-process rclpy exchanges (rule 37)"; exit 1; }
+        echo "EXCHANGE IDENTITIES PINNED ($distro): direction_a (rclpy->native) and direction_b twist + string (native->rclpy) each passed by name in its own fresh process"
+        echo "GATE PASS (rclpy exchange): $distro ran $exchanges_ok/$EXCHANGES_EXPECTED cross-process rclpy exchanges over rmw_cerulion, each in a FRESH process (both directions)"
+        echo "GATE TABLE | distro=$distro | judged=rclpy_xproc | exchanges=$exchanges_ok/$EXCHANGES_EXPECTED | directions=A(rclpy_talker->native),B(native->rclpy:twist,string) | procs=fresh-per-test | staged_so=$dig_built | rc=0"
+
+        # (Arm 2a) NEGATIVE self-test: inject a WRONG payload through the harness
+        # seam and PROVE the exchange oracle rejects it - otherwise the positive
+        # arm could pass vacuously (a toothless oracle, an inert exchange). The
+        # oracle here is an INDEPENDENT LITERAL invented in THIS script
+        # (GATE_WRONG_SENTINEL), never read from the harness oracle (b-1..b-5) nor
+        # from any talker (Direction B has none). Two-sided:
+        #   (a) the run MUST fail (the harness value oracle caught the mismatch), and
+        #   (b) the injected literal MUST appear in the rclpy child's RECV output
+        #       (the wrong payload really crossed the iceoryx2 boundary to a real
+        #       rclpy process - the RED is a payload mismatch, not an unrelated crash).
+        GATE_WRONG_SENTINEL="__cerulion_gate_selftest_wrong_payload__"
+        rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+        slog="/tmp/rmw_rclpy_selftest_${distro}.log"
+        echo "== rmw rclpy exchange SELF-TEST on $distro (wrong payload MUST red) =="
+        timeout --kill-after=30 "$RCLPY_TIMEOUT" \
+            env RMW_IMPLEMENTATION=rmw_cerulion \
+                AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH" \
+                LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                CERULION_RCLPY_XPROC_FORCE_WRONG_PAYLOAD="$GATE_WRONG_SENTINEL" \
+            cargo test --locked -p rmw_cerulion --release --test rclpy_xproc_test -- \
+                --ignored --test-threads=1 --nocapture \
+                direction_b_native_string_publisher_to_rclpy_listener 2>&1 | tee "$slog"
+        rc_self=${PIPESTATUS[0]}
+        rclpy_timed_out "$rc_self" "$distro" "rclpy exchange SELF-TEST" "$RCLPY_TIMEOUT" "(expected a fast RED, not a hang)" && exit 1
+        splain="${slog}.plain"; strip_ansi "$slog" > "$splain"
+        # (a) the wrong-payload run MUST have failed.
+        [ "$rc_self" -ne 0 ] || { echo "GATE FAIL: $distro rclpy exchange SELF-TEST(2a): the wrong-payload run PASSED; the exchange does NOT detect a payload mismatch"; exit 1; }
+        scounts="$(suite_counts "$splain")"
+        s_ran=$(printf '%s' "$scounts" | awk '{print $2}')
+        s_fail=$(printf '%s' "$scounts" | awk '{print $3}')
+        [ "${s_fail:-0}" -ge 1 ] || { echo "GATE FAIL: $distro rclpy exchange SELF-TEST(2a): no failed test in the wrong-payload run (ran=${s_ran:-0}); the RED is not a real test failure"; exit 1; }
+        # (b) the gate's OWN literal must appear in the exchange's FAILURE output.
+        # The harness prints the values it collected from the rclpy child in its
+        # assertion panic ("got [...]"), so the injected wrong payload the child
+        # received and the native side collected shows up in the cargo log. The
+        # child's own RECV lines are drained programmatically by the harness and
+        # never reach this log, so match the bare literal, not a "RECV " prefix.
+        grep -q -F "$GATE_WRONG_SENTINEL" "$splain" || { echo "GATE FAIL: $distro rclpy exchange SELF-TEST(2a): the injected literal ($GATE_WRONG_SENTINEL) never appears in the exchange's failure output; the RED is not a proven payload mismatch"; echo "-- output tail:"; tail -n 40 "$splain"; exit 1; }
+        echo "GATE SELF-TEST PASS (2a): $distro wrong payload ($GATE_WRONG_SENTINEL) crossed the exchange and the oracle REJECTED it ($s_fail failed; the literal is in the collected values)"
+        rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+        # ===================================================================
         ;;
     refuse)
         # The row must pin its refusal for real before anything is compared against it.

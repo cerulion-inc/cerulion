@@ -52,11 +52,13 @@
 //! the read layer — so a hash mismatch does not break iceoryx2 connection, it
 //! drops the DATA (which is exactly what Direction A asserts against).
 //!
-//! ## Scope + how to run (needs a ROS 2 Jazzy container)
+//! ## Scope + how to run (runs in the rmw distro lanes)
 //!
-//! CI has NO ROS distro, so every test is `#[ignore]`'d and the whole module is
-//! `#![cfg(unix)]`. Run only inside the `ros2-bench` container with
-//! `librmw_cerulion.so` staged in an ament prefix. Each test PRECONDITION-CHECKS
+//! The rmw distro lanes run these tests: `tools/ci/rmw-distros/gate.sh` runs them
+//! with `--ignored` inside each `ros:<distro>-ros-base` container, across the
+//! supported distros, against a freshly staged `librmw_cerulion.so`. A plain
+//! `cargo test` still skips them (they stay `#[ignore]`'d and the module is
+//! `#![cfg(unix)]`); to run one by hand, use the recipe below. Each test PRECONDITION-CHECKS
 //! (loud panic with the recipe) that `python3 -c "import rclpy"` works,
 //! `RMW_IMPLEMENTATION=rmw_cerulion` is set, and `AMENT_PREFIX_PATH` is set —
 //! the child inherits the parent env, so the RUNNER (not the test) must source
@@ -64,16 +66,22 @@
 //! `ensure_rmw_cerulion` in `benches/latency/ros2/run_bench.sh`):
 //!
 //! ```bash
-//! # inside the ros2-bench container (tools/ros2_toolchain/Dockerfile):
-//! set +u; source /opt/ros/jazzy/setup.bash        # setup.bash is nounset-hostile
+//! # inside a ros:<distro>-ros-base container (what the rmw distro lanes use):
+//! set +u; source /opt/ros/<distro>/setup.bash     # setup.bash is nounset-hostile
 //! cargo build --release -p rmw_cerulion            # build the .so
 //! PREFIX=/tmp/rmw_prefix; mkdir -p "$PREFIX/lib"
 //! cp target/release/librmw_cerulion.so "$PREFIX/lib/"
 //! export AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH"
 //! export LD_LIBRARY_PATH="$PREFIX/lib:$LD_LIBRARY_PATH"
 //! export RMW_IMPLEMENTATION=rmw_cerulion
-//! rm -rf /tmp/iceoryx2 /dev/shm/iox2_*             # clean iox state BETWEEN tests
-//! cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --nocapture
+//! # each direction in its OWN process, with iox state cleaned BEFORE each (what
+//! # the rmw distro lanes do in tools/ci/rmw-distros/gate.sh):
+//! for t in direction_a_rclpy_string_talker_to_native_subscriber \
+//!          direction_b_native_twist_publisher_to_rclpy_listener \
+//!          direction_b_native_string_publisher_to_rclpy_listener; do
+//!   rm -rf /tmp/iceoryx2 /dev/shm/iox2_*           # fresh iox state per test
+//!   cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --exact "$t" --nocapture
+//! done
 //! ```
 //!
 //! Run each test with clean iox state in a FRESH process — the native
@@ -138,6 +146,46 @@ const CHILD_TIMEOUT_SECS: u64 = 40;
 /// every oracle value so the child filters it out cleanly.
 const STRING_SENTINEL: &str = "__warmup__";
 
+/// Fault-injection seam (SELF-TEST ONLY). When
+/// `CERULION_RCLPY_XPROC_FORCE_WRONG_PAYLOAD` holds a non-empty value, the
+/// Direction-B `String` arm publishes THAT value in place of every `b-{i}`
+/// oracle frame, so the distro-lane gate can prove the exchange oracle detects a
+/// mismatch (`tools/ci/rmw-distros/gate.sh`, self-test arm 2a). Read at ONE site
+/// (the Direction-B String publish loop) through this ONE helper; nothing else in
+/// the harness reads the variable. Unset in every real run, so the hand oracle
+/// `b-{i}` holds.
+fn forced_wrong_payload() -> Option<String> {
+    match std::env::var("CERULION_RCLPY_XPROC_FORCE_WRONG_PAYLOAD") {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => None,
+    }
+}
+
+/// The seam is never inert by accident: unset selects the oracle, set selects the
+/// injected literal, and a blank value is treated as unset. Proven WITHOUT rclpy
+/// or a container, so a plain `cargo test` runs it (the exchange tests themselves
+/// stay `#[ignore]`'d). This arm and `forced_wrong_payload` are the only readers
+/// of the seam variable.
+#[test]
+#[serial]
+fn wrong_payload_seam_selects_literal_only_when_set() {
+    const VAR: &str = "CERULION_RCLPY_XPROC_FORCE_WRONG_PAYLOAD";
+    let oracle = "b-1";
+    std::env::remove_var(VAR);
+    assert_eq!(forced_wrong_payload(), None);
+    assert_eq!(forced_wrong_payload().as_deref().unwrap_or(oracle), oracle);
+    let injected = "seam-unit-literal";
+    std::env::set_var(VAR, injected);
+    assert_eq!(forced_wrong_payload().as_deref(), Some(injected));
+    assert_eq!(
+        forced_wrong_payload().as_deref().unwrap_or(oracle),
+        injected
+    );
+    std::env::set_var(VAR, "");
+    assert_eq!(forced_wrong_payload(), None);
+    std::env::remove_var(VAR);
+}
+
 // ===========================================================================
 // Precondition — the container-only environment contract (loud panic + recipe).
 // ===========================================================================
@@ -146,16 +194,19 @@ const STRING_SENTINEL: &str = "__warmup__";
 /// misconfigured environment fails LOUDLY with actionable guidance rather than a cryptic
 /// spawn/connect error.
 const RECIPE: &str = "\
-rclpy cross-process test PRECONDITION failed. Run ONLY inside the \
-ros2-bench ROS 2 Jazzy container with librmw_cerulion.so staged:\n  \
-set +u; source /opt/ros/jazzy/setup.bash\n  \
+rclpy cross-process test PRECONDITION failed. It runs in the rmw distro \
+lanes (ros:<distro>-ros-base); to run by hand, inside a ROS container with \
+librmw_cerulion.so staged:\n  \
+set +u; source /opt/ros/<distro>/setup.bash\n  \
 cargo build --release -p rmw_cerulion\n  \
 PREFIX=/tmp/rmw_prefix; mkdir -p \"$PREFIX/lib\"; cp target/release/librmw_cerulion.so \"$PREFIX/lib/\"\n  \
 export AMENT_PREFIX_PATH=\"$PREFIX:$AMENT_PREFIX_PATH\"\n  \
 export LD_LIBRARY_PATH=\"$PREFIX/lib:$LD_LIBRARY_PATH\"\n  \
 export RMW_IMPLEMENTATION=rmw_cerulion\n  \
-rm -rf /tmp/iceoryx2 /dev/shm/iox2_*  # between tests\n  \
-cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --nocapture\n\
+# each direction in its own process, iox state cleaned before each:\n  \
+for t in direction_a_rclpy_string_talker_to_native_subscriber direction_b_native_twist_publisher_to_rclpy_listener direction_b_native_string_publisher_to_rclpy_listener; do\n  \
+  rm -rf /tmp/iceoryx2 /dev/shm/iox2_*; cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --exact \"$t\" --nocapture\n  \
+done\n\
 (the same steps as ensure_rmw_cerulion in benches/latency/ros2/run_bench.sh)";
 
 /// Assert the inherited env is a real ROS 2 + rmw_cerulion environment. Panics
@@ -444,7 +495,7 @@ fn render(template: &str, node: &str, topic: &str) -> String {
 // ===========================================================================
 
 #[test]
-#[ignore = "box-only: needs the ros2-bench ROS 2 Jazzy container + staged librmw_cerulion.so (see module docs)"]
+#[ignore = "distro-lane exchange: run by tools/ci/rmw-distros/gate.sh inside ros:<distro>-ros-base with a staged librmw_cerulion.so (--ignored); a plain cargo test skips it. Direction B: native Twist publisher -> rclpy listener"]
 #[serial]
 fn direction_b_native_twist_publisher_to_rclpy_listener() {
     precondition_or_panic();
@@ -519,7 +570,7 @@ fn direction_b_native_twist_publisher_to_rclpy_listener() {
 }
 
 #[test]
-#[ignore = "box-only: needs the ros2-bench ROS 2 Jazzy container + staged librmw_cerulion.so (see module docs)"]
+#[ignore = "distro-lane exchange: run by tools/ci/rmw-distros/gate.sh inside ros:<distro>-ros-base with a staged librmw_cerulion.so (--ignored); a plain cargo test skips it. Direction B: native String publisher -> rclpy listener"]
 #[serial]
 fn direction_b_native_string_publisher_to_rclpy_listener() {
     precondition_or_panic();
@@ -545,8 +596,13 @@ fn direction_b_native_string_publisher_to_rclpy_listener() {
         thread::sleep(PUBLISH_GAP);
     }
     let oracle: Vec<String> = (1..=N).map(|i| format!("b-{i}")).collect();
+    // Self-test seam: with CERULION_RCLPY_XPROC_FORCE_WRONG_PAYLOAD set, publish
+    // the injected literal for every frame instead of the oracle, so the assertion
+    // below MUST reject it (the distro-lane gate's Arm 2a drives this to prove the
+    // exchange detects a mismatch). Unset in every real run, so `s` is published.
+    let forced = forced_wrong_payload();
     for s in &oracle {
-        publish_string(&mut pubr, s);
+        publish_string(&mut pubr, forced.as_deref().unwrap_or(s));
         thread::sleep(PUBLISH_GAP);
     }
 
@@ -582,7 +638,7 @@ fn direction_b_native_string_publisher_to_rclpy_listener() {
 // ===========================================================================
 
 #[test]
-#[ignore = "box-only: needs the ros2-bench ROS 2 Jazzy container + staged librmw_cerulion.so (see module docs)"]
+#[ignore = "distro-lane exchange: run by tools/ci/rmw-distros/gate.sh inside ros:<distro>-ros-base with a staged librmw_cerulion.so (--ignored); a plain cargo test skips it. Direction A: rclpy String talker -> native subscriber"]
 #[serial]
 fn direction_a_rclpy_string_talker_to_native_subscriber() {
     precondition_or_panic();

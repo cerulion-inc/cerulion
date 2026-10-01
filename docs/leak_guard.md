@@ -5,12 +5,14 @@ file and branch names, commit messages, commit identities, pull request titles a
 bodies, and the images and clips under `docs/media`. The leak guard is one scanner,
 `tools/scripts/leak_scan.py` (stdlib Python 3, no dependencies), that keeps machine
 names, addresses, home paths, logins, people and location metadata out of all of it.
-It runs in three places: the git hooks on your machine, the `lint` job of the main CI
-workflow, and the `Leak guard` workflow on every pull request, merge queue batch and
-push to `main`, and on every issue and comment body as it is written or edited. The
-messages job scans in two runs that both always happen and whose results combine: the
-commit range and the pull request title under the full hard set, and the pull request body
-under the conversation hard set.
+It runs in four places: the git hooks on your machine, the `lint` job of the main CI
+workflow, the tree, names, messages and media scans in the `Leak guard` workflow
+(`.github/workflows/leak-guard.yml`) on every pull request, merge queue batch and push
+to `main`, and the issue and comment body scan in the `Leak guard (issue and comment
+bodies)` job of `.github/workflows/leak-guard-conversation.yml` as a body is written or
+edited. The messages job scans in two runs that both always happen and whose results
+combine: the commit range and the pull request title under the full hard set, and the
+pull request body under the conversation hard set.
 
 A body is public the moment it is written and no check runs before it is, so that last
 job cannot block anything. It reads EVERY author, bots included. A bot restates a diff and
@@ -88,7 +90,7 @@ forge is not a candidate and is not checked; a reference there is a reviewer's j
 | a forge link | `https://github.com/<owner>/<repo>/...` | that owner and repository |
 | a qualified shorthand | `<owner>/<repo>#<n>` | that owner and repository |
 | a bare shorthand | `<repo>#<n>` | `<repo>` under this repository's own owner |
-| a tracker link | a link to `linear.app` or to a private-tier `tracker-host:` | nothing: a tracker is closed to a stranger already |
+| a tracker link | `https://<tracker host>/...`, shipped or private-tier | nothing: a tracker is closed to a stranger already |
 
 `200` means public and is clean. `404` means private, renamed away or never there, and a
 stranger is given nothing in every one of those cases, so all three are one finding,
@@ -229,7 +231,7 @@ tracker-host:tickets.example.invalid    # a tracker whose links a stranger canno
 repo-slug:exampleoldname                # a repository name that must not appear at all
 ```
 
-`tracker-host:` names a tracker host beside the one that ships (`linear.app`): a link to
+`tracker-host:` names a tracker host beside the hosts the scanner ships with: a link to
 it becomes a `ref-unopenable` finding, and the host itself is refused anywhere in the
 tree. `repo-slug:` names a repository whose NAME is the secret, in the spelling the forge
 uses (`<repo>`, or `<owner>/<repo>`): the reference classes see a slug-shaped reference

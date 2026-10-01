@@ -18403,10 +18403,13 @@ mod tests {
         use std::collections::BTreeMap;
 
         const PAYLOAD: u64 = crate::state_ring::STATE_RECORD_PAYLOAD as u64;
-        // 64 KiB of arena is 137 records — the term that was always there.
+        // 64 KiB of arena is 139 records, the term that was always there. The
+        // number is DERIVED from the record payload region, so it moved with the
+        // header: it read 137 at state record format version 0, whose payload
+        // region was eight bytes wider.
         const ARENA: u64 = 64 * 1024;
         let arena_parts = crate::state_ring::parts_for_len(ARENA);
-        assert_eq!(arena_parts, 137, "the arena term, as shipped");
+        assert_eq!(arena_parts, 139, "the arena term, as shipped");
 
         // No framing at all: the framing term contributes NOTHING, so the formula
         // reduces to exactly what it was before this change. Back-compat, stated.

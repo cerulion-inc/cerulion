@@ -862,10 +862,15 @@ fn the_watched_accessor_set_matches_the_singletons_own_doors() {
 /// cannot read — e.g. a sharding script that derives package names from a
 /// matrix variable rather than naming them on the `run:` line.
 ///
-/// Empty today. The walk already treats a `run:` line that invokes a
-/// `scripts/*.sh` AND names the package as serial (the script owns the flag),
-/// so this list is only for the case where the package name never appears in
-/// the workflow text at all.
+/// Empty today, and NOT the mechanism for a script invocation. A workflow line
+/// naming `tools/scripts/<name>.sh` or `scripts/<name>.sh` (a leading `./` is
+/// stripped) is read, not assumed: the package comes from `-p` or, for a
+/// `ci_test_shard.sh` line, from the first token after the script that is a
+/// bare name (no leading `-`, none of `$ { } .`, not a number), and the POLICY
+/// comes from `script_thread_policy`, which reads that script's own text. So
+/// `ci_test_shard.sh` classifies its package as NEXTEST, not serial. This list
+/// is consulted only where the walk reached NEITHER verdict: no line named the
+/// package, or every line that did read as parallel.
 const SERIAL_BY_RUNNER: &[(&str, &str)] = &[];
 
 /// `tests/` HELPER modules that call the singleton, with why that is safe.
@@ -1162,8 +1167,9 @@ fn script_named(line: &str) -> Option<String> {
 /// That is deliberately not read as parallel (see the call site); an unreadable
 /// runner leaves the package to its other evidence.
 ///
-/// EVERY test-running line in the script is folded in, and the WEAKEST wins:
-/// one unserialised `cargo test` is enough to flake, so `Parallel` beats
+/// EVERY test-running line that can reach a `tests/` file is folded in (a
+/// `--doc` line is skipped), and the WEAKEST wins: one unserialised
+/// `cargo test` is enough to flake, so `Parallel` beats
 /// `Nextest` beats `LibtestSerial`. A script that runs tests two ways is only
 /// as strong as its weakest line.
 fn script_thread_policy(root: &Path, rel: &str) -> Option<RunnerPolicy> {
@@ -1200,17 +1206,18 @@ fn weaker(a: RunnerPolicy, b: RunnerPolicy) -> RunnerPolicy {
     }
 }
 
-/// The package a `scripts/ci_test_shard.sh` invocation names POSITIONALLY.
+/// The package a `tools/scripts/ci_test_shard.sh` invocation names POSITIONALLY.
 ///
-/// The lane that actually runs `cerulion_core`'s `tests/` files on a pull
-/// request is `./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4`
+/// The lanes that actually run `cerulion_core`'s `tests/` files on a pull
+/// request are `./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4`
+/// on Linux and the same line with a count of `3` on macOS
 /// — no `-p`, so [`packages_named`] finds nothing and the gate's verdict for
 /// the package would rest entirely on the release-latency and nightly lines
 /// that happen to name it with `-p`. Reading the positional argument grounds
 /// it in the lane that runs the files instead.
 ///
 /// Such a line runs under NEXTEST, and it is read from the script rather than
-/// assumed: `script_thread_policy` opens `scripts/ci_test_shard.sh` and finds
+/// assumed: `script_thread_policy` opens `tools/scripts/ci_test_shard.sh` and finds
 /// its `exec cargo nextest run --profile … "$@"`. (A policy stated in this
 /// comment would be true until the script changed and false after, which is
 /// exactly why
@@ -1261,8 +1268,12 @@ fn shard_script_package(line: &str) -> Option<String> {
 /// nightly mirrors kept outside this tree), none carrying
 /// `--test-threads=1`. Folded in, they flip `cerulion_core` to PARALLEL and the
 /// gate reports ~20 files as violations — every one of which CI really does run
-/// single-threaded, through `scripts/ci_test_shard.sh` (which applies the flag
-/// unconditionally at its `exec cargo test "$@" -- --test-threads=1`).
+/// under nextest, through `tools/scripts/ci_test_shard.sh`, whose policy
+/// `script_thread_policy` reads out of the script's own text: it strips each
+/// line's comment, folds every line that runs tests and can reach a `tests/`
+/// file (a `--doc` line is skipped) and keeps the WEAKEST, and
+/// the one such line there is `exec cargo nextest run --profile … "$@"`, which
+/// gives each test its own process.
 ///
 /// Deliberately NARROW: it excludes one INVOCATION FORM that provably cannot
 /// reach a `tests/` file. It exempts no package and no file — a genuinely

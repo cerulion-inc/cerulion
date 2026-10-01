@@ -193,7 +193,7 @@ while the PR number is minted here once, so the same name on any other PR, or wi
 
 `tools/scripts/check_agents_md.sh` runs in the `lint` job. Context files are loaded by coding
 agents with SILENT truncation and nearest-file-wins chaining, so the repo must be the alarm.
-It enforces: per-file size budgets (root `AGENTS.md` <= 170 lines and <= 11500 bytes; every
+It enforces: per-file size budgets (root `AGENTS.md` <= 190 lines and <= 13000 bytes; every
 other <= 60 lines and <= 4096 bytes), a whole-chain byte budget, a `CLAUDE.md` shim beside
 every `AGENTS.md` (crate shims contain exactly `@AGENTS.md`), no symlinked context file (a
 symlink dodges every check while tools happily read the target), and a banned-token scan
@@ -227,11 +227,11 @@ tree, no cargo, no network), and each names the document it is the machine half 
 | `no_source_or_test_file_is_named_after_a_plan_step` | A file under a `src/` or `tests/` directory whose name carries the step of the work that produced it: a `chunk` segment, an indexed `pass2` / `stage3` / `phase1` / `wave2` / `round4`, or a leading lane label like `d2_`. An index is what separates a step from a word, so the `node stage` verb and a `round_trip` are silent, and `e2e_` is not a lane. Seven names the tree still carries are declared in the test; the list may only shrink, and a name that leaves the tree has to leave the list. |
 | `the_documented_login_exemptions_are_the_ones_the_code_exempts` | `docs/user-api.md`'s "Exempt: `login` …" sentence and `command_needs_identity` in `crates/cerulion_cli/src/main.rs` naming different verbs. The code side is read from a comment-stripped view of the function, so a variant mentioned in a comment beside the list does not count as a member of it. `--help` and `--version` are declared separately: clap answers them above the gate, so they are asserted PRESENT in the sentence rather than compared against the code. |
 
-The fourth doc-versus-code property, that every `cerulion <verb>` spelled in `README.md`
-and `docs/user-api.md` exists in the CLI, is enforced by the public-surface gate's
-`docs-refs` class, which walks the verb tree out of the clap definitions; its self-test
-carries a markdown TABLE row, because a table cell is where those two pages spell their
-verbs.
+The fourth doc-versus-code property, that every `cerulion <verb>` spelled in `README.md` and
+`docs/user-api.md` exists in the CLI, is enforced by the public-surface gate's `docs-refs` class,
+which walks the verb tree out of the clap definitions; its self-test carries a markdown TABLE row,
+because a table cell is where those two pages spell their verbs. That gate's `agent-file-ref`
+class refuses `AGENTS.md` and `CLAUDE.md` on a user-facing page, excepting files so named.
 
 ## The dependency-architecture rules
 
@@ -282,14 +282,19 @@ reaches by `path`.
 `tools/scripts/leak_scan.py` keeps machine names, addresses, home paths, logins, people and
 location metadata out of everything the repository publishes: file contents, path and branch
 names, commit messages and identities, pull request text, and media containers. It runs in
-three places. The `lint` job runs its self-test and then a whole-tree scan with the GENERIC
+four places. The `lint` job runs its self-test and then a whole-tree scan with the GENERIC
 classes only (`--no-private`, because that job holds no secret); both steps block CI.
 `.github/workflows/leak-guard.yml` runs with the private tier as a repository secret mapped
 at step level:
 changed files and added names, commit messages plus pull request title and body (through
 environment variable names, never interpolated), and media metadata, on every pull request,
-merge queue batch, push to `main` and manual run. The git hooks (`tools/hooks`, installed by
-`tools/scripts/install_hooks.sh`) run the same scanner before a commit exists.
+merge queue batch and push to `main`. Its three job names are required contexts and every
+run writes a check run under each of them, so it triggers on those three events and on no
+other. `.github/workflows/leak-guard-conversation.yml` runs the
+`Leak guard (issue and comment bodies)` job on `issues`, `issue_comment` and
+`pull_request_review_comment`, scanning the body the event carries; that name is required
+by nothing, which is what lets it run on those events. The git hooks (`tools/hooks`,
+installed by `tools/scripts/install_hooks.sh`) run the same scanner before a commit exists.
 
 The two-tier shape is the agent-docs gate's, with one stricter output contract: a private hit
 prints the file, the line number and the pattern INDEX and nothing else, a generic hit on a line
@@ -301,78 +306,6 @@ matchable literal from fragments and scans itself to zero with no allowlist entr
 arm pinned both ways. "Found something" and "could not run" never share an exit code, a
 built-in control per class must hit before any scan, and an allowlist entry that matches no
 file or excused nothing fails a full-tree run. Contributor-facing detail: `docs/leak_guard.md`.
-
-## The public-surface review (`tools/review/public-surface-review.md`)
-
-`tools/scripts/check_public_surface.sh` refuses the wording it can NAME. A regex cannot
-see narrative, a stale claim, or a sentence that contradicts another page, and an
-independent audit of this tree found all three in files every pattern passed. The
-semantic half reads a pull request's DIFF for those. It is run locally, over the diff
-rather than the tree, and no CI job runs it.
-
-The prompt is fixed and in the tree at `tools/review/public-surface-review.md` (the
-eleven families of tell, the vocabulary that is legitimate and must be judged rather
-than reported, and the four severities LEAK, EMBARRASSING, CONFUSING, COSMETIC). The
-diff is handed over as a file, the reader needs `Read`, `Grep`, `Glob` and `Write` and
-no shell at all, and the output is ONE JSON verdict.
-
-`tools/review/render_public_surface_verdict.py` reads that verdict, renders the one pull
-request comment, and decides the exit, so the outcome never depends on the session
-choosing to call a tool: clean is a silent pass, a LEAK or EMBARRASSING finding FAILS,
-advisory findings pass with the comment, and a missing or unparseable verdict FAILS,
-because a semantic review that did not happen looks exactly like a clean one. Its
-`--self-test` runs in `lint` on every push and drives every arm, including a quoted pipe
-that must not add a table column and a blocking finding past the table's row cap.
-
-RUNNING IT, on the branch, before the pull request is opened, by whoever opened it:
-
-```bash
-# 1. Prepare the diff. The stale working files go FIRST, so a preparation that fails
-#    cannot leave an earlier diff or an earlier verdict standing in for this one.
-#    The steps are CHAINED, not run under errexit: a shell suspends `set -e` inside a
-#    command whose status is tested, an inner `set -e` included, so a guard written
-#    that way never fires.
-prepared=0
-rm -f pr.diff public-surface-review.json \
-  && git fetch -q https://github.com/cerulion-inc/cerulion.git main \
-  && base=$(git merge-base FETCH_HEAD HEAD) \
-  && git diff "$base..HEAD" > pr.diff \
-  && test -s pr.diff \
-  || prepared=$?
-echo "prepared: $prepared"
-
-# 2. With prepared 0, hand pr.diff and tools/review/public-surface-review.md to a local
-#    agent session holding Read, Grep, Glob and Write and no shell; it writes
-#    public-surface-review.json. Anything else and there is no diff to read.
-
-# 3. Read the verdict. A preparation that did not finish means there was nothing to
-#    review, which is 3 and never a clean pass, whatever file is lying around. A script
-#    that must FAIL on a blocking verdict ends `exit "$verdict"`.
-verdict=3
-if [ "$prepared" -eq 0 ]; then
-  verdict=0
-  python3 -B tools/review/render_public_surface_verdict.py public-surface-review.json || verdict=$?
-fi
-echo "verdict: $verdict"
-```
-
-The three steps fail CLOSED, the same way the renderer does: a fetch that does not land,
-a merge base that does not resolve, or an empty `pr.diff` leaves `prepared` non-zero and
-no file for step 2 to read, and step 3 over an absent verdict reports 3 rather than
-clean. Deleting both working files inside the chain is what makes that true a second
-time, because a verdict left over from the previous branch reads exactly like this one,
-and step 3 refuses to read any verdict at all unless `prepared` is 0, so a delete that
-does not happen cannot pass an old file off as this branch's result.
-Every status is captured rather than trapped, and no step relies on errexit, so none of
-the three can close a shell that already has it on.
-Neither working file is committed. The
-renderer's own status is the verdict, and `$verdict` is where the block keeps it, because
-a trailing `echo` would otherwise become the status a caller reads: 0 clean, 1 a LEAK or
-EMBARRASSING finding to fix before the branch lands, 2 advisory findings, 3 no verdict
-to read. The rendered comment is what goes on the pull request when it is 1 or 2.
-
-Its findings are ADVISORY: no required check on `main` carries them, so a finding is a
-review to read, not a block.
 
 ## The docs gate
 
@@ -426,17 +359,19 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 `merge_group` events like everything else: there is no cost gate, no routing expression
 and no stub job standing in for a skipped required check.
 
-`lint` gates six jobs: `docs` and `netd-wan`, which carry no condition of their own, and `fuzz`,
-`miri`, `test-latency` and `cli-e2e-latency`, which no pull request and no queued batch runs; a
-red `lint` saves their runner minutes. `crate-tests` and `viz-tests` depend on `lint` as well
-but are not gated by it: their `!cancelled()` guard replaces the implicit `success()` over the
-whole `needs:` set; GitHub offers no per-dependency form, so both run and report through a red
-`lint`, and the dependency buys the ordering alone. It does NOT gate the two that set the wall:
-`test-linux` and `test-macos`. Both list `changes` and nothing else in `needs:`, so both start
-after the classifier, which is a checkout and a path classification, about a minute, and no
-build. No REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so
-nothing in front of either job is a data dependency for compilation. A `lint` verdict was never
-one either, and while it gated them the wall was `lint` plus the longest test job instead of the
+`lint` gates the four push-only jobs that depend on it (`fuzz`, `miri`, `test-latency` and
+`cli-e2e-latency`), which no pull request and no queued batch runs; a red `lint` saves their
+runner minutes, and none of the four reports a required context. It gates none of the four
+dependants that DO report one (`docs`, `netd-wan`, `crate-tests`, `viz-tests`): each carries
+the `!cancelled()` guard, which replaces the implicit `success()` over the whole `needs:` set;
+GitHub offers no per-dependency form, so all four run and report through a red `lint`, and the
+dependency buys the ordering alone. A skipped required context counts as satisfied, which is
+what the guard is there to stop. It does NOT gate the two that set the wall: `test-linux` and
+`test-macos`. Both list `changes` and nothing else in `needs:`, so both start after the
+classifier, which is a checkout and a path classification, about a minute, and no build. No
+REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so nothing
+in front of either job is a data dependency for compilation. A `lint` verdict was never one
+either, and while it gated them the wall was `lint` plus the longest test job instead of the
 longest test job.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
@@ -680,7 +615,7 @@ before the checker reads the real files.
 | `tools/scripts/check_citation_release.sh` | citation version, calendar, and release-date window validation | n/a |
 | `crates/cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` | every member inherits the one lint table; the table's levels | no |
 | `crates/cerulion_cli_engine/tests/library_print_ban_test.rs` | every library crate carries the print ban | no |
-| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths | no |
+| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. The required names are read from `tools/ci/required_contexts.txt` | no |
 | `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches` or `examples`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # check_public_surface.sh: the public-surface gate.
 #
-# Eight classes of mistake in a shipped tree are shapes a script can see, so
+# Nine classes of mistake in a shipped tree are shapes a script can see, so
 # this gate makes them fail in CI before the page ships. It runs
 # over the TRACKED tree (`git ls-files`), needs no cargo and no network, and
 # finishes in seconds (the work-state scan, the one costly pass, is split over
@@ -65,6 +65,96 @@
 #                         (d) no phrase from `public_surface_phrases.txt`, a
 #                             data file of claims the README contradicts (it
 #                             grows the day the README changes a fact).
+#                         (e) no pictograph on a `.md` page: prose says what
+#                             the product does in words. Three shapes, because
+#                             "emoji" is not one range: the astral emoji
+#                             planes; a curated set of characters that exist
+#                             only as a sign or as the emoji twin of a mark
+#                             (the warning sign, the heavy and emoji check,
+#                             cross and ballot X, star, exclamation, heart,
+#                             sparkles); and U+FE0F, the variation selector
+#                             that forces emoji presentation onto any base
+#                             character, which is how a plain check mark
+#                             becomes one. The BARE check mark and ballot X
+#                             STAY: a support table draws its yes and no with
+#                             them and 28 such cells ship, so refusing them
+#                             would be a rule against a table.
+#                         (f) ONE spelling of the project's legal name,
+#                             everywhere in shipped text. The name is DECLARED
+#                             in `public_surface_entity.txt`, one line and
+#                             nothing else, and is parsed out of no prose at
+#                             all: a notice is a list of OTHER holders'
+#                             copyright lines, so a rule that reads one to find
+#                             its own input takes whichever line comes first,
+#                             and a rename, a reordering or a deleted line
+#                             hands it a vendor's name to police, green. An
+#                             absent file, an empty one, a second line, a line
+#                             carrying whitespace or a character a reader
+#                             cannot see, a name that is only a suffix, and a
+#                             name the rule cannot find whole are each exit 3.
+#                             A mention is the declared name's first word, then
+#                             the name's OWN other words, then a suffix of the
+#                             family. A mention that DROPS one of those words is
+#                             still judged; one that ADDS a word the name does
+#                             not have is not a mention of it. Between the words
+#                             may stand a comma or ONE line break per gap, with
+#                             the comment or quote prefix a wrapped line carries
+#                             (a blank line ends the sentence and is not a
+#                             wrap). The prefix set is the comment and quote
+#                             marks only: a `-` list item and a `|` table cell
+#                             are NOT in it, so a name spelled down either is
+#                             silent by design. A `*` list, a `#` heading and a
+#                             doc comment DO carry, so a name spelled down one
+#                             of those is a finding to waive: seeing a name
+#                             wrapped in a narrow comment column is worth that
+#                             noise.
+#                             THE SUFFIX FAMILY is Inc, Inc., Incorporated,
+#                             Corp, Corp., Corporation, Co., LLC, LLP, Ltd,
+#                             Ltd., Limited, PLC, GmbH, AG, S.A., B.V., AB, Oy
+#                             and A/S; the same list also decides which
+#                             characters a declared name may hold, so a suffix
+#                             the rule accepts can never be one a declaration
+#                             may not spell. It is matched LONGEST FIRST, so a page
+#                             writing the period gets the form with it. `Co.`
+#                             keeps its period, because a bare `Co` would match
+#                             the first half of a hyphenated word. `Co.`,
+#                             `S.A.` and `B.V.` are the three forms the list
+#                             carries WITHOUT a period-less twin, so a page
+#                             writing one of them without its stop is silent
+#                             rather than a finding: the rule never sees that
+#                             spelling at all.
+#                             A mention whose text is not the declared spelling
+#                             is a finding. A FINAL FULL STOP is asymmetric: one
+#                             the page ADDED is punctuation, since a declared
+#                             `Ltd` at a sentence end cannot be told from the
+#                             same name plus a stop; one the page DROPPED is a
+#                             finding, since the family matches longest first
+#                             and so carries the stop whenever the page wrote
+#                             one. Everything else is exact: the letters, their
+#                             case, the comma before the suffix, and which word
+#                             of the family the suffix is.
+#                             A SECOND suffix behind a correct mention, ON THE
+#                             SAME LINE, is a finding of its own: one form of
+#                             the name, not two. Across a line break it would
+#                             read the next line's opening word, and several
+#                             countries write the form first. That check is
+#                             case SENSITIVE, deliberately: an upper-case `AB`
+#                             after the name is a company form, a lower-case
+#                             `ab` is an English or a Latin word.
+#                             A word in front of the name is not part of a
+#                             mention, because the scan starts at the name. A
+#                             third-party holder is a candidate only where it
+#                             begins with the declared name's FIRST word and
+#                             adds no word the declared name does not have: a
+#                             holder that DROPS a word is judged, one that adds
+#                             one is not a mention at all. The allow list
+#                             carries the case when it happens.
+#                             ZERO mentions is a finding, not a clean run: a
+#                             declaration the scan never matches reads the same
+#                             green as a tree where every mention is right. The
+#                             summary line carries the declared spelling and the
+#                             number of mentions judged, and no allow entry may
+#                             excuse the zero.
 #   work-state            Shipped text describes the product to its user: what
 #                         works, what is experimental, what is not supported,
 #                         what to do. It never reports how the project was
@@ -124,6 +214,17 @@
 #                         measurements, and are skipped. A round figure can
 #                         match another package by coincidence; the class is
 #                         built for the measured decimals.
+#   agent-file-ref        No user-facing page names an agent instruction
+#                         file: the token `AGENTS.md` or `CLAUDE.md` in the
+#                         RAW text of README.md, CHANGELOG.md, docs/ outside
+#                         docs/internals/, a .md under examples/ or .github/,
+#                         or a README.md anywhere under crates/. Raw text and
+#                         not the prose view: such a path ships backticked. A
+#                         file whose own basename is one of the two names is
+#                         out of the scan BY NAME, whatever it holds, so
+#                         `docs/AGENTS.md` and the `docs/CLAUDE.md` include
+#                         shim are silent. One finding per line, and the
+#                         summary line says how many files the rule ran over.
 #   string-literal-rewrite This one cannot be a tree check. A bulk edit that
 #                         strips a token turns "/cer561pos/producer/out" into
 #                         "/producer/out" inside a test's string literal and

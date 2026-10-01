@@ -175,9 +175,9 @@ impl RetainedAnchor {
         let header = StateRecordHeader::from_bytes(
             record[..STATE_RECORD_HEADER_SIZE]
                 .try_into()
-                .expect("32-byte header"),
+                .expect("40-byte header"),
         );
-        if header.kind != cerulion_core::state_ring::RECORD_KIND_SKIP {
+        if header.kind != cerulion_core::state_ring::RECORD_KIND_SKIP_V2 {
             return None;
         }
         // The DECLARED length gates the read. A record is a fixed-size slot, so
@@ -205,8 +205,28 @@ impl RetainedAnchor {
     }
 }
 
-/// PURE: the STATE bytes a whole anchor's records carry — the sum of each
-/// record's declared `len`, never the record footprint.
+/// The producer RANK this anchor's records carry, read off the first one.
+///
+/// Read rather than carried, on exactly the rule
+/// [`RetainedAnchor::skip_cause`] states for the skip cause: the rank is IN the
+/// record from state record format version 1, so a second copy on the retained
+/// anchor would be a second thing to keep in step with the wire. `None` for an
+/// anchor holding no record, which is a shape the harvester does not produce and
+/// which is answered rather than assumed.
+pub(crate) fn producer_rank(records: &[StateRecord]) -> Option<u32> {
+    let first = records.first()?;
+    Some(
+        StateRecordHeader::from_bytes(
+            first[..STATE_RECORD_HEADER_SIZE]
+                .try_into()
+                .expect("a 512-byte record always holds a 40-byte header"),
+        )
+        .rank,
+    )
+}
+
+/// PURE: the STATE bytes a whole anchor's records carry, which is the sum of
+/// each record's declared `len` and never the record footprint.
 ///
 /// The distinction matters for coverage: `byte_len` is what the anchor
 /// costs the RETENTION (footprint, which is what a byte ceiling must bound),
@@ -224,7 +244,7 @@ pub(crate) fn anchor_payload_bytes(records: &[StateRecord]) -> u64 {
             let header = StateRecordHeader::from_bytes(
                 record[..STATE_RECORD_HEADER_SIZE]
                     .try_into()
-                    .expect("a 512-byte record always holds a 32-byte header"),
+                    .expect("a 512-byte record always holds a 40-byte header"),
             );
             u64::from(header.len)
         })
@@ -957,7 +977,7 @@ impl AnchorHarvester {
         let header = StateRecordHeader::from_bytes(
             record[..STATE_RECORD_HEADER_SIZE]
                 .try_into()
-                .expect("a 512-byte record always holds a 32-byte header"),
+                .expect("a 512-byte record always holds a 40-byte header"),
         );
         let key = (header.run_id, header.step, header.node_idx);
 
@@ -1151,7 +1171,9 @@ impl AnchorHarvester {
 mod tests {
     use super::*;
     use cerulion_core::state::SkipCause;
-    use cerulion_core::state_ring::{encode_record, StateChunker, RECORD_KIND_SKIP};
+    use cerulion_core::state_ring::{
+        encode_record, StateChunker, RECORD_KIND_SKIP_V2, STATE_RECORD_FORMAT_VERSION,
+    };
 
     const MS: u64 = 1_000_000;
     const REC: usize = STATE_RECORD_SIZE as usize;
@@ -1161,7 +1183,7 @@ mod tests {
     /// than producing a retention full of bytes no reader accepts.
     fn anchor_records(run_id: u64, step: u64, node_idx: u32, blob: &[u8]) -> Vec<StateRecord> {
         let mut out = Vec::new();
-        let mut chunker = StateChunker::new(run_id, step, node_idx);
+        let mut chunker = StateChunker::new(run_id, step, node_idx, 0);
         chunker.append(blob, &mut |r| out.push(*r));
         chunker.finish(&mut |r| out.push(*r));
         out
@@ -1178,8 +1200,10 @@ mod tests {
                 step,
                 node_idx,
                 part: 0,
-                kind: RECORD_KIND_SKIP,
+                kind: RECORD_KIND_SKIP_V2,
                 len: payload.len() as u32,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &payload,
         )
@@ -1421,7 +1445,7 @@ mod tests {
     /// `__cerulion/state` bytes be identical to a recording's.
     #[test]
     fn the_harvester_yields_a_whole_anchors_records_byte_for_byte() {
-        // Three records' worth: 480-byte payloads, so the last is short.
+        // Three records' worth: 472-byte payloads, so the last is short.
         let blob = vec![0xC5u8; 1000];
         let expected = anchor_records(3, 42, 1, &blob);
         assert_eq!(expected.len(), 3, "precondition: this blob really chunks");
@@ -1704,8 +1728,10 @@ mod tests {
                 step: 2,
                 node_idx: 3,
                 part: 0,
-                kind: RECORD_KIND_SKIP,
+                kind: RECORD_KIND_SKIP_V2,
                 len: 1,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &[SkipCause::Contended.as_wire() as u8],
         );
@@ -1730,8 +1756,10 @@ mod tests {
                 step: 2,
                 node_idx: 3,
                 part: 0,
-                kind: RECORD_KIND_SKIP,
+                kind: RECORD_KIND_SKIP_V2,
                 len: 4,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &SkipCause::Contended.as_wire().to_le_bytes(),
         );
@@ -1958,5 +1986,52 @@ mod tests {
         fn expect_none_or_panic(self) {
             assert!(self.is_none(), "expected no anchor yet");
         }
+    }
+
+    /// `skip_cause` reads the kind family the encoder MINTS, so the cause survives
+    /// into the sentence `plan_restore` renders.
+    ///
+    /// Left on the previous format's constant this returns `None` on the arm its own
+    /// doc calls unreachable, and the operator loses the reason their capture cannot
+    /// be resumed. The compiler cannot see it: the test is a `u32` against a `u32`.
+    #[test]
+    fn a_skipped_anchor_reports_its_cause_from_the_kind_the_encoder_mints() {
+        let skipped = RetainedAnchor {
+            ring: "r0".to_string(),
+            node_idx: 1,
+            node: Some("n1".to_string()),
+            kind: AnchorKind::Skipped,
+            records: Arc::new(vec![cerulion_core::state_ring::encode_skip_record(
+                7,
+                42,
+                1,
+                0,
+                SkipCause::ChildTimeout,
+                "no progress",
+            )]),
+        };
+        assert_eq!(
+            skipped.skip_cause(),
+            Some(SkipCause::ChildTimeout),
+            "the cause the writer put in, not None"
+        );
+
+        // THE CONTROL: a record in the PREVIOUS layout carries the v0 SKIP kind at
+        // bytes 24 to 28, and this build must NOT read it as a skip. Without it the
+        // arm above would also pass on a reader widened to accept both families,
+        // which is exactly what the kind change exists to prevent.
+        let mut old = [0u8; STATE_RECORD_SIZE as usize];
+        old[24..28].copy_from_slice(&3u32.to_le_bytes()); // the v0 SKIP kind
+        old[28..32].copy_from_slice(&4u32.to_le_bytes());
+        old[32..36].copy_from_slice(&SkipCause::ChildTimeout.as_wire().to_le_bytes());
+        let previous_format = RetainedAnchor {
+            records: Arc::new(vec![old]),
+            ..skipped.clone()
+        };
+        assert_eq!(
+            previous_format.skip_cause(),
+            None,
+            "a previous-format record is not this build's skip"
+        );
     }
 }

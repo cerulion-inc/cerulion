@@ -127,6 +127,7 @@ jobs:
         if: >-
           github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        shell: bash
         run: |
           set -euo pipefail
           apt-get update

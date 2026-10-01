@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """leak_scan.py: the in-tree leak guard.
 
-Keeps machine names, addresses, home paths, logins, people and location
-metadata out of everything this repository publishes: file contents, file and
-branch names, commit messages and identities, pull request text, and media
-containers.
+Keeps machine names, addresses, home paths, logins, people, co-author trailers
+and location metadata out of everything this repository publishes: file
+contents, file and branch names, commit messages and identities, pull request
+text, and media containers.
 
 Two tiers:
   GENERIC classes ship here. They are SHAPES only (a home path, an address in
@@ -153,10 +153,15 @@ TAGS = ('host', 'device', 'person', 'login', 'lan', 'nickname', 'slug', 'hygiene
 # The reference classes are here too: when a reference is unopenable BECAUSE the
 # repository is closed, the slug it names is itself the secret, and a CI log
 # outlives the force-push that scrubs the branch.
+# The attribution trailer is here for the same reason. Its match reaches one
+# character past the colon, so what it would print is the trailer and the
+# author's INITIAL; on a public pull request that initial arrives with a file
+# and a line number beside it, which is more of a person than a log should
+# carry. Masked, the finding still says where and what.
 IDENTITY_CLASSES = frozenset((
     'lan-addr', 'cgnat-addr', 'home-mac', 'home-linux', 'home-win', 'home-tilde', 'temp-root',
     'login-at-host', 'mdns-local', 'host-field', 'overlay-dns', 'email-personal', 'acl-tag',
-    'ref-unopenable', 'ref-unverified'))
+    'ref-unopenable', 'ref-unverified', 'attribution-trailer'))
 MASK_RX = re.compile(r'[^\W_]')
 # What is HARD on a CONVERSATION surface: an issue body, an issue comment, a
 # review comment. Exactly the classes whose finding is a value a reader should
@@ -165,6 +170,9 @@ MASK_RX = re.compile(r'[^\W_]')
 # prose is a house style note about text WE write, and turning it into a label,
 # an ask and a red run on a contributor's thread is the guard crying wolf on a
 # page that leaks nothing. The private tier stays hard here as everywhere.
+# The attribution trailer is one of them: a pull request BODY is scanned as a
+# conversation, and a trailer there names a second author on this repository's
+# own record, which is an identity statement rather than a house style note.
 CONVERSATION_HARD = IDENTITY_CLASSES
 
 # Published placeholder vocabularies. Explicit sets, never a length rule.
@@ -202,7 +210,8 @@ LAN_EXAMPLES = frozenset((
 
 GUARD_FILES = frozenset((
     'tools/scripts/leak_scan.py', 'tools/scripts/leak_scan_allow.txt',
-    'tools/scripts/install_hooks.sh', '.github/workflows/leak-guard.yml', 'docs/leak_guard.md'))
+    'tools/scripts/install_hooks.sh', '.github/workflows/leak-guard.yml',
+    '.github/workflows/leak-guard-conversation.yml', 'docs/leak_guard.md'))
 GUARD_PREFIXES = ('tools/hooks/',)
 
 OCT = r'(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)'
@@ -596,6 +605,17 @@ def build_classes(neuter=None):
         [DASH_EN, DASH_EM, DASH_ESCAPE], None,
         {'tree': _sev_dash, 'diff': _sev_dash, 'messages': 'HARD', 'names': 'REPORT'},
         'range 3' + DASH_EN + '5', what='an en dash or an em dash')
+    # A co-author trailer names a second author on a commit this repository
+    # publishes under one identity, and a squash concatenates every message it
+    # folds, so one trailer reaches main as text on a commit nobody can attach
+    # it to. The shape is assembled from fragments, like every literal here.
+    # A real trailer is a git trailer: it STARTS its line and names someone. Prose
+    # explaining the format mid-sentence is not one, and an authorless template
+    # is not one either, so the match is anchored and needs a name after the
+    # colon. Both shapes appear in documentation and neither is an attribution.
+    add('attribution-trailer', '^[ \t]*co-?' + 'authored-by' + r'[ \t]*:[ \t]*\S',
+        ['authored-by'], None, CONTENT_HARD,
+        'Co-' + 'authored-by' + ': A Contributor', what='a co-author trailer')
     return out
 
 
@@ -999,9 +1019,9 @@ GLUED_TAG_RX = re.compile(r'@(?:' + '|'.join(TAGS) + r')$', re.I)
 # The two KEYS. A key is an entry like any other: it counts in the index, it
 # compiles to a pattern that is HARD in every mode, and its value never prints.
 # `tracker-host:` additionally tells the reference class that a link to that
-# host is a defect, the way `linear.app` already is. `repo-slug:` is the one
-# shape the generic reference class cannot see: a repository named by a single
-# word, with no separator and no link around it, which reads as prose.
+# host is a defect, the way a host in `TRACKER_HOSTS` already is. `repo-slug:`
+# is the one shape the generic reference class cannot see: a repository named
+# by a single word, with no separator and no link around it, reading as prose.
 KEYS = {'tracker-host': 'host', 'repo-slug': 'slug'}
 KEY_PREFIX_RX = re.compile(r'(?:' + '|'.join(KEYS) + r'):', re.I)
 KEY_RX = re.compile(r'(' + '|'.join(KEYS) + r'):(\S+)$')
@@ -3161,10 +3181,12 @@ R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 236
+EXPECTED_ARMS = 238
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
+ON_RX = re.compile(r'^on:\n((?:[ ].*\n|\n)*)', re.M)
+TRIGGER_RX = re.compile(r'^  ([a-z_]+):', re.M)
 
 
 def _conversation_condition(path):
@@ -3177,6 +3199,18 @@ def _conversation_condition(path):
     except OSError:
         return None
     return ' '.join(m.group(1).split()) if m else None
+
+
+def _workflow_triggers(path):
+    """The event names in that workflow's `on:` block, as a set. None when the
+    file or the block cannot be read: the caller fails the arm rather than
+    comparing against an empty set."""
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            m = ON_RX.search(fh.read())
+    except OSError:
+        return None
+    return set(TRIGGER_RX.findall(m.group(1))) if m else None
 
 
 def _eval_condition(cond, event, login, body):
@@ -4740,6 +4774,22 @@ def self_test(out, base_env, argv0):
         arm('conversation-the-same-body-is-still-hard-on-a-commit-surface',
             rc == EXIT_HIT and any(c == 'style-dash' for c, p, n in hits(lines)),
             'rc=%d' % rc)
+        # An attribution trailer is an identity statement, so a pull request BODY,
+        # which is scanned as a conversation, is still refused for one; a trailer
+        # with no author after the colon is a worked example of the format.
+        trailer_body = 'a change worth making\n\n' + 'Co-' + 'authored-by' + ': A Contributor\n'
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'pr-body',
+                         '--conversation', '--no-allow'] + mine,
+                        dict(refenv, LG_BODY=trailer_body), repo_ref)
+        arm('conversation-an-attribution-trailer-is-still-hard',
+            rc == EXIT_HIT and any(c == 'attribution-trailer' for c, p, n in hits(lines)),
+            'rc=%d' % rc)
+        empty_body = 'the format is ' + 'Co-' + 'authored-by' + ': followed by a name\n'
+        rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'pr-body',
+                         '--conversation', '--no-allow'] + mine,
+                        dict(refenv, LG_BODY=empty_body), repo_ref)
+        arm('conversation-an-authorless-trailer-example-is-not-a-finding',
+            not any(c == 'attribution-trailer' for c, p, n in hits(lines)), 'rc=%d' % rc)
         # ... and a value in the same body is still hard WITH --conversation
         rc, lines = run(['messages', '--body-env', 'LG_BODY', '--body-label', 'issue-body',
                          '--conversation', '--no-allow'] + mine,
@@ -4749,8 +4799,9 @@ def self_test(out, base_env, argv0):
         arm('conversation-keeps-the-identity-and-reference-classes-hard',
             rc == EXIT_HIT and {'home-mac', REF_DEFECT} <= got and 'style-dash' not in got,
             str(sorted(got)))
-        arm('conversation-hard-set-is-the-identity-classes',
+        arm('conversation-hard-set-is-the-identity-classes-and-the-trailer',
             CONVERSATION_HARD == IDENTITY_CLASSES
+            and 'attribution-trailer' in CONVERSATION_HARD
             and 'style-dash' not in CONVERSATION_HARD
             and 'overlay-word' not in CONVERSATION_HARD
             and REF_DEFECT in CONVERSATION_HARD and REF_UNVERIFIED in CONVERSATION_HARD)
@@ -4813,8 +4864,13 @@ def self_test(out, base_env, argv0):
         # and evaluated, rather than restated here where it could drift.
         wf = os.path.join(os.path.normpath(os.path.join(
             os.path.dirname(os.path.abspath(argv0)), '..', '..')),
-            '.github', 'workflows', 'leak-guard.yml')
+            '.github', 'workflows', 'leak-guard-conversation.yml')
         cond = _conversation_condition(wf) if os.path.isfile(wf) else None
+        # The events reach the job through the workflow's TRIGGERS, so the set
+        # is read beside the condition and compared whole: an event added here
+        # runs the job, and an event dropped stops it.
+        triggers = _workflow_triggers(wf) if os.path.isfile(wf) else None
+        want_triggers = {'issues', 'issue_comment', 'pull_request_review_comment'}
         cases = [
             ('the guard reading its own ask', 'issue_comment', 'github-actions[bot]',
              'please edit\n<!--leak-guard:issue_comment:1:abc-->', False),
@@ -4827,7 +4883,6 @@ def self_test(out, base_env, argv0):
             ('a person quoting the marker', 'issue_comment', 'someone',
              'why did it say <!--leak-guard:issue_comment:1:abc-->', True),
             ('an issue body', 'issues', '', '', True),
-            ('a push', 'push', '', '', False),
         ]
         try:
             got = [(n, _eval_condition(cond, ev, lg, b)) for n, ev, lg, b, _ in cases]
@@ -4837,10 +4892,16 @@ def self_test(out, base_env, argv0):
             # arm cannot vouch for, so it fails and says which, rather than
             # passing on a reading it did not make or killing the whole suite.
             got, why = [], 'the condition uses something this arm cannot evaluate: %s' % exc
+        if triggers is None:
+            detail = 'the `on:` block of %s could not be read' % os.path.basename(wf)
+        elif triggers != want_triggers:
+            detail = 'triggers %s' % sorted(triggers)
+        else:
+            detail = why or str(got)
         arm('conversation-the-workflow-reads-every-author-but-never-its-own-ask',
-            cond is not None and not why
+            cond is not None and not why and triggers == want_triggers
             and got == [(n, want) for n, ev, lg, b, want in cases],
-            why or str(got))
+            detail)
         # The code-span exemption is the REFERENCE classes' alone. A host, a
         # login, an address or a private-tier name is as visible to a reader in
         # backticks as in prose, so every other class still reads the body whole.

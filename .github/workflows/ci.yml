@@ -1022,6 +1022,24 @@ jobs:
       # remedy line per class, and it belongs in `lint` for the same reason the
       # gates above do: pure python3 over `git ls-files`, no cargo, seconds.
       #
+      # The same class also keeps a page in words (no pictograph: the emoji
+      # planes, a curated set of sign and emoji-twin characters, and the
+      # variation selector that forces emoji presentation; the BARE check mark
+      # and ballot X a support table draws with are typography and stay) and
+      # holds the project's legal name to one spelling everywhere in shipped
+      # text. The name is DECLARED in public_surface_entity.txt, one line, and
+      # is parsed out of no prose: a notice lists other holders, so reading one
+      # to find the name takes whichever line comes first. Any defect of that
+      # file is exit 3. Every mention is then matched past case, a comma, one
+      # hard wrap and the suffix family, and a mention that does not read as the
+      # declared spelling is a finding: exact in the letters, their case, the
+      # comma and the suffix word, with a final full stop forgiven only when the
+      # page ADDED one. A second suffix on the same line is its own finding, and
+      # zero mentions is a finding rather than a clean run. A third-party holder
+      # is a candidate only where it begins with the declared name's first word
+      # and adds no word the name does not have: one that drops a word is
+      # judged, one that adds a word is not a mention at all.
+      #
       # It reads data files beside it: an allow list whose entries name
       # one finding each and FAIL when stale, a phrase list of claims the
       # README contradicts, and a per-file dash LEDGER that only burns down
@@ -1047,13 +1065,6 @@ jobs:
       - name: Public-surface gate (examples, docs, media, benchmarks, shipped text, figures)
         run: ./tools/scripts/check_public_surface.sh
 
-      # The semantic half of the shipped-text gates is a read of the pull
-      # request's diff against `tools/review/public-surface-review.md`, run
-      # locally rather than as a job here. The script that reads its verdict
-      # and decides the outcome still belongs to every push: a rule nobody
-      # drives is a rule nobody has checked.
-      - name: Public-surface review verdict renderer (self-test)
-        run: python3 -B tools/review/render_public_surface_verdict.py --self-test
       # The README shows its logo and two schematics through <picture>, one
       # fixed-palette file per GitHub theme, because an SVG inside an <img>
       # follows the viewer's operating system and never the GitHub theme they
@@ -4199,6 +4210,17 @@ jobs:
       contents: read
       actions: write
     needs: [lint]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
+    # dependency fails and a skipped required context counts as SATISFIED, so
+    # without this guard a red `lint` waves the pull request through with this
+    # job's context never run. With it the job runs on its own terms and
+    # reports its own result. `Lint` is its own required context and a red one
+    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
+    # The cost is the runner minutes this job spends on a change whose lint is
+    # already red, which is what a context that reports beats a context that is
+    # waved through.
+    if: ${{ !cancelled() }}
     # 30, and the number follows the MACHINE rather than the job. On a 4-core
     # runner the healthy build ran 8m56s-9m18s and 15 was ample; on a 2-core one
     # `cargo doc --workspace` takes about twice that, and 15 became a coin flip:
@@ -4209,9 +4231,9 @@ jobs:
     #
     # 30 is ~2x the slower measured wall, the same ratio 15 gave the faster
     # machine, and it guards a HUNG job rather than rationing a healthy one,
-    # the rule this file applies everywhere else. It is not a required context,
-    # so the cancellations blocked nothing; they just meant the docs gate
-    # silently stopped gating two runs out of three.
+    # the rule this file applies everywhere else. `Documentation` is a required
+    # context, so a job cancelled at its budget reports a cancellation the pull
+    # request cannot merge past.
     timeout-minutes: 30
     env:
       # Same ENOSPC class as the lint job (see its comment): rustdoc's dep
@@ -4298,6 +4320,17 @@ jobs:
       contents: read
       actions: write
     needs: [lint]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
+    # dependency fails and a skipped required context counts as SATISFIED, so
+    # without this guard a red `lint` waves the pull request through with this
+    # job's context never run. With it the job runs on its own terms and
+    # reports its own result. `Lint` is its own required context and a red one
+    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
+    # The cost is the runner minutes this job spends on a change whose lint is
+    # already red, which is what a context that reports beats a context that is
+    # waved through.
+    if: ${{ !cancelled() }}
     timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"

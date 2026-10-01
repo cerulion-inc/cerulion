@@ -94,7 +94,8 @@ use cerulion_core::flashback::switch::TriggerPosture;
 use cerulion_core::flashback::trigger::{CaptureRequest, TriggerPolicy};
 use cerulion_core::state_ring::{
     encode_record, encode_skip_record, SkipCause, StateRecordHeader, StateRingOwner,
-    RECORD_KIND_CHUNK, RECORD_KIND_FINAL, STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE,
+    RECORD_KIND_CHUNK_V2, RECORD_KIND_FINAL_V2, STATE_RECORD_FORMAT_VERSION, STATE_RECORD_PAYLOAD,
+    STATE_RECORD_SIZE,
 };
 
 use common::{
@@ -200,8 +201,10 @@ fn anchor(node_idx: u32, step: u64, parts: u32, tail_len: usize) -> Vec<Vec<u8>>
                     step,
                     node_idx,
                     part,
-                    kind: RECORD_KIND_CHUNK,
+                    kind: RECORD_KIND_CHUNK_V2,
                     len: STATE_RECORD_PAYLOAD as u32,
+                    rank: 0,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
                 },
                 &vec![(0xA0 + node_idx as u8).wrapping_add(part as u8); STATE_RECORD_PAYLOAD],
             )
@@ -215,8 +218,10 @@ fn anchor(node_idx: u32, step: u64, parts: u32, tail_len: usize) -> Vec<Vec<u8>>
                 step,
                 node_idx,
                 part: parts - 1,
-                kind: RECORD_KIND_FINAL,
+                kind: RECORD_KIND_FINAL_V2,
                 len: tail_len as u32,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &vec![0x5A; tail_len],
         )
@@ -1528,6 +1533,7 @@ fn a_voided_node_is_retained_over_a_real_ring_and_counted_apart() {
             RUN,
             80,
             1,
+            0,
             SkipCause::RecorderBehind,
             "the recorder has not drained enough of the state ring",
         )
