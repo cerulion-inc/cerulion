@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cerulion-vizd` answers a new `sample` request: the newest 1 to 20 messages of an attached topic, each as `seq`, `ts_ns`, `size`, the decoded `fields` where the schema is known (or `null`) and a one line `summary`. The daemon keeps frames only for a topic that is being sampled, drops the ring five seconds after the last request, keeps at most eight rings, and keeps no body larger than 16 KiB, so sampling adds no subscription and a bounded amount of memory. The control protocol version in the banner is unchanged; a daemon without the verb answers it with the structured unknown-method error. See `docs/user-api.md`.
+
 ## [1.0.0] - 2026-09-21
 
 The first release of Cerulion. Its crates, binaries and Debian packages come from this tree.

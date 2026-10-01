@@ -58,6 +58,17 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   once discovery settles (absent = terminal), and `DiscoverResponse.discovery`
   distinguishes a settled gather from a still-discovering one (absent =
   unknown, never treated as settled).
+- `sample {topic, n}` returns the newest `n <= 20` frames of an ATTACHED topic
+  (`src/sample.rs`). It is a read of a ring the poll thread feeds from the drain
+  it already does; it never opens a tap, a subscriber or a netd demand, and a
+  topic with no tap is refused, not attached. The ring is armed by the first
+  `sample` (so that reply is empty by construction: frames from before the ask are
+  never kept), fed only while armed, and swept five seconds after the last ask. Hard
+  bounds, all constants in `sample.rs`: 20 rows per ring, no body over 16 KiB (a
+  larger frame keeps `seq`/`ts_ns`/`size` only), 8 rings, and caps on decode depth,
+  node count, array length and string length. The decode runs on the controller
+  thread against a snapshot taken under the state lock, never under it. A new verb
+  does not bump the protocol version: capability is negotiated by verb.
 - Catalog-change events: a controller subscribes; each connection owns a
   capacity-one push slot with a lossless merge, drained immediately before each
   `CONN_READ_TIMEOUT`-paced blocking control read. Push latency budget =
@@ -432,6 +443,7 @@ themselves via mechanism 5 above.
 | `convergence_adoption_test.rs` | STRUCTURAL: no control handler waits/polls (whole-`src/` walk); seam-adoption guards invisible to hermetic e2e | lane | none |
 | `host_test.rs` | the daemon's rerun-endpoint hosting; mutates process env | lane | none |
 | `live_only_history_test.rs` | HARD GATE: a fresh viewer gets the scene skeleton, zero temporal replay | lane | none |
+| `sample_e2e_test.rs` | the `sample` verb end to end: decode oracles, ring armed by the first ask and gone after five seconds, `n` clamp, no attach side effect, oversize and undecodable rows, the 8-topic cap, additive compatibility | lane | none |
 | `poll_period_test.rs` | the drain loop's period: observable, then paced | lane | none |
 | `vizd_e2e_test.rs` | end-to-end daemon acceptance: attach/list/status/detach, attribution, `*` reflow arms | lane | none |
 | `wake_drain_e2e_test.rs` | the drain loop blocks on the tap's wake listener (remote AND local production shapes) | lane | none |
