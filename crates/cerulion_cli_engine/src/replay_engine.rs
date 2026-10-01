@@ -3829,6 +3829,26 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // is what `run_engine` returns. A pass that fails is not harvested (its
     // runtime dies with the iteration, as it always did): the partial report
     // holds exactly the ranks that COMPLETED.
+    // ── 4a. The BAG SIDE of the read-log enforcement, for EVERY rank, BEFORE
+    //        the first pass ────────────────────────────────────────────────
+    //
+    // A refusal that is a fact about the RECORDING is whole-RUN, so it must not
+    // wait for a rank's turn to execute: this plans every rank's gated edges from
+    // the bag's own staging rows and refuses here, before rank 0 has run a step.
+    // What stays per rank is the pair that needs a built runtime (see
+    // `plan_bag_side_admissions`), and each pass CONSUMES the plan made here.
+    let bag_side = plan_bag_side_admissions(
+        &plans,
+        &trace,
+        &rank_tables,
+        &config,
+        &factories,
+        &classes,
+        coordination == CoordinationMode::Lockstep,
+        roles_stamped,
+        kind_width,
+    )?;
+
     let aborted: Option<(u32, ReplayError)> = 'passes: {
         for (pass_idx, plan) in plans.iter().enumerate() {
             let rank = plan.rank();
@@ -3858,6 +3878,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 duration_bound_ns,
                 run_epoch_ns,
                 node_infos: &node_infos,
+                bag_side: &bag_side,
                 node_info_notes,
                 config: &config,
             };
@@ -7397,6 +7418,10 @@ struct PassInputs<'a> {
     /// [`collect_pass_node_infos`]). The candidate's side of the re-derivation
     /// comparison, and the source of each input's consume mode + depth.
     node_infos: &'a IndexMap<String, cerulion_core::graph::NodeInfo>,
+    /// What the PRE-PASS planned for every rank's BAG SIDE before pass 0: the
+    /// plan this pass CONSUMES rather than re-planning from its census (see
+    /// [`plan_bag_side_admissions`]).
+    bag_side: &'a BTreeMap<u32, RankBagSide>,
     /// The stand-down notes `collect_pass_node_infos` produced —
     /// one per member whose declared metadata could not be read, so the
     /// verifier's clean claim never covers a node nobody looked at.
@@ -9951,6 +9976,314 @@ fn enforcement_blocked_by_decline(
 // borrows into a struct only to satisfy the ceiling would not make the
 // function clearer.
 #[allow(clippy::too_many_arguments)]
+/// One topic's consuming edges, as the admission planner takes them.
+///
+/// ONE spelling with two callers (the pre-pass that plans the bag side and the
+/// pass that plans a bag stating no stage rows), so the two cannot disagree about
+/// which reads belong to which edge or about an edge's consume mode.
+fn topic_admission_for(
+    topic: &str,
+    consumed: &[(String, String, String)],
+    node_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
+    per_input: &BTreeMap<(String, String), Vec<replay_inject::SitedRead>>,
+    config: &GraphConfig,
+) -> replay_inject::TopicAdmission {
+    let mut edges: Vec<replay_inject::AdmissionEdge> = Vec::new();
+    for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
+        let info = node_infos.get(node.as_str());
+        edges.push(replay_inject::AdmissionEdge {
+            node_id: node.clone(),
+            input: input.clone(),
+            // The ONE consume-mode rule, the same call the steering edges
+            // resolve through.
+            mode: info.map_or(replay_inject::ConsumeMode::Latest, |i| {
+                input_consume_mode(i, input)
+            }),
+            reads: per_input
+                .get(&(node.clone(), input.clone()))
+                .cloned()
+                .unwrap_or_default(),
+        });
+    }
+    replay_inject::TopicAdmission {
+        topic: topic.to_string(),
+        multi_publisher: config.is_multi_publisher(topic),
+        edges,
+    }
+}
+
+/// What the PRE-PASS planned for ONE rank from the recording alone.
+struct RankBagSide {
+    /// Topic to the stages the RECORDING staged, with their per-step
+    /// admissions. Consumed by that rank's pass, which re-plans nothing.
+    admission: BTreeMap<String, Vec<replay_inject::StageAdmission>>,
+}
+
+/// Plan the BAG SIDE of every rank's read-log enforcement BEFORE pass 0, and
+/// refuse the whole run there.
+///
+/// The split this answers: a refusal that is a fact about the RECORDING (no
+/// coverage on a gated stage, a dropped-record marker, a record shape no
+/// admission can be built from) does not need a runtime, so it must not wait for
+/// one. The bag's `read_log_capacities` rows ARE a stage set, which is every
+/// answer the planner takes from a census except gateability, so the plan can be
+/// built here from the rows and the trace. What stays per rank is the pair that
+/// needs this build's wiring: which stages the core will let the gate hold frames
+/// back on, and whether the stage set this replay wires is the one the recording
+/// staged.
+///
+/// A rank with no entry here is one this function had nothing to plan from: its
+/// manifest could not be used, its census was declined, its bag carries no read
+/// record for the rank, or the bag states no staging rows at all (every pre-stamp
+/// bag). Each of those is a path the PASS already owns, with its own decline, its
+/// own warn and its own report field, and reproducing them here would be a second
+/// spelling of each; the pass plans for itself only in the no-rows case, where
+/// there was nothing to plan from before pass 0.
+fn plan_bag_side_admissions(
+    plans: &[RankPlan],
+    trace: &RecordedTrace,
+    rank_tables: &[Vec<Arc<str>>],
+    config: &GraphConfig,
+    factories: &IndexMap<String, Box<dyn NodeEntry>>,
+    classes: &TopicClasses,
+    lockstep: bool,
+    roles_stamped: bool,
+    kind_width: KindFieldWidth,
+) -> Result<BTreeMap<u32, RankBagSide>, ReplayError> {
+    // A lockstep bag arms no gate at all: one gating clock already orders every
+    // publish against every step.
+    if lockstep {
+        return Ok(BTreeMap::new());
+    }
+    let Ok((recorded_inputs, producer_tokens, rims)) = load_recorded_input_tables(trace) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(rows) = rims.per_edge else {
+        return Ok(BTreeMap::new());
+    };
+    let stages = replay_inject::StageTable::from_recorded_stages(
+        &recorded_inputs,
+        rows.keys().cloned().collect::<Vec<_>>(),
+    );
+    let mut out: BTreeMap<u32, RankBagSide> = BTreeMap::new();
+    for plan in plans {
+        let enforce_topics = rank_enforce_topics(plan, classes);
+        if enforce_topics.is_empty() {
+            continue;
+        }
+        let reads = match collect_rank_read_log(
+            trace,
+            plan.rank(),
+            rank_tables,
+            &recorded_inputs,
+            kind_width,
+        )? {
+            ReadLogCensus::Collected(reads) => reads,
+            ReadLogCensus::Declined(_) => continue,
+        };
+        if reads.is_empty() {
+            continue;
+        }
+        let consumed = rank_consumed_edges(plan);
+        let enforced_edges: BTreeSet<(String, String)> = consumed
+            .iter()
+            .filter(|(topic, _, _)| enforce_topics.iter().any(|t| t == topic))
+            .map(|(_, node, input)| (node.clone(), input.clone()))
+            .collect();
+        let mut per_input: BTreeMap<(String, String), Vec<replay_inject::SitedRead>> =
+            BTreeMap::new();
+        for r in &reads {
+            let key = (r.node_id.to_string(), r.input.clone());
+            if !enforced_edges.contains(&key) {
+                continue;
+            }
+            let Some(decoded) = decode_enforcement_read(r, true, roles_stamped, &producer_tokens)?
+            else {
+                continue;
+            };
+            per_input
+                .entry(key)
+                .or_default()
+                .push(replay_inject::SitedRead {
+                    role: decoded.site,
+                    read: decoded.read,
+                });
+        }
+        let (node_infos, _notes) = collect_pass_node_infos(plan, factories);
+        let mut admission: BTreeMap<String, Vec<replay_inject::StageAdmission>> = BTreeMap::new();
+        for topic in &enforce_topics {
+            let planned = topic_admission_for(topic, &consumed, &node_infos, &per_input, config);
+            match replay_inject::plan_edge_admission(&planned, &stages) {
+                replay_inject::AdmissionPlan::Enforced { stages, .. } => {
+                    admission.insert(topic.clone(), stages);
+                }
+                // Unreachable from this table: every RECORDED stage is gateable
+                // here, so no stage can be left ungated and `planned` cannot be
+                // empty. Answered as "nothing planned for this topic" rather
+                // than asserted, because the pass owns the ungateable report.
+                replay_inject::AdmissionPlan::NotGateable(_) => {}
+                replay_inject::AdmissionPlan::Refused(refusal) => {
+                    let detail = refusal.reason.to_string();
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        topic = %topic,
+                        cause = refusal.reason.code(),
+                        detail = %detail,
+                        "replay: this recording's read log cannot be ENFORCED on a \
+                         graph-produced input edge, so the replay is REFUSED before its first \
+                         step rather than run against whatever the consumer's queue happened \
+                         to hold"
+                    );
+                    return Err(ReplayError::ReadLogNotEnforceable {
+                        edge: refusal.reason.edge_label(),
+                        cause: refusal.reason.code().to_string(),
+                        detail,
+                    });
+                }
+            }
+        }
+        out.insert(plan.rank(), RankBagSide { admission });
+    }
+    Ok(out)
+}
+
+/// The topics ONE rank both PRODUCES and CONSUMES: the edges whose intra-step
+/// arrival nothing else pins, and the only ones the read gate enforces.
+///
+/// A topic this rank produces is re-executed in its pass and in its step, so no
+/// injection places its frame and the consumer's drain takes whatever its queue
+/// holds at the moment it runs. The CROSS-RANK set is SUBTRACTED rather than
+/// assumed disjoint: `RankPlan::produced`'s own doc says a
+/// `multi_publisher_topics` topic whose writers are split across ranks is in BOTH
+/// sets on a rank that writes and reads it, and such a topic IS injected, so the
+/// gate must never claim it.
+///
+/// ONE spelling with two callers, which is why it is a function: the PRE-PASS
+/// that plans the bag side before pass 0 and the pass that plans the census half
+/// must agree about which topics are gated, or the plan one builds is not the
+/// plan the other consumes. The LOCKSTEP arm stays at the call sites, where the
+/// mode is already in hand (one gating clock orders every publish against every
+/// step, so a lockstep pass enforces nothing).
+fn rank_enforce_topics(plan: &RankPlan, classes: &TopicClasses) -> Vec<String> {
+    let consumed_topics = rank_consumed_topics(plan);
+    let cross: BTreeSet<&str> = plan
+        .cross_rank_consumed()
+        .iter()
+        .map(|e| e.topic.as_str())
+        .collect();
+    classes
+        .produced
+        .iter()
+        .filter(|t| plan.produced().contains(*t))
+        .filter(|t| consumed_topics.contains(t.as_str()))
+        .filter(|t| !cross.contains(t.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// One recorded kind-6 record in the ENFORCEMENT vocabulary.
+struct DecodedRead {
+    /// The wire kind, which the STEERING site split also reads.
+    kind: ReadOutcomeKind,
+    /// The record as the admission planner takes it.
+    read: replay_inject::RecordedRead,
+    /// The read SITE, already through the bag-level trust gate: a bag whose
+    /// format does not stamp roles carries `Unstamped` whatever its bits say.
+    site: ReadSiteRole,
+}
+
+/// Decode ONE recorded read for the enforcement, or refuse the run when a GATED
+/// edge carries a wire kind this binary's admission vocabulary has no meaning
+/// for. `Ok(None)` = an unknown kind OFF a gated edge, which is skipped exactly
+/// as it was.
+///
+/// ONE spelling with TWO callers, which is why it is a function: the PRE-PASS
+/// plans the bag side of every rank from it before pass 0, and the pass decodes
+/// the same records beside its steering split. A second spelling of the kind
+/// rule, the served-seq narrowing or the hand-off conjunct would let the plan the
+/// pre-pass refuses on drift from the plan the pass runs.
+fn decode_enforcement_read(
+    r: &CollectedRead,
+    gated: bool,
+    roles_stamped: bool,
+    producer_tokens: &BTreeMap<u64, ProducerResolution>,
+) -> Result<Option<DecodedRead>, ReplayError> {
+    let Some(kind) = read_outcome_kind_from_wire(r.kind) else {
+        // A wire kind this binary does not know names a read whose position
+        // in the pop stream is unknown: skipping it leaves the step's
+        // admissions one entry short, so every later consult in that step
+        // spends the wrong entry and the gate admits a frame at a read the
+        // recording made elsewhere. The three admission shapes ARE the
+        // enforcement vocabulary, which is what makes a new kind a trace
+        // format bump. Off a gated edge the skip stands: the steering and
+        // the verifier already report an unknown kind their own way.
+        if gated {
+            return Err(ReplayError::ReadLogNotEnforceable {
+                edge: Some(format!("{}.{}", r.node_id, r.input)),
+                cause: "read_log_unenforceable_record".to_string(),
+                detail: format!(
+                    "a read record at step {} on '{}.{}' carries wire kind {}, which this \
+                     binary's admission vocabulary has no meaning for, so the recorded \
+                     reads of a topic this rank both produces and consumes cannot be placed \
+                     on their recorded steps. Replay this bag with the binary that recorded \
+                     it, or under CERULION_EXECUTION_MODE=lockstep",
+                    r.step, r.node_id, r.input, r.kind
+                ),
+            });
+        }
+        return Ok(None);
+    };
+    let served_seq = narrow_served_seq(r.served_seq, &r.node_id, &r.input)?;
+    let read = match replay_inject::ReadKind::from_outcome(kind) {
+        // The five READ kinds.
+        //
+        // The last argument flags the per-set Sync
+        // matcher's PROMOTION, a `Drain`-role `DrainedBatch` that NAMES a
+        // frame while popping nothing. It re-names a frame an earlier
+        // `Peek` on this edge already consumed, so the planner must skip it
+        // rather than join it.
+        //
+        // The two conjuncts HERE are the ones only this seam can judge:
+        // `roles_stamped` keeps an archived bag on the pre-roles arm, and `Drain`
+        // excludes the peek itself (which pops for real). The SHAPE half
+        // (popped nothing, named a frame, AND is a `DrainedBatch`; the kind
+        // conjunct was restored there) is `RecordedRead::read`'s,
+        // where it is enforced by the type rather than asserted: a
+        // `hand_off` claim over a record with any other shape or kind
+        // becomes an ordinary read, and a zero-pop serving read that names
+        // nothing, or is a `Served`, still meets `ServedNothingPopped`
+        // under every role.
+        Some(read_kind) => replay_inject::RecordedRead::read(
+            r.step,
+            read_kind,
+            served_seq,
+            r.popped,
+            roles_stamped && r.role == ReadSiteRole::Drain,
+        ),
+        // ... and the two ANNOTATION kinds, which `from_outcome` refuses
+        // for exactly this reason: each is a body of its own.
+        //
+        // The token resolves through the SHARED resolver: the
+        // frame's own sidecar label resolves through the very same one, so
+        // the two sides of the multi-publisher join cannot disagree about
+        // what a token names.
+        None if kind == ReadOutcomeKind::Producer => replay_inject::RecordedRead::producer(
+            r.step,
+            resolve_producer_token(producer_tokens, r.aux),
+        ),
+        None => replay_inject::RecordedRead::truncated(r.step, r.popped),
+    };
+    Ok(Some(DecodedRead {
+        kind,
+        read,
+        site: if roles_stamped {
+            r.role
+        } else {
+            ReadSiteRole::Unstamped
+        },
+    }))
+}
+
 fn prepare_pass_verification(
     plan: &RankPlan,
     trace: &RecordedTrace,
@@ -9969,6 +10302,11 @@ fn prepare_pass_verification(
     // the gate may hold its frames back, the ONE authority on both questions
     // (`replay_read_enforceable`).
     census: &[cerulion_core::read_outcome::ReadEdgeCapability],
+    // What the PRE-PASS planned for THIS rank from the recording's own staging
+    // rows, before pass 0. `None` = it had nothing to plan from (see
+    // `plan_bag_side_admissions`), and the only such case this function plans
+    // for itself is a bag that states no rows at all.
+    bag_side: Option<&RankBagSide>,
     // May this bag's kind-6 role bits be read as roles? The
     // steering and the re-derivation feed both branch on it — see
     // `ROLE_STAMPED_MIN_TRACE_FORMAT`.
@@ -10209,85 +10547,18 @@ fn prepare_pass_verification(
         .map(|(_, node, input)| (node.clone(), input.clone()))
         .collect();
     for r in &reads {
-        let Some(kind) = read_outcome_kind_from_wire(r.kind) else {
-            // A wire kind this binary does not know names a read whose position
-            // in the pop stream is unknown: skipping it leaves the step's
-            // admissions one entry short, so every later consult in that step
-            // spends the wrong entry and the gate admits a frame at a read the
-            // recording made elsewhere. The three admission shapes ARE the
-            // enforcement vocabulary, which is what makes a new kind a trace
-            // format bump. Off a gated edge the skip stands: the steering and
-            // the verifier already report an unknown kind their own way.
-            if enforced_edges.contains(&(r.node_id.to_string(), r.input.clone())) {
-                return Err(ReplayError::ReadLogNotEnforceable {
-                    edge: Some(format!("{}.{}", r.node_id, r.input)),
-                    cause: "read_log_unenforceable_record".to_string(),
-                    detail: format!(
-                        "a read record at step {} on '{}.{}' carries wire kind {}, which this \
-                         binary's admission vocabulary has no meaning for, so the recorded \
-                         reads of a topic this rank both produces and consumes cannot be placed \
-                         on their recorded steps. Replay this bag with the binary that recorded \
-                         it, or under CERULION_EXECUTION_MODE=lockstep",
-                        r.step, r.node_id, r.input, r.kind
-                    ),
-                });
-            }
+        let gated = enforced_edges.contains(&(r.node_id.to_string(), r.input.clone()));
+        let Some(decoded) = decode_enforcement_read(r, gated, roles_stamped, &producer_tokens)?
+        else {
             continue;
         };
-        let served_seq = narrow_served_seq(r.served_seq, &r.node_id, &r.input)?;
-        let read = match replay_inject::ReadKind::from_outcome(kind) {
-            // The five READ kinds.
-            //
-            // The last argument flags the per-set Sync
-            // matcher's PROMOTION — a `Drain`-role `DrainedBatch` that NAMES a
-            // frame while popping nothing. It re-names a frame an earlier
-            // `Peek` on this edge already consumed, so the planner must skip it
-            // rather than join it.
-            //
-            // The two conjuncts HERE are the ones only this seam can judge:
-            // `roles_stamped` keeps an archived bag on the pre-roles arm, and `Drain`
-            // excludes the peek itself (which pops for real). The SHAPE half
-            // (popped nothing, named a frame, AND is a `DrainedBatch`; the kind
-            // conjunct was restored there) is `RecordedRead::read`'s,
-            // where it is enforced by the type rather than asserted: a
-            // `hand_off` claim over a record with any other shape or kind
-            // becomes an ordinary read, and a zero-pop serving read that names
-            // nothing — or is a `Served` — still meets `ServedNothingPopped`
-            // under every role.
-            Some(read_kind) => replay_inject::RecordedRead::read(
-                r.step,
-                read_kind,
-                served_seq,
-                r.popped,
-                roles_stamped && r.role == ReadSiteRole::Drain,
-            ),
-            // ... and the two ANNOTATION kinds, which `from_outcome` refuses
-            // for exactly this reason: each is a body of its own.
-            //
-            // The token resolves through the SHARED resolver — the
-            // frame's own sidecar label resolves through the very same one, so
-            // the two sides of the multi-publisher join cannot disagree about
-            // what a token names.
-            None if kind == ReadOutcomeKind::Producer => replay_inject::RecordedRead::producer(
-                r.step,
-                resolve_producer_token(&producer_tokens, r.aux),
-            ),
-            None => replay_inject::RecordedRead::truncated(r.step, r.popped),
-        };
+        let DecodedRead { kind, read, site } = decoded;
         if !enforce_topics.is_empty() {
             per_input
                 .entry((r.node_id.to_string(), r.input.clone()))
                 .or_default()
                 .push(replay_inject::SitedRead {
-                    // The trust gate, applied HERE as it is at every other
-                    // consumer: a bag whose format does not stamp roles carries
-                    // `Unstamped` whatever its bits say, and the placement rule
-                    // then takes the pre-roles kind rule.
-                    role: if roles_stamped {
-                        r.role
-                    } else {
-                        ReadSiteRole::Unstamped
-                    },
+                    role: site,
                     read: read.clone(),
                 });
         }
@@ -10782,11 +11053,11 @@ fn prepare_pass_verification(
         ));
     }
     if !enforce_topics.is_empty() && !reads.is_empty() {
-        // The bag's own staging rows ride into the planner beside the census:
-        // the rims are the verifier's business and the set of stage ROLES is the
-        // enforcement's, and this is the one place both sides of one input's
-        // stage set are in hand. An absent table states no stage set and the
-        // planner compares nothing.
+        // THE CENSUS HALF. The bag side was planned ONCE, before pass 0, from the
+        // recording's own staging rows (`plan_bag_side_admissions`), and is
+        // CONSUMED here: this pass re-plans nothing from its census, so there is
+        // no second table to disagree with the one the refusals were decided on.
+        // What is left are the two answers that need this build's wiring.
         let stages = replay_inject::StageTable::new(&recorded_inputs, census).with_recorded_stages(
             recorded_rims
                 .per_edge
@@ -10795,77 +11066,138 @@ fn prepare_pass_verification(
                 .collect::<Vec<_>>(),
         );
         for topic in enforce_topics {
-            let mut edges: Vec<replay_inject::AdmissionEdge> = Vec::new();
+            // (1) THE WIRING COMPARISON, per consuming edge. A difference between
+            //     the stage set the recording staged and the one this build wires
+            //     is the stage-set skew refusal, and it is also what makes
+            //     consuming the pre-pass plan sound: that plan placed each record
+            //     on a RECORDED stage, and past this comparison the recorded
+            //     stages ARE the wired ones.
             for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
-                let info = node_infos.get(node.as_str());
-                edges.push(replay_inject::AdmissionEdge {
-                    node_id: node.clone(),
-                    input: input.clone(),
-                    // The ONE consume-mode rule, the same call the steering
-                    // edges resolve through.
-                    mode: info.map_or(replay_inject::ConsumeMode::Latest, |i| {
-                        input_consume_mode(i, input)
-                    }),
-                    reads: per_input
-                        .get(&(node.clone(), input.clone()))
-                        .cloned()
-                        .unwrap_or_default(),
-                });
-            }
-            let planned = replay_inject::TopicAdmission {
-                topic: topic.clone(),
-                multi_publisher: config.is_multi_publisher(topic),
-                edges,
-            };
-            match replay_inject::plan_edge_admission(&planned, &stages) {
-                replay_inject::AdmissionPlan::Enforced { stages, ungateable } => {
-                    tracing::debug!(
-                        rank = plan.rank(),
-                        topic = %topic,
-                        gated = stages.len(),
-                        ungateable = ungateable.len(),
-                        "replay: this topic's consuming stages will be GATED on their recorded \
-                         reads"
-                    );
-                    admission_ungateable.extend(render_ungateable(&ungateable));
-                    admission.insert(topic.clone(), stages);
-                }
-                replay_inject::AdmissionPlan::NotGateable(ungateable) => {
-                    // NOT a refusal: the core decided on WIRING facts that these
-                    // stages cannot be gated, so they take today's drain exactly
-                    // as every ungated edge does, and the report says which.
-                    for (key, reason) in &ungateable {
+                let (input_idx, roles) = match stages.resolve(node, input) {
+                    Ok(v) => v,
+                    // The bag-side arms of this resolution were already decided
+                    // before pass 0; what reaches here is the CENSUS-derived one
+                    // (this build wires no stage at that index).
+                    Err(reason) => {
+                        let detail = reason.to_string();
                         tracing::warn!(
                             rank = plan.rank(),
                             topic = %topic,
-                            stage = %key.label(),
-                            reason = %reason,
-                            "replay: this topic is produced and consumed inside one rank and its \
-                             consuming stage cannot be GATED on its recorded reads, so that \
-                             edge's intra-step arrival is whatever its queue holds (report \
-                             only, the replay proceeds exactly as an ungated one)"
+                            cause = reason.code(),
+                            detail = %detail,
+                            "replay: this recording's read log cannot be ENFORCED on a \
+                             graph-produced input edge, so the replay is REFUSED rather than \
+                             run against whatever the consumer's queue happened to hold"
                         );
+                        return Err(ReplayError::ReadLogNotEnforceable {
+                            edge: reason.edge_label(),
+                            cause: reason.code().to_string(),
+                            detail,
+                        });
                     }
-                    admission_ungateable.extend(render_ungateable(&ungateable));
-                }
-                replay_inject::AdmissionPlan::Refused(refusal) => {
-                    let detail = refusal.reason.to_string();
+                };
+                if let Some((recorded, wired)) = stages.recorded_stage_skew(node, input_idx, roles)
+                {
+                    let reason = replay_inject::AdmissionRefusalReason::StageSetSkew {
+                        node: node.clone(),
+                        input: input.clone(),
+                        recorded,
+                        wired,
+                    };
+                    let detail = reason.to_string();
                     tracing::warn!(
                         rank = plan.rank(),
                         topic = %topic,
-                        cause = refusal.reason.code(),
+                        cause = reason.code(),
                         detail = %detail,
-                        "replay: this recording's read log cannot be ENFORCED on a \
-                         graph-produced input edge, so the replay is REFUSED rather than run \
-                         against whatever the consumer's queue happened to hold"
+                        "replay: this replay's wiring is not the one the recording staged its \
+                         reads on, so the replay is REFUSED before this rank's first step \
+                         rather than run against a plan placed on queues it does not have"
                     );
                     return Err(ReplayError::ReadLogNotEnforceable {
-                        edge: refusal.reason.edge_label(),
-                        cause: refusal.reason.code().to_string(),
+                        edge: reason.edge_label(),
+                        cause: reason.code().to_string(),
                         detail,
                     });
                 }
             }
+            // (2) The PRE-PASS plan for this topic, CONSUMED. The `None` arm is
+            //     reachable two ways and neither is a second plan: a bag that
+            //     states NO staging rows (there was nothing to plan from before
+            //     pass 0, so this is the FIRST plan), and a topic with no
+            //     consuming edge on this rank, which plans nothing on either
+            //     side.
+            let planned_stages: Vec<replay_inject::StageAdmission> =
+                match bag_side.and_then(|b| b.admission.get(topic)) {
+                    Some(stages) => stages.clone(),
+                    None => {
+                        let planned =
+                            topic_admission_for(topic, &consumed, &node_infos, &per_input, config);
+                        match replay_inject::plan_edge_admission(&planned, &stages) {
+                            replay_inject::AdmissionPlan::Enforced { stages, .. } => stages,
+                            replay_inject::AdmissionPlan::NotGateable(_) => Vec::new(),
+                            replay_inject::AdmissionPlan::Refused(refusal) => {
+                                let detail = refusal.reason.to_string();
+                                tracing::warn!(
+                                    rank = plan.rank(),
+                                    topic = %topic,
+                                    cause = refusal.reason.code(),
+                                    detail = %detail,
+                                    "replay: this recording's read log cannot be ENFORCED on a \
+                                     graph-produced input edge, so the replay is REFUSED rather \
+                                     than run against whatever the consumer's queue happened to \
+                                     hold"
+                                );
+                                return Err(ReplayError::ReadLogNotEnforceable {
+                                    edge: refusal.reason.edge_label(),
+                                    cause: refusal.reason.code().to_string(),
+                                    detail,
+                                });
+                            }
+                        }
+                    }
+                };
+            // (3) WHICH of the planned stages the core will gate. A stage it
+            //     refuses takes today's drain and is NAMED, which is the
+            //     report-only path the per-set Sync and multi-publisher classes
+            //     keep; the gate is armed on the rest.
+            let mut armed: Vec<replay_inject::StageAdmission> = Vec::new();
+            let mut ungateable: Vec<(cerulion_core::read_outcome::StageKey, String)> = Vec::new();
+            for stage in planned_stages {
+                if stages.stage_gateable(&stage.key) == Some(true) {
+                    armed.push(stage);
+                    continue;
+                }
+                let reason = stages.refusal(&stage.key).map_or_else(
+                    || "the core refuses to gate this stage".to_string(),
+                    |r| r.to_string(),
+                );
+                ungateable.push((stage.key.clone(), reason));
+            }
+            for (key, reason) in &ungateable {
+                tracing::warn!(
+                    rank = plan.rank(),
+                    topic = %topic,
+                    stage = %key.label(),
+                    reason = %reason,
+                    "replay: this topic is produced and consumed inside one rank and its \
+                     consuming stage cannot be GATED on its recorded reads, so that edge's \
+                     intra-step arrival is whatever its queue holds (report only, the replay \
+                     proceeds exactly as an ungated one)"
+                );
+            }
+            admission_ungateable.extend(render_ungateable(&ungateable));
+            if armed.is_empty() {
+                continue;
+            }
+            tracing::debug!(
+                rank = plan.rank(),
+                topic = %topic,
+                gated = armed.len(),
+                ungateable = ungateable.len(),
+                "replay: this topic's consuming stages will be GATED on their recorded reads"
+            );
+            admission.insert(topic.clone(), armed);
         }
     }
 
@@ -11220,15 +11552,7 @@ fn run_rank_pass(
     let enforce_topics: Vec<String> = if lockstep {
         Vec::new()
     } else {
-        let consumed_topics = rank_consumed_topics(plan);
-        classes
-            .produced
-            .iter()
-            .filter(|t| plan.produced().contains(*t))
-            .filter(|t| consumed_topics.contains(t.as_str()))
-            .filter(|t| !cross.contains(t.as_str()))
-            .cloned()
-            .collect()
+        rank_enforce_topics(plan, classes)
     };
     // PLAN before opening the injectors — the steered schedule is
     // what an injector is CONSTRUCTED with, and a topic that stood down must get
@@ -11247,6 +11571,7 @@ fn run_rank_pass(
             &inject_topics,
             &enforce_topics,
             &runtime.replay_read_enforceable(),
+            pass.bag_side.get(&plan.rank()),
             pass.roles_stamped,
             pass.kind_width,
             pass.catchup_onset,
@@ -11260,8 +11585,16 @@ fn run_rank_pass(
     if !verification.admission.is_empty() {
         let gate = AdmissionGate::new(&verification.admission);
         let keys = gate.keys();
-        // The census reads WIRING facts only and answers before a single step,
-        // which is what keeps a refusal whole-run rather than per-step.
+        // The census reads WIRING facts only and answers before THIS rank's first
+        // step. That is the SPLIT: a recording whose read log cannot cover one of
+        // its edges is refused before the first step, by the pre-pass that plans
+        // the bag side from the bag's own staging rows
+        // (`plan_bag_side_admissions`), while a replay whose WIRING differs from
+        // the recording's is refused before that rank's first step, here, because
+        // these rows exist only once this pass's runtime is built. A stage the
+        // wiring cannot GATE refuses nothing in either half: it takes today's
+        // drain and the report names it, which is the only answer those two edge
+        // classes have until they are gated.
         for cap in runtime.replay_read_enforceable() {
             if cap.enforceable || !keys.contains(&cap.key) {
                 continue;

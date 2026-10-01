@@ -2142,11 +2142,17 @@ impl std::fmt::Display for ReadPlanRefusal {
     }
 }
 
-/// One wired stage's answer to "can this edge be gated", read BEFORE step 0.
+/// One wired stage's answer to "can this edge be gated", read before that
+/// rank's first step.
 ///
-/// The census is a read-only walk so the engine can refuse the whole run
-/// before a single step, which is what keeps a refusal whole-run rather than
-/// per-pass.
+/// The census is a read-only walk, so a refusal built on it lands before the rank
+/// it refuses has executed anything. The SCOPE is the rank and not the run,
+/// because the rows are this RUNTIME's wiring and a replay stands one runtime up
+/// per rank in rank order: a recording whose read log cannot cover one of its
+/// edges is refused before the first step, while a replay whose wiring differs
+/// from the recording's is refused before that rank's first step. A stage this
+/// row says cannot be gated is never a refusal at all: it takes today's drain
+/// and the report NAMES it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadEdgeCapability {
     /// The stage this row describes.

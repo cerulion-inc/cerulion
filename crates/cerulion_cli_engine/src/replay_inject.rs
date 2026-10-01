@@ -1717,6 +1717,14 @@ impl StageRoles {
         }
     }
 
+    /// Does the stage this role names EXIST on this input?
+    fn wires(self, role: ReadStageRole) -> bool {
+        match role {
+            ReadStageRole::Body => self.body,
+            ReadStageRole::Drain => self.drain,
+        }
+    }
+
     /// The stages this input owns, body before drain. The REPLAY's half of the
     /// stage-set comparison, and what its refusal sentence names.
     fn wired(self) -> Vec<ReadStageRole> {
@@ -1800,6 +1808,51 @@ impl StageTable {
         }
     }
 
+    /// The table the PRE-PASS plans from: the bag's input names and the stage
+    /// set the RECORDING wired, with no census at all.
+    ///
+    /// Every recorded stage is GATEABLE here, and that is a statement about what
+    /// this table may decide rather than a guess: gateability is a WIRING fact
+    /// with one authority (the core's own `GateBlocker`, set when the stage is
+    /// wired) and no runtime exists before pass 0, so a pre-pass that asked the
+    /// question would be re-deriving the core's rule in the engine. What it may
+    /// decide is every refusal the RECORDING alone earns, and the two refusals
+    /// scoped to a gated two-stage input cannot fire on the classes the core
+    /// refuses to gate: the per-set Sync discipline unifies the drain onto the
+    /// body subscriber, so such an input's recorded stage set is ONE stage, a
+    /// promotion is a hand off and is skipped, and a multi-publisher edge's
+    /// annotations are skipped.
+    ///
+    /// `recorded` stays `None`: the stage set IS the recorded one here, so there
+    /// is nothing for [`Self::recorded_stage_skew`] to compare. That comparison
+    /// is the CENSUS half's, where a runtime's wiring is in hand.
+    #[must_use]
+    pub fn from_recorded_stages(
+        inputs: &BTreeMap<String, Vec<String>>,
+        keys: impl IntoIterator<Item = StageKey>,
+    ) -> Self {
+        let mut stages: BTreeMap<(String, u16), StageRoles> = BTreeMap::new();
+        for key in keys {
+            let roles = stages.entry((key.node.clone(), key.input_idx)).or_default();
+            match key.role {
+                ReadStageRole::Body => {
+                    roles.body = true;
+                    roles.body_gateable = true;
+                }
+                ReadStageRole::Drain => {
+                    roles.drain = true;
+                    roles.drain_gateable = true;
+                }
+            }
+        }
+        Self {
+            inputs: inputs.clone(),
+            stages,
+            refusals: Vec::new(),
+            recorded: None,
+        }
+    }
+
     /// Adopt the stage set the RECORDING wired, as the bag's own staging rows
     /// state it (`read_log_capacities`, already parsed for the rim adoption).
     ///
@@ -1834,7 +1887,7 @@ impl StageTable {
     /// drain stamps the DRAIN site into the one BODY stage, so a site set is a
     /// fact about call sites and not about stages.
     #[must_use]
-    fn recorded_stage_skew(
+    pub fn recorded_stage_skew(
         &self,
         node: &str,
         input_idx: u16,
@@ -1845,6 +1898,18 @@ impl StageTable {
         let wired = roles.wired();
         let same = rows.len() == wired.len() && wired.iter().all(|r| rows.contains(r));
         (!same).then(|| (rows.clone(), wired))
+    }
+
+    /// Does the census this table was built from let the gate hold frames back
+    /// on this stage? `None` = this build wires no such stage.
+    ///
+    /// The CENSUS half's own question, asked by the pass over a plan the pre-pass
+    /// built: a stage the core refuses to gate takes today's drain and is NAMED,
+    /// which is the report-only path the two edge classes keep.
+    #[must_use]
+    pub fn stage_gateable(&self, key: &StageKey) -> Option<bool> {
+        let roles = self.stages.get(&(key.node.clone(), key.input_idx))?;
+        roles.wires(key.role).then(|| roles.gateable(key.role))
     }
 
     /// The core's reason for refusing to gate this stage, when it named one.

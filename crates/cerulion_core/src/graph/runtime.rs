@@ -15499,10 +15499,15 @@ impl GraphRuntime {
 
     /// Every wired stage, with whether it can be GATED and why not.
     ///
-    /// Read BEFORE step 0 so the engine can refuse the whole run before a
-    /// single step: a refusal is whole-run, because enforcing what can be
-    /// enforced and reporting the rest is exactly the partial-coverage claim the
-    /// enforcement exists to delete.
+    /// Read before THIS runtime's first step, so a refusal built on it lands
+    /// before the rank this runtime replays has executed anything: enforcing
+    /// what can be enforced and reporting the rest is exactly the
+    /// partial-coverage claim the enforcement exists to delete. A recording
+    /// whose read log cannot cover one of its edges is refused before the first
+    /// step, from the bag alone; what these rows add is the other half, a replay
+    /// whose wiring differs from the recording's, refused before that rank's
+    /// first step. A row that says a stage cannot be GATED is not a refusal in
+    /// either half: that stage takes today's drain and the report names it.
     ///
     /// The core answers on WIRING facts only. It cannot see a bag, so no
     /// coverage, a truncated stream, a dropped record and every unenforceable

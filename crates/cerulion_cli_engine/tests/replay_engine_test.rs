@@ -7087,6 +7087,38 @@ fn write_multi_rank_bag_coordinated(
     )
 }
 
+/// [`write_multi_rank_bag_coordinated`] plus a per-rank STAGING declaration.
+///
+/// The seam the read-log SPLIT's arms need: the bag side of the enforcement is
+/// planned before pass 0 from the bag's own `read_log_capacities` rows, so a bag
+/// that states none has no bag side to plan there and takes the in-pass path.
+/// Every real recording states them.
+fn write_multi_rank_bag_coordinated_with_staging(
+    rec: &Recording,
+    rank_of: impl Fn(&str) -> u32,
+    rank_count: u32,
+    path: &std::path::Path,
+    tweak: impl FnOnce(&mut Vec<Vec<TraceRingRecord>>),
+    coordination: replay_engine::CoordinationMode,
+    staging: &dyn Fn(u32) -> Option<serde_json::Value>,
+) -> MpBag {
+    write_multi_rank_bag_impl(
+        rec,
+        rank_of,
+        rank_count,
+        MpLayout::RankBlocks,
+        path,
+        tweak,
+        None,
+        Some(production_recorder_json(coordination)),
+        None,
+        &[],
+        ProducerAttributionFixture::default(),
+        Some(staging),
+        &[],
+    )
+}
+
 /// [`write_multi_rank_bag_coordinated`] plus VERBATIM extra attachments: the
 /// seam the multi-rank REFUSAL pins use to give a two-rank bag the
 /// `state_coverage.json` a real two-worker capture declares.
@@ -35672,6 +35704,308 @@ fn a_bag_whose_staged_stage_set_differs_from_the_replays_is_an_exit_2_refusal() 
         parsed["aborted"]["failed_at_rank"], 0,
         "the one rank's prepare is where it stopped: {parsed}"
     );
+}
+
+/// The `salvage_two_consumer` split: `source` + `relay` on rank 0, `slow` +
+/// `relayb` on rank 1. EACH rank both produces and consumes a topic of its own,
+/// so each is gated on its own recorded reads and neither has a cross-rank edge.
+fn two_rank_split(id: &str) -> u32 {
+    if id == "source" || id == "relay" {
+        0
+    } else {
+        1
+    }
+}
+
+/// One rank's staging rows for the `salvage_two_consumer` split, as a real
+/// recorder stamps them: the per-edge table plus the `read_log_capacity: 0`
+/// sentinel beside it. `role` 0 is the body stage, 1 the drain stage.
+fn two_rank_staging(rank: u32, rank1_rows: serde_json::Value) -> Option<serde_json::Value> {
+    let capacities = match rank {
+        0 => serde_json::json!({"relay": [[0, 0, 64]]}),
+        _ => rank1_rows,
+    };
+    Some(serde_json::json!({"capacities": capacities, "scalar": 0}))
+}
+
+/// **A BAG-SIDE hole on rank 1 is refused BEFORE rank 0 executes anything.**
+///
+/// The split's first half. Rank 1's gated edge carries records that plan no
+/// admission (every one restamped as a PRODUCER annotation), which is a fact
+/// about the RECORDING: the bag's own staging rows say which stages staged its
+/// reads, so the whole bag can be planned before a runtime exists and refused
+/// there. The evidence that it really was refused before rank 0 ran is that NO
+/// report exists: the refusal returns before the pass loop, so there is no
+/// outcome to assemble and no partial artifact to write, which is the strongest
+/// form of "rank 0 executed nothing" this seam can state.
+///
+/// Both ranks state their rows. Rank 0's match its replay's wiring and its
+/// records are untouched, so nothing but rank 1's hole can refuse this bag, which
+/// is what makes the arm narrow.
+#[test]
+#[serial]
+fn a_bag_side_hole_on_rank_1_is_refused_before_rank_0_executes() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(
+        salvage_two_consumer_yaml(),
+        salvage_two_consumer_factories,
+        &[],
+        steps,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_rank1_bag_side_hole.mcap");
+    write_multi_rank_bag_coordinated_with_staging(
+        &rec,
+        two_rank_split,
+        2,
+        &bag,
+        |per_rank| {
+            let mut restamped = 0;
+            for r in per_rank[1]
+                .iter_mut()
+                .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+            {
+                // The PRODUCER annotation kind, no site claim: an annotation
+                // names the publisher of the read that follows it and occupies no
+                // position in the pop stream, so not one of rank 1's records
+                // plans an admission.
+                r.global_level = pack_read_outcome_meta(
+                    0,
+                    cerulion_core::trace_ring::READ_OUTCOME_PRODUCER,
+                    ReadSiteRole::Unstamped,
+                );
+                restamped += 1;
+            }
+            assert!(
+                restamped > 0,
+                "PRECONDITION: rank 1 records reads to restamp"
+            );
+        },
+        replay_engine::CoordinationMode::FreeRun,
+        &|rank| two_rank_staging(rank, serde_json::json!({"relayb": [[0, 0, 64]]})),
+    );
+    let report = dir.path().join("report.json");
+
+    let err = replay(
+        &bag,
+        salvage_two_consumer_factories,
+        None,
+        Some(report.clone()),
+    )
+    .expect_err("a bag-side hole on a gated edge must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_no_coverage") && msg.contains("relayb"),
+        "the refusal names the cause token and rank 1's consumer: {msg}"
+    );
+    assert!(
+        !report.exists(),
+        "a whole-run refusal lands BEFORE the pass loop, so no outcome is \
+         assembled and no partial report is written: rank 0 executed nothing"
+    );
+}
+
+/// **A WIRING skew on rank 1 is refused after rank 0 ran, and the partial report
+/// carries rank 0's row.**
+///
+/// The split's second half, and the reason it is a half: the stage set this
+/// replay wires is a fact about the RUNTIME, and a replay builds one runtime per
+/// rank in rank order, so rank 1's census does not exist until rank 0 has run
+/// every step it owns. Rank 1's rows here claim a BODY and a DRAIN stage where
+/// its replay wires one, which is what a recording made under
+/// `CERULION_DRAIN_DISCIPLINE=separate` carries; the records are untouched, so
+/// the bag side plans cleanly before pass 0 and only the census half can refuse.
+#[test]
+#[serial]
+fn a_wiring_skew_on_rank_1_is_refused_after_rank_0_ran() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(
+        salvage_two_consumer_yaml(),
+        salvage_two_consumer_factories,
+        &[],
+        steps,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_rank1_wiring_skew.mcap");
+    write_multi_rank_bag_coordinated_with_staging(
+        &rec,
+        two_rank_split,
+        2,
+        &bag,
+        |_per_rank| {},
+        replay_engine::CoordinationMode::FreeRun,
+        &|rank| {
+            two_rank_staging(
+                rank,
+                serde_json::json!({"relayb": [[0, 0, 64], [0, 1, 64]]}),
+            )
+        },
+    );
+    let report = dir.path().join("report.json");
+
+    let err = replay(
+        &bag,
+        salvage_two_consumer_factories,
+        None,
+        Some(report.clone()),
+    )
+    .expect_err("a stage set this replay does not wire must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_stage_set_skew")
+            && msg.contains("relayb.inp")
+            && msg.contains("body + drain"),
+        "the refusal names the cause token, the edge and both stage sets: {msg}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the partial report is written"))
+            .expect("the partial report is JSON");
+    assert_eq!(
+        parsed["aborted"]["failed_at_rank"], 1,
+        "the refusal is rank 1's: {parsed}"
+    );
+    assert!(
+        parsed["ticks_replayed"].as_u64().unwrap_or(0) > 0,
+        "RANK 0 EXECUTED before it, which is what the census half's scope means: {parsed}"
+    );
+    let rows = parsed["rank_execution"]
+        .as_array()
+        .expect("the partial report lists the ranks that completed");
+    assert_eq!(
+        rows.iter().map(|r| r["rank"].as_u64()).collect::<Vec<_>>(),
+        vec![Some(0)],
+        "exactly rank 0 completed: {parsed}"
+    );
+}
+
+/// **A recorded read the re-execution never performs is the exit-6 verdict, WHOLE:
+/// the never-arrived kind, the edge, the step and the sequence.**
+///
+/// The gate's own half of the read-log plane had no engine-level arm: the verdict
+/// and the exit code were pinned for the redundant VERIFIER's findings and for the
+/// gate's refusals, never for a violation the gate MINTS at a step's sweep, so a
+/// mutant that stops minting `NeverArrived` passed the suite.
+///
+/// THE CRAFT, and why it is the shape that mint is for: the positive control's own
+/// recording with the relay's LAST read record DUPLICATED, so the recording says
+/// the edge read twice at that step where the replay drains once. The gate spends
+/// the first admission at that drain and the second is UNSPENT when the step
+/// retires, which is exactly the condition `ReadPlanStage::sweep` mints
+/// `NeverArrived` for (an unspent entry whose pop count is above zero). Nothing
+/// else in the bag moves, so the frame comparator and the fire comparator stay
+/// clean and the exit code can only be the read log's.
+///
+/// Deleting the relay's last FIRE instead does NOT reach this mint, measured: the
+/// trigger drain is performed at the level BOUNDARY and not by the fire, so the
+/// drain still consults the gate and still spends the admission.
+///
+/// TWO OTHER GATES SPEAK ABOUT THE SAME STEP, and both are the read log driving
+/// them rather than second defects: the redundant verifier compares two recorded
+/// reads against one replayed, and the fire re-derivation counts a FIFO edge's
+/// fires FROM the pop-bearing records, so it derives two fires where the trace
+/// records one (measured: "node 'relay' step 5 FIFO pop count, re-derived 2
+/// fire(s), recorded 1"). The assertion below is on the ENFORCEMENT's entry,
+/// whole, because that is the half with no other arm; a mutant that stops minting
+/// `NeverArrived` leaves the other two speaking and still fails here.
+///
+/// The ORACLE is written in the arm: the step is the last recorded step and the
+/// sequence is the one the bag's own kind-6 record for that step carries.
+#[test]
+#[serial]
+fn a_recorded_read_the_replay_never_performs_is_the_exit_6_never_arrived_verdict() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let relay_idx = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let last = steps as u64 - 1;
+
+    // THE HAND ORACLE: the sequence the recording says the relay read at the last
+    // step, read off the bag's own kind-6 record before it is duplicated.
+    let k6 = kind6_records(&rec);
+    let due: Vec<u32> = k6
+        .iter()
+        .filter(|r| r.0 == last && r.1 == relay_idx)
+        .map(|r| u32::try_from(r.4).expect("a recorded served sequence is 32-bit"))
+        .collect();
+    assert_eq!(
+        due.len(),
+        1,
+        "PRECONDITION: one recorded read on the relay's edge at the last step: {k6:?}"
+    );
+    let due_seq = due[0];
+
+    // Duplicate it, in place, so the step holds TWO pop-bearing admissions where
+    // the replay performs ONE drain.
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| {
+            r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx && r.step == last
+        })
+        .expect("the record the oracle just read");
+    let twin = rec.trace[at];
+    rec.trace.insert(at + 1, twin);
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_never_arrived.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+    let report = dir.path().join("report.json");
+
+    let outcome = replay(&bag, source_relay_factories, None, Some(report.clone()))
+        .expect("the replay runs to completion: the finding is a VERDICT, not a refusal");
+
+    // The ENFORCEMENT's entry, whole.
+    let v = outcome
+        .read_log_verdict
+        .as_ref()
+        .expect("a recorded read the replay never performed is the exit-6 verdict");
+    assert_eq!(v.unmet.len(), 1, "one unmet read: {v:?}");
+    let u = &v.unmet[0];
+    assert_eq!(
+        (
+            u.node_id.as_str(),
+            u.input.as_str(),
+            u.step,
+            u.sequence,
+            u.cause.as_str()
+        ),
+        ("relay", "inp", last, Some(due_seq), "never_arrived"),
+        "the edge, the step, the sequence and the kind, all four: {u:?}"
+    );
+    assert_eq!(
+        v.unmet_total, 1,
+        "one violation observed over the run: {v:?}"
+    );
+
+    // The DATA plane is untouched: no frame moved, so nothing here is a
+    // frame-content divergence and the finding is a SCHEDULE one.
+    assert!(
+        outcome.violations.is_empty(),
+        "no frame-content divergence: {:?}",
+        outcome.violations
+    );
+    assert!(!outcome.passed, "an unmet recorded read is not a pass");
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+            true
+        ),
+        6,
+        "the CLI's own classifier exits 6: {outcome:?}"
+    );
+
+    // And the machine report carries the same four values.
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    let row = &parsed["read_log_verdict"]["unmet"][0];
+    assert_eq!(row["cause"], "never_arrived");
+    assert_eq!(row["node_id"], "relay");
+    assert_eq!(row["input"], "inp");
+    assert_eq!(row["step"], last);
+    assert_eq!(row["sequence"], due_seq);
 }
 
 /// TWO indices resolving to ONE recorded input name is an exit-2 refusal naming
