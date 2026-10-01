@@ -312,11 +312,20 @@ fn kind_json(kind: &FrameValueKind<'_>, depth: usize, budget: &mut usize) -> Val
             if depth >= FIELD_MAX_DEPTH {
                 return cut();
             }
+            let mut cut_short = false;
             let head: Vec<Value> = elements
                 .iter()
                 .take(FIELD_MAX_ARRAY)
-                .map(|e| kind_json(e, depth + 1, budget))
+                .map(|e| {
+                    cut_short |= *budget == 0;
+                    kind_json(e, depth + 1, budget)
+                })
                 .collect();
+            if cut_short {
+                // The budget ran out inside this array: its tail is `"..."`
+                // markers, so it must not read as a complete short array.
+                return len_head(elements.len(), head);
+            }
             wrap_array(elements.len(), head)
         }
         FrameValueKind::NestedArrayOpaque(raw) => {
@@ -370,6 +379,10 @@ fn wrap_array(len: usize, head: Vec<Value>) -> Value {
     if len <= FIELD_MAX_ARRAY && head.len() == len {
         return Value::Array(head);
     }
+    len_head(len, head)
+}
+
+fn len_head(len: usize, head: Vec<Value>) -> Value {
     let mut map = Map::new();
     map.insert("len".to_string(), Value::from(len));
     map.insert("head".to_string(), Value::Array(head));
@@ -841,6 +854,19 @@ mod tests {
         assert_eq!(data.get("len").and_then(Value::as_u64), Some(16), "{data}");
         let head = data.get("head").and_then(Value::as_array).expect("head");
         assert!(head.is_empty(), "no budget left for elements: {data}");
+    }
+
+    #[test]
+    fn a_nested_array_cut_by_the_budget_keeps_its_length() {
+        let items: Vec<FrameValueKind<'_>> = (0..4).map(FrameValueKind::I32).collect();
+        let mut fields: Vec<NamedValue<'_>> = (0..FIELD_MAX_NODES - 2)
+            .map(|i| nv(&format!("f{i:04}"), FrameValueKind::I32(i as i32)))
+            .collect();
+        fields.push(nv("zlist", FrameValueKind::Array(items)));
+        let got = json_of(&msg("t/CutList", fields));
+        let list = got.get("zlist").expect("the array field");
+        assert_eq!(list.get("len").and_then(Value::as_u64), Some(4), "{list}");
+        assert!(list.get("head").is_some_and(Value::is_array), "{list}");
     }
 
     #[test]
