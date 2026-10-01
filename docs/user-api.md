@@ -2727,8 +2727,13 @@ untouched. Besides the codes above, they refuse with:
   or port, an input that is already wired (unwire it first), no such wire, or
   an edit that would leave the graph invalid (the last node cannot be removed).
 
-Loops and levelization are not judged by these verbs; `graph.validate` and
-`graph.levels` are the full check. `error.data` is present only on these two
+Loops, levelization and the trigger wiring a node type requires are not
+judged by these verbs (for example, unwiring a node's only trigger input
+succeeds); `graph.validate` and `graph.levels` are the full check. A node named
+in `process_groups` or `level_assignments` cannot be unstaged here: the edit is
+refused as `invalid_request` and the file is untouched. An input that reads a
+topic other nodes also publish (`multi_publisher_topics`) does not depend on
+the node being unstaged. `error.data` is present only on these two
 refusals. The verbs are additive: the protocol version stays 1, and a daemon
 without them answers `unknown_verb`.
 

@@ -285,6 +285,18 @@ fn check_schemas(
 /// The same validation `node stage` runs before it writes, with the engine's
 /// refusal text carried as a refusal rather than a transport fault.
 fn validate_after_edit(config: &GraphConfig) -> Result<(), GraphEditError> {
+    // A graph that omits `prefix:` runs under a host-derived default, but the
+    // reader here keeps it empty (so a rewrite never invents the line) and the
+    // validator refuses an empty prefix. Validate a copy under a stand-in.
+    let resolved;
+    let config = if config.prefix.is_empty() {
+        let mut copy = config.clone();
+        copy.prefix = "graph".to_string();
+        resolved = copy;
+        &resolved
+    } else {
+        config
+    };
     validate_graph_with(
         config,
         ValidationOptions {
@@ -355,12 +367,29 @@ pub fn graph_unstage(
     // (consumer index, input position, wire) for every other node's input
     // fed by one of this node's outputs.
     let mut dependents: Vec<(usize, usize, Wire)> = Vec::new();
+    // Topics another node still publishes (a `multi_publisher_topics` entry):
+    // an input that reads one of them keeps a producer without this node.
+    let still_produced: Vec<String> = config
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(other, _)| *other != index)
+        .flat_map(|(_, n)| {
+            n.outputs
+                .iter()
+                .map(|o| resolve_output_topic(&prefix, &n.id, o))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for (consumer_index, consumer) in config.nodes.iter().enumerate() {
         if consumer_index == index {
             continue;
         }
         for (input_position, input) in consumer.inputs.iter().enumerate() {
             let key = resolve_source(&prefix, &input.source);
+            if still_produced.contains(&key) {
+                continue;
+            }
             if let Some((port, _)) = produced.iter().find(|(_, topic)| *topic == key) {
                 dependents.push((
                     consumer_index,
@@ -718,6 +747,21 @@ fn splice_remove_input(raw: &str, index: usize, position: usize) -> Result<Strin
     let limit = firsts.get(position + 1).copied().unwrap_or(block_end);
     let last = last_content_line(&lines, first, limit).unwrap_or(first);
     let only_one = firsts.len() == 1;
+    if only_one && after_key.starts_with('#') {
+        // `inputs: # note`: the comment is the author's, so the key stays as an
+        // empty list carrying it.
+        let nl = eol_of(raw, &lines[key_line]);
+        let pad = " ".repeat(indent_of(lines[key_line].content));
+        let mut out = String::with_capacity(raw.len());
+        for (i, line) in lines.iter().enumerate() {
+            if i == key_line {
+                out.push_str(&format!("{pad}inputs: [] {after_key}{nl}"));
+            } else if !(i >= first && i <= last) {
+                out.push_str(&raw[line.start..line.end]);
+            }
+        }
+        return Ok(out);
+    }
     Ok(join(raw, &lines, |i| {
         (i >= first && i <= last) || (only_one && i == key_line)
     }))

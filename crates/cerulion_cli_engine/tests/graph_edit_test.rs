@@ -167,7 +167,13 @@ fn an_agreeing_bare_spelling_is_not_a_mismatch() {
         &ws,
         &HAND_AUTHORED.replace("schema: sensor_msgs/Image", "schema: Image"),
     );
-    graph_wire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    let out = graph_wire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    assert!(
+        out.raw.contains("        source: cam/image\n"),
+        "{}",
+        out.raw
+    );
+    assert_eq!(read_graph(&ws), out.raw);
 }
 
 #[test]
@@ -272,8 +278,81 @@ fn removing_the_only_node_is_refused() {
         &ws,
         "prefix: percep\nnodes:\n  - id: cam\n    type: camera\n",
     );
+    let before = read_graph(&ws);
     let result = graph_unstage(&ws, "percep", "cam", false);
     assert!(matches!(result, Err(GraphEditError::Cli(_))), "{result:?}");
+    assert_eq!(read_graph(&ws), before);
+    assert!(no_backup(&ws));
+}
+
+#[test]
+fn a_graph_without_a_prefix_line_can_be_wired_and_unstaged() {
+    let tmp = TempDir::new().unwrap();
+    let ws = workspace(tmp.path());
+    let doc = HAND_AUTHORED.replace("prefix: percep\n", "");
+    write_graph(&ws, &doc);
+    let out = graph_wire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    assert!(!out.raw.contains("prefix:"), "no prefix line is invented");
+    let out = graph_unstage(&ws, "percep", "log", false).unwrap();
+    assert!(!out.raw.contains("id: log"), "{}", out.raw);
+}
+
+#[test]
+fn a_topic_another_node_still_publishes_keeps_its_readers_on_unstage() {
+    let tmp = TempDir::new().unwrap();
+    let ws = workspace(tmp.path());
+    let doc = "\
+prefix: percep
+multi_publisher_topics: [/shared/image]
+nodes:
+  - id: cam_a
+    type: camera
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+        topic: /shared/image
+  - id: cam_b
+    type: camera
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+        topic: /shared/image
+  - id: det
+    type: detector
+    inputs:
+      - name: image
+        source: /shared/image
+";
+    write_graph(&ws, doc);
+    let out = graph_unstage(&ws, "percep", "cam_a", false).unwrap();
+    assert!(out.removed_wires.is_empty());
+    assert!(out.raw.contains("source: /shared/image"), "{}", out.raw);
+    assert!(!out.raw.contains("cam_a"), "{}", out.raw);
+    // The last publisher is a real dependency again.
+    let result = graph_unstage(&ws, "percep", "cam_b", false);
+    assert!(
+        matches!(result, Err(GraphEditError::WouldBreak { ref wires }) if wires.len() == 1),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn removing_the_only_input_keeps_a_comment_on_the_inputs_key() {
+    let tmp = TempDir::new().unwrap();
+    let ws = workspace(tmp.path());
+    let doc = HAND_AUTHORED.replace(
+        "  - id: det # the detector\n    type: detector\n",
+        "  - id: det # the detector\n    type: detector\n    inputs: # camera feed\n      - name: image\n        source: cam/image\n",
+    );
+    write_graph(&ws, &doc);
+    let out = graph_unwire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    let expected = HAND_AUTHORED.replace(
+        "  - id: det # the detector\n    type: detector\n",
+        "  - id: det # the detector\n    type: detector\n    inputs: [] # camera feed\n",
+    );
+    assert_eq!(out.raw, expected);
+    // And it wires again.
+    graph_wire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
 }
 
 #[test]
