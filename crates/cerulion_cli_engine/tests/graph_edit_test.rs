@@ -397,3 +397,35 @@ fn a_topic_override_is_wired_by_its_absolute_topic() {
     let back = graph_unwire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
     assert!(!back.raw.contains("source:"), "{}", back.raw);
 }
+
+#[test]
+fn removing_the_only_input_takes_its_own_line_comment_with_it() {
+    let tmp = TempDir::new().unwrap();
+    let ws = workspace(tmp.path());
+    let doc = HAND_AUTHORED.replace(
+        "  - id: det # the detector\n    type: detector\n",
+        "  - id: det # the detector\n    type: detector\n    inputs:\n      # camera feed\n      - name: image\n        source: cam/image\n",
+    );
+    write_graph(&ws, &doc);
+    let out = graph_unwire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    assert_eq!(out.raw, HAND_AUTHORED);
+}
+
+#[test]
+fn wiring_a_node_keeps_the_comment_above_its_outputs_attached() {
+    let tmp = TempDir::new().unwrap();
+    let ws = workspace(tmp.path());
+    let doc = HAND_AUTHORED.replace(
+        "    type: detector\n    outputs:\n",
+        "    type: detector\n    # what the detector emits\n    outputs:\n",
+    );
+    write_graph(&ws, &doc);
+    let out = graph_wire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    assert!(
+        out.raw.contains(
+            "    inputs:\n      - name: image\n        source: cam/image\n    # what the detector emits\n    outputs:\n"
+        ),
+        "{}",
+        out.raw
+    );
+}

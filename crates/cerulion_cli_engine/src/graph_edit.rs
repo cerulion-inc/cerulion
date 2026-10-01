@@ -658,7 +658,16 @@ fn splice_add_input(raw: &str, index: usize, input: &InputDef) -> Result<String,
                     && lines[i].content.trim_start().starts_with("outputs:")
             });
             match outputs_key {
-                Some(outputs) => insert_after(raw, &lines, outputs - 1, &text, nl),
+                Some(outputs) => {
+                    // Own-line comments right above `outputs:` describe it, so
+                    // the new block goes above them, not between.
+                    let mut at = outputs;
+                    while at > span.first + 1 && lines[at - 1].content.trim_start().starts_with('#')
+                    {
+                        at -= 1;
+                    }
+                    insert_after(raw, &lines, at - 1, &text, nl)
+                }
                 None => insert_after(raw, &lines, span.end - 1, &text, nl),
             }
         }
@@ -760,6 +769,9 @@ fn splice_remove_input(raw: &str, index: usize, position: usize) -> Result<Strin
     let limit = firsts.get(position + 1).copied().unwrap_or(block_end);
     let last = last_content_line(&lines, first, limit).unwrap_or(first);
     let only_one = firsts.len() == 1;
+    // Own-line comments between the key and its only entry describe that
+    // entry, so they go with it rather than being left stranded.
+    let first = if only_one { key_line + 1 } else { first };
     if only_one && after_key.starts_with('#') {
         // `inputs: # note`: the comment is the author's, so the key stays as an
         // empty list carrying it.
