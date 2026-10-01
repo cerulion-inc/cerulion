@@ -65,6 +65,7 @@ pub mod error;
 #[cfg(unix)]
 pub mod flashback_cmd;
 pub mod graph_cmd;
+pub mod graph_edit;
 // The hostname-convention discovery rung (well-known robot names).
 pub mod hostname_peers;
 pub mod ipc_cleanup;

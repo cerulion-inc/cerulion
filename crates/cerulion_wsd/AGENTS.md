@@ -10,6 +10,9 @@ re-implement engine rules: a staged node's outputs come from
 - Every request type is `deny_unknown_fields`; `VERBS` and the `Request`
   variants are one set (a unit test pins it). Bump `PROTOCOL_VERSION` for any
   change a v1 client could misread; adding a verb is not one.
+- `graph.wire/unwire/unstage` go through `graph_edit` (comment-preserving
+  splice); only their refusals (`schema_mismatch`, `would_break`) carry
+  `error.data`. Adding them did not bump the protocol.
 - Response `id` is `null` only when the line had no parseable id. Codes:
   `bad_request`, `unknown_verb`, `workspace_not_found`, `not_found`,
   `invalid_request` (the engine's own refusal text), `version_conflict`,

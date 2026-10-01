@@ -2672,7 +2672,8 @@ greeted with `{"hello":"cerulion-wsd","protocol":1}`; a client that reads a
 does not know are refused (`bad_request`), never silently ignored. Error codes:
 `bad_request`, `unknown_verb`, `workspace_not_found`, `not_found` (graph/node
 type/schema), `invalid_request` (the engine refused; the CLI's own message),
-`version_conflict`, `engine_error`. `cerulion-wsd --help` documents the flags
+`version_conflict`, `engine_error`; the graph edit verbs below add
+`schema_mismatch` and `would_break`. `cerulion-wsd --help` documents the flags
 and environment; the daemon logs to stderr under `RUST_LOG` (default `info`).
 
 | Variable | Meaning |
@@ -2689,14 +2690,47 @@ and environment; the daemon logs to stderr under `RUST_LOG` (default `info`).
 
 WSD graph and node reads include a `version` field containing the lowercase
 SHA-256 digest of the exact bytes of `graphs/<graph>.yaml` or
-`nodes/<node_type>/src/lib.rs`. The `graph.stage_node` and `node.modify`
-requests may include `expect_version`. When supplied, the daemon compares it
+`nodes/<node_type>/src/lib.rs`. The `graph.stage_node`, `graph.wire`, `graph.unwire`,
+`graph.unstage` and `node.modify` requests may include `expect_version`. When supplied, the daemon compares it
 under the shared workspace-scoped exclusive lock at
 `<root>/.cerulion/workspace.lock` and returns `version_conflict` without writing
 if the file changed. Successful mutations return the new file-byte version.
 A staged node's `outputs:` are its DECLARED ports (name and schema, read from
 `nodes/<type>/src/lib.rs`), exactly as `cerulion node stage` writes them; only
 the input bindings are supplied by the client.
+
+Three more edit verbs take the same `root`, `graph` and optional
+`expect_version`, and answer with the new `raw` YAML and file `version`:
+
+| Verb | Request fields | Effect |
+|---|---|---|
+| `graph.wire` | `from: {node, port}`, `to: {node, port}` | Adds one `inputs:` entry to the consuming node, `source: <node>/<port>` (the output's absolute `topic:` when it has one). |
+| `graph.unwire` | `from: {node, port}`, `to: {node, port}` | Deletes the matching `inputs:` entry; the `inputs:` key goes with its last entry. |
+| `graph.unstage` | `node` (a node id), optional `force` (default `false`) | Deletes the node's entry. |
+
+`node` and `port` name a node id of the graph and a port on it. These verbs
+edit the file in place: every line outside the added or removed entry keeps its
+bytes, so comments, key order, quoting and the `network:` block survive, and the
+prior bytes are copied to `<graph>.yaml.bak`. A layout that cannot be edited in
+place (a flow-style `nodes:` or `inputs:` entry) is refused with the file
+untouched. Besides the codes above, they refuse with:
+
+- `schema_mismatch`: the output and the input name different schemas, by the
+  same rule as `graph validate`. `error.data` is `{"expected": <input schema>,
+  "found": <output schema>}`. When either side declares no schema name, the wire
+  is accepted and `graph.validate` is the full check.
+- `would_break`: `graph.unstage` of a node whose outputs feed other nodes.
+  `error.data` is `{"wires": [{"from": {node, port}, "to": {node, port}}]}` and
+  nothing is written. With `"force": true` the node and those inputs are
+  removed together, and the response lists them under `removed_wires`.
+- `invalid_request`: anything else the engine refuses, such as an unknown node
+  or port, an input that is already wired (unwire it first), no such wire, or
+  an edit that would leave the graph invalid (the last node cannot be removed).
+
+Loops and levelization are not judged by these verbs; `graph.validate` and
+`graph.levels` are the full check. `error.data` is present only on these two
+refusals. The verbs are additive: the protocol version stays 1, and a daemon
+without them answers `unknown_verb`.
 
 Every engine writer of a workspace file holds that same lock across its
 check-and-write: `cerulion node create/delete/modify`, `node stage`,
