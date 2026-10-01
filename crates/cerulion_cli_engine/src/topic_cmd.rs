@@ -5594,7 +5594,6 @@ mod tests {
         };
         // A discovered robot is presence evidence without configured endpoints.
         let out = render_remote_topics_section(&disc, false);
-        let window_ms = REMOTE_QUERY_GATHER_WINDOW.as_millis();
         assert_eq!(
             out,
             format!(
