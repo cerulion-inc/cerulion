@@ -380,7 +380,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
     // One file cannot be both the verdict and the bag: refuse the collision by
     // name rather than let the second writer clobber the first.
     if let (Some(out), Some(rep)) = (&record_out, &report) {
-        if out == rep {
+        if same_destination(out, rep) {
             return Err(format!(
                 "`--record-out` and `--report` name the same file ({}). The report is a JSON \
                  verdict and the output is a bag; give each its own path.",
@@ -566,6 +566,45 @@ impl ResimReport {
                 .map(|s| (s.rank, s.node_id.clone(), s.count))
                 .collect(),
         }
+    }
+}
+
+/// Whether two output paths name the same file, however each is spelled.
+///
+/// Neither need exist yet, so an existing path is resolved whole (following any
+/// symlink) and a new one by its parent directory plus its file name. `out.mcap`
+/// and `./out.mcap` compare equal; so do a path and a symlink to it.
+pub fn same_destination(a: &Path, b: &Path) -> bool {
+    fn resolve(p: &Path) -> PathBuf {
+        if let Ok(full) = p.canonicalize() {
+            return full;
+        }
+        let parent = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        match (parent.canonicalize(), p.file_name()) {
+            (Ok(dir), Some(name)) => dir.join(name),
+            _ => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
+        }
+    }
+    resolve(a) == resolve(b)
+}
+
+/// The final exit code once a `--record-out` bag may have failed to finish.
+///
+/// A requested bag that could not be finished must not vanish under exit 0, so a
+/// passing run becomes an internal error. Any other code (a crash, a violation, a
+/// divergence) is a verdict of its own and stands.
+#[cfg(unix)]
+fn artifact_exit(code: u8, record_out_failed: bool) -> u8 {
+    if code == EXIT_PASS && record_out_failed {
+        replay_cmd::ReplayError::Internal {
+            reason: String::new(),
+        }
+        .exit_code()
+    } else {
+        code
     }
 }
 
@@ -790,7 +829,9 @@ pub fn run_resim(
     // An existing file is never overwritten, and least of all the input bag. A
     // path that is already there is a usage error, refused before any work.
     if let Some(out) = &options.record_out_path {
-        if out.exists() {
+        // `symlink_metadata`, not `exists`: a dangling symlink is a name the
+        // writer cannot take either, and `exists` would call it free.
+        if out.symlink_metadata().is_ok() {
             eprintln!(
                 "Error: `--record-out {}` already exists. Give it a path that does not, so a \
                  recording is never overwritten.",
@@ -810,7 +851,11 @@ pub fn run_resim(
             if let Some(out) = &outcome.record_out {
                 eprintln!("re-executed frames written to {out}");
             }
-            resim_exit_code(&report, verify)
+            let code = resim_exit_code(&report, verify);
+            if let (EXIT_PASS, Some(why)) = (code, &outcome.record_out_error) {
+                eprintln!("Error: {why}");
+            }
+            artifact_exit(code, outcome.record_out_error.is_some())
         }
         // The typed-error half of the contract is identical in both modes:
         // every `ReplayError` means the re-execution could not be performed (or
@@ -1253,6 +1298,71 @@ mod tests {
             ..resim("all")
         })
         .is_ok());
+    }
+
+    /// Two spellings of one path are one file: the collision check must see
+    /// through `./`, `..` and a symlink, neither file needing to exist.
+    #[cfg(unix)]
+    #[test]
+    fn same_destination_sees_through_spellings_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let plain = d.join("out.mcap");
+        assert!(same_destination(&plain, &d.join(".").join("out.mcap")));
+        std::fs::create_dir(d.join("sub")).unwrap();
+        assert!(same_destination(
+            &plain,
+            &d.join("sub").join("..").join("out.mcap")
+        ));
+        std::fs::write(&plain, b"x").unwrap();
+        std::os::unix::fs::symlink(&plain, d.join("link")).unwrap();
+        assert!(same_destination(&plain, &d.join("link")));
+        // ANTI-TAUTOLOGY: different files are different.
+        assert!(!same_destination(&plain, &d.join("other.mcap")));
+        // The resolver refuses the aliased pair by name.
+        let err = resolve_play_mode(PlayFlags {
+            verify: true,
+            report: Some(d.join(".").join("out.mcap")),
+            record_out: Some(plain),
+            ..resim("all")
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--record-out") && err.contains("--report"),
+            "{err}"
+        );
+    }
+
+    /// A dangling symlink is a name that is taken: refused with exit 2, and the
+    /// link is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_record_out_is_refused_as_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("dangling.mcap");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+        let code = run_resim(
+            &dir.path().join("no_such_input.mcap"),
+            &ResimSelection::All,
+            false,
+            ResimOptions {
+                record_out_path: Some(link.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(code, EXIT_USAGE);
+        assert!(link.symlink_metadata().is_ok());
+    }
+
+    /// A bag that could not be finished turns a passing run into exit 5 in BOTH
+    /// modes, and never replaces a verdict that already failed.
+    #[cfg(unix)]
+    #[test]
+    fn an_unfinished_record_out_fails_a_passing_run_only() {
+        assert_eq!(artifact_exit(EXIT_PASS, true), 5);
+        assert_eq!(artifact_exit(EXIT_PASS, false), EXIT_PASS);
+        assert_eq!(artifact_exit(EXIT_NODE_FAILURE, true), EXIT_NODE_FAILURE);
+        assert_eq!(artifact_exit(EXIT_VIOLATION, true), EXIT_VIOLATION);
     }
 
     /// An output path that already exists is a usage error (exit 2), refused

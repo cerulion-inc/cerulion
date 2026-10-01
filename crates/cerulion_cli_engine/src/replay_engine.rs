@@ -515,6 +515,11 @@ pub struct ReplayOutcome {
     /// readers ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_out: Option<String>,
+    /// Why the `--record-out` bag could not be finished, when it could not. The
+    /// bag is removed in that case. Not part of the report: the surface decides
+    /// the exit code, because only it knows whether a verdict was asked for.
+    #[serde(skip)]
+    pub record_out_error: Option<String>,
 }
 
 /// The verdict's coordination PROVENANCE line, verbatim.
@@ -3726,8 +3731,10 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         },
         abort_marker,
     );
-    if let Some(Ok(path)) = &record_out_result {
-        outcome.record_out = Some(path.clone());
+    match &record_out_result {
+        Some(Ok(path)) => outcome.record_out = Some(path.clone()),
+        Some(Err(e)) => outcome.record_out_error = Some(e.to_string()),
+        None => {}
     }
 
     if let Some((rank, e)) = aborted {
@@ -3750,17 +3757,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         return Err(e);
     }
     persist_report(report_path.as_deref(), &outcome)?;
-    // The same precedence as the report: a requested artifact never silently
-    // vanishes under exit 0, and never shadows a failing verdict's own code.
-    if let Some(Err(e)) = record_out_result {
-        if outcome.passed {
-            return Err(e);
-        }
-        tracing::error!(
-            error = %e,
-            "replay: could not finish the --record-out bag; the FAILING replay verdict below \
-             is UNAFFECTED and its exit code stands"
-        );
+    // A bag that could not be finished is reported on the outcome, not raised
+    // here: the engine does not know whether a verdict was asked for, and the
+    // surface keeps a failing verdict's own exit code while never letting a
+    // requested artifact vanish under exit 0.
+    if let Some(e) = &outcome.record_out_error {
+        tracing::error!(error = %e, "replay: could not finish the --record-out bag");
     }
 
     // Drop order: the pass runtimes + their ports are ALL already gone — each
@@ -4430,6 +4432,7 @@ fn assemble_outcome(
         divergence_classes,
         report_version: REPORT_VERSION,
         record_out: None,
+        record_out_error: None,
     }
 }
 
@@ -10495,6 +10498,7 @@ fn run_rank_pass(
         pass.trailing_frames,
         &mut partitionings,
         pass.record_out.as_ref(),
+        &injectors,
     )?;
     // The injectors live behind the pass's ONE injection lock, so
     // the scheduler's intra-step hook — which runs inside `runtime.step()` and
@@ -12760,6 +12764,10 @@ struct Capture {
     /// The `--record-out` sink: every drained frame is also written to it,
     /// before the diff looks at it. `None` on every run that did not ask.
     record_out: Option<Arc<crate::resim_record_out::RecordOut>>,
+    /// The publisher id of this pass's injector for the topic, when the pass
+    /// both produces and injects it (a split multi-publisher topic). Its frames
+    /// are the input bag's, so `--record-out` skips them.
+    injected_origin: Option<u128>,
 }
 
 /// The per-topic tolerance comparison plan attached
@@ -13053,10 +13061,16 @@ impl Capture {
             for sample in scratch.drain(..) {
                 // `--record-out` sees every frame the graph published, including
                 // those the diff below skips, and a write failure is the run's.
+                // A frame this pass's own injector re-published is the input
+                // bag's, not the graph's, so it is not written. This is opt-in
+                // output I/O: a run without the flag never reaches it.
                 if let Some(sink) = &self.record_out {
-                    if let Err(e) = sink.write_frame(self.subscriber.topic(), sample.payload()) {
-                        outcome = Err(e);
-                        break;
+                    if self.injected_origin != Some(sample.origin()) {
+                        if let Err(e) = sink.write_frame(self.subscriber.topic(), sample.payload())
+                        {
+                            outcome = Err(e);
+                            break;
+                        }
                     }
                 }
                 // Rule 5d: once a record-side-lossy topic's gap has been
@@ -13909,6 +13923,8 @@ fn open_captures(
     // The `--record-out` sink every capture writes its drained frames to, if the
     // run asked for one.
     record_out: Option<&Arc<crate::resim_record_out::RecordOut>>,
+    // This pass's injectors, for the id whose frames `--record-out` must skip.
+    injectors: &IndexMap<String, Injector>,
 ) -> Result<IndexMap<String, Capture>, ReplayError> {
     let mut captures = IndexMap::new();
     for topic in produced {
@@ -13961,6 +13977,7 @@ fn open_captures(
                         tolerance: capture_tolerance,
                         partitions: partitionings.remove(topic),
                         record_out: record_out.cloned(),
+                        injected_origin: injectors.get(topic).map(Injector::publisher_id),
                     },
                 );
             }
@@ -24246,6 +24263,7 @@ mod capture_drain_tests {
             &BTreeMap::new(),
             &mut BTreeMap::new(),
             None,
+            &IndexMap::new(),
         )
         .expect("open_captures builds a data-only capture tap");
         let cap = captures

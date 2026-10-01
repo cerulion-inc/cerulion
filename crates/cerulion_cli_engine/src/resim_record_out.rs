@@ -32,8 +32,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use cerulion_bag::{
-    BagChannel, BagWriter, BagWriterConfig, ChannelProvisioning, FileSink, TopicSchema,
-    DESCRIPTOR_VERSION, SCHEMA_ENCODING,
+    BagChannel, BagSchemaCatalog, BagWriter, BagWriterConfig, ChannelProvisioning, FileSink,
+    TopicSchema, DESCRIPTOR_VERSION, SCHEMA_ENCODING,
 };
 use cerulion_core::wire::WireHeader;
 
@@ -49,6 +49,9 @@ pub struct RecordOutPlan {
     pub path: PathBuf,
     /// The input bag's user channels (reserved `__cerulion/` channels excluded).
     pub channels: Vec<BagChannel>,
+    /// The input bag's schema catalog, if it carries one. The output gets the
+    /// part of it its own channels use, so custom types stay readable.
+    pub catalog: Option<BagSchemaCatalog>,
 }
 
 /// An open `--record-out` bag. Shared by every rank's pass behind one lock; the
@@ -106,7 +109,11 @@ impl RecordOut {
     /// (a node added since the recording) cannot copy one, so it is skipped
     /// with a warning rather than invented or failed.
     pub(crate) fn open(plan: RecordOutPlan, produced: &[String]) -> Result<Self, ReplayError> {
-        let RecordOutPlan { path, channels } = plan;
+        let RecordOutPlan {
+            path,
+            channels,
+            catalog,
+        } = plan;
         let mut schemas = Vec::new();
         let mut provisioning: BTreeMap<String, ChannelProvisioning> = BTreeMap::new();
         for topic in produced {
@@ -161,6 +168,17 @@ impl RecordOut {
                 out.path.display()
             ))
         })?;
+        let mut writer = writer;
+        if let Some(catalog) = catalog {
+            // Only what the exported channels use, the way the recorder prunes.
+            let used = catalog.closure_for_hashes(schemas.iter().map(|s| s.schema_hash));
+            writer.write_schema_catalog(&used).map_err(|e| {
+                internal(format!(
+                    "--record-out cannot write the schema catalog of '{}': {e}",
+                    out.path.display()
+                ))
+            })?;
+        }
         *out.writer.get_mut().unwrap_or_else(|p| p.into_inner()) = Some(writer);
         Ok(out)
     }
@@ -171,9 +189,15 @@ impl RecordOut {
         if !self.registered.contains(topic) {
             return Ok(());
         }
-        let (seq, ts) = WireHeader::read_from_buf(frame)
-            .map(|h| (h.sequence, h.timestamp_ns))
-            .unwrap_or((0, 0));
+        // A frame with no wire header has no sequence or timestamp to record, and
+        // a zero would claim values the frame never carried.
+        let Some(header) = WireHeader::read_from_buf(frame) else {
+            return Err(internal(format!(
+                "--record-out cannot write a frame of '{topic}': it is {} bytes, shorter than                  the wire header, so it has no sequence or timestamp to record",
+                frame.len()
+            )));
+        };
+        let (seq, ts) = (header.sequence, header.timestamp_ns);
         let mut guard = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         let Some(writer) = guard.as_mut() else {
             return Err(internal(format!(
@@ -214,5 +238,107 @@ impl Drop for RecordOut {
             // that was writing it already reports its own failure.
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cerulion_bag::{BagReader, SchemaDescriptor};
+    use cerulion_core::{SchemaDoc, SchemaEncoding, SchemaHashName};
+
+    const HASH: u64 = 0x11;
+
+    fn channel(topic: &str) -> BagChannel {
+        BagChannel {
+            id: 1,
+            topic: topic.to_string(),
+            schema_name: "go/State".to_string(),
+            schema_encoding: SCHEMA_ENCODING.to_string(),
+            message_encoding: SCHEMA_ENCODING.to_string(),
+            descriptor: Some(SchemaDescriptor {
+                descriptor_version: DESCRIPTOR_VERSION,
+                hash_recipe: cerulion_core::trace::bag::HASH_RECIPE,
+                schema_hash: HASH,
+                wire_fixed_size: 8,
+            }),
+            provisioning: ChannelProvisioning::default(),
+        }
+    }
+
+    fn catalog() -> BagSchemaCatalog {
+        let doc = |q: &str| SchemaDoc {
+            qualified: q.to_string(),
+            encoding: SchemaEncoding::Msg,
+            text: "float32 q\n".to_string(),
+            deps: Vec::new(),
+        };
+        BagSchemaCatalog::new(
+            vec![doc("go/State"), doc("go/Unrelated")],
+            vec![
+                SchemaHashName {
+                    schema_hash: HASH,
+                    qualified: "go/State".to_string(),
+                },
+                SchemaHashName {
+                    schema_hash: 0x22,
+                    qualified: "go/Unrelated".to_string(),
+                },
+            ],
+        )
+    }
+
+    fn open(dir: &std::path::Path, with_catalog: bool) -> (RecordOut, PathBuf) {
+        let path = dir.join("out.mcap");
+        let plan = RecordOutPlan {
+            path: path.clone(),
+            channels: vec![channel("/state")],
+            catalog: with_catalog.then(catalog),
+        };
+        (
+            RecordOut::open(plan, &["/state".to_string()]).expect("opens"),
+            path,
+        )
+    }
+
+    fn frame(seq: u32, ts: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; WireHeader::SIZE + 8];
+        WireHeader::new(HASH, seq, ts).write_to_buf(&mut buf);
+        buf
+    }
+
+    /// A frame shorter than the wire header has no sequence or timestamp, so
+    /// writing it is refused rather than stamped with zeros.
+    #[test]
+    fn a_headerless_frame_is_refused_not_stamped_with_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, _) = open(dir.path(), false);
+        let err = out.write_frame("/state", &[1, 2, 3]).unwrap_err();
+        assert!(err.to_string().contains("wire header"), "{err}");
+        // ANTI-TAUTOLOGY: a full frame on the same sink is accepted.
+        out.write_frame("/state", &frame(7, 99))
+            .expect("full frame");
+    }
+
+    /// The output keeps the input's schema definitions for the types it still
+    /// carries, and only those.
+    #[test]
+    fn the_output_carries_the_pruned_schema_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, path) = open(dir.path(), true);
+        out.write_frame("/state", &frame(1, 5)).unwrap();
+        out.finalize().unwrap();
+        let got = BagReader::open(&path)
+            .unwrap()
+            .schema_catalog()
+            .expect("catalog");
+        let names: Vec<&str> = got.docs.iter().map(|d| d.qualified.as_str()).collect();
+        assert_eq!(names, ["go/State"], "pruned to the exported channel's type");
+
+        // ANTI-TAUTOLOGY: an input with no catalog yields an output with none.
+        let dir = tempfile::tempdir().unwrap();
+        let (out, path) = open(dir.path(), false);
+        out.finalize().unwrap();
+        assert!(BagReader::open(&path).unwrap().schema_catalog().is_none());
     }
 }

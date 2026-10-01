@@ -2021,6 +2021,8 @@ fn read_record_out(path: &Path) -> RecordedOut {
         ),
         "the output bag must be finalized"
     );
+    // The writer declares its reserved channels up front, so they are not
+    // listed here; what the output must not do is put a message on one.
     let channels = reader
         .channels()
         .expect("channels")
@@ -2028,13 +2030,18 @@ fn read_record_out(path: &Path) -> RecordedOut {
         .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
         .map(|c| (c.topic, c.schema_name))
         .collect();
-    let messages = reader
+    let messages: Vec<_> = reader
         .messages()
         .expect("messages")
         .map(|m| m.expect("a readable message"))
-        .filter(|m| !m.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
         .map(|m| (m.topic, m.sequence, m.log_time, m.data))
         .collect();
+    assert!(
+        messages
+            .iter()
+            .all(|(t, ..)| !t.starts_with(cerulion_bag::RESERVED_PREFIX)),
+        "the output must carry no reserved message, in particular no scheduler trace"
+    );
     (channels, messages)
 }
 

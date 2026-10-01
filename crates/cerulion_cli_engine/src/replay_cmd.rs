@@ -1305,6 +1305,20 @@ pub struct ReplayOptions {
 pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, ReplayError> {
     tracing::debug!(bag = ?bag, "replay: opening bag");
 
+    // One file cannot be both the `--report` JSON and the `--record-out` bag,
+    // whatever the two paths are spelled like. Checked at the engine boundary so
+    // no caller can have the report truncate the finished bag.
+    if let (Some(out), Some(rep)) = (&opts.record_out_path, &opts.report_path) {
+        if crate::resim_cmd::same_destination(out, rep) {
+            return Err(ReplayError::Internal {
+                reason: format!(
+                    "--record-out and --report name the same file ({})",
+                    out.display()
+                ),
+            });
+        }
+    }
+
     // 1. Open — read the whole file. Missing/unreadable → BagOpen (exit 2).
     let reader = BagReader::open(bag).map_err(|source| ReplayError::BagOpen {
         path: bag.to_path_buf(),
@@ -1781,7 +1795,11 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
                 .into_iter()
                 .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
                 .collect();
-            Ok(crate::resim_record_out::RecordOutPlan { path, channels })
+            Ok(crate::resim_record_out::RecordOutPlan {
+                path,
+                channels,
+                catalog: reader.schema_catalog(),
+            })
         })
         .transpose()?;
 

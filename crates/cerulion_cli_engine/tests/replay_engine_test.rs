@@ -4223,6 +4223,7 @@ fn failing_outcome_skeleton() -> ReplayOutcome {
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
         record_out: None,
+        record_out_error: None,
     }
 }
 
@@ -4383,6 +4384,7 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
         record_out: None,
+        record_out_error: None,
     };
 
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
@@ -4999,6 +5001,7 @@ fn render_verdict_trace_divergence_section_exact_lines() {
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
         record_out: None,
+        record_out_error: None,
     };
 
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
@@ -5098,6 +5101,7 @@ fn render_verdict_trace_divergence_non_positional_exact_lines() {
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
         record_out: None,
+        record_out_error: None,
     };
 
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
@@ -11977,6 +11981,7 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
         record_out: None,
+        record_out_error: None,
     };
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
     assert!(
@@ -24586,6 +24591,7 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
         record_out: None,
+        record_out_error: None,
     };
 
     // SURFACE 2 — the verdict.
