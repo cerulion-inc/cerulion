@@ -21363,6 +21363,11 @@ fn a_peer_ending_shorter_holds_the_covered_range_at_the_declared_minimum() {
 
     let outcome = replay(&bag, mp_slow_b_factories, None, None)
         .expect("a capture declaring its own fold is honoured, never refused");
+    // The VERDICT first. Without it this arm passes on any replay that merely
+    // returned Ok, which is how it passed while the comparator was reporting
+    // `ExtraMessages` on two topics: the trailing band was deducted from the
+    // recorded side only.
+    assert_clean_verdict(&outcome, "a peer ending shorter");
     let range = outcome
         .covered_range
         .as_ref()
@@ -21380,6 +21385,100 @@ fn a_peer_ending_shorter_holds_the_covered_range_at_the_declared_minimum() {
         "a frame stamped between the declared 15 ms and rank 0's 20 ms must be \
          counted beyond coverage: {:?}",
         range.trailing_frames
+    );
+}
+
+/// The trailing band is excluded from BOTH sides of the frame count.
+///
+/// The covered range excludes a band from the verdict. The recorded side was
+/// already short by the band's width, and the replay re-executes rank 0's own
+/// boundary stream, which runs PAST a declared endpoint that sits below rank 0's
+/// last boundary, so the replay re-produces frames in that band too. Deducting
+/// from the recorded side alone invented a difference of exactly the band's width
+/// and published it as `ExtraMessages` on every rank 0 owned topic.
+///
+/// HAND ORACLE, every count written down as its own number. The fixture's four
+/// steps carry boundary targets 5, 10, 15 and 20 ms. Rank 1's trace is trimmed to
+/// step 2, so the declared fold is 15 ms, rank 0's own last boundary is 20 ms, and
+/// the band is the 15 to 20 ms gap between them. Per rank 0 owned topic:
+///
+/// * recorded frames: 4, one per step;
+/// * recorded frames beyond `through_ns`: 1, the step 3 frame at 20 ms, which is
+///   the number the report publishes as `trailing_frames`;
+/// * REPLAYED frames beyond `through_ns`: 1, because the replay window is rank 0's
+///   boundary stream and runs all four steps, so it re-emits that same frame;
+/// * compared: 4 minus 1 against 4 minus 1, so 3 against 3, and CLEAN.
+///
+/// The two deductions are 1 and 1 HERE and that is the case this arm pins. They
+/// are not equal in general: on a tail-race bag the recorded frames beyond the
+/// endpoint sit above rank 0's last boundary, the replay cannot emit them, and the
+/// replayed deduction is 0 while the recorded one is not. That direction is pinned
+/// by `a_capture_whose_frames_outran_its_trace_replays_to_its_covered_range`, which
+/// a deduction of the recorded count from both sides turns red.
+///
+/// Without the replayed deduction this compares 3 against 4 and publishes
+/// `ExtraMessages` on both rank 0 owned topics.
+///
+/// The arm asserts the trailing count per topic and that EVERY checked topic
+/// passed, not just the verdict: a clean verdict alone is also what a reader that
+/// stopped reporting a covered range at all would produce, and a passing count
+/// alone would not show the band was measured.
+#[test]
+#[serial]
+fn the_trailing_band_leaves_the_frame_count_balanced_on_both_sides() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_band_both_sides.mcap");
+    write_multi_rank_bag_with_declared_range(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        15_000_000,
+    );
+
+    // PRECONDITION: each rank 0 owned topic really carries 4 frames, so "1 in the
+    // band" below is a count off this fixture and not an assumption.
+    for topic in ["/mp2/src_a1/out", "/mp2/src_a2/out"] {
+        assert_eq!(
+            rec.messages[topic].len(),
+            4,
+            "PRECONDITION: {topic} carries one frame per step"
+        );
+    }
+
+    let outcome = replay(&bag, mp_slow_b_factories, None, None)
+        .expect("a declared fold below rank 0's last boundary is honoured");
+    assert_clean_verdict(&outcome, "the band on both sides");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert_eq!(range.through_ns, 15_000_000, "the declared fold");
+    for topic in ["/mp2/src_a1/out", "/mp2/src_a2/out"] {
+        assert_eq!(
+            range.trailing_frames.get(topic).copied(),
+            Some(1),
+            "one frame per rank 0 owned topic sits in the 15 to 20 ms band: {:?}",
+            range.trailing_frames
+        );
+    }
+    // And every topic the comparator CHECKED came out equal, which is what says
+    // the two deductions landed on the same band rather than that the comparison
+    // was skipped.
+    assert_eq!(
+        outcome.topics_passed, outcome.topics_checked,
+        "every checked topic compares equal once the band is off both sides: \
+         {} of {}",
+        outcome.topics_passed, outcome.topics_checked
+    );
+    assert!(
+        outcome.topics_checked >= 3,
+        "all three produced topics are judged, so the band is not being dodged by \
+         an unjudged topic: {}",
+        outcome.topics_checked
     );
 }
 

@@ -4002,7 +4002,32 @@ fn assemble_outcome(
                 continue;
             }
         }
-        let replayed_count = summary.map_or(0, |c| c.replayed_count);
+        // The band the replay ACTUALLY re-produces comes off this side, which is
+        // what makes the covered range an exclusion rather than a penalty. The
+        // recorded side is already short by `trailing_frames[topic]` (see
+        // `replayed_frame_count`), and where the declared endpoint sits below rank
+        // 0's last boundary the replay runs on past it and emits frames in the
+        // band. Leaving this side whole is then a difference of exactly the band's
+        // width, published as `ExtraMessages`: on a k>1 capture declaring its own
+        // fold, 4 recorded frames against 4 replayed read as 3 against 4.
+        //
+        // It is `CoveredRange::reproduced` and NOT the trailing count, because the
+        // two differ exactly where it matters. On a tail-race bag the trailing
+        // frames sit ABOVE rank 0's last boundary and the replay never emits them,
+        // so deducting the trailing count here reports `MissingMessages` on a
+        // clean bag: five arms of this binary read that, among them
+        // `a_capture_whose_frames_outran_its_trace_replays_to_its_covered_range`.
+        //
+        // Neither deduction can mask an imbalance, because every violation class
+        // reads the DIFFERENCE between the counts: a replay that under-produces
+        // inside the band still lands short, and one that over-produces beyond it
+        // still lands long.
+        let replayed_count = summary.map_or(0, |c| c.replayed_count).saturating_sub(
+            covered_range
+                .as_ref()
+                .and_then(|c| c.reproduced.get(topic).copied())
+                .unwrap_or(0),
+        );
         let byte_violation = summary.and_then(|c| c.byte_violation);
         let partition_counts = summary.and_then(|c| c.partition_counts.clone());
         let tolerance_violations = summary
@@ -4685,6 +4710,14 @@ fn seed_rung_name(rung: SeedRung) -> &'static str {
 /// MISSING every frame before them — a total FAIL of a byte-identical node,
 /// which is exactly the reading the sequence seed exists to prevent one layer
 /// down. Saturating, so a stale count can only ever under-report.
+///
+/// A band is taken off the REPLAYED side as well, at the compare site, because
+/// the covered range excludes frames from the verdict and excluding them from one
+/// side only is a difference of the band's width reported as a divergence. The
+/// two deductions are NOT the same number: this side loses every frame beyond
+/// `through_ns`, that side loses only the ones the replay can re-produce
+/// ([`CoveredRange::reproduced`]), which is those at or below rank 0's own last
+/// boundary.
 fn replayed_frame_count(
     recorded_messages: &RecordedMessages,
     topic: &str,
@@ -5043,6 +5076,22 @@ struct CoveredRange {
     through_ns: u64,
     /// Per GRAPH-PRODUCED topic, recorded frames stamped beyond `through_ns`.
     trailing: BTreeMap<String, usize>,
+    /// Per GRAPH-PRODUCED topic, the subset of [`Self::trailing`] the REPLAY
+    /// re-produces: frames stamped above `through_ns` and at or below rank 0's
+    /// own last recorded boundary.
+    ///
+    /// The replay window ends at rank 0's last boundary, so a frame stamped above
+    /// that is one the replay cannot emit and this count excludes it. EMPTY
+    /// whenever `through_ns` is rank 0's last boundary, which is every derived
+    /// range and every declaration clamped up to it; non-empty only when a
+    /// DECLARED range ends below it, the capture whose peer ended shorter.
+    ///
+    /// It exists because the two sides of the frame count must have the same band
+    /// removed, and [`Self::trailing`] is the wrong number for this side in one
+    /// direction: on a tail-race bag the trailing frames sit ABOVE rank 0's last
+    /// boundary and the replay never emits them, so deducting them here reports
+    /// `MissingMessages` on a clean bag.
+    reproduced: BTreeMap<String, usize>,
     /// `true` when the READER derived this range (a multi-rank
     /// lockstep bag that declared nothing — see [`resolve_covered_range`]),
     /// `false` when the bag DECLARED it in its Flashback manifest. Carried
@@ -5082,8 +5131,11 @@ struct CoveredRange {
 /// the fold over ranks instead, which is a different question, see
 /// [`earliest_last_boundary_target`]), so frames past it are outside what a
 /// resim can re-execute
-/// whatever else is true — un-judgeable by check 3 (nothing to match) and
-/// un-comparable by the diff (never re-produced). They are classified
+/// whatever else is true: un-judgeable by check 3, which has nothing for them to
+/// match. They are NOT un-comparable: a DECLARED range can end below rank 0's own
+/// last boundary, and the replay runs rank 0's stream, so it re-produces frames
+/// inside the band. The comparator excludes them from BOTH sides of the frame
+/// count rather than from the recorded side alone. They are classified
 /// TRAILING: in the bag, readable, reported (never silent — see
 /// [`CoveredRangeReport::derived`] and the render note), excluded from the
 /// verdict. Everything the boundary stream can still judge reaches check 3 at
@@ -5301,6 +5353,11 @@ fn resolve_covered_range(
     // would count the remainder as trailing and skip it, which is check 4's
     // own evidence being discarded before check 4 runs.
     let mut trailing: BTreeMap<String, usize> = BTreeMap::new();
+    // The upper edge of what the REPLAY can emit: its window is rank 0's boundary
+    // stream, so a frame above this is beyond re-production whatever the declared
+    // range says. `None` is the no-boundary bag the refusals above already own.
+    let replay_ceiling_ns = last_recorded_boundary_target(trace)?.unwrap_or(through_ns);
+    let mut reproduced: BTreeMap<String, usize> = BTreeMap::new();
     let produced_set: BTreeSet<&str> = produced.iter().map(|s| s.as_str()).collect();
     recorded_messages.for_each_frame(&mut |topic, frame| {
         if !produced_set.contains(topic) {
@@ -5319,6 +5376,11 @@ fn resolve_covered_range(
         if let Some(header) = WireHeader::read_from_buf(frame) {
             if is_beyond_covered(header.timestamp_ns, through_ns) {
                 *trailing.entry(topic.to_string()).or_default() += 1;
+                // Inside the band the replay still runs, so this frame has a
+                // replayed twin that must come off that side too.
+                if header.timestamp_ns <= replay_ceiling_ns {
+                    *reproduced.entry(topic.to_string()).or_default() += 1;
+                }
             }
         }
     })?;
@@ -5344,6 +5406,7 @@ fn resolve_covered_range(
     Ok(Some(CoveredRange {
         through_ns,
         trailing,
+        reproduced,
         derived,
     }))
 }
