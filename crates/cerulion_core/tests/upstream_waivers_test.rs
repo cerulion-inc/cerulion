@@ -48,6 +48,7 @@
 //! written under still hold, and it names what to do when they stop.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The waiver reason's stable head, as every waived arm's `cfg_attr` spells it.
@@ -1003,11 +1004,22 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
         deps_dir().display()
     );
     if checked_binaries == 0 {
-        eprintln!(
+        // Written to the stdout HANDLE rather than through `println!`. libtest
+        // captures what the print macros emit and shows it only for a FAILING
+        // test, so a notice sent through them is absent from the one run it has
+        // to appear in: the green one, where the arm passed having asked libtest
+        // nothing. A write to the handle is not captured and lands in the log
+        // beside the `ok` line. Measured both ways on a passing test: without
+        // `--nocapture` only the handle write appears, with it all three do.
+        let mut out = std::io::stdout().lock();
+        writeln!(
+            out,
             "skip: this invocation built none of the {} waived binaries, so there \
              is nothing to ask libtest (the source scan still covers them)",
             by_binary.len()
-        );
+        )
+        .expect("report the vacuous pass on stdout");
+        out.flush().expect("flush the vacuous-pass notice");
         return;
     }
     // ALL or NONE, PER CRATE. A run that asked some of a crate's waived binaries
@@ -1021,8 +1033,8 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
     // `cerulion_cli_engine` target, so an inventory-wide rule would make the
     // ordinary per-crate command unpassable while offering a remedy that does not
     // exist. Per crate, that run reads one crate fully asked and the other fully
-    // unasked, which are both honest, and CI, which builds both, still gets the
-    // whole rule.
+    // unasked; neither of those overstates what was put to libtest, and CI, which
+    // builds both, still gets the whole rule.
     // Distinct BINARIES per crate, not inventory rows: several arms share one
     // binary and the question here is which binaries were asked.
     let mut by_crate: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
