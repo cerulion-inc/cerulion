@@ -125,7 +125,7 @@ case "$expect" in
         # RMW_GATE_SKIP_SERIAL_SUITE=1 AND the lane is not x86_64 (serial_suite_runs in harvest.sh,
         # self-tested in gate_selftest.sh). The emulated aarch64 leg sets it; the x86_64 lanes run the
         # suite unconditionally, so a skip variable leaked into a shared env cannot empty their floors.
-        if serial_suite_runs; then
+        if serial_suite_runs "$(uname -m)"; then
             tlog="/tmp/rmw_test_${distro}.log"
             echo "== rmw serial suite on $distro (every target, no fail-fast) =="
             cargo test --locked -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
@@ -208,13 +208,17 @@ case "$expect" in
         # is set and the staged prefix is FIRST on both search paths, under a hard
         # wall. Clean iox SHM BEFORE EACH invocation (the previous invocation and
         # the serial suite, when it ran, both leave services behind).
-        # [N3] The serial suite compiles the exchange test target; when the suite is
+        # The serial suite compiles the exchange test target; when the suite is
         # deferred (emulated leg) nothing has, and the test-target build (it flips the
         # test-seams/test-helpers features on two in-tree crates) would otherwise fall
-        # inside a per-exchange wall. Compile it ONCE here, OUTSIDE every wall, so each
-        # timed invocation below is a build-cache hit that only RUNS its one test.
+        # inside a per-exchange wall. Compile it ONCE here, OUTSIDE every wall, UNDER the
+        # SAME AMENT_PREFIX_PATH the timed invocations use: rmw_cerulion's build.rs
+        # declares rerun-if-env-changed on it, so a pre-build with a different prefix is
+        # rebuilt inside the first wall; matched, each timed invocation below is a
+        # build-cache hit that only RUNS its one test.
         echo "== pre-build the rclpy exchange test target on $distro (outside the per-exchange wall) =="
-        cargo test --locked -p rmw_cerulion --release --test rclpy_xproc_test --no-run 2>&1 | tee "/tmp/rmw_rclpy_${distro}_build.log"
+        env AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH" \
+            cargo test --locked -p rmw_cerulion --release --test rclpy_xproc_test --no-run 2>&1 | tee "/tmp/rmw_rclpy_${distro}_build.log"
         [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "GATE FAIL: $distro rclpy exchange test target did not compile"; exit 1; }
         # Each run logs to its OWN file and is judged off the colour-stripped copy
         # (no truncating pipe on cargo). One passing invocation per name IS the

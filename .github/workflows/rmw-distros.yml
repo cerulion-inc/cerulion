@@ -338,7 +338,7 @@ jobs:
           grep -qE '^ELF TEETH OK: .*AArch64$' "$plain" \
             || { echo "::error::teeth: the built .so was not confirmed AArch64"; exit 1; }
 
-          # 4) [N2/N6] the in-process serial suite must NOT have run on this emulated
+          # 4) the in-process serial suite must NOT have run on this emulated
           #    leg, and the skip + policy lines must be present: the deferral is proven,
           #    not assumed, and the policy line that names the deferred tests cannot be
           #    dropped (or the skip flipped on elsewhere) without reddening here.
