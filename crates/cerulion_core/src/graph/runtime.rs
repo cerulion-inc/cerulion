@@ -12115,6 +12115,34 @@ impl GraphRuntime {
     /// telemetry line's job (it logs deltas from an entry snapshot); callers
     /// wanting a windowed view should snapshot-and-subtract the same way.
     ///
+    /// The `data_wake` term this runtime resolved: the park's doorbell rung
+    /// decision, read from the one decision site the rung and the wait policy
+    /// line both take.
+    ///
+    /// Read-only. The baseline argument is `true` because a baseline is taken
+    /// per park entry rather than here, which is the same value the wait policy
+    /// line passes.
+    pub fn data_wake_rung_for_test(&self) -> bool {
+        doorbell_rung_applies(
+            self.monitor_wait_policy.doorbell(),
+            crate::doorbell::wake_word_block_primitive_available(),
+            self.doorbell_registry.is_some(),
+            true,
+            self.doorbell_registry
+                .as_ref()
+                .is_some_and(|r| r.primary().is_some()),
+        )
+    }
+
+    /// The topic the park would arm a kernel wake on, or `None` when this
+    /// runtime has no such line. Read-only.
+    pub fn doorbell_primary_topic_for_test(&self) -> Option<String> {
+        self.doorbell_registry
+            .as_ref()
+            .and_then(|r| r.primary_topic())
+            .map(str::to_string)
+    }
+
     /// The barrier-arrival wake counter is NOT part of this tuple
     /// (kept stable for existing callers); it is surfaced via the exit
     /// telemetry line's `wakes_barrier` field and, in tests, via
@@ -13380,16 +13408,7 @@ impl GraphRuntime {
             graph = %self.config.identity(),
             park_active = self.park_active(),
             doorbell = self.doorbell_registry.is_some(),
-            data_wake = doorbell_rung_applies(
-                self.monitor_wait_policy.doorbell(),
-                crate::doorbell::wake_word_block_primitive_available(),
-                self.doorbell_registry.is_some(),
-                // The baseline is taken per park entry, never here.
-                true,
-                self.doorbell_registry
-                    .as_ref()
-                    .is_some_and(|r| r.primary().is_some()),
-            ),
+            data_wake = self.data_wake_rung_for_test(),
             barrier = self.barrier_participant.is_some(),
             credit_edges = self.credit_park_edges.len(),
             primary_topic = tracing::field::display(

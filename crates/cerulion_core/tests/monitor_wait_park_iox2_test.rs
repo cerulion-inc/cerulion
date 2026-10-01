@@ -215,6 +215,73 @@ fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn
     (config, factories)
 }
 
+/// A TWO-node chain inside ONE runtime: the period `Ticker` publishes `out` and
+/// the data-trigger `Consumer` triggers on it, so every trigger topic of this
+/// graph is produced by a node this runtime owns.
+///
+/// This is the single-process shape. A park that arms a kernel wake on such a
+/// topic waits for a write only the blocked thread can make, so the rung must
+/// decline here and the park must stay on its bounded recheck.
+fn in_process_chain_graph(
+    observed: Arc<Mutex<Vec<f64>>>,
+    fires: Arc<AtomicU64>,
+) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_chain".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![
+            NodeDef {
+                fuse: None,
+                ros2: None,
+                id: "ticker".to_string(),
+                node_type: "ticker".to_string(),
+                inputs: vec![],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "geometry_msgs/Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            },
+            NodeDef {
+                fuse: None,
+                ros2: None,
+                id: "consumer".to_string(),
+                node_type: "consumer".to_string(),
+                inputs: vec![InputDef {
+                    name: "inp".to_string(),
+                    source: "ticker/out".to_string(),
+                }],
+                outputs: vec![],
+            },
+        ],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "ticker".to_string(),
+        Box::new(TickerEntry::with_state(Ticker {
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "consumer".to_string(),
+        Box::new(ConsumerEntry::with_state(Consumer {
+            observed: Arc::clone(&observed),
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    (config, factories)
+}
+
 /// A one-node data-trigger `Consumer` of `/mwp/ext` + factories, sharing
 /// `observed` / `fires`. `id` == factory-map key.
 fn consumer_graph(
@@ -508,6 +575,88 @@ fn doorbell_data_graph_builds_registry_and_flows_data() {
         observed, observed_b,
         "two doorbell-policy runs must produce byte-identical observed values"
     );
+}
+
+/// A graph whose every data-trigger topic is produced by a node THIS runtime
+/// owns must resolve no primary line and no data wake.
+///
+/// A kernel wake armed on such a topic waits for a write only the blocked thread
+/// can make, so the park would hold its slice out and then find the message at
+/// the recheck it was going to make anyway. The decision is read from the
+/// runtime's own resolved state, the one site the wait policy line also reads,
+/// never from that line's text.
+#[test]
+#[serial]
+fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = in_process_chain_graph(Arc::clone(&observed), Arc::clone(&fires));
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("chainprim")),
+    )
+    .expect("build the in-process chain graph");
+    assert_eq!(
+        runtime.doorbell_primary_topic_for_test(),
+        None,
+        "every trigger topic of this graph is produced by a node this runtime \
+         owns, so no peer can ring one and the park must arm none"
+    );
+    assert!(
+        !runtime.data_wake_rung_for_test(),
+        "with no ringable line the data-wake rung must decline, so the park keeps \
+         its bounded recheck instead of blocking for a write only this thread makes"
+    );
+    runtime.shutdown();
+}
+
+/// The positive control for the arm above, and the shape a declared two-group
+/// split gives its second group: the trigger topic has NO producer in this
+/// runtime, so a peer process rings it and the rung is right to arm.
+///
+/// Judged in BOTH directions against the host fact the rung is gated on, so a
+/// host without the Apple os_sync family is a judged arm rather than a skipped
+/// one.
+#[test]
+#[serial]
+fn a_trigger_with_no_in_graph_producer_resolves_a_primary_and_arms_the_rung() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = consumer_graph(Arc::clone(&observed), Arc::clone(&fires));
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("extprim")),
+    )
+    .expect("build the external-producer consumer graph");
+    assert_eq!(
+        runtime.doorbell_primary_topic_for_test().as_deref(),
+        Some(EXT_TOPIC),
+        "the trigger topic has no producer in this runtime, so it is exactly the \
+         line a peer rings and the park must arm it"
+    );
+    let armed = runtime.data_wake_rung_for_test();
+    if cerulion_core::doorbell::wake_word_block_primitive_available() {
+        assert!(
+            armed,
+            "with a ringable line and a host that can kernel-block on one, the \
+             data-wake rung must arm"
+        );
+    } else {
+        assert!(
+            !armed,
+            "with no wake word on this host the rung must decline even though the \
+             line is ringable, and no sibling term may arm it"
+        );
+    }
+    runtime.shutdown();
 }
 
 /// A doorbell RING landing inside a park window is attributed to the DOORBELL
