@@ -407,7 +407,7 @@ fn n_is_clamped_to_twenty_and_zero_is_refused() {
     // A count beyond u32 is still a request, clamped like any other large one.
     let huge = client.sample(topic, 4_294_967_296);
     assert_eq!(huge["ok"].as_bool(), Some(true), "{huge}");
-    assert!(rows(&huge).len() <= 20, "{huge}");
+    assert_eq!(rows(&huge).len(), 20, "{huge}");
 
     // Omitting `n` gives the default of five.
     let default = client.request(&format!(

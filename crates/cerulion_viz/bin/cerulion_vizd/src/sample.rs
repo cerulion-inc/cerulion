@@ -363,10 +363,11 @@ fn array_json(len: usize, items: impl Iterator<Item = Value>, budget: &mut usize
     wrap_array(len, head)
 }
 
-/// A short array renders as itself; a longer one as `{"len":N,"head":[...]}`,
-/// so a client can tell "these are all of them" from "these are the first few".
+/// An array renders as itself only when `head` holds every element; a longer
+/// one, or one the value budget cut short, as `{"len":N,"head":[...]}`, so a
+/// client can tell "these are all of them" from "these are the first few".
 fn wrap_array(len: usize, head: Vec<Value>) -> Value {
-    if len <= FIELD_MAX_ARRAY {
+    if len <= FIELD_MAX_ARRAY && head.len() == len {
         return Value::Array(head);
     }
     let mut map = Map::new();
@@ -826,6 +827,20 @@ mod tests {
             }
         }
         assert!(values <= FIELD_MAX_NODES + 1, "{values} values emitted");
+    }
+
+    #[test]
+    fn a_short_array_cut_by_the_budget_keeps_its_length() {
+        let bytes = [7u8; FIELD_MAX_ARRAY];
+        let mut fields: Vec<NamedValue<'_>> = (0..FIELD_MAX_NODES - 1)
+            .map(|i| nv(&format!("f{i:04}"), FrameValueKind::I32(i as i32)))
+            .collect();
+        fields.push(nv("zdata", FrameValueKind::Bytes(&bytes)));
+        let got = json_of(&msg("t/Cut", fields));
+        let data = got.get("zdata").expect("the array field");
+        assert_eq!(data.get("len").and_then(Value::as_u64), Some(16), "{data}");
+        let head = data.get("head").and_then(Value::as_array).expect("head");
+        assert!(head.is_empty(), "no budget left for elements: {data}");
     }
 
     #[test]

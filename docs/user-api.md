@@ -2672,8 +2672,8 @@ a larger number is clamped to 20 and `0` is refused). `fields` is the decoded
 message as `{field: value}`, or `null` when the daemon holds no schema for the
 frame, the frame is larger than 16 KiB (an image or a point cloud keeps `seq`,
 `ts_ns` and `size` only), or it did not decode; `summary` is a one line label, or
-the reason `fields` is `null`. An array of more than 16 elements is
-`{"len":N,"head":[first 16]}`, and NaN and the infinities are the strings `"NaN"`,
+the reason `fields` is `null`. An array of more than 16 elements, or one cut short by the 512 value limit, is
+`{"len":N,"head":[the values kept]}`, and NaN and the infinities are the strings `"NaN"`,
 `"inf"` and `"-inf"`. One decoded frame emits at most 512 values; past that the
 remaining fields are replaced by one `"..."` entry. A byte array (`uint8[]` and
 `int8[]`) is shown as unsigned values from 0 to 255. The `summary` shows a number
