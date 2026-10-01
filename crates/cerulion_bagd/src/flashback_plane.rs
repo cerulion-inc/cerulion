@@ -2064,11 +2064,18 @@ pub(crate) struct CaptureManifest<'a> {
     /// The gating-clock instant this capture's `resimmable` claim
     /// extends TO: the MINIMUM over the ranks that kept a boundary of each
     /// rank's last kept step-boundary target. It is rank 0's own last target
-    /// only when no rank was trimmed or ended shorter than rank 0, because a
-    /// resume covers the graph only as far as its slowest rank.
+    /// exactly when rank 0's is the minimum, which holds wherever no rank ended
+    /// shorter than rank 0 and can hold when one did, because equal consecutive
+    /// targets are legal. The MINIMUM is what the field carries because a resume
+    /// covers the graph only as far as its slowest rank.
     ///
     /// The range's OTHER endpoint is already stated: `anchor_target_ns` for a
-    /// resume, or the run's own step 0 for a from-start capture. What was
+    /// resume, or the run's own step 0 for a from-start capture. The two fold in
+    /// OPPOSITE directions on a multi rank capture: this END is the earliest last
+    /// kept boundary across the ranks that kept one, what the slowest rank can
+    /// back, while the resume's START is the authoritative rank's own first kept
+    /// boundary, because the replay window is rank 0's boundary stream by
+    /// construction. What was
     /// missing was the upper one, and its absence is what made the verdict a
     /// confident-false: a capture's frame window ends one writer cycle past its
     /// trace window (see
@@ -4931,9 +4938,12 @@ mod tests {
     /// The rule itself is oracle-tested in `trace_window`; this is the WIRING —
     /// without it the recovery exists and nothing calls it, and every arm over
     /// there stays green (the inert-shipping shape). The straddle it drives is
-    /// the ordinary one: `AnchorWindow::select` returns an `AnchorSelection`,
-    /// the newest eligible checkpoint for EACH ring at or before the deadline,
-    /// and the eligible band's lower edge IS the floor,
+    /// the ordinary one: `AnchorWindow::select` returns an `AnchorSelection`
+    /// carrying three outcomes per ring: the newest eligible checkpoint at or
+    /// before the deadline; nothing at all for a ring with no candidate, which
+    /// lands in `shortfall` instead; and, when no candidate reaches the deadline,
+    /// the OLDEST candidate stamped `AnchorFit::NewerThanTheClaimedWindow`. The
+    /// eligible band's lower edge IS the floor,
     /// so a boundary drained one pass before its own anchor sits below it.
     #[test]
     fn select_trace_recovers_an_anchor_target_drained_below_the_capture_floor() {

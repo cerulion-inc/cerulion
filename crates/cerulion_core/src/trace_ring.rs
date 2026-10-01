@@ -528,8 +528,10 @@ pub const DEPARTURE_RING_RANK: u32 = u32::MAX;
 /// `last_recorded_boundary_target` reads, is one term of that fold: it is the
 /// whole answer on a single-rank capture and wherever no rank ended shorter than
 /// rank 0, and it is also the endpoint the replay engine DERIVES for a
-/// continuous multi-rank recording, which declares no value for either side to
-/// agree with. Neither side is mode-gated. So
+/// continuous multi-rank LOCKSTEP recording, which declares no value for either
+/// side to agree with; under the FREE-RUN default that derivation is mode-gated
+/// off and such a bag reports no covered range at all. The two FOLDS are not
+/// mode-gated, which is the property this constant has to keep. So
 /// the constant lives in the crate both already depend on, beside the wire form
 /// it describes.
 pub const AUTHORITATIVE_TRACE_RANK: u32 = 0;
@@ -538,8 +540,9 @@ pub const AUTHORITATIVE_TRACE_RANK: u32 = 0;
 /// record — the SHARED condition, so a capture's verdict cannot drift from the
 /// gate.**
 ///
-/// `run_replay` walks the trace channel once and refuses on four things
-/// (`replay_cmd.rs`, the loop at 628-722). A Flashback capture decides whether it
+/// `run_replay` walks the trace channel once and refuses on four things, through
+/// `classify_trace_record` (`replay_cmd.rs:1553-1605`). A Flashback capture
+/// decides whether it
 /// may claim `resimmable` by asking the SAME questions, and the whole point of
 /// putting them here is that there is one copy: a refusal added to the replay
 /// gate without a matching arm in the judge is exactly how a bag comes to be
