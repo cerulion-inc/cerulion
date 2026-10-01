@@ -47,6 +47,10 @@ cargo test -p go2_tf                             # pure codec, no globals
 
 ## Gotchas
 
+- URDF numeric attributes are strict: malformed or non-finite vectors fail with
+  XML location context. Only absent attributes receive defaults; never silently
+  replace invalid supplied geometry with zeros.
+
 - `MemorySinkStorage::num_msgs()` counts CHUNKS and the micro-batcher compacts
   same-entity rows - exact-count oracles need distinct entities or
   `flush_blocking()` boundaries. Never call `Mesh3D::sanity_check()`.

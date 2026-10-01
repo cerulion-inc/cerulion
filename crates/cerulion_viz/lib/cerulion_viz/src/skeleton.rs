@@ -620,19 +620,49 @@ pub enum UrdfError {
     /// The document declared no `<link>`s.
     #[error("URDF has no <link> elements")]
     NoLinks,
+    /// An explicitly supplied geometry vector is malformed or cannot reach the renderer.
+    #[error("URDF <{element}> {attribute} at line {line}: expected three finite numbers representable as f32, got {value:?}")]
+    InvalidVector {
+        /// XML element carrying the attribute.
+        element: String,
+        /// Attribute name within that element.
+        attribute: String,
+        /// One-based XML source line.
+        line: u32,
+        /// The rejected attribute value.
+        value: String,
+    },
 }
 
-/// Split whitespace-separated floats into a fixed `[f64; 3]` (missing/garbage
-/// components default to 0 — a lenient parse for the demo).
-fn parse_vec3(s: &str) -> [f64; 3] {
-    let mut it = s
-        .split_whitespace()
-        .map(|t| t.parse::<f64>().unwrap_or(0.0));
-    [
-        it.next().unwrap_or(0.0),
-        it.next().unwrap_or(0.0),
-        it.next().unwrap_or(0.0),
-    ]
+/// Read an optional vector attribute. Defaults apply only when the attribute is
+/// absent; malformed values never become plausible geometry at the origin.
+fn vector_attribute(
+    node: Option<roxmltree::Node<'_, '_>>,
+    attribute: &str,
+    default: [f64; 3],
+) -> Result<[f64; 3], UrdfError> {
+    let Some((node, value)) = node.and_then(|n| n.attribute(attribute).map(|v| (n, v))) else {
+        return Ok(default);
+    };
+    let invalid = || UrdfError::InvalidVector {
+        element: node.tag_name().name().to_string(),
+        attribute: attribute.to_string(),
+        line: node.document().text_pos_at(node.range().start).row,
+        value: value.to_string(),
+    };
+    let mut components = value.split_whitespace();
+    let mut vector = [0.0; 3];
+    for component in &mut vector {
+        *component = components
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (*v as f32).is_finite())
+            .ok_or_else(invalid)?;
+    }
+    if components.next().is_some() {
+        return Err(invalid());
+    }
+    Ok(vector)
 }
 
 /// The `link` attribute of a joint's `<parent>` / `<child>` child element.
@@ -645,20 +675,15 @@ fn joint_link_ref(joint: roxmltree::Node<'_, '_>, tag: &str) -> String {
         .to_string()
 }
 
-/// A joint's `<origin xyz rpy>` (both default to zero).
-fn joint_origin(joint: roxmltree::Node<'_, '_>) -> ([f64; 3], [f64; 3]) {
-    let origin = joint
+/// Read a joint or visual's origin, with identity defaults for absent attributes.
+fn parse_origin(element: roxmltree::Node<'_, '_>) -> Result<([f64; 3], [f64; 3]), UrdfError> {
+    let origin = element
         .children()
         .find(|n| n.is_element() && n.tag_name().name() == "origin");
-    let xyz = origin
-        .and_then(|n| n.attribute("xyz"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3]);
-    let rpy = origin
-        .and_then(|n| n.attribute("rpy"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3]);
-    (xyz, rpy)
+    Ok((
+        vector_attribute(origin, "xyz", [0.0; 3])?,
+        vector_attribute(origin, "rpy", [0.0; 3])?,
+    ))
 }
 
 /// Parse a `<link>`'s first MESH `<visual>` into a [`RawVisual`], or `None` when
@@ -668,63 +693,47 @@ fn joint_origin(joint: roxmltree::Node<'_, '_>) -> ([f64; 3], [f64; 3]) {
 /// mesh visual, and taking the first `<visual>` unconditionally would silently
 /// drop the mesh. Tolerant: a link with zero mesh visuals (no `<visual>`, only
 /// non-`<mesh>` geometries, or only empty `filename`s) degrades to `None` — it
-/// never fails the whole URDF load. The `<origin>` (default identity) and the
-/// mesh `scale` (default `[1,1,1]`) are optional.
-fn parse_link_visual(link: roxmltree::Node<'_, '_>) -> Option<RawVisual> {
-    link.children()
-        .filter(|n| n.is_element() && n.tag_name().name() == "visual")
-        .find_map(parse_mesh_visual)
+/// missing mesh does not fail the URDF load. The `<origin>` (default identity)
+/// and mesh `scale` (default `[1,1,1]`) are optional; malformed supplied vectors
+/// return an error.
+fn parse_link_visual(link: roxmltree::Node<'_, '_>) -> Result<Option<RawVisual>, UrdfError> {
+    for visual in link.children().filter(|n| n.has_tag_name("visual")) {
+        if let Some(mesh) = parse_mesh_visual(visual)? {
+            return Ok(Some(mesh));
+        }
+    }
+    Ok(None)
 }
 
-/// Parse ONE `<visual>` element into a [`RawVisual`] iff it carries a
-/// `<geometry><mesh filename="...">` with a non-empty filename; `None` otherwise
-/// (a primitive-geometry or empty-filename visual — see [`parse_link_visual`],
-/// which skips these and scans on).
-fn parse_mesh_visual(visual: roxmltree::Node<'_, '_>) -> Option<RawVisual> {
-    let geometry = visual
+/// Read the first mesh in one visual. A missing mesh remains a supported
+/// stick-figure fallback; malformed transforms on a mesh are an import error.
+fn parse_mesh_visual(visual: roxmltree::Node<'_, '_>) -> Result<Option<RawVisual>, UrdfError> {
+    let mesh = visual
         .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "geometry")?;
-    let mesh = geometry
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "mesh")?;
-    let filename = mesh.attribute("filename").filter(|f| !f.is_empty())?;
-
-    // The <visual> origin (both xyz + rpy default to identity).
-    let origin = visual
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "origin");
-    let origin_xyz = origin
-        .and_then(|n| n.attribute("xyz"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3]);
-    let origin_rpy = origin
-        .and_then(|n| n.attribute("rpy"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3]);
-    // A mesh with no `scale` attr is unit-scaled (parse_vec3 would default an
-    // absent value to 0 — wrong for scale — so the default is explicit).
-    let scale = mesh.attribute("scale").map(parse_vec3).unwrap_or([1.0; 3]);
-
-    Some(RawVisual {
+        .find(|n| n.has_tag_name("geometry"))
+        .and_then(|n| n.children().find(|n| n.has_tag_name("mesh")));
+    let Some(mesh) = mesh else { return Ok(None) };
+    let Some(filename) = mesh.attribute("filename").filter(|f| !f.is_empty()) else {
+        return Ok(None);
+    };
+    let (origin_xyz, origin_rpy) = parse_origin(visual)?;
+    let scale = vector_attribute(Some(mesh), "scale", [1.0; 3])?;
+    Ok(Some(RawVisual {
         mesh_filename: filename.to_string(),
         origin_xyz,
         origin_rpy,
         scale,
-    })
+    }))
 }
 
-/// A joint's `<axis xyz>` (defaults to zero — fine for fixed joints).
-fn joint_axis(joint: roxmltree::Node<'_, '_>) -> [f64; 3] {
-    joint
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "axis")
-        .and_then(|n| n.attribute("xyz"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3])
+/// URDF defaults an omitted motion axis to X; fixed joints ignore their axis.
+fn joint_axis(joint: roxmltree::Node<'_, '_>) -> Result<[f64; 3], UrdfError> {
+    let axis = joint.children().find(|n| n.has_tag_name("axis"));
+    vector_attribute(axis, "xyz", [1.0, 0.0, 0.0])
 }
 
 /// Parse a URDF XML string into a resolved [`UrdfModel`] using the default
-/// (Go2) [`UrdfConfig`]. Byte-identical to the pre-config parse.
+/// (Go2) [`UrdfConfig`]. Invalid numeric geometry returns an explicit error.
 fn parse_urdf(xml: &str) -> Result<UrdfModel, UrdfError> {
     parse_urdf_with_config(xml, &UrdfConfig::default())
 }
@@ -747,7 +756,7 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
             "link" => {
                 if let Some(name) = node.attribute("name") {
                     links.push(name.to_string());
-                    if let Some(vis) = parse_link_visual(node) {
+                    if let Some(vis) = parse_link_visual(node)? {
                         link_visuals.insert(name.to_string(), vis);
                     }
                 }
@@ -761,8 +770,8 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
                 };
                 let parent = joint_link_ref(node, "parent");
                 let child = joint_link_ref(node, "child");
-                let (xyz, rpy) = joint_origin(node);
-                let axis = joint_axis(node);
+                let (xyz, rpy) = parse_origin(node)?;
+                let axis = joint_axis(node)?;
                 if !name.is_empty() && !parent.is_empty() && !child.is_empty() {
                     joints.push(UrdfJoint {
                         name,
@@ -836,7 +845,7 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
         .map(|jname| {
             joints
                 .iter()
-                .find(|j| j.name == *jname)
+                .find(|j| j.name == *jname && matches!(j.kind, JointKind::Revolute))
                 .map(|j| MotorBinding {
                     joint_name: j.name.clone(),
                     child_entity: link_entity.get(&j.child).cloned().unwrap_or_else(|| {
@@ -1647,6 +1656,49 @@ mod tests {
     }
 
     #[test]
+    fn motor_angles_only_animate_revolute_and_continuous_joints() {
+        for kind in [
+            "fixed",
+            "prismatic",
+            "floating",
+            "planar",
+            "revolute",
+            "continuous",
+        ] {
+            for axis in ["", r#"<axis xyz="1 0 0"/>"#] {
+                let xml = format!(
+                    r#"<robot name="test"><link name="base"/><link name="tip"/>
+                    <joint name="joint" type="{kind}"><parent link="base"/><child link="tip"/>{axis}</joint></robot>"#
+                );
+                let config = UrdfConfig {
+                    motor_joints: vec!["joint".into()],
+                    ..UrdfConfig::default()
+                };
+                let mut skeleton = Skeleton::from_urdf_str_with_config(&xml, &config).unwrap();
+                let (rec, storage) = rerun::RecordingStreamBuilder::new("motion_kinds")
+                    .memory()
+                    .unwrap();
+                rec.flush_blocking().unwrap();
+                let before = storage.num_msgs();
+                let frame = FrameValue {
+                    schema_name: "unitree_go/LowState".into(),
+                    fields: vec![NamedValue {
+                        name: "motor_state".into(),
+                        value: FrameValueKind::Array(vec![motor_state_value(1.0)]),
+                    }],
+                };
+                skeleton.log_joint_angles(&rec, 1_000, &frame);
+                rec.flush_blocking().unwrap();
+                assert_eq!(
+                    storage.num_msgs() > before,
+                    matches!(kind, "revolute" | "continuous"),
+                    "unexpected angular transform for {kind} with axis {axis:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reads_leg_motor_qs_from_array_of_nested() {
         // Build a LowState-shaped value: motor_state = Array of 20 MotorState
         // nested values, q = index as radians (a distinct oracle per motor).
@@ -1924,6 +1976,79 @@ mod tests {
     }
 
     #[test]
+    fn malformed_geometry_vectors_are_rejected_instead_of_replaced_with_zero() {
+        for vector in [
+            "",
+            "1 2",
+            "1 2 3 4",
+            "1 nope 3",
+            "NaN 0 0",
+            "inf 0 0",
+            "1e100 0 0",
+        ] {
+            for attribute in [
+                format!("<origin xyz=\"{vector}\"/>"),
+                format!("<origin rpy=\"{vector}\"/>"),
+                format!("<axis xyz=\"{vector}\"/>"),
+            ] {
+                let xml = format!(
+                    r#"<robot name="test"><link name="a"/><link name="b"/>
+                    <joint name="joint" type="revolute"><parent link="a"/><child link="b"/>{attribute}</joint></robot>"#
+                );
+                assert!(
+                    parse_urdf(&xml).is_err(),
+                    "accepted joint vector: {attribute}"
+                );
+            }
+            let visual_rpy = mesh_urdf("body.glb", "0 0 0", "1 1 1").replace(
+                "<origin xyz=\"0 0 0\"/>",
+                &format!("<origin rpy=\"{vector}\"/>"),
+            );
+            assert!(
+                parse_urdf(&visual_rpy).is_err(),
+                "accepted visual rpy: {vector:?}"
+            );
+            for (origin, scale) in [(vector, "1 1 1"), ("0 0 0", vector)] {
+                let xml = mesh_urdf("body.glb", origin, scale);
+                assert!(
+                    parse_urdf(&xml).is_err(),
+                    "accepted visual: origin={origin:?}, scale={scale:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn geometry_errors_locate_the_attribute_and_valid_numbers_keep_their_values() {
+        let xml = r#"<robot name="test"><link name="base"><visual>
+<origin xyz="1 wrong 3"/><geometry><mesh filename="body.glb"/></geometry>
+</visual></link></robot>"#;
+        assert_eq!(
+            parse_urdf(xml).unwrap_err(),
+            UrdfError::InvalidVector {
+                element: "origin".into(),
+                attribute: "xyz".into(),
+                line: 2,
+                value: "1 wrong 3".into(),
+            }
+        );
+        let xml = mesh_urdf("body.glb", " +1e-1  -2.5  3 ", "1 2 0.5");
+        let model = parse_urdf(&xml).unwrap();
+        assert_eq!(model.link_visuals["base"].origin_xyz, [0.1, -2.5, 3.0]);
+        assert_eq!(model.link_visuals["base"].scale, [1.0, 2.0, 0.5]);
+    }
+
+    #[test]
+    fn omitted_revolute_axis_uses_urdf_x_axis_default() {
+        let xml = r#"<robot name="test"><link name="a"/><link name="b"/>
+            <joint name="joint" type="revolute"><parent link="a"/><child link="b"/></joint></robot>"#;
+        let model = parse_urdf(xml).unwrap();
+        assert_eq!(model.joints[0].axis, [1.0, 0.0, 0.0]);
+        assert_eq!(model.joints[0].xyz, [0.0; 3]);
+        assert_eq!(model.joints[0].rpy, [0.0; 3]);
+    }
+
+    #[test]
     fn parse_link_visual_extracts_mesh_origin_and_scale() {
         // A full mesh visual → the exact hand-parsed values.
         let urdf = mesh_urdf(
@@ -1945,8 +2070,7 @@ mod tests {
         // The non-visual links carry no entry.
         assert!(!model.link_visuals.contains_key("FR_hip"));
 
-        // An absent scale defaults to unit (parse_vec3 would default an absent
-        // value to 0 — this proves the [1,1,1] default is explicit).
+        // An absent scale defaults to unit, independently of origin defaults.
         let no_scale = r#"<?xml version="1.0"?>
 <robot name="ns">
   <link name="base">
