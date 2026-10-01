@@ -2915,35 +2915,22 @@ fn render_robots_section(robots: &[RobotRow], peers: &[DiscoveredPeer]) -> Strin
 ///
 /// With NO remote topic the `REMOTE TOPICS` header is not printed at all: the
 /// section collapses to the ONE line of `render_remote_none_discovered`, so
-/// a local-only desk (the quickstart) ends its listing with a single `remote:`
-/// line instead of a header plus a paragraph; when a `ROBOTS` section did
-/// render, a blank line separates it from that line. The line is EXPLICIT about the
-/// BOUNDED gather: an empty result means nothing answered within the
-/// [`REMOTE_QUERY_GATHER_WINDOW`], NOT a definitive "no robot exists". A query
-/// FAILURE never reaches this renderer; it stays a distinct loud error at the
-/// dispatch site.
+/// a local-only desk ends its listing with a single `remote:` line instead of
+/// a header plus a paragraph. Empty-topic diagnostics distinguish observed
+/// presence, configured endpoints without presence, and no endpoints. An empty
+/// result means nothing answered within the [`REMOTE_QUERY_GATHER_WINDOW`], NOT
+/// a definitive "no robot exists". A query FAILURE stays a distinct loud error
+/// at the dispatch site.
 pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool) -> String {
     let mut out = render_robots_section(&disc.robots, &disc.peers);
     let topics = &disc.topics;
     if topics.is_empty() {
-        // The "pass --connect tcp/<host>:7683" escape is
-        // misleading once a peer is ALREADY reachable: either the user passed
-        // a locator (`had_endpoints`), a presence row proved a live gateway
-        // (announce/mDNS), OR the ladder's mDNS rung got a browse answer (an
-        // intrinsically-live gateway). In those cases the accurate message is
-        // "a reachable peer just didn't advertise a topic in time", not "go
-        // find a peer". Cache/hostname/scan
-        // candidates are not reachability evidence: a dead cached robot must
-        // not suppress the --connect escape for 7 days of TTL.
-        let reachable = had_endpoints
-            || !disc.robots.is_empty()
-            || disc.peers.iter().any(|p| p.rung == DiscoveryRung::Mdns);
-        if !out.is_empty() {
-            // A ROBOTS section preceded: keep a blank line
-            // so the notice reads as its own paragraph.
-            out.push('\n');
-        }
-        out.push_str(&render_remote_none_discovered(reachable));
+        let has_presence =
+            !disc.robots.is_empty() || disc.peers.iter().any(|p| p.rung == DiscoveryRung::Mdns);
+        out.push_str(&render_remote_none_discovered(
+            has_presence,
+            had_endpoints,
+        ));
         return out;
     }
     out.push_str("\nREMOTE TOPICS\n");
@@ -2959,23 +2946,23 @@ pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool)
 /// empty answer reads as "nobody answered in N ms", never "no robot exists")
 /// and the escape that fits the evidence:
 ///
-/// - `reachable == false` (no locator given, no robot row, no mDNS answer):
-///   the `--connect tcp/<host>:7683` hint, for a robot scouting cannot reach
-///   (7683 is the well-known permissive-gateway port).
-/// - `reachable == true` (a given locator, a discovered robot, or an mDNS
-///   browse answer): a peer IS reachable and simply advertised no topic within
-///   the window (a busy peer, or no networked publisher alive yet; a
-///   liveliness token exists only while one is), so the hint is `retry`, and
-///   the `--connect` escape is deliberately absent: telling an operator whose
-///   robot is already on screen to go find it is noise.
+/// - Presence: a discovered robot advertised no topic within the window.
+/// - Configured endpoints without presence: reachability is unconfirmed.
+/// - No endpoints or presence: the `--connect` hint for a robot scouting cannot reach.
 ///
 /// Pure; oracle-tested below.
-fn render_remote_none_discovered(reachable: bool) -> String {
+fn render_remote_none_discovered(has_presence: bool, had_endpoints: bool) -> String {
     let window_ms = REMOTE_QUERY_GATHER_WINDOW.as_millis();
-    if reachable {
+    if has_presence {
         format!(
-            "remote: none discovered in {window_ms} ms (a reachable peer advertised no topic \
+            "remote: none discovered in {window_ms} ms (a discovered robot advertised no topic \
              in time; retry)\n"
+        )
+    } else if had_endpoints {
+        format!(
+            "remote: none discovered in {window_ms} ms (robot reachability is unconfirmed for \
+             configured endpoints; check the address, name resolution, network route, and \
+             Cerulion gateway, then retry)\n"
         )
     } else {
         format!(
@@ -5592,13 +5579,11 @@ mod tests {
         assert!(!out.contains('\u{1b}') && !out.contains('\r'));
     }
 
-    /// The ladder found +
-    /// connected a peer (shown in ROBOTS) but NO topic answered within the
-    /// window — even though the user passed no `--connect`, the correct hint is
-    /// the REACHABLE arm ("a reachable peer didn't advertise in time"), NOT the
-    /// misleading "go pass --connect" escape. Exact hand oracle.
+    /// A discovered robot is shown in ROBOTS, but no topic answered within the
+    /// window. Presence warrants the discovered-robot hint without claiming a
+    /// topic stream was established. Exact hand oracle.
     #[test]
-    fn remote_section_ladder_peers_but_no_topics_uses_reachable_hint() {
+    fn remote_section_ladder_peers_but_no_topics_uses_presence_hint() {
         let disc = RemoteDiscovery {
             topics: vec![],
             robots: vec![RobotRow {
@@ -5610,8 +5595,15 @@ mod tests {
             peers: vec![mdns_peer("found-robot", "tcp/10.0.0.9:7683")],
             announce_entries: vec![],
         };
-        // had_endpoints == false, but a discovered robot makes us reachable.
+        // A discovered robot is presence evidence without configured endpoints.
         let out = render_remote_topics_section(&disc, false);
+        let window_ms = REMOTE_QUERY_GATHER_WINDOW.as_millis();
+        let hint = format!(
+            "none discovered within the {window_ms} ms gather window — a discovered robot \
+             did not advertise a topic in time. \
+             Robots may still exist: a slow or busy peer can miss the window (retry), and \
+             liveliness tokens exist only while a networked publisher is alive\n"
+        );
         assert_eq!(
             out,
             format!(
@@ -5825,12 +5817,12 @@ mod tests {
         );
     }
 
-    /// The exact one-line REACHABLE arm (a given locator, a discovered robot, or
-    /// an mDNS answer, and no topic within the window). Hand oracle, spelled
+    /// The exact one-line presence arm (a discovered robot and no topic within
+    /// the window). Hand oracle, spelled
     /// out so a renderer change is a visible diff here, not a self-compare.
     fn reachable_none_line() -> String {
         format!(
-            "remote: none discovered in {} ms (a reachable peer advertised no topic in \
+            "remote: none discovered in {} ms (a discovered robot advertised no topic in \
              time; retry)\n",
             REMOTE_QUERY_GATHER_WINDOW.as_millis()
         )
@@ -5846,6 +5838,15 @@ mod tests {
         )
     }
 
+    fn configured_none_line() -> String {
+        format!(
+            "remote: none discovered in {} ms (robot reachability is unconfirmed for \
+             configured endpoints; check the address, name resolution, network route, and \
+             Cerulion gateway, then retry)\n",
+            REMOTE_QUERY_GATHER_WINDOW.as_millis()
+        )
+    }
+
     /// Empty + endpoints given: ONE line (no `REMOTE TOPICS` header), explicit
     /// about the BOUNDED gather window (an empty result is "nobody answered
     /// within N ms", never a definitive "no robot exists"), naming the retry
@@ -5853,7 +5854,7 @@ mod tests {
     #[test]
     fn remote_section_empty_with_endpoints_is_one_honest_line() {
         let out = render_remote_topics_section(&topics_only(&[]), true);
-        assert_eq!(out, reachable_none_line());
+        assert_eq!(out, configured_none_line());
         assert_eq!(
             out.matches('\n').count(),
             1,
@@ -5874,9 +5875,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_section_configured_endpoints_do_not_verify_cached_or_guessed_peers() {
+        for rung in [
+            DiscoveryRung::Cache,
+            DiscoveryRung::Hostname,
+            DiscoveryRung::Scan,
+        ] {
+            let disc = RemoteDiscovery {
+                peers: vec![DiscoveredPeer {
+                    robot: "candidate".into(),
+                    locator: "tcp/192.0.2.1:7683".into(),
+                    rung,
+                }],
+                ..RemoteDiscovery::empty()
+            };
+            let out = render_remote_topics_section(&disc, true);
+            assert!(out.contains("candidates (unverified)"));
+            assert!(out.contains("reachability is unconfirmed"), "{out}");
+            assert!(!out.contains("a reachable peer"), "{out}");
+        }
+    }
+
     /// Empty + no explicit endpoints: ONE line carrying the `--connect` escape
-    /// (7683 = the well-known permissive-gateway port), the bounded window, and
-    /// no `REMOTE TOPICS` header. The removed `--network` flag must NOT be named.
+    /// and bounded window, without a section header.
     #[test]
     fn remote_section_empty_without_endpoints_is_one_line_hinting_connect() {
         let out = render_remote_topics_section(&topics_only(&[]), false);

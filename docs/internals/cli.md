@@ -504,10 +504,8 @@ empty, never a hang.
   `candidates (unverified):` line: not rows, not reachability evidence. No remote
   TOPIC collapses the `REMOTE TOPICS` section to ONE
   `remote: none discovered in N ms (...)` line (`render_remote_none_discovered`), after
-  a blank line when a `ROBOTS` section rendered: the `--connect tcp/<host>:7683` hint
-  when nothing was reachable, `retry` when a peer was (a given locator, a robot row, an
-  mDNS answer). With no robot and no candidate there is no `ROBOTS` section either. A
-  populated gather keeps the header and its rows unchanged.
+  a blank line when a `ROBOTS` section rendered. A populated gather keeps the header
+  and its rows unchanged.
 - **Internal topics are hidden from the LOCAL section by default.**
   `topic_cmd::is_internal_topic` is the ONE predicate for the framework's own
   channels: the prefix list `topic_cmd::INTERNAL_TOPIC_PREFIXES` (`/__cerulion/`, its
@@ -532,6 +530,10 @@ empty, never a hang.
   `topic_cmd::render_remote_discovery_unavailable` (exact oracle; a multi-line error
   folds onto the one line, control characters are neutralized). The binary prints the
   returned string verbatim, like every other `topic list` line.
+- **Configured endpoints are not reachability evidence.** When an empty gather has
+  neither presence nor an mDNS answer, explicit `--connect`/`--listen` options produce
+  an unconfirmed-reachability hint, even if all their probes failed. Presence with no
+  topics has a separate discovered-robot hint. Neither claims a topic stream exists.
 - **Peer-cache write-back** goes through the `resolve_write_back` gate: only robots
   confirmed live write back; an announce-only row has no verified locator and is never
   cached (its old entries age toward the TTL).

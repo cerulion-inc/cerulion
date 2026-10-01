@@ -21,6 +21,8 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - `node_metadata::parse_node_metadata` is the sole port/trigger source. Raw-FFI markers optional; only `INFO_END` before `INFO_START` is fatal.
 - Never hand-compute pinned schema hashes; run `pinned_hashes` after a recipe change
   and copy its values into `topic_cmd.rs`.
+- Discovery diagnostics distinguish observed robot presence from configured endpoints;
+  a supplied locator or unverified cache/hostname candidate is not reachability proof.
 - Completions never hang, spawn, or open the network: `run_bounded` +
   `COMPLETION_BUDGET`; pinned by `completions_test`.
 - Port spellings are SIZED before acceptance; unverifiable = `CliError::SchemaUnchecked`,
