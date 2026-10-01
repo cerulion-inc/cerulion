@@ -2558,11 +2558,13 @@ fn dry_run_without_workspace_root() -> CliResult<PathBuf> {
             // degradation: an operator who cannot see why the report shows
             // no workspace schemas cannot trust its resolvability verdicts.
             // The refusal names the two remedies that keep the dry-run
-            // usable on a host with an unwritable temp dir.
+            // usable on a host with an unwritable temp dir. ASCII
+            // punctuation only: this string is shipped text, and the
+            // public-surface dash gate scans string literals.
             Err(e) => {
                 return Err(cerulion_cli_engine::error::CliError::Validation(format!(
                     "ros2 attach: could not create a temporary root for the workspace-less \
-                     dry-run at {}: {e} — the dry-run needs one writable directory outside a \
+                     dry-run at {}: {e}; the dry-run needs one writable directory outside a \
                      workspace (created empty, removed again at exit). Point TMPDIR at a \
                      writable location, or run the dry-run from inside a workspace.",
                     candidate.display()
