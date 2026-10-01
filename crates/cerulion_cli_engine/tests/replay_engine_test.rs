@@ -1203,6 +1203,33 @@ fn write_bag_with_per_input_capacities(
     );
 }
 
+/// [`write_bag_with_coordination`] plus the per-input `read_log_capacities`
+/// table and its `read_log_capacity: 0` sentinel: the seam a free-run bag needs
+/// to state WHICH STAGES the recording staged its reads on, which is the
+/// recorded half of the enforcement's stage-set comparison.
+fn write_bag_coordinated_with_capacities(
+    rec: &Recording,
+    path: &std::path::Path,
+    coordination: replay_engine::CoordinationMode,
+    capacities: serde_json::Value,
+) {
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl(
+        rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(production_recorder_json(coordination)),
+        None,
+        None,
+        Some(capacities),
+    );
+}
+
 /// [`write_bag_with_capacity`] with an ARBITRARY JSON value for
 /// the `read_log_capacity` key — the injector for a present-but-MALFORMED stamp
 /// (a hand-edited or corrupted bag), which must be distinguishable from an
@@ -35579,6 +35606,71 @@ fn an_uncovered_read_log_on_a_produced_edge_is_an_exit_2_refusal() {
     assert!(
         msg.contains("read_log_no_coverage") && msg.contains("Re-record"),
         "the refusal names the cause token and the remedy: {msg}"
+    );
+}
+
+/// **A bag that staged a gated input on TWO stages, replayed where ONE is wired,
+/// is an exit-2 REFUSAL, and the partial report carries NO verdict.**
+///
+/// The positive control's own recording, with the manifest's
+/// `read_log_capacities` rows stating what a
+/// `CERULION_DRAIN_DISCIPLINE=separate` recorder would have staged: a BODY row
+/// and a DRAIN row for the relay's one input. This replay wires the unified
+/// shape, one BODY stage, so the recording's two queues are not the ones its
+/// records would be admitted from.
+///
+/// THE CRAFT IS THE MANIFEST CLAIM ALONE, deliberately: the records stay the
+/// unified recorder's own, so before this refusal this bag replayed as if nothing
+/// were wrong, which is the silence the refusal replaces. A real
+/// separate-discipline recording carries the body reads as well, and
+/// `replay_inject`'s `a_recording_staged_on_two_stages_replayed_on_one_is_refused`
+/// pins that stream; what this arm adds is the whole path, from the bag's rows
+/// through the engine to the exit code and the report.
+///
+/// THE NARROWNESS CONTROL is `a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so`:
+/// the same recording whose rows match its replay exits 0 with the gate armed.
+#[test]
+#[serial]
+fn a_bag_whose_staged_stage_set_differs_from_the_replays_is_an_exit_2_refusal() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_stage_set_skew.mcap");
+    // `[input_idx, role, capacity]` rows: role 0 is the body stage, role 1 the
+    // drain stage, and the capacity is the ordinary consumer depth both sides
+    // derive, so the ROLE SET is the only thing that differs.
+    write_bag_coordinated_with_capacities(
+        &rec,
+        &bag,
+        replay_engine::CoordinationMode::FreeRun,
+        serde_json::json!({"relay": [[0, 0, 4], [0, 1, 4]]}),
+    );
+    let report = dir.path().join("report.json");
+
+    let err = replay(&bag, source_relay_factories, None, Some(report.clone()))
+        .expect_err("a staged stage set this replay does not wire must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_stage_set_skew")
+            && msg.contains("relay.inp")
+            && msg.contains("body + drain")
+            && msg.contains("this replay wires body"),
+        "the refusal names the cause token, the edge and BOTH stage sets: {msg}"
+    );
+
+    // The PARTIAL report is written and carries no read-log verdict: this bag is
+    // refused, never verdicted.
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the partial report is written"))
+            .expect("the partial report is JSON");
+    assert!(
+        parsed.get("read_log_verdict").is_none(),
+        "a refused bag reaches no verdict: {parsed}"
+    );
+    assert_eq!(
+        parsed["aborted"]["failed_at_rank"], 0,
+        "the one rank's prepare is where it stopped: {parsed}"
     );
 }
 

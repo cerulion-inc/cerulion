@@ -1716,6 +1716,18 @@ impl StageRoles {
             ReadStageRole::Drain => self.drain_gateable,
         }
     }
+
+    /// The stages this input owns, body before drain. The REPLAY's half of the
+    /// stage-set comparison, and what its refusal sentence names.
+    fn wired(self) -> Vec<ReadStageRole> {
+        [
+            (self.body, ReadStageRole::Body),
+            (self.drain, ReadStageRole::Drain),
+        ]
+        .into_iter()
+        .filter_map(|(exists, role)| exists.then_some(role))
+        .collect()
+    }
 }
 
 /// The name-to-index table a recorded read's input name resolves through, plus
@@ -1737,6 +1749,22 @@ pub struct StageTable {
     /// `StageKey` is a hashable identity and not an ordered one, and the list is
     /// one entry per refused stage on one rank.
     refusals: Vec<(StageKey, ReadPlanRefusal)>,
+    /// `(node, input_idx)` to the stages the RECORDING wired there, from the
+    /// bag's own `read_log_capacities` rows, which the recorder writes for every
+    /// stage the recording WIRED (staged or not, keyed on `(input_idx, role)`),
+    /// so an empty stage is present here rather than missing.
+    ///
+    /// A `Vec` and not a set because `ReadStageRole` is a two-value wire enum
+    /// with no `Ord`: the list is sorted by the wire byte on insert, which is
+    /// the body-before-drain order every sentence and every comparison here
+    /// reads.
+    ///
+    /// `None` is a bag that states none, which is every pre-stamp bag and makes
+    /// no claim to compare against. A table with rows for some inputs and not
+    /// this one is also no claim HERE: a partial table already stands the
+    /// redundant verifier down, and a second refusal on the same evidence would
+    /// refuse bags over a hole the verifier has already reported.
+    recorded: Option<BTreeMap<(String, u16), Vec<ReadStageRole>>>,
 }
 
 impl StageTable {
@@ -1766,7 +1794,57 @@ impl StageTable {
                 .iter()
                 .filter_map(|c| c.reason.clone().map(|r| (c.key.clone(), r)))
                 .collect(),
+            // A table built from the census alone states no RECORDED stage set;
+            // `with_recorded_stages` is where the bag's own rows arrive.
+            recorded: None,
         }
+    }
+
+    /// Adopt the stage set the RECORDING wired, as the bag's own staging rows
+    /// state it (`read_log_capacities`, already parsed for the rim adoption).
+    ///
+    /// Taken as STAGE KEYS rather than as the rim map, because the rims are the
+    /// verifier's business and the set of ROLES is this planner's: the two sides
+    /// of one input's stage set are what decide whether this replay performs the
+    /// reads the recording recorded.
+    #[must_use]
+    pub fn with_recorded_stages(mut self, keys: impl IntoIterator<Item = StageKey>) -> Self {
+        let mut recorded: BTreeMap<(String, u16), Vec<ReadStageRole>> = BTreeMap::new();
+        for key in keys {
+            let roles = recorded.entry((key.node, key.input_idx)).or_default();
+            if !roles.contains(&key.role) {
+                roles.push(key.role);
+            }
+        }
+        for roles in recorded.values_mut() {
+            roles.sort_by_key(|r| r.wire());
+        }
+        self.recorded = (!recorded.is_empty()).then_some(recorded);
+        self
+    }
+
+    /// Does the RECORDING's stage set for this input differ from the one this
+    /// replay wired? `Some((recorded, wired))` names both, body before drain.
+    ///
+    /// This is the one conclusive statement of a record/replay wiring skew that
+    /// needs no new wire field: the bag's rows say which stages STAGED its reads
+    /// and the census says which stages this build wires, so a difference means
+    /// the replay does not perform the reads the recording recorded. The SITES
+    /// the records stamp cannot say it: under the unified discipline the boundary
+    /// drain stamps the DRAIN site into the one BODY stage, so a site set is a
+    /// fact about call sites and not about stages.
+    #[must_use]
+    fn recorded_stage_skew(
+        &self,
+        node: &str,
+        input_idx: u16,
+        roles: StageRoles,
+    ) -> Option<(Vec<ReadStageRole>, Vec<ReadStageRole>)> {
+        let recorded = self.recorded.as_ref()?;
+        let rows = recorded.get(&(node.to_string(), input_idx))?;
+        let wired = roles.wired();
+        let same = rows.len() == wired.len() && wired.iter().all(|r| rows.contains(r));
+        (!same).then(|| (rows.clone(), wired))
     }
 
     /// The core's reason for refusing to gate this stage, when it named one.
@@ -2032,6 +2110,18 @@ pub enum AdmissionRefusalReason {
         /// Which half of the resolution failed.
         detail: String,
     },
+    /// The RECORDING staged this input's reads on a different set of stages than
+    /// this replay wires, so the two do not perform the same reads.
+    StageSetSkew {
+        /// The consuming node.
+        node: String,
+        /// The input name.
+        input: String,
+        /// The stages the recording wired, body before drain.
+        recorded: Vec<ReadStageRole>,
+        /// The stages this replay wired, body before drain.
+        wired: Vec<ReadStageRole>,
+    },
     /// A gated input's recorded name appears twice in its node's table, so the
     /// records naming it address two stages.
     InputNameDuplicated {
@@ -2057,6 +2147,7 @@ impl AdmissionRefusalReason {
             Self::UnenforceableRecord { .. } => "read_log_unenforceable_record",
             Self::InputNameUnresolved { .. } => "read_log_input_name_unresolved",
             Self::InputNameDuplicated { .. } => "read_log_input_name_duplicated",
+            Self::StageSetSkew { .. } => "read_log_stage_set_skew",
         }
     }
 
@@ -2064,9 +2155,13 @@ impl AdmissionRefusalReason {
     #[must_use]
     pub fn key(&self) -> Option<&StageKey> {
         match self {
+            // The stage-set SKEW names no single stage on purpose: its finding
+            // is the difference between two SETS, and the stages on one side of
+            // it do not exist in this replay at all. It names the EDGE.
             Self::NoCoverage { .. }
             | Self::InputNameUnresolved { .. }
-            | Self::InputNameDuplicated { .. } => None,
+            | Self::InputNameDuplicated { .. }
+            | Self::StageSetSkew { .. } => None,
             Self::RecordDropped { key, .. } | Self::UnenforceableRecord { key, .. } => Some(key),
         }
     }
@@ -2080,6 +2175,7 @@ impl AdmissionRefusalReason {
             Self::NoCoverage { .. } => None,
             Self::InputNameUnresolved { node, input, .. } => Some(format!("{node}.{input}")),
             Self::InputNameDuplicated { node, name, .. } => Some(format!("{node}.{name}")),
+            Self::StageSetSkew { node, input, .. } => Some(format!("{node}.{input}")),
             other => other.key().map(StageKey::label),
         }
     }
@@ -2138,8 +2234,40 @@ impl fmt::Display for AdmissionRefusalReason {
                  index {second_idx}), so every record naming it addresses two stages and the \
                  gate cannot tell which one read the frame. Re-record the bag with this binary"
             ),
+            Self::StageSetSkew {
+                node,
+                input,
+                recorded,
+                wired,
+            } => write!(
+                f,
+                "the recording staged '{node}.{input}' on {} and this replay wires {}, so the \
+                 two do not perform the same reads on that edge: the recording's reads would \
+                 be admitted from a different set of queues than the ones they came off, where \
+                 the gate holds a frame back for a read this replay never performs and the \
+                 unspent entry convicts a candidate that read exactly what the recording read. \
+                 Replay this bag under the drain discipline and the node builds it was \
+                 recorded with (CERULION_DRAIN_DISCIPLINE), or under \
+                 CERULION_EXECUTION_MODE=lockstep, which arms no gate",
+                render_stage_roles(recorded),
+                render_stage_roles(wired)
+            ),
         }
     }
+}
+
+/// Render the stage roles a refusal sentence names. The empty case cannot be
+/// reached from `plan_edge_admission` (an input with no wired stage does not
+/// resolve), and is spelled rather than left as an empty string.
+fn render_stage_roles(roles: &[ReadStageRole]) -> String {
+    if roles.is_empty() {
+        return "<no read stage>".to_string();
+    }
+    roles
+        .iter()
+        .map(|r| r.label())
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 /// Render a stage list for a refusal sentence.
@@ -2238,6 +2366,29 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
             Ok(v) => v,
             Err(reason) => return refused(reason),
         };
+        // The RECORD/REPLAY WIRING SKEW, before a single record is placed. The
+        // bag's own staging rows say which stages staged its reads and the
+        // census says which stages this build wires: a difference means the
+        // recording read this input at a set of queues this replay does not
+        // have, so its records cannot be placed on the stages that produced
+        // them. Both directions are reachable from one knob
+        // (`CERULION_DRAIN_DISCIPLINE`, which gives a trigger input its own
+        // drain stage) and from a node entry rebuilt between record and replay.
+        //
+        // Checked here rather than per record because the finding is the EDGE's,
+        // and refused rather than collapsed because the collapse is what charged
+        // the candidate: a separate-staged recording replayed unified put two
+        // records on one stage's step quota, and the unspent one minted a
+        // never-arrived over output frames that matched byte for byte.
+        if let Some((recorded, wired)) = stages.recorded_stage_skew(&edge.node_id, input_idx, roles)
+        {
+            return refused(AdmissionRefusalReason::StageSetSkew {
+                node: edge.node_id.clone(),
+                input: edge.input.clone(),
+                recorded,
+                wired,
+            });
+        }
         let key_of = |role: ReadStageRole| StageKey {
             node: edge.node_id.clone(),
             input_idx,
@@ -4535,6 +4686,115 @@ mod tests {
             panic!("an unresolvable input name is refused");
         };
         assert_eq!(r.reason.code(), "read_log_input_name_unresolved");
+    }
+
+    /// **A recording that staged an input on TWO stages, replayed where ONE is
+    /// wired, is REFUSED.**
+    ///
+    /// The bag's `read_log_capacities` rows are the recording's own stage set
+    /// and the census is this replay's: `body + drain` against `body` is a node
+    /// whose trigger input had its own drain queue at record time and does not
+    /// here (`CERULION_DRAIN_DISCIPLINE`, or a node entry rebuilt between the
+    /// two). The stream fed here is that recording's per-fire pair, and
+    /// `a_drain_site_read_folds_into_the_body_stage_under_the_unified_discipline`
+    /// still pins what becomes of it when the bag claims no stage set: both
+    /// records on the one wired stage, two entries in one step's quota, which a
+    /// replay that drains once leaves half unspent at sweep.
+    ///
+    /// The refusal is the EDGE's, not a stage's: half the stages it names do not
+    /// exist in this replay.
+    #[test]
+    fn a_recording_staged_on_two_stages_replayed_on_one_is_refused() {
+        let unified = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        )
+        .with_recorded_stages([
+            StageKey {
+                node: "relay".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            StageKey {
+                node: "relay".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Drain,
+            },
+        ]);
+        let reads = vec![
+            sited(0, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(0), 1),
+            sited(0, ReadSiteRole::Body, ReadKind::Served, Some(0), 1),
+        ];
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&one_edge(reads), &unified) else {
+            panic!("a recording staged on two stages is refused where one is wired");
+        };
+        assert_eq!(r.reason.code(), "read_log_stage_set_skew");
+        assert_eq!(
+            r.reason.edge_label().as_deref(),
+            Some("relay.inp"),
+            "the refusal names the EDGE: the stages it names are not all wired here"
+        );
+        let detail = r.reason.to_string();
+        assert!(
+            detail.contains("body + drain") && detail.contains("and this replay wires body"),
+            "the sentence names BOTH stage sets, recorded first: {detail}"
+        );
+    }
+
+    /// **The same stream over a bag whose rows MATCH this replay's stages plans,
+    /// and so does a bag that states no rows at all.**
+    ///
+    /// The narrowness control for
+    /// `a_recording_staged_on_two_stages_replayed_on_one_is_refused`, and the
+    /// reason that refusal reads the bag's STAGE ROWS and not the SITES its
+    /// records stamp: under the unified discipline the boundary drain stamps the
+    /// DRAIN site and stages into the one BODY stage, so a drain-stamped record
+    /// over a body-only input is the ordinary shape of every unified recording
+    /// (measured: keying the refusal on that shape fails four arms of
+    /// `replay_engine_test`, the gate's own positive control among them), and a
+    /// node that holds an input snapshot adds BODY-site records to the same
+    /// one-stage input legitimately.
+    #[test]
+    fn a_matching_or_absent_recorded_stage_set_plans() {
+        let reads = vec![
+            sited(0, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(0), 1),
+            sited(0, ReadSiteRole::Body, ReadKind::Served, Some(0), 1),
+        ];
+        let matching = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        )
+        .with_recorded_stages([StageKey {
+            node: "relay".to_string(),
+            input_idx: 0,
+            role: ReadStageRole::Body,
+        }]);
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission(&one_edge(reads.clone()), &matching)
+        else {
+            panic!("a matching stage set plans");
+        };
+        assert_eq!(plans.len(), 1, "one input, one stage: {plans:?}");
+        assert_eq!(
+            plans[0].per_step[0].due.len(),
+            2,
+            "both records land on the stage that staged them: {:?}",
+            plans[0].per_step
+        );
+
+        // A bag that states NO rows (every pre-stamp bag) makes no claim, and
+        // `StageTable::new` alone is that state.
+        let silent = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        assert!(
+            matches!(
+                plan_edge_admission(&one_edge(reads), &silent),
+                AdmissionPlan::Enforced { .. }
+            ),
+            "a bag with no staging rows is compared against nothing"
+        );
     }
 
     /// A stage the CORE refuses to gate is left ungated and NAMED, not refused.

@@ -9980,7 +9980,8 @@ fn prepare_pass_verification(
     // Period rule so its per-step clamp mirrors the scheduler's.
     catchup_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
 ) -> Result<PassVerification, ReplayError> {
-    let (recorded_inputs, producer_tokens, _rims) = match load_recorded_input_tables(trace) {
+    let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
+    {
         Ok(v) => v,
         Err(ManifestRefusal {
             cause,
@@ -10781,7 +10782,18 @@ fn prepare_pass_verification(
         ));
     }
     if !enforce_topics.is_empty() && !reads.is_empty() {
-        let stages = replay_inject::StageTable::new(&recorded_inputs, census);
+        // The bag's own staging rows ride into the planner beside the census:
+        // the rims are the verifier's business and the set of stage ROLES is the
+        // enforcement's, and this is the one place both sides of one input's
+        // stage set are in hand. An absent table states no stage set and the
+        // planner compares nothing.
+        let stages = replay_inject::StageTable::new(&recorded_inputs, census).with_recorded_stages(
+            recorded_rims
+                .per_edge
+                .iter()
+                .flat_map(|rows| rows.keys().cloned())
+                .collect::<Vec<_>>(),
+        );
         for topic in enforce_topics {
             let mut edges: Vec<replay_inject::AdmissionEdge> = Vec::new();
             for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {

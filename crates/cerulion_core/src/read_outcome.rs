@@ -5212,6 +5212,40 @@ mod tests {
         assert_eq!(plan.unplanned_consults(), 2);
     }
 
+    /// **An EMPTY step plan withholds, admits nothing and mints no violation.**
+    ///
+    /// The half of the readless-stage question that is INTENDED, pinned beside
+    /// the half that is not (`replay_inject`'s
+    /// `a_two_site_stream_over_one_wired_stage_is_refused`): a stage the
+    /// recording holds no read for at a step is armed and declares that step
+    /// empty, so the gate withholds and NOTHING is charged to the candidate. A
+    /// drain that found its queue empty writes no record at all, so most steps
+    /// of a gated stage name no read and this is the ordinary path.
+    ///
+    /// The frame the withhold leaves QUEUED is the subscriber's half
+    /// (`drain_with_accounting_impl` answers `DrainOutcome::withheld()`), which
+    /// needs a wired transport and is unreachable from this crate: the claim
+    /// here is scoped to what the gate itself does.
+    #[test]
+    fn an_empty_step_plan_withholds_admits_nothing_and_mints_no_violation() {
+        let (plan, now) = armed_plan(None);
+        at_step(&now, 3);
+        plan.install_step(3, &[]).unwrap();
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        assert_eq!(plan.admitted_this_step(), 0, "an empty plan grants nothing");
+        plan.sweep(3);
+        assert!(
+            plan.take_violations().is_empty(),
+            "a step the recording named no read for charges the candidate nothing"
+        );
+        assert_eq!(plan.admitted(), 0);
+        // The consult IS counted as refused (the refill classifier reads this
+        // witness to tell an enforced empty from an empty queue) and NOT as one
+        // the plan held no position for.
+        assert_eq!(plan.refused_consults(), 1);
+        assert_eq!(plan.unplanned_consults(), 0);
+    }
+
     /// A recorded none admits nothing and mints nothing.
     ///
     /// The arm reads the GATE only. Its earlier name claimed "even with frames
