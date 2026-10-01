@@ -52,7 +52,7 @@
 #             --test a --test b ...`
 #   --list  — print the cargo argument list and exit (no cargo, no build);
 #             what the CI log shows and what the tests assert against.
-#   --selected — answer whether <package> rides CI_SELECTED_PACKAGES, the same
+#   --selected: answer whether <package> rides CI_SELECTED_PACKAGES, the same
 #             reading the run mode gates on, as an exit code (0 rides, 1 does
 #             not) plus one `selection:` line. For a workflow step that spends
 #             something before this script's run step is reached.
