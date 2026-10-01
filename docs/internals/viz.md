@@ -177,9 +177,9 @@ lockstep with the rest of the `re_*` graph).
   different buffers on the same path, and either alone is not enough.
 - The fork also carries one test-only change: the forwarder behind
   `spawn_with_recv` runs on a blocking-pool thread, since its push into the
-  receiver it hands back is a thread-blocking send that parked a runtime worker
-  whenever that receiver was left undrained; vizd hosts through
-  `serve_from_channel` and is unaffected.
+  receiver it hands back is a thread-blocking send: once an undrained receiver's
+  128 MiB channel had filled, that send parked a runtime worker; vizd hosts
+  through `serve_from_channel` and is unaffected.
 - Landmine: the added `ServerOptions` fields are safe only because rerun's
   `clap`/`run`/`web_viewer` features (which construct `ServerOptions` with
   explicit-field literals) are not compiled in our sdk+server build. Re-check

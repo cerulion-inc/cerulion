@@ -528,9 +528,10 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # receive through `Handle::block_on`) instead of a runtime worker: its push into
 # the receiver it hands back is a thread-blocking send that waits with no timeout
 # once the channel has warned, so on the two-worker runtimes of the vizd liveness
-# tests a receiver left undrained parked a worker and the viewer missed its
-# deadline. `spawn_with_recv` is called only by those tests; vizd hosts through
-# `serve_from_channel`, whose send already ran on a blocking thread.
+# tests a receiver left undrained filled that channel, the send parked a worker
+# and the viewer missed its deadline. `spawn_with_recv` is called only by those
+# tests; vizd hosts through `serve_from_channel`, whose send already ran on a
+# blocking thread.
 #
 # WHY A FORK — stock 0.34.1's two `ServerOptions` knobs (`playback_behavior`,
 # `memory_limit`) cannot express "deliver the scene skeleton to a late joiner but
@@ -551,9 +552,11 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # re_grpc_server ever ships BOTH a statics-only / drop-temporal history mode
 # and a bounded, non-blocking live queue, AND moves the `spawn_with_recv`
 # forwarder's send off its runtime workers (or the vizd test harnesses drain that
-# receiver themselves). The first two alone are not enough: the two patches bound
-# two different buffers on the same path. `deny.toml [sources]` carries the same
-# three; the fork's CERULION-PATCH.md "Exit condition" names the first two.
+# receiver themselves). The first two alone are not enough: either capability
+# alone leaves one of the two buffers on that path unbounded, and without the
+# third an undrained receiver fills the forwarder's channel and its push parks a
+# runtime worker again. `deny.toml [sources]` carries the same three; the fork's
+# CERULION-PATCH.md "Exit condition" names the first two.
 #
 # LANDMINE: the added `ServerOptions` fields are safe ONLY because rerun's
 # `clap`/`run`/`web_viewer` features — which construct `ServerOptions` with
