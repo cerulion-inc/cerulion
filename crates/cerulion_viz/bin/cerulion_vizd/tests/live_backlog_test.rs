@@ -493,7 +493,8 @@ fn assert_pressed_until_dropping(p: &Pressed, phase: &str, frame_bytes: usize) {
 /// than fewer frames, since the queue crosses the budget while it lags and every
 /// frame the gate drops there is a frame that never entered the sink.
 ///
-/// So 300 is ~5.5x what the stop condition needs when the forwarder keeps pace. It
+/// So 300 is ~5.5x what the stop condition needs when the forwarder keeps pace, and
+/// about 4x the count a task that falls behind has reached (around 75 frames). It
 /// is deliberately not tighter: that count is a property of the FORK's constants
 /// (a 128 MiB sink, an 8 MiB budget, a 2_779_552-byte encoded frame), not of the
 /// machine, so the only thing this bound has to survive is somebody moving one of
@@ -516,7 +517,8 @@ const FLOOD_DEADLINE: Duration = Duration::from_secs(120);
 /// `max_bytes_on_wire` quota, 128 MiB. Nothing in these arms consumes the
 /// receiver, so the task absorbs this many bytes and then BLOCKS inside the push
 /// for the rest of the arm: from that instant nothing takes bytes out of the
-/// broadcast, occupancy only grows, and every temporal frame is dropped.
+/// broadcast, occupancy only grows, and every temporal frame at or over the
+/// small-message floor is dropped (a sub-floor sample is still admitted).
 ///
 /// The quota is charged on the DECODED message the task pushes (`to_application`
 /// runs first, and the channel sizes what it is handed), while every number
@@ -895,7 +897,7 @@ fn with_runtime<R>(f: impl FnOnce() -> R) -> R {
     // floor, so a forwarding task parked inside the send leaves no trace in the
     // output at all.
     //
-    // The same call the daemon makes (`init_tracing`), with three choices: `warn` as
+    // The same subscriber the daemon's `init_tracing` builds, with three choices: `warn` as
     // the default level, so the transport's per-drop `debug` lines cannot add stderr
     // writes to the path these arms time; stderr rather than `print!`, because the
     // harness's output capture is per-thread and this warning is emitted on a
@@ -2284,10 +2286,10 @@ const VIEWER_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 /// Sized from what one pass through the loop can leave in that log: its sample and
 /// its sentinel, plus the at most two camera frames each of its two pressure phases
 /// can admit before the queue is back over the budget and every later frame is
-/// dropped. Six rows, so sixteen carries the failing pass and the two before it,
+/// dropped. Six rows, so eighteen carries the failing pass and the two before it,
 /// which is what separates a viewer that stopped mid-stream from one that was
 /// handed nothing after its connect.
-const VIEWER_LOG_TAIL: usize = 16;
+const VIEWER_LOG_TAIL: usize = 18;
 
 /// The entity `a_plot_sample_...` logs its ORDER SENTINEL under.
 ///
