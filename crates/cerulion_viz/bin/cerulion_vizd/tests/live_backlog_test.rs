@@ -657,10 +657,12 @@ struct Flood {
 /// measurement, taking a worker out from under a viewer that is already streaming
 /// and leaving the arm to spend its delivery wall waiting on a receiver that
 /// cannot be polled. Exiting once the sink is a frame or two from full, with the
-/// broadcast holding more frames than the task can still take, puts that park in
-/// the settle after this call rather than inside the caller's measurement. The
-/// guarantee does not rest on which frame the park lands on, only on its being
-/// ahead of the viewer.
+/// broadcast holding more frames than the task can still take, leaves the park a
+/// receive or two away, reachable without another frame being sent. Which frame it
+/// lands on is neither established nor needed here: a caller that will connect a
+/// viewer waits for it positively with `wait_until_the_forwarder_is_parked`, which
+/// reads the park off the broadcast going still while that task is the queue's only
+/// receiver.
 ///
 /// So the loop exits only once all three of these hold, each read off the proxy's
 /// own accounting rather than off a frame count:
@@ -672,11 +674,12 @@ struct Flood {
 ///    task took, as the upper bound the `absorbed` field documents;
 ///  * `live_dropped > 0`, so the gate itself has fired at least once;
 ///  * the final reading is OVER the budget, which takes at least four camera frames
-///    at this size, so the broadcast holds more than the task can still absorb. It
-///    parks on whichever of those pushes overflows the sink, during the settle that
-///    follows and before `re_grpc_client::stream` is reached; occupancy dips by the
-///    at most two frames it still takes and then only grows, since the park leaves
-///    no consumer anywhere.
+///    at this size, so the broadcast holds more than the task can still absorb and
+///    the park needs no further frame to be reached. It lands on whichever of those
+///    pushes overflows the sink; occupancy dips by the at most two frames the task
+///    still takes first and then only grows, since the park leaves no consumer
+///    anywhere. `wait_until_the_forwarder_is_parked` is what OBSERVES it, so no
+///    caller infers the ordering from this exit.
 ///
 /// Load can only make this spend more frames: a frame the gate drops while the
 /// task lags is a frame that never entered the sink, so it is replaced by a
@@ -755,8 +758,9 @@ fn flood_until_budget_engages(
 
 /// The shared precondition: the flood really did fill the forwarding sink and
 /// drive the live queue over budget, so the probes the caller is about to send
-/// cross a gate that is actually deciding something, and nothing is left to park a
-/// runtime worker once the caller has a viewer.
+/// cross a gate that is actually deciding something, and the push that parks a
+/// runtime worker is a receive or two away rather than tens of frames away, close
+/// enough for `wait_until_the_forwarder_is_parked` to wait it out.
 ///
 /// Every exit is a FAILURE — this never converts a flood that did not flood into
 /// a pass. What it adds over `assert!(f.engaged)` is ATTRIBUTION, and the classes
@@ -817,9 +821,9 @@ fn assert_budget_engaged(f: &Flood) {
              {FORWARDER_SINK_BYTES}-byte capacity after {} frames ({} absorbed at {} bytes a \
              frame). Those drops are a forwarding task that is BEHIND, not one that is blocked: \
              it keeps pulling, so occupancy can fall back under the budget and the push that \
-             parks a runtime worker has yet to land. Letting it land after the caller has a \
-             viewer is what this stop condition exists to prevent, so read this as the stop \
-             condition running out of frames or wall, never as the gate",
+             parks a runtime worker is tens of frames of pulling away, which no quiet window can \
+             carry it to: the sink wants more frames than the broadcast holds. Read it as the \
+             stop condition running out of frames or wall, never as the gate",
             FORWARDER_SINK_BYTES.saturating_sub(f.absorbed),
             f.frames,
             f.absorbed,
@@ -828,19 +832,20 @@ fn assert_budget_engaged(f: &Flood) {
     } else {
         format!(
             "the sink filled and the gate dropped, but the final reading holds only {} bytes, \
-             under the {LIVE_TEMPORAL_BUDGET_BYTES}-byte budget. A parked forwarding task consumes \
-             nothing and no other consumer exists, so occupancy cannot have fallen on its own: \
-             read this as the arithmetic's two inputs, {FORWARDER_SINK_BYTES} bytes of sink and \
-             the {} bytes a frame measured here, no longer describing the fork",
+             under the {LIVE_TEMPORAL_BUDGET_BYTES}-byte budget. There is no consumer but the \
+             forwarding task, and the at most two frames it takes on its way to parking cannot \
+             account for a queue this far down: read it as the arithmetic's two inputs, \
+             {FORWARDER_SINK_BYTES} bytes of sink and the {} bytes a frame measured here, no \
+             longer describing the fork",
             f.last.broadcast, f.frame_bytes
         )
     };
     panic!(
         "precondition: the flood must have left the forwarding sink FULL and the live queue over \
-         budget. Short of the first, the push that parks a runtime worker lands after the caller \
-         has connected a viewer; short of the second, the probes below cross a gate that admits \
-         everything. {why}. Bounds were {FLOOD_FRAME_CEILING} frames / {FLOOD_DEADLINE:?}, spent \
-         {} frames in {:?}. {f:?}",
+         budget. Short of the first, the push that parks a runtime worker is too far off for the \
+         park signal to wait out, and lands while the caller's viewer is streaming; short of the \
+         second, the probes below cross a gate that admits everything. {why}. Bounds were \
+         {FLOOD_FRAME_CEILING} frames / {FLOOD_DEADLINE:?}, spent {} frames in {:?}. {f:?}",
         f.frames, f.elapsed
     );
 }
@@ -1349,6 +1354,11 @@ fn a_fresh_viewer_still_gets_its_scene_while_the_live_queue_is_over_budget() {
         // old `for seq in 0..FRAMES` loop.
         let flood = flood_until_budget_engages(&prod, &handle, &store, &rgb, w, h);
         assert_budget_engaged(&flood);
+        // This arm connects a fresh viewer after its probes, so it needs the same
+        // ordering the plot arm does: the push that parks an OS worker has to land
+        // here, in a window where nothing is being sent, rather than during that
+        // viewer's connect.
+        wait_until_the_forwarder_is_parked(&handle, flood.last.broadcast);
         let dropped_before = flood.last.live_dropped;
 
         // The probes: a STATIC in the recording store and a BLUEPRINT chunk in its
@@ -1440,6 +1450,119 @@ const LATE_STATIC_ENTITY: &str = "scene/late_axes";
 
 fn entity_path(s: &str) -> re_log_types::EntityPath {
     re_log_types::EntityPath::from(s)
+}
+
+/// The quiet-window cadence the park signal polls on, and how many consecutive
+/// readings have to agree before it calls the forwarding task stopped.
+///
+/// `capture_memory` hands back the snapshot from the event loop's previous pass, so
+/// a single repeat proves nothing: it can be one snapshot read twice. Five readings
+/// 250 ms apart span a second of quiet, and in each of those gaps a runnable task
+/// that needs microseconds to take one frame out of the broadcast has had thousands
+/// of chances to take it. Agreement across them is therefore the task not pulling,
+/// not the reading not moving.
+const FORWARDER_PARK_POLL: Duration = Duration::from_millis(250);
+const FORWARDER_PARK_HOLD_POLLS: usize = 5;
+
+/// Liveness backstop on that signal, never a pacing threshold. What it waits for is
+/// at most two receives and one push that cannot fit: microseconds of work when the
+/// task is scheduled, milliseconds on a loaded runner. 30 s is orders of magnitude
+/// above that, the same ceiling as [`VIEWER_CONNECT_DEADLINE`] and for the same
+/// reason: at that distance an expiry is the work not happening at all, never the
+/// work being slow.
+const FORWARDER_PARK_DEADLINE: Duration = Duration::from_secs(30);
+
+/// What the park signal observed.
+#[derive(Debug)]
+struct Parked {
+    /// The live-queue reading the flood left behind.
+    at_flood_exit: u64,
+    /// The reading that then held still: what the stopped task leaves resident.
+    settled_at: u64,
+    /// Readings taken.
+    polls: usize,
+    /// Readings that differed from the one before, which is frames the task was
+    /// still taking (or a straggler the proxy was still handling).
+    changes: usize,
+    elapsed: Duration,
+}
+
+/// Wait until the forwarding task has STOPPED taking frames out of the broadcast,
+/// which is the park, so a caller that connects a viewer next does not have to
+/// assume that ordering.
+///
+/// The mechanism is single-subscriber accounting. Until a viewer connects that task
+/// is the broadcast's ONLY receiver and these arms drain nothing, and a broadcast
+/// message's bytes are released when every receiver has received it, so with one
+/// receiver the live-queue reading falls by exactly one frame per receive and
+/// nothing else can move it down. Nothing is produced in this window either, so
+/// nothing can move it up. A reading that holds still across
+/// [`FORWARDER_PARK_HOLD_POLLS`] spaced polls is therefore a task taking nothing
+/// while frames are still resident for it to take (the flood leaves at least four
+/// resident against a sink that can take at most two, so this window is never one
+/// with an empty queue), and the only thing that stops that loop between receives is
+/// the push it cannot fit: the thread-blocking send that parks an OS worker. It
+/// cannot resume either, since nothing drains its sink until `rx` drops at the end
+/// of the arm.
+///
+/// One other thing would hold the reading still: a wedged event loop, which serves
+/// every snapshot. That is not this signal's to catch, and it does not escape, since
+/// the pressure phases after it need the same counter to advance and report it when
+/// it does not.
+///
+/// A FALL is not required before the hold, and that is not a weakening. When the
+/// task keeps pace with the producer it parks several frames BEFORE the flood's own
+/// stop condition is met (the frames that then pile up resident are what takes the
+/// queue over the budget), so there is no fall left to observe by the time this
+/// runs; requiring one would fail exactly the case where the park is earliest. The
+/// fall is reported instead, as `changes` against `at_flood_exit`.
+fn wait_until_the_forwarder_is_parked(
+    handle: &re_grpc_server::MessageProxyHandle,
+    at_flood_exit: u64,
+) -> Parked {
+    let start = Instant::now();
+    let mut parked = Parked {
+        at_flood_exit,
+        settled_at: usage(handle, Duration::from_secs(5)).broadcast,
+        polls: 1,
+        changes: 0,
+        elapsed: Duration::ZERO,
+    };
+    let mut held = 1usize;
+    while held < FORWARDER_PARK_HOLD_POLLS {
+        // The two ways to miss are named by the DIRECTION the reading was moving,
+        // because they want opposite responses.
+        assert!(
+            start.elapsed() < FORWARDER_PARK_DEADLINE,
+            "precondition: the forwarding task must have PARKED before a viewer connects, and the \
+             live-queue reading was still moving after {FORWARDER_PARK_DEADLINE:?}. Nothing \
+             produces or consumes here, so that task is the only thing that can move it. A \
+             reading still FALLING below the {at_flood_exit} bytes the flood left is the task \
+             still taking frames, into a sink with more room than the frames the flood left it \
+             with: the push that parks a worker would then land while the viewer is already \
+             streaming, which is the ordering this signal exists to establish rather than hope \
+             for. A reading RISING is the producer's own queue still draining into the proxy, so \
+             delivery had not finished when the flood returned. {parked:?}"
+        );
+        std::thread::sleep(FORWARDER_PARK_POLL);
+        let next = usage(handle, Duration::from_secs(5)).broadcast;
+        parked.polls += 1;
+        if next == parked.settled_at {
+            held += 1;
+        } else {
+            parked.changes += 1;
+            parked.settled_at = next;
+            held = 1;
+        }
+    }
+    parked.elapsed = start.elapsed();
+    println!(
+        "forwarder park: the live queue held {} bytes across {FORWARDER_PARK_HOLD_POLLS} readings \
+         {FORWARDER_PARK_POLL:?} apart ({} readings, {} changes, {} bytes when the flood \
+         returned) in {:?}",
+        parked.settled_at, parked.polls, parked.changes, parked.at_flood_exit, parked.elapsed
+    );
+    parked
 }
 
 /// Wait for the viewer's own acknowledgement that its subscribe landed: the
@@ -1580,6 +1703,15 @@ fn a_plot_sample_survives_a_queue_full_of_camera_frames() {
             }
             u = next;
         }
+
+        // AND WAIT FOR THE PARK, which the settle above cannot show. That loop
+        // watches `live_dropped`, and a forwarding task delayed through it leaves the
+        // drop total still and the queue over budget while it still has frames to
+        // take: the settle passes, the viewer below connects, and the push that
+        // blocks an OS worker lands while that viewer is streaming, which is the one
+        // ordering this arm cannot measure through. The signal reads the park off the
+        // broadcast going still while that task is the queue's only receiver.
+        wait_until_the_forwarder_is_parked(&handle, flood.last.broadcast);
 
         // The viewer joins NOW — after the backlog, before the sample — and is
         // drained CONTINUOUSLY by its own thread, which is both what a real
@@ -2914,6 +3046,12 @@ fn measure_plot_sample_delivery_under_pressure() {
             }
             u = next;
         }
+
+        // The arm's PARK SIGNAL too, so every wall this function reports is measured
+        // with the worker already parked. Without it a figure here could come from a
+        // run whose park landed mid-delivery, and the wall the arm is set against
+        // would be the wall of a different apparatus.
+        wait_until_the_forwarder_is_parked(&handle, flood.last.broadcast);
 
         // An ORDERED log of every entity path the viewer received, so a round can
         // ask "what had arrived by then", not merely "did ours".
