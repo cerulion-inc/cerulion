@@ -1629,7 +1629,7 @@ fn a_plot_sample_survives_a_queue_full_of_camera_frames() {
         // ROUND 0 STARTS ON THE VIEWER'S OWN ACKNOWLEDGEMENT, not on a sleep.
         // `re_grpc_client::stream` returns its receiver BEFORE the tonic connect,
         // which runs in a task it spawns, so a sleep here gates on the runner: it
-        // can expire with the subscribe still unsent, and round 0's sample then
+        // can expire with the subscribe still unsent, and the first sample then
         // crosses the gate ahead of the viewer's subscribe point with no replay
         // history behind it (`drop_temporal_history`), i.e. a sample no viewer
         // could receive however long the wait. The acknowledgement is one message
