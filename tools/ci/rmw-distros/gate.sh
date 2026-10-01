@@ -118,6 +118,9 @@ case "$expect" in
         symbol_audit "$nmlog" "$absent_symbols" || { echo "GATE FAIL: $distro exports a symbol its headers do not declare"; exit 1; }
         absent_n=$(printf '%s\n' "$absent_symbols" | sed '/^$/d' | wc -l | tr -d ' ')
         echo "SYMBOL AUDIT PASS: $NM_CONTROL_SYMBOL defined and $absent_n header-absent symbol(s) undefined"
+        # The in-process serial suite is skipped only when a caller sets RMW_GATE_SKIP_SERIAL_SUITE=1
+        # (the emulated aarch64 leg does; the amd64 lanes never set it, so they run it as before).
+        if [ "${RMW_GATE_SKIP_SERIAL_SUITE:-0}" != "1" ]; then
         tlog="/tmp/rmw_test_${distro}.log"
         echo "== rmw serial suite on $distro (every target, no fail-fast) =="
         cargo test --locked -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
@@ -147,6 +150,9 @@ case "$expect" in
         else
             echo "GATE FAIL: $distro failing-test set differs from the pinned one."; echo "-- expected:"; echo "$expected"; echo "-- got:"; echo "$failed"
             echo "(a test that started passing or a new failure both land here; update the table in the PR that changes $distro)"; exit 1
+        fi
+        else
+            echo "== serial suite SKIPPED on $distro (RMW_GATE_SKIP_SERIAL_SUITE=1): build + symbol audit + rclpy exchange only =="
         fi
         # ===================================================================
         # rclpy CROSS-PROCESS EXCHANGE (item: distro-lane rclpy step).

@@ -6,7 +6,7 @@ name: rmw distro lanes
 # refused).
 # Each lane asserts the distro's KNOWN state through tools/ci/rmw-distros/gate.sh, so the lane is
 # green while the state is true and turns red the moment the truth moves in either direction.
-# Runs on PRs and pushes to main that touch the rmw path (the crate, its in-tree dependencies, the workspace manifests). No lane is a required context on main, so a
+# The per-distro lanes run on PRs and pushes to main that touch the rmw path (the crate, its in-tree dependencies, the workspace manifests); the emulated aarch64 Foxy job runs on manual dispatch only. No lane is a required context on main, so a
 # path-filtered lane that does not run can never leave a PR pending.
 
 on:
@@ -176,3 +176,161 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-rmw-distros-${{ matrix.distro }}-${{ steps.headers.outputs.hash }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+
+  # ---------------------------------------------------------------------------
+  # aarch64 Foxy under QEMU emulation. Builds rmw_cerulion and runs the rclpy
+  # cross-process exchange on the aarch64 Foxy platform (glibc 2.31) inside an
+  # emulated linux/arm64 container, short of physical hardware: the architecture
+  # and C-library surface a library built for a newer distribution can meet at a
+  # different alignment and stride. Emulated, so slow; manual-dispatch only. It
+  # never runs on a pull request, so the only status it can emit there is
+  # skipped, and it is in neither required-check list.
+  # ---------------------------------------------------------------------------
+  lane_foxy_aarch64:
+    name: rmw distro lane (foxy, aarch64 via QEMU)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # QEMU user-mode runs arm64 at roughly 5-20x slowdown; a from-scratch
+    # clang+bindgen+rustc build of the whole dep tree plus the serial suite and
+    # three exchanges fits comfortably under this ceiling (GitHub caps at 6 h).
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Register the arm64 binfmt handler on the host so `docker run --platform
+      # linux/arm64` executes arm64 binaries under QEMU. Done with the canonical
+      # digest-pinned binfmt image rather than a third-party Action, so this adds
+      # no new `uses:` entry. The digest is tonistiigi/binfmt:latest as resolved
+      # on 2026-09-30; :latest moves, so the digest is the pin.
+      - name: Register arm64 binfmt (QEMU)
+        shell: bash
+        run: |
+          set -uo pipefail
+          docker run --privileged --rm \
+            tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 \
+            --install arm64
+
+      - name: Build + symbol audit + rclpy exchange on Foxy aarch64 (QEMU)
+        shell: bash
+        env:
+          # Colour off at the source; the markers below are also read off a
+          # colour-stripped copy (belt and braces, repo rule).
+          CARGO_TERM_COLOR: never
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/rmw-foxy-arm64.log"
+
+          # stdin heredoc + `bash -s` avoids arg-quoting; the quoted delimiter
+          # keeps $VAR expanding INSIDE the container. The `tee` is
+          # non-truncating and the greps below read the FILE, not a live pipe.
+          # RCLPY_TIMEOUT: the native exchange finishes far inside gate.sh's 600s
+          # per-exchange default; 2400s keeps the per-exchange wall clear of the
+          # emulation slowdown. RMW_GATE_SKIP_SERIAL_SUITE=1 runs build + symbol
+          # audit + the staged-library digest + the exchanges, skipping the
+          # in-process serial suite (see the POLICY line below).
+          # The runner invokes `shell: bash` with -e; drop it only around the
+          # docker pipeline so a nonzero gate is captured in rc (not an instant
+          # abort), then restore it for the marker checks that follow.
+          set +e
+          docker run --rm -i \
+            --platform linux/arm64 \
+            --shm-size=1g \
+            -e CARGO_TERM_COLOR=never \
+            -e RCLPY_TIMEOUT=2400 \
+            -e RMW_GATE_SKIP_SERIAL_SUITE=1 \
+            -v "$PWD":/w -w /w \
+            ros:foxy-ros-base \
+            bash -s <<'CONTAINER' 2>&1 | tee "$log"
+          set -euo pipefail
+
+          # [planted-failure self-test, emulated path] The SAME predicates that
+          # gate this leg on arm64-ness must ACCEPT the arm64 value and REJECT
+          # the amd64 value. Drive each on known literals first (two-sided), so a
+          # vacuous always-true predicate cannot let a silent amd64 fallback pass
+          # as green. Mirrors gate.sh's wrong-payload self-test philosophy.
+          is_aarch64_uname() { [ "$1" = aarch64 ]; }
+          is_aarch64_elf()   { printf '%s' "$1" | grep -qi 'aarch64'; }
+          is_aarch64_uname aarch64 || { echo "::error::planted-failure: the uname predicate REJECTED aarch64 (comparator broken)"; exit 1; }
+          if is_aarch64_uname x86_64; then echo "::error::planted-failure: the uname predicate ACCEPTED x86_64 (no teeth)"; exit 1; fi
+          is_aarch64_elf 'AArch64' || { echo "::error::planted-failure: the ELF predicate REJECTED AArch64 (comparator broken)"; exit 1; }
+          if is_aarch64_elf 'Advanced Micro Devices X86-64'; then echo "::error::planted-failure: the ELF predicate ACCEPTED x86-64 (no teeth)"; exit 1; fi
+          echo "PLANTED-FAILURE SELF-TEST OK: arm64 predicates accept aarch64/AArch64 and reject x86_64/X86-64"
+
+          # [arch teeth] a silent amd64 fallback must die cheaply, before any
+          # build. Uses the predicate the self-test just proved discriminates.
+          echo "RUNNING UNDER: $(uname -m)"
+          is_aarch64_uname "$(uname -m)" || { echo "::error::QEMU NOT active: uname -m=$(uname -m), expected aarch64 (a silent amd64 fallback invalidates this leg)"; exit 1; }
+
+          # [rule 46] force a from-scratch compile: no cache is restored, and the
+          # bind-mounted target/ is removed belt-and-suspenders, so a real
+          # 'Compiling rmw_cerulion' line is guaranteed on a real arm64 build.
+          rm -rf target
+
+          # ROS env (setup.bash is nounset-hostile).
+          set +u; source /opt/ros/foxy/setup.bash; set -u
+          [ "${ROS_DISTRO:-}" = "foxy" ] || { echo "::error::ROS_DISTRO=${ROS_DISTRO:-} is not foxy"; exit 1; }
+          echo "GLIBC: $(ldd --version | head -n1)"   # expect 2.31 -- the Ubuntu 20.04 (focal) ABI
+
+          # bindgen toolchain (same package set as the amd64 lane) + Rust via
+          # rustup (the arm64 ros image ships no Rust); rustfmt matches the amd64
+          # lane (the bindgen layout-test reader needs it).
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git clang libclang-dev pkg-config procps
+          curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal --component rustfmt
+          . "$HOME/.cargo/env"
+          rustc -vV; cargo -vV
+
+          # Parity with the amd64 lane: prove the gate's own self-tests run under
+          # arm64 bash BEFORE the real gate.
+          bash tools/ci/rmw-distros/gate_selftest.sh </dev/null
+
+          # Scope on this emulated leg: build + nm symbol audit + the staged-
+          # library digest + 3 fresh-process rclpy exchanges (both directions) +
+          # the wrong-payload self-test. The in-process serial suite is skipped
+          # (RMW_GATE_SKIP_SERIAL_SUITE=1); the POLICY line names the two tests
+          # that drove the skip, so the gate reports what it judged.
+          echo "POLICY: emulated aarch64 Foxy runs build + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + the wrong-payload self-test; the in-process serial suite is skipped because two tests are timing-sensitive under emulation and both pass on the amd64 foxy lane in the same run: rmw_wait_event_test::a_nine_entity_hop_drains_and_probes_only_what_fired (the selective-drain oracle assumes events arrive separately) and rmw_shadow_take_test::c_copied_then_malformed_frame_retires_the_shadow_instead_of_recycling_it (adopt-take SHM segment registration returns rc -4 under emulation)."
+          bash tools/ci/rmw-distros/gate.sh foxy </dev/null
+
+          # [rule 46 + teeth] the freshly built .so must be an AArch64 ELF --
+          # proves the compile produced arm64 code, not a leaked amd64 artifact.
+          # Uses the predicate the self-test proved discriminates.
+          so="target/release/librmw_cerulion.so"
+          machine="$(readelf -h "$so" | awk -F: '/Machine:/ {gsub(/^[ \t]+/,"",$2); print $2}')"
+          echo "BUILT .so MACHINE: ${machine}"
+          is_aarch64_elf "${machine}" || { echo "::error::rule 46: ${so} is NOT an AArch64 ELF (Machine=${machine})"; exit 1; }
+          echo "ELF TEETH OK: ${so} is AArch64"
+          CONTAINER
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          # Read every marker off a colour-stripped copy (repo rule), belt and
+          # braces with CARGO_TERM_COLOR=never.
+          plain="$RUNNER_TEMP/rmw-foxy-arm64.plain"
+          sed -E "s/$(printf '\033')\[[0-9;]*m//g" "$log" > "$plain"
+
+          # 1) the gate itself must have passed.
+          [ "$rc" -eq 0 ] || { echo "::error::Foxy aarch64 QEMU gate failed (rc=$rc)"; exit 1; }
+
+          # 2) rule 46: a real arm64 compile happened. A target-cache hit would
+          #    omit these lines; this leg caches nothing, so their ABSENCE means
+          #    the build was skipped -- red it even on an rc=0 'green'.
+          grep -qE '^[[:space:]]*Compiling rmw_cerulion v' "$plain" \
+            || { echo "::error::rule 46: 'Compiling rmw_cerulion' absent from the arm64 build log -- not a real arm64 compile"; exit 1; }
+          grep -qE '^[[:space:]]*Compiling cerulion_core v' "$plain" \
+            || { echo "::error::rule 46: 'Compiling cerulion_core' absent -- in-tree deps were not compiled for arm64"; exit 1; }
+
+          # 3) the planted-failure self-test and the arch/ELF teeth must have run.
+          grep -qxE 'PLANTED-FAILURE SELF-TEST OK: .*' "$plain" \
+            || { echo "::error::teeth: the planted-failure self-test line is absent -- the arm64 predicates were never proven to discriminate"; exit 1; }
+          grep -qxE 'RUNNING UNDER: aarch64' "$plain" \
+            || { echo "::error::QEMU teeth: the container never confirmed uname -m=aarch64"; exit 1; }
+          grep -qE '^ELF TEETH OK: .*AArch64$' "$plain" \
+            || { echo "::error::teeth: the built .so was not confirmed AArch64"; exit 1; }
+
+          echo "Foxy aarch64 (QEMU) PASSED: planted-failure self-test + real arm64 compile + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + wrong-payload self-test (glibc 2.31, aarch64)."
