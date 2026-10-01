@@ -46,11 +46,16 @@
 #   ci_test_shard.sh <package> <shard_index> <shard_count> [package_dir]
 #   ci_test_shard.sh --list  <package> <shard_index> <shard_count> [package_dir]
 #   ci_test_shard.sh --check [package] [shard_count] [package_dir]
+#   ci_test_shard.sh --selected <package>
 #
 #   run     — invoke `cargo nextest run --profile <p> -p <package> --lib?
 #             --test a --test b ...`
 #   --list  — print the cargo argument list and exit (no cargo, no build);
 #             what the CI log shows and what the tests assert against.
+#   --selected — answer whether <package> rides CI_SELECTED_PACKAGES, the same
+#             reading the run mode gates on, as an exit code (0 rides, 1 does
+#             not) plus one `selection:` line. For a workflow step that spends
+#             something before this script's run step is reached.
 #   --check — prove the partition is TOTAL and DISJOINT: the union of all
 #             shards equals the full file list exactly once. Defaults to the
 #             package + shard count CI actually uses, so a bare `--check` is
@@ -509,8 +514,28 @@ MODE=run
 case "${1:-}" in
     --check) shift; do_check "${1:-}" "${2:-}" "${3:-}"; exit 0 ;;
     --list)  shift; MODE=list ;;
+    --selected)
+        # The SAME `selection_holds` the run mode below gates on, asked as a
+        # question by a workflow step that builds something BEFORE this script's
+        # own run step is reached. A second reading of the selection written in
+        # YAML would be free to drift from this one; a mode cannot, and
+        # `--check`'s table already pins the function's answers. rc 0 means the
+        # package rides this selection, rc 1 means it does not, and the line
+        # says which either way, because a command with no output proves nothing
+        # to whoever reads the log.
+        shift
+        [ $# -ge 1 ] || usage
+        if selection_holds "$1" "${CI_SELECTED_PACKAGES:-}"; then
+            printf 'selection: %s rides the selection (selected: %s)\n' \
+                "$1" "${CI_SELECTED_PACKAGES:-}"
+            exit 0
+        fi
+        printf 'selection: %s is not in the selection (selected: %s)\n' \
+            "$1" "${CI_SELECTED_PACKAGES:-}"
+        exit 1
+        ;;
     -h|--help) usage ;;
-    -*) die "unknown option '$1' (expected --check, --list or a package name)" ;;
+    -*) die "unknown option '$1' (expected --check, --list, --selected or a package name)" ;;
 esac
 
 [ $# -ge 3 ] || usage

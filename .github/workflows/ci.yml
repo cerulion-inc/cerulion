@@ -1948,8 +1948,19 @@ jobs:
       # here and is owed; the shard map above is packed against measured walls, so
       # the figure belongs beside its other terms once one run has it.
       - name: Build the binaries the waiver gate asks (its shard only)
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: |
           set -euo pipefail
+          # THE SELECTION FIRST, and read through the script that owns the rule.
+          # Without this the step built the waiver set on every job of every
+          # change, including a docs-only one where the shard step below prints
+          # its `selection:` line and runs nothing: a test build of thirteen
+          # binaries bought for a change that cannot reach the gate.
+          if ! ./tools/scripts/ci_test_shard.sh --selected cerulion_core; then
+            echo "the gate's own shard step skips this change; nothing to build"
+            exit 0
+          fi
           args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 4)
           if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
             echo "this shard does not run the waiver gate; nothing to build"
@@ -1958,13 +1969,21 @@ jobs:
           inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
           total=0
           for crate in cerulion_core cerulion_cli_engine; do
+            # Scoped to the WAIVED_2034 block, not the whole file. The arm
+            # that asks libtest what it will do with an arm reads WAIVED_2034
+            # alone; the 2035 rows are judged by a source-reading arm that needs
+            # no binary at all. Over the whole file the same pattern also matched
+            # those rows and bought five more test links per job for nothing:
+            # 18 binaries instead of 13.
+            #
             # `|| true` so a zero-match parse reaches the floor below instead of
             # dying here under `pipefail` with nothing said.
-            names=$(grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" "$inventory" \
+            names=$(sed -n '/^const WAIVED_2034/,/^];/p' "$inventory" \
+              | grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" \
               | sed 's#.*/##; s#\.rs"##' | sort -u || true)
             n=$(printf '%s\n' "$names" | grep -c . || true)
             # Per crate the floor is ONE, because the split between the two is
-            # the inventory's to decide and today it is 16 and 2. The total is
+            # the inventory's to decide and today it is 12 and 1. The total is
             # floored below, which is what catches a parse that stopped reaching
             # the file.
             if [ "$n" -lt 1 ]; then
@@ -2967,8 +2986,19 @@ jobs:
       # here and is owed; the shard map above is packed against measured walls, so
       # the figure belongs beside its other terms once one run has it.
       - name: Build the binaries the waiver gate asks (its shard only)
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: |
           set -euo pipefail
+          # THE SELECTION FIRST, and read through the script that owns the rule.
+          # Without this the step built the waiver set on every job of every
+          # change, including a docs-only one where the shard step below prints
+          # its `selection:` line and runs nothing: a test build of thirteen
+          # binaries bought for a change that cannot reach the gate.
+          if ! ./tools/scripts/ci_test_shard.sh --selected cerulion_core; then
+            echo "the gate's own shard step skips this change; nothing to build"
+            exit 0
+          fi
           args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 3)
           if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
             echo "this shard does not run the waiver gate; nothing to build"
@@ -2977,13 +3007,21 @@ jobs:
           inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
           total=0
           for crate in cerulion_core cerulion_cli_engine; do
+            # Scoped to the WAIVED_2034 block, not the whole file. The arm
+            # that asks libtest what it will do with an arm reads WAIVED_2034
+            # alone; the 2035 rows are judged by a source-reading arm that needs
+            # no binary at all. Over the whole file the same pattern also matched
+            # those rows and bought five more test links per job for nothing:
+            # 18 binaries instead of 13.
+            #
             # `|| true` so a zero-match parse reaches the floor below instead of
             # dying here under `pipefail` with nothing said.
-            names=$(grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" "$inventory" \
+            names=$(sed -n '/^const WAIVED_2034/,/^];/p' "$inventory" \
+              | grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" \
               | sed 's#.*/##; s#\.rs"##' | sort -u || true)
             n=$(printf '%s\n' "$names" | grep -c . || true)
             # Per crate the floor is ONE, because the split between the two is
-            # the inventory's to decide and today it is 16 and 2. The total is
+            # the inventory's to decide and today it is 12 and 1. The total is
             # floored below, which is what catches a parse that stopped reaching
             # the file.
             if [ "$n" -lt 1 ]; then
