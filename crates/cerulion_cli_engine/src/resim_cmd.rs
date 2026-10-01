@@ -703,8 +703,16 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
     // * `topics_checked > 0` — with nothing compared, "the frames match" is
     //   vacuously true and reads as a positive result (`--duration 0`, or a
     //   run where no produced topic carried a frame).
+    //
+    // * `!report.read_log_diverged`: the read log's own exit-6 verdict says a
+    //   recorded EDGE READ did not reproduce. The frames can still match
+    //   byte-for-byte when it fires (the divergence is in WHEN a read happened,
+    //   not in what was published), so without this conjunct a bare `--resim`
+    //   printed "the re-executed frames match the recording byte-for-byte" over
+    //   a run the verb exits 6 on: a false observation beside a real verdict.
     let matched_everything = differing == 0
         && !report.trace_diverged
+        && !report.read_log_diverged
         && report.violations.is_empty()
         && report.topics_checked > 0;
 
@@ -1382,6 +1390,50 @@ mod tests {
         assert!(
             !out.contains("coordination:"),
             "an absent provenance must render NOTHING, never a default: {out}"
+        );
+    }
+
+    /// **The byte-for-byte OBSERVATION is withheld over a read-log divergence.**
+    ///
+    /// A bare `--resim` makes no verdict, but it does make one OBSERVATION, and
+    /// that observation must not contradict the verb's own exit code. The read
+    /// log's exit-6 verdict says a recorded EDGE READ did not reproduce, which
+    /// leaves the published frames free to match byte for byte: the divergence is
+    /// in WHEN a read happened. So the guard reads BOTH exit-6 halves, and this
+    /// arm pins the one that was missing (reverting the `!read_log_diverged`
+    /// conjunct prints the success sentence over a run the verb exits 6 on).
+    #[test]
+    fn the_byte_for_byte_observation_is_withheld_over_a_read_log_divergence() {
+        let bag = Path::new("/tmp/x.mcap");
+        const MATCH: &str = "the re-executed frames match the recording byte-for-byte";
+
+        // Both halves clear: the observation IS made, which is what keeps the
+        // assertion below a withholding and not a sentence that never renders.
+        let clean = report(true, 0, false);
+        let out = render_resim_summary(&clean, bag);
+        assert!(
+            out.contains(MATCH),
+            "a clean re-execution states the match: {out}"
+        );
+
+        // The READ-LOG half set, every other field identical.
+        let mut diverged = report(false, 0, false);
+        diverged.read_log_diverged = true;
+        let out = render_resim_summary(&diverged, bag);
+        assert!(
+            !out.contains(MATCH),
+            "a read-log divergence is an exit-6 verdict: the neutral summary must \
+             not observe a byte-for-byte match over it: {out}"
+        );
+
+        // And the fire-schedule half, which already held, so the two are pinned
+        // together rather than one standing in for the other.
+        let mut trace = report(false, 0, true);
+        trace.read_log_diverged = false;
+        let out = render_resim_summary(&trace, bag);
+        assert!(
+            !out.contains(MATCH),
+            "the trace half still withholds it: {out}"
         );
     }
 
