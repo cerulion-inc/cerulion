@@ -47,13 +47,13 @@ Three nodes forming a reactive pipeline:
   A robot or a headless box prints a short code to approve from a browser on any
   machine.
 
-- Rust **1.93+** from [rustup.rs](https://rustup.rs) (the distro `cargo` package is
+- Rust **1.95+** from [rustup.rs](https://rustup.rs) (the distro `cargo` package is
   usually too old). `cerulion node build` compiles your nodes with your
   own `cargo`.
 
   Build the nodes below with the same compiler that built the `cerulion` binary you
   installed above: a node cdylib built by a different rustc release is refused at
-  load, loudly, even when both meet the `1.93` minimum. A downloaded release binary
+  load, loudly, even when both meet the `1.95` minimum. A downloaded release binary
   is pinned to the exact rustc that built it, so the README's
   [Install](../../README.md#install) section gives the `RUSTUP_TOOLCHAIN=` step for
   that case. The workspace you create in step 1 also
