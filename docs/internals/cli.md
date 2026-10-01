@@ -908,7 +908,6 @@ sandbox helper). `flashback_resim` removes it on a `--single-process` run,
 where the variable is inert and removing it only keeps the inert-request warn
 out of a log the test reads.
 
-## 10. `cerulion clean`: dead-node sweep, orphan port-tag reclaim, state-file gate
 ## 10. `cerulion clean`: dead-node sweep and state-file gate
 
 `cerulion clean` walks iceoryx2's node registry ONCE with its trace lines
