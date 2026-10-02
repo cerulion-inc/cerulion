@@ -511,7 +511,11 @@ pub struct ReadStageSizing {
 /// # Where each term comes from
 ///
 /// The bound is stated in RECORDS, not reads, and a stage's population splits
-/// in two: records that CONSUMED a frame and records that did not.
+/// in two: records that CONSUMED a frame and records that did not. Because the
+/// fold stores a run of identical reads as ONE record, this number is not a
+/// bound on a step's READS, and the replay gate's step plan, which carries one
+/// entry per read, is therefore NOT bounded by it
+/// ([`ReadPlanStage::install_step`]).
 ///
 /// **Frame-consuming records ≤ `site × depth`.** The queue yields at most its
 /// declared depth in one merge window (one merge per step), and a per-set
@@ -2255,10 +2259,15 @@ pub struct ReadPlanStage {
     /// node + `input_idx` + [`ReadStageRole`], the same key the capture twin
     /// is enumerated by, fixed at creation.
     key: StageKey,
-    /// The bound on one step's admissions and on the retained violation list,
-    /// the SAME number the capture twin derives, so a step whose plan names
-    /// more reads than the recording's own stage could hold is refusable
-    /// rather than silently truncated.
+    /// The bound on the RETAINED DIVERGENCE LIST, and nothing else, the SAME
+    /// number the capture twin derives.
+    ///
+    /// It does NOT bound the installed step plan. The number is a bound on this
+    /// stage's RECORDS within one merge window
+    /// ([`derive_stage_capacity`]), while a step plan is the recording's READS
+    /// with folded runs expanded, so the two are in different units and the
+    /// smaller one was never the larger one's ceiling (see
+    /// [`ReadPlanStage::install_step`]).
     rim: u32,
     /// Why this stage can never be gated, from wiring facts (see
     /// [`GateBlocker`]). `None` on a gateable stage.
@@ -2333,7 +2342,10 @@ impl ReadPlanStage {
     /// The rim is PASSED here rather than derived, because the caller derives
     /// it ONCE per edge through [`derive_stage_capacity`] and hands the same
     /// number to both twins: deriving it twice would let the plan and the
-    /// capture disagree about a rim that is the same edge's.
+    /// capture disagree about a rim that is the same edge's. On this twin the
+    /// number bounds the RETAINED DIVERGENCE LIST only; what bounds a step's
+    /// plan is the recording, and [`Self::install_step`] states why the rim
+    /// cannot.
     pub(crate) fn new(
         key: StageKey,
         rim: u32,
@@ -2356,7 +2368,8 @@ impl ReadPlanStage {
         &self.key
     }
 
-    /// The bound on one step's admissions and on the retained violation list.
+    /// The bound on the retained divergence list. NOT a bound on one step's
+    /// plan: see the field's own doc for the two units.
     #[must_use]
     pub fn rim(&self) -> u32 {
         self.rim
@@ -2410,18 +2423,32 @@ impl ReadPlanStage {
 
     /// Write this step's quota, retiring the previous step's wholesale.
     ///
-    /// `Err(InstallRefusal::RimExceeded)` when `due` is longer than the rim: a
-    /// step whose plan names more reads than the recording's own stage could
-    /// hold is proof the log is foreign or truncated. `Err(GateUnusable)` when a
-    /// panic poisoned the gate. The caller renders one sentence per arm, so an
-    /// install over a poisoned gate never reports a count nobody passed.
+    /// # The plan is bounded by the RECORDING, never by the rim
+    ///
+    /// `due` is this step's recorded reads with folded runs EXPANDED, one entry
+    /// per read, because the gate answers one consult per read. The rim bounds
+    /// this stage's RECORDS within one merge window, and the fold means those
+    /// two counts are not the same number: a catch-up burst whose reads are
+    /// byte identical is stored as ONE record carrying the count, and a
+    /// `Period` node bursts to the derivation's ceiling, so a step the
+    /// recording describes exactly can name more reads than the rim holds.
+    /// Refusing that install rejected a replay the recording is a complete
+    /// description of, which is why no bound is applied here.
+    ///
+    /// A FOREIGN or TRUNCATED recording is still refused, by name, where the
+    /// bag is read rather than here: an overflow marker that dropped records
+    /// (`read_log_record_dropped`), a recorded stage set this build does not
+    /// wire (`read_log_stage_set_skew`), an input name that does not resolve or
+    /// resolves twice (`read_log_input_name_unresolved`,
+    /// `read_log_input_name_duplicated`), every unenforceable record shape
+    /// (`read_log_unenforceable_record`), and a recorded rim outside this
+    /// binary's window ([`AdoptedRim::from_recorded`]). The engine also expands
+    /// runs under its own whole-bag record budget and DECLINES past it, so a
+    /// crafted run count cannot make this allocation unbounded.
+    ///
+    /// `Err(GateUnusable)` when a panic poisoned the gate: it accepts no
+    /// install and admits nothing from there on.
     pub(crate) fn install_step(&self, step: u64, due: &[DueRead]) -> Result<(), InstallRefusal> {
-        if due.len() as u64 > u64::from(self.rim) {
-            return Err(InstallRefusal::RimExceeded {
-                named: due.len(),
-                rim: self.rim,
-            });
-        }
         let mut inner = self.lock_plan().map_err(|_| InstallRefusal::GateUnusable)?;
         inner.step = step;
         inner.installed = true;
@@ -2755,18 +2782,14 @@ impl ReadPlanStage {
 
 /// Why a step's quota could not be installed on a stage.
 ///
-/// Two arms and not one number pair: a poisoned gate names no count, and
-/// reporting it as a rim of zero told an operator their recording was foreign
-/// or truncated for what is a panic in this process.
+/// ONE arm, because a poisoned gate is the only thing an install can refuse on:
+/// the plan's LENGTH is the recording's own, and a rim that counts records was
+/// never a ceiling for a count of reads (see
+/// [`ReadPlanStage::install_step`]). An enum rather than a unit type so a
+/// second cause, if one is ever found, arrives without changing every caller's
+/// shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallRefusal {
-    /// The step named more reads than the stage's rim can hold.
-    RimExceeded {
-        /// How many reads the step named.
-        named: usize,
-        /// The stage's rim.
-        rim: u32,
-    },
     /// A panic poisoned the gate; it accepts no install and admits nothing.
     GateUnusable,
 }
@@ -2776,7 +2799,6 @@ impl InstallRefusal {
     #[must_use]
     pub fn code(self) -> &'static str {
         match self {
-            Self::RimExceeded { .. } => "rim_exceeded",
             Self::GateUnusable => "gate_unusable",
         }
     }
@@ -5552,22 +5574,86 @@ mod tests {
         assert!(ok.arm().is_ok());
     }
 
+    /// THE BOUND ON A STEP PLAN IS THE RECORDING, NOT THE RIM.
+    ///
+    /// The rim counts this stage's RECORDS in one merge window; a step plan
+    /// carries one entry per recorded READ, and the fold stores a run of
+    /// identical reads as ONE record. So a plan longer than the rim is what a
+    /// catch-up burst looks like, not evidence of a foreign log, and it installs
+    /// and is SERVED IN FULL. Refusing it refused replays the recording
+    /// describes exactly.
     #[test]
-    fn a_step_plan_above_the_derived_rim_is_refused() {
-        let (plan, _now) = armed_plan(None);
+    fn a_step_plan_longer_than_the_derived_rim_installs_and_is_served_in_full() {
+        let (plan, now) = armed_plan(None);
         assert_eq!(plan.rim(), ORDINARY_RIM);
+        at_step(&now, 0);
         // The rim oracle is the DERIVATION, evaluated in a `const` above, so
-        // this arm does not restate the formula's number.
+        // this arm does not restate the formula's number. One entry PAST it is
+        // the shape the old bound refused.
         let over: Vec<DueRead> = (0..=ORDINARY_RIM).map(|i| served(1, i)).collect();
-        assert_eq!(
-            plan.install_step(0, &over),
-            Err(InstallRefusal::RimExceeded {
-                named: over.len(),
-                rim: ORDINARY_RIM,
-            })
+        assert!(
+            over.len() > ORDINARY_RIM as usize,
+            "PRECONDITION: the plan must be longer than the rim"
         );
-        // At the rim exactly, the install is accepted.
-        assert!(plan.install_step(0, &over[..ORDINARY_RIM as usize]).is_ok());
+        assert_eq!(plan.install_step(0, &over), Ok(()));
+        // Every entry, the ones past the rim included, is answered in recorded
+        // order: a bound that truncated the tail would withhold at the rim.
+        for i in 0..=ORDINARY_RIM {
+            assert_eq!(plan.admit(), GateAnswer::Exact(served(1, i)));
+            plan.settle(served(1, i), 1, Some(i));
+        }
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        assert_eq!(plan.admitted(), u64::from(ORDINARY_RIM) + 1);
+    }
+
+    /// A plan sized by a WIDER recording installs on a stage at the FLOOR rim.
+    ///
+    /// The mismatch direction the enforcement has to survive: the sizing reads
+    /// candidate facts (a node's burst bound and its per-set shape), so a
+    /// recording whose stage derived the CEILING can be replayed on a build that
+    /// derives the FLOOR for the same edge. The recorded reads are then many
+    /// times this stage's rim, and refusing that install refused the replay
+    /// outright. Written at the floor and the ceiling so the arm states the
+    /// widest gap the clamp allows rather than a number picked by hand.
+    #[test]
+    fn a_plan_sized_by_a_wider_recording_installs_on_a_floor_rim_stage() {
+        let now = Arc::new(AtomicU64::new(0));
+        let plan = ReadPlanStage::new(
+            plan_key("relay", 0, ReadStageRole::Body),
+            READ_OUTCOME_STAGE_MIN,
+            None,
+            Arc::clone(&now),
+        );
+        plan.arm().expect("an ordinary body stage arms");
+        let wide: Vec<DueRead> = (0..=READ_OUTCOME_STAGE_MAX).map(|_| NOTHING).collect();
+        assert!(
+            wide.len() > READ_OUTCOME_STAGE_MIN as usize,
+            "PRECONDITION: the recording's step must outnumber this stage's rim"
+        );
+        assert_eq!(plan.install_step(0, &wide), Ok(()));
+        // A recorded NONE at every position: the gate withholds at each, which is
+        // the enforcement working, and no position was lost to a bound.
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        assert_eq!(plan.admitted(), 0);
+    }
+
+    /// The rim KEEPS its one job over a plan longer than itself.
+    ///
+    /// The arm above proves the plan is not bounded; this one proves that did
+    /// not take the divergence list's bound with it. Unreachable before the
+    /// plan's bound was lifted, which is why it is written beside it.
+    #[test]
+    fn the_divergence_list_is_still_bounded_by_the_rim_over_a_longer_plan() {
+        let (plan, now) = armed_plan(None);
+        let rim = ORDINARY_RIM as usize;
+        at_step(&now, 1);
+        // Twice the rim, every entry UNSPENT: the sweep mints one finding per
+        // entry, retains the rim's worth and counts the rest.
+        let due: Vec<DueRead> = (0..rim * 2).map(|i| served(1, i as u32)).collect();
+        plan.install_step(1, &due).unwrap();
+        plan.sweep(1);
+        assert_eq!(plan.take_violations().len(), rim);
+        assert_eq!(plan.violations_dropped() as usize, due.len() - rim);
     }
 
     #[test]

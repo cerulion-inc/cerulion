@@ -15609,9 +15609,12 @@ impl GraphRuntime {
     ///
     /// An EMPTY slice, and an armed stage this call omits, both declare "reads
     /// nothing this step". `Err` ([`TransportError::GraphError`] naming the
-    /// stage) for an unarmed or unknown key, a duplicate key, or a step plan
-    /// above the stage's derived rim: each is an engine install bug, since both
-    /// the arming and the rim came from this runtime.
+    /// stage) for an unarmed or unknown key, a duplicate key, or a gate a panic
+    /// poisoned. The first three are engine install bugs, since the arming came
+    /// from this runtime. A step plan LONGER than the stage's derived rim is NOT
+    /// one of them and is installed: its length is the recording's own read
+    /// count and the rim counts RECORDS, which
+    /// [`crate::read_outcome::ReadPlanStage::install_step`] states in full.
     // hot-path-alloc-ok-fn: cold relative to a step: one pass over the armed edges
     pub fn set_replay_read_plan(
         &mut self,
@@ -15650,11 +15653,6 @@ impl GraphRuntime {
             }
             if let Err(refusal) = plan.install_step(step, edge.due) {
                 let reason = match refusal {
-                    crate::read_outcome::InstallRefusal::RimExceeded { named, rim } => format!(
-                        "set_replay_read_plan: stage {} names {named} reads at step {step} but \
-                         its derived rim holds {rim}, the recording is foreign or truncated",
-                        edge.key.label()
-                    ),
                     crate::read_outcome::InstallRefusal::GateUnusable => format!(
                         "set_replay_read_plan: stage {} refuses the install ({}), a panic \
                          poisoned its gate and it admits nothing from here on",

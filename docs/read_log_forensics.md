@@ -253,7 +253,10 @@ counts.
 
 Folding is a common-case saving, never a change to what a stage is SIZED for: a
 live input's reads differ from one another, so it still costs one record per
-read, and the stage's rim is derived for that worst case.
+read, and the stage's rim is derived for that worst case. The rim is therefore a
+count of RECORDS, and a folded run can stand for more READS than it: the replay
+gate's per step plan carries one entry per read and is bounded by the recording,
+never by the rim, which stays the bound on the divergences one stage retains.
 
 ### Resolving the names
 

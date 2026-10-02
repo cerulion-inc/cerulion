@@ -20477,6 +20477,127 @@ fn a_recording_whose_reads_fold_replays_clean_on_both_sides() {
     );
 }
 
+/// The WIDE fold graph's source: a `period_ms = 1000` producer, so a step wide
+/// enough to burst the consumer past the staging ceiling still holds a COUNTABLE
+/// number of fires and frames.
+///
+/// Measured why this exists: the same step driven with the 25 ms source stages
+/// 208 fires and 208 frames in ONE step, which fills the reference recorder's
+/// trace ring and truncates the fire records (recorded 10 of 208), so the replay
+/// reports a fire-schedule divergence over a bag that is simply incomplete. The
+/// burst under test is the CONSUMER's, so the producer is slowed instead of the
+/// ring being argued with.
+#[cerulion_node(period_ms = 1000)]
+#[derive(Default)]
+struct WideStepSourceNode {
+    #[output]
+    out: Vector3,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl WideStepSourceNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.counter;
+        Ok(())
+    }
+}
+
+/// The WIDE fold graph: a 1000 ms source feeding the `period_ms = 1` consumer over
+/// the same `block` (never frozen) edge the fold fixture uses. The source is the
+/// slow one so that one very wide step publishes a handful of frames rather than
+/// hundreds, which keeps the burst's RUN the thing under test.
+fn wide_fold_burst_yaml() -> &'static str {
+    "name: wfgraph\nprefix: wf\nnodes:\n\
+     \x20 - id: source\n    type: wide_step_source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: burst\n    type: fold_burst_consumer_node\n    inputs:\n      - name: ctx\n        source: source/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn wide_fold_burst_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("source", Box::new(WideStepSourceNodeEntry::new())),
+        ("burst", Box::new(FoldBurstConsumerNodeEntry::new())),
+    ])
+}
+
+/// **A folded catch-up burst whose EXPANDED reads outnumber the derived rim
+/// replays clean and ENFORCED.**
+///
+/// A stage rim bounds that stage's RECORDS in one merge window; the gate's step
+/// plan carries one entry per recorded READ, and the fold stores a run of
+/// identical reads as ONE record. The two counts come apart exactly here: one
+/// very wide step of a `period_ms = 1` consumer serves the frames its source
+/// published and then reads an empty queue on every remaining fire, which is one
+/// maximal run folded into a single record whose count is larger than any rim
+/// this binary can derive. While the plan was bounded by the rim, installing it
+/// failed and the replay ended as an engine fault over a recording that
+/// describes its own reads completely.
+///
+/// THE PREMISE IS ASSERTED from the recording's own run counts against the
+/// derivation's CEILING, so the arm cannot pass without reaching the shape: a
+/// run past the ceiling is past every rim, whatever this edge derived. The
+/// oracle is then the pair that shape broke, a clean verdict and an ENFORCED
+/// read log with frames actually admitted through the gate.
+#[test]
+#[serial]
+fn a_folded_burst_wider_than_the_derived_rim_replays_clean_and_enforced() {
+    // ONE very wide step, then an ordinary one: at a 1 ms period the wide step
+    // fires past the ceiling, and the second step keeps the run multi-step. The
+    // subscriber buffer holds the wide step's frames so the burst under test is
+    // a RUN of empty reads and not a queue overflow.
+    let rec = record_reference_impl(
+        wide_fold_burst_yaml(),
+        wide_fold_burst_factories,
+        &[],
+        &[5_200, 40],
+        2_048,
+        true,
+    );
+    // PREMISE: one folded record stands for more reads than any stage of this
+    // binary holds records for, so that step's expanded plan is longer than its
+    // stage's rim whatever the rim derived to.
+    let longest = fold_runs(&rec)
+        .iter()
+        .map(|(_, _, n)| *n)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        longest > cerulion_core::read_outcome::READ_OUTCOME_STAGE_MAX,
+        "PRECONDITION: one run must expand past the derivation's ceiling, or this \
+         arm never reaches the shape it exists for: longest run was {longest}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("foldburst_over_rim.mcap");
+    // A FREE RUN bag: the enforcement stands aside on a lockstep one (measured,
+    // the same recording written lockstep reports `Lockstep`), and it is the
+    // GATE's install that this arm exists to reach.
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+    let outcome = replay(&bag, wide_fold_burst_factories, None, None)
+        .expect("a recording whose own reads outnumber the rim is still replayable");
+    assert_clean_verdict(&outcome, "a folded burst wider than the rim");
+    assert!(
+        outcome.read_log_divergence.is_none(),
+        "a byte-identical replay of a wide folded burst must not diverge: {:?}",
+        outcome.read_log_divergence
+    );
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            stages,
+            frames_admitted,
+            ..
+        } => {
+            assert!(
+                stages > 0 && frames_admitted > 0,
+                "the burst edge was GATED and admitted its frames through the plan: {:?}",
+                outcome.read_log_enforcement
+            );
+        }
+        other => panic!("the burst edge is produced and consumed in one rank: {other:?}"),
+    }
+}
+
 /// The fold is DETERMINISTIC: two recordings of the same
 /// run produce byte-identical read logs, run counts included.
 ///
