@@ -25,15 +25,22 @@
 //!
 //! # The 2034 inventory is the set that fails under the harness CI uses
 //!
-//! `cargo nextest` gives every test its own PROCESS, and 2034 is a per-process
-//! defect: it bites the SECOND iceoryx2 resource creation in a process that has
-//! already loaded a plugin node library. The waived arms reach that second
-//! creation two different ways, which is the mechanism they share rather than a
-//! shape they all have: most build more than one plugin graph inside the test
-//! process, and the multi-process arms spawn a supervisor that loads a node
-//! library and then pre-creates the graph-owned services from a second node of
-//! its own. That set, thirty two arms across fifteen binaries in three crates, is
-//! what is waived here. CI shards `cerulion_core` under nextest, so CI is green.
+//! THE MECHANISM, once. On macOS a process that has loaded a plugin linking
+//! iceoryx2 cannot create any further event resource, whichever process that is:
+//! the test process itself, or a `cerulion` child it spawns. So the defect bites
+//! the SECOND resource creation after a plugin load, and nothing about it is
+//! specific to a particular arm.
+//!
+//! That is why this inventory has TWO units. Where the arms run under
+//! `cargo nextest`, which gives each its own process, the arm is the unit and the
+//! ones that build more than one plugin graph inside themselves are declared one by
+//! one: 26 arms across 13 binaries in two crates. Where the arms run under plain
+//! `cargo test`, many arms share one process and the victim is whichever reaches
+//! the second creation first, so a per-arm list cannot converge: two runs of the
+//! same tree with the same fixtures on one macOS host disagreed on six arms out of
+//! thirty nine in each direction while the failing BINARIES stayed the same. Those
+//! binaries are gated whole, 3 of them in `cerulion_cli`. CI shards
+//! `cerulion_core` under nextest, so CI is green.
 //!
 //! `cargo test --test <binary>` runs a whole binary in ONE process, so on macOS
 //! it will additionally fail arms that nextest proves pass, because the second
@@ -72,9 +79,9 @@ use std::path::{Path, PathBuf};
 const WAIVER_2034_MARKER: &str = "upstream iceoryx2 0.10.0 defect 2034";
 
 /// Every arm carrying the 2034 macOS waiver, as `(path from the workspace root,
-/// test name)`. Thirty two arms across fifteen binaries in three crates; the
-/// counts are checked, not just written down, by the both-directions inventory
-/// below.
+/// test name)`. 26 arms across 13 binaries in two crates, with the binaries that
+/// are gated whole declared separately below; the counts are checked, not just
+/// written down, by the both-directions inventory further down.
 ///
 /// Workspace rooted for the same reason the 2035 list is: a waiver inventory
 /// scoped to the crate where a defect was first seen is incomplete by
@@ -186,41 +193,29 @@ const WAIVED_2034: &[(&str, &str)] = &[
         "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
         "two_runs_agree_on_artifact_shape",
     ),
-    // The credit-death bring-up arms, added after a measurement on a macOS host
-    // carrying three leftover `.shm_state` records with the system file table at
-    // 5,532 of 184,320: all three still fail at `wait_until_live` with the same
-    // `InternalFailure` reporting the file handle limit, so the cause is the
-    // defect this inventory names and not stale state a sweep would clear.
+];
+
+/// Binaries waived WHOLE on macOS, as `(path from the workspace root, the upstream
+/// issue)`. The unit is the BINARY and not the arm, and that is a measurement
+/// rather than a preference: the defect is per PROCESS, libtest runs many arms in
+/// one process, so the arm that dies is whichever reaches a second resource
+/// creation first. Two runs of the same tree with the same fixtures on one macOS
+/// host disagreed on six arms out of thirty nine in each direction while the
+/// failing BINARIES stayed the same. Each listed file carries
+/// `#![cfg(not(target_os = "macos"))]` and the marker, so on macOS it builds to a
+/// harness with no tests, and it runs normally on Linux.
+const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
     (
         "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
-        "c7_a_real_consumer_death_strands_its_producer_loudly",
-    ),
-    (
-        "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
-        "c7_the_free_run_death_line_names_its_dead_groups",
-    ),
-    (
-        "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
-        "c7_a_producer_that_dies_after_being_named_gets_retracted",
-    ),
-    // The flashback multi-process arms. Same shape, measured differently: the
-    // spawned supervisor loads a node library (its own cdylib tracing breadcrumb
-    // appears in its output) and then pre-creates the graph-owned services from a
-    // SECOND node in that process, which fails with the same `InternalFailure`.
-    // These three carry no file-handle line, where the credit-death arms do, and
-    // all three pass on the 0.9.1 base, which is what ties them to this defect
-    // rather than to a limit.
-    (
-        "crates/cerulion_cli/tests/flashback_argv_e2e_test.rs",
-        "a_plain_multi_process_run_hands_its_recorder_the_rings_it_created",
+        "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
         "crates/cerulion_cli/tests/flashback_argv_e2e_test.rs",
-        "no_rings_declines_both_the_rings_and_the_window_recorder",
+        "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
-        "crates/cerulion_cli/tests/flashback_argv_e2e_test.rs",
-        "a_rank_whose_ring_create_fails_is_declared_unavailable_and_handed_to_no_recorder",
+        "crates/cerulion_cli/tests/graph_run_validate_gate_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
     ),
 ];
 
@@ -509,6 +504,102 @@ fn both_waivers_are_pinned_to_the_iceoryx2_release_they_describe() {
 
 /// Every declared 2034 arm carries its own macOS scoped ignore, in its own
 /// contiguous attribute run, naming the defect.
+#[test]
+fn every_waived_binary_is_gated_whole_and_names_the_defect() {
+    if skip_out_of_workspace() {
+        return;
+    }
+    for (file, issue) in WAIVED_2034_BINARIES {
+        let src = read_at(file);
+        assert!(
+            src.contains("#![cfg(not(target_os = \"macos\"))]"),
+            "{file} is declared waived WHOLE but carries no file-level \
+             `#![cfg(not(target_os = \"macos\"))]`, so on macOS its arms still build \
+             and run. Gate the file or declare its arms one by one."
+        );
+        assert!(
+            src.contains(WAIVER_2034_MARKER),
+            "{file} is gated whole but does not name the defect: a reader meeting \
+             the gate has nothing to look up. Name `{WAIVER_2034_MARKER}` beside it."
+        );
+        assert!(
+            !src.contains("ignore = \"upstream iceoryx2 0.10.0 defect 2034"),
+            "{file} carries BOTH the file-level gate and a per-arm ignore for the \
+             same defect. One unit per file: the per-arm attributes are redundant \
+             once the file cannot compile on macOS at all."
+        );
+        assert!(
+            !WAIVED_2034.iter().any(|(f, _)| f == file),
+            "{file} is declared in BOTH inventories, which makes the counts and the \
+             per-crate rule say two different things about one binary."
+        );
+        assert!(
+            issue.contains("2034"),
+            "{file} is waived without naming the upstream issue (got `{issue}`)"
+        );
+    }
+}
+
+/// On macOS a whole-binary waiver is only real if the binary really lists nothing.
+/// The source check above reads the gate; this one reads what libtest does with it.
+#[test]
+fn a_waived_binary_lists_no_test_on_macos() {
+    if skip_out_of_workspace() {
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        // Off macOS the gate is inert BY DESIGN and the arms run, which the
+        // per-platform assertion in the arm below is what checks. Written to the
+        // stdout handle so a passing run says which platform it judged.
+        let mut out = std::io::stdout().lock();
+        writeln!(
+            out,
+            "skip: whole-binary waivers are only observable on macOS; this run is not macOS"
+        )
+        .expect("report the platform skip on stdout");
+        out.flush().expect("flush the platform skip");
+        return;
+    }
+    let stems: Vec<&str> = WAIVED_2034_BINARIES
+        .iter()
+        .map(|(f, _)| {
+            Path::new(f)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("a waived binary path names a .rs file")
+        })
+        .collect();
+    let built = candidates_by_stem(&stems);
+    let mut asked = 0usize;
+    for stem in &stems {
+        let Some(found) = built.get(*stem) else {
+            continue;
+        };
+        let Some(bin) = found.first() else {
+            continue;
+        };
+        let listed = arms_of(bin, false);
+        assert!(
+            listed.is_empty(),
+            "{stem} is declared waived WHOLE on macOS, but libtest lists {} arm(s) \
+             in the built binary ({}): the file-level gate did not take, so those \
+             arms will RUN here.",
+            listed.len(),
+            bin.display()
+        );
+        asked += 1;
+    }
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "whole-binary waivers asked on macOS: {asked} of {} (the rest were not built \
+         by this invocation)",
+        stems.len()
+    )
+    .expect("report the asked count on stdout");
+    out.flush().expect("flush the asked count");
+}
+
 #[test]
 fn every_declared_2034_arm_carries_a_macos_scoped_ignore_that_names_the_defect() {
     if skip_out_of_workspace() {
@@ -1069,8 +1160,8 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
     // `unbuilt` was reported and never asserted, which was the remaining way for
     // this arm to pass having checked less than it says.
     //
-    // Per CRATE and not across the inventory, because the inventory spans three and
-    // no single `-p` can build them all: `cargo test -p cerulion_core` cannot build a
+    // Per CRATE and not across the inventory, because the per-arm inventory spans
+    // two and no single `-p` can build both: `cargo test -p cerulion_core` cannot build a
     // `cerulion_cli_engine` target, so an inventory-wide rule would make the
     // ordinary per-crate command unpassable while offering a remedy that does not
     // exist. Per crate, that run reads one crate fully asked and the other fully

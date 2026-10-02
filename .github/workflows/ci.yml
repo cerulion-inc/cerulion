@@ -1990,12 +1990,12 @@ jobs:
             #
             # `|| true` so a zero-match parse reaches the floor below instead of
             # dying here under `pipefail` with nothing said.
-            names=$(sed -n '/^const WAIVED_2034/,/^];/p' "$inventory" \
+            names=$(sed -n '/^const WAIVED_2034:/,/^];/p;/^const WAIVED_2034_BINARIES:/,/^];/p' "$inventory" \
               | grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" \
               | sed 's#.*/##; s#\.rs"##' | sort -u || true)
             n=$(printf '%s\n' "$names" | grep -c . || true)
             # Per crate the floor is ONE, because the split between the two is
-            # the inventory's to decide and today it is 12, 1 and 2. The total is
+            # the inventory's to decide and today it is 12, 1 and 3. The total is
             # floored below, which is what catches a parse that stopped reaching
             # the file.
             if [ "$n" -lt 1 ]; then
@@ -3028,12 +3028,12 @@ jobs:
             #
             # `|| true` so a zero-match parse reaches the floor below instead of
             # dying here under `pipefail` with nothing said.
-            names=$(sed -n '/^const WAIVED_2034/,/^];/p' "$inventory" \
+            names=$(sed -n '/^const WAIVED_2034:/,/^];/p;/^const WAIVED_2034_BINARIES:/,/^];/p' "$inventory" \
               | grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" \
               | sed 's#.*/##; s#\.rs"##' | sort -u || true)
             n=$(printf '%s\n' "$names" | grep -c . || true)
             # Per crate the floor is ONE, because the split between the two is
-            # the inventory's to decide and today it is 12, 1 and 2. The total is
+            # the inventory's to decide and today it is 12, 1 and 3. The total is
             # floored below, which is what catches a parse that stopped reaching
             # the file.
             if [ "$n" -lt 1 ]; then
@@ -3149,10 +3149,14 @@ jobs:
       # and the engine's is the third (6.2 min).
       - name: CLI engine tests
         if: matrix.shard == 1
-        run: cargo test -p cerulion_cli_engine
+        # --no-fail-fast so ONE run reports every failing binary: cargo stops at
+        # the first by default, which is why a per-binary waiver took three heads.
+        run: cargo test -p cerulion_cli_engine --no-fail-fast
       - name: CLI binary tests
         if: matrix.shard == 0
-        run: cargo test -p cerulion_cli
+        # --no-fail-fast so ONE run reports every failing binary: cargo stops at
+        # the first by default, which is why a per-binary waiver took three heads.
+        run: cargo test -p cerulion_cli --no-fail-fast
       - name: CLI TUI tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
         run: cargo test -p cerulion_cli_tui
