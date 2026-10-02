@@ -604,7 +604,7 @@ def verb_findings(path, txt, tree):
 
 
 def check_docs_refs(root, files):
-    findings, notes = [], []
+    findings = []
     cli_src = read_text(root, CLI_FILE) if CLI_FILE in files else None
     if cli_src is None:
         raise CannotRun("%s is not in the tree: the verb check cannot run" % CLI_FILE)
@@ -630,18 +630,23 @@ def check_docs_refs(root, files):
             target = target.split("#", 1)[0].split("?", 1)[0]
             if not target:
                 continue
-            if PLACEHOLDER_RE.match(target):
-                notes.append("docs-refs: %s:%d: link target %s is a placeholder token, replaced at the cut (cut.sh refuses a leftover)" % (f, line_of(prose, at), target))
-                continue
             resolved = os.path.normpath(os.path.join(os.path.dirname(f), target)) if not target.startswith("/") else target.lstrip("/")
-            if not os.path.exists(os.path.join(root, resolved)):
-                findings.append(Finding("docs-refs", f, line_of(prose, at), "link target %s resolves to %s, which does not exist" % (target, resolved)))
+            if os.path.exists(os.path.join(root, resolved)):
+                continue
+            # Resolution comes first, so the placeholder SHAPE alone never fires: a
+            # tracked file spelled ALL_CAPS_WITH_UNDERSCORE is a link target like
+            # any other. A target of that shape resolving to nothing is reported as
+            # a token, because the message then names what a reader must replace.
+            if PLACEHOLDER_RE.match(target):
+                findings.append(Finding("docs-refs", f, line_of(prose, at), "link target %s is an unreplaced placeholder token; no file in the tree resolves it" % target))
+                continue
+            findings.append(Finding("docs-refs", f, line_of(prose, at), "link target %s resolves to %s, which does not exist" % (target, resolved)))
         findings.extend(verb_findings(f, txt, tree))
         for m in stale_re.finditer(txt):
             findings.append(Finding("docs-refs", f, line_of(txt, m.start()), "pre-move path spelling `%s/`; the tree keeps crates under crates/ and scripts under tools/scripts/" % m.group(1)))
         for m in user_api_re.finditer(txt):
             findings.append(Finding("docs-refs", f, line_of(txt, m.start()), "`USER_API.md` no longer exists; the user API reference is docs/user-api.md"))
-    return findings, notes, tree
+    return findings, tree
 
 
 # ---------------------------------------------------------------------------
@@ -1405,9 +1410,8 @@ def run_tree(root, out=sys.stdout):
     findings = []
     notes = []
     findings.extend(check_examples_shape(root, files))
-    f2, n2, _tree = check_docs_refs(root, files)
+    f2, _tree = check_docs_refs(root, files)
     findings.extend(f2)
-    notes.extend(n2)
     findings.extend(check_unreferenced_media(root, files))
     findings.extend(check_bench_citation(root, files))
     f5, legal_tail = check_shipped_text(root, files, phrases, ledger)
@@ -1656,7 +1660,8 @@ Benchmarks: [latency](benches/latency/README.md), results in [cited](docs/benchm
 FIXTURE_PAGE = """# Page
 
 See [the README](../README.md), [a missing page](missing.md), [external](https://example.invalid/x), [an anchor](#top),
-and [a placeholder](STUDIO_MACOS_DOWNLOAD_URL), while [an all-caps file](../NOTICE) is a link like any other.
+and [a placeholder](STUDIO_MACOS_DOWNLOAD_URL), while [an all-caps file](../NOTICE) is a link like any other,
+and [an all-caps name with an underscore](RELEASE_NOTES) resolves, so the shape alone never fires.
 
 Run `cerulion graph run demo`, then `cerulion graph validate demo`; never `cerulion graph frobnicate demo`,
 `cerulion replay bag.mcap` or `cerulion account devices purge`. The old `cerulion ros attach` spelling still exists as a stub,
@@ -1892,6 +1897,10 @@ def build_fixture(root):
          "Portions copyright Eclipse Foundation Inc.\n"
          "A later line writes it Acme Systems LLC instead.\n")
     _put(root, "docs/page.md", FIXTURE_PAGE)
+    # The NEIGHBOUR of the placeholder rule: a target of the placeholder SHAPE
+    # that resolves is a link like any other. No `.md`, so `in_docs_set` keeps it
+    # out of the docs-refs page walk and it is only ever a link target.
+    _put(root, "docs/RELEASE_NOTES", "an all-caps file a page may link\n")
     # Named after an agent instruction file, so outside the agent-file-ref scan:
     # the include shim and the guide itself. docs/guide.md holds the shim's line
     # byte for byte under another name, and reports.
@@ -1948,6 +1957,7 @@ EXPECTED = [
     ("examples-shape", "docs/page.md", "`cargo ... --example`"),
     ("examples-shape", "AGENTS.md", "`cargo ... --example`"),
     ("docs-refs", "docs/page.md", "link target missing.md"),
+    ("docs-refs", "docs/page.md", "link target STUDIO_MACOS_DOWNLOAD_URL is an unreplaced placeholder token"),
     ("docs-refs", "docs/page.md", "link target ../NOTICE resolves to NOTICE"),
     ("docs-refs", "docs/page.md", "link target media/missing-dark.svg resolves to docs/media/missing-dark.svg"),
     ("docs-refs", "docs/page.md", "link target media/missing-fallback.svg resolves to docs/media/missing-fallback.svg"),
@@ -2259,7 +2269,7 @@ def self_test(out=sys.stdout):
                     "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717",
                     "Eclipse Foundation", "Willow Garage", "MyAcme", "Incidentally", "Acme Systems Corp.",
                     "Co-operative", "works with Foo", "Acme Robotics Systems", "Acme Robotics Inc.",
-                    "git revert <this commit>", "does not reverse this commit",
+                    "git revert <this commit>", "does not reverse this commit", "RELEASE_NOTES",
                     "docs/CLAUDE.md", "docs/AGENTS.md:", "docs/internals/"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
@@ -2277,7 +2287,9 @@ def self_test(out=sys.stdout):
                      "docs/benchmarks/results/pkg-cited/run.log", "docs/legal/HISTORY.md", ALLOW_FILE):
             arm("work-state-control:" + path, not any(l.startswith(path + ":") for l in ws_lines), "\n" + text)
         arm("work-state-note-per-fired-key", all(any(l.startswith("note: work-state: %s: write instead: " % key) for l in lines) for key in ws_compiled), text)
-        arm("placeholder-is-a-note", any(l.startswith("note: docs-refs: docs/page.md:") and "STUDIO_MACOS_DOWNLOAD_URL" in l for l in lines), text)
+        arm("placeholder-is-a-finding-not-a-note",
+            not any(l.startswith("note: docs-refs:") for l in lines)
+            and any(l.startswith("docs/page.md:") and "STUDIO_MACOS_DOWNLOAD_URL is an unreplaced placeholder token" in l for l in findings), text)
         arm("allow-entry-excused-gate-only", not any(l.startswith("examples/gate_only:") and "no Cargo.toml" in l for l in findings))
         # agent-file-ref: the exclusion is the NAME. docs/CLAUDE.md and
         # docs/guide.md hold the same line byte for byte, and only the one not
