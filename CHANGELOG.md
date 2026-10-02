@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A graph could die with no panic text when the `cerulion` host and a node cdylib had been built against different layouts of a transport type. A type whose field types change is re-packed by the compiler, which can leave its size, its alignment and its field names identical and still move its fields, so a node built earlier reads a field at an offset the host no longer writes. This takes the node cdylib ABI from 23 to 24, so every prebuilt node cdylib must be rebuilt (`cerulion node build <type>`) before it will load.
+
 ### Changed
+- An input that declares no trigger no longer creates an event listener. Such an input is read on its own node's fire by the step's snapshot and is woken by nothing, so the port that would sit in every publisher's notify path for it is not created at all; a topic's live listener count and its expected in-process total both drop by one per such input. `CerulionSubscriber::wait_for_message`, and `AnySubscriber::wait_for_message` which forwards to it and is the method a node body can reach through the prelude, now return an error naming the topic ("this subscriber was built with no event listener, so there is nothing here to wait on") instead of waiting out its timeout and returning `Ok(0)`. That entry serves subscribers a tool builds for itself, the `cerulion topic` observer among them; a node reads a declared input through its own tick or has the step drain it.
 - The minimum supported Rust version is 1.95 (it was 1.93), and the release workflow builds with Rust 1.95.0. `cerulion_core` calls `try_update` on its atomics, the name Rust 1.95 stabilised and Rust 1.99 uses in place of the deprecated `fetch_update`; a workspace that denies warnings builds again under the current stable.
 - The shared memory transport moves to iceoryx2 0.10.0. Every event service is sized to the event
   ids the transport actually mints rather than the library default, so a listener no longer walks

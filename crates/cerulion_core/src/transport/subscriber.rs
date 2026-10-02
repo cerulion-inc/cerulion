@@ -568,10 +568,10 @@ const _: fn() = || {
 ///
 /// The recorder (`bagd`) and the replay engine's capture taps drain SHM samples
 /// exclusively via a POLLING loop ([`Self::drain_owned`]); they never wait on an
-/// event listener. A [`CerulionSubscriber`], however, MANDATES a `Listener` (it
-/// bundles a data receiver AND a WaitSet event listener), so attaching one puts
-/// a connection in every publisher's notifier send loop that nothing will ever
-/// wait on.
+/// event listener. A [`CerulionSubscriber`], however, opens the topic's EVENT
+/// service and holds a `Listener` on it for anything but an input that declares no
+/// trigger, so attaching one puts a connection in every publisher's notifier send
+/// loop that nothing will ever wait on.
 ///
 /// A `DataOnlySubscriber` opens ONLY the data pub/sub service (never the topic's
 /// event service), so it registers NO listener connection: the notifier's
@@ -1077,7 +1077,16 @@ pub fn fault_inject_drain_events_err_for_test(armed: bool) {
 pub struct CerulionSubscriber {
     topic: String,
     subscriber: Subscriber<CerService, [u8], ()>,
-    listener: Listener<CerService>,
+    /// This input's event listener, or `None` for an input that declares no
+    /// trigger.
+    ///
+    /// A latest-value input is read on its own node's fire, by the step's
+    /// snapshot. Nothing waits on it: no wake source attaches its listener and no
+    /// execution path blocks on one. So it is built without one, and the port that
+    /// would sit in every publisher's notifier send loop, waited on by nothing,
+    /// does not exist rather than depending on a read to empty it. The subscriber
+    /// still announces itself through its notifier, so history still reaches it.
+    listener: Option<Listener<CerService>>,
     notifier: Notifier<CerService>,
     /// This input's single backpressure probe (see
     /// [`BackpressureProbe`] for the per-variant semantics). `Some` on
@@ -1505,7 +1514,7 @@ impl CerulionSubscriber {
     pub(crate) fn new(
         topic: String,
         subscriber: Subscriber<CerService, [u8], ()>,
-        listener: Listener<CerService>,
+        listener: Option<Listener<CerService>>,
         notifier: Notifier<CerService>,
         max_publishers: usize,
         max_borrowed_samples: usize,
@@ -2158,6 +2167,14 @@ impl CerulionSubscriber {
     /// re-establishes. Mixing read paths on one probed input is a caller
     /// error.
     #[must_use = "receive result must be checked"]
+    /// # Errors
+    ///
+    /// A subscriber built with no event listener, which is how a graph builds an
+    /// input that declares no trigger, has nothing to wait on and REFUSES here,
+    /// naming the topic. This entry serves subscribers a tool builds for itself;
+    /// the `cerulion topic` observer is its caller in this tree, and it is not how
+    /// a node reads a declared input, which its own tick reads through the view or
+    /// the step drains for it.
     pub fn wait_for_message<F>(&self, timeout: Duration, mut callback: F) -> TransportResult<usize>
     where
         F: FnMut(ReceivedMessage<'_>),
@@ -2169,6 +2186,35 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("wait_for_message");
         }
+        // An input that declares no trigger is built with no event listener, so
+        // there is nothing here to block on. Refuse by name rather than return
+        // zero after the timeout: a zero would read as "no frame arrived" and send
+        // the caller back to wait again on a thing that can never fire.
+        //
+        // This entry serves subscribers a TOOL builds for itself, the `cerulion
+        // topic` observer being its caller in this tree, and is not how a node
+        // reads a declared input: a node's input is read by its own tick through
+        // the view, or drained for it by the step.
+        //
+        // The refusal names the input by its TOPIC, which is what a subscriber
+        // holds; the node-side input name is the caller's own.
+        if self.listener.is_none() {
+            return Err(TransportError::Receive {
+                // hot-path-alloc-ok: cold refusal arm, once per misuse.
+                topic: self.topic.clone(),
+                reason: String::from(
+                    "this subscriber was built with no event listener, so there is nothing \
+                     here to wait on. A graph builds an input that declares no trigger this \
+                     way: read it from the tick instead, or declare the input as a trigger \
+                     if it should wake its node",
+                ),
+            });
+        }
+        // Bound once, after the refusal above proved it present.
+        let listener = self
+            .listener
+            .as_ref()
+            .expect("the refusal above returns for a listenerless input");
         // Drain any stale events from the listener before waiting.
         // This prevents spurious wakeups from previously queued events
         // (e.g., SentSample from a prior publish cycle, SubscriberConnected
@@ -2202,8 +2248,7 @@ impl CerulionSubscriber {
             // id per loop turn is the same outcome the old loop reached by
             // re-waiting, with no re-wait.
             let mut saw_data_event = false;
-            let activations = self
-                .listener
+            let activations = listener
                 .timed_wait(
                     |activation| {
                         if matches!(
@@ -2387,7 +2432,12 @@ impl CerulionSubscriber {
         // iceoryx2 0.10: one `try_wait` empties the queue, so the old
         // drain-to-`Ok(None)` loop collapses to a single call with the same
         // outcome (this site always drained to empty).
-        match self.listener.try_wait(|_a| {}) {
+        // An input that declares no trigger was built without a listener, so
+        // there is no queue to empty and nothing to fail. See the field's doc.
+        let Some(listener) = self.listener.as_ref() else {
+            return Ok(());
+        };
+        match listener.try_wait(|_a| {}) {
             Ok(_) => Ok(()),
             Err(e) => Err(TransportError::Receive {
                 // hot-path-alloc-ok: cold error arm, a listener
@@ -2418,7 +2468,11 @@ impl CerulionSubscriber {
         // `count` repeats, so push `count` copies to keep this helper's
         // "one entry per notify" contract (the 0.9.1 queue held one datagram
         // per notify and this loop popped them one at a time).
-        let _ = self.listener.try_wait(|activation| {
+        let listener = self.listener.as_ref().expect(
+            "test_drain_events reads a listener's event queue, and this subscriber was built \
+             with none, so an empty result would read as 'no events arrived'",
+        );
+        let _ = listener.try_wait(|activation| {
             if let Ok(parsed) = super::events::PubSubEvent::try_from(activation.id) {
                 for _ in 0..activation.count {
                     events.push(parsed);
@@ -2504,7 +2558,12 @@ impl CerulionSubscriber {
         // SAFETY (native_handle): the value is returned as a plain integer
         // whose lifetime/no-close contract is documented above; this call
         // itself stores nothing and closes nothing.
-        unsafe { self.listener.file_descriptor().native_handle() }
+        let listener = self.listener.as_ref().expect(
+            "an input that declares no trigger has no event listener and no file \
+             descriptor to watch; only a trigger input or a tool's own subscriber is \
+             waited on",
+        );
+        unsafe { listener.file_descriptor().native_handle() }
     }
 
     /// Drain this subscriber's event-NOTIFICATION queue
@@ -4886,8 +4945,8 @@ impl CerulionSubscriber {
     /// `run_waitset_reactor_once_for_test` seam). The reactor records which
     /// sources fired and clears the `Listener`'s EVENT-notification queue;
     /// it never reads/consumes the data sample and never fires the scheduler.
-    pub(crate) fn listener(&self) -> &Listener<CerService> {
-        &self.listener
+    pub(crate) fn listener(&self) -> Option<&Listener<CerService>> {
+        self.listener.as_ref()
     }
 }
 

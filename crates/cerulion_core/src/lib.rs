@@ -685,7 +685,19 @@ pub mod wire;
 ///   asserts no offset.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 23;
+/// - v24: `CerulionSubscriber`'s event listener became optional, because an input
+///   that declares no trigger is woken by nothing and the port that would sit in
+///   every publisher's notifier send loop for it need not exist. The field SET and
+///   the struct's size and alignment can all stay as they were and rustc still
+///   re-packs a `repr(Rust)` struct when a field's type changes, so a node library
+///   built against the previous packing reads a field at an offset this core does
+///   not write, drops whatever bytes live there, and dies inside the node library
+///   with no panic text. That is the same drop path the v22 entry describes,
+///   reached by a different divergence. The host reads the cdylib's exported
+///   version at load and names the stale node instead of faulting inside it.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 24;
 
 // Re-export commonly used types
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};
