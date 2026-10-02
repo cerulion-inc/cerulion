@@ -437,9 +437,29 @@ pub struct OwnedInboundSample {
 }
 
 impl OwnedInboundSample {
+    /// [`Self::new`] for a caller that has ALREADY parsed this frame's header and
+    /// bounds-checked its `total_size` against the loaned slot.
+    ///
+    /// The read path that hands this in has done both one line earlier, so parsing
+    /// the same thirty-two bytes again here would be the second parse of a frame on
+    /// a path whose rule is one.
+    fn with_header(sample: InboundSample, header: &WireHeader) -> Self {
+        let frame_len = header.total_size as usize;
+        // The precondition, checked where it is cheap: `payload()` slices the loaned
+        // slot to `frame_len`, so a `total_size` outside it would panic there
+        // instead of here. A slot-length read, not a parse, so the tally stays one.
+        debug_assert!(
+            (WireHeader::SIZE..=sample.payload().len()).contains(&frame_len),
+            "with_header's caller must bounds-check total_size against the loaned slot: \
+             {frame_len} is outside 32..={}",
+            sample.payload().len()
+        );
+        Self { sample, frame_len }
+    }
+
     /// Wrap an owned inbound sample, computing its wire-frame length once
-    /// (alignment-safe header read; SHM slots are not guaranteed 8-byte
-    /// aligned — see `wire.rs`).
+    /// (alignment-safe header read; SHM slots are not guaranteed 8-byte aligned,
+    /// see `wire.rs`).
     fn new(sample: InboundSample) -> Self {
         let raw = sample.payload();
         let frame_len = match WireHeader::read_from_buf(raw) {
@@ -1630,16 +1650,25 @@ impl CerulionSubscriber {
     /// advancing at pop would tell a resume to skip a frame it must re-inject.
     ///
     /// Cost: one predictable branch (`None` for every subscriber that is not a
-    /// per-message FIFO trigger input), then one header parse and one `Release`
-    /// store. No allocation, no transport call.
+    /// per-message FIFO trigger input), then one `Release` store. The header is
+    /// the caller's, already parsed on the path that served the frame. No
+    /// allocation, no transport call.
     #[inline]
-    fn record_service_cursor(&self, raw: &[u8]) {
+    fn record_service_cursor_from(&self, header: &WireHeader) {
         let Some(cursor) = self.served_sequence.as_ref() else {
             return;
         };
-        if let Some(header) = WireHeader::read_from_buf(raw) {
-            cursor.store(u64::from(header.sequence) + 1, Ordering::Release);
-        }
+        cursor.store(u64::from(header.sequence) + 1, Ordering::Release);
+    }
+
+    /// [`Self::register_service_cursor`] for a test.
+    ///
+    /// The cursor is installed by graph wiring, so a subscriber a test builds by
+    /// hand has none, and the serve-point work the cursor gates does not run at all
+    /// on such a subscriber. A test that means to measure that work installs one.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn register_service_cursor_for_test(&mut self, cursor: Arc<AtomicU64>) {
+        self.register_service_cursor(cursor);
     }
 
     /// Mark this subscriber as the body half of a
@@ -2499,7 +2528,7 @@ impl CerulionSubscriber {
             callback(ReceivedMessage::new(header, payload));
             // Same serve point as `drain_samples` — one frame, really
             // delivered.
-            self.record_service_cursor(raw);
+            self.record_service_cursor_from(&header);
             return Ok(true);
         }
     }
@@ -2587,8 +2616,8 @@ impl CerulionSubscriber {
             }
             // Same serve point as the callback twin — one frame,
             // really delivered (ownership does not change what "served" means).
-            self.record_service_cursor(raw);
-            return Ok(Some(OwnedInboundSample::new(sample)));
+            self.record_service_cursor_from(&header);
+            return Ok(Some(OwnedInboundSample::with_header(sample, &header)));
         }
     }
 
@@ -2663,7 +2692,10 @@ impl CerulionSubscriber {
             // (whether or not it survives `deliver_raw_frame`'s filter) — the
             // `block` mirror tracks queue REMOVALS, not deliveries.
             |sample| {
-                if deliver_raw_frame(topic, sample.payload(), callback) {
+                // The header `deliver_raw_frame` parsed comes back instead of being
+                // read again here: the served sequence and the cursor below both
+                // want the same thirty-two bytes.
+                if let Some(header) = deliver_raw_frame(topic, sample.payload(), callback) {
                     count += 1;
                     if capture {
                         if let Some(seq) = wire_sequence(sample.payload()) {
@@ -2679,7 +2711,7 @@ impl CerulionSubscriber {
                     // reads "nothing served" at the anchor while frames were
                     // flowing, and a resume re-injects a band the node had
                     // already consumed.
-                    self.record_service_cursor(sample.payload());
+                    self.record_service_cursor_from(&header);
                 }
             },
             |removed| self.record_block_drained(removed),
@@ -2767,7 +2799,7 @@ impl CerulionSubscriber {
                     .held_sample
                     .as_ref()
                     .expect("FrozenSlot::Held implies held_sample is Some");
-                return build_inbound_view::<T, R>(&self.topic, sample, f).map(Some);
+                return build_inbound_view::<T, R>(&self.topic, sample, f).map(|(r, _)| Some(r));
             }
             Some(FrozenSlot::Empty) => return Ok(None),
             // `Sample` / `Err` (consumed below) and `None` (the live arm).
@@ -2949,8 +2981,8 @@ impl CerulionSubscriber {
                 // schema-mismatched / undersized / out-of-bounds frame, which
                 // the tick never sees. Recording it as served would tell a
                 // resume to skip a frame nothing read.
-                let out = build_inbound_view::<T, R>(&self.topic, &sample, f)?;
-                self.record_service_cursor(sample.payload());
+                let (out, header) = build_inbound_view::<T, R>(&self.topic, &sample, f)?;
+                self.record_service_cursor_from(&header);
                 Ok(Some(out))
             }
             // NB: this arm records NO cursor, and it is unreachable TWICE over,
@@ -2972,7 +3004,7 @@ impl CerulionSubscriber {
                     .held_sample
                     .as_ref()
                     .expect("FrozenSlot::Held implies held_sample is Some");
-                build_inbound_view::<T, R>(&self.topic, sample, f).map(Some)
+                build_inbound_view::<T, R>(&self.topic, sample, f).map(|(r, _)| Some(r))
             }
             FrozenSlot::Empty => Ok(None),
             FrozenSlot::Err(e) => Err(e),
@@ -4763,13 +4795,13 @@ fn build_inbound_view<T: ShmMessage, R>(
     topic: &str,
     sample: &InboundSample,
     f: impl FnOnce(InputView<'_, T>) -> R,
-) -> TransportResult<R> {
+) -> TransportResult<(R, WireHeader)> {
     let raw = sample.payload();
     // THE shared frame checks, so this path and the scheduler-bounded one in
     // `super::bounded_view` refuse the same frames for the same reasons. Four
     // bounds checks in two places is how one of them ends up accepting a frame
     // the other rejects.
-    let (_header, payload) = super::input_view::validate_wire_frame::<T>(topic, raw)?;
+    let (header, payload) = super::input_view::validate_wire_frame::<T>(topic, raw)?;
     let payload_ptr = raw.as_ptr();
     let payload_len = payload.len();
     // SAFETY: `raw` is a valid slice into the iceoryx2 SHM region owned by
@@ -4785,13 +4817,14 @@ fn build_inbound_view<T: ShmMessage, R>(
     let reader = T::build_reader(payload_slice);
     let handle = SampleHandle::InboundRef { sample };
     let view = InputView::new(handle, reader);
-    Ok(f(view))
+    Ok((f(view), header))
 }
 
 /// Validate a raw wire frame and deliver it to `callback` as a
-/// `ReceivedMessage`. Returns `true` if delivered, `false` if skipped
-/// (a `warn` was emitted). Used by the `drain_samples` receive path.
-fn deliver_raw_frame<F>(topic: &str, raw: &[u8], callback: &mut F) -> bool
+/// `ReceivedMessage`. Returns the frame's parsed `WireHeader` if delivered,
+/// `None` if skipped (a `warn` was emitted). Used by the `drain_samples` receive
+/// path.
+fn deliver_raw_frame<F>(topic: &str, raw: &[u8], callback: &mut F) -> Option<WireHeader>
 where
     F: FnMut(ReceivedMessage<'_>),
 {
@@ -4801,7 +4834,7 @@ where
             size_bytes = raw.len(),
             "received undersized message, skipping"
         );
-        return false;
+        return None;
     }
     let header = match WireHeader::read_from_buf(raw) {
         Some(h) => h,
@@ -4814,7 +4847,7 @@ where
                 size_bytes = raw.len(),
                 "wire header read failed, skipping"
             );
-            return false;
+            return None;
         }
     };
     // Validate total_size against the
@@ -4828,11 +4861,11 @@ where
             frame_len = raw.len(),
             "wire header total_size out of bounds, skipping"
         );
-        return false;
+        return None;
     }
     let payload = &raw[WireHeader::SIZE..total_size];
     callback(ReceivedMessage::new(header, payload));
-    true
+    Some(header)
 }
 
 /// Drive a `receive()` loop to exhaustion (or the first error) while keeping

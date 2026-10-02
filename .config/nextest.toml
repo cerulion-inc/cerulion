@@ -97,6 +97,7 @@ filter = '''
 + binary(=graph_latency_test)
 + binary(=graph_test)
 + binary(=latency_threshold_test)
++ binary(=wire_header_parsed_once_test)
 + binary(=macro_cdylib_test)
 + binary(=macro_graph_test)
 + binary(=network_test)
