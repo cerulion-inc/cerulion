@@ -512,7 +512,8 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # (SetStoreInfo / blueprint / statics) always takes the reliable path, and drops
 # are reported as `live_dropped` by `capture_memory`. `None` = stock behaviour.
 #
-# Upstream 0.34.1 + those two localized patches. The first is a
+# Upstream 0.34.1 + two localized `ServerOptions` patches and one test-only change
+# (THE THIRD CHANGE below). The first patch is a
 # `ServerOptions::drop_temporal_history` mode that
 # makes the per-client connect-history retain the scene skeleton (persistent +
 # static_) but NEVER buffer disposable/temporal frames — Cerulion Studio's
@@ -521,6 +522,16 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # no viewer-blueprint clobber). vizd sets it on; every other re_grpc_server user
 # gets stock behavior (default `false`). Version stays 0.34.1 so the whole re_*
 # graph stays lockstep (`cargo tree | grep re_grpc`).
+#
+# THE THIRD CHANGE (fork commit 92d8fee) adds no option. The forwarding loop behind
+# `spawn_with_recv` runs on a blocking-pool thread (`spawn_blocking` driving its
+# receive through `Handle::block_on`) instead of a runtime worker: its push into
+# the receiver it hands back is a thread-blocking send that waits with no timeout
+# once the channel has warned, so on the two-worker runtimes of the vizd liveness
+# tests a receiver left undrained filled that channel, the send parked a worker
+# and the viewer missed its deadline. `spawn_with_recv` is called only by those
+# tests; vizd hosts through `serve_from_channel`, whose send already ran on a
+# blocking thread.
 #
 # WHY A FORK — stock 0.34.1's two `ServerOptions` knobs (`playback_behavior`,
 # `memory_limit`) cannot express "deliver the scene skeleton to a late joiner but
@@ -531,18 +542,20 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # SPARSE-FORK MODEL — cerulion-inc/re_grpc_server is a single-crate fork (NOT a
 # fork of rerun's ~278MB monorepo — a cargo git-dep clones the whole repo per cold
 # CI job): branch `upstream` carries the crates.io tarball verbatim (tagged
-# `upstream/<ver>`), branch `main` = `upstream` + the patch (what this rev pins),
+# `upstream/<ver>`), branch `main` = `upstream` + the patches (what this rev pins),
 # mirroring the cerulion-inc/RustDDS precedent above. UPGRADE: in that repo run
 # `./import-upstream.sh <new-ver>` then `git merge upstream` on main, rebuild +
 # retest, and bump the `rev` here. See its README.md + CERULION-PATCH.md.
 #
-# EXIT CONDITION: drop this patch entirely (revert to the crates.io
+# EXIT CONDITION: drop this fork entirely (revert to the crates.io
 # re_grpc_server, prune this rev + the `deny.toml [sources]` entry) if upstream
 # re_grpc_server ever ships BOTH a statics-only / drop-temporal history mode
-# and a bounded, non-blocking live queue. Either alone is not
-# enough — the two patches bound two different buffers on the same path, and the
-# same wording is carried by `deny.toml [sources]` and the fork's
-# CERULION-PATCH.md "Exit condition".
+# and a bounded, non-blocking live queue, AND moves the `spawn_with_recv`
+# forwarder's send off its runtime workers. The first two alone are not enough: either capability
+# alone leaves one of the two buffers on that path unbounded, and without the
+# third an undrained receiver fills the forwarder's channel and its push parks a
+# runtime worker again. `deny.toml [sources]` carries the same three; the fork's
+# CERULION-PATCH.md "Exit condition" names the first two.
 #
 # LANDMINE: the added `ServerOptions` fields are safe ONLY because rerun's
 # `clap`/`run`/`web_viewer` features — which construct `ServerOptions` with
@@ -550,7 +563,7 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # `rerun` (sdk + server only) build. If a future workspace change enables any of
 # those features on `rerun`, those upstream literals would need the fields. Watch
 # on any `rerun` feature change.
-re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "29b38496264e4681844346aa49c770070097305e" }
+re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "92d8feeeb583289b5b976ab121f90b50d4eb2e50" }
 
 # A FORK of iceoryx2-bb-posix 0.10.0 removing the process umask from
 # `UnixDatagramSocket::bind`.

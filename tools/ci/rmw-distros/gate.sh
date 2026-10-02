@@ -3,12 +3,14 @@
 #
 # Each distro has an expected state in the table below. `build` means rmw_cerulion must compile
 # against the distro's real headers (generated bindings, never the vendored fallback), must export
-# no symbol the distro's headers do not declare, and its serial test suite must pass. After the
-# suite, a `build` row also runs a REAL rclpy cross-process exchange over rmw_cerulion in this
-# distro's container (both directions, the three #[ignore]'d tests in rclpy_xproc_test.rs run
-# with --ignored against the freshly staged .so), with a wrong-payload self-test that must red
-# and a staged-vs-built digest check, so a green lane proves a real rclpy peer talks to native
-# Cerulion on this distro. `refuse`
+# no symbol the distro's headers do not declare, and (on the x86_64 lanes) its serial test suite
+# must pass. After the build, a `build` row also runs a REAL rclpy cross-process exchange over
+# rmw_cerulion in this distro's container (both directions, the three #[ignore]'d tests in
+# rclpy_xproc_test.rs run with --ignored against the freshly staged .so), with a wrong-payload
+# self-test that must red and a staged-vs-built digest check, so a green lane proves a real rclpy
+# peer talks to native Cerulion on this distro. The emulated aarch64 leg sets
+# RMW_GATE_SKIP_SERIAL_SUITE=1 to defer the in-process serial suite (the x86_64 lanes always run
+# it); the build, symbol audit, staged digest and the exchange still run there. `refuse`
 # means the build is expected to stop at a KNOWN place, and
 # the gate requires that exact marker in the build log: any other failure is a lane failure, and a
 # distro that silently starts building fails the lane too, so the table can never lag the truth.
@@ -43,7 +45,8 @@ set -u
 # symbol is a claim the distro cannot back, and a stub that answers UNSUPPORTED is worse than no
 # symbol at all. The audit reads the library with `nm` and also requires the control symbol
 # rmw_init, so an empty or unreadable symbol table can never pass it.
-# A `build` row also pins floors the suite must clear before "green" means anything: at least
+# A `build` row also pins floors the suite must clear before "green" means anything (on the lanes
+# that run the suite; the emulated aarch64 leg defers it): at least
 # min_targets target summaries and min_tests tests run (ok, failed or ignored), pinned PER ROW from
 # that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run; 33 and 479
 # with the two vendored-gate binaries) with margin for
@@ -118,35 +121,43 @@ case "$expect" in
         symbol_audit "$nmlog" "$absent_symbols" || { echo "GATE FAIL: $distro exports a symbol its headers do not declare"; exit 1; }
         absent_n=$(printf '%s\n' "$absent_symbols" | sed '/^$/d' | wc -l | tr -d ' ')
         echo "SYMBOL AUDIT PASS: $NM_CONTROL_SYMBOL defined and $absent_n header-absent symbol(s) undefined"
-        tlog="/tmp/rmw_test_${distro}.log"
-        echo "== rmw serial suite on $distro (every target, no fail-fast) =="
-        cargo test --locked -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
-        rc_test=${PIPESTATUS[0]}
-        # Everything below reads the log with terminal colour stripped (see harvest.sh).
-        plain="${tlog}.plain"; strip_ansi "$tlog" > "$plain"
-        # "Green" must mean the suite RAN: a crash or a test target that does not compile fails here,
-        # every target must report a summary, and the counts must clear the floors.
-        if crashed "$plain"; then
-            echo "GATE FAIL: $distro suite crashed or a test target did not compile (rc=$rc_test)"; exit 1
-        fi
-        read -r summaries ran failed_total <<< "$(suite_counts "$plain")"
-        [ "$summaries" -ge "$min_targets" ] || { echo "GATE FAIL: $distro suite reported $summaries target summaries, floor $min_targets"; exit 1; }
-        [ "$ran" -ge "$min_tests" ] || { echo "GATE FAIL: $distro suite ran $ran tests, floor $min_tests"; exit 1; }
-        failed="$(qualified_failures "$plain")"
-        expected="$(printf '%s\n' "${known_failures:-}" | sed '/^$/d' | sort -u)"
-        expected_n=$(printf '%s\n' "$expected" | sed '/^$/d' | wc -l | tr -d ' ')
-        if [ -z "$expected" ]; then
-            [ "$rc_test" -eq 0 ] || { echo "GATE FAIL: $distro suite exited rc=$rc_test with an empty pinned set"; exit 1; }
+        # The in-process serial suite runs on every lane EXCEPT when a caller sets
+        # RMW_GATE_SKIP_SERIAL_SUITE=1 AND the lane is not x86_64 (serial_suite_runs in harvest.sh,
+        # self-tested in gate_selftest.sh). The emulated aarch64 leg sets it; the x86_64 lanes run the
+        # suite unconditionally, so a skip variable leaked into a shared env cannot empty their floors.
+        if serial_suite_runs "$(uname -m)"; then
+            tlog="/tmp/rmw_test_${distro}.log"
+            echo "== rmw serial suite on $distro (every target, no fail-fast) =="
+            cargo test --locked -p rmw_cerulion --release --no-fail-fast -- --test-threads=1 2>&1 | tee "$tlog"
+            rc_test=${PIPESTATUS[0]}
+            # Everything below reads the log with terminal colour stripped (see harvest.sh).
+            plain="${tlog}.plain"; strip_ansi "$tlog" > "$plain"
+            # "Green" must mean the suite RAN: a crash or a test target that does not compile fails here,
+            # every target must report a summary, and the counts must clear the floors.
+            if crashed "$plain"; then
+                echo "GATE FAIL: $distro suite crashed or a test target did not compile (rc=$rc_test)"; exit 1
+            fi
+            read -r summaries ran failed_total <<< "$(suite_counts "$plain")"
+            [ "$summaries" -ge "$min_targets" ] || { echo "GATE FAIL: $distro suite reported $summaries target summaries, floor $min_targets"; exit 1; }
+            [ "$ran" -ge "$min_tests" ] || { echo "GATE FAIL: $distro suite ran $ran tests, floor $min_tests"; exit 1; }
+            failed="$(qualified_failures "$plain")"
+            expected="$(printf '%s\n' "${known_failures:-}" | sed '/^$/d' | sort -u)"
+            expected_n=$(printf '%s\n' "$expected" | sed '/^$/d' | wc -l | tr -d ' ')
+            if [ -z "$expected" ]; then
+                [ "$rc_test" -eq 0 ] || { echo "GATE FAIL: $distro suite exited rc=$rc_test with an empty pinned set"; exit 1; }
+            else
+                [ "$rc_test" -ne 0 ] || { echo "GATE FAIL: $distro suite exited 0 but the table pins $expected_n failures; flip the row"; exit 1; }
+            fi
+            [ "$failed_total" -eq "$expected_n" ] || { echo "GATE FAIL: $distro summaries count $failed_total failures, the pinned set has $expected_n"; echo "-- got:"; echo "$failed"; exit 1; }
+            if [ "$failed" = "$expected" ]; then
+                if [ -z "$expected" ]; then echo "GATE PASS: $distro builds from generated bindings and its suite is green ($summaries targets, $ran tests run, rc 0)"
+                else echo "GATE PASS (known failures only): $distro builds; $summaries targets, $ran tests run, the failing set is exactly the pinned one:"; echo "$expected"; fi
+            else
+                echo "GATE FAIL: $distro failing-test set differs from the pinned one."; echo "-- expected:"; echo "$expected"; echo "-- got:"; echo "$failed"
+                echo "(a test that started passing or a new failure both land here; update the table in the PR that changes $distro)"; exit 1
+            fi
         else
-            [ "$rc_test" -ne 0 ] || { echo "GATE FAIL: $distro suite exited 0 but the table pins $expected_n failures; flip the row"; exit 1; }
-        fi
-        [ "$failed_total" -eq "$expected_n" ] || { echo "GATE FAIL: $distro summaries count $failed_total failures, the pinned set has $expected_n"; echo "-- got:"; echo "$failed"; exit 1; }
-        if [ "$failed" = "$expected" ]; then
-            if [ -z "$expected" ]; then echo "GATE PASS: $distro builds from generated bindings and its suite is green ($summaries targets, $ran tests run, rc 0)"
-            else echo "GATE PASS (known failures only): $distro builds; $summaries targets, $ran tests run, the failing set is exactly the pinned one:"; echo "$expected"; fi
-        else
-            echo "GATE FAIL: $distro failing-test set differs from the pinned one."; echo "-- expected:"; echo "$expected"; echo "-- got:"; echo "$failed"
-            echo "(a test that started passing or a new failure both land here; update the table in the PR that changes $distro)"; exit 1
+            echo "== in-process serial suite SKIPPED on $distro (RMW_GATE_SKIP_SERIAL_SUITE=1); the gate still runs build + symbol audit + staged-library digest + rclpy exchanges + wrong-payload self-test =="
         fi
         # ===================================================================
         # rclpy CROSS-PROCESS EXCHANGE (item: distro-lane rclpy step).
@@ -154,10 +165,11 @@ case "$expect" in
         # rmw_cerulion in BOTH directions, inside this distro's
         # ros:<distro>-ros-base container. Reuses the three #[ignore]'d tests in
         # crates/rmw_cerulion/tests/rclpy_xproc_test.rs (run with --ignored).
-        # Runs AFTER the serial suite, so the freshly built .so and the green
-        # in-process suite are both known-good first. The lane is never a
-        # required context (see .github/workflows/rmw-distros.yml), so this
-        # section reds a PR check without blocking anything.
+        # Runs after the build and symbol audit; on the x86_64 lanes the serial
+        # suite has also run green first, and on the emulated leg the freshly built
+        # and staged .so is the known-good basis. The lane is never a required
+        # context (see .github/workflows/rmw-distros.yml), so this section reds a
+        # PR check without blocking anything.
         # -------------------------------------------------------------------
         RCLPY_TIMEOUT="${RCLPY_TIMEOUT:-600}"      # hard wall for one exchange run (s)
         EXCHANGES_EXPECTED=3                        # both directions: A (1) + B twist+string (2); == the 3 #[ignore]'d exchange tests run with --ignored (NOT the #[test] count, which includes the non-ignored seam unit arm)
@@ -195,14 +207,24 @@ case "$expect" in
         # singleton is ever swept out from under a running test. RMW_IMPLEMENTATION
         # is set and the staged prefix is FIRST on both search paths, under a hard
         # wall. Clean iox SHM BEFORE EACH invocation (the previous invocation and
-        # the serial suite both leave services behind). The test binary was already
-        # compiled by the serial suite above, so each invocation here is a build-
-        # cache hit that only RUNS its one test. Each run logs to its OWN file and
-        # is judged off the colour-stripped copy (no truncating pipe on cargo).
-        # One passing invocation per name IS the identity proof (rule 37): its
-        # summary must read exactly `1 passed; 0 failed` AND its own
-        # `test <name> ... ok` line must be present - so the earlier separate
-        # identity-pin loop is SUBSUMED and removed.
+        # the serial suite, when it ran, both leave services behind).
+        # The serial suite compiles the exchange test target; when the suite is
+        # deferred (emulated leg) nothing has, and the test-target build (it flips the
+        # test-seams/test-helpers features on two in-tree crates) would otherwise fall
+        # inside a per-exchange wall. Compile it ONCE here, OUTSIDE every wall, UNDER the
+        # SAME AMENT_PREFIX_PATH the timed invocations use: rmw_cerulion's build.rs
+        # declares rerun-if-env-changed on it, so a pre-build with a different prefix is
+        # rebuilt inside the first wall; matched, each timed invocation below is a
+        # build-cache hit that only RUNS its one test.
+        echo "== pre-build the rclpy exchange test target on $distro (outside the per-exchange wall) =="
+        env AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH" \
+            cargo test --locked -p rmw_cerulion --release --test rclpy_xproc_test --no-run 2>&1 | tee "/tmp/rmw_rclpy_${distro}_build.log"
+        [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "GATE FAIL: $distro rclpy exchange test target did not compile"; exit 1; }
+        # Each run logs to its OWN file and is judged off the colour-stripped copy
+        # (no truncating pipe on cargo). One passing invocation per name IS the
+        # identity proof (rule 37): its summary must read exactly `1 passed; 0 failed`
+        # AND its own `test <name> ... ok` line must be present - so the earlier
+        # separate identity-pin loop is SUBSUMED and removed.
         exchanges_ok=0
         for xt in \
             direction_a_rclpy_string_talker_to_native_subscriber \

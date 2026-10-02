@@ -6978,7 +6978,7 @@ dependencies = [
 [[package]]
 name = "re_grpc_server"
 version = "0.34.1"
-source = "git+https://github.com/cerulion-inc/re_grpc_server?rev=29b38496264e4681844346aa49c770070097305e#29b38496264e4681844346aa49c770070097305e"
+source = "git+https://github.com/cerulion-inc/re_grpc_server?rev=92d8feeeb583289b5b976ab121f90b50d4eb2e50#92d8feeeb583289b5b976ab121f90b50d4eb2e50"
 dependencies = [
  "anyhow",
  "async-stream",

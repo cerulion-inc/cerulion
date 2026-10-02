@@ -276,14 +276,16 @@ wrappers = ["cerulion_viz", "cerulion_vizd"]
 #      per-client REPLAY history, so a late joiner gets statics + blueprint and
 #      zero temporal replay) and `live_temporal_budget_bytes` (the LIVE
 #      broadcast queue, so a viewer that cannot keep up is served the present
-#      rather than a backlog). Pinned until upstream ships equivalents.
+#      rather than a backlog), plus one test-only change: the forwarder behind
+#      `spawn_with_recv` runs on a blocking-pool thread, so a receiver left
+#      undrained parks no runtime worker. Pinned until upstream ships equivalents.
 # zenoh still comes from crates.io; iceoryx2 comes from the pinned fork below.
 unknown-registry = "deny"
 unknown-git = "deny"
 # The pinned re_grpc_server fork. PRUNE this the moment the
 # root `[patch.crates-io]` is dropped (upstream re_grpc_server ships BOTH a
 # statics-only / drop-temporal history mode and a bounded, non-blocking live
-# queue).
+# queue, and runs the `spawn_with_recv` forwarder's send off its runtime workers).
 #
 # The iceoryx2 fork removes the process umask from the unix datagram socket
 # bind. The released 0.10.0 sets a process global umask for the duration of a
