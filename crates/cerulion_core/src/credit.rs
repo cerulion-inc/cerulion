@@ -59,7 +59,7 @@
 //! [`CreditShared`] is `#[repr(C)]` and contains ONLY atomics, so it can be
 //! placed directly in an mmap'd `MAP_SHARED` page and operated on by two
 //! processes at the same physical address. Every operation is lock-free (atomic
-//! load / `fetch_add` / `fetch_update` / store), so a crashed peer can never
+//! load / `fetch_add` / `try_update` / store), so a crashed peer can never
 //! leave the word holding a lock.
 //!
 //! Layout is evolvable later on the barrier's own three-clause argument
@@ -477,13 +477,13 @@ impl CreditShared {
         if removed == 0 {
             return;
         }
-        // The result is INFALLIBLE by construction: `fetch_update` returns `Err`
+        // The result is INFALLIBLE by construction: `try_update` returns `Err`
         // only when the closure returns `None`, and this closure always returns
         // `Some`. So the discard drops a `Result` that cannot be `Err`, never a
         // failure signal.
         let _ = self
             .outstanding
-            .fetch_update(Ordering::Release, Ordering::Acquire, |v| {
+            .try_update(Ordering::Release, Ordering::Acquire, |v| {
                 Some(v.saturating_sub(removed))
             });
         self.note_credit_freed();

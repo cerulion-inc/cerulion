@@ -172,8 +172,14 @@ lockstep with the rest of the `re_*` graph).
   bump in the root manifest, never a bare version edit here. The fork repo's
   README and patch doc carry the procedure.
 - The exit condition (recorded beside the pin and in `deny.toml`): drop the
-  fork only when upstream ships BOTH capabilities; they bound two different
-  buffers on the same path, and either alone is not enough.
+  fork only when upstream ships BOTH capabilities and runs the `spawn_with_recv`
+  forwarder's send off its runtime workers; the two capabilities bound two
+  different buffers on the same path, and either alone is not enough.
+- The fork also carries one test-only change: the forwarder behind
+  `spawn_with_recv` runs on a blocking-pool thread, since its push into the
+  receiver it hands back is a thread-blocking send: once an undrained receiver's
+  128 MiB channel had filled, that send parked a runtime worker; vizd hosts
+  through `serve_from_channel` and is unaffected.
 - Landmine: the added `ServerOptions` fields are safe only because rerun's
   `clap`/`run`/`web_viewer` features (which construct `ServerOptions` with
   explicit-field literals) are not compiled in our sdk+server build. Re-check
@@ -195,8 +201,9 @@ lockstep with the rest of the `re_*` graph).
   `set_timestamp_nanos_since_epoch`; `RecordingStreamBuilder::memory()`
   returns `(stream, storage)`; `flush_blocking() -> Result` must be handled
   under `-D warnings`.
-- rerun's MSRV exceeds the repo default: every crate whose dep graph
-  (dev-deps included) reaches rerun declares `rust-version`, so an MSRV break
+- rerun's own floor (1.93, through its `fixed` dependency) sits under the repo
+  default of 1.95; every crate whose dep graph (dev-deps included) reaches rerun
+  declares `rust-version`, so an MSRV break
   surfaces as a clean toolchain message instead of a confusing compile error.
 - Process-global scene setup (ViewCoordinates + Pinhole) uses an
   AtomicBool-swap exactly-once guard, not `std::sync::Once`; a `Once` cannot

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The minimum supported Rust version is 1.95 (it was 1.93), and the release workflow builds with Rust 1.95.0. `cerulion_core` calls `try_update` on its atomics, the name Rust 1.95 stabilised and Rust 1.99 uses in place of the deprecated `fetch_update`; a workspace that denies warnings builds again under the current stable.
+
 ### Added
 - `cerulion-wsd` can wire and unwire a graph and remove a node from it. `graph.wire` and `graph.unwire` add or delete one `inputs:` entry, and `graph.unstage` deletes a node entry. Each takes an optional `expect_version`, edits the file in place so comments and layout survive, and refuses a wire between different schemas (`schema_mismatch`) or removing a node other nodes read from (`would_break`, with the wires listed) unless `force` is set. The protocol version is unchanged.
 
