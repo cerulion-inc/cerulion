@@ -11,15 +11,25 @@
 //! (`macos/mman.rs`). `shm_state`'s own module doc already knew half of this:
 //! removing the file "would strand [the object] under an unresolvable name".
 //!
-//! The half nobody had measured is that it also strands the REGISTRY. A dead
-//! node's details, and the services it must be deregistered from, live in
-//! exactly such objects — so once the mapping is gone, `try_cleanup_dead_nodes`
-//! can never reap that node again, on this run or any future one. The node
-//! directory is then permanent, which is what
+//! The half nobody had measured is what it costs the REGISTRY. A dead node's
+//! details, and the services it must be deregistered from, live in exactly such
+//! objects, so once the mapping is gone nothing can name them again.
+//!
+//! iceoryx2 0.10 changed what that failure LOOKS like, and not for the better.
+//! Up to 0.9.1 the unresolvable name propagated: `try_cleanup_dead_nodes` could
+//! never reap that node again, on this run or any future one, and the permanent
+//! node directory was the visible symptom, which is what
 //! `cerulion_cli/tests/trace_inspect_and_clean_cli_test.rs::
 //! clean_sweeps_its_own_registry_and_leaves_another_root_untouched` asserts
 //! against when it requires a second `clean` over the node it just swept to
-//! find nothing.
+//! find nothing. 0.10 removes the node entry anyway and reports the sweep as a
+//! success, so the registry comes out clean while the segments stay in the
+//! kernel under a name no process can reconstruct: the `.shm_state` file was
+//! their only record, `shm_unlink` of the logical name answers ENOENT without
+//! it, and `shm_list` is a readdir of those very files. A visible strand became
+//! a SILENT orphan, which is why the ordering gate matters more under 0.10 and
+//! not less. This test pins the new shape so the next reader measures it rather
+//! than inferring it from a version number.
 //!
 //! # Shape
 //!
@@ -28,7 +38,8 @@
 //!
 //! * **LEG A (control)** — state files left alone: one sweep reaps the node.
 //! * **LEG B** — the state files removed FIRST, exactly as an ungated exit pass
-//!   would: the sweep fails and the entry survives every later sweep.
+//!   would: the sweep reports success, the entry comes off, and the segments
+//!   behind it are still in the kernel with nothing left to name them.
 //!
 //! Without leg A, leg B proves nothing — a node that is simply not reapable on
 //! this host would produce the same result.
@@ -53,6 +64,32 @@ use iceoryx2::service::ipc_threadsafe::Service as CerService;
 const ENV_ROLE: &str = "PROBE_ROLE";
 const ENV_CONFIG: &str = "PROBE_CONFIG";
 const ENV_READY: &str = "PROBE_READY";
+
+/// The real POSIX object name a state file records.
+///
+/// The SHIPPED parser, never a second copy of the rule: it refuses an empty
+/// file, anything that is not the four numeric segments `generate_real_shm_name`
+/// mints, and a pid that does not parse. A hand-rolled trim at the first NUL
+/// would hand `shm_unlink` whatever bytes the file happened to carry, which is
+/// the one thing the reclaimer's own validation exists to prevent.
+fn real_object_name(content: &[u8]) -> Option<std::ffi::CString> {
+    let parsed = shm_state::parse_real_shm_name(content).ok()?;
+    std::ffi::CString::new(parsed.name).ok()
+}
+
+/// Does the kernel still hold this object?
+///
+/// Raw `libc` on purpose: the iceoryx2 call would resolve the LOGICAL name
+/// through the state file, which is the very thing this leg removed. Asking the
+/// kernel for the REAL name is the only question left that has an answer.
+fn shm_object_exists(name: &std::ffi::CStr) -> bool {
+    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        return false;
+    }
+    unsafe { libc::close(fd) };
+    true
+}
 
 /// Generous: this is a liveness bound on a child process, not a measurement.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -212,7 +249,7 @@ fn sweep(cfg: &iceoryx2::config::Config) -> BoundedCleanup {
 }
 
 #[test]
-fn a_dead_node_is_reclaimable_only_while_its_state_files_survive() {
+fn state_files_removed_before_the_reap_orphan_the_segments_silently() {
     // ---------------- LEG A: the control ----------------
     let cfg_a = cerulion_core::testing::iceoryx_test_config();
     let a = plant_dead_node(&cfg_a, "lega");
@@ -242,8 +279,16 @@ fn a_dead_node_is_reclaimable_only_while_its_state_files_survive() {
     // every one of them. Asserted through the SHIPPED classifier rather than
     // assumed, so this leg cannot drift away from what the reclaimer does.
     let mut proven_dead = 0usize;
+    // The real object names, read BEFORE the files go: after that they cannot be
+    // recovered from anything, which is the whole point of the leg.
+    let mut real_names: Vec<std::ffi::CString> = Vec::new();
     for file in &b.files {
         let read = shm_state::read_state_file(file);
+        if let Ok(content) = read.as_ref().map(|r| r.content.clone()) {
+            if let Some(name) = real_object_name(&content) {
+                real_names.push(name);
+            }
+        }
         if matches!(
             shm_state::classify(read.as_ref().map_err(|e| e.clone()), &shm_state::LibcProbe),
             shm_state::StateFileVerdict::ProvenDead(_)
@@ -298,12 +343,58 @@ fn a_dead_node_is_reclaimable_only_while_its_state_files_survive() {
         let _ = std::fs::remove_dir_all(root.join(entry));
     }
 
+    // EVERY cleanup first, then every assertion. These orphans are reachable only
+    // through names that live nowhere but this function's stack, so an assertion
+    // that fired before this loop would leave them for the life of the machine on
+    // exactly the run that found a problem.
+    let mut present_before_unlink = 0usize;
+    let mut present_after_unlink = 0usize;
+    for name in &real_names {
+        if shm_object_exists(name) {
+            present_before_unlink += 1;
+        }
+        unsafe { libc::shm_unlink(name.as_ptr()) };
+        if shm_object_exists(name) {
+            present_after_unlink += 1;
+        }
+    }
+
+    // THE 0.10 SHAPE, in two halves. The registry comes clean...
     assert_eq!(
-        stranded,
-        b.entries.len(),
-        "reclaiming a dead node's state files before it is reaped must strand it — this \
-         assertion documents the defect the ordering + convergence gate exists to avoid; \
-         if it starts failing, the platform stopped needing the name mapping and the gate \
-         can be revisited"
+        stranded, 0,
+        "0.10 removes a dead node's registry entry even when its state files are \
+         already gone, so nothing survives here; if THIS starts failing with the \
+         entries back, the platform went back to propagating the unresolvable name \
+         and the 0.9.1 shape (a visible strand) is what to pin again"
+    );
+
+    // ...and the segments do not, which is the defect the ordering + convergence
+    // gate exists to avoid. Removing the file does NOT unlink the object: the
+    // shipped reclaimer unlinks the OBJECT FIRST and only then the file, and this
+    // leg models the wrong order on purpose to price it.
+    // Not `is_empty`: a file that failed to parse would silently shrink the set
+    // and the leak assertion would still read "all of them". Every file the
+    // shipped classifier called ProvenDead parsed its name to get there, so the
+    // two counts must agree.
+    assert_eq!(
+        real_names.len(),
+        proven_dead,
+        "precondition: every state file proved dead must also yield its real object \
+         name, or the leak half of this oracle measures a shrunken set"
+    );
+    assert_eq!(
+        present_before_unlink,
+        real_names.len(),
+        "every segment whose mapping this leg removed must still be in the kernel, \
+         unreachable under any name a later sweep could form. That silent orphan is \
+         what the gate prevents, and it is strictly worse than 0.9.1's strand because \
+         no sweep reports it"
+    );
+    // The CONTROL: without it, a probe that answered `true` for everything would
+    // satisfy the assertion above while measuring nothing.
+    assert_eq!(
+        present_after_unlink, 0,
+        "control: the probe must distinguish present from absent, or the leak \
+         assertion above proves nothing"
     );
 }

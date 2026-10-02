@@ -1372,10 +1372,10 @@ pub unsafe extern "C" fn rmw_borrow_loaned_message(
         let payload_ptr = bytes.as_mut_ptr().add(WireHeader::SIZE).cast::<u8>();
         // Alignment gate (fail closed — never hand out, and never run a
         // typed `init_function` on, a misaligned struct pointer). Expected
-        // to ALWAYS hold on iceoryx2 0.9.1: the sample header is 40 B @
-        // align 8 (measured — see `IOX2_SAMPLE_HEADER_BYTES` in
-        // cerulion_core) and a `[u8]` payload has align 1, so the payload
-        // starts at chunk+40 of an 8-aligned chunk ⇒ 8-aligned; +32
+        // to ALWAYS hold: the sample header is align 8 and its size is a
+        // multiple of 8 (measured, see `IOX2_SAMPLE_HEADER_BYTES` in
+        // cerulion_core, currently 48) and a `[u8]` payload has align 1, so
+        // the payload starts 8-aligned in an 8-aligned chunk; +32
         // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen
         // static assert. But that is DE FACTO, not an iceoryx2 API
         // guarantee, and the service builder's `.payload_alignment()`
@@ -3912,10 +3912,10 @@ unsafe fn take_loaned_impl(
             return RMW_RET_OK;
         }
         // Alignment gate (fail closed — never hand out a misaligned struct
-        // pointer). Expected to ALWAYS hold on iceoryx2 0.9.1: the sample
-        // header is 40 B @ align 8 (measured — see `IOX2_SAMPLE_HEADER_BYTES`
-        // in cerulion_core) and a `[u8]` payload has align 1, so the payload
-        // starts at chunk+40 of an 8-aligned chunk ⇒ 8-aligned; +32
+        // pointer). Expected to ALWAYS hold: the sample header is align 8 and
+        // its size is a multiple of 8 (measured, see
+        // `IOX2_SAMPLE_HEADER_BYTES` in cerulion_core, currently 48) and a
+        // `[u8]` payload has align 1, so the payload starts 8-aligned; +32
         // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen static
         // assert. But that is DE FACTO, not an iceoryx2 API guarantee, and
         // the service builder's `.payload_alignment()` override is

@@ -486,6 +486,18 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point; iceoryx2's own logger writes to the process stderr, so a child is the only way to read it",
     ),
     (
+        "notify_shortfall_iox2_test.rs",
+        "subprocess_child_holds_a_subscriber",
+        "child",
+        "self-re-exec entry point; the condition under test is a listener whose OWNING PROCESS died without deregistering, which needs a second process to kill",
+    ),
+    (
+        "output_proxy_test.rs",
+        "subprocess_child_holds_a_subscriber",
+        "child",
+        "self-re-exec entry point; the same killed-consumer condition, driven against a graph output topic",
+    ),
+    (
         "lat_probe_env_test.rs",
         "subprocess_probe_report",
         "child",

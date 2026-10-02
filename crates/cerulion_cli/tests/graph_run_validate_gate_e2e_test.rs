@@ -23,6 +23,18 @@
 //! (signals); `#[serial]` + unique per-test prefixes (the run looks on the
 //! DEFAULT iceoryx2 namespace, so topic names must not collide).
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. On macOS a process
+// that has loaded a plugin linking iceoryx2 cannot create any further event
+// resource, whichever process that is: this test process, or a `cerulion` child it
+// spawns. Every arm here brings up a deployment that way.
+//
+// The WHOLE BINARY is gated rather than each arm, because the defect is per
+// PROCESS and libtest runs many arms in one process: which arm dies is whichever
+// reaches a second resource creation first. Measured on one macOS host, two runs
+// of the same tree with the same fixtures disagreed on six arms out of thirty nine
+// in each direction while the failing BINARIES stayed the same. A per-arm list
+// cannot converge on that; the binary can. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
