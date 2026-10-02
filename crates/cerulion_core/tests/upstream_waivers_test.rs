@@ -181,6 +181,23 @@ const WAIVED_2034: &[(&str, &str)] = &[
         "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
         "two_runs_agree_on_artifact_shape",
     ),
+    // The credit-death bring-up arms, added after a measurement on a macOS host
+    // carrying three leftover `.shm_state` records with the system file table at
+    // 5,532 of 184,320: all three still fail at `wait_until_live` with the same
+    // `InternalFailure` reporting the file handle limit, so the cause is the
+    // defect this inventory names and not stale state a sweep would clear.
+    (
+        "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
+        "c7_a_real_consumer_death_strands_its_producer_loudly",
+    ),
+    (
+        "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
+        "c7_the_free_run_death_line_names_its_dead_groups",
+    ),
+    (
+        "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
+        "c7_a_producer_that_dies_after_being_named_gets_retracted",
+    ),
 ];
 
 /// Binaries whose zero-allocation arms subtract the 2035 publish allocation,

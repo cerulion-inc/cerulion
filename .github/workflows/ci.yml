@@ -1980,7 +1980,7 @@ jobs:
           fi
           inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
           total=0
-          for crate in cerulion_core cerulion_cli_engine; do
+          for crate in cerulion_core cerulion_cli_engine cerulion_cli; do
             # Scoped to the WAIVED_2034 block, not the whole file. The arm
             # that asks libtest what it will do with an arm reads WAIVED_2034
             # alone; the 2035 rows are judged by a source-reading arm that needs
@@ -3018,7 +3018,7 @@ jobs:
           fi
           inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
           total=0
-          for crate in cerulion_core cerulion_cli_engine; do
+          for crate in cerulion_core cerulion_cli_engine cerulion_cli; do
             # Scoped to the WAIVED_2034 block, not the whole file. The arm
             # that asks libtest what it will do with an arm reads WAIVED_2034
             # alone; the 2035 rows are judged by a source-reading arm that needs

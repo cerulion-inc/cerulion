@@ -1330,6 +1330,10 @@ fn assert_no_shm_left(sup_pid: u32, ns: &str, edge_id: &str) {
 /// is correct and that both `Continue` arms call it; only this proves a genuine
 /// worker death reaches it — through the mint, the plan stamp, the spawn, the
 /// join pass and the group resolution.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn c7_a_real_consumer_death_strands_its_producer_loudly() {
@@ -1561,6 +1565,10 @@ fn c7_a_real_consumer_death_strands_its_producer_loudly() {
 /// BOTH paths, not in the `Some(barrier)` arm only. On the free-run path
 /// (`barrier_owner == None`) the per-death warn carries `deaths`,
 /// `survivors` and `groups=`; this drives it.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn c7_the_free_run_death_line_names_its_dead_groups() {
@@ -1663,6 +1671,10 @@ fn c7_the_free_run_death_line_names_its_dead_groups() {
 /// cannot be unsaid — so the watch says the correcting thing once, rather than
 /// leaving an operator chasing a "permanently deferred" survivor that is a
 /// corpse.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn c7_a_producer_that_dies_after_being_named_gets_retracted() {
