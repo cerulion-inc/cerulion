@@ -80,7 +80,12 @@ the secret the text just published. An internal ticket quoted in a public issue 
 `#` shorthand is how this class came to exist.
 
 Nothing in the tree lists a repository. The scanner RESOLVES what the text points at and
-asks the forge, anonymously and with no token, whether a stranger is served a page.
+asks the forge's repository endpoint (`api.github.com/repos/<owner>/<repo>`, one `HEAD`)
+whether a stranger is served that repository. The question carries `GITHUB_TOKEN` when the
+environment holds one, which raises the budget the forge prices it under from 60 an hour
+to the authenticated ceiling; the token is sent on that request and is never printed,
+written or passed as an argument. The page endpoint answers the same 200 and 404 but
+publishes no budget header, so a throttle there cannot be told from a server fault.
 
 One forge is resolved, the one this repository lives on (`github.com`). A link to any other
 forge is not a candidate and is not checked; a reference there is a reviewer's job.
@@ -92,22 +97,36 @@ forge is not a candidate and is not checked; a reference there is a reviewer's j
 | a bare shorthand | `<repo>#<n>` | `<repo>` under this repository's own owner |
 | a tracker link | `https://<tracker host>/...`, shipped or private-tier | nothing: a tracker is closed to a stranger already |
 
-`200` means public and is clean. `404` means private, renamed away or never there, and a
-stranger is given nothing in every one of those cases, so all three are one finding,
-`ref-unopenable`. A throttle, a server error or no network at all is `ref-unverified`,
-which is HARD under `--require-private` and a warning without it, so a laptop on a train
-still runs. Every `Leak guard` job escalates it by name as well (`--hard ref-unverified`),
-because a fork run holds no secret and so cannot be gated on `--require-private`, and a
-reference the forge would not confirm must stop a fork pull request too. `--offline` asks
-nothing and reports every candidate as unverified; the hooks always run that way.
+`200` means public and is clean. `404` and `410` mean private, renamed away, taken down or
+never there, and a stranger is given nothing in every one of those cases, so all of them
+are one finding, `ref-unopenable`.
+
+AN ANSWER IS A VERDICT; NO ANSWER IS A TOOL FAILURE. A throttle (`429`, or a `403`
+carrying a rate limit header), a server error, a transport error and a timeout say nothing
+about the reference, so each one is retried: three attempts per reference, the wait
+doubling between them, or the wait a short `Retry-After` asked for, all inside the run's
+own time budget. A reference still unanswered after that is recorded as NOT QUERIED. The
+run then prints one line per such reference, masked the way a finding's value is masked,
+one summary line naming the class and the count, and exits `3` (NON-RUN) having asserted
+no leak about any of them. It carries no finding row, so `--require-private` and `--hard
+ref-unverified` have nothing to raise and are inert for the class on an online run; the
+same unchanged content used to read 0, 2, 2 and 3 `ref-unverified` findings across four
+runs, which is the defect this split closes. `--offline` is the operator's own choice not
+to ask, so it keeps reporting every candidate as a scoped `ref-unverified` note, and there
+`--require-private` and `--hard ref-unverified` still make it a finding; the hooks always
+run that way. The one `ref-unverified` left on an online run is a bare `<repo>#<n>` with
+no owner known to resolve it against, which is a reference the text did not finish
+writing.
 
 The asking is bounded twice over: at most 300 distinct repositories per run, and at most
-two minutes of asking in total from the first question. Past either bound every further
-repository is unverified with no request, so a scan behind a dead network still finishes
-and still says what it could not check.
+two minutes of asking in total from the first question. Past either bound no further
+repository is asked about at all, and each one is NOT QUERIED on the same terms, so a scan
+behind a dead network still finishes and still refuses to call what it did not check
+clean.
 
-One question per distinct repository per run, cached in memory, to the host the link
-names and to no other host. That question carries the owner and repository the text
+One question per distinct repository per run, cached in memory (the no-answer verdict
+included, so a throttled repository costs its bounded attempts once), to the forge the
+link names and to no other host. That question carries the owner and repository the text
 already wrote, and it goes to the forge that owns the name; no text reaches anywhere
 else, and a tracker link is judged with no request at all. A reference to THIS repository
 is never a finding, and neither is a bare `#<n>`, which the forge already reads as this
@@ -338,7 +357,7 @@ check still runs, since that depends on the tree alone). Every summary line prin
 python3 -B tools/scripts/leak_scan.py --self-test        # every class and surface, planted
 python3 -B tools/scripts/leak_scan.py tree               # the whole worktree
 python3 -B tools/scripts/leak_scan.py tree --require-private   # refuse to run without the private tier
-python3 -B tools/scripts/leak_scan.py tree --offline           # resolve no reference; every candidate reads unverified
+python3 -B tools/scripts/leak_scan.py tree --offline           # resolve no reference; every candidate reads unverified, and no run is a NON-RUN for it
 python3 -B tools/scripts/leak_scan.py tree --self-repo OWNER/REPO   # name this repository yourself
 python3 -B tools/scripts/leak_scan.py tree --ref HEAD --files-from changed.zlist   # a NUL separated list, taken verbatim; a listed path the ref lacks is a NO RUN
 python3 -B tools/scripts/leak_scan.py messages --range origin/main..HEAD

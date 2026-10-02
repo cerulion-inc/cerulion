@@ -305,7 +305,14 @@ whole string; a regex match is never a registered secret). The scanner's own sou
 matchable literal from fragments and scans itself to zero with no allowlist entry, a self-test
 arm pinned both ways. "Found something" and "could not run" never share an exit code, a
 built-in control per class must hit before any scan, and an allowlist entry that matches no
-file or excused nothing fails a full-tree run. Contributor-facing detail: `docs/leak_guard.md`.
+file or excused nothing fails a full-tree run. The reference classes carry that separation
+onto the network: the one `HEAD` they send to the forge's repository endpoint is a verdict
+only when it is answered (200 clean, 404 or 410 a `ref-unopenable` finding), and a throttle,
+a server error, a transport error or a timeout is retried three times with a doubling wait
+and then recorded as NOT QUERIED, which exits `3` with the class and the count and asserts
+no leak. `leak-guard.yml` passes `GITHUB_TOKEN` at workflow level for that request alone,
+which lifts its hourly budget off the 60 an anonymous runner address shares.
+Contributor-facing detail: `docs/leak_guard.md`.
 
 ## The docs gate
 

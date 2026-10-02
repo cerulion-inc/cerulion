@@ -639,27 +639,60 @@ CLASS_FLOOR = 15
 # the text just published.
 #
 # Nothing here names a repository. The classes resolve what the text points at
-# and then ASK, anonymously and with no token, whether a stranger is served a
-# page: 200 is public, 404 is private or absent and a defect either way, and
-# anything else is unverified. One question per distinct repository per run,
-# cached, to the host the reference names and to no other host. A tracker link
-# needs no question: a tracker is closed to a stranger by construction.
+# and then ASK the forge's repository endpoint whether a stranger is served the
+# repository: 200 is public, 404 and 410 are private or absent and a defect
+# either way. One question per distinct repository per run, cached, to the host
+# the reference names and to no other host. A tracker link needs no question: a
+# tracker is closed to a stranger by construction.
+#
+# AN ANSWER IS A VERDICT; NO ANSWER IS A TOOL FAILURE. A throttle (429, or 403
+# carrying a rate limit signal), a server error, a transport error and a timeout
+# say nothing about the reference, so they are retried with a growing backoff
+# inside the run's time budget and, failing that, the reference is recorded as
+# NOT QUERIED: the run prints the class and the count, asserts no leak, and exits
+# EXIT_NORUN. That is the whole reason this file reads status codes in two
+# groups. Reporting no answer as a finding is what made the guard red four times
+# out of four on content that was already on main.
+#
+# OFFLINE (--offline, and every hook) is the operator's own choice not to ask, so
+# it keeps reporting each candidate as a scoped ref-unverified note instead, and
+# that is where --require-private, and --hard ref-unverified, still make the class
+# a finding. On an online run the only ref-unverified left is a bare shorthand
+# with no owner to resolve it against, which is a reference the text did not write
+# down rather than a question the forge refused.
 # ---------------------------------------------------------------------------
 REF_DEFECT = 'ref-unopenable'
 REF_UNVERIFIED = 'ref-unverified'
 # The two reference classes are two VERDICTS on the same reference, and a line
 # pragma judges the reference ("this token is not a repository name"), which no
 # verdict changes. So a pragma naming either one excuses the other on that line:
-# without this, a line reviewed and excused as a 404 goes hard the first time the
-# forge is slow and the same token reads unverified instead, with no exemption
-# the author could have written in advance.
+# a line excused as a 404 by an author who ran the scan online would otherwise go
+# hard the moment the same line is scanned with --offline, where the same token
+# reads unverified, and no exemption written in advance would cover both.
 REF_PAIR = frozenset(('ref-unopenable', 'ref-unverified'))
+# Not a class: no row, no allowlist entry and no pragma carries this, and
+# `RefScan.findings` drops it, so a reference the forge did not answer about
+# reaches the NON-RUN summary and never the report. It survives in
+# `RefScan.matches`, which masks a slug sitting in a file or directory NAME out
+# of every printed location whatever the forge said about it, and that mask is
+# labelled with the class below so a location reads the same either way.
+REF_NOANSWER = 'ref-unqueried'
 REF_CLASSES = (
     (REF_DEFECT, 'HARD', 'a repository or tracker reference a stranger cannot open'),
     (REF_UNVERIFIED, 'scoped',
-     'a reference whose target the forge would not confirm (HARD with --require-private)'),
+     'a candidate the scan did not resolve: --offline, or no owner to resolve a bare '
+     'shorthand against (HARD with --require-private or --hard; a reference the forge '
+     'did not answer about is a NON-RUN instead, and carries no row at all)'),
 )
 FORGE_HOST = 'github' + '.com'
+# The probe goes to the API, not to the repository's HTML page. Both answer 200
+# for a repository a stranger is served and 404 for one that is private, renamed
+# away or absent, and only the API prices the question: it returns
+# X-RateLimit-Limit and X-RateLimit-Remaining (60 an hour anonymous, 5,000 with a
+# token; the forge's own job token is held to 1,000 an hour per repository) and a
+# Retry-After when it throttles, where the HTML page returns no budget header at
+# all and a throttle there cannot be told from a server fault.
+FORGE_API_HOST = 'api.' + FORGE_HOST
 # A tracker is unreadable to a stranger whoever they are, so a link to one is a
 # defect on its face. This tuple is a PRODUCT host, not a private name; a
 # project's own tracker host goes in the private tier under `tracker-host:`.
@@ -695,15 +728,25 @@ REF_SELF_RX = re.compile(r'(?:' + re.escape(FORGE_HOST) + r'[:/])([A-Za-z0-9._-]
                          r'([A-Za-z0-9._-]+?)(?:\.git)?/?$', re.I)
 REF_TIMEOUT = 6.0
 REF_BACKOFF = 1.5
-# A ceiling on the questions one run may ask. Past it every further repository
-# is unverified, which is a finding under --require-private and a warning
-# otherwise: the run slows down and says so, it never quietly scans less.
+# How many times one reference is asked about before it is recorded as not
+# queried, and how the waits between those attempts grow: REF_BACKOFF doubles per
+# attempt (1.5s, then 3s), so a throttle that clears in a second or two costs the
+# run one wait and still yields an answer. Three attempts, not two: a single
+# retry left the guard reading a leak off a rate limit.
+REF_ATTEMPTS = 3
+# A Retry-After this short is waited out as the forge asked. A longer one is not
+# shortened: retrying sooner than the forge said is what earns a longer block, so
+# the reference goes unqueried and the run says so.
+REF_RETRY_AFTER_MAX = 5.0
+# A ceiling on the questions one run may ask. Past it every further repository is
+# NOT QUERIED, which makes the run a NON-RUN: it slows down and says what it did
+# not get to, it never quietly scans less and it never calls the rest clean.
 REF_BUDGET = 300
 # ... and a ceiling on the TIME they may take together. A count alone is not a
 # bound: 300 repositories behind a black-holed network are 300 timeouts in a
-# row, which outlives the job that started the scan. Past the deadline every
-# further repository is unverified with no request, so a scan that cannot
-# finish asking still finishes, and says so.
+# row, which outlives the job that started the scan. Past the deadline no further
+# repository is asked about at all and each one is NOT QUERIED, so a scan that
+# cannot finish asking still finishes, and says what it could not reach.
 REF_DEADLINE = 120.0
 REF_AGENT = 'leak-scan (repository reachability check)'
 
@@ -760,25 +803,70 @@ def tracker_rx(hosts):
                       + '|'.join(re.escape(h) for h in hosts) + r')(?![A-Za-z0-9.-])', re.I)
 
 
-def forge_status(owner, repo, remaining=None, clock=time.monotonic):
-    """Ask the forge, as nobody in particular, whether a stranger gets a page.
-    A HEAD for the repository's own page: no token, no credentials, no body, and
-    to the host the reference names and to no other host. Returns the status
-    code, or None when the network did not answer. A throttle or a server error
-    is retried once; the caller reads both as unverified.
+def _header(headers, name):
+    """One response header as a string, '' when it is absent. A live response's
+    headers answer `get` without regard to case; the self-test writes the
+    canonical spelling."""
+    got = headers.get(name) if headers is not None else None
+    return got.strip() if isinstance(got, str) else ''
+
+
+def _no_answer(code, headers):
+    """True when a status says the forge DID NOT ANSWER the question rather than
+    answered it: a throttle (429, or 403 carrying a rate limit signal) or a server
+    error. Such an attempt is retried. The verdict map is wider than this: it
+    reads every status that is neither 200 nor a not-found as no answer, retried
+    or not, because only those two codes say what a stranger is served."""
+    if code == 429 or 500 <= code < 600:
+        return True
+    if code != 403:
+        return False
+    return (bool(_header(headers, 'Retry-After'))
+            or _header(headers, 'X-RateLimit-Remaining') == '0')
+
+
+def _retry_wait(headers, attempt):
+    """How long to wait before the next attempt, or None to stop asking. The
+    forge's own Retry-After wins when it asks for a wait this run will pay for;
+    past REF_RETRY_AFTER_MAX the answer is to stop, never to retry sooner than
+    the forge said."""
+    asked = _header(headers, 'Retry-After')
+    if asked.isdigit():
+        wait = float(asked)
+        return wait if wait <= REF_RETRY_AFTER_MAX else None
+    return REF_BACKOFF * (2 ** attempt)
+
+
+def forge_status(owner, repo, remaining=None, clock=time.monotonic, token=None):
+    """Ask the forge whether a stranger is served this repository. A HEAD for the
+    repository's own API resource: no body, no credentials beyond `token`, and to
+    the host the reference names and to no other host. Returns the status code, or
+    None when no attempt got an ANSWER.
+
+    200 and a not-found are answers and return at once. A throttle, a server
+    error, a transport error and a timeout are not: each is retried up to
+    REF_ATTEMPTS attempts with the wait REF_BACKOFF doubles per attempt, or the
+    wait the forge asked for, and None goes back when the attempts run out. The
+    caller records such a reference as not queried and asserts nothing about it.
+
+    `token` lifts the budget the forge prices this question under from 60 an hour
+    to the authenticated ceiling. It is sent as a bearer credential and is never
+    logged, echoed or passed as an argument to anything.
 
     `remaining` is what is left of the run's whole time budget. It caps this
-    request's own timeout and it decides whether there is room to retry, so the
-    budget binds the request IN FLIGHT and not only the decision to start the
-    next one. The budget is spent as it goes: what the first attempt and the
-    backoff actually took is measured and subtracted before the retry is priced,
-    because pricing the retry off the figure handed in would let one request,
-    one sleep and one more request together run past the whole run's deadline.
+    request's own timeout and it decides whether there is room for another
+    attempt, so the budget binds the request IN FLIGHT and not only the decision
+    to start the next one. The budget is spent as it goes: what each attempt and
+    each wait actually took is measured and subtracted before the next attempt is
+    priced, because pricing it off the figure handed in would let a request, a
+    sleep and one more request together run past the whole run's deadline.
     `clock` is a seam for the self-test."""
-    url = ('https' + '://' + FORGE_HOST + '/' + urllib.parse.quote(owner, safe='')
-           + '/' + urllib.parse.quote(repo, safe=''))
-    req = urllib.request.Request(url, method='HEAD',
-                                 headers={'User-Agent': REF_AGENT, 'Accept': '*/*'})
+    url = ('https' + '://' + FORGE_API_HOST + '/repos/'
+           + urllib.parse.quote(owner, safe='') + '/' + urllib.parse.quote(repo, safe=''))
+    headers = {'User-Agent': REF_AGENT, 'Accept': '*/*'}
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    req = urllib.request.Request(url, method='HEAD', headers=headers)
     started = clock()
 
     def left():
@@ -786,22 +874,29 @@ def forge_status(owner, repo, remaining=None, clock=time.monotonic):
             return REF_TIMEOUT
         return min(REF_TIMEOUT, max(0.0, remaining - (clock() - started)))
 
-    for attempt in (0, 1):
+    for attempt in range(REF_ATTEMPTS):
         room = left()
         try:
             with urllib.request.urlopen(req, timeout=max(0.1, room)) as resp:
                 return resp.status
         except urllib.error.HTTPError as e:
-            retryable = e.code == 429 or 500 <= e.code < 600
-            # Priced before the sleep, so a budget that cannot pay for the
-            # backoff plus one more attempt does not spend the backoff either,
-            # and priced again after it, on what the sleep actually cost.
-            if attempt == 0 and retryable and left() > REF_BACKOFF + 0.1:
-                time.sleep(REF_BACKOFF)
-                if left() > 0.1:
-                    continue
-            return e.code
+            if not _no_answer(e.code, e.headers):
+                return e.code
+            wait = _retry_wait(e.headers, attempt)
         except Exception:
+            # A transport error and a timeout carry no headers and no status at
+            # all, which is the plainest case of no answer there is.
+            wait = REF_BACKOFF * (2 ** attempt)
+        if wait is None or attempt + 1 >= REF_ATTEMPTS:
+            return None
+        # Priced before the sleep, so a budget that cannot pay for the wait plus
+        # one more attempt does not spend the wait either, and priced again after
+        # it, on what the sleep actually cost: a descheduled process wakes late
+        # and a suspended one wakes much later.
+        if left() <= wait + 0.1:
+            return None
+        time.sleep(wait)
+        if left() <= 0.1:
             return None
     return None
 
@@ -811,22 +906,35 @@ class RefResolver(object):
     repository per run, answered by the forge itself and cached in memory, so no
     list of repositories lives in the tree and none can go stale.
 
-      public      the forge served the page (200)
-      closed      the forge answered 404: private, renamed away or never there,
-                  and a stranger is given nothing in every one of those cases
-      unverified  the forge would not say (a throttle, a server error, no
-                  network), or the scanner was told not to ask
+      public      the forge served the repository (200)
+      closed      the forge answered 404 or 410: private, renamed away, taken
+                  down or never there, and a stranger is given nothing in every
+                  one of those cases
+      unqueried   no answer came back (a throttle, a server error, a transport
+                  error, a timeout, or this run had spent its asking budget).
+                  Nothing is asserted about such a reference and the run is a
+                  NON-RUN: see `unqueried`
+      unverified  the scanner was told not to ask at all (--offline, every hook)
+
+    `unqueried` maps each unanswered repository to the `owner/repo` the summary
+    prints, in the order the scan met them, so the caller names every one of them
+    rather than a bare count.
     """
 
     def __init__(self, fetch=None, offline=False, budget=REF_BUDGET, deadline=REF_DEADLINE,
-                 clock=time.monotonic):
-        self.fetch = forge_status if fetch is None else fetch
+                 clock=time.monotonic, token=None):
+        # The default fetch is bound at CALL time, not here, because only it takes
+        # a token: an injected fetch is the self-test's canned forge and asks
+        # nothing of the network.
+        self.fetch = fetch
+        self.token = token
         self.offline = offline
         self.budget = budget
         self.deadline = deadline
         self.clock = clock
         self.started = None
         self.cache = {}
+        self.unqueried = collections.OrderedDict()
         self.asked = 0
         self.spent = False
 
@@ -840,22 +948,41 @@ class RefResolver(object):
             return False
         return self.clock() - self.started >= self.deadline
 
+    def _unqueried(self, key, owner, repo):
+        """Record one repository nobody got an answer about, under the name the
+        summary prints, and cache the verdict so the same repository is neither
+        asked about nor counted twice."""
+        self.unqueried[key] = owner + '/' + repo
+        self.cache[key] = 'unqueried'
+        return 'unqueried'
+
     def verdict(self, owner, repo):
         key = (owner.lower(), repo.lower())
         if key in self.cache:
             return self.cache[key]
-        if self.offline or self.out_of_budget():
-            self.spent = not self.offline
+        if self.offline:
             return 'unverified'
+        if self.out_of_budget():
+            # The run stopped asking of its own accord, which is still nobody
+            # answering: a reference the scan never put a question about cannot be
+            # cleared or condemned, so it goes in with the throttled ones.
+            self.spent = True
+            return self._unqueried(key, owner, repo)
         if self.started is None:
             self.started = self.clock()
         self.asked += 1
         remaining = max(0.0, self.deadline - (self.clock() - self.started))
         try:
-            code = self.fetch(owner, repo, remaining)
+            code = (forge_status(owner, repo, remaining, token=self.token)
+                    if self.fetch is None else self.fetch(owner, repo, remaining))
         except Exception:
             code = None
-        verdict = 'public' if code == 200 else 'closed' if code == 404 else 'unverified'
+        if code == 200:
+            verdict = 'public'
+        elif code in (404, 410):
+            verdict = 'closed'
+        else:
+            return self._unqueried(key, owner, repo)
         self.cache[key] = verdict
         return verdict
 
@@ -881,8 +1008,14 @@ class RefScan(object):
         whole matched reference, so nothing of a closed slug survives in a
         printed location. Deliberately not deduplicated: one finding per token is
         right for a report, and wrong for masking, because a name that carries
-        the same slug twice would have kept the second copy in clear."""
-        return [(s, e, cid) for cid, _, s, e in self._scan(text, dedupe=False)]
+        the same slug twice would have kept the second copy in clear.
+
+        A reference the forge did not answer about carries REF_NOANSWER, which is
+        not a class and never prints: its span is labelled with the reference class
+        here, so a masked location reads the same whether the forge answered or
+        not, and `findings` drops it so no row does."""
+        return [(s, e, REF_UNVERIFIED if cid == REF_NOANSWER else cid)
+                for cid, _, s, e in self._scan(text, dedupe=False)]
 
     def _repo(self, owner, repo):
         """(class, token) for one resolved repository, or None when a stranger
@@ -897,12 +1030,17 @@ class RefScan(object):
         verdict = self.res.verdict(owner, repo)
         if verdict == 'public':
             return None
+        if verdict == 'unqueried':
+            return (REF_NOANSWER, owner + '/' + repo)
         return (REF_DEFECT if verdict == 'closed' else REF_UNVERIFIED, owner + '/' + repo)
 
     def findings(self, line):
         """Every finding on one line as (class id, token), in order, one per
-        distinct token."""
-        return [(cid, token) for cid, token, _, _ in self._scan(line)]
+        distinct token. A reference nobody got an answer about is not among them:
+        the resolver holds it for the NON-RUN summary, and a tool failure that
+        printed a row here is the defect this split exists to stop."""
+        return [(cid, token) for cid, token, _, _ in self._scan(line)
+                if cid != REF_NOANSWER]
 
     def _scan(self, line, dedupe=True):
         out, seen = [], set()
@@ -2963,11 +3101,16 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
     private = PrivateSet(private_patterns) if private_patterns else None
     git = Git(root, env)
     # A hook runs on a laptop, often with no network and always on a keystroke
-    # budget, so it never asks: every candidate reads unverified, which is a
-    # warning there and a finding in CI.
+    # budget, so it never asks: every candidate reads unverified, a warning there.
+    # CI asks for real, where a candidate the forge answers is clean or
+    # ref-unopenable and one it does not answer makes the run a NON-RUN.
     offline = bool(getattr(args, 'offline', False)) or args.mode == 'hook'
     owner, repo = self_slug(args, env, git)
-    refs = RefScan(RefResolver(fetch=fetch, offline=offline), owner, repo,
+    # GITHUB_TOKEN, when the environment carries one, buys the forge's
+    # authenticated budget for the reachability question and nothing else. It is
+    # never printed, never written and never passed on an argument list.
+    refs = RefScan(RefResolver(fetch=fetch, offline=offline,
+                               token=env.get('GITHUB_TOKEN')), owner, repo,
                    private.tracker_hosts if private is not None else (),
                    require=bool(args.require_private))
     run_controls(classes, private_patterns, out, neuter, fetch=fetch)
@@ -3018,8 +3161,20 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
         out('PRIVATE PATTERNS NOT LOADED: names, devices, people and real LAN addresses were '
             'NOT checked.')
     if refs.res.spent and not args.quiet:
-        out('REFERENCE BUDGET SPENT: this run stopped asking the forge and every reference '
-            'after that point is reported unverified, NOT clean.')
+        out('REFERENCE BUDGET SPENT: this run stopped asking the forge, so every reference '
+            'after that point is NOT QUERIED and this run asserts nothing about it.')
+    if refs.res.unqueried:
+        # No answer is no verdict. Each one is named the way a finding's value is
+        # named, so a log publishes no more here than a row would, and then the run
+        # exits NON-RUN: a reference the forge would not answer about is a failure
+        # of this tool, and calling it a leak reds a guard on content nobody
+        # changed.
+        for token in refs.res.unqueried.values():
+            out('NOT QUERIED %s: %s' % (REF_UNVERIFIED, _ref_value(sc, token)))
+        out('leak_scan %s: NON-RUN: %s=%d reference(s) could not be queried (rate limit or '
+            'transport); no leak is asserted' % (args.mode, REF_UNVERIFIED,
+                                                 len(refs.res.unqueried)))
+        return EXIT_NORUN
     by_class = {}
     for h in sc.hits:
         by_class[h.cls] = by_class.get(h.cls, 0) + 1
@@ -3038,6 +3193,15 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
                 len(allow), st.pragmas, time.time() - t0,
                 _extras(sc)))
     return EXIT_OK if status == 'OK' else EXIT_HIT
+
+
+def _ref_value(sc, token):
+    """One unqueried reference as it may be PRINTED: the masking an
+    identity-bearing finding's value gets, so a NON-RUN line publishes no more of
+    a slug than a row for it would have."""
+    if sc.masks_values():
+        return mask_shape(token)
+    return clean(sc.redact(token))[:80]
 
 
 def _extras(sc):
@@ -3177,11 +3341,12 @@ R_SELF = 'qz' + 'rkv-here'               # the repository being scanned
 R_PUB = 'qz' + 'rkv-open'                # 200: a stranger gets a page
 R_PRIV = REF_SAMPLE_REPO                 # 404: private
 R_GONE = 'qz' + 'rkv-absent'             # 404: never there
-R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge would not say
+R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge did not answer
+R_WITHDRAWN = 'qz' + 'rkv-withdrawn'     # 410: taken down, and still a not-found
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
-                (RO, R_SLOW): 429, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 238
+                (RO, R_SLOW): 429, (RO, R_WITHDRAWN): 410, (RO, R_ONEWORD): 404}
+EXPECTED_ARMS = 254
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
@@ -4515,7 +4680,7 @@ def self_test(out, base_env, argv0):
             'filed as ' + R_SELF + '#945 here',                                # 9 own repo bare
             'sign in at ' + FORGE + 'login/oauth/authorize now',               # 10 forge word
             'clone ' + FORGE + RO + '/' + R_PUB + '.git today',                # 11 .git suffix
-            'see ' + FORGE + RO + '/' + R_SLOW + '/issues/1',                  # 12 throttled
+            'see ' + FORGE + RO + '/' + R_WITHDRAWN + '/issues/1',             # 12 taken down
             'issue#5 and demand#1 and Alive#2 and rclcpp#2335 are prose',      # 13 prose
             'filed as ' + R_ONEWORD + '#945 upstream',                         # 14 one word
         ]
@@ -4555,25 +4720,33 @@ def self_test(out, base_env, argv0):
             10 not in every and not any(a.startswith('login/') for a in asked))
         arm('ref-dot-git-suffix-is-not-part-of-the-name',
             11 not in every and (RO + '/' + R_PUB.lower() + '.git') not in asked, str(asked))
-        arm('ref-unverified-without-require-is-a-warning',
-            12 in soft_lines and 12 not in hard_lines)
+        arm('ref-410-is-a-not-found-and-fails', 12 in hard_lines and 12 not in soft_lines,
+            str([ln for ln in lines if 'refs.md:12' in ln]))
         arm('ref-prose-before-a-number-sign-is-not-a-reference', 13 not in every)
         arm('ref-a-one-word-repository-name-is-invisible-to-the-shape', 14 not in every)
         arm('ref-one-question-per-repository-per-run',
             asked.count(RO + '/' + R_PRIV.lower()) == 1, str(asked))
+        # OFFLINE is where ref-unverified still lives: the operator said not to
+        # ask, so every candidate is a scoped note there and --require-private
+        # raises it. Online the class carries no row for either flag to raise.
         del asked[:]
-        rc, lines = run(['tree', '--no-allow', '--require-private'] + mine, refenv, repo_ref)
+        rc, lines = run(['tree', '--no-allow', '--offline', '--require-private'] + mine,
+                        refenv, repo_ref)
         got = hits(lines)
-        arm('ref-unverified-with-require-is-a-finding', rc == EXIT_HIT and any(
-            c == REF_UNVERIFIED and n == 12 for c, p, n in got),
-            str([ln for ln in lines if 'refs.md:12' in ln]))
+        arm('ref-unverified-offline-with-require-is-a-finding', rc == EXIT_HIT and not asked
+            and {1, 2, 3, 7, 8, 11, 12} <= set(
+                n for c, p, n in got if c == REF_UNVERIFIED and p == 'refs.md'),
+            'asked=%s rc=%d' % (asked, rc))
         del asked[:]
         rc, lines = run(['tree', '--no-allow', '--offline'] + mine, refenv, repo_ref)
         rep = hits(lines, 'REPORT')
+        soft_off = set(n for c, p, n in rep if c == REF_UNVERIFIED and p == 'refs.md')
         arm('ref-offline-asks-nothing-and-reports-every-candidate',
-            rc == EXIT_HIT and not asked and set(
-                n for c, p, n in rep if c == REF_UNVERIFIED and p == 'refs.md')
-            >= {1, 2, 3, 7, 8, 11, 12}, 'asked=%s rc=%d' % (asked, rc))
+            rc == EXIT_HIT and not asked and soft_off >= {1, 2, 3, 7, 8, 11, 12},
+            'asked=%s rc=%d' % (asked, rc))
+        arm('ref-unverified-offline-without-require-is-a-warning',
+            soft_off >= {1, 2, 3, 7, 8, 11, 12} and not any(
+                c == REF_UNVERIFIED for c, p, n in hits(lines)), str(sorted(soft_off)))
         arm('ref-offline-still-refuses-a-tracker-link', any(
             ln.startswith('HIT ' + REF_DEFECT + ' refs.md:4') for ln in lines))
         rc, lines = run(['tree', '--no-allow', '--format', 'github'] + mine, refenv, repo_ref)
@@ -4590,6 +4763,78 @@ def self_test(out, base_env, argv0):
             not any(ln.startswith('HIT ' + REF_DEFECT + ' refs.md:2') for ln in lines)
             and any(ln.startswith('HIT ' + REF_DEFECT + ' refs.md:4') for ln in lines),
             str([ln for ln in lines if ln.startswith('HIT')][:3]))
+        # NO ANSWER IS NOT A FINDING. One reference, three forges: one that
+        # throttles it, one that cannot be reached at all, and one that confirms
+        # it. The first two must say so and assert nothing; the third must be
+        # clean. This is the defect the split exists for, so it is planted whole
+        # rather than read off the shape fixture above.
+        repo_noans = os.path.join(tmp, 'repo-noans')
+        os.makedirs(repo_noans)
+        _write_files(repo_noans, {'throttle.md': (
+            'see ' + FORGE + RO + '/' + R_SLOW + '/issues/1\n').encode('utf-8')})
+        gitn = Git(repo_noans, env)
+        gitn.run(['init', '-q'])
+        gitn.run(['symbolic-ref', 'HEAD', 'refs/heads/main'])
+        gitn.run(['add', '-A'])
+        gitn.run(['commit', '-q', '-m', 'throttle'])
+        norun_head = ('leak_scan tree: NON-RUN: ' + REF_UNVERIFIED + '=1 reference(s) '
+                      'could not be queried (rate limit or transport); no leak is asserted')
+        rc, lines = run(['tree', '--no-allow'] + mine, refenv, repo_noans)
+        ref_rows = [ln for ln in lines if ln.startswith(('HIT ' + REF_UNVERIFIED,
+                                                         'REPORT ' + REF_UNVERIFIED,
+                                                         'HIT ' + REF_DEFECT))]
+        arm('ref-a-throttled-reference-is-a-non-run-and-not-a-finding',
+            rc == EXIT_NORUN and norun_head in lines and not ref_rows
+            and any(ln.startswith('NOT QUERIED ' + REF_UNVERIFIED + ': ') and R_SLOW in ln
+                    for ln in lines),
+            'rc=%d rows=%s %s' % (rc, ref_rows, [ln for ln in lines if 'QUERIED' in ln
+                                                 or 'NON-RUN' in ln]))
+        # A forge that answers nothing at all, which is what a transport error and
+        # a timeout reach the resolver as.
+        rc_t, lines_t = run(['tree', '--no-allow'] + mine, refenv, repo_noans,
+                            fetch=lambda o, r, *_: None)
+        arm('ref-a-reference-the-network-never-reached-is-a-non-run-not-a-finding',
+            rc_t == EXIT_NORUN and norun_head in lines_t
+            and not any(ln.startswith(('HIT ' + REF_UNVERIFIED, 'REPORT ' + REF_UNVERIFIED))
+                        for ln in lines_t), 'rc=%d' % rc_t)
+        # The escalation flags cannot turn a tool failure back into a finding: the
+        # class has no row online for either of them to raise.
+        rc_h, lines_h = run(['tree', '--no-allow', '--hard', REF_UNVERIFIED,
+                             '--require-private'] + mine, refenv, repo_noans)
+        arm('ref-the-escalation-flags-raise-nothing-for-a-reference-nobody-answered-about',
+            rc_h == EXIT_NORUN and norun_head in lines_h
+            and not any(ln.startswith('HIT ' + REF_UNVERIFIED) for ln in lines_h),
+            'rc=%d' % rc_h)
+        # the clean control beside the two failures: the same tree, a forge that
+        # confirms the reference, no NON-RUN and nothing to report.
+        rc_c, lines_c = run(['tree', '--no-allow'] + mine, refenv, repo_noans,
+                            fetch=lambda o, r, *_: 200)
+        arm('ref-a-confirmed-reference-is-clean-and-no-non-run',
+            rc_c == EXIT_OK and not any('NON-RUN' in ln or 'NOT QUERIED' in ln
+                                        for ln in lines_c),
+            'rc=%d %s' % (rc_c, [ln for ln in lines_c if 'leak_scan' in ln]))
+        # A NON-RUN line is a printed line like any other, so a CI log gets the
+        # masked shape and not the slug. The tier is loaded for every run here, so
+        # the terminal arms above read the value in clear and this one proves the
+        # same content masks it where the format says to.
+        rc_g, lines_g = run(['tree', '--no-allow', '--format', 'github'] + mine,
+                            refenv, repo_noans)
+        notq = [ln for ln in lines_g if ln.startswith('NOT QUERIED ')]
+        arm('ref-a-ci-log-carries-a-masked-shape-for-a-reference-nobody-answered-about',
+            rc_g == EXIT_NORUN and len(notq) == 1 and R_SLOW not in notq[0]
+            and notq[0] == 'NOT QUERIED ' + REF_UNVERIFIED + ': '
+            + mask_shape(RO + '/' + R_SLOW),
+            'rc=%d %s' % (rc_g, notq))
+        # OFFLINE over the same tree is the operator's choice not to ask: a scoped
+        # note, no question, and no NON-RUN.
+        del asked[:]
+        rc_o, lines_o = run(['tree', '--no-allow', '--offline'] + mine, refenv, repo_noans)
+        arm('ref-offline-over-the-same-tree-reports-a-scoped-note-and-asks-nothing',
+            rc_o == EXIT_OK and not asked
+            and any(ln.startswith('REPORT ' + REF_UNVERIFIED + ' throttle.md:1')
+                    for ln in lines_o)
+            and not any('NON-RUN' in ln for ln in lines_o),
+            'rc=%d asked=%s' % (rc_o, asked))
         # the private tier keys: a tracker host and a repository slug the shape
         # cannot see. Neither value is in the tree and neither ever prints.
         tracker = 'tickets.' + SH + '.example'
@@ -4958,7 +5203,7 @@ def self_test(out, base_env, argv0):
         spent_now = rr.verdict(RO, R_SLOW)
         arm('ref-the-fetch-is-handed-what-is-left-of-the-budget',
             seen == [100.0, 60.0, 20.0] and rr.asked == 3
-            and spent_now == 'unverified' and rr.spent and len(seen) == 3,
+            and spent_now == 'unqueried' and rr.spent and len(seen) == 3,
             'seen=%s asked=%d spent=%s' % (seen, rr.asked, rr.spent))
         # What the budget does to a request is observed AT THE BOUNDARY: the
         # timeout the socket was actually handed, and whether a retry was
@@ -4983,8 +5228,9 @@ def self_test(out, base_env, argv0):
         finally:
             urllib.request.urlopen, time.sleep = real_open, real_sleep
         arm('ref-an-exhausted-budget-caps-the-request-timeout-and-kills-the-retry',
-            plain == 503 and full == ([REF_TIMEOUT, REF_TIMEOUT], [REF_BACKOFF])
-            and starved == 503 and tight == ([0.1], []),
+            plain is None and full == ([REF_TIMEOUT] * REF_ATTEMPTS,
+                                       [REF_BACKOFF, REF_BACKOFF * 2])
+            and starved is None and tight == ([0.1], []),
             'full=%s tight=%s' % (full, tight))
         # A budget that can pay for one attempt but not for a second plus the
         # backoff must not spend the backoff and must not run past the deadline.
@@ -5006,7 +5252,7 @@ def self_test(out, base_env, argv0):
         finally:
             urllib.request.urlopen, time.sleep = real_open, real_sleep
         arm('ref-a-budget-that-cannot-pay-for-a-retry-does-not-spend-the-backoff',
-            code == 503 and seen_t == [REF_TIMEOUT] and slept_t == []
+            code is None and seen_t == [REF_TIMEOUT] and slept_t == []
             and spent_clock[0] <= 7.6,
             'seen=%s slept=%s spent=%s' % (seen_t, slept_t, spent_clock[0]))
         # The backoff can cost far more than it asked for: a descheduled process
@@ -5032,8 +5278,127 @@ def self_test(out, base_env, argv0):
         finally:
             urllib.request.urlopen, time.sleep = real_open, real_sleep
         arm('ref-a-backoff-that-overran-cancels-the-retry-it-had-earned',
-            late == 503 and slept_s == [REF_BACKOFF] and len(seen_s) == 1,
+            late is None and slept_s == [REF_BACKOFF] and len(seen_s) == 1,
             'seen=%s slept=%s' % (seen_s, slept_s))
+        # THE RETRY PATH ITSELF, at the boundary: how many attempts one reference
+        # costs, how the waits between them grow, and that a retry can succeed. A
+        # bounded retry nobody counted is one attempt again the next time somebody
+        # edits the loop, and that is the shape that read a rate limit as a leak.
+        def _patched(opener, sleeper=None):
+            """Run `opener` as the only way out of this process for one call, with
+            every wait recorded instead of taken. Returns (result, timeouts,
+            waits)."""
+            timeouts, waits = [], []
+
+            def wrapped(req, timeout=None):
+                timeouts.append(timeout)
+                return opener(req)
+
+            real_open, real_sleep = urllib.request.urlopen, time.sleep
+            urllib.request.urlopen = wrapped
+            time.sleep = waits.append
+            try:
+                return (sleeper(), timeouts, waits)
+            finally:
+                urllib.request.urlopen, time.sleep = real_open, real_sleep
+
+        def _throttled(headers):
+            def opener(req):
+                raise urllib.error.HTTPError(req.full_url, 429, 'slow down', headers, None)
+            return opener
+
+        code429, tries429, waits429 = _patched(
+            _throttled({'X-RateLimit-Remaining': '0'}), lambda: forge_status(RO, R_SLOW))
+        arm('ref-a-throttle-is-retried-a-bounded-number-of-times-with-a-growing-wait',
+            code429 is None and REF_ATTEMPTS >= 3 and len(tries429) == REF_ATTEMPTS
+            and waits429 == [REF_BACKOFF, REF_BACKOFF * 2]
+            and waits429 == sorted(waits429) and len(set(waits429)) == len(waits429),
+            'rc=%s attempts=%d waits=%s' % (code429, len(tries429), waits429))
+
+        def _dead(req):
+            raise OSError('connection reset by peer')
+
+        codetx, triestx, waitstx = _patched(_dead, lambda: forge_status(RO, R_SLOW))
+        arm('ref-a-transport-error-is-retried-the-same-bounded-number-of-times',
+            codetx is None and len(triestx) == REF_ATTEMPTS
+            and waitstx == [REF_BACKOFF, REF_BACKOFF * 2],
+            'rc=%s attempts=%d waits=%s' % (codetx, len(triestx), waitstx))
+
+        class _Answer(object):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        healed = [0]
+
+        def _once_then_answered(req):
+            healed[0] += 1
+            if healed[0] == 1:
+                raise urllib.error.HTTPError(req.full_url, 429, 'slow down', {}, None)
+            return _Answer()
+
+        codeok, triesok, waitsok = _patched(_once_then_answered,
+                                            lambda: forge_status(RO, R_SLOW))
+        arm('ref-a-throttle-that-clears-on-the-retry-is-answered-and-clean',
+            codeok == 200 and healed[0] == 2 and len(triesok) == 2
+            and waitsok == [REF_BACKOFF],
+            'rc=%s attempts=%d waits=%s' % (codeok, healed[0], waitsok))
+        short, tries_s, waits_s = _patched(_throttled({'Retry-After': '2'}),
+                                           lambda: forge_status(RO, R_SLOW))
+        arm('ref-a-short-retry-after-is-waited-out-as-the-forge-asked',
+            short is None and waits_s == [2.0, 2.0] and len(tries_s) == REF_ATTEMPTS,
+            'waits=%s attempts=%d' % (waits_s, len(tries_s)))
+        longa, tries_l, waits_l = _patched(
+            _throttled({'Retry-After': str(int(REF_RETRY_AFTER_MAX) + 600)}),
+            lambda: forge_status(RO, R_SLOW))
+        arm('ref-a-retry-after-longer-than-the-cap-stops-the-asking-rather-than-shortening-it',
+            longa is None and waits_l == [] and len(tries_l) == 1,
+            'waits=%s attempts=%d' % (waits_l, len(tries_l)))
+        arm('ref-no-answer-oracles',
+            _no_answer(429, {}) and _no_answer(500, {}) and _no_answer(503, {})
+            and not _no_answer(200, {}) and not _no_answer(404, {})
+            and not _no_answer(410, {}) and not _no_answer(301, {})
+            and not _no_answer(403, {}) and _no_answer(403, {'Retry-After': '30'})
+            and _no_answer(403, {'X-RateLimit-Remaining': '0'})
+            and not _no_answer(403, {'X-RateLimit-Remaining': '42'}))
+        arm('ref-retry-wait-oracles',
+            _retry_wait({}, 0) == REF_BACKOFF and _retry_wait({}, 1) == REF_BACKOFF * 2
+            and _retry_wait({'Retry-After': '2'}, 0) == 2.0
+            and _retry_wait({'Retry-After': str(int(REF_RETRY_AFTER_MAX) + 1)}, 0) is None
+            and _retry_wait({'Retry-After': 'Wed, 21 Oct 2026 07:28:00 GMT'}, 0)
+            == REF_BACKOFF,
+            str(_retry_wait({'Retry-After': '2'}, 0)))
+        # WHERE the question goes and WHAT it carries, read off the request object:
+        # a probe that drifted to another host, or that dropped the credential the
+        # budget rides on, is invisible in a status code.
+        sent = []
+
+        def _record(req):
+            sent.append((req.full_url, req.get_method(), dict(req.header_items())))
+            raise urllib.error.HTTPError(req.full_url, 404, 'nope', {}, None)
+
+        anon = _patched(_record, lambda: forge_status(RO, R_PRIV))[0]
+        with_token = _patched(_record,
+                              lambda: forge_status(RO, R_PRIV, token='tok' + 'en'))[0]
+        arm('ref-the-probe-asks-the-api-repository-endpoint-and-carries-a-token-only-'
+            'when-there-is-one',
+            anon == 404 and with_token == 404 and len(sent) == 2
+            and sent[0][1] == 'HEAD'
+            and sent[0][0] == 'https' + '://' + FORGE_API_HOST + '/repos/' + RO + '/' + R_PRIV
+            and not any(k.lower() == 'authorization' for k in sent[0][2])
+            and sent[1][2].get('Authorization') == 'Bearer ' + 'tok' + 'en',
+            str([sent[0][0], sent[0][1], sorted(sent[0][2]), sorted(sent[1][2])]))
+        del sent[:]
+        tok_verdict = _patched(_record,
+                               lambda: RefResolver(token='tok' + 'en').verdict(RO, R_PRIV))[0]
+        arm('ref-the-resolver-hands-its-token-to-the-default-probe',
+            tok_verdict == 'closed' and len(sent) == 1
+            and sent[0][2].get('Authorization') == 'Bearer ' + 'tok' + 'en',
+            str([sorted(h) for _, _, h in sent]))
         # the deadline: a count alone is not a bound, so an injected clock proves
         # the run stops asking and reports unverified instead of running long
         ticks = [0.0]
@@ -5041,7 +5406,7 @@ def self_test(out, base_env, argv0):
         first = slow.verdict(RO, R_PRIV)
         ticks[0] = 9.0
         arm('ref-probing-stops-at-the-deadline',
-            first == 'closed' and slow.verdict(RO, R_GONE) == 'unverified'
+            first == 'closed' and slow.verdict(RO, R_GONE) == 'unqueried'
             and slow.asked == 1 and slow.spent
             and slow.verdict(RO, R_PRIV) == 'closed',
             'asked=%d spent=%s' % (slow.asked, slow.spent))
@@ -5052,12 +5417,16 @@ def self_test(out, base_env, argv0):
         arm('ref-a-spent-budget-is-reported-not-hidden',
             sc_b.refs.res.spent and 'refs_budget_spent' in _extras(sc_b),
             _extras(sc_b))
-        res = RefResolver(fetch=lambda o, r, *_: {R_PUB: 200, R_PRIV: 404, R_SLOW: 429}.get(r))
+        res = RefResolver(fetch=lambda o, r, *_: {R_PUB: 200, R_PRIV: 404, R_SLOW: 429,
+                                                  R_WITHDRAWN: 410}.get(r))
         arm('ref-resolver-oracles',
             res.verdict(RO, R_PUB) == 'public' and res.verdict(RO, R_PRIV) == 'closed'
-            and res.verdict(RO, R_SLOW) == 'unverified'
-            and res.verdict(RO, 'nothing-known') == 'unverified' and res.asked == 4
-            and res.verdict(RO, R_PUB.upper()) == 'public' and res.asked == 4)
+            and res.verdict(RO, R_WITHDRAWN) == 'closed'
+            and res.verdict(RO, R_SLOW) == 'unqueried'
+            and res.verdict(RO, 'nothing-known') == 'unqueried' and res.asked == 5
+            and res.verdict(RO, R_PUB.upper()) == 'public' and res.asked == 5
+            and list(res.unqueried.values()) == [RO + '/' + R_SLOW, RO + '/nothing-known'],
+            str(list(res.unqueried.values())))
         off = RefScan(RefResolver(offline=True), RO, R_SELF)
         arm('ref-shape-oracles',
             [t for _, t in off.findings(FORGE + RO + '/' + R_PUB + '/tree/main/x.rs')]

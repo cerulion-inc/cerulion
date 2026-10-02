@@ -58,6 +58,27 @@ on:
 permissions:
   contents: read
 
+# The reference classes ask the forge's repository endpoint whether a stranger is
+# served a repository the text points at. Anonymously that question is priced at
+# 60 an hour per runner address, which a busy day shares with every other job on
+# the same address; this token raises it to the authenticated ceiling (5,000 an
+# hour for a token, 1,000 an hour per repository for the forge's own job token),
+# and it is the lowest-privileged credential here, read-only by the permissions
+# block above. The scanner reads it from the environment, sends it as a bearer
+# credential on that one request, and never echoes it, writes it or passes it as
+# an argument. Workflow level, so all three jobs get it in one place.
+#
+# What this fixed: a throttled question used to be reported as a ref-unverified
+# finding, so the same unchanged content read 0, 2, 2 and 3 findings across four
+# runs. A question with no answer is now retried and, failing that, recorded as
+# NOT QUERIED: the run exits 3 (NON-RUN) and asserts no leak. The `--hard
+# ref-unverified` escalation in the steps below is therefore INERT on an online
+# run, since the class carries no row there for it to raise; it still binds
+# `--offline`, which only the hooks use. Whether to drop the flag is a separate
+# decision and the lines are left as they are.
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
 # Same three shapes as ci.yml: a pull request keys on its number and cancels
 # the superseded run; a merge queue run keys on the queue's own branch and is
 # never cancelled; a push to main keys on the run id and groups with nothing.
