@@ -4096,7 +4096,7 @@ const SHARD_CHECK_RUN: &str = "./tools/scripts/ci_test_shard.sh --check";
 /// The workflow and the job the step belongs to.
 ///
 /// A step of the right name running the right script proves nothing about WHEN
-/// it runs. Six jobs of `ci.yml` sit behind `github.event_name != 'pull_request'
+/// it runs. Five jobs of `ci.yml` sit behind `github.event_name != 'pull_request'
 /// && github.event_name != 'merge_group'` under a cost policy, and the other
 /// workflows run on their own events, so the same step moved into one of those
 /// keeps its name and its script and stops running on a pull request, which is
@@ -4366,12 +4366,12 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
     // job that skips on a pull request. It is the wrong job AND the job is not
     // pull-request blocking, and both are said.
     let moved = format!(
-        "jobs:\n  msrv:\n    if: github.event_name != 'pull_request'\n    steps:\n      \
+        "jobs:\n  miri:\n    if: github.event_name != 'pull_request'\n    steps:\n      \
          - name: {SHARD_CHECK_STEP}\n        run: {SHARD_CHECK_RUN}\n"
     );
     let complaints = shard_check_complaints(&moved);
     assert!(
-        complaints.iter().any(|c| c.contains("`msrv` job")),
+        complaints.iter().any(|c| c.contains("`miri` job")),
         "a step in another job is named by its job: {complaints:?}"
     );
     assert!(

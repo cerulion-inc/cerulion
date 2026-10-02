@@ -3436,6 +3436,17 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         } else {
             BTreeSet::new()
         };
+    // Under LOCKSTEP this map is never built (an empty map, so
+    // check 3 resolves every topic against rank 0 exactly as it always has);
+    // under FREE-RUN it resolves each produced topic to its PRODUCING rank,
+    // whose boundary stream is the only one that describes its stamps.
+    //
+    // Built HERE rather than below its other consumer because the covered range
+    // needs it too: a declared range's replay ceiling is per producing rank.
+    let producing_rank = match coordination {
+        CoordinationMode::Lockstep => BTreeMap::new(),
+        CoordinationMode::FreeRun => produced_topic_ranks(&config, &rank_tables),
+    };
     let covered_range = resolve_covered_range(
         &recorded_messages,
         &trace,
@@ -3443,19 +3454,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         coordination,
         rank_count,
         &derived_tail_topics,
+        &producing_rank,
     )?;
     let trailing_frames = covered_range
         .as_ref()
         .map(|c| c.trailing.clone())
         .unwrap_or_default();
-    // Under LOCKSTEP this map is never built (an empty map, so
-    // check 3 resolves every topic against rank 0 exactly as it always has);
-    // under FREE-RUN it resolves each produced topic to its PRODUCING rank,
-    // whose boundary stream is the only one that describes its stamps.
-    let producing_rank = match coordination {
-        CoordinationMode::Lockstep => BTreeMap::new(),
-        CoordinationMode::FreeRun => produced_topic_ranks(&config, &rank_tables),
-    };
     validate_recording_consistency(
         &trace,
         rank_count,
@@ -4002,7 +4006,32 @@ fn assemble_outcome(
                 continue;
             }
         }
-        let replayed_count = summary.map_or(0, |c| c.replayed_count);
+        // The band the replay ACTUALLY re-produces comes off this side, which is
+        // what makes the covered range an exclusion rather than a penalty. The
+        // recorded side is already short by `trailing_frames[topic]` (see
+        // `replayed_frame_count`), and where the declared endpoint sits below rank
+        // 0's last boundary the replay runs on past it and emits frames in the
+        // band. Leaving this side whole is then a difference of exactly the band's
+        // width, published as `ExtraMessages`: on a k>1 capture declaring its own
+        // fold, 4 recorded frames against 4 replayed read as 3 against 4.
+        //
+        // It is `CoveredRange::reproduced` and NOT the trailing count, because the
+        // two differ exactly where it matters. On a tail-race bag the trailing
+        // frames sit ABOVE rank 0's last boundary and the replay never emits them,
+        // so deducting the trailing count here reports `MissingMessages` on a
+        // clean bag: five arms of this binary read that, among them
+        // `a_capture_whose_frames_outran_its_trace_replays_to_its_covered_range`.
+        //
+        // Neither deduction can mask an imbalance, because every violation class
+        // reads the DIFFERENCE between the counts: a replay that under-produces
+        // inside the band still lands short, and one that over-produces beyond it
+        // still lands long.
+        let replayed_count = summary.map_or(0, |c| c.replayed_count).saturating_sub(
+            covered_range
+                .as_ref()
+                .and_then(|c| c.reproduced.get(topic).copied())
+                .unwrap_or(0),
+        );
         let byte_violation = summary.and_then(|c| c.byte_violation);
         let partition_counts = summary.and_then(|c| c.partition_counts.clone());
         let tolerance_violations = summary
@@ -4685,6 +4714,15 @@ fn seed_rung_name(rung: SeedRung) -> &'static str {
 /// MISSING every frame before them — a total FAIL of a byte-identical node,
 /// which is exactly the reading the sequence seed exists to prevent one layer
 /// down. Saturating, so a stale count can only ever under-report.
+///
+/// A band is taken off the REPLAYED side as well, at the compare site, because
+/// the covered range excludes frames from the verdict and excluding them from one
+/// side only is a difference of the band's width reported as a divergence. The
+/// two deductions are NOT the same number: this side loses every frame beyond
+/// `through_ns`, that side loses only the ones the replay can re-produce
+/// ([`CoveredRange::reproduced`]), which is those at or below the PRODUCING
+/// RANK's own last boundary, rank 0's under lockstep where every pass is driven
+/// from that one stream.
 fn replayed_frame_count(
     recorded_messages: &RecordedMessages,
     topic: &str,
@@ -4911,9 +4949,10 @@ fn capture_anchor_target_ns(reader: &cerulion_bag::BagReader) -> Option<u64> {
 ///
 /// # `None` is the whole gate, and that is deliberate
 ///
-/// The value could be re-derived here — it is the last authoritative-rank
-/// boundary target in the bag's own trace, which [`last_recorded_boundary_target`]
-/// computes in one walk. Deriving it and ALWAYS applying the trim would be
+/// The value could be re-derived here: it is the EARLIEST last recorded
+/// boundary target across the ranks that kept one, which
+/// [`earliest_last_boundary_target`] computes by the same fold over ranks the
+/// recorder writes it with. Deriving it and ALWAYS applying the trim would be
 /// wrong: on a SINGLE-RANK `--record` continuous bag the frames and the trace
 /// are written by the SAME writer thread from the SAME batch, so a frame
 /// stamped past the last boundary there is genuine corruption — exactly what
@@ -4938,19 +4977,72 @@ fn capture_resim_covered_through_ns(reader: &cerulion_bag::BagReader) -> Option<
 ///
 /// The upper edge of everything a produced frame's timestamp can legally match:
 /// `validate_recording_consistency` check 3 walks exactly this stream and a
-/// frame stamped above its last entry can match NOTHING, whatever else the bag
-/// holds. It is what a declared covered range is ADJUDICATED against — clamped
-/// up to it, or refused for claiming past it (see [`resolve_covered_range`]).
+/// frame stamped above its last entry can match NOTHING in THAT rank's stream.
+/// It is ONE rank's endpoint, and it has two uses in [`resolve_covered_range`]:
+/// it IS the range that resolver DERIVES for a multi-rank lockstep recording
+/// that declares none, and it is reported beside the fold's minimum in the
+/// refusal so an operator reading that sentence sees both numbers. What a
+/// DECLARED range is adjudicated against is the fold over every rank that kept a
+/// boundary ([`earliest_last_boundary_target`]), never this value.
 ///
 /// One forward walk, the same one `last_replayed_step` makes; it returns the
 /// step and this returns the target, and neither is worth a second cursor type.
 fn last_recorded_boundary_target(trace: &RecordedTrace) -> Result<Option<u64>, ReplayError> {
-    let mut cursor = BoundaryCursor::for_rank(trace, AUTHORITATIVE_TRACE_RANK)?;
+    last_boundary_target_for_rank(trace, AUTHORITATIVE_TRACE_RANK)
+}
+
+/// The target of the LAST `STEP_BOUNDARY` `rank` kept, or `None` when it kept
+/// none.
+///
+/// One forward walk over `rank`'s own boundary stream, the walk
+/// [`last_recorded_boundary_target`] and [`earliest_last_boundary_target`] both
+/// spend: one cursor type, so the two answers cannot drift apart over what a
+/// boundary is.
+fn last_boundary_target_for_rank(
+    trace: &RecordedTrace,
+    rank: u32,
+) -> Result<Option<u64>, ReplayError> {
+    let mut cursor = BoundaryCursor::for_rank(trace, rank)?;
     let mut last = None;
     while let Some(b) = cursor.next()? {
         last = Some(b.target_ns);
     }
     Ok(last)
+}
+
+/// The MINIMUM, over the ranks that kept a boundary, of each rank's last kept
+/// `STEP_BOUNDARY` target. `None` when NO rank kept one.
+///
+/// The reader's half of the recorder's own fold: `cerulion_bagd`'s
+/// `TrimmedTrace::last_boundary_target_ns` takes the same minimum over the same
+/// per-rank lasts (`trace_window.rs`'s fold at the end of its walk, stated on
+/// that field, written into the manifest by `cerulion_bagd`'s capture close), so
+/// a well-formed capture's declaration and this value are one number.
+///
+/// The MINIMUM and not rank 0's own last, because a resume covers the graph only
+/// as far as its slowest rank: past the earliest rank's last boundary that rank
+/// has no recorded boundary for a frame to be matched against, so an endpoint
+/// taken from rank 0 claims coverage a trimmed or shorter-ending rank cannot
+/// back. On a single-rank capture, and on any capture where no rank ended
+/// shorter than rank 0, the fold and rank 0's own last target are the same
+/// number.
+///
+/// Ranks are dense `0..rank_count`; a rank that kept no boundary contributes
+/// nothing rather than zero, which would pull every capture's endpoint to 0.
+fn earliest_last_boundary_target(
+    trace: &RecordedTrace,
+    rank_count: usize,
+) -> Result<Option<u64>, ReplayError> {
+    let mut earliest: Option<u64> = None;
+    for rank in 0..rank_count.max(1) {
+        if let Some(last) = last_boundary_target_for_rank(trace, rank as u32)? {
+            earliest = Some(match earliest {
+                Some(seen) => seen.min(last),
+                None => last,
+            });
+        }
+    }
+    Ok(earliest)
 }
 
 /// Is this frame past the end of the covered range?
@@ -4989,6 +5081,22 @@ struct CoveredRange {
     through_ns: u64,
     /// Per GRAPH-PRODUCED topic, recorded frames stamped beyond `through_ns`.
     trailing: BTreeMap<String, usize>,
+    /// Per GRAPH-PRODUCED topic, the subset of [`Self::trailing`] the REPLAY
+    /// re-produces: frames stamped above `through_ns` and at or below the
+    /// PRODUCING RANK's own last recorded boundary.
+    ///
+    /// Each pass stops at its own rank's last boundary, so a frame stamped above
+    /// that rank's edge is one no pass emits and this count excludes it. Under
+    /// lockstep every pass is driven from rank 0's stream and that edge is rank
+    /// 0's for every topic; under free run each pass advances on its own, so a
+    /// peer's edge sits above rank 0's and its frames in the band ARE re-emitted.
+    ///
+    /// It exists because the two sides of the frame count must have the same band
+    /// removed, and [`Self::trailing`] is the wrong number for this side in one
+    /// direction: on a tail-race bag the trailing frames sit above every rank's
+    /// edge and no pass emits them, so deducting them here reports
+    /// `MissingMessages` on a clean bag.
+    reproduced: BTreeMap<String, usize>,
     /// `true` when the READER derived this range (a multi-rank
     /// lockstep bag that declared nothing — see [`resolve_covered_range`]),
     /// `false` when the bag DECLARED it in its Flashback manifest. Carried
@@ -5024,10 +5132,16 @@ struct CoveredRange {
 ///
 /// The derived range states the truth the lockstep replay already enforces:
 /// its authoritative clock ends at RANK 0's last boundary target
-/// ([`last_recorded_boundary_target`] — the same value a declared range is
-/// clamped to), so frames past it are outside what a resim can re-execute
-/// whatever else is true — un-judgeable by check 3 (nothing to match) and
-/// un-comparable by the diff (never re-produced). They are classified
+/// ([`last_recorded_boundary_target`]; a DECLARED range is adjudicated against
+/// the fold over ranks instead, which is a different question, see
+/// [`earliest_last_boundary_target`]), so frames past it are outside what a
+/// resim can re-execute
+/// whatever else is true: un-judgeable by check 3, which has nothing for them to
+/// match. They are NOT un-comparable: a DECLARED range can end below a producing
+/// rank's own last boundary, and that rank's pass runs to it, so the replay
+/// re-produces frames inside the band. The comparator excludes them from BOTH
+/// sides of the frame count rather than from the recorded side alone. They are
+/// classified
 /// TRAILING: in the bag, readable, reported (never silent — see
 /// [`CoveredRangeReport::derived`] and the render note), excluded from the
 /// verdict. Everything the boundary stream can still judge reaches check 3 at
@@ -5040,22 +5154,27 @@ struct CoveredRange {
 ///
 /// # An understatement is CLAMPED UP; an overstatement is REFUSED
 ///
-/// The recorder computes the declared value as the trace's own last boundary
-/// target (`TrimmedTrace::last_boundary_target_ns`) — ONE fact, ONE derivation —
-/// so on every well-formed capture the two are EQUAL and neither arm below fires.
-/// Which is what makes them guards rather than behaviours. The two directions
-/// are NOT symmetric, because this whole feature is about the truth of the
-/// `resimmable` CLAIM:
+/// The recorder computes the declared value as the MINIMUM over the ranks that
+/// kept a boundary of each rank's last kept target
+/// (`TrimmedTrace::last_boundary_target_ns`), and
+/// [`earliest_last_boundary_target`] folds the bag's own trace the same way, so
+/// on every well-formed capture the two are EQUAL and neither arm below fires.
+/// ONE fact, ONE derivation, in two places. Reading rank 0's own last target
+/// here instead is what this arm used to do, and on a capture whose peer ended
+/// shorter it answered an instant that rank's trace has no boundary for. The
+/// two directions are NOT symmetric, because this whole feature is about the
+/// truth of the `resimmable` CLAIM:
 ///
-/// - **BELOW the last boundary** (an UNDERSTATEMENT) is modesty: the bag
-///   promises less coverage than it can back. `through_ns` is clamped UP to the
-///   last boundary, so the frames forgiven are exactly those that could match
-///   NOTHING (check 3 walks that stream) — the MINIMAL set that fixes the tail
+/// - **BELOW the earliest rank's last boundary** (an UNDERSTATEMENT) is
+///   modesty: the bag promises less coverage than it can back. `through_ns` is
+///   clamped UP to the fold's minimum, so the frames forgiven are exactly those
+///   no rank can match: the MINIMAL set that fixes the tail
 ///   race, with the gate at full strength over every frame that could have
 ///   matched. Without the clamp a hand-edited bag could declare instant 0 and
 ///   buy itself silence over frames the boundary stream can still judge.
 ///
-/// - **ABOVE the last boundary** (an OVERSTATEMENT) is a claim the bag cannot
+/// - **ABOVE the earliest rank's last boundary** (an OVERSTATEMENT) is a claim
+///   the bag cannot
 ///   back, and the claim IS the fault: the manifest and the trace are two
 ///   artifacts of one recorder contradicting each other. It is REFUSED here,
 ///   loudly and by name.
@@ -5149,6 +5268,10 @@ fn resolve_covered_range(
     coordination: CoordinationMode,
     rank_count: usize,
     derived_tail_topics: &BTreeSet<String>,
+    // Per produced topic, the rank whose boundary stream describes its stamps.
+    // EMPTY under lockstep, where every pass is driven from rank 0's stream and
+    // rank 0's last boundary is the ceiling for all of them.
+    producing_rank: &BTreeMap<String, ProducingRank>,
 ) -> Result<Option<CoveredRange>, ReplayError> {
     let (declared, derived) = match capture_resim_covered_through_ns(&recorded_messages.reader) {
         // A DECLARED range always wins (the declared-range contract, clamp/refusal
@@ -5159,10 +5282,20 @@ fn resolve_covered_range(
         // `None`.
         None if rank_count > 1 && coordination == CoordinationMode::Lockstep => {
             match last_recorded_boundary_target(trace)? {
-                // Deriving the value AS the clamp target makes the guard arms
-                // below structurally unreachable on this path (`declared ==
-                // last` on both), so the derived range is exactly the furthest
-                // instant the bag can back — never more, never less.
+                // RANK 0's last target, and deliberately NOT the fold over ranks
+                // the DECLARED path adjudicates against. A derived range exists
+                // to forgive a peer that out-stepped rank 0 at an independent
+                // shutdown cut, and the lockstep replay's own clock ends at rank
+                // 0's last boundary, so rank 0's endpoint is the instant this
+                // path is reasoning about. Lowering it to the earliest rank's
+                // would EXCLUDE from the verdict every frame between the two,
+                // which is check 3 and the diff losing frames they can still
+                // judge: MEASURED on this suite, a writer's genuine shortfall
+                // stopped failing the run
+                // (`c6_a_tail_refire_never_nets_against_another_writers_shortfall`).
+                // A capture's DECLARED value is a different question: there the
+                // recorder has already measured the fold and the reader's job is
+                // to honour it rather than widen it.
                 Some(last) => (last, true),
                 // No rank-0 boundary at all: `BagNoStepBoundaries` refuses
                 // this bag in `validate_step_boundaries` (which ran before
@@ -5172,30 +5305,53 @@ fn resolve_covered_range(
         }
         None => return Ok(None),
     };
-    let through_ns = match last_recorded_boundary_target(trace)? {
-        Some(last) if declared > last => {
-            // STRICTLY above — equality is every well-formed capture and must stay
-            // untouched. See the asymmetry argument above: an overstatement is
-            // the fault, not a value to be repaired.
-            return Err(ReplayError::RecordingInconsistent {
-                detail: format!(
-                    "the Flashback manifest declares `resim_covered_through_ns` {declared} ns \
-                     but the trace's own last STEP_BOUNDARY target is {last} ns — the bag's \
-                     manifest and its trace disagree about how far the capture reaches. A \
-                     recorder derives that value FROM the trace it just wrote, so the two are \
-                     equal on every capture it produces; this bag was hand-edited or written \
-                     by a defective recorder. Re-record the capture, or drop the \
-                     `__cerulion/flashback.json` attachment to replay it as an ordinary bag"
-                ),
-            });
+    // The ADJUDICATION is the declared path's alone, and the `derived` arm skips
+    // it. On that path `declared` was just read off this same trace as rank 0's
+    // last target, so there is no second artifact for it to disagree with;
+    // comparing it against the fold refuses every ragged-shutdown recording
+    // whose peer ring was cut a step early, which is the ordinary multi-rank
+    // shape. MEASURED on this suite: adjudicating the derived value reds 17 arms
+    // of the ragged-tail and mp families.
+    let through_ns = if derived {
+        declared
+    } else {
+        match earliest_last_boundary_target(trace, rank_count)? {
+            Some(earliest) if declared > earliest => {
+                // STRICTLY above the FOLD's minimum. Equality is every well-formed
+                // capture and must stay untouched. See the asymmetry argument above:
+                // an overstatement is the fault, not a value to be repaired. Rank 0's
+                // own last target is reported beside it because it can be HIGHER on a
+                // capture whose peer ended shorter, and a declaration sitting between
+                // the two is exactly the bag this arm used to accept. Rendered as
+                // a number rather than a `Some(..)`: an operator reads this.
+                let rank_zero_clause = match last_recorded_boundary_target(trace)? {
+                    Some(last) => format!("rank 0's own last target is {last} ns"),
+                    None => "rank 0 kept no boundary of its own".to_string(),
+                };
+                return Err(ReplayError::RecordingInconsistent {
+                    detail: format!(
+                        "the Flashback manifest declares `resim_covered_through_ns` {declared} ns \
+                     but the ranks' own traces back only {earliest} ns, the EARLIEST last \
+                     recorded STEP_BOUNDARY target across the ranks that kept one \
+                     ({rank_zero_clause}). A resume covers the graph only as \
+                     far as its slowest rank, so a claim above that instant names a step some \
+                     rank's trace carries no boundary for. A recorder derives the declared \
+                     value by that same fold over ranks, so the two agree on every capture it \
+                     produces; this bag was hand-edited or written by a defective recorder. \
+                     Re-record the capture, or drop the `__cerulion/flashback.json` attachment \
+                     to replay it as an ordinary bag"
+                    ),
+                });
+            }
+            // The guard above leaves `declared <= earliest`, so the clamp UP is
+            // exactly the fold's minimum, the furthest instant this bag can back.
+            Some(earliest) => earliest,
+            // A trace with no boundary on any rank is refused by
+            // `BagNoStepBoundaries` before any of this matters; taking the
+            // declaration as-is keeps the arithmetic total rather than inventing a
+            // second refusal here.
+            None => declared,
         }
-        // The guard above leaves `declared <= last`, so the clamp UP is exactly
-        // the last boundary — the furthest instant this bag can back.
-        Some(last) => last,
-        // A trace with no boundary at all is refused by `BagNoStepBoundaries`
-        // before any of this matters; taking the declaration as-is keeps the
-        // arithmetic total rather than inventing a second refusal here.
-        None => declared,
     };
     // ONE streaming walk over every recorded frame (`for_each_frame` — built
     // for exactly this: "a feed is a per-topic PULL: draining topic A to EOF
@@ -5207,6 +5363,43 @@ fn resolve_covered_range(
     // would count the remainder as trailing and skip it, which is check 4's
     // own evidence being discarded before check 4 runs.
     let mut trailing: BTreeMap<String, usize> = BTreeMap::new();
+    // The upper edge of what the REPLAY can emit, PER TOPIC, because that edge is
+    // the producing rank's own last boundary and not one number for the bag.
+    //
+    // Under LOCKSTEP every pass is driven from rank 0's stream
+    // (`PassBoundaries::Lockstep`), so rank 0's last boundary is the edge for all
+    // of them and `producing_rank` is empty. Under FREE RUN each pass advances on
+    // its OWN cursor (`PassBoundaries::Rank`), so a peer emits frames above rank
+    // 0's last by design; taking rank 0's number for those topics leaves their
+    // frames outside `reproduced` while the recorded side has already dropped
+    // them, which is an `ExtraMessages` on a byte-identical bag.
+    //
+    // A topic whose producer no manifest names, and a multi-publisher topic split
+    // across ranks, keep rank 0's edge: there is no single stream to read an edge
+    // off, and the conservative direction is to deduct LESS from this side, which
+    // can only leave a difference visible rather than hide one.
+    let rank_zero_ceiling_ns = last_recorded_boundary_target(trace)?.unwrap_or(through_ns);
+    let mut ceiling_for_rank: BTreeMap<u32, u64> = BTreeMap::new();
+    for topic_rank in producing_rank.values() {
+        if let ProducingRank::Rank(rank) = topic_rank {
+            if let std::collections::btree_map::Entry::Vacant(slot) = ceiling_for_rank.entry(*rank)
+            {
+                slot.insert(
+                    last_boundary_target_for_rank(trace, *rank)?.unwrap_or(rank_zero_ceiling_ns),
+                );
+            }
+        }
+    }
+    let ceiling_of = |topic: &str| -> u64 {
+        match producing_rank.get(topic) {
+            Some(ProducingRank::Rank(rank)) => ceiling_for_rank
+                .get(rank)
+                .copied()
+                .unwrap_or(rank_zero_ceiling_ns),
+            _ => rank_zero_ceiling_ns,
+        }
+    };
+    let mut reproduced: BTreeMap<String, usize> = BTreeMap::new();
     let produced_set: BTreeSet<&str> = produced.iter().map(|s| s.as_str()).collect();
     recorded_messages.for_each_frame(&mut |topic, frame| {
         if !produced_set.contains(topic) {
@@ -5225,6 +5418,11 @@ fn resolve_covered_range(
         if let Some(header) = WireHeader::read_from_buf(frame) {
             if is_beyond_covered(header.timestamp_ns, through_ns) {
                 *trailing.entry(topic.to_string()).or_default() += 1;
+                // Inside the band its OWN pass still runs, so this frame has a
+                // replayed twin that must come off that side too.
+                if header.timestamp_ns <= ceiling_of(topic) {
+                    *reproduced.entry(topic.to_string()).or_default() += 1;
+                }
             }
         }
     })?;
@@ -5250,6 +5448,7 @@ fn resolve_covered_range(
     Ok(Some(CoveredRange {
         through_ns,
         trailing,
+        reproduced,
         derived,
     }))
 }

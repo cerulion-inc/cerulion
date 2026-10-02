@@ -187,7 +187,13 @@ script does not check. The script can exempt a head branch that cannot be rename
 branch closes it, so a listed branch is accepted verbatim until it merges (the list is
 empty); the pair is required because a head ref is fork-controlled text
 while the PR number is minted here once, so the same name on any other PR, or with no
-`--pr` at all, still fails.
+`--pr` at all, still fails. The second exemption is the forge's own update namespace: a
+head branch of the shape `dependabot/<ecosystem>/<name>` is accepted when the pull
+request author login is exactly `dependabot[bot]`, which `ci.yml` passes from the event
+payload as `github.event.pull_request.user.login` (set when the pull request opens;
+`github.actor` is whoever pushed the run). The script's author list is matched whole-line
+and fixed-string, so a login containing it or contained by it grants nothing, and the branch
+name is what the exemption covers: the title is still checked.
 
 ## The agent-docs gate
 
@@ -230,7 +236,12 @@ tree, no cargo, no network), and each names the document it is the machine half 
 The fourth doc-versus-code property, that every `cerulion <verb>` spelled in `README.md` and
 `docs/user-api.md` exists in the CLI, is enforced by the public-surface gate's `docs-refs` class,
 which walks the verb tree out of the clap definitions; its self-test carries a markdown TABLE row,
-because a table cell is where those two pages spell their verbs. That gate's `agent-file-ref`
+because a table cell is where those two pages spell their verbs. The same class resolves every
+relative link before it judges it: a target that resolves to nothing is a finding whatever its
+spelling, and one of the `ALL_CAPS_WITH_UNDERSCORE` placeholder shape says in its own message
+that no file in the tree resolves the token. A target held by a maintainer ruling is named line
+by line in `tools/scripts/public_surface_allow.txt`, and its row is deleted by the change that
+replaces the token, because a row that excuses nothing fails the run. That gate's `agent-file-ref`
 class refuses `AGENTS.md` and `CLAUDE.md` on a user-facing page, excepting files so named.
 
 ## The dependency-architecture rules
@@ -350,10 +361,11 @@ against the type it has to parse as by a unit test in
 `lint` runs: `cargo fmt --all --check` plus a workspace-root WALK
 that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/*`, every
 `examples/*`, the fuzz workspace); `cargo clippy --workspace --all-targets -- -D warnings`;
-the hot-path alloc lint and its self-test; the agent-docs gate; the leak guard's self-test
-and generic-class tree scan; the three crates.io script self-tests (the index wait, the
-publish retry, and the post-publish archive reader `release.yml` runs after an upload);
-the naming gate (pull requests only); `shellcheck` over
+the hot-path alloc lint and its self-test; the advisory issue bookkeeping self-test;
+the agent-docs gate; the leak guard's self-test and generic-class tree scan; the three
+crates.io script self-tests (the index wait, the publish retry, and the post-publish
+archive reader `release.yml` runs after an upload); the naming gate (pull requests only);
+`shellcheck` over
 `tools/scripts/**` recursively and over the extensionless hooks in `tools/hooks` (`-type f`
 deduplicates a symlink into a scanned subdirectory); and `actionlint` over every workflow.
 
@@ -423,19 +435,31 @@ only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `exa
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
 
-Six Linux jobs run on push / `workflow_dispatch` only and never
-on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `msrv`, `fuzz`, `miri` and
+Five Linux jobs run on push / `workflow_dispatch` only and never
+on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `fuzz`, `miri` and
 `machete` each carry a job-level `if: github.event_name != 'pull_request' && github.event_name
 != 'merge_group'`; `deb-smoke` carries one exception, below; the second
 conjunct is required because a bare `!= 'pull_request'` ADMITS a merge-queue batch,
 which would run the same work a second time over the same commits (`main`'s push run is the
 control), with their `needs: [lint]` (`fuzz`, `miri`) and
-`continue-on-error: true` (`fuzz`, `machete`) untouched. None of the six is a required
+`continue-on-error: true` (`fuzz`, `machete`) untouched. None of the five is a required
 status context on `main`, so a skipped one is simply absent from a pull request's checks.
 They run on every merge to `main` (the push run is where their breakage
 surfaces, revert-on-red), and the coverage walk drops any job behind a job-level `if:`
-from its PR-blocking view, so none of the six can credit pull-request coverage it does not
+from its PR-blocking view, so none of the five can credit pull-request coverage it does not
 provide.
+
+The MSRV check (`msrv`) runs on every pull request and every push to `main`, and carries
+`if: github.event_name != 'merge_group'` alone: a compiler-floor break found after the merge
+costs a revert on a branch that already landed, and a queue run would do the same check a
+second time over the same commits. It is not a required status context, and its job-level
+`if:` keeps the coverage walk dropping it from the PR-blocking view, which is correct: it
+type-checks the workspace on the floor and runs no test. Its cache key carries the
+`-main-`/`-pr-` scope segment, so a prune reached from a pull request deletes only `-pr-`
+entries of that namespace; the namespace token `msrv-1.95` is absent from the
+`CACHE_SAVE_NAMESPACES` default, so nothing fills it and the check compiles the workspace from
+scratch on every run. It lists no `needs:`, so a pull request starts it beside `lint` rather
+than after it.
 
 The `changes` job classifies a pull request's changed paths (rules and a
 `--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) into four
@@ -503,6 +527,89 @@ The release workflows reject missing, malformed, impossible-calendar, pre-tag, a
 future dates before publishing artifacts. The shared implementation is
 `tools/scripts/check_citation_release.sh`, which is also exercised by the release-gate
 regression script.
+
+## Scheduled workflows
+
+Four workflows run on a clock, and none of them reports a required status context.
+Three of the four run on nothing but the clock and a manual dispatch:
+`.github/workflows/moveit-hero.yml` at 03:43 UTC builds the ROS 2 Jazzy MoveIt image
+and runs the hero demo, `.github/workflows/advisories.yml` at 04:37 UTC runs the
+dependency advisory check, and `.github/workflows/stale.yml` at 07:17 UTC labels and
+closes `needs-info` items. The fourth, `.github/workflows/examples-replay.yml`, runs
+the replay-tolerance demo at 07:30 UTC and ALSO on a push to `main` and on a pull
+request, both path-filtered to `examples/perception/**` and its own file, so for that
+one the clock is the second trigger rather than the only one: it is what notices a
+change outside the filter breaking the demo. Every minute is off the hour, where
+GitHub queues the world's hourly crons at once.
+
+`advisories.yml` runs `cargo deny --format json --config tools/release/deny.toml
+check advisories` and nothing else. Licences, bans and sources are decided by
+`Cargo.lock` and `tools/release/deny.toml` together, and an edit to either is a push
+the per-change `Dependency Audit (cargo-deny)` job reads. Advisories are decided by
+the RustSec database, which `tools/release/deny.toml` does not pin, so an advisory
+published after the last push matches a lockfile nobody has edited and no event
+`ci.yml` triggers on fires.
+
+`tools/scripts/advisory_issue.sh` turns the result into one write on ONE issue,
+found among the open issues labelled `security` by the exact title `Dependency
+advisory audit reports a finding on the committed lockfile`. A finding opens that
+issue or rewrites its body; a clean run comments the commit the check passed on and
+closes it; a clean run with no such issue open writes nothing.
+
+The script acts on a diagnostic in the captured JSON log, at error or warning
+severity, whose class is one of `vulnerability`, `unmaintained`, `unsound`, `notice`
+and `yanked`. cargo-deny 0.20.2 checks each of those classes over a different set of
+crates, and `tools/release/deny.toml` is what fixes which:
+
+* `vulnerability` and `notice`, over every crate in the resolved graph, as
+  `error[<class>]` on a nonzero exit.
+* `unmaintained`, a scope key the file leaves at the default `all`, so over every
+  crate, as `error[unmaintained]` on a nonzero exit.
+* `unsound`, the same kind of scope key, which the file leaves at the default
+  `workspace`: a crate is checked only when at least one of its DIRECT dependents is
+  a workspace member. An unsound advisory on a crate reached only through
+  third-party edges emits no diagnostic and the check exits 0, so it reaches neither
+  this run nor the per-change job. Measured 2026-10-02 against the committed
+  lockfile: the same run with `unsound = "all"` exits 1 on seven such advisories, on
+  `anyhow` 1.0.102, `event-listener` 5.4.1, `lru` 0.12.5, `lru` 0.18.1, `rand` 0.8.5
+  and `scc` 2.4.0, every one of them silent at `workspace` scope.
+* `yanked`, which `yanked = "warn"` renders as `warning[yanked]` on exit 0.
+
+`unmaintained` and `unsound` are the two live keys there, each taking `all`,
+`workspace`, `transitive` or `none`. `version = 2` drives none of the above:
+cargo-deny 0.20.2 parses that key and discards the value, as it does the lint level
+on the removed `vulnerability` and `notice` keys.
+
+An advisory accepted in that file's `ignore` table drops to `note`, which the default
+`--log-level warn` keeps out of the log. So the exit status alone would overlook a
+yanked crate, which is why the log is read, and the severity bound is what keeps an
+accepted advisory from being reported. The body names the crate and version behind
+every diagnostic beside any `RUSTSEC-` id on it: the yanked class carries no advisory
+id, so the crate name is the only handle on it.
+
+Two shapes route to exit 3, each writing nothing, each leaving an open issue exactly
+as it stands, each naming the run URL so the Actions run goes red rather than a
+verdict on the lockfile resting on a check that did not fully run. One is
+`warning[index-failure]`
+in the log at any exit status: cargo-deny emits it per crate whose registry index
+query failed, while `yanked` is not `allow`, at warning severity and exit 0, so the
+registry query failed and the yanked half of the check did not run for the crates it
+names. The other is a nonzero exit carrying no advisory diagnostic: `cargo metadata`
+failed, the advisory database would not fetch, the index cache would not load. The
+script refuses with exit 2 and writes nothing when `jq` is absent or cannot read the
+log, when `gh` is unauthenticated, when the repository carries no `security` label,
+when `gh` refuses a listing, and when two open issues carry the title. Its oracle is
+`tools/scripts/test_advisory_issue.sh`: thirteen cases over JSON log fixtures against
+a `gh` shim that records every call, run as a step of `lint`.
+
+A `schedule` trigger fires only from the default branch, so a pull request branch's
+copy of one of these workflows never runs on the clock. `workflow_dispatch` is not
+the same: the button appears only once the file is on the default branch, and from
+there a dispatch runs the copy on whichever ref it names, a pull request branch
+included. Until the file lands, the pre-merge proof of a scheduled workflow is
+actionlint, the cache save policy checker and the script self-test; the first run on
+the clock is on `main`. GitHub also disables scheduled workflows on a repository
+after 60 days with no commit.
 
 ## The cache save policy (`CACHE_SAVE_*` in `ci.yml`)
 

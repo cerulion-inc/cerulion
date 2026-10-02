@@ -210,9 +210,10 @@ and runs in the `Lint` job.
   (`iroh` 1.0.2 and its companion crates declare rust-version 1.91), and the
   `rerun` 0.34 SDK pulled by the `cerulion_viz` / `cerulion-vizd` members at 1.93
   through its transitive `fixed` 1.31.0. ENFORCED: the `msrv` CI job runs
-  `cargo +1.95.0 check --workspace --all-targets` on every push to `main`
-  (and on `workflow_dispatch`; it is skipped on
-  `pull_request`; see `docs/internals/ci-and-gates.md` § "CI job map"), so
+  `cargo +1.95.0 check --workspace --all-targets` on every pull request and every
+  push to `main` (and on `workflow_dispatch`; it is excluded from the merge
+  queue, where `main`'s push run is the control; see
+  `docs/internals/ci-and-gates.md` § "CI job map"), so
   this floor is build-proven, not a survey.
 - **Minimal-versions floor**: macro-emitted code calls
   `IndexMap::get_disjoint_mut` (added in indexmap 2.8); manifests

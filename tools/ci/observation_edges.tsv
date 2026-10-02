@@ -20,6 +20,8 @@
 # `all` in the observed column means the walk
 # could not attribute the read to one package, so the observing package rides
 # every selection that names a package and no step of it may be gated.
+cerulion_bagd	cerulion_cli_engine	crate-path	crates/cerulion_bagd/tests/state_anchor_partial_scan_test.rs
+cerulion_bagd	cerulion_core	crate-path	crates/cerulion_bagd/tests/state_anchor_partial_scan_test.rs
 cerulion_cli	all	unattributable	crates/cerulion_cli/tests/mp_supervisor_box_test.rs
 cerulion_cli	all	whole-tree	crates/cerulion_cli/tests/replay_cli_test.rs
 cerulion_cli	cerulion_heaphook	dlopen	crates/cerulion_cli/tests/ros2_run_e2e_test.rs
@@ -35,6 +37,7 @@ cerulion_cli_engine	rmw_cerulion	dlopen	crates/cerulion_cli_engine/src/ros2_cmd.
 cerulion_core	all	whole-tree	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
 cerulion_core	cerulion_bag	crate-path	crates/cerulion_core/tests/state_record_framing_scan_test.rs
 cerulion_core	cerulion_bagd	crate-path	crates/cerulion_core/tests/doc_attachment_discipline_test.rs
+cerulion_core	cerulion_cli	crate-path	crates/cerulion_core/tests/upstream_waivers_test.rs
 cerulion_core	cerulion_cli_engine	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
 cerulion_core	cerulion_macros	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
 cerulion_hygiene	all	whole-tree	crates/cerulion_hygiene/tests/crate_license_texts_test.rs

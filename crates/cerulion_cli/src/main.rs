@@ -2958,39 +2958,16 @@ fn report_shm_state_population(mode: SweepMode) {
 /// left registered. The `.shm_state` reclamation is gated on that second
 /// value; see [`clean_iceoryx2_state`].
 ///
-/// ONE refusal shape is healed here rather than reported and
-/// left standing. A dead node whose directory holds nothing but orphan port
-/// tags — a publisher was destroyed while one of its loaned samples had been
-/// leaked, so the port was deregistered but its tag outlived it — fails the
-/// sweep at the final `rmdir` on EVERY sweep, forever, and one such node blocks
-/// the `.shm_state` reclamation for good. After the first sweep, the nodes
-/// whose refusal is EXACTLY that chain
-/// (`orphan_port_tags::orphan_port_tag_candidates`) have their tags removed
-/// (`orphan_port_tags::reclaim_orphan_port_tags`: the process must be provably
-/// gone, and the directory — re-listed at that instant — must hold nothing
-/// else; anything else is refused and named), then ONE more sweep runs and its
-/// summary is printed; the convergence handed back is the SECOND sweep's, so
-/// the reclamation gate sees the healed registry. That sweep runs whenever
-/// candidates EXISTED — not only when a tag came off: a candidate whose
-/// directory was already empty (`ReclaimVerdict::AlreadyEmpty` — another
-/// session, or an interrupted earlier run, removed its tags) has nothing to
-/// reclaim and converges on exactly that sweep. `--report-only` removes
-/// nothing and skips the second sweep — nothing changed, so it would re-find
-/// the same refusals. The source fix (the rmw destroy path) is what stops the
-/// shape being minted; this only heals a robot already carrying it.
-///
-/// One thing a `--report-only` run canNOT list is the orphan port tags. A tag
-/// is identified by the refusal iceoryx2 raises while REMOVING the node, and a
-/// report performs no removal, so there is no refusal to read a candidate out
-/// of. The report states that where the listing would have been, rather than
-/// printing an empty section a reader would take for "none". The dry-run bit
-/// still travels to the reclaim as the verb's own mode, so a report can never
-/// remove a tag even if a future sweep reported a refusal without attempting
-/// one.
+/// ONE sweep, and the shape that used to need a second one is gone. A dead
+/// node's directory holding nothing but the orphan port tags of ports it had
+/// already deregistered used to fail the final `rmdir` on every sweep forever,
+/// and one such node blocked the `.shm_state` reclamation for good. iceoryx2
+/// 0.10 removes a dead port's tag with the rest of its stale resources
+/// (`service/stale_resource_cleanup.rs`, the port tag arm), so the shape cannot
+/// arise and the reclaim that healed it is gone with it. The convergence handed
+/// back is this sweep's.
 fn clean_dead_nodes(mode: SweepMode) -> (CliResult<()>, bool) {
     use cerulion_cli_engine::ipc_cleanup;
-    use cerulion_cli_engine::orphan_port_tags;
-    use cerulion_cli_engine::shm_state::creator_verdict;
 
     let report = ipc_cleanup::sweep_dead_nodes(mode);
     report_sweep(&report, mode);
@@ -2999,120 +2976,7 @@ fn clean_dead_nodes(mode: SweepMode) -> (CliResult<()>, bool) {
     // never reached is still registered and counted nowhere, so the
     // `.shm_state` reclamation must stand down for it.
     let converged = report.failed_cleanups == 0 && report.registry_errors.is_empty();
-    if report.failed_cleanups == 0 {
-        return (Ok(()), converged);
-    }
-
-    let config = orphan_port_tags::Iceoryx2Config::global_config();
-    let candidates = orphan_port_tags::orphan_port_tag_candidates(&report.failures, config);
-    if candidates.is_empty() {
-        return (Ok(()), false);
-    }
-    // The liveness evidence is `shm_state`'s ONE predicate, reached through its
-    // exported verdict — never re-spelt here.
-    let reclaims = orphan_port_tags::reclaim_orphan_port_tags(
-        &candidates,
-        config,
-        mode.reports_only(),
-        &creator_verdict,
-    );
-    for line in render_orphan_tag_reclaims(&reclaims, mode) {
-        println!("{line}");
-    }
-    if mode.reports_only() {
-        // Nothing changed: what WOULD be removed is listed above, and a
-        // second sweep would only re-find the same refusals.
-        return (Ok(()), false);
-    }
-
-    // ONE more sweep, whenever candidates EXISTED: a reclaimed node's
-    // directory now holds nothing, and an `AlreadyEmpty` one never did, so
-    // `remove_node` can finish what every earlier sweep could not. Its
-    // counters are the proof the shape is healed (`cleanups` counts the
-    // converged nodes), and its convergence is what the `.shm_state` gate
-    // must see. A refused candidate costs one re-sweep that re-finds it —
-    // cheap, and the report it prints is the truth of the registry NOW.
-    println!("Second sweep after the orphan port-tag reclaim:");
-    let second = ipc_cleanup::sweep_dead_nodes(mode);
-    report_sweep(&second, mode);
-    (
-        Ok(()),
-        second.failed_cleanups == 0 && second.registry_errors.is_empty(),
-    )
-}
-
-/// Render the orphan port-tag reclaim for `cerulion clean`, one line per
-/// candidate, exactly as the outcome was:
-///
-/// * `node <id> (pid <pid>, process gone): directory not empty — removed <k>
-///   orphan port tag(s) [<port ids>]` — or `would remove` under
-///   `--report-only`, which also closes with a line saying nothing was
-///   removed;
-/// * `node <id> (pid <pid>, process gone): directory already empty — nothing
-///   to reclaim; the next sweep removes it` for an `AlreadyEmpty` verdict —
-///   converged pending sweep, never rendered as a refusal;
-/// * `node <id> (pid <pid>): not reclaimed — <reason>` for a refusal, with
-///   any tags removed before a mid-way failure stated rather than hidden.
-///
-/// PURE (a `Vec` of lines) so `clean_diagnostic_tests` pins it against hand
-/// oracles. Empty input renders NOTHING.
-fn render_orphan_tag_reclaims(
-    reclaims: &[cerulion_cli_engine::orphan_port_tags::OrphanTagReclaim],
-    mode: SweepMode,
-) -> Vec<String> {
-    if reclaims.is_empty() {
-        return Vec::new();
-    }
-    let report_only = mode.reports_only();
-    let ids = |removed: &[u128]| {
-        removed
-            .iter()
-            .map(u128::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let mut lines = vec![if report_only {
-        "Orphan port tags `cerulion clean` would reclaim (report only — nothing removed):"
-            .to_string()
-    } else {
-        "Reclaiming orphan port tags (a leaked loan kept each tag alive past its port's \
-         deregistration; the process is gone and iceoryx2 already reclaimed the ports' resources):"
-            .to_string()
-    }];
-    for reclaim in reclaims {
-        use cerulion_cli_engine::orphan_port_tags::ReclaimVerdict;
-        match &reclaim.verdict {
-            ReclaimVerdict::AlreadyEmpty => lines.push(format!(
-                "node {} (pid {}, process gone): directory already empty — nothing to reclaim; \
-                 the next sweep removes it",
-                reclaim.node_id, reclaim.pid
-            )),
-            ReclaimVerdict::Reclaimed => lines.push(format!(
-                "node {} (pid {}, process gone): directory not empty — {} {} orphan port tag(s) [{}]",
-                reclaim.node_id,
-                reclaim.pid,
-                if report_only { "would remove" } else { "removed" },
-                reclaim.removed.len(),
-                ids(&reclaim.removed)
-            )),
-            ReclaimVerdict::Refused(reason) if reclaim.removed.is_empty() => lines.push(format!(
-                "node {} (pid {}): not reclaimed — {reason}",
-                reclaim.node_id, reclaim.pid
-            )),
-            ReclaimVerdict::Refused(reason) => lines.push(format!(
-                "node {} (pid {}): not fully reclaimed — {reason}; {} tag(s) removed before the \
-                 failure [{}]",
-                reclaim.node_id,
-                reclaim.pid,
-                reclaim.removed.len(),
-                ids(&reclaim.removed)
-            )),
-        }
-    }
-    if report_only {
-        lines.push("(run `cerulion clean` without `--report-only` to reclaim them)".to_string());
-    }
-    lines
+    (Ok(()), converged)
 }
 
 /// Print one sweep's outcome: the registry-wide block first (if any), the
@@ -3190,10 +3054,7 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport, mode: 
                 "iceoryx2 internal error" => {
                     "iceoryx2 refused to remove the node's registry entry; \
                      the node ids of the refused nodes listed below name the \
-                     culprit and carry the sub-causes iceoryx2 logged. A directory \
-                     holding only orphan port tags (a publisher destroyed while a \
-                     loaned sample was leaked — the tag outlives the port) is \
-                     reclaimed by this verb right after this listing; any other \
+                     culprit and carry the sub-causes iceoryx2 logged. A \
                      stranded entry never converges on its own"
                 }
                 _ => "see iceoryx2 logs for details",
@@ -3235,25 +3096,11 @@ const REMOVAL_CAN_STILL_BE_REFUSED: &str =
      insufficient permissions or a version mismatch only when it tries to remove a node, which \
      a report does not do)";
 
-/// The sentence `cerulion clean --report-only` prints where the orphan
-/// port-tag listing sits on a destructive run.
-///
-/// An absence STATED, never an empty section. A tag is identified by the
-/// refusal iceoryx2 raises while removing its node
-/// (`orphan_port_tags::orphan_port_tag_candidates` reads the refusal's
-/// sub-cause chain), and a report performs no removal, so a report has no
-/// refusal to read a candidate out of. Printing nothing there would read as
-/// "no orphan port tags", which is a claim this run cannot make.
-const ORPHAN_TAGS_NOT_LISTED: &str =
-    "Orphan port tags: not listed by a report. iceoryx2 identifies one by the refusal it \
-     raises while removing the tag's node, and this run removed nothing. A run without \
-     `--report-only` lists and reclaims them.";
-
 /// Render the would-remove listing for `cerulion clean --report-only`: the
 /// dead nodes the sweep classified, by the NAME each carries under the
 /// registry directory (its entry name, checkable against `ls`), capped at
 /// [`NODES_SHOWN`] with the same `… and N more` fold the refusal listing
-/// uses, and closed by the orphan-tag absence.
+/// uses.
 ///
 /// The set is the sweep's own [`cerulion_cli_engine::ipc_cleanup::CleanupReport::dead_nodes`],
 /// which a destructive run over the same registry produces from the same
@@ -3284,7 +3131,6 @@ fn render_would_remove(
         lines.push(format!("  … and {} more", dead.len() - NODES_SHOWN));
     }
     lines.push(REMOVAL_CAN_STILL_BE_REFUSED.to_string());
-    lines.push(ORPHAN_TAGS_NOT_LISTED.to_string());
     lines
 }
 
