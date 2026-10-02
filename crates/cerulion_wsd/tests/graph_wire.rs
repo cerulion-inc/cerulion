@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 #![cfg(unix)]
 //! `graph.wire`, `graph.unwire` and `graph.unstage` end to end over the
 //! daemon's socket: the version check, the typed refusals, and that a refusal
