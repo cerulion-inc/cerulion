@@ -235,7 +235,7 @@ unsafe extern "C" fn fault_allocate(size: usize, state: *mut c_void) -> *mut c_v
     // Atomic countdown: succeed while the budget lasts, then null.
     if st
         .remaining_successes
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
         .is_err()
     {
         return std::ptr::null_mut();

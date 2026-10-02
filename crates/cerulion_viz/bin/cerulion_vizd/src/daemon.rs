@@ -1754,7 +1754,9 @@ impl Ctx {
                 return Response::error(
                     Some(id),
                     format!(
-                        "sample: '{topic}' is not attached. sample reads the frames an attach                          already drains and opens no subscription of its own; attach the topic                          first"
+                        "sample: '{topic}' is not attached. sample reads the frames an attach \
+                        already drains and opens no subscription of its own; attach the topic \
+                        first"
                     ),
                     Some(topic),
                 );
@@ -1763,7 +1765,8 @@ impl Ctx {
                 return Response::error(
                     Some(id),
                     format!(
-                        "sample: {} topics are already being sampled; a topic stops counting                          five seconds after its last sample",
+                        "sample: {} topics are already being sampled; a topic stops counting \
+                        five seconds after its last sample",
                         crate::sample::SAMPLE_MAX_TOPICS
                     ),
                     Some(topic),

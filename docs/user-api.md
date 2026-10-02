@@ -341,7 +341,7 @@ count declared in the same `node create` invocation.
 
 Before any of this, `cerulion node build` needs **your own** Rust toolchain: it
 compiles the node with `cargo`, which the CLI does not ship, so `cargo` must be
-on `PATH` (Rust **1.93+**, the MSRV, via [rustup](https://rustup.rs)) alongside a
+on `PATH` (Rust **1.95+**, the MSRV, via [rustup](https://rustup.rs)) alongside a
 **C linker** (`build-essential` on Ubuntu/Debian, the Xcode Command Line Tools on
 macOS). If `cargo` is missing the build fails with a message naming rustup and
 the linker, rather than a raw "No such file or directory" that reads like a lost
@@ -2672,7 +2672,8 @@ a larger number is clamped to 20 and `0` is refused). `fields` is the decoded
 message as `{field: value}`, or `null` when the daemon holds no schema for the
 frame, the frame is larger than 16 KiB (an image or a point cloud keeps `seq`,
 `ts_ns` and `size` only), or it did not decode; `summary` is a one line label, or
-the reason `fields` is `null`. An array of more than 16 elements, or one cut short by the 512 value limit, is
+the reason `fields` is `null`. An array of more than 16 elements, or one cut
+short by the 512 value limit, is
 `{"len":N,"head":[the values kept]}`, and NaN and the infinities are the strings `"NaN"`,
 `"inf"` and `"-inf"`. One decoded frame emits at most 512 values; past that the
 remaining fields are replaced by one `"..."` entry. A byte array (`uint8[]` and

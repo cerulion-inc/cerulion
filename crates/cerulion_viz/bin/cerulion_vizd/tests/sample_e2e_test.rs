@@ -436,6 +436,16 @@ fn sampling_an_unattached_topic_is_refused_and_attaches_nothing() {
     let error = reply["error"].as_str().unwrap();
     assert!(error.contains("not attached"), "{error}");
     assert!(error.contains("opens no subscription"), "{error}");
+    assert!(!error.contains("  "), "no run of spaces in a message: {error}");
+    assert_eq!(
+        error,
+        format!(
+            "sample: '{}' is not attached. sample reads the frames an attach already \
+             drains and opens no subscription of its own; attach the topic first",
+            reply["topic"].as_str().unwrap_or_default()
+        ),
+        "{reply}"
+    );
 
     // Nothing was attached as a side effect, however often it is asked.
     for _ in 0..3 {
@@ -582,6 +592,12 @@ fn at_most_eight_topics_are_sampled_at_once() {
             .as_str()
             .unwrap()
             .contains("already being sampled"),
+        "{ninth}"
+    );
+    assert_eq!(
+        ninth["error"].as_str().unwrap(),
+        "sample: 8 topics are already being sampled; a topic stops counting \
+         five seconds after its last sample",
         "{ninth}"
     );
     // A topic already sampled can still be asked again at the cap.
