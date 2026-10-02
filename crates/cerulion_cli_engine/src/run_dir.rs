@@ -1040,15 +1040,21 @@ pub fn transition_run_paused<T>(
             "its lock could not be taken, so two commands could not be made to take turns",
         ));
     };
-    // The manifest, when readable, must name this run. An unreadable one is the
-    // mirror's problem to report, not a reason to leave the run unpaused.
-    if let Some(named) = std::fs::read(canon.join(RUN_MANIFEST_FILE))
+    // The manifest, when readable, must name this run. An unreadable or absent one is
+    // the mirror's problem to report, not a reason to leave the run unpaused; a manifest
+    // that reads but names no run, or another run, is not this run's directory.
+    if let Some(doc) = std::fs::read(canon.join(RUN_MANIFEST_FILE))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|d| d.get("run_id")?.as_str().map(str::to_string))
     {
-        if u128::from_str_radix(named.trim_start_matches("0x"), 16).ok() != Some(run_id) {
-            return Err(refuse("its run.json names a different run"));
+        let named = doc
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|n| u128::from_str_radix(n.trim_start_matches("0x"), 16).ok());
+        if named != Some(run_id) {
+            return Err(refuse(
+                "its run.json does not name this run (it names a different one, or none)",
+            ));
         }
     }
     let (value, paused) = transition();

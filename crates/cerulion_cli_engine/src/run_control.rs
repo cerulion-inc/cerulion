@@ -619,8 +619,15 @@ mod tests {
         assert!(!owner.is_paused(), "a refused verb must not flip the page");
         assert!(manifest(&other).get("paused").is_none());
 
-        // Named for the run, but its manifest belongs to another run.
+        // Named for the run, but its manifest names no run at all.
         let dir = home.run_dir(run_id);
+        std::fs::write(dir.join(crate::run_dir::RUN_MANIFEST_FILE), b"{}").expect("{}");
+        record.run_dir = dir.display().to_string();
+        let err = apply(&record, RunControlOp::Pause).expect_err("nameless manifest");
+        assert!(err.to_string().contains("does not name this run"), "{err}");
+        assert!(!owner.is_paused());
+
+        // Named for the run, but its manifest belongs to another run.
         std::fs::write(
             dir.join(crate::run_dir::RUN_MANIFEST_FILE),
             format!(r#"{{"version":1,"run_id":"0x{:032x}"}}"#, run_id ^ 1),
@@ -628,7 +635,7 @@ mod tests {
         .expect("rewrite run.json");
         record.run_dir = dir.display().to_string();
         let err = apply(&record, RunControlOp::Pause).expect_err("wrong run");
-        assert!(err.to_string().contains("different run"), "{err}");
+        assert!(err.to_string().contains("does not name this run"), "{err}");
         assert!(!owner.is_paused());
         assert!(manifest(&dir).get("paused").is_none());
 

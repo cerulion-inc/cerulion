@@ -51,7 +51,7 @@ const PAUSE: Duration = Duration::from_secs(5);
 /// leave: half the pause. A hold that was not a stop of the clock leaves the whole
 /// pause (five seconds and a tenth, measured); the wake interval a paused graph can
 /// overshoot by is two orders of magnitude under this.
-const MAX_ALLOWED_GAP_NS: u64 = PAUSE.as_nanos() as u64 / 2;
+const MAX_ALLOWED_GAP_NS: u64 = PAUSE.as_nanos() as u64 / 5;
 
 /// Two consecutive frames closer than this are a BURST: the ticker is 50 ms, so a
 /// healthy pair is tens of milliseconds apart, and the burst a stopped process
@@ -66,9 +66,10 @@ struct VerbOutcome {
 }
 
 /// Run `cerulion graph <verb> <target>` with its output captured.
-fn graph_verb(verb: &str, target: &str) -> VerbOutcome {
+fn graph_verb(home: &Path, verb: &str, target: &str) -> VerbOutcome {
     let out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
         .args(["graph", verb, target])
+        .env("CERULION_HOME", home)
         .env("CERULION_NETWORK", "off")
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
@@ -250,7 +251,7 @@ impl Recorded {
 /// Pause the run, hold it for [`PAUSE`], resume it, and wait for it to publish on
 /// `topic` again. The verbs' own output is checked on the way.
 fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration) {
-    let first = graph_verb("pause", &run.run_id);
+    let first = graph_verb(&run.home, "pause", &run.run_id);
     assert_eq!(first.code, Some(0), "pause: {}", first.stderr);
     assert!(
         first.stdout.contains("is now paused"),
@@ -262,7 +263,7 @@ fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration) {
         Some(true),
         "run.json must say the run is paused"
     );
-    let again = graph_verb("pause", &run.run_id);
+    let again = graph_verb(&run.home, "pause", &run.run_id);
     assert_eq!(
         again.code,
         Some(0),
@@ -291,7 +292,7 @@ fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration) {
          {held_end} frames during the hold"
     );
 
-    let resumed = graph_verb("resume", &run.run_id);
+    let resumed = graph_verb(&run.home, "resume", &run.run_id);
     assert_eq!(resumed.code, Some(0), "resume: {}", resumed.stderr);
     assert!(
         resumed.stdout.contains("is now running"),
@@ -303,7 +304,7 @@ fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration) {
         Some(false),
         "run.json must say the run is no longer paused"
     );
-    let again = graph_verb("resume", &run.run_id);
+    let again = graph_verb(&run.home, "resume", &run.run_id);
     assert_eq!(
         again.code,
         Some(0),
@@ -434,8 +435,9 @@ fn a_pause_longer_than_the_barrier_timeout_does_not_poison_a_lockstep_run() {
 #[serial]
 fn the_verbs_exit_4_for_a_run_that_is_not_running_and_2_for_a_missing_argument() {
     let ghost = "0x00000000000000000000000000000001";
+    let empty_home = tempfile::tempdir().unwrap();
     for verb in ["pause", "resume"] {
-        let out = graph_verb(verb, ghost);
+        let out = graph_verb(empty_home.path(), verb, ghost);
         assert_eq!(
             out.code,
             Some(4),
@@ -484,7 +486,7 @@ fn a_virtual_time_run_cannot_be_paused_and_the_verb_says_why() {
     // Let the run register in the live-run registry.
     std::thread::sleep(Duration::from_secs(2));
 
-    let out = graph_verb("pause", &run_id);
+    let out = graph_verb(&home, "pause", &run_id);
     assert_eq!(
         out.code,
         Some(1),
