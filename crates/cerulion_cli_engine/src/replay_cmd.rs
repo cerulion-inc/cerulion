@@ -691,6 +691,14 @@ pub enum ReplayError {
         ranks: usize,
     },
 
+    /// The `--record-out` path was taken between the surface's check and the
+    /// engine's exclusive create. A usage error, never an overwrite. Exit 2.
+    #[error("`--record-out {path:?}` already exists; give it a path that does not")]
+    RecordOutExists {
+        /// The output path that already exists.
+        path: PathBuf,
+    },
+
     /// An unexpected internal failure (panic, transport, scheduler). Exit 5.
     #[error("internal replay error: {reason}")]
     Internal {
@@ -717,6 +725,7 @@ impl ReplayError {
             | ReplayError::RecordingInconsistent { .. }
             | ReplayError::SchemaDrift { .. }
             | ReplayError::StateRestore { .. }
+            | ReplayError::RecordOutExists { .. }
             // Both free-run refusals are "this bag is not
             // replay-grade FOR THIS BINARY" — the same class as the
             // trace-format version gate they sit beside, never a candidate
@@ -2649,6 +2658,12 @@ mod tests {
                     reason: "bad".to_string(),
                 },
                 4,
+            ),
+            (
+                ReplayError::RecordOutExists {
+                    path: PathBuf::from("/x.mcap"),
+                },
+                2,
             ),
             (
                 ReplayError::Internal {

@@ -139,6 +139,9 @@ impl RecordOut {
             .create_new(true)
             .open(&path)
             .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    return ReplayError::RecordOutExists { path: path.clone() };
+                }
                 internal(format!(
                     "--record-out cannot create '{}': {e}",
                     path.display()
@@ -322,6 +325,32 @@ mod tests {
         // ANTI-TAUTOLOGY: a full frame on the same sink is accepted.
         out.write_frame("/state", &frame(7, 99))
             .expect("full frame");
+    }
+
+    /// A path taken after the surface's precheck is a usage error (exit 2),
+    /// never an overwrite and never an internal failure.
+    #[test]
+    fn a_path_taken_before_create_is_a_usage_error_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir.path().join("taken.mcap");
+        std::fs::write(&taken, b"precious").unwrap();
+        let plan = RecordOutPlan {
+            path: taken.clone(),
+            channels: vec![channel("/state")],
+            catalog: None,
+        };
+        let err = RecordOut::open(plan, &["/state".to_string()])
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(err, ReplayError::RecordOutExists { .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"precious");
+        // ANTI-TAUTOLOGY: a free path on the same plan opens.
+        let (_out, free) = open(dir.path(), false);
+        assert!(free.exists());
     }
 
     /// The output keeps the input's schema definitions for the types it still
