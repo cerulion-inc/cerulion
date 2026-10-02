@@ -12001,6 +12001,16 @@ impl GraphRuntime {
         // external bindings. RECORD-ONLY: it only sets the idempotent
         // `external_triggered` bool the deterministic `step()` External arm
         // decides on — never the fire set/order/data (Principle #7).
+        // A pause can land while this call sat in the wait above. The wake that ended
+        // the wait must not run a step the pause already forbids: return to the loop
+        // top, which holds. `last` stays put, so the paused time is excluded from the
+        // next step exactly as for a hold that began at the loop top. Whatever woke
+        // the wait is still queued for the step that follows the resume.
+        #[cfg(unix)]
+        if self.pause.as_ref().is_some_and(|page| page.is_paused()) {
+            return;
+        }
+
         self.sweep_external_sources();
 
         let now = std::time::Instant::now();
