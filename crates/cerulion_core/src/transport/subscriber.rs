@@ -1944,7 +1944,7 @@ impl CerulionSubscriber {
             // replay on a late joiner) could otherwise drive the mirror
             // below zero. Clamping keeps "outstanding == 0" the floor.
             //
-            // `record_drained` IS that saturating `fetch_update`,
+            // `record_drained` IS that saturating `try_update`,
             // and it additionally RINGS the word's wake epoch. Ringing is not
             // decoration on a split edge: freeing credit is precisely the event
             // a credit-blocked producer in another process parks for, and a

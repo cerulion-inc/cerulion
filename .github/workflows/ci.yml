@@ -329,7 +329,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Test workspace version parser
         run: tools/scripts/test_workspace_version.sh
@@ -1168,14 +1168,15 @@ jobs:
 
   # MSRV enforcement. Pins the toolchain to the declared MSRV
   # (Cargo.toml `rust-version`) and `cargo check`s the whole workspace so the
-  # "Rust 1.93+" claim in README/CONTRIBUTING/docs is a build-proven floor, not
+  # "Rust 1.95+" claim in README/CONTRIBUTING/docs is a build-proven floor, not
   # a survey. `check` (not full `test`) keeps it fast — it only needs to prove
   # the workspace COMPILES on the floor, not that every test passes (that's
-  # test-linux/test-macos on stable). 1.93 is the true minimum stable that
-  # resolves the WHOLE workspace: the `rerun` 0.34 SDK (pulled by the
-  # `cerulion_viz` / `cerulion-vizd` members) declares rust-version 1.92, but its
-  # transitive `fixed` 1.31.0 dep declares 1.93 — so 1.93 is rerun's real floor
-  # with unpinned deps, above the pre-viz 1.88 floor. `--workspace` deliberately
+  # test-linux/test-macos on stable). 1.95 is set by this workspace's own code
+  # (`cerulion_core` calls `try_update` on the integer atomics, stable since
+  # 1.95); the dependency tree floors lower, the `rerun` 0.34 SDK (pulled by the
+  # `cerulion_viz` / `cerulion-vizd` members) at 1.93 through its transitive
+  # `fixed` 1.31.0 dep, above the non-viz tree's 1.91 floor (`iroh` 1.0.2 and its
+  # companion crates). `--workspace` deliberately
   # INCLUDES the viz members (they are excluded from `default-members` for lean
   # builds, NOT from `--workspace`), so this job also proves rerun compiles on
   # the floor.
@@ -1211,7 +1212,7 @@ jobs:
             target
           key: cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}
   msrv:
-    name: MSRV (1.93)
+    name: MSRV (1.95)
     runs-on: ubuntu-latest
     # `actions: write` is for the cache prune step only (it deletes stale
     # entries of this job's cache namespace). Every other step needs read.
@@ -1226,10 +1227,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install Rust toolchain (MSRV 1.93.0)
+      - name: Install Rust toolchain (MSRV 1.95.0)
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Cache cargo (restore)
         id: cache-restore-1
@@ -1239,12 +1240,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-msrv-1.95-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-msrv-1.93-
+            cargo-msrv-1.95-
 
-      - name: cargo check (workspace, MSRV 1.93.0)
-        run: cargo +1.93.0 check --workspace --all-targets
+      - name: cargo check (workspace, MSRV 1.95.0)
+        run: cargo +1.95.0 check --workspace --all-targets
 
   # The example workspaces under examples/ are excluded from the
   # root workspace (root Cargo.toml `exclude`), so no other job compiles
@@ -1260,7 +1261,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-msrv-1.95-${{ hashFiles('**/Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -1272,14 +1273,14 @@ jobs:
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' msrv-1.93 '))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' msrv-1.95 '))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-msrv-1.95-${{ hashFiles('**/Cargo.lock') }}
   examples:
     name: Examples (cargo check)
     runs-on: ubuntu-latest

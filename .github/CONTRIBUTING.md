@@ -56,7 +56,7 @@ to start.
 
 ### Prerequisites
 
-- **Rust 1.93 or newer**: this is our MSRV (minimum supported Rust version),
+- **Rust 1.95 or newer**: this is our MSRV (minimum supported Rust version),
   declared as `rust-version` in the workspace `Cargo.toml`. Install via
   [rustup](https://rustup.rs/).
 - **A supported platform:** Linux or macOS (x86_64 and aarch64 / Apple
