@@ -112,6 +112,7 @@ CLASSES = (
     "shipped-text",
     "work-state",
     "numbers-without-data",
+    "agent-file-ref",
     "string-literal-rewrite",
 )
 
@@ -144,6 +145,9 @@ REMEDIES = {
     "a shipped package under docs/benchmarks/results/ (a CSV, HEADLINE.md or the package "
     "README.md); print the package's spelling or ship the package "
     "(AGENTS.md: 'Shipped surface' rules)",
+    "agent-file-ref": "a user-facing page never names an agent instruction file: drop the "
+    "`AGENTS.md` or `CLAUDE.md` mention and write what the reader needs in the page's own "
+    "words (AGENTS.md: 'Shipped surface' rules)",
     "string-literal-rewrite": "a bulk edit never rewrites the inside of a string literal; fix "
     "each literal by hand and run the tests that read it (AGENTS.md: 'Shipped surface' rules)",
 }
@@ -1309,7 +1313,52 @@ def check_numbers(root, files):
 
 
 # ---------------------------------------------------------------------------
-# Class 8: string-literal-rewrite (a rule with a named shape, not a tree check)
+# Class 8: agent-file-ref
+# ---------------------------------------------------------------------------
+
+# The two names an agent instruction file is spelled with, and the token shape
+# that finds one named inside a page. A path separator or an include marker may
+# sit in front of the token (`crates/x/AGENTS.md`, `@AGENTS.md`); a letter,
+# digit, underscore, dot or hyphen may not: `MY_AGENTS.md` and `AGENTS.mdown`
+# are other files. The two guards are ASYMMETRIC about `.`: the lookbehind
+# refuses it, so `x.AGENTS.md` is another file, and the lookahead permits it,
+# so a sentence-final `AGENTS.md.` is the token and `AGENTS.md.bak` carries it
+# too.
+AGENT_FILE_NAMES = ("AGENTS.md", "CLAUDE.md")
+AGENT_FILE_RE = re.compile(r"(?<![A-Za-z0-9_.-])(" + "|".join(re.escape(n) for n in AGENT_FILE_NAMES)
+                           + r")(?![A-Za-z0-9_-])")
+
+
+def check_agent_file_ref(root, files):
+    """A user-facing page never names an agent instruction file. Returns the
+    findings and what the class judged.
+
+    The scan reads RAW text rather than the prose view: such a path ships
+    backticked, and the prose view blanks every backticked span. A file whose own
+    basename is one of the two names is out of the scan BY NAME, whatever it
+    holds: `docs/CLAUDE.md` is one line naming the other file. One finding per
+    line, because a line can spell a name twice."""
+    findings = []
+    judged = 0
+    for f in files:
+        if not is_user_facing(f) or os.path.basename(f) in AGENT_FILE_NAMES:
+            continue
+        txt = read_text(root, f)
+        if txt is None:
+            continue
+        judged += 1
+        seen = set()
+        for m in AGENT_FILE_RE.finditer(txt):
+            ln = line_of(txt, m.start())
+            if ln in seen:
+                continue
+            seen.add(ln)
+            findings.append(Finding("agent-file-ref", f, ln, "`%s` is an agent instruction file, which a user-facing page never names" % m.group(1)))
+    return findings, "agent-file-ref over %d user-facing file(s)" % judged
+
+
+# ---------------------------------------------------------------------------
+# Class 9: string-literal-rewrite (a rule with a named shape, not a tree check)
 # ---------------------------------------------------------------------------
 
 PREFIX_RE = re.compile(r'prefix\s*[:=]\s*"([^"]+)"')
@@ -1367,6 +1416,8 @@ def run_tree(root, out=sys.stdout):
     findings.extend(f6)
     notes.extend(n6)
     findings.extend(check_numbers(root, files))
+    f8, agent_tail = check_agent_file_ref(root, files)
+    findings.extend(f8)
     # Allow entries excuse a finding by path + class + message substring.
     kept = []
     for fd in findings:
@@ -1395,8 +1446,8 @@ def run_tree(root, out=sys.stdout):
             failing.append(c)
             out.write("remedy: %s: %s\n" % (c, REMEDIES[c]))
     per_class = ", ".join("%s=%d" % (c, sum(1 for fd in kept if fd.cls == c)) for c in failing)
-    tail = "files=%d, allowlist=%d, ledger=%d file(s), workstate-ledger=%d line(s), %s" % (
-        len(files), len(allow), len(ledger), len(ws_ledger), legal_tail)
+    tail = "files=%d, allowlist=%d, ledger=%d file(s), workstate-ledger=%d line(s), %s, %s" % (
+        len(files), len(allow), len(ledger), len(ws_ledger), legal_tail, agent_tail)
     if kept:
         out.write("check_public_surface: FAIL (%d finding(s) in %d class(es): %s; %s)\n" % (len(kept), len(failing), per_class, tail))
         return 1
@@ -1639,6 +1690,9 @@ RUSTFLOOR is a claim the README contradicts; this page is still UNPUBLISHED. A d
 Support: yes \u2713 and no \u2717 are typography and stay; a rocket \U0001F680 is not. Join the WAITWORD today.
 
 \u26a0\ufe0f A sign with a variation selector on a heading is decoration, not a warning.
+
+A page that names `crates/cerulion_core/AGENTS.md` names an agent instruction file, and naming
+`crates/cerulion_core/CLAUDE.md` beside `AGENTS.md` on one line is one finding for that line.
 """.replace("WAITWORD", "wait" + "list").replace("RUSTFLOOR", "Rust 1." + "88").replace("UNPUBLISHED", "not yet published" + " to crates.io")
 
 FIXTURE_DAMAGED = '''fn topics() {
@@ -1838,6 +1892,17 @@ def build_fixture(root):
          "Portions copyright Eclipse Foundation Inc.\n"
          "A later line writes it Acme Systems LLC instead.\n")
     _put(root, "docs/page.md", FIXTURE_PAGE)
+    # Named after an agent instruction file, so outside the agent-file-ref scan:
+    # the include shim and the guide itself. docs/guide.md holds the shim's line
+    # byte for byte under another name, and reports.
+    _put(root, "docs/CLAUDE.md", "@AGENTS.md\n")
+    _put(root, "docs/guide.md", "@AGENTS.md\n")
+    _put(root, "docs/AGENTS.md", "This guide points at `crates/x/AGENTS.md`.\n")
+    # docs/internals/ is outside is_user_facing, so the same mention is silent.
+    _put(root, "docs/internals/gates.md", "The gate list is in `crates/cerulion_core/AGENTS.md`.\n")
+    # Excluded by BASENAME, at a path no hand-written path list would hold: an
+    # implementation comparing whole paths reports this file and fails its arm.
+    _put(root, ".github/nested/deep/AGENTS.md", "A nested guide names `crates/y/AGENTS.md`.\n")
     _put(root, "docs/PERFORMANCE.md", "# Performance\n\nThe 64 B p50 is 4.08 µs.\n")
     _put(root, "docs/media/used.svg", "<svg/>\n")
     _put(root, "docs/media/orphan.png", "PNG-ish text\n")
@@ -1947,6 +2012,9 @@ EXPECTED = [
     ("numbers-without-data", "README.md", "figure 15.9 is in no shipped package"),
     ("numbers-without-data", "README.md", "figure 9.99 is in no shipped package"),
     ("numbers-without-data", "README.md", "figure 7.77 is in no shipped package"),
+    ("agent-file-ref", "docs/page.md", "`AGENTS.md` is an agent instruction file"),
+    ("agent-file-ref", "docs/page.md", "`CLAUDE.md` is an agent instruction file"),
+    ("agent-file-ref", "docs/guide.md", "`AGENTS.md` is an agent instruction file"),
 ]
 
 
@@ -1980,6 +2048,15 @@ def self_test(out=sys.stdout):
                                         "crates/cerulion_bag/README.md", ".github/CONTRIBUTING.md"))
         and not any(is_user_facing(f) for f in ("AGENTS.md", "docs/internals/design.md", "examples/go2/nodes/n/src/lib.rs", "crates/cerulion_bag/AGENTS.md",
                                                 "crates/cerulion_bag/src/lib.rs", ".github/workflows/ci.yml", "tools/scripts/install.sh")))
+    # The token is a whole filename: a path separator or an include marker may
+    # sit in front of it, a filename character may not, and `.` is refused in
+    # front and permitted behind.
+    agent_probe = ("crates/x/AGENTS.md @AGENTS.md AGENTS.md docs/CLAUDE.md MY_AGENTS.md AGENTS.mdown xCLAUDE.md"
+                   " AGENTS.md. x.AGENTS.md AGENTS.md.bak")
+    arm("agent-file-token-oracle",
+        [m.group(1) for m in AGENT_FILE_RE.finditer(agent_probe)]
+        == ["AGENTS.md", "AGENTS.md", "AGENTS.md", "CLAUDE.md", "AGENTS.md", "AGENTS.md"],
+        repr([m.group(0) for m in AGENT_FILE_RE.finditer(agent_probe)]))
     arm("work-state-exclusions",
         all(WORKSTATE_EXCLUDE_RE.search(f) for f in ("docs/benchmarks/results/pkg/run.log", "Cargo.lock", "examples/go2/Cargo.lock", "docs/legal/HISTORY.md",
                                                      ".github/CLA/individual.md", "LICENSE", "tools/scripts/check_public_surface.py",
@@ -2120,6 +2197,15 @@ def self_test(out=sys.stdout):
         [x.group(0) for x in legal_name_mentions("Acme Robotics Co., Ltd.").finditer("Acme Robotics Co., Ltd.")]
         == ["Acme Robotics Co., Ltd."])
     arm("one-sig-fig", all(ONE_SIG_FIG_RE.match(x) for x in ("100", "10", "2", "500")) and not any(ONE_SIG_FIG_RE.match(x) for x in ("87", "104", "4.08", "311")))
+    # The shell header opens with the class count as a WORD, hand-written beside
+    # `len(CLASSES)`. The arm reads that line and maps the word through a table;
+    # a word the table does not hold is a failure, not a pass.
+    count_words = {"seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+    header_line = open(os.path.join(here_root, "tools/scripts/check_public_surface.sh"), encoding="utf-8").read().split("\n")[3]
+    header_words = header_line.split()
+    arm("the-shell-header-counts-the-classes-the-table-holds",
+        len(header_words) > 1 and count_words.get(header_words[1].lower()) == len(CLASSES),
+        "%r against %d classes" % (header_line, len(CLASSES)))
     with tempfile.TemporaryDirectory(prefix="public-surface-selftest-") as tmp:
         root = os.path.join(tmp, "tree")
         os.makedirs(root)
@@ -2144,12 +2230,16 @@ def self_test(out=sys.stdout):
         for path in ("examples/good_ws", "examples/good_ws/nodes/timer/src/lib.rs", "examples/good_ws/nodes/timer/tests/harness.rs",
                      "crates/lib_ledgered/src/lib.rs", "crates/lib_clean/src/lib.rs", "crates/lib_clean/tests/it.rs",
                      "crates/test_fixtures/fx/src/lib.rs", "crates/lib_new/Cargo.toml", "CHANGELOG.md", "docs/media/used.svg",
-                     "docs/benchmarks/results/pkg-cited", "benches/latency", "docs/PERFORMANCE.md", "examples/good_ws/README.md"):
+                     "docs/benchmarks/results/pkg-cited", "benches/latency", "docs/PERFORMANCE.md", "examples/good_ws/README.md",
+                     "docs/CLAUDE.md", "docs/AGENTS.md", "docs/internals/gates.md",
+                     ".github/nested/deep/AGENTS.md"):
             arm("control:" + path, not any(l.startswith(path + ":") for l in findings), "\n" + text)
         # A control is a substring that must NOT appear in the findings. Deleting
         # the fixture text it controls would make it pass while proving nothing,
         # so each control's text is asserted PRESENT in the tree first.
-        for text, rel in ((" Acme Systems Co-operative ", "README.md"),
+        # Its own loop names, because the arms after it report the run's text as
+        # their failure detail and a loop variable called `text` rebinds that.
+        for ctl_text, ctl_rel in ((" Acme Systems Co-operative ", "README.md"),
                           (" Acme works with Foo Inc. ", "README.md"),
                           (" Acme Robotics Systems Inc. ", "README.md"),
                           ("Acme Robotics Inc. is a different company", "README.md"),
@@ -2157,15 +2247,20 @@ def self_test(out=sys.stdout):
                           ("The Acme Systems Inc.", "README.md"),
                           ("Acme Systems Incidentally", "README.md"),
                           ("Acme Systems\n\nIncorporated feedback", "README.md"),
-                          ("Acme Systems Corp.", "crates/lib_clean/tests/it.rs")):
-            body = open(os.path.join(root, rel), encoding="utf-8").read()
-            arm("control-text-is-in-the-fixture:" + text.strip()[:34], text.strip() in body, rel)
+                          ("Acme Systems Corp.", "crates/lib_clean/tests/it.rs"),
+                          ("@AGENTS.md", "docs/CLAUDE.md"),
+                          ("crates/x/AGENTS.md", "docs/AGENTS.md"),
+                          ("crates/cerulion_core/AGENTS.md", "docs/internals/gates.md"),
+                          ("crates/y/AGENTS.md", ".github/nested/deep/AGENTS.md")):
+            body = open(os.path.join(root, ctl_rel), encoding="utf-8").read()
+            arm("control-text-is-in-the-fixture:" + ctl_text.strip()[:34], ctl_text.strip() in body, ctl_rel)
         for sub in ("`cerulion graph run`", "`cerulion graph validate`", "`cerulion graph run-worker`", "`cerulion ros`", "`cerulion viz`",
                     "`cerulion make-it-so`", "`cerulion account devices list`", "graph bogus", "figure 4.08", "figure 5.54", "figure 15.89",
                     "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717",
                     "Eclipse Foundation", "Willow Garage", "MyAcme", "Incidentally", "Acme Systems Corp.",
                     "Co-operative", "works with Foo", "Acme Robotics Systems", "Acme Robotics Inc.",
-                    "git revert <this commit>", "does not reverse this commit"):
+                    "git revert <this commit>", "does not reverse this commit",
+                    "docs/CLAUDE.md", "docs/AGENTS.md:", "docs/internals/"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
         # its own key, and the legitimate neighbour fires no key at all.
@@ -2184,6 +2279,18 @@ def self_test(out=sys.stdout):
         arm("work-state-note-per-fired-key", all(any(l.startswith("note: work-state: %s: write instead: " % key) for l in lines) for key in ws_compiled), text)
         arm("placeholder-is-a-note", any(l.startswith("note: docs-refs: docs/page.md:") and "STUDIO_MACOS_DOWNLOAD_URL" in l for l in lines), text)
         arm("allow-entry-excused-gate-only", not any(l.startswith("examples/gate_only:") and "no Cargo.toml" in l for l in findings))
+        # agent-file-ref: the exclusion is the NAME. docs/CLAUDE.md and
+        # docs/guide.md hold the same line byte for byte, and only the one not
+        # named after an agent instruction file reports.
+        agent_lines = [l for l in findings if ": agent-file-ref: " in l]
+        arm("the-agent-file-exclusion-is-the-name-not-the-content",
+            open(os.path.join(root, "docs/CLAUDE.md"), encoding="utf-8").read()
+            == open(os.path.join(root, "docs/guide.md"), encoding="utf-8").read()
+            and any(l.startswith("docs/guide.md:1: agent-file-ref: ") for l in agent_lines)
+            and not any(l.startswith("docs/CLAUDE.md:") for l in agent_lines), "\n".join(agent_lines))
+        # A line that spells both names is ONE finding.
+        arm("one-agent-file-finding-per-line",
+            len([l for l in agent_lines if l.startswith("docs/page.md:")]) == 2, "\n".join(agent_lines))
         arm("remedy-per-failing-class", all(any(l.startswith("remedy: %s: " % c) for l in lines) for c in CLASSES if c != "string-literal-rewrite"), text)
         # A tree with nothing wrong is reported OK with exit 0 (the run cannot be vacuous).
         clean = os.path.join(tmp, "clean")
@@ -2204,6 +2311,10 @@ def self_test(out=sys.stdout):
         # reads is a tail that can report the wrong name, or none.
         arm("the-summary-names-what-the-legal-name-rule-judged",
             "legal-name=`Acme Systems Inc.` in 2 mention(s)" in buf2.getvalue(), buf2.getvalue())
+        # The same for agent-file-ref: README.md is the one user-facing file this
+        # tree tracks, so the count is the predicate's own reach.
+        arm("the-summary-names-what-the-agent-file-rule-judged",
+            "agent-file-ref over 1 user-facing file(s)" in buf2.getvalue(), buf2.getvalue())
         # And the floor FIRES: a tree that never writes the declared name is not
         # a clean tree, it is a rule that found nothing.
         named = open(os.path.join(clean, "README.md"), encoding="utf-8").read()
@@ -2378,6 +2489,8 @@ def self_test(out=sys.stdout):
             and "docs/" not in regenerated.split("#")[-1] and "ws_gone" not in regenerated, regenerated)
     out.write("check_public_surface --self-test: OK (%d arms: %d expected findings, the negative controls, the verb-tree oracle, the lexer, the fail-closed and ledger arms, "
               "and for work-state every key caught and their neighbours silent, the ledger at, above and below its count, the user-facing page nobody may ledger, "
+              "for agent-file-ref the planted mentions, the files excluded by name (two beside the same line under another name, one at a nested path) and the internals page "
+              "outside the rule, the shell header's class count against the class tuple, "
               "the malformed and the missing pattern file, the allow list before the count, and the pool against one process [%s])\n" % (arms, len(EXPECTED), pooled_mode))
     return 0
 

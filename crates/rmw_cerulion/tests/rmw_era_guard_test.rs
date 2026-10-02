@@ -1637,9 +1637,10 @@ const DECLARED_OPAQUE_STRIPS: [(&str, usize, &str); 6] = [
 /// resets at each newline, so a closing quote on a continuation line of a
 /// multi-line, backslash-continued, or raw string, or a char literal holding a
 /// quote (`'"'`), is read as an OPENING quote, and a removal call later on that
-/// same line is not seen. A `//` or `/*` inside a string is not a comment, and a
-/// `"` inside a comment does not open a string, because in-string is tested
-/// before the comment tests each step.
+/// same line is not seen. A `//` or `/*` inside a string is not a comment,
+/// because the in-string branch runs before the comment tests; and a `"`
+/// inside a comment does not open a string, because the line-comment and
+/// block-comment branches both run before the normal-code quote test.
 fn masked_source(text: &str, keep_strings: bool) -> (String, Vec<usize>) {
     let mut out = text.as_bytes().to_vec();
     let mut in_line_comment = false;

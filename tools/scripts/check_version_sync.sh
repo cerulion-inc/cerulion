@@ -4,7 +4,7 @@
 # in lockstep. Run this before every crates.io publish so one workspace-version
 # edit cannot leave a path dependency pinned to an older release.
 #
-# Usage: bash scripts/check_version_sync.sh
+# Usage: bash tools/scripts/check_version_sync.sh
 # Exit 0 = all versions match; Exit 1 = mismatch found (printed to stderr).
 set -euo pipefail
 

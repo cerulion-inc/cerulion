@@ -12,17 +12,15 @@ version = "1.0.0"
 edition = "2021"
 description = "Cerulion Rerun viz support: PointCloud2 codec, schema→archetype adapter, RecordingStream lifecycle, VizConfig parametrization"
 license.workspace = true
-# MSRV note: the `rerun` dep below declares
-# `rust-version` 1.92 (rerun 0.34.x), but its transitive `fixed` 1.31.0 dep
-# declares 1.93 — so the effective floor for building this crate with unpinned
-# deps is 1.93. This crate is a MEMBER of the root workspace (under
-# `cerulion_viz/*`), and the root MSRV was raised 1.88 -> 1.93 expressly to admit
-# it (so `fixed` resolves naturally to 1.31.0, no lockfile pin back to 1.30.0),
-# so `rust-version = "1.93"` here is exactly the root floor. It is kept out of
-# `default-members` (see the root Cargo.toml) so a plain `cargo build` never
-# pulls rerun; the root `cargo +1.93.0 check --workspace` MSRV job, `cargo clippy
-# --workspace`, and `cargo deny check` all COVER it now.
-rust-version = "1.93"
+# MSRV note: the `rerun` dep below declares `rust-version` 1.92 (rerun 0.34.x)
+# and its transitive `fixed` 1.31.0 dep declares 1.93, so rerun's own floor with
+# unpinned deps is 1.93. This crate is a MEMBER of the root workspace (under
+# `cerulion_viz/*`), whose floor is 1.95 (set by `cerulion_core`'s `try_update`
+# call), so `rust-version = "1.95"` here is exactly the root floor. It is kept
+# out of `default-members` (see the root Cargo.toml) so a plain `cargo build`
+# never pulls rerun; the root `cargo +1.95.0 check --workspace` MSRV job,
+# `cargo clippy --workspace`, and `cargo deny check` all COVER it.
+rust-version = "1.95"
 # Not published to crates.io: the viz tree is excluded from `default-members`
 # and pulls the Rerun SDK; it is not part of the documented publish set.
 publish = false
