@@ -436,7 +436,10 @@ fn sampling_an_unattached_topic_is_refused_and_attaches_nothing() {
     let error = reply["error"].as_str().unwrap();
     assert!(error.contains("not attached"), "{error}");
     assert!(error.contains("opens no subscription"), "{error}");
-    assert!(!error.contains("  "), "no run of spaces in a message: {error}");
+    assert!(
+        !error.contains("  "),
+        "no run of spaces in a message: {error}"
+    );
     assert_eq!(
         error,
         format!(
