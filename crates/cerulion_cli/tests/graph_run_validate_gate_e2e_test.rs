@@ -376,7 +376,7 @@ fn no_validate_runs_the_same_defective_graph_to_a_clean_exit() {
 }
 
 /// The two halves of the `--no-validate` `schema:` story must
-/// be told apart in `USER_API.md`, because the sentence that describes one of
+/// be told apart in `docs/user-api.md`, because the sentence that describes one of
 /// them can easily read as describing the other.
 ///
 /// The row said, in order: an ABSENT or empty `schema:` "is refused by
@@ -448,7 +448,7 @@ fn the_user_api_no_validate_row_binds_the_runs_sentence_to_the_non_empty_case() 
     // (1) The dangling binding is gone.
     assert!(
         !doc.contains("which this flag cannot skip either. Such a graph RUNS"),
-        "`USER_API.md` must not bind \"Such a graph RUNS\" to the ABSENT/empty \
+        "`docs/user-api.md` must not bind \"Such a graph RUNS\" to the ABSENT/empty \
          `schema:` case it has just said is REFUSED"
     );
     // (2) The refusal is stated as holding under the flag — the claim a reader
@@ -459,7 +459,7 @@ fn the_user_api_no_validate_row_binds_the_runs_sentence_to_the_non_empty_case() 
             "which this flag cannot skip either: such a graph is REFUSED whether or not \
              `--no-validate` is passed."
         ),
-        "`USER_API.md` must say an absent/empty `schema:` refuses EVEN UNDER \
+        "`docs/user-api.md` must say an absent/empty `schema:` refuses EVEN UNDER \
          `--no-validate`, in the sentence that raises the case"
     );
     // (3) The RUNS sentence names the case it is actually about — one
@@ -469,7 +469,7 @@ fn the_user_api_no_validate_row_binds_the_runs_sentence_to_the_non_empty_case() 
             "A graph whose `schema:` is NON-EMPTY but wrong (the family the flag DOES \
              skip) RUNS instead"
         ),
-        "`USER_API.md`'s \"runs anyway\" sentence must name the NON-EMPTY \
+        "`docs/user-api.md`'s \"runs anyway\" sentence must name the NON-EMPTY \
          invalid-label family it describes, in one sentence with it"
     );
 }
