@@ -7258,9 +7258,16 @@ pub fn graph_run_worker(
                     group = %plan.group,
                     rank = plan.rank,
                     error = %e,
-                    "this worker is ARMED for checkpoints but its rank cannot name a \
-                     state ring, so it captures NOTHING and every anchor of this run will be \
-                     reported partial"
+                    "this worker is ARMED for checkpoints but its rank cannot name a state ring, \
+                     so it captures NOTHING and every anchor of this run LACKS the records of the \
+                     rank this event names. A resim of a capture from this run whose window \
+                     reaches step 0 reads no anchor at all and reaches a verdict whatever the ring \
+                     count. One whose window starts mid run exits 2 with no verdict in two ways: \
+                     with more than one state ring left it refuses the recording outright as \
+                     ambiguous, and with one ring left it resumes from that ring and refuses by \
+                     name every node of the missing rank the replay executes, none of which has an \
+                     anchor. It reaches a verdict of its own only when no node of that rank runs \
+                     in that window"
                 );
                 return None;
             }
@@ -7275,8 +7282,8 @@ pub fn graph_run_worker(
         // was set for: a 1 MiB supervisor would admit the plane and a worker of any
         // size would open it.
         //
-        // A refusal here is THIS RANK's alone. It creates no state ring, so the
-        // run's anchors are partial and the recorder reports the hole
+        // A refusal here is THIS RANK's alone. It creates no state ring, so every
+        // anchor of the run LACKS its records and the recorder reports the hole
         // through `missing_state_ring_ranks` — the accurate outcome, and the one
         // that keeps every other rank's anchors rather than throwing the run's
         // whole plane away because one group is fat.

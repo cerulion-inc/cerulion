@@ -13276,6 +13276,242 @@ fn a_two_ring_recording_refuses_because_a_node_index_names_nothing() {
     assert!(text.contains("--single-process"), "names the fix: {text}");
 }
 
+/// The coverage manifest a run with a rank HOLE carries.
+///
+/// `rings` is how many rings SURVIVED the hole, which is the whole of the
+/// difference between the two shapes below: on a run of two ranks the gap
+/// leaves ONE ring and on a run of three or more it leaves several. Built on
+/// the sibling helper, so nothing but the ring count and the stamp differs from
+/// the healthy manifest.
+fn coverage_with_a_rank_hole(rings: usize, discovered: Vec<u32>, missing: Vec<u32>) -> Vec<u8> {
+    let mut cov: StateCoverage =
+        serde_json::from_slice(&checkpoint_coverage(rings, Some(CHECKPOINT_NODE_IDX)))
+            .expect("the sibling helper produces a readable manifest");
+    cov.ranks_discovered = discovered;
+    cov.ranks_missing = missing;
+    serde_json::to_vec(&cov).expect("state coverage serializes")
+}
+
+/// The id of the second node in [`two_node_checkpoint_yaml`], which stands for
+/// a node of the rank that published no ring: the manifest names it nowhere and
+/// no record can be attributed to it.
+const CP_HOLED_NODE: &str = "spare";
+
+/// A TWO-node checkpoint graph.
+///
+/// One node is covered by the surviving ring and the other is not, which is the
+/// shape a rank hole really produces: the resume restores what the ring holds
+/// and has nothing for the rest. A one-node graph cannot show that, because
+/// there is no covered node left to restore beside the uncovered one.
+fn two_node_checkpoint_yaml() -> &'static str {
+    "name: cp\nprefix: cp\nnodes:\n\
+     \x20 - id: counter\n    type: counter\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: spare\n    type: counter\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn two_node_checkpoint_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (CP_NODE, Box::new(CounterEntry::new()) as Box<dyn NodeEntry>),
+        (
+            CP_HOLED_NODE,
+            Box::new(CounterEntry::new()) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+#[test]
+#[serial]
+fn a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case() {
+    // THE SENTENCES THIS PINS, and the reason the arm it replaces was worth
+    // nothing. That arm stamped `ranks_missing` on a manifest declaring TWO
+    // rings and read the refusal back, so it was refused for the RING COUNT and
+    // would have passed unchanged with the stamp removed: it proved nothing
+    // about a rank hole at all.
+    //
+    // What the code actually does, established by driving each shape rather
+    // than by reading the stamp: NOTHING on the replay path reads
+    // `ranks_missing`. The hole reaches the resim only through the rings it
+    // took away, and there are two shapes of that.
+    //
+    //  (A) ONE ring survives (a run of two ranks, the gap at one of them).
+    //      `read_bag_anchors` does not refuse, the resume runs from that ring's
+    //      anchors, and every node of the missing rank the replay EXECUTES has
+    //      no anchor, so `plan_restore` refuses it BY NAME: exit 2, no verdict.
+    //      Leg (A2) drives exactly that and reads the printed line back.
+    //      When no such node runs in the window, the resim reaches a verdict of
+    //      its own instead, which is leg (A1).
+    //  (B) SEVERAL rings survive (three or more ranks) and the capture's window
+    //      starts MID RUN. The recording is refused outright as ambiguous
+    //      before any node is judged, exit 2, and that refusal names the holed
+    //      rank beside the ring count.
+    //  (C) The capture's window reaches step 0, at EITHER ring count.
+    //      `resolve_resume` returns before any anchor is read, so neither the
+    //      rank stamp nor the ring count is ever consulted and the resim
+    //      reaches its own verdict. Driven at one ring AND at two, because the
+    //      two-ring half is what makes (B) a statement about the WINDOW rather
+    //      than about the ring count, and the six sentences are worded on it.
+    //
+    // Every leg asserts the PRINTED line, because `resim_cmd::run_resim`
+    // renders a typed error as `Error: {e}` on stderr and returns
+    // `e.exit_code()` with no verdict block, so the refusal's own Display IS
+    // what the operator reads.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = checkpoint_reference();
+    let mid = make_mid_run(&rec, CP_FIRST_STEP);
+    let one_ring = coverage_with_a_rank_hole(1, vec![1], vec![0]);
+    // The SAME manifest legs (B) and (C2) both drive, bound once so the pair
+    // differs in the WINDOW and in nothing else.
+    let two_rings = coverage_with_a_rank_hole(2, vec![0, 2], vec![1]);
+
+    // (A1) ONE surviving ring, and every node the replay executes is covered by
+    // it. The stamp refuses NOTHING, so the resim resumes and reaches its own
+    // verdict. This is the leg the retired arm claimed was impossible.
+    let a1 = dir.path().join("hole_one_ring_covered.mcap");
+    write_checkpoint_bag(
+        &mid,
+        &a1,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+        ),
+        Some(&one_ring),
+        None,
+    );
+    let verdict = replay(&a1, checkpoint_factories, None, None)
+        .expect("one surviving ring covering every executed node resumes");
+    assert!(
+        verdict.passed,
+        "the rank stamp is not read by the replay: {:?}",
+        verdict.violations
+    );
+    let resume = verdict
+        .resume
+        .expect("it really did resume from the anchor");
+    assert_eq!(
+        resume.restored_nodes,
+        vec![CP_NODE.to_string()],
+        "restored from the SURVIVING ring's anchors: {resume:?}"
+    );
+
+    // (A2) ONE surviving ring and a node of the missing rank that the replay
+    // EXECUTES. The surviving ring's node is restorable and this one is not, so
+    // the refusal is the per-node one and it names the node.
+    let rec2 = record_reference(
+        two_node_checkpoint_yaml(),
+        two_node_checkpoint_factories,
+        &[],
+        &[DELTA_MS; CP_STEPS],
+    );
+    let mid2 = make_mid_run(&rec2, CP_FIRST_STEP);
+    let a2 = dir.path().join("hole_one_ring_uncovered.mcap");
+    write_checkpoint_bag(
+        &mid2,
+        &a2,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+        ),
+        Some(&one_ring),
+        None,
+    );
+    let err = replay(&a2, two_node_checkpoint_factories, None, None)
+        .expect_err("a node of the holed rank has no anchor");
+    assert_eq!(err.exit_code(), 2, "the code the six sentences name: {err}");
+    let printed = err.to_string();
+    assert!(
+        printed.contains(CP_HOLED_NODE) && printed.contains("no anchor recorded"),
+        "the node of the missing rank is named: {printed}"
+    );
+    assert!(
+        printed.contains("1 of the 2 node(s)"),
+        "the other rank's node WAS covered, which is what makes this the hole \
+         rather than an anchorless bag: {printed}"
+    );
+
+    // (B) SEVERAL surviving rings. Refused before any node is judged, and the
+    // refusal answers the warn that sent the operator here by naming the rank.
+    let b = dir.path().join("hole_two_rings.mcap");
+    write_checkpoint_bag(
+        &mid,
+        &b,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+        ),
+        Some(&two_rings),
+        None,
+    );
+    let ambiguous = replay(&b, checkpoint_factories, None, None)
+        .expect_err("two surviving rings refuse the recording outright");
+    assert_eq!(ambiguous.exit_code(), 2, "{ambiguous}");
+    let printed = ambiguous.to_string();
+    assert!(printed.contains("2 state rings"), "{printed}");
+    assert!(
+        printed.contains("rank 1 published none"),
+        "the refusal names the rank the operator was warned about, beside the \
+         ring fault: {printed}"
+    );
+    assert!(
+        printed.contains("--single-process"),
+        "names the fix: {printed}"
+    );
+
+    // (C) The window reaches step 0, at BOTH ring counts. `resolve_resume`
+    // returns before any anchor is read, so nothing reaches the ring-count gate
+    // and the hole costs nothing either way.
+    //
+    // DRIVEN AT TWO RINGS as well as one, because that is the leg that decides
+    // how the six sentences may be worded. With only the one-ring bag here, the
+    // sentences could say "more than one ring refuses outright" unqualified and
+    // this arm would stay green while leg (B)'s bag, which differs from the
+    // two-ring bag here ONLY in starting mid run, is the one that refuses. The
+    // (B)/(C2) PAIR is what pins the refusal to the WINDOW rather than to the
+    // ring count.
+    for (label, rings) in [("one ring", &one_ring), ("two rings", &two_rings)] {
+        let c = dir
+            .path()
+            .join(format!("hole_from_start_{}.mcap", label.replace(' ', "_")));
+        write_checkpoint_bag(
+            &rec,
+            &c,
+            &state_records(
+                CHECKPOINT_RUN,
+                CP_FIRST_STEP - 1,
+                CHECKPOINT_NODE_IDX,
+                &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+            ),
+            Some(rings),
+            None,
+        );
+        let whole = replay(&c, checkpoint_factories, None, None).unwrap_or_else(|e| {
+            panic!("a recording that reaches step 0 needs no anchor, hole or not ({label}): {e}")
+        });
+        assert!(whole.passed, "{label}: {whole:?}");
+        assert!(
+            whole.resume.is_none(),
+            "{label}: nothing resumed, which is why the hole cost nothing: {:?}",
+            whole.resume
+        );
+    }
+
+    // THE ANTI-CLAIM half, over every line an operator can be handed here: a
+    // verdict word and an exit code the 0 to 6 contract does not have.
+    for line in [err.to_string(), ambiguous.to_string()] {
+        for absent in ["PARTIAL", "exits 8", "exit 8"] {
+            assert!(
+                !line.contains(absent),
+                "the resim has no {absent:?}: {line}"
+            );
+        }
+    }
+}
+
 #[test]
 #[serial]
 fn two_runs_anchored_at_the_resume_step_refuse_naming_both() {
@@ -17192,6 +17428,10 @@ const DECLARED_LITERAL_SHAPE_SITES: &[(&str, &str)] = &[
     (
         "a_two_ring_recording_refuses_because_a_node_index_names_nothing",
         "the `cp` counter",
+    ),
+    (
+        "a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case",
+        "the `cp` counter, four times (one of them over the two-node graph)",
     ),
     (
         "a_state_manifest_from_a_newer_bagd_is_read_and_used_and_the_skew_is_named",
@@ -21539,12 +21779,317 @@ fn a_range_declared_above_the_traces_last_boundary_is_refused_as_a_skew() {
                 detail.contains("resim_covered_through_ns")
                     && detail.contains(&declared.to_string())
                     && detail.contains(&covered.to_string())
-                    && detail.contains("last STEP_BOUNDARY"),
+                    && detail.contains("last recorded STEP_BOUNDARY"),
                 "the refusal must name the manifest, both numbers and the real \
                  disagreement (declared {declared}), got: {detail}"
             ),
             other => panic!("expected RecordingInconsistent, got {other:?}"),
         }
+    }
+}
+
+/// The reader's covered range is the RECORDER's fold, not rank 0's endpoint.
+///
+/// Three arms over one contract. The recorder writes
+/// `resim_covered_through_ns` as the MINIMUM, over the ranks that kept a
+/// boundary, of each rank's last kept target, and the reader derives the same
+/// minimum from the bag's own trace. The reader used to adjudicate against rank
+/// 0's last target alone, which on a capture whose PEER ended shorter answered an
+/// instant that rank's trace carries no boundary for.
+///
+/// Every expected instant below is WRITTEN DOWN. The fixture's four steps have
+/// boundary targets 5, 10, 15 and 20 ms, so trimming a rank to `step <= 2`
+/// leaves that rank ending at 15 ms while the untrimmed rank ends at 20 ms.
+/// Nothing here reads an endpoint back out of the code under test.
+#[test]
+#[serial]
+fn a_k1_captures_declared_range_is_its_own_last_boundary() {
+    // k = 1 through the real recorder: one rank, so the fold is over one value
+    // and the declared value, the fold and rank 0's last target are one number.
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 5);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("k1_full_coverage.mcap");
+    write_capture_bag(&rec, &bag, Some(25_000_000));
+
+    let outcome = replay(&bag, source_relay_factories, None, None)
+        .expect("a capture declaring exactly what its trace backs replays clean");
+    assert_clean_verdict(&outcome, "k=1 declared range");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert!(!range.derived, "the bag declared this range");
+    assert_eq!(
+        range.through_ns, 25_000_000,
+        "five uniform steps end at the 25 ms boundary target, and on one rank the \
+         fold and that rank's last target are the same number"
+    );
+    assert!(
+        range.trailing_frames.is_empty(),
+        "nothing is outside a range that covers the whole trace: {:?}",
+        range.trailing_frames
+    );
+}
+
+/// k > 1 with a PEER ending shorter: the reader covers to the DECLARED minimum,
+/// and a frame between it and rank 0's last target is outside the range.
+///
+/// Rank 1's trace is trimmed to `step <= 2`, so rank 1 ends at 15 ms while rank 0
+/// runs on to 20 ms. The recorder's fold writes 15 ms. The old reader answered
+/// rank 0's 20 ms and so claimed the 15 to 20 ms band, which rank 1 has no
+/// boundary in.
+#[test]
+#[serial]
+fn a_peer_ending_shorter_holds_the_covered_range_at_the_declared_minimum() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_peer_shorter_declared.mcap");
+    write_multi_rank_bag_with_declared_range(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        // Rank 1 stopped after step 2; rank 0 keeps its full 0..=3 stream.
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        15_000_000,
+    );
+
+    let outcome = replay(&bag, mp_slow_b_factories, None, None)
+        .expect("a capture declaring its own fold is honoured, never refused");
+    // The VERDICT first. Without it this arm passes on any replay that merely
+    // returned Ok, which is how it passed while the comparator was reporting
+    // `ExtraMessages` on two topics: the trailing band was deducted from the
+    // recorded side only.
+    assert_clean_verdict(&outcome, "a peer ending shorter");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert!(!range.derived, "the bag declared this range");
+    assert_eq!(
+        range.through_ns, 15_000_000,
+        "the endpoint is the EARLIEST rank's last kept target, not rank 0's 20 ms"
+    );
+    // The 20 ms frames are in the bag, readable, and outside the range: the
+    // band rank 1 has no boundary in is reported rather than claimed.
+    let beyond: usize = range.trailing_frames.values().sum();
+    assert!(
+        beyond > 0,
+        "a frame stamped between the declared 15 ms and rank 0's 20 ms must be \
+         counted beyond coverage: {:?}",
+        range.trailing_frames
+    );
+}
+
+/// The trailing band is excluded from BOTH sides of the frame count.
+///
+/// The covered range excludes a band from the verdict. The recorded side was
+/// already short by the band's width, and the replay re-executes rank 0's own
+/// boundary stream, which runs PAST a declared endpoint that sits below rank 0's
+/// last boundary, so the replay re-produces frames in that band too. Deducting
+/// from the recorded side alone invented a difference of exactly the band's width
+/// and published it as `ExtraMessages` on every rank 0 owned topic.
+///
+/// HAND ORACLE, every count written down as its own number. The fixture's four
+/// steps carry boundary targets 5, 10, 15 and 20 ms. Rank 1's trace is trimmed to
+/// step 2, so the declared fold is 15 ms, rank 0's own last boundary is 20 ms, and
+/// the band is the 15 to 20 ms gap between them. Per rank 0 owned topic:
+///
+/// * recorded frames: 4, one per step;
+/// * recorded frames beyond `through_ns`: 1, the step 3 frame at 20 ms, which is
+///   the number the report publishes as `trailing_frames`;
+/// * REPLAYED frames beyond `through_ns`: 1, because the replay window is rank 0's
+///   boundary stream and runs all four steps, so it re-emits that same frame;
+/// * compared: 4 minus 1 against 4 minus 1, so 3 against 3, and CLEAN.
+///
+/// The two deductions are 1 and 1 HERE and that is the case this arm pins. They
+/// are not equal in general: on a tail-race bag the recorded frames beyond the
+/// endpoint sit above rank 0's last boundary, the replay cannot emit them, and the
+/// replayed deduction is 0 while the recorded one is not. That direction is pinned
+/// by `a_capture_whose_frames_outran_its_trace_replays_to_its_covered_range`, which
+/// a deduction of the recorded count from both sides turns red.
+///
+/// Without the replayed deduction this compares 3 against 4 and publishes
+/// `ExtraMessages` on both rank 0 owned topics.
+///
+/// The arm asserts the trailing count per topic and that EVERY checked topic
+/// passed, not just the verdict: a clean verdict alone is also what a reader that
+/// stopped reporting a covered range at all would produce, and a passing count
+/// alone would not show the band was measured.
+#[test]
+#[serial]
+fn the_trailing_band_leaves_the_frame_count_balanced_on_both_sides() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_band_both_sides.mcap");
+    write_multi_rank_bag_with_declared_range(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        15_000_000,
+    );
+
+    // PRECONDITION: each rank 0 owned topic really carries 4 frames, so "1 in the
+    // band" below is a count off this fixture and not an assumption.
+    for topic in ["/mp2/src_a1/out", "/mp2/src_a2/out"] {
+        assert_eq!(
+            rec.messages[topic].len(),
+            4,
+            "PRECONDITION: {topic} carries one frame per step"
+        );
+    }
+
+    let outcome = replay(&bag, mp_slow_b_factories, None, None)
+        .expect("a declared fold below rank 0's last boundary is honoured");
+    assert_clean_verdict(&outcome, "the band on both sides");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert_eq!(range.through_ns, 15_000_000, "the declared fold");
+    for topic in ["/mp2/src_a1/out", "/mp2/src_a2/out"] {
+        assert_eq!(
+            range.trailing_frames.get(topic).copied(),
+            Some(1),
+            "one frame per rank 0 owned topic sits in the 15 to 20 ms band: {:?}",
+            range.trailing_frames
+        );
+    }
+    // And every topic the comparator CHECKED came out equal, which is what says
+    // the two deductions landed on the same band rather than that the comparison
+    // was skipped.
+    assert_eq!(
+        outcome.topics_passed, outcome.topics_checked,
+        "every checked topic compares equal once the band is off both sides: \
+         {} of {}",
+        outcome.topics_passed, outcome.topics_checked
+    );
+    assert!(
+        outcome.topics_checked >= 3,
+        "all three produced topics are judged, so the band is not being dodged by \
+         an unjudged topic: {}",
+        outcome.topics_checked
+    );
+}
+
+/// A peer that runs past rank 0 on a DECLARED FREE RUN range is not an extra.
+///
+/// Under free run each pass advances on its OWN rank's boundary cursor
+/// (`PassBoundaries::Rank`), so a peer legitimately emits frames above rank 0's
+/// last boundary. The covered range's replayed deduction has to be taken at the
+/// PRODUCING RANK's edge for that reason: one ceiling taken from rank 0 leaves a
+/// peer's in band frames out of `reproduced` while the recorded side has already
+/// dropped them, and the comparison then publishes `ExtraMessages` on a bag whose
+/// frames are byte identical.
+///
+/// Reachable without a resume: a capture whose first boundary is step 0 returns
+/// from `resolve_resume` before the free run multi rank refusal, so this shape is
+/// replayed rather than refused.
+///
+/// HAND ORACLE, every count its own number. The fixture's four steps carry
+/// boundary targets 5, 10, 15 and 20 ms. Rank 0's trace is trimmed to step 2, so
+/// rank 0's edge is 15 ms and rank 1's is 20 ms, and the declared range is 15 ms.
+/// Rank 1 owns `/mp2/src_b/out` and fires at steps 1 and 3, so exactly one of its
+/// frames, the 20 ms one, sits in the 15 to 20 ms band and above rank 0's edge.
+/// That frame is the one a single ceiling mishandles: it is counted beyond the
+/// range on the recorded side and, with the per rank edge, on the replayed side
+/// too, so the verdict is CLEAN.
+#[test]
+#[serial]
+fn a_free_run_peer_past_rank_zero_is_deducted_at_its_own_ceiling() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_free_run_peer_past.mcap");
+    write_multi_rank_bag_impl(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        // Rank 0 stops after step 2; rank 1 keeps its full stream and so runs past
+        // rank 0's own last boundary, which is the whole point of the shape.
+        |per_rank| per_rank[0].retain(|r| r.step <= 2),
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        Some(15_000_000),
+        &[],
+        ProducerAttributionFixture::default(),
+        None,
+        &[],
+    );
+
+    let outcome = replay(&bag, mp_slow_b_factories, None, None)
+        .expect("a declared free run range is replayed, not refused");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert_eq!(range.through_ns, 15_000_000, "the declared range");
+    // PRECONDITION: the peer's 20 ms frame really is outside the range, so the
+    // deduction below has something to act on.
+    assert_eq!(
+        range.trailing_frames.get("/mp2/src_b/out").copied(),
+        Some(1),
+        "rank 1's step 3 frame sits above the declared range: {:?}",
+        range.trailing_frames
+    );
+    // THE VERDICT: no ExtraMessages anywhere. A single rank 0 ceiling reports one
+    // on '/mp2/src_b/out', because that frame stays on the replayed side while the
+    // recorded side has lost it.
+    let extras: Vec<String> = outcome
+        .violations
+        .iter()
+        .filter(|v| matches!(v.class, ViolationClass::ExtraMessages { .. }))
+        .map(|v| v.detail.clone())
+        .collect();
+    assert!(
+        extras.is_empty(),
+        "a peer running past rank 0 under free run is not an extra: {extras:?}"
+    );
+    assert_clean_verdict(&outcome, "a free run peer past rank 0");
+}
+
+/// A manifest ABOVE the fold's minimum but AT OR BELOW rank 0's last target is
+/// REFUSED BY NAME.
+///
+/// This is the arm the old reader had no answer for: 18 ms is not above rank 0's
+/// 20 ms, so the old guard passed it and the old clamp answered 20 ms. Against
+/// the fold it is an overstatement, because rank 1 stopped at 15 ms.
+#[test]
+#[serial]
+fn a_claim_above_the_folds_minimum_is_refused_even_below_rank_zeros_last() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_over_the_fold.mcap");
+    write_multi_rank_bag_with_declared_range(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        18_000_000,
+    );
+
+    let err = replay(&bag, mp_slow_b_factories, None, None)
+        .expect_err("a claim no rank can back is refused, never clamped");
+    assert_eq!(err.exit_code(), 2);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => assert!(
+            detail.contains("resim_covered_through_ns")
+                && detail.contains("18000000")
+                && detail.contains("15000000")
+                && detail.contains("EARLIEST last"),
+            "the refusal must name the manifest, the claim, the fold's minimum and \
+             what the minimum is, got: {detail}"
+        ),
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
     }
 }
 

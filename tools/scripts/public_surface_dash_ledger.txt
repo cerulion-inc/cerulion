@@ -32,10 +32,10 @@
 6 crates/cerulion_bagd/src/discovery.rs
 3 crates/cerulion_bagd/src/discovery_scan.rs
 28 crates/cerulion_bagd/src/flashback_plane.rs
-201 crates/cerulion_bagd/src/lib.rs
+200 crates/cerulion_bagd/src/lib.rs
 3 crates/cerulion_bagd/src/producer_labeling.rs
 13 crates/cerulion_bagd/src/schema_resolve.rs
-13 crates/cerulion_bagd/src/state_coverage.rs
+12 crates/cerulion_bagd/src/state_coverage.rs
 16 crates/cerulion_bagd/src/trace_drain.rs
 1 crates/cerulion_bagd/src/trace_window.rs
 5 crates/cerulion_bagd/src/window.rs
@@ -68,7 +68,7 @@
 38 crates/cerulion_cli_engine/src/partition_emit.rs
 1 crates/cerulion_cli_engine/src/peer_cache.rs
 39 crates/cerulion_cli_engine/src/replay_cmd.rs
-185 crates/cerulion_cli_engine/src/replay_engine.rs
+184 crates/cerulion_cli_engine/src/replay_engine.rs
 8 crates/cerulion_cli_engine/src/replay_field_registry.rs
 7 crates/cerulion_cli_engine/src/replay_inject.rs
 11 crates/cerulion_cli_engine/src/replay_rank.rs
@@ -87,7 +87,7 @@
 16 crates/cerulion_cli_engine/src/schema_serve.rs
 9 crates/cerulion_cli_engine/src/schema_store.rs
 30 crates/cerulion_cli_engine/src/shm_state.rs
-17 crates/cerulion_cli_engine/src/state_arm_attach.rs
+15 crates/cerulion_cli_engine/src/state_arm_attach.rs
 6 crates/cerulion_cli_engine/src/subnet_sweep.rs
 8 crates/cerulion_cli_engine/src/system_deps.rs
 20 crates/cerulion_cli_engine/src/templates.rs
@@ -120,7 +120,7 @@
 16 crates/cerulion_core/src/flashback.rs
 16 crates/cerulion_core/src/flashback/channel.rs
 5 crates/cerulion_core/src/flashback/machine_mem.rs
-10 crates/cerulion_core/src/flashback/resim.rs
+8 crates/cerulion_core/src/flashback/resim.rs
 1 crates/cerulion_core/src/flashback/retention.rs
 1 crates/cerulion_core/src/flashback/switch.rs
 3 crates/cerulion_core/src/flashback/trigger.rs
