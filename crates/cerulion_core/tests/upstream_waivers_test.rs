@@ -195,15 +195,32 @@ const WAIVED_2034: &[(&str, &str)] = &[
     ),
 ];
 
+/// The three function-name families that spawn a `cerulion` SUPERVISOR child. This
+/// is the waiver's DECLARED INPUT: the set of whole-binary waivers below is derived
+/// from it by `the_whole_binary_inventory_equals_the_spawn_family_walk`, so the list
+/// cannot drift from the code it describes, and a new suite that spawns a supervisor
+/// fails that arm until it is declared.
+const SUPERVISOR_SPAWN_FAMILIES: &[&str] = &["spawn_graph_run", "spawn_mp_record", "spawn_run"];
+
 /// Binaries waived WHOLE on macOS, as `(path from the workspace root, the upstream
-/// issue)`. The unit is the BINARY and not the arm, and that is a measurement
-/// rather than a preference: the defect is per PROCESS, libtest runs many arms in
-/// one process, so the arm that dies is whichever reaches a second resource
-/// creation first. Two runs of the same tree with the same fixtures on one macOS
-/// host disagreed on six arms out of thirty nine in each direction while the
-/// failing BINARIES stayed the same. Each listed file carries
-/// `#![cfg(not(target_os = "macos"))]` and the marker, so on macOS it builds to a
-/// harness with no tests, and it runs normally on Linux.
+/// issue)`.
+///
+/// THE MECHANISM, and it is the same one for every row: each of these spawns a
+/// `cerulion` supervisor child that loads plugin nodes, and on macOS a process that
+/// has loaded a plugin linking iceoryx2 cannot create any further event resource.
+/// The child is the process that loaded the plugin, so no runner arrangement on this
+/// side helps: a per-arm list cannot converge either, because under plain
+/// `cargo test` many arms share one process and the victim is whichever reaches the
+/// second creation first. Two runs of one macOS host disagreed on six arms out of
+/// thirty nine in each direction while the failing BINARIES stayed the same.
+///
+/// THE COVERAGE THIS COSTS, stated once: 16 binaries of `cerulion_cli` do not run on
+/// macOS at all. They run on Linux, where the defect does not arise. Two of the 16,
+/// `ros2_graph_e2e_test` and `network_gateway_e2e_test`, are in the set BY THE RULE
+/// rather than by measurement: they were not observed failing, because their own
+/// environment checks already skip them on macOS. The cure is an upstream release
+/// carrying the fix, or the pinned fork carrying a patch for it; nothing in this
+/// repository can shorten the list.
 const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
     (
         "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
@@ -215,6 +232,58 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
     ),
     (
         "crates/cerulion_cli/tests/graph_run_validate_gate_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/graph_start_order_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/mp_auto_partition_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/mp_consumer_first_spawn_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/mp_default_ns_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/mp_execution_mode_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/mp_record_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/mp_record_replay_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/network_gateway_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/plain_run_resim_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/ros2_graph_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/signal_matrix_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/topic_introspect_cli_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/wedge_alarm_e2e_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
 ];
@@ -505,6 +574,75 @@ fn both_waivers_are_pinned_to_the_iceoryx2_release_they_describe() {
 /// Every declared 2034 arm carries its own macOS scoped ignore, in its own
 /// contiguous attribute run, naming the defect.
 #[test]
+fn the_whole_binary_inventory_equals_the_spawn_family_walk() {
+    if skip_out_of_workspace() {
+        return;
+    }
+    // DECLARED INPUT, PARSED OUTPUT: the families are declared above, the set is
+    // walked out of the sources here, and the two must agree. Writing the list by
+    // hand is what let the earlier per-arm waiver crawl across three heads.
+    let mut found: Vec<String> = Vec::new();
+    for crate_dir in ["cerulion_cli", "cerulion_cli_engine"] {
+        let dir = workspace_root()
+            .join("crates")
+            .join(crate_dir)
+            .join("tests");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            panic!(
+                "{} is not readable, so this walk would pass having seen nothing",
+                dir.display()
+            );
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let rel = format!(
+                "crates/{crate_dir}/tests/{}",
+                p.file_name()
+                    .and_then(|x| x.to_str())
+                    .expect("a test file name")
+            );
+            let src = read_at(&rel);
+            if SUPERVISOR_SPAWN_FAMILIES
+                .iter()
+                .any(|fam| src.contains(&format!("{fam}(")) || src.contains(&format!("{fam}_")))
+            {
+                found.push(rel);
+            }
+        }
+    }
+    found.sort();
+    let mut declared: Vec<String> = WAIVED_2034_BINARIES
+        .iter()
+        .map(|(f, _)| (*f).to_string())
+        .collect();
+    declared.sort();
+    let missing: Vec<&String> = found.iter().filter(|f| !declared.contains(f)).collect();
+    let stale: Vec<&String> = declared.iter().filter(|f| !found.contains(f)).collect();
+    assert!(
+        missing.is_empty(),
+        "these test binaries call a supervisor-spawn family and are NOT declared \
+         waived whole: {missing:?}. On macOS they will run and fail on the upstream \
+         defect. Declare them, or stop spawning a supervisor from them."
+    );
+    assert!(
+        stale.is_empty(),
+        "these binaries are declared waived whole but no longer call any \
+         supervisor-spawn family: {stale:?}. The waiver outlived its reason, which is \
+         the failure mode this file exists to prevent."
+    );
+    assert!(
+        found.len() >= 10,
+        "the walk found only {} supervisor-spawning binaries, which is fewer than the \
+         suites known to exist: the families are not matching, so this arm would pass \
+         having derived almost nothing",
+        found.len()
+    );
+}
+
+#[test]
 fn every_waived_binary_is_gated_whole_and_names_the_defect() {
     if skip_out_of_workspace() {
         return;
@@ -560,24 +698,48 @@ fn a_waived_binary_lists_no_test_on_macos() {
         out.flush().expect("flush the platform skip");
         return;
     }
-    let stems: Vec<&str> = WAIVED_2034_BINARIES
+    let pairs: Vec<(&str, &str)> = WAIVED_2034_BINARIES
         .iter()
         .map(|(f, _)| {
-            Path::new(f)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("a waived binary path names a .rs file")
+            (
+                *f,
+                Path::new(f)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .expect("a waived binary path names a .rs file"),
+            )
         })
         .collect();
+    let stems: Vec<&str> = pairs.iter().map(|(_, s)| *s).collect();
     let built = candidates_by_stem(&stems);
     let mut asked = 0usize;
-    for stem in &stems {
+    for (file, stem) in &pairs {
         let Some(found) = built.get(*stem) else {
             continue;
         };
         let Some(bin) = found.first() else {
             continue;
         };
+        // STALENESS FIRST. A binary built before the file was gated still lists its
+        // arms, and reading that as "the gate did not take" is a false red: the
+        // binary predates the gate. Compare mtimes and skip, with the skip visible,
+        // which is the same rule the per-arm side applies through its marker check.
+        let src_path = workspace_root().join(*file);
+        let src_time = std::fs::metadata(&src_path).and_then(|m| m.modified()).ok();
+        let bin_time = std::fs::metadata(bin).and_then(|m| m.modified()).ok();
+        if let (Some(s), Some(b)) = (src_time, bin_time) {
+            if b < s {
+                let mut out = std::io::stdout().lock();
+                writeln!(
+                    out,
+                    "skip: {stem}'s built binary predates its own source, so it cannot \
+                     answer what the gate does (rebuild it to ask)"
+                )
+                .expect("report the stale-binary skip on stdout");
+                out.flush().expect("flush the stale-binary skip");
+                continue;
+            }
+        }
         let listed = arms_of(bin, false);
         assert!(
             listed.is_empty(),

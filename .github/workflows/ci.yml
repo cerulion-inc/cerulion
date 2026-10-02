@@ -2600,7 +2600,11 @@ jobs:
     # every suite green, so the rule those raises teach still holds: tighten
     # only against green runs, and only downward from a number the runs have
     # already cleared.
-    timeout-minutes: 60
+    # 120, not 60: with `--no-fail-fast` a failing binary waits out its
+    # supervisor child, and four such binaries took 814, 430, 184 and 182 s in one
+    # run. At 60 minutes the job was CANCELLED mid-suite, which reports nothing:
+    # a remaining failing binary has to be able to say so.
+    timeout-minutes: 120
     env:
       # `line-tables-only`, matching every other TEST job (`test-linux`,
       # `crate-tests`, `viz-tests`): backtraces keep file:line while rustc emits
