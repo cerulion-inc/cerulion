@@ -8919,6 +8919,44 @@ impl GraphRuntime {
         Ok(runtime)
     }
 
+    /// Like [`Self::build_for_test_with_policy`] but with the CROSS-PROCESS wiring
+    /// a worker receives, so an arm can reach the producer-side doorbell gate with
+    /// its outbound set NON-EMPTY.
+    ///
+    /// Every other test build passes `CrossProcessWiring::none()`, where the
+    /// outbound set is absent and the gate declines for every topic, so the gate's
+    /// own decision is unreachable from them.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn build_for_test_with_policy_and_wiring(
+        config: GraphConfig,
+        node_factories: IndexMap<String, Box<dyn NodeEntry>>,
+        clock: Arc<VirtualClock>,
+        subscriber_buffer_size: usize,
+        policy: crate::monitor_wait::MonitorWaitPolicy,
+        cross_process: CrossProcessWiring<'_>,
+    ) -> TransportResult<Self> {
+        let ix_config = crate::testing::iceoryx_test_config();
+        let transport_config = crate::transport::TransportConfig {
+            node_name: "cerulion_graph_test".into(),
+            clock: clock.clone(),
+            subscriber_buffer_size,
+            network: None,
+        };
+        let mgr = TransportManager::init_for_test(transport_config, ix_config)?;
+        let clock_dyn: Arc<dyn Clock> = clock;
+        let mut runtime = Self::build_live_free_run(
+            config,
+            node_factories,
+            &mgr,
+            clock_dyn,
+            None,
+            policy,
+            cross_process,
+        )?;
+        runtime.test_transport = Some(mgr);
+        Ok(runtime)
+    }
+
     /// Test helper: like `build_for_test` but routes through the
     /// DETERMINISTIC-LIVE path (`build_live_deterministic*`) over an isolated
     /// per-test iceoryx2 SHM root. Drive with `run_live_step_once_for_test`; no
@@ -12331,6 +12369,13 @@ impl GraphRuntime {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn data_wake_rung_for_test(&self) -> bool {
         self.data_wake_rung()
+    }
+
+    /// Test seam: how many of this graph's own publishers armed a doorbell, which
+    /// is the producer-side gate's decision.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn producer_doorbells_armed_for_test(&self) -> usize {
+        self.producer_doorbells_armed
     }
 
     /// Test seam over [`Self::armed_primary_topic`].

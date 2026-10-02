@@ -4129,80 +4129,107 @@ mod tests {
         assert_eq!(sub1.prefix, "p");
     }
 
-    /// The producer-side gate's input, over a DECLARED two-group split: a rank's
-    /// outbound set holds exactly the outputs a sibling reads.
+    /// The producer-side gate's input, through `plan_deployment` on a DECLARED
+    /// two-group split: each rank's plan names exactly the outputs a sibling reads.
     ///
-    /// This is what decides whether a publish arms a doorbell. P0 produces `n1/out`
-    /// which P1 reads, so P0 arms that one line; P1's own outputs are read only
-    /// inside P1, so P1 arms none. The mirror set is asserted beside it, because the
-    /// two answer opposite questions and reading one for the other is the mistake
-    /// this pair exists to catch.
+    /// Through the planner rather than the helper, because the planner is the one
+    /// construction site a worker's plan comes from and the stamping is what a
+    /// regression would drop. P0 produces `n1/out` which P1 reads, so P0's plan
+    /// names that one line; P1's outputs are read only inside P1, so its plan names
+    /// none. The inbound mirror is asserted beside it, because the two answer
+    /// opposite questions and reading one for the other arms the wrong rank.
     #[test]
-    fn a_declared_split_names_the_outputs_a_sibling_reads() {
+    fn a_declared_split_plan_names_the_outputs_a_sibling_reads() {
         let config = chain_config(groups(&[
             ("P0", &["n0", "n1"]),
             ("P1", &["n2", "n3", "n4"]),
         ]));
-        let p0 = vec!["n0".to_string(), "n1".to_string()];
-        let p1 = vec!["n2".to_string(), "n3".to_string(), "n4".to_string()];
+        let levels = chain_levels(&config);
+        let plan = plan_deployment(&config, &levels, None, "outbound").expect("plan");
 
-        let out0 = sibling_consumed_topics_for(&config, &p0);
+        let by_group = |g: &str| {
+            plan.workers
+                .iter()
+                .find(|w| w.group == g)
+                .unwrap_or_else(|| panic!("the plan carries a worker for {g}"))
+        };
+        let p0 = by_group("P0");
+        let p1 = by_group("P1");
+
         assert_eq!(
-            out0.iter().cloned().collect::<Vec<_>>(),
+            p0.sibling_consumed_topics
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
             vec!["/p/n1/out".to_string()],
             "P1 reads n1/out, so P0's publish of it can wake a consumer in another \
-             process and that is the one line P0 arms"
+             process and that is the one line P0's plan names"
         );
-        let out1 = sibling_consumed_topics_for(&config, &p1);
         assert!(
-            out1.is_empty(),
-            "every output of P1 is read inside P1, so no publish of P1's can wake a \
-             consumer in another process - got {out1:?}"
+            p1.sibling_consumed_topics.is_empty(),
+            "every output of P1 is read inside P1, so its plan names none - got {:?}",
+            p1.sibling_consumed_topics
         );
-
-        let in0 = sibling_topics_for(&config, &p0);
         assert!(
-            in0.is_empty(),
-            "the mirror: P0 consumes nothing a sibling produces - got {in0:?}"
+            p0.sibling_topics.is_empty(),
+            "the mirror: P0 consumes nothing a sibling produces - got {:?}",
+            p0.sibling_topics
         );
-        let in1 = sibling_topics_for(&config, &p1);
         assert_eq!(
-            in1.iter().cloned().collect::<Vec<_>>(),
+            p1.sibling_topics.iter().cloned().collect::<Vec<_>>(),
             vec!["/p/n1/out".to_string()],
             "the mirror: P1 consumes that same topic, which is why reading one set \
              for the other arms the wrong rank"
         );
     }
 
-    /// The same question over a DERIVED partition, answered by the same function.
+    /// The same question for a partition the DERIVER wrote rather than the file.
     ///
-    /// `plan_deployment` is the one `WorkerPlan` construction site for a declared
-    /// and a derived partition alike, so a rank whose members came from the
-    /// deriver gets the same outbound set as one whose members came from the file.
-    /// Asserted over the members a two-rank derivation produces rather than over
-    /// the groups a file declares.
+    /// What the planner sees of the difference is nothing: `plan_deployment` reads
+    /// `config.process_groups` and refuses a config without them, so a derived
+    /// partition reaches this site with its groups already in the config and is
+    /// indistinguishable from a declared one except in who wrote them and what they
+    /// are called. That is the claim this arm pins, by handing the planner groups
+    /// under the names the deriver mints and asserting the same outcome; the
+    /// deriving itself is `auto_partition`'s own to test.
+    ///
+    /// Asserted as a MIRROR across the whole plan rather than per named rank, since
+    /// the point is that the names carry no weight: every topic one rank names
+    /// outbound is named inbound by another, and at least one is, or the arm would
+    /// be vacuous on a plan that split nothing.
     #[test]
-    fn a_derived_partition_names_the_same_outputs_as_a_declared_one() {
+    fn a_partition_the_deriver_wrote_names_the_same_outputs() {
         let config = chain_config(groups(&[
             ("g0", &["n0", "n1"]),
             ("g1", &["n2", "n3", "n4"]),
         ]));
-        // The members a two-rank split yields, whatever named them.
-        let derived_rank0 = vec!["n0".to_string(), "n1".to_string()];
-        let derived_rank1 = vec!["n2".to_string(), "n3".to_string(), "n4".to_string()];
+        let levels = chain_levels(&config);
+        let plan = plan_deployment(&config, &levels, None, "derived").expect("plan");
 
         assert_eq!(
-            sibling_consumed_topics_for(&config, &derived_rank0)
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec!["/p/n1/out".to_string()],
-            "the deriver's rank 0 arms the cross-rank line, the same as a declared \
-             group with the same members"
+            plan.workers.len(),
+            2,
+            "two ranks, or the cross-rank question does not arise"
         );
-        assert!(
-            sibling_consumed_topics_for(&config, &derived_rank1).is_empty(),
-            "and the deriver's rank 1 arms none"
+        let outbound: std::collections::BTreeSet<String> = plan
+            .workers
+            .iter()
+            .flat_map(|w| w.sibling_consumed_topics.iter().cloned())
+            .collect();
+        let inbound: std::collections::BTreeSet<String> = plan
+            .workers
+            .iter()
+            .flat_map(|w| w.sibling_topics.iter().cloned())
+            .collect();
+        assert_eq!(
+            outbound.iter().cloned().collect::<Vec<_>>(),
+            vec!["/p/n1/out".to_string()],
+            "the split edge is n1/out whatever the groups are called"
+        );
+        assert_eq!(
+            outbound, inbound,
+            "the two sets are mirrors across the plan: a topic one rank publishes \
+             for another is the topic that other rank consumes from it"
         );
     }
 

@@ -964,6 +964,104 @@ fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
     }
 }
 
+/// The producer-side gate's own decision: a publisher arms a doorbell for the
+/// output a sibling group reads and for no other.
+///
+/// The only arm that reaches that gate with a NON-EMPTY outbound set. Every other
+/// build in the tree passes no cross-process wiring, so the gate declines for
+/// every topic and reading the inbound set where the outbound one belongs is
+/// invisible. Here the two sets are both non-empty and name DIFFERENT topics, so a
+/// swap inverts both page probes and the count.
+///
+/// Asserted on the pages themselves rather than only on the count: a page exists
+/// for the topic a sibling reads, none exists for the topic a sibling only writes
+/// to this graph, and exactly one publisher armed.
+#[test]
+#[serial]
+fn a_publisher_arms_a_doorbell_only_for_the_output_a_sibling_reads() {
+    let fires = Arc::new(AtomicU64::new(0));
+    let ns = mwp_ns("outbound");
+    let read_by_sibling = "/mwp/ta/out";
+    let written_by_sibling = "/mwp/tb/out";
+
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_outbound".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec!["ta", "tb"]
+            .into_iter()
+            .map(|id| NodeDef {
+                fuse: None,
+                ros2: None,
+                id: id.to_string(),
+                node_type: "ticker".to_string(),
+                inputs: vec![],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "geometry_msgs/Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            })
+            .collect(),
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    for id in ["ta", "tb"] {
+        factories.insert(
+            id.to_string(),
+            Box::new(TickerEntry::with_state(Ticker {
+                fires: Arc::clone(&fires),
+                ..Default::default()
+            })),
+        );
+    }
+
+    // Both sets non-empty and naming different topics: that is what makes a swap
+    // of one for the other visible.
+    let outbound: std::collections::BTreeSet<String> =
+        [read_by_sibling.to_string()].into_iter().collect();
+    let inbound: std::collections::BTreeSet<String> =
+        [written_by_sibling.to_string()].into_iter().collect();
+    let wiring = cerulion_core::graph::runtime::CrossProcessWiring::none()
+        .with_sibling_consumed_topics(&outbound)
+        .with_sibling_topics(&inbound);
+
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy_and_wiring(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, ns.clone()),
+        wiring,
+    )
+    .expect("build the two-output graph with cross-process wiring");
+
+    assert_eq!(
+        runtime.producer_doorbells_armed_for_test(),
+        1,
+        "exactly one of the two publishers may arm: the one whose output a sibling \
+         group reads"
+    );
+    assert!(
+        cerulion_core::doorbell::shm_object_exists_for_test(&ns, read_by_sibling),
+        "the page for {read_by_sibling} must exist: a sibling reads it, so a ring \
+         can wake a consumer in another process"
+    );
+    assert!(
+        !cerulion_core::doorbell::shm_object_exists_for_test(&ns, written_by_sibling),
+        "the page for {written_by_sibling} must NOT exist: a sibling writes that \
+         topic to this graph rather than reading it, so a ring would wake nobody"
+    );
+    runtime.shutdown();
+}
+
 /// A doorbell RING landing inside a park window is attributed to the DOORBELL
 /// counter, the `wakes_doorbell` branch's e2e coverage (the doorbell data test
 /// above pins it at 0, since its out-of-graph producer never rings; on a target

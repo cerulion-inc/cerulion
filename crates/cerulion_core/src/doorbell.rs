@@ -129,8 +129,12 @@
 //! The one consumer class that loses a wake to this is the `rmw_cerulion` wait
 //! set, the only other opener of a consumer-side doorbell in the tree: for a
 //! topic no sibling group reads it blocks on a line nothing advances and falls
-//! back to its own fd wait, which is what it does on a release with no doorbell
-//! at all. Tools that read a topic open no doorbell and so lose nothing.
+//! back to its own listener descriptor wait, which is what it does on a release
+//! with no doorbell at all. It does not poll: the descriptor wait is a kernel
+//! block on an iceoryx2 event. An `rmw_cerulion` PUBLISHER arms its own bell
+//! unconditionally at `rmw_create_publisher`, independent of these gates, so an
+//! rmw to rmw hop on Linux still wakes on the ring. Tools that read a topic open
+//! no doorbell and so lose nothing.
 
 use std::io;
 use std::sync::atomic::AtomicU64;
