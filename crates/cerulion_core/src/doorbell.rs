@@ -58,8 +58,8 @@
 //! orphan, and because the counter is RELATIVE (consumers snapshot on attach and
 //! read deltas) a stale absolute value is harmless. If a producer restarts and
 //! re-creates a FRESH object (new inode) the consumer's old mapping points at
-//! the orphan; the runtime re-maps via [`DoorbellRegistry::reopen`] on a
-//! producer-reconnect `LivelinessEvent`. Full restart-race
+//! the orphan; [`DoorbellRegistry::reopen`] is the re-map seam for that case,
+//! which the live loop does not call. Full restart-race
 //! correctness is the runtime's timer-recheck backstop; this
 //! module only guarantees it does not make that worse.
 //!
@@ -1376,16 +1376,17 @@ fn doorbell_page_bytes_for_test() -> usize {
     imp::page_bytes()
 }
 
-/// Wake syscalls this process issued on a doorbell wake word, and how many of them
-/// found nobody to wake.
+/// Wake syscalls this process issued on a doorbell wake word. Its pair,
+/// [`WAKES_WITH_NO_WAITER`], counts how many found nobody; both are read together
+/// through [`wake_syscall_counts`].
 ///
 /// Shipped, not test-only. A consumer killed inside its block leaves its `parked`
 /// claim set for good, and on a consumer-only topic the claims of successive
 /// crashed consumers add up, so every later publish pays a syscall that returns at
 /// once. That is accepted and bounded, but it is a permanent publish-path cost with
 /// no log line by design, so the numbers are the only way an operator can answer
-/// "my macOS publish path got slower after a worker died" without a rebuild. Two
-/// relaxed counters on an arm that already paid for a syscall.
+/// "my macOS publish path got slower after a worker died" without a rebuild. A
+/// relaxed counter on an arm that already paid for a syscall.
 #[cfg(target_os = "macos")]
 static WAKE_SYSCALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1505,14 +1506,16 @@ impl Drop for ParkedDoorbellGuard<'_> {
 /// A registry of unowned [`Doorbell`]s over a set of (consumer-side)
 /// data-trigger topics.
 ///
-/// Opens and dedups exactly one doorbell per UNIQUE topic (first-declared order
-/// preserved), RAII-owning them all (every one unowned — production producers
+/// Opens and dedups exactly one doorbell per UNIQUE topic (the order it is
+/// handed, preserved), RAII-owning them all (every one unowned: production producers
 /// own + `shm_unlink` their own lines via [`Doorbell::open_owned`]). The runtime
 /// uses [`snapshot_all`](DoorbellRegistry::snapshot_all) for the record-only
-/// poll-all, [`primary_addr`](DoorbellRegistry::primary_addr) to arm the single
-/// hardware monitor on the FIRST topic it was handed (the graph runtime decides
-/// that order; see [`primary_addr`](DoorbellRegistry::primary_addr)), and
-/// [`reopen`](DoorbellRegistry::reopen) on a producer-reconnect `LivelinessEvent`.
+/// poll-all, and [`addr`](DoorbellRegistry::addr) with
+/// [`slot_of`](DoorbellRegistry::slot_of) and [`bell`](DoorbellRegistry::bell) on
+/// the one topic it chose to arm. [`reopen`](DoorbellRegistry::reopen) is the
+/// re-map seam for a producer that re-created its object; see the
+/// `doorbell_registry` field doc on `GraphRuntime` for why the live loop does
+/// not call it.
 #[must_use = "the registry unmaps all its doorbells on drop — bind it to a named local for the desired scope"]
 pub struct DoorbellRegistry {
     /// Namespace passed at construction — retained so [`reopen`] can re-derive
@@ -1520,14 +1523,14 @@ pub struct DoorbellRegistry {
     ///
     /// [`reopen`]: DoorbellRegistry::reopen
     ns: String,
-    /// Deduped topics in first-declared order; parallel to `doorbells`.
+    /// Deduped topics in the order handed to `open`; parallel to `doorbells`.
     topics: Vec<String>,
     /// One unowned doorbell per topic, parallel to `topics`.
     doorbells: Vec<Doorbell>,
 }
 
 impl DoorbellRegistry {
-    /// Open one unowned doorbell per UNIQUE topic in `topics` (first-declared
+    /// Open one unowned doorbell per UNIQUE topic in `topics` (the given
     /// order preserved) under namespace `ns`.
     ///
     /// Returns the first open error on a target with a real SHM page (linux,
@@ -1564,7 +1567,8 @@ impl DoorbellRegistry {
         self.doorbells.is_empty()
     }
 
-    /// The deduped topics, in first-declared order (parallel to the doorbells).
+    /// The deduped topics, in the order handed to [`open`](Self::open) (parallel
+    /// to the doorbells).
     pub fn topics(&self) -> &[String] {
         &self.topics
     }
@@ -1605,36 +1609,52 @@ impl DoorbellRegistry {
             .any(|(i, db)| baseline.get(i).is_none_or(|&b| db.seq() != b))
     }
 
-    /// The FIRST topic as handed to [`open`](Self::open), and its doorbell line:
-    /// the single line the hardware monitor (`UMONITOR`/`WFE`) is armed on.
+    /// The FIRST topic as handed to [`open`](Self::open), and its doorbell line.
     /// `None` when the registry is empty.
+    ///
+    /// The POSITIONAL accessor. The runtime arms the hardware monitor through
+    /// [`addr`](Self::addr) on the topic it chose, not through this.
     ///
     /// The registry preserves the order it is given and knows nothing about who
     /// publishes a topic; the graph runtime hands it an order whose first entry
     /// is a topic a publisher outside that process can write
     /// (`graph::runtime::rung_topics`), so "first" here is not "first declared in
     /// the graph file".
+    #[deprecated(
+        since = "1.0.0",
+        note = "take the line by topic: addr, bell and slot_of. A position taken here and an index taken from a baseline can name different topics."
+    )]
     pub fn primary_addr(&self) -> Option<*const AtomicU64> {
         self.doorbells.first().map(Doorbell::addr)
     }
 
-    /// The FIRST topic as handed to [`open`](Self::open) and its DOORBELL: the handle whose wake word the
-    /// macOS data-wake park blocks on (the same line
-    /// [`primary_addr`](Self::primary_addr) hands the hardware monitor). `None`
+    /// The FIRST topic as handed to [`open`](Self::open) and its DOORBELL. `None`
     /// when the registry is empty.
+    ///
+    /// The POSITIONAL accessor. The macOS park takes its handle through
+    /// [`bell`](Self::bell) on the topic it chose, not through this.
     ///
     /// The handle it hands back can `ring()`, and every handle in this registry is
     /// a CONSUMER's: a ring from here would be a data wake with no data behind it,
     /// which the park would attribute to the doorbell and act on. The park reads
     /// it to block, never to ring.
+    #[deprecated(
+        since = "1.0.0",
+        note = "take the handle by topic: bell. A position taken here and an index taken from a baseline can name different topics."
+    )]
     pub fn primary(&self) -> Option<&Doorbell> {
         self.doorbells.first()
     }
 
-    /// The FIRST topic NAME as handed to [`open`](Self::open), the one hardware-armed on
-    /// [`primary_addr`](Self::primary_addr). Surfaced in the `run_live` wait-policy
-    /// telemetry line so a worker's chosen doorbell primary is observable (the
-    /// CLI monolith arm never runs in a worker). `None` when the registry is empty.
+    /// The FIRST topic NAME as handed to [`open`](Self::open). `None` when the
+    /// registry is empty.
+    ///
+    /// The POSITIONAL accessor. The `run_live` wait-policy line reports the topic
+    /// the runtime chose from its own record, not from here.
+    #[deprecated(
+        since = "1.0.0",
+        note = "a caller that armed a line already knows its topic; slot_of gives that topic index in a baseline."
+    )]
     pub fn primary_topic(&self) -> Option<&str> {
         self.topics.first().map(String::as_str)
     }
@@ -1895,7 +1915,7 @@ mod tests {
     // ---- PURE dedup / order (all OS) ----
 
     #[test]
-    fn dedup_preserves_first_declared_order_and_removes_dups() {
+    fn dedup_preserves_the_given_order_and_removes_dups() {
         let topics = ["a", "b", "a"].map(String::from);
         assert_eq!(
             dedup_topics(&topics),
@@ -1922,7 +1942,8 @@ mod tests {
     // ---- registry dedup / order (all OS: real SHM where a page exists, stub elsewhere) ----
 
     #[test]
-    fn registry_dedups_and_primary_is_first_declared() {
+    #[allow(deprecated)] // the positional family is what this arm pins
+    fn registry_dedups_and_primary_is_the_first_topic_given() {
         let ns = test_ns("reg_dedup");
         let topics = ["a", "b", "a"].map(String::from);
         let reg = DoorbellRegistry::open(&ns, &topics).expect("registry open");
@@ -1932,13 +1953,13 @@ mod tests {
         assert_eq!(
             reg.topics(),
             &["a".to_string(), "b".to_string()],
-            "first-declared order preserved"
+            "the order handed to open is preserved"
         );
-        // primary == the first-declared topic ("a")'s line — cross-checked
+        // primary == the first given topic ("a")'s line, cross-checked
         // against the name-based lookup, so this is NOT a self-compare.
         assert_eq!(reg.primary_addr(), reg.addr("a"));
         // The primary topic NAME (surfaced in the run_live wait-policy
-        // line) is the same first-declared topic.
+        // line) is the same first given topic.
         assert_eq!(reg.primary_topic(), Some("a"));
         assert_ne!(
             reg.addr("a"),
@@ -1953,6 +1974,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // the positional family is what this arm pins
     fn registry_empty_has_no_primary() {
         let reg = DoorbellRegistry::open(&test_ns("reg_empty"), &[]).expect("open empty");
         assert!(reg.is_empty());
@@ -2504,7 +2526,8 @@ mod tests {
     /// that, because it compares two lookups in the same registry.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn the_registry_primary_is_the_first_declared_topics_bell() {
+    #[allow(deprecated)] // the positional family is what this arm pins
+    fn the_registry_primary_is_the_first_given_topics_bell() {
         let ns = test_ns("primary_bell");
         let topics = ["first", "second"].map(String::from);
         let reg = DoorbellRegistry::open(&ns, &topics).expect("registry open");

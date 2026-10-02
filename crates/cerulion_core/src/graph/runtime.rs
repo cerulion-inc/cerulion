@@ -956,9 +956,10 @@ fn edge_needs_producer_annotation(
 ///
 /// The same question [`edge_needs_producer_annotation`] asks, under the name the
 /// park's doorbell arming asks it by, so a reader narrowing one call site sees
-/// the other. The two terms are the two provisioning states that admit a writer
-/// the graph does not own: the `multi_publisher_topics:` opt-in, and `External`,
-/// which is every topic with no in-graph producer. The opt-in ADMITS such a
+/// the other. The two terms are the two ways a writer the graph does not own is
+/// admitted: the `multi_publisher_topics:` opt-in, read off the config whatever
+/// the provisioning, and `External` provisioning, which is every topic with no
+/// in-graph producer. The opt-in ADMITS such a
 /// writer rather than guaranteeing one, so a `true` here is not proof a peer
 /// exists; a line armed with nobody writing it costs one bounded park slice.
 fn topic_is_writable_from_outside(
@@ -2128,9 +2129,12 @@ struct RungTopics {
 /// joins before returning. So while that thread is blocked, no node of this
 /// runtime can ring. Hence `armable`: a line is armed only when a publisher this
 /// process does not own can write it, which
-/// [`edge_needs_producer_annotation`] answers over the resolved provisioning.
+/// [`topic_is_writable_from_outside`] answers over the resolved provisioning.
 ///
-/// The non-armable topics STAY in the list, after the others, because the
+/// Both planes find the armed line by NAME, so the ordering decides nothing the
+/// park reads; it keeps the registry's positional accessors describing the same
+/// topic the runtime chose. The non-armable topics STAY in the list, after the
+/// others, because the
 /// poll-all scan reads every topic's ring counter and only the armed line has to
 /// be writable from outside. Declared order is preserved within each class.
 fn rung_topics(declared: &[String], armable: &std::collections::BTreeSet<String>) -> RungTopics {
@@ -12550,13 +12554,13 @@ impl GraphRuntime {
         use crate::monitor_wait::AddrParkOutcome;
         let reg = self.doorbell_registry.as_ref();
         let wake_word = crate::doorbell::wake_word_block_primitive_available();
-        let has_primary = self.has_armed_line();
+        let has_armed_line = self.has_armed_line();
         if !doorbell_rung_applies(
             self.monitor_wait_policy.doorbell(),
             wake_word,
             reg.is_some(),
             baseline.is_some(),
-            has_primary,
+            has_armed_line,
         ) {
             // The WAKE-WORD term is the one an operator cannot see coming: the
             // policy armed the doorbell, this graph has a line to watch, and the
@@ -12564,7 +12568,7 @@ impl GraphRuntime {
             // family latched after a sibling's unrecoverable errno. The gate is
             // re-evaluated every iteration, so the wait is never reached to
             // report it; this is the site that observes it.
-            if !wake_word && self.monitor_wait_policy.doorbell() && has_primary {
+            if !wake_word && self.monitor_wait_policy.doorbell() && has_armed_line {
                 crate::doorbell::note_tier_inactive();
             }
             return AddrParkOutcome::Unavailable;
@@ -13542,7 +13546,8 @@ impl GraphRuntime {
         // `data_wake` is the macOS doorbell rung's own gate, read through the
         // function the rung reads, so the line cannot claim a rung that would
         // decline (a registry built for a graph with no data-trigger topics is
-        // present but EMPTY, which the three obvious terms do not catch). Stated
+        // present but EMPTY, which `doorbell` alone does not show, hence
+        // `doorbell_topics` beside it). Stated
         // here because the decision is per process: the supervisor resolves the
         // policy and stamps it, and the shared os_sync family can latch off in
         // THIS process afterwards. Without it the run's only statement about the

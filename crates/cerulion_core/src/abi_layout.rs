@@ -98,7 +98,7 @@
 //!   cdylib are built together on one machine. Pinning their sizes here would
 //!   pin the platform, not the ABI.
 //! - **`crate::doorbell::Doorbell`** (held by value as `Option<Doorbell>` in
-//!   `CerulionPublisher`) has per-target `#[cfg]`-selected definitions with
+//!   `CerulionPublisher`) has THREE `#[cfg]`-selected definitions (linux, macos, neither) with
 //!   different field sets, so a portable field-set pin would need per-platform
 //!   tables. Its parent's field set is pinned; its own is not.
 //! - **The closure BELOW `TransportManager`.** The manager itself IS pinned

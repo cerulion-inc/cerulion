@@ -712,7 +712,8 @@ fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
 
 /// The positive control for the arm above, and the shape a declared two-group
 /// split gives its second group: the trigger topic has NO producer in this
-/// runtime, so a writer outside it rings the line and the rung is right to arm.
+/// runtime, so a writer that is not a node of it rings the line and the rung is
+/// right to arm.
 ///
 /// Judged in BOTH directions against the host fact the rung is gated on, so a
 /// host without the Apple os_sync family is a judged arm rather than a skipped
@@ -834,14 +835,16 @@ fn a_multi_publisher_topic_this_runtime_also_writes_is_armable() {
 ///
 /// The counter this reads is the same one
 /// `doorbell_ring_during_park_is_attributed_to_doorbell_counter` asserts moves
-/// when an outside writer rings, and this graph carries no barrier participant
-/// and no
+/// when a writer that is not a node of it rings, and this graph carries no
+/// barrier participant and no
 /// credit edge, so the shared counter is attributable to the doorbell rung
 /// alone. Zero on its own would not say much: it is also what a host with no wake
 /// word and a removed rung produce. So the same drive runs twice, once on the
-/// chain and once on a graph whose trigger has an outside writer that really
-/// rings, and the chain's zero is read against that graph's nonzero. The pair is
-/// skipped, loudly, only where the host carries no wake word at all.
+/// chain and once on a graph whose trigger has a writer that is not a node of
+/// this runtime and really rings, and the chain's zero is read against that graph's nonzero. The pair is
+/// macOS-only: off macOS there is no rung to judge and only the park-entry
+/// premise runs. On macOS it is skipped, with a recorded reason, where the host
+/// carries no usable os_sync backend.
 #[test]
 #[serial]
 fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
@@ -884,9 +887,10 @@ fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
     );
     runtime.shutdown();
 
-    // The positive half, same host, same run: a consumer whose trigger has an
-    // outside writer, with that writer ringing. Its nonzero count is what makes
-    // the zero above a decision rather than an absent capability.
+    // The positive half, same host, same run: a consumer whose trigger is written
+    // by a thread that is not a node of this runtime, with that thread ringing.
+    // Its nonzero count is what makes the zero above a decision rather than an
+    // absent capability.
     #[cfg(target_os = "macos")]
     {
         let ns = mwp_ns("chainctl");
