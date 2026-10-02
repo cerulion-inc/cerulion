@@ -1,0 +1,92 @@
+name: Advisory audit (cargo-deny, scheduled)
+
+# The advisory half of the dependency audit, on a clock.
+#
+# `ci.yml`'s `Dependency Audit (cargo-deny)` job runs `cargo deny ... check
+# advisories licenses bans sources` on every pull request, every merge-queue
+# batch and every push to `main`. Licences, bans and sources are decided by
+# `Cargo.lock` and `tools/release/deny.toml` together, and an edit to either is
+# a push `ci.yml` triggers on. Advisories are not: `tools/release/deny.toml`
+# pins no advisory database, so each run resolves the current RustSec database
+# against the committed lockfile, and an advisory published after the last push
+# matches a lockfile nobody has edited. No event `ci.yml` triggers on fires.
+#
+# So the advisories check runs here on a schedule against the default branch,
+# and `tools/scripts/advisory_issue.sh` records the result on ONE issue carrying
+# the `security` label that `.github/labels.yml` declares. That script also
+# reads the `warning[...]` classes `tools/release/deny.toml` leaves at warn
+# level, which exit 0 and are therefore invisible to the exit status alone.
+#
+# Licences, bans and sources stay out of this run: every path into `main`
+# already checks them, and they move only when a file in the checkout moves.
+#
+# Neither trigger is reachable from a fork: `schedule` and `workflow_dispatch`
+# only ever run on a branch of this repository.
+on:
+  workflow_dispatch:
+  schedule:
+    # 04:37 UTC daily. Off-peak and off the hour, where GitHub queues the whole
+    # world's `0 * * * *` crons at once; moveit-hero.yml holds 03:43,
+    # stale.yml 07:17 and examples-replay.yml 07:30.
+    - cron: "37 4 * * *"
+
+# Read the checkout; write one issue. `issues: write` is what lets
+# `advisory_issue.sh` create, edit, comment on and close it.
+permissions:
+  contents: read
+  issues: write
+
+# A daily cron plus manual dispatch can overlap itself, and two runs would race
+# on the same issue: one would create it while the other edits or closes it.
+# Queue rather than cancel, so the newer lockfile reading is the last write.
+concurrency:
+  group: advisory-audit
+  cancel-in-progress: false
+
+jobs:
+  advisories:
+    name: Advisories against the committed lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The release archive, version and checksum `ci.yml`'s Dependency Audit
+      # job installs. cargo-deny runs against the runner image's own cargo, so
+      # there is no toolchain step and no cache.
+      - name: Install cargo-deny 0.20.2
+        run: |
+          set -eu
+          url=https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          curl -sSL --retry 3 -o cargo-deny.tgz "$url"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tgz" | sha256sum -c -
+          tar -xzf cargo-deny.tgz
+          install -m 0755 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.cargo/bin/cargo-deny"
+          cargo deny --version
+
+      # No `-e`: the exit status is the verdict the next step reads, so it is
+      # captured into an output instead of ending the job. Both streams go to
+      # the log file the next step parses, and `cat` puts them in the run log.
+      - name: Check advisories
+        id: audit
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          cargo deny --config tools/release/deny.toml check advisories \
+            > "$RUNNER_TEMP/advisories.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/advisories.log"
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+
+      # `GH_TOKEN` is the run's own token, scoped by the `issues: write`
+      # permission above. The status reaches the script through `env`, not
+      # through an expression expanded into the shell.
+      - name: Record the result on one issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          AUDIT_STATUS: ${{ steps.audit.outputs.status }}
+        run: |
+          set -euo pipefail
+          tools/scripts/advisory_issue.sh "$AUDIT_STATUS" "$RUNNER_TEMP/advisories.log"

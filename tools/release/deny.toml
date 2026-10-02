@@ -4,8 +4,10 @@
 #   cargo install cargo-deny --locked
 #   cargo deny check advisories licenses bans sources
 #
-# CI runs the same four checks via EmbarkStudios/cargo-deny-action@v2
-# in the `deps` job of .github/workflows/ci.yml (blocking).
+# CI runs the same four checks in the `deps` job of
+# .github/workflows/ci.yml (blocking), from a checksummed cargo-deny release
+# archive installed by that job. .github/workflows/advisories.yml runs the
+# advisories check alone on a schedule, against this same policy file.
 #
 # Schema: cargo-deny 0.16+ (`version = 2` for [advisories] and [licenses]).
 

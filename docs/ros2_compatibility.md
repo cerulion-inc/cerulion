@@ -78,7 +78,7 @@ States: **validated** means an artifact above shows it running; **expected, unva
 | Jazzy | validated | the wire rung's live capture is from the Jazzy container (`crates/cerulion_dds/src/wire.rs` line 116) |
 | Kilted, Rolling | expected, unvalidated | inside the wire rung's stated domain (`docs/schema_resolution.md` lines 31 to 36); no run |
 
-The DDS crate defaults to the 16-byte GID world (`crates/cerulion_dds/Cargo.toml` lines 44 to 84, `default = ["jazzy"]`). Its `humble` feature selects the 24-byte GID and is an explicit opt-in that cannot decode Iron-or-newer discovery (`crates/cerulion_dds/src/wire.rs` lines 807 to 817). No CI step builds that feature (the only `cerulion_dds` job runs default features, `.github/workflows/ci.yml` lines 3149 to 3151), so it is unvalidated; the Go2 example's own DDS wrapper crate is what carries a default `humble` build (`examples/go2/lib/cerulion_go2_dds/Cargo.toml` line 52).
+The DDS crate defaults to the 16-byte GID world (`crates/cerulion_dds/Cargo.toml` lines 44 to 84, `default = ["jazzy"]`). Its `humble` feature selects the 24-byte GID and is an explicit opt-in that cannot decode Iron-or-newer discovery (`crates/cerulion_dds/src/wire.rs` lines 807 to 817). No CI step builds that feature (the only `cerulion_dds` job runs default features, `.github/workflows/ci.yml` lines 3152 to 3154), so it is unvalidated; the Go2 example's own DDS wrapper crate is what carries a default `humble` build (`examples/go2/lib/cerulion_go2_dds/Cargo.toml` line 52).
 
 ## 4. What runs unmodified over the rmw, and the known limits
 

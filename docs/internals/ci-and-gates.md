@@ -350,8 +350,9 @@ against the type it has to parse as by a unit test in
 `lint` runs: `cargo fmt --all --check` plus a workspace-root WALK
 that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/*`, every
 `examples/*`, the fuzz workspace); `cargo clippy --workspace --all-targets -- -D warnings`;
-the hot-path alloc lint and its self-test; the agent-docs gate; the leak guard's self-test
-and generic-class tree scan; the naming gate (pull requests only); `shellcheck` over
+the hot-path alloc lint and its self-test; the advisory issue bookkeeping self-test;
+the agent-docs gate; the leak guard's self-test and generic-class tree scan; the
+naming gate (pull requests only); `shellcheck` over
 `tools/scripts/**` recursively and over the extensionless hooks in `tools/hooks` (`-type f`
 deduplicates a symlink into a scanned subdirectory); and `actionlint` over every workflow.
 
@@ -501,6 +502,43 @@ The release workflows reject missing, malformed, impossible-calendar, pre-tag, a
 future dates before publishing artifacts. The shared implementation is
 `tools/scripts/check_citation_release.sh`, which is also exercised by the release-gate
 regression script.
+
+## Scheduled workflows
+
+Four workflows run on a clock rather than on a change, and none of them reports a
+required status context: `.github/workflows/moveit-hero.yml` at 03:43 UTC builds the
+ROS 2 Jazzy MoveIt image and runs the hero demo, `.github/workflows/advisories.yml`
+at 04:37 UTC runs the dependency advisory check, `.github/workflows/stale.yml` at
+07:17 UTC labels and closes `needs-info` items, and
+`.github/workflows/examples-replay.yml` at 07:30 UTC runs the replay-tolerance demo.
+Every minute is off the hour, where GitHub queues the world's hourly crons at once.
+
+`advisories.yml` runs `cargo deny --config tools/release/deny.toml check advisories`
+and nothing else. Licences, bans and sources are decided by `Cargo.lock` and
+`tools/release/deny.toml` together, and an edit to either is a push the per-change
+`Dependency Audit (cargo-deny)` job reads. Advisories are decided by the RustSec
+database, which `tools/release/deny.toml` does not pin, so an advisory published
+after the last push matches a lockfile nobody has edited and no event `ci.yml`
+triggers on fires.
+
+`tools/scripts/advisory_issue.sh` turns the result into one write on ONE issue,
+found among the open issues labelled `security` by an exact title. A finding opens
+that issue or rewrites its body; a clean run comments the commit the check passed on
+and closes it; a clean run with no such issue open writes nothing. A finding is a
+nonzero cargo-deny status OR a `warning[unmaintained|unsound|notice|yanked]` line in
+the captured log: `tools/release/deny.toml` leaves those four classes at warn level
+and they exit 0, so the status alone sees only a denied vulnerability. The script
+refuses with exit 2 and writes nothing when `gh` is unauthenticated, when the
+repository carries no `security` label, when `gh` refuses a listing, and when two
+open issues carry the title. Its oracle is `tools/scripts/test_advisory_issue.sh`:
+nine cases against a `gh` shim that records every call, run as a step of `lint`.
+
+A `schedule` trigger fires only from the default branch, and the `workflow_dispatch`
+button appears only for a workflow already on it, so neither trigger runs on a pull
+request branch. The pre-merge proof of a scheduled workflow is actionlint, the cache
+save policy checker and the script self-test; the first run of the trigger itself is
+on `main`. GitHub also disables scheduled workflows on a repository after 60 days
+with no commit.
 
 ## The cache save policy (`CACHE_SAVE_*` in `ci.yml`)
 
