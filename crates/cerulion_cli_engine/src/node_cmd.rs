@@ -939,6 +939,54 @@ pub fn node_build_streaming(
 /// failure is reported); the streaming build reads it on its own thread so a
 /// full pipe can never stall cargo.
 const STREAMING_STDERR_CAP: usize = 1024 * 1024;
+/// The longest stdout line kept; a longer one is dropped whole.
+const STREAMING_LINE_CAP: usize = 1024 * 1024;
+
+/// Call `on_line` for each `\n` terminated line of `reader`, holding at most
+/// `cap` bytes of one line. A longer line is read to its end without being
+/// kept and `on_line` is not called for it. A final line with no newline is
+/// delivered. Stops at the first read error.
+fn for_each_capped_line(
+    mut reader: impl std::io::BufRead,
+    cap: usize,
+    on_line: &mut dyn FnMut(&[u8]),
+) {
+    let mut line: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if available.is_empty() {
+            if !overflowed && !line.is_empty() {
+                on_line(&line);
+            }
+            return;
+        }
+        let (piece, ends_line, consumed) = match available.iter().position(|b| *b == b'\n') {
+            Some(at) => (&available[..at], true, at + 1),
+            None => (available, false, available.len()),
+        };
+        if !overflowed {
+            if line.len() + piece.len() > cap {
+                overflowed = true;
+                line.clear();
+            } else {
+                line.extend_from_slice(piece);
+            }
+        }
+        reader.consume(consumed);
+        if ends_line {
+            if !overflowed {
+                on_line(&line);
+            }
+            line.clear();
+            overflowed = false;
+        }
+    }
+}
 
 /// The message sink and cancel flag of a streaming build.
 type StreamingBuild<'a> = (&'a mut dyn FnMut(&str), &'a std::sync::atomic::AtomicBool);
@@ -1086,7 +1134,7 @@ fn run_cargo_streaming(
     node_type: &str,
     spawn_failure: impl FnOnce(std::io::Error) -> CliError,
 ) -> CliResult<std::process::Output> {
-    use std::io::{BufRead, BufReader, Read};
+    use std::io::{BufReader, Read};
     use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1137,10 +1185,9 @@ fn run_cargo_streaming(
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
         });
-        for line in BufReader::new(stdout).split(b'\n') {
-            let Ok(line) = line else { break };
-            on_message(&String::from_utf8_lossy(&line));
-        }
+        for_each_capped_line(BufReader::new(stdout), STREAMING_LINE_CAP, &mut |line| {
+            on_message(&String::from_utf8_lossy(line));
+        });
         // Closed stdout does not mean cargo is done (it can close the pipe and
         // keep running), so cancel is still honoured until the child is
         // reaped. The watcher stops first, so only one thread ever signals,
@@ -1483,6 +1530,35 @@ fn remove_workspace_member(cargo_toml: &Path, node_type: &str) -> CliResult<()> 
 
 #[cfg(test)]
 mod tests {
+    fn capped_lines(input: &[u8], cap: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        // A one byte buffer forces the line to span many fill_buf calls.
+        for_each_capped_line(std::io::BufReader::with_capacity(1, input), cap, &mut |l| {
+            out.push(l.to_vec())
+        });
+        out
+    }
+
+    #[test]
+    fn capped_lines_split_on_newline_and_keep_a_final_unterminated_line() {
+        assert_eq!(
+            capped_lines(b"ab\n\ncd\nef", 16),
+            vec![b"ab".to_vec(), Vec::new(), b"cd".to_vec(), b"ef".to_vec()]
+        );
+        assert!(capped_lines(b"", 16).is_empty());
+    }
+
+    #[test]
+    fn capped_lines_drop_an_over_long_line_and_keep_its_neighbours() {
+        let got = capped_lines(b"ok\n0123456789\nnext\n", 4);
+        assert_eq!(got, vec![b"ok".to_vec(), b"next".to_vec()]);
+        // Exactly at the cap is kept; one past is dropped.
+        assert_eq!(capped_lines(b"abcd\n", 4), vec![b"abcd".to_vec()]);
+        assert!(capped_lines(b"abcde\n", 4).is_empty());
+        // An over-long unterminated tail is dropped too.
+        assert!(capped_lines(b"abcde", 4).is_empty());
+    }
+
     use super::*;
 
     fn setup_workspace() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -2751,7 +2827,7 @@ mod tests {
         assert_eq!(
             reason,
             "`cargo` was not found on PATH. `cerulion node build` compiles the node with \
-             the Rust toolchain: install Rust 1.93+ from https://rustup.rs (plus a C \
+             the Rust toolchain: install Rust 1.95+ from https://rustup.rs (plus a C \
              linker: build-essential on Ubuntu/Debian, Xcode Command Line Tools on macOS) \
              and retry"
         );

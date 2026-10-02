@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! End to end over the real daemon socket: the three create verbs return the
 //! new file's `version`, and `node.build` streams structured diagnostics.
 //!
