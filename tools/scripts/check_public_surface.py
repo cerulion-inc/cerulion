@@ -2261,7 +2261,8 @@ def self_test(out=sys.stdout):
                           ("@AGENTS.md", "docs/CLAUDE.md"),
                           ("crates/x/AGENTS.md", "docs/AGENTS.md"),
                           ("crates/cerulion_core/AGENTS.md", "docs/internals/gates.md"),
-                          ("crates/y/AGENTS.md", ".github/nested/deep/AGENTS.md")):
+                          ("crates/y/AGENTS.md", ".github/nested/deep/AGENTS.md"),
+                          ("RELEASE_NOTES", "docs/page.md")):
             body = open(os.path.join(root, ctl_rel), encoding="utf-8").read()
             arm("control-text-is-in-the-fixture:" + ctl_text.strip()[:34], ctl_text.strip() in body, ctl_rel)
         for sub in ("`cerulion graph run`", "`cerulion graph validate`", "`cerulion graph run-worker`", "`cerulion ros`", "`cerulion viz`",
