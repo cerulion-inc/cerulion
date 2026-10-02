@@ -55,7 +55,7 @@
 //! that one is intra-process and not SHM-mappable). So `MappedBarrier` can place a
 //! [`BarrierShared`] directly in an mmap'd `MAP_SHARED` page and have two
 //! processes operate on the SAME physical atomics. Every operation is lock-free
-//! (atomic load / `fetch_sub` / `fetch_add` / store / `fetch_update`), so a
+//! (atomic load / `fetch_sub` / `fetch_add` / store / `try_update`), so a
 //! crashed participant can never leave the barrier holding a lock.
 //!
 //! # Count-down sense-reversing design
@@ -1636,10 +1636,10 @@ impl BarrierShared {
         // `expected` 1→0 would read 0 and silently swallow a real desync.
         let old_expected = self
             .expected
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_sub(1))
             })
-            // The closure always returns `Some`, so `fetch_update` always returns
+            // The closure always returns `Some`, so `try_update` always returns
             // `Ok(prev)`; extract the value from either arm without `.unwrap()`.
             .unwrap_or_else(|v| v);
 
@@ -1728,7 +1728,7 @@ impl BarrierShared {
     ///
     /// # Memory ordering (concurrent same-gen drop vs a live arrival)
     ///
-    /// `try_drop_participant` decrements `expected` (a `fetch_update`, `AcqRel`)
+    /// `try_drop_participant` decrements `expected` (a `try_update`, `AcqRel`)
     /// SEQUENCED-BEFORE its `remaining.fetch_sub` (`AcqRel`). A later opener's re-arm
     /// reads `expected` with an `Acquire` load; because the `remaining` `fetch_sub`
     /// chain is `AcqRel`, any arrival whose `fetch_sub` is ordered AFTER this drop's

@@ -193,7 +193,8 @@ impl RecordOut {
         // a zero would claim values the frame never carried.
         let Some(header) = WireHeader::read_from_buf(frame) else {
             return Err(internal(format!(
-                "--record-out cannot write a frame of '{topic}': it is {} bytes, shorter than                  the wire header, so it has no sequence or timestamp to record",
+                "--record-out cannot write a frame of '{topic}': it is {} bytes, shorter than \
+                 the wire header, so it has no sequence or timestamp to record",
                 frame.len()
             )));
         };
@@ -315,6 +316,9 @@ mod tests {
         let (out, _) = open(dir.path(), false);
         let err = out.write_frame("/state", &[1, 2, 3]).unwrap_err();
         assert!(err.to_string().contains("wire header"), "{err}");
+        // The message reads as one sentence: no run of spaces from a lost line
+        // continuation.
+        assert!(!err.to_string().contains("  "), "{err}");
         // ANTI-TAUTOLOGY: a full frame on the same sink is accepted.
         out.write_frame("/state", &frame(7, 99))
             .expect("full frame");

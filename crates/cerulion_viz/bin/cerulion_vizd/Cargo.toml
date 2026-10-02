@@ -17,7 +17,7 @@ version = "1.0.0"
 edition = "2021"
 description = "cerulion-vizd, the long-lived schema-generic dynamic viz daemon (UDS NDJSON control protocol)"
 license.workspace = true
-rust-version = "1.93" # inherits cerulion_viz's rerun MSRV (see lib/cerulion_viz/Cargo.toml)
+rust-version = "1.95" # the root floor (see the root Cargo.toml and lib/cerulion_viz/Cargo.toml)
 # Not published to crates.io: a desk-side daemon binary, not a library
 # dependency.
 publish = false

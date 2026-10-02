@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `cerulion bag play <BAG> --resim all --record-out <PATH>` writes the frames the re-executed graph published to a new bag: one channel per graph-produced topic, copied from the input bag's channel table. It works with and without `--verify`. The path must not exist, so an existing file is refused with exit 2 and never overwritten, and a run that does not finish removes the partial file. The `--report` JSON gains a `record_out` field naming the written path; reports from runs without the flag are unchanged, and `report_version` is unchanged.
 
+### Changed
+- The minimum supported Rust version is 1.95 (it was 1.93), and the release workflow builds with Rust 1.95.0. `cerulion_core` calls `try_update` on its atomics, the name Rust 1.95 stabilised and Rust 1.99 uses in place of the deprecated `fetch_update`; a workspace that denies warnings builds again under the current stable.
+
 ## [1.0.0] - 2026-09-21
 
 The first release of Cerulion. Its crates, binaries and Debian packages come from this tree.
