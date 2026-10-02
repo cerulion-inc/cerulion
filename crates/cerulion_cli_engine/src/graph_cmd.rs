@@ -36919,9 +36919,10 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     /// live) → the park arms via the LIVE AUTO (`monitor_wait` default), and the
     /// doorbell is then decided by the host's wake-word fact: HONOURED where a
     /// consumer can kernel-block on one (no downgrade warn, since the request was
-    /// granted), FORCED OFF with the loud-once downgrade warn where the ring is
-    /// a no-op stub. An explicit request is never silently ignored on either
-    /// side.
+    /// granted), FORCED OFF with the loud-once downgrade warn where nothing on
+    /// the run can kernel-block on a wake word (a target with none, macOS before
+    /// 14.4, the shared latch, or the kill switch). An explicit request is never
+    /// silently ignored on either side.
     #[test]
     #[tracing_test::traced_test]
     fn resolve_mw_unavailable_doorbell_requested_warns_downgrade_park_on() {

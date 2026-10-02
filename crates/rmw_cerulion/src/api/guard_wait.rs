@@ -1261,7 +1261,8 @@ fn park_horizon_from_env() -> ParkHorizon {
 
 /// Does a ring WAKE this wait's park on this target? Only on Linux, where the
 /// CPU monitor-wait primitive the park arms is watching the doorbell line the
-/// ring stores into. macOS maps a real doorbell page and a real wake word, but
+/// ring stores into; on a Linux host whose CPU carries no such primitive this
+/// wait takes [`ParkHorizon::NoPark`] anyway. macOS maps a real doorbell page and a real wake word, but
 /// this wait has no kernel block on that word, so a park here would trade the
 /// fd block's instant wake for a 100 µs recheck cadence and buy nothing; the
 /// macOS wake-word block is the native live loop's rung
