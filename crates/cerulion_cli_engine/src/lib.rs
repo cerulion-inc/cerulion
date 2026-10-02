@@ -124,6 +124,10 @@ pub mod replay_cmd;
 // transport).
 #[cfg(unix)]
 pub mod replay_engine;
+// The `--record-out` sink of `bag play --resim`: the re-executed frames, written
+// to a fresh bag. Unix-gated with the engine that feeds it.
+#[cfg(unix)]
+pub mod resim_record_out;
 // The `cerulion bag play --resim` SURFACE
 // over that engine — flag legality and the neutral-vs-`--verify` exit contract.
 // A verb layer only: it calls `replay_cmd::run_replay` and changes nothing

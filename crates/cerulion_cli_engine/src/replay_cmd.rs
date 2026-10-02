@@ -691,6 +691,14 @@ pub enum ReplayError {
         ranks: usize,
     },
 
+    /// The `--record-out` path was taken between the surface's check and the
+    /// engine's exclusive create. A usage error, never an overwrite. Exit 2.
+    #[error("`--record-out {path:?}` already exists; give it a path that does not")]
+    RecordOutExists {
+        /// The output path that already exists.
+        path: PathBuf,
+    },
+
     /// An unexpected internal failure (panic, transport, scheduler). Exit 5.
     #[error("internal replay error: {reason}")]
     Internal {
@@ -717,6 +725,7 @@ impl ReplayError {
             | ReplayError::RecordingInconsistent { .. }
             | ReplayError::SchemaDrift { .. }
             | ReplayError::StateRestore { .. }
+            | ReplayError::RecordOutExists { .. }
             // Both free-run refusals are "this bag is not
             // replay-grade FOR THIS BINARY" — the same class as the
             // trace-format version gate they sit beside, never a candidate
@@ -1282,6 +1291,10 @@ pub struct ReplayOptions {
     ///
     /// Inert on a from-start replay (nothing is restored there by design).
     pub strict_state: bool,
+    /// `--record-out PATH`: write the re-executed frames of every graph-produced
+    /// topic to a fresh bag here. `None` writes nothing. The path must not
+    /// exist; the surface refuses one that does.
+    pub record_out_path: Option<PathBuf>,
 }
 
 /// Run `cerulion bag play --resim` end-to-end against `bag`.
@@ -1300,6 +1313,20 @@ pub struct ReplayOptions {
 /// verdict is [`crate::replay_engine::render_verdict`].
 pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, ReplayError> {
     tracing::debug!(bag = ?bag, "replay: opening bag");
+
+    // One file cannot be both the `--report` JSON and the `--record-out` bag,
+    // whatever the two paths are spelled like. Checked at the engine boundary so
+    // no caller can have the report truncate the finished bag.
+    if let (Some(out), Some(rep)) = (&opts.record_out_path, &opts.report_path) {
+        if crate::resim_cmd::same_destination(out, rep) {
+            return Err(ReplayError::Internal {
+                reason: format!(
+                    "--record-out and --report name the same file ({})",
+                    out.display()
+                ),
+            });
+        }
+    }
 
     // 1. Open — read the whole file. Missing/unreadable → BagOpen (exit 2).
     let reader = BagReader::open(bag).map_err(|source| ReplayError::BagOpen {
@@ -1763,6 +1790,28 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
     //     problems reports the tolerance error first.
     detect_schema_drift(&reader, &recorded_messages, &config, &workspace_root)?;
 
+    // `--record-out`: the output copies each produced topic's channel from this
+    // bag's table, so read it while the reader is still here.
+    let record_out = opts
+        .record_out_path
+        .map(|path| {
+            let channels = reader
+                .channels()
+                .map_err(|source| ReplayError::BagOpen {
+                    path: bag.to_path_buf(),
+                    source,
+                })?
+                .into_iter()
+                .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
+                .collect();
+            Ok(crate::resim_record_out::RecordOutPlan {
+                path,
+                channels,
+                catalog: reader.schema_catalog(),
+            })
+        })
+        .transpose()?;
+
     let trace = replay_engine::RecordedTrace::new(reader);
     tracing::info!(
         bag = ?bag,
@@ -1786,6 +1835,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         tolerance,
         strict_state: opts.strict_state,
         ros2_entries_skipped,
+        record_out,
     };
     let nodes = ReplayNodes::Cdylib {
         workspace_root,
@@ -2608,6 +2658,12 @@ mod tests {
                     reason: "bad".to_string(),
                 },
                 4,
+            ),
+            (
+                ReplayError::RecordOutExists {
+                    path: PathBuf::from("/x.mcap"),
+                },
+                2,
             ),
             (
                 ReplayError::Internal {
