@@ -15614,7 +15614,7 @@ impl GraphRuntime {
     /// from this runtime. A step plan LONGER than the stage's derived rim is NOT
     /// one of them and is installed: its length is the recording's own read
     /// count and the rim counts RECORDS, which
-    /// [`crate::read_outcome::ReadPlanStage::install_step`] states in full.
+    /// `read_outcome::ReadPlanStage::install_step` states in full.
     // hot-path-alloc-ok-fn: cold relative to a step: one pass over the armed edges
     pub fn set_replay_read_plan(
         &mut self,

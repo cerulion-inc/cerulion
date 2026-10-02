@@ -515,7 +515,7 @@ pub struct ReadStageSizing {
 /// fold stores a run of identical reads as ONE record, this number is not a
 /// bound on a step's READS, and the replay gate's step plan, which carries one
 /// entry per read, is therefore NOT bounded by it
-/// ([`ReadPlanStage::install_step`]).
+/// (`ReadPlanStage::install_step`).
 ///
 /// **Frame-consuming records ≤ `site × depth`.** The queue yields at most its
 /// declared depth in one merge window (one merge per step), and a per-set
@@ -2785,7 +2785,7 @@ impl ReadPlanStage {
 /// ONE arm, because a poisoned gate is the only thing an install can refuse on:
 /// the plan's LENGTH is the recording's own, and a rim that counts records was
 /// never a ceiling for a count of reads (see
-/// [`ReadPlanStage::install_step`]). An enum rather than a unit type so a
+/// `ReadPlanStage::install_step`). An enum rather than a unit type so a
 /// second cause, if one is ever found, arrives without changing every caller's
 /// shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
