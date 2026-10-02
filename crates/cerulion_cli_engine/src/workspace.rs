@@ -135,7 +135,7 @@ pub fn workspace_init(location: &Path) -> CliResult<CerulionWorkspace> {
 ///    so the walk-up fails even though the repo is right where it was at
 ///    build time — and the generated workspace `Cargo.toml` would fall back
 ///    to broken relative paths, killing every `node_build` in it. The engine
-///    crate's baked `CARGO_MANIFEST_DIR` parent is the repo root at BUILD
+///    crate's baked `CARGO_MANIFEST_DIR` grandparent is the repo root at BUILD
 ///    time; it is valid whenever the binary runs on the machine it was built
 ///    on (developer machines, CI, tests) and is guarded by a runtime existence check.
 ///    Same `CARGO_TARGET_DIR` hazard class as cdylib resolution.
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn test_compile_time_base_candidate_returns_some_in_repo() {
-        // In-repo test run: the engine crate's CARGO_MANIFEST_DIR parent IS
+        // In-repo test run: the engine crate's CARGO_MANIFEST_DIR grandparent IS
         // the repo root, so the runtime existence guard holds by construction.
         let base = compile_time_base_candidate();
         assert!(
