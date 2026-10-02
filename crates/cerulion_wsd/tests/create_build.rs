@@ -413,9 +413,11 @@ async fn schema_create_returns_the_version_and_the_schema_is_listed() {
     assert!(!fixture.root.join("escape.yaml").exists());
     // A name with a colon, a newline or no characters would write a YAML key
     // that cannot be read.
-    for (offset, name) in ["foo: bar", "foo\nbar", "", "a b", "scan#1"]
-        .into_iter()
-        .enumerate()
+    for (offset, name) in [
+        "foo: bar", "foo\nbar", "", "a b", "scan#1", "123", "true", "null", "1e5",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let refused = call(
             &fixture.socket,

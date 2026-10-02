@@ -942,18 +942,32 @@ const STREAMING_STDERR_CAP: usize = 1024 * 1024;
 /// The longest stdout line kept; a longer one is dropped whole and replaced
 /// by [`DROPPED_MESSAGE_LINE`], so the client is told it is missing one.
 const STREAMING_LINE_CAP: usize = 1024 * 1024;
+/// How every compiler message line of `cargo --message-format=json` begins.
+const COMPILER_MESSAGE_HEAD: &[u8] = br#"{"reason":"compiler-message""#;
 /// What `on_message` gets in place of a cargo line over the cap: a compiler
 /// message in cargo's own JSON shape, with no span, saying what happened.
 pub const DROPPED_MESSAGE_LINE: &str = r#"{"reason":"compiler-message","message":{"level":"warning","message":"a compiler message over 1 MiB was left out; run `cerulion node build` for the full output","spans":[],"children":[],"code":null,"rendered":null}}"#;
 
+/// One stdout line from [`for_each_capped_line`].
+enum CappedLine<'a> {
+    Whole(&'a [u8]),
+    /// A line over the cap: only its first bytes are kept.
+    Dropped {
+        head: &'a [u8],
+    },
+}
+
+/// How much of a dropped line is kept, enough to read cargo's `reason` key.
+const DROPPED_HEAD_BYTES: usize = 64;
+
 /// Call `on_line` for each `\n` terminated line of `reader`, holding at most
 /// `cap` bytes of one line. A longer line is read to its end without being
-/// kept; `on_line` gets `None` once for it. A final line with no newline is
-/// delivered. Stops at the first read error.
+/// kept; `on_line` gets `Dropped` once for it, with its first bytes. A final
+/// line with no newline is delivered. Stops at the first read error.
 fn for_each_capped_line(
     mut reader: impl std::io::BufRead,
     cap: usize,
-    on_line: &mut dyn FnMut(Option<&[u8]>),
+    on_line: &mut dyn FnMut(CappedLine<'_>),
 ) {
     let mut line: Vec<u8> = Vec::new();
     let mut overflowed = false;
@@ -965,9 +979,9 @@ fn for_each_capped_line(
         };
         if available.is_empty() {
             if overflowed {
-                on_line(None);
+                on_line(CappedLine::Dropped { head: &line });
             } else if !line.is_empty() {
-                on_line(Some(&line));
+                on_line(CappedLine::Whole(&line));
             }
             return;
         }
@@ -975,20 +989,21 @@ fn for_each_capped_line(
             Some(at) => (&available[..at], true, at + 1),
             None => (available, false, available.len()),
         };
-        if !overflowed {
-            if line.len() + piece.len() > cap {
-                overflowed = true;
-                line.clear();
-            } else {
-                line.extend_from_slice(piece);
-            }
+        if overflowed || line.len() + piece.len() > cap {
+            overflowed = true;
+            // Past the cap only the head keeps growing, up to its own bound.
+            let room = DROPPED_HEAD_BYTES.saturating_sub(line.len());
+            line.extend_from_slice(&piece[..piece.len().min(room)]);
+            line.truncate(DROPPED_HEAD_BYTES);
+        } else {
+            line.extend_from_slice(piece);
         }
         reader.consume(consumed);
         if ends_line {
             if overflowed {
-                on_line(None);
+                on_line(CappedLine::Dropped { head: &line });
             } else {
-                on_line(Some(&line));
+                on_line(CappedLine::Whole(&line));
             }
             line.clear();
             overflowed = false;
@@ -1197,8 +1212,14 @@ fn run_cargo_streaming(
             BufReader::new(stdout),
             STREAMING_LINE_CAP,
             &mut |line| match line {
-                Some(line) => on_message(&String::from_utf8_lossy(line)),
-                None => on_message(DROPPED_MESSAGE_LINE),
+                CappedLine::Whole(line) => on_message(&String::from_utf8_lossy(line)),
+                // Cargo writes `reason` first. Only a compiler message is
+                // worth saying was left out; an oversized artifact or
+                // build-script record carried nothing the client shows.
+                CappedLine::Dropped { head } if head.starts_with(COMPILER_MESSAGE_HEAD) => {
+                    on_message(DROPPED_MESSAGE_LINE)
+                }
+                CappedLine::Dropped { .. } => {}
             },
         );
         // Closed stdout does not mean cargo is done (it can close the pipe and
@@ -1543,38 +1564,55 @@ fn remove_workspace_member(cargo_toml: &Path, node_type: &str) -> CliResult<()> 
 
 #[cfg(test)]
 mod tests {
-    /// Each delivered line, with `None` where an over-long line was dropped.
-    fn capped_lines(input: &[u8], cap: usize) -> Vec<Option<Vec<u8>>> {
+    /// Each delivered line, with the head of one that was dropped as `Err`.
+    fn capped_lines(input: &[u8], cap: usize) -> Vec<Result<Vec<u8>, Vec<u8>>> {
         let out = std::cell::RefCell::new(Vec::new());
         // A one byte buffer forces the line to span many fill_buf calls.
         for_each_capped_line(std::io::BufReader::with_capacity(1, input), cap, &mut |l| {
-            out.borrow_mut().push(l.map(<[u8]>::to_vec))
+            out.borrow_mut().push(match l {
+                CappedLine::Whole(bytes) => Ok(bytes.to_vec()),
+                CappedLine::Dropped { head } => Err(head.to_vec()),
+            })
         });
         out.into_inner()
     }
 
     #[test]
     fn capped_lines_split_on_newline_and_keep_a_final_unterminated_line() {
-        let some = |bytes: &[u8]| Some(bytes.to_vec());
+        let ok = |bytes: &[u8]| Ok(bytes.to_vec());
         assert_eq!(
             capped_lines(b"ab\n\ncd\nef", 16),
-            vec![some(b"ab"), some(b""), some(b"cd"), some(b"ef")]
+            vec![ok(b"ab"), ok(b""), ok(b"cd"), ok(b"ef")]
         );
         assert!(capped_lines(b"", 16).is_empty());
     }
 
     #[test]
-    fn capped_lines_report_an_over_long_line_and_keep_its_neighbours() {
-        let some = |bytes: &[u8]| Some(bytes.to_vec());
+    fn capped_lines_report_an_over_long_line_with_its_head_and_keep_its_neighbours() {
+        let ok = |bytes: &[u8]| Ok(bytes.to_vec());
+        let dropped = |bytes: &[u8]| Err(bytes.to_vec());
         assert_eq!(
             capped_lines(b"ok\n0123456789\nnext\n", 4),
-            vec![some(b"ok"), None, some(b"next")]
+            vec![ok(b"ok"), dropped(b"0123456789"), ok(b"next")]
         );
         // Exactly at the cap is kept; one past is reported.
-        assert_eq!(capped_lines(b"abcd\n", 4), vec![some(b"abcd")]);
-        assert_eq!(capped_lines(b"abcde\n", 4), vec![None]);
+        assert_eq!(capped_lines(b"abcd\n", 4), vec![ok(b"abcd")]);
+        assert_eq!(capped_lines(b"abcde\n", 4), vec![dropped(b"abcde")]);
         // An over-long unterminated tail is reported too.
-        assert_eq!(capped_lines(b"abcde", 4), vec![None]);
+        assert_eq!(capped_lines(b"abcde", 4), vec![dropped(b"abcde")]);
+        // The head is bounded.
+        let long = vec![b'z'; 1000];
+        let got = capped_lines(&long, 4);
+        assert_eq!(got, vec![Err(vec![b'z'; DROPPED_HEAD_BYTES])]);
+    }
+
+    #[test]
+    fn the_head_kept_of_a_dropped_line_tells_a_compiler_message_from_an_artifact() {
+        let message = br#"{"reason":"compiler-message","package_id":"x","message":{}}"#;
+        let artifact = br#"{"reason":"compiler-artifact","package_id":"x"}"#;
+        assert!(message.starts_with(COMPILER_MESSAGE_HEAD));
+        assert!(!artifact.starts_with(COMPILER_MESSAGE_HEAD));
+        assert!(DROPPED_HEAD_BYTES >= COMPILER_MESSAGE_HEAD.len());
     }
 
     #[test]

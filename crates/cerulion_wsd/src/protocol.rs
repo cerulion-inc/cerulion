@@ -523,7 +523,9 @@ fn dispatch(
         }
     }
     if let Request::SchemaCreate { spec, .. } = &request {
-        if !is_schema_name(&spec.name) {
+        if !is_schema_name(&spec.name)
+            || !cerulion_cli_engine::schema_cmd::schema_name_makes_a_string_key(&spec.name)
+        {
             return Err((id, "bad_request", "invalid schema name".to_string()));
         }
     }
@@ -666,7 +668,9 @@ fn request_node_type(request: &Request) -> Option<&str> {
 /// A schema name is the file stem and, PascalCased, the YAML key of the new
 /// file. It takes what `cerulion schema create` takes in practice: ASCII
 /// letters, digits, `_` and `-`, in any order. Anything else (a colon, a
-/// newline, a path separator) would write a key that cannot be read back.
+/// newline, a path separator) would write a key that cannot be read back, and
+/// so would a name that PascalCases to a number or a boolean (`123`, `true`),
+/// which the engine's `schema_name_makes_a_string_key` refuses.
 fn is_schema_name(value: &str) -> bool {
     !value.is_empty()
         && value
