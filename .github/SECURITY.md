@@ -10,9 +10,9 @@ reporting a vulnerability found on an older one.
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-A scheduled dependency audit opens one public issue naming already-public
-upstream advisory ids that the committed lockfile still carries, which is
-lockfile housekeeping on third-party crates and not a disclosure channel.
+A scheduled dependency audit opens one public issue naming the third-party
+crates it reports and any already-public advisory ids on them; it is not a
+disclosure channel.
 
 If you discover a security vulnerability in Cerulion, please report it responsibly:
 

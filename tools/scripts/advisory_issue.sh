@@ -3,13 +3,36 @@
 #
 #   tools/scripts/advisory_issue.sh <exit-status> <log-path>
 #
-# WHAT COUNTS AS A FINDING. `tools/release/deny.toml`'s `[advisories]` section
-# sets `version = 2` and `yanked = "warn"`: a vulnerability denies and the run
-# exits nonzero, while the unmaintained, unsound, notice and yanked classes emit
-# a `warning[<class>]` diagnostic and the run exits 0. THE RULE IMPLEMENTED HERE
-# READS BOTH: a finding is a nonzero exit status OR a log line matching
-# `warning[(unmaintained|unsound|notice|yanked)]`. An advisory listed in the
-# `ignore` table of that file emits no `warning[...]` line and is not a finding.
+# THE LOG IS cargo-deny's `--format json` output with both streams merged: one
+# JSON object per line. A diagnostic is `{"fields":{"code":...,"graphs":[...],
+# "labels":[...],"message":...,"severity":...},"type":"diagnostic"}`, and the
+# crate it is about is each `graphs[].Krate`. A check that ran to the end also
+# prints `{"fields":{"advisories":{...}},"type":"summary"}`; a tool error
+# arrives as `{"fields":{"level":"ERROR",...},"type":"log"}`. `jq` reads the
+# lines it can parse and skips the rest, so a plain-text line in the log never
+# ends the scan.
+#
+# WHAT COUNTS AS A FINDING. cargo-deny 0.20.2 under `tools/release/deny.toml`'s
+# `[advisories] version = 2`:
+#
+#   vulnerability, unmaintained, unsound, notice   `error[<class>]`, and the
+#                                                  check exits nonzero
+#   yanked, which `yanked = "warn"` holds at       `warning[yanked]`, and the
+#   warn level                                     check exits 0
+#   an id in the `ignore` table                    a `note`, which the default
+#                                                  `--log-level warn` keeps out
+#                                                  of the log altogether
+#
+# A FINDING IS A DIAGNOSTIC AT ERROR OR WARNING SEVERITY whose class is one of
+# those five. Reading the log rather than the exit status alone is what catches
+# a yanked crate, which exits 0; the severity bound is what keeps an advisory
+# accepted in the `ignore` table out.
+#
+# A NONZERO EXIT CARRYING NO SUCH DIAGNOSTIC IS A TOOL FAILURE, not a finding:
+# `cargo metadata` failed, the advisory database would not fetch, the index
+# cache would not load (`error[index-cache-load-failure]`). The script then
+# writes nothing, leaves an open issue exactly as it stands, and exits 3 with a
+# message naming the run URL, so the run that carries it goes red.
 #
 # WHAT IT WRITES. One issue carries the result. It is found among the open
 # issues labelled `security` by the exact title in TITLE below.
@@ -19,23 +42,36 @@
 #   clean, one such issue     comment the commit the check passed on, then close it
 #   clean, no such issue      no write at all
 #
-# REFUSALS, exit 2 with one message each: `gh` is unauthenticated; the
-# repository carries no `security` label; `gh` refused a listing; two open
-# issues carry the title. The unauthenticated check runs FIRST, so the
-# label-missing message never stands in for a token that cannot read.
+# The body names the crate and version behind every diagnostic it reports,
+# beside any `RUSTSEC-` id on that diagnostic: a yanked crate carries no
+# advisory id, so its name is the only handle on it.
+#
+# REFUSALS, exit 2 with one message each: `jq` is absent; `jq` could not read
+# the log; `gh` is unauthenticated; the repository carries no `security` label;
+# `gh` refused a listing; two open issues carry the title. The unauthenticated
+# check runs FIRST of the three `gh` ones, so the label-missing message never
+# stands in for a token that cannot read.
 #
 # ENVIRONMENT. `GH_TOKEN` is read by `gh` itself. `GITHUB_SERVER_URL`,
 # `GITHUB_REPOSITORY`, `GITHUB_RUN_ID` and `GITHUB_SHA` build the run URL and
-# name the lockfile commit; `GH_REPO` stands in for `GITHUB_REPOSITORY`.
+# name the lockfile commit; `GH_REPO` stands in for `GITHUB_REPOSITORY`. The
+# scheduled run that calls this runs on the public default branch, so the
+# `GITHUB_SHA` the body quotes is a public commit.
 #
 # Oracle: tools/scripts/test_advisory_issue.sh.
 
 set -euo pipefail
 
-TITLE='Dependency advisory audit fails on the committed lockfile'
+TITLE='Dependency advisory audit reports a finding on the committed lockfile'
 LABEL=security
-WARN_CLASSES='warning\[(unmaintained|unsound|notice|yanked)\]'
 POLICY='tools/release/deny.toml'
+CHECK="cargo deny --format json --config ${POLICY} check advisories"
+# The five advisory classes this check reports. `yanked` is the one deny.toml
+# holds at warn level; the other four are errors under `version = 2`.
+CLASSES='["vulnerability","unmaintained","unsound","notice","yanked"]'
+# One body row per reported diagnostic, bounded: a pathological log must not
+# push the body past what `gh issue create` accepts.
+MAX_ROWS=50
 
 die() {
     printf 'advisory_issue: %s\n' "$1" >&2
@@ -58,6 +94,53 @@ commit=${GITHUB_SHA:-}
 [ -n "$run_id" ] || die 'GITHUB_RUN_ID is empty: the body would carry no run URL' 2
 [ -n "$commit" ] || die 'GITHUB_SHA is empty: the body would name no lockfile commit' 2
 run_url="${server}/${repository}/actions/runs/${run_id}"
+
+command -v jq >/dev/null 2>&1 ||
+    die 'jq is not on PATH: the cargo-deny JSON log cannot be read without it' 2
+
+rows_file=$(mktemp "${TMPDIR:-/tmp}/advisory-rows.XXXXXX")
+jq_err_file=$(mktemp "${TMPDIR:-/tmp}/advisory-jq-err.XXXXXX")
+body_file=$(mktemp "${TMPDIR:-/tmp}/advisory-issue.XXXXXX")
+trap 'rm -f "$rows_file" "$jq_err_file" "$body_file"' EXIT
+
+# One tab-separated row per reported diagnostic: severity, class, crates, ids,
+# message. `fromjson?` drops a line that is not JSON instead of ending the scan.
+# The id scan reads the whole diagnostic, which is where cargo-deny puts the id:
+# `notes[0]` is `ID: RUSTSEC-...` on every advisory diagnostic, and the
+# `advisory` object `--format json` attaches repeats it.
+# shellcheck disable=SC2016  # a jq program, not a shell expansion
+jq_rows='
+fromjson?
+| select(.type == "diagnostic")
+| .fields as $f
+| select($f.severity == "error" or $f.severity == "warning")
+| select($f.code != null and ($classes | index($f.code)) != null)
+| [ $f.severity,
+    $f.code,
+    ([$f.graphs[]? | .Krate | "\(.name) \(.version)"] | unique | join(", ")),
+    ([tojson | scan("RUSTSEC-[0-9]{4}-[0-9]{4}")] | unique | join(", ")),
+    (($f.message // "") | gsub("[[:space:]]+"; " "))
+  ]
+| @tsv
+'
+if ! jq -R -r --argjson classes "$CLASSES" "$jq_rows" "$log" \
+    > "$rows_file" 2> "$jq_err_file"; then
+    die "jq could not read ${log}: $(tr '\n' ' ' < "$jq_err_file")" 2
+fi
+row_count=$(awk 'END { print NR + 0 }' "$rows_file")
+
+# A verdict needs at least one advisory diagnostic to rest on. Checked before
+# any `gh` call, so this path writes nothing at all.
+if [ "$row_count" -eq 0 ] && [ "$status" -ne 0 ]; then
+    die "cargo deny exited ${status} and its log carries no advisory diagnostic: the check did not complete, so no issue was written. Run: ${run_url}" 3
+fi
+
+# The reported diagnostics, printed where the step log shows them beside the
+# cargo-deny JSON they came from.
+if [ "$row_count" -gt 0 ]; then
+    printf 'advisory_issue: %s reported diagnostic(s)\n' "$row_count"
+    awk -F'\t' '{ printf "advisory_issue:   %s[%s] %s\n", $1, $2, $3 }' "$rows_file"
+fi
 
 # An unauthenticated `gh` fails every call below with the same shape as a
 # missing label, so the token is checked on its own first.
@@ -88,38 +171,32 @@ done <<< "$listing"
 [ "$count" -le 1 ] ||
     die "issues ${matches} all carry the title \"${TITLE}\": one issue carries this result" 2
 
-finding=0
-[ "$status" -eq 0 ] || finding=1
-
-# `grep` exits 1 on no match and 2 or more on a read error. Collapsing the two
-# would report a log it never scanned as carrying no warning, so the status is
-# read: 1 leaves the verdict alone, anything above it refuses.
-warn_status=0
-grep -Eq "$WARN_CLASSES" "$log" || warn_status=$?
-[ "$warn_status" -le 1 ] ||
-    die "grep exited ${warn_status} on ${log}: the warn-level classes went unscanned" 2
-[ "$warn_status" -ne 0 ] || finding=1
-
-id_status=0
-ids_found=$(grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' "$log") || id_status=$?
-[ "$id_status" -le 1 ] ||
-    die "grep exited ${id_status} on ${log}: the advisory ids went unread" 2
-ids=$(printf '%s\n' "$ids_found" | LC_ALL=C sort -u | paste -sd, - | sed 's/,/, /g')
-
-body_file=$(mktemp "${TMPDIR:-/tmp}/advisory-issue.XXXXXX")
-trap 'rm -f "$body_file"' EXIT
-
-if [ "$finding" -eq 1 ]; then
+if [ "$row_count" -gt 0 ]; then
+    error_rows=$(awk -F'\t' '$1 == "error" { n++ } END { print n + 0 }' "$rows_file")
+    warn_rows=$(awk -F'\t' '$1 == "warning" { n++ } END { print n + 0 }' "$rows_file")
+    classes_fired=
+    if [ "$error_rows" -gt 0 ]; then
+        classes_fired="${error_rows} advisory diagnostic(s) failed the check (\`error[...]\`)"
+    fi
+    if [ "$warn_rows" -gt 0 ]; then
+        classes_fired="${classes_fired}${classes_fired:+; }${warn_rows} yanked crate(s) warned (\`warning[yanked]\`, which does not fail the check)"
+    fi
     {
-        printf '%s\n\n' "\`cargo deny --config ${POLICY} check advisories\` reports a finding against the lockfile committed at \`${commit}\`."
-        if [ -n "$ids" ]; then
-            printf 'Advisory ids in the run log: %s\n\n' "$ids"
-        else
-            printf '%s\n\n' 'The run log names no advisory id. Read the run for the diagnostics it printed.'
-        fi
+        printf '%s\n\n' "\`${CHECK}\` reports a finding against the lockfile committed at \`${commit}\`, and exited ${status}."
+        printf '%s.\n\n' "$classes_fired"
+        awk -F'\t' -v max="$MAX_ROWS" '
+            NR <= max {
+                crates = ($3 == "" ? "(the log names no crate)" : $3)
+                row = "* `" $1 "[" $2 "]` " crates
+                if ($4 != "") { row = row ", " $4 }
+                print row ": " $5
+            }
+            END { if (NR > max) { printf "* and %d more, in the run log.\n", NR - max } }
+        ' "$rows_file"
+        printf '\n'
         printf 'Run: %s\n\n' "$run_url"
-        printf '%s\n\n' "\`${POLICY}\` is the policy this check and the per-change dependency audit both read: a vulnerability fails the check, and the unmaintained, unsound, notice and yanked classes are warnings that this issue reports as well. An advisory accepted in the \`ignore\` table of that file is not reported here."
-        printf '%s\n' "Every id above is already public in the RustSec database and names a third-party crate. A vulnerability in Cerulion itself goes to the address in \`.github/SECURITY.md\`, not here."
+        printf '%s\n\n' "\`${POLICY}\` is the policy this check and the per-change dependency audit both read: a vulnerability, unmaintained, unsound or notice advisory fails the check, and a yanked crate warns and is reported here as well. An advisory accepted in the \`ignore\` table of that file renders below warn level and is not reported here."
+        printf '%s\n' "Every crate named above is a third-party dependency of this workspace, and every \`RUSTSEC-\` id above is already public in the RustSec database. A vulnerability in Cerulion itself goes to the address in \`.github/SECURITY.md\`, not here."
     } > "$body_file"
     if [ "$count" -eq 0 ]; then
         gh issue create --title "$TITLE" --label "$LABEL" --body-file "$body_file"
@@ -137,7 +214,7 @@ if [ "$count" -eq 0 ]; then
 fi
 
 {
-    printf '%s\n\n' "\`cargo deny --config ${POLICY} check advisories\` passes on the lockfile committed at \`${commit}\`, with no advisory warning in the run log."
+    printf '%s\n\n' "\`${CHECK}\` exited 0 on the lockfile committed at \`${commit}\`, and its log carries no \`warning[yanked]\` and no \`error[...]\` advisory diagnostic."
     printf 'Run: %s\n' "$run_url"
 } > "$body_file"
 gh issue comment "$matches" --body-file "$body_file"

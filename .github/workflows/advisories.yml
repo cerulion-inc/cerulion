@@ -13,9 +13,12 @@ name: Advisory audit (cargo-deny, scheduled)
 #
 # So the advisories check runs here on a schedule against the default branch,
 # and `tools/scripts/advisory_issue.sh` records the result on ONE issue carrying
-# the `security` label that `.github/labels.yml` declares. That script also
-# reads the `warning[...]` classes `tools/release/deny.toml` leaves at warn
-# level, which exit 0 and are therefore invisible to the exit status alone.
+# the `security` label that `.github/labels.yml` declares. That script reads the
+# log as well as the exit status, because the classes do not all land the same
+# way: a vulnerability, unmaintained, unsound or notice advisory is
+# `error[<class>]` and exits nonzero, while the yanked class
+# `tools/release/deny.toml` holds at warn level is `warning[yanked]` and exits 0,
+# so the exit status alone would pass over a yanked crate.
 #
 # Licences, bans and sources stay out of this run: every path into `main`
 # already checks them, and they move only when a file in the checkout moves.
@@ -64,23 +67,33 @@ jobs:
           install -m 0755 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.cargo/bin/cargo-deny"
           cargo deny --version
 
-      # No `-e`: the exit status is the verdict the next step reads, so it is
-      # captured into an output instead of ending the job. Both streams go to
-      # the log file the next step parses, and `cat` puts them in the run log.
+      # `shell: bash` runs this under `bash --noprofile --norc -eo pipefail`, so
+      # errexit is on and a nonzero cargo-deny would end the step right here:
+      # the `|| status=$?` capture is what keeps the step alive and turns the
+      # exit status into the output the next step reads. `--format json` is what
+      # that step parses, one JSON object per line naming each diagnostic's
+      # severity, class, affected crate and message, so the crate names in the
+      # issue body are read rather than scraped out of prose. Both streams go to
+      # the log file, and `cat` puts that same JSON in the run log, which is
+      # readable as it stands because it carries the message text: a second
+      # `--format human` run would resolve the RustSec database again and could
+      # print a different reading from the one the verdict came from.
       - name: Check advisories
         id: audit
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           status=0
-          cargo deny --config tools/release/deny.toml check advisories \
+          cargo deny --format json --config tools/release/deny.toml check advisories \
             > "$RUNNER_TEMP/advisories.log" 2>&1 || status=$?
           cat "$RUNNER_TEMP/advisories.log"
           echo "status=${status}" >> "$GITHUB_OUTPUT"
 
       # `GH_TOKEN` is the run's own token, scoped by the `issues: write`
       # permission above. The status reaches the script through `env`, not
-      # through an expression expanded into the shell.
+      # through an expression expanded into the shell. The script reads the JSON
+      # log with `jq`, which the ubuntu runner image carries; it refuses with a
+      # message of its own if `jq` is ever absent.
       - name: Record the result on one issue
         shell: bash
         env:

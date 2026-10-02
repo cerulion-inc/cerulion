@@ -505,40 +505,63 @@ regression script.
 
 ## Scheduled workflows
 
-Four workflows run on a clock rather than on a change, and none of them reports a
-required status context: `.github/workflows/moveit-hero.yml` at 03:43 UTC builds the
-ROS 2 Jazzy MoveIt image and runs the hero demo, `.github/workflows/advisories.yml`
-at 04:37 UTC runs the dependency advisory check, `.github/workflows/stale.yml` at
-07:17 UTC labels and closes `needs-info` items, and
-`.github/workflows/examples-replay.yml` at 07:30 UTC runs the replay-tolerance demo.
-Every minute is off the hour, where GitHub queues the world's hourly crons at once.
+Four workflows run on a clock, and none of them reports a required status context.
+Three of the four run on nothing but the clock and a manual dispatch:
+`.github/workflows/moveit-hero.yml` at 03:43 UTC builds the ROS 2 Jazzy MoveIt image
+and runs the hero demo, `.github/workflows/advisories.yml` at 04:37 UTC runs the
+dependency advisory check, and `.github/workflows/stale.yml` at 07:17 UTC labels and
+closes `needs-info` items. The fourth, `.github/workflows/examples-replay.yml`, runs
+the replay-tolerance demo at 07:30 UTC and ALSO on a push to `main` and on a pull
+request, both path-filtered to `examples/perception/**` and its own file, so for that
+one the clock is the second trigger rather than the only one: it is what notices a
+change outside the filter breaking the demo. Every minute is off the hour, where
+GitHub queues the world's hourly crons at once.
 
-`advisories.yml` runs `cargo deny --config tools/release/deny.toml check advisories`
-and nothing else. Licences, bans and sources are decided by `Cargo.lock` and
-`tools/release/deny.toml` together, and an edit to either is a push the per-change
-`Dependency Audit (cargo-deny)` job reads. Advisories are decided by the RustSec
-database, which `tools/release/deny.toml` does not pin, so an advisory published
-after the last push matches a lockfile nobody has edited and no event `ci.yml`
-triggers on fires.
+`advisories.yml` runs `cargo deny --format json --config tools/release/deny.toml
+check advisories` and nothing else. Licences, bans and sources are decided by
+`Cargo.lock` and `tools/release/deny.toml` together, and an edit to either is a push
+the per-change `Dependency Audit (cargo-deny)` job reads. Advisories are decided by
+the RustSec database, which `tools/release/deny.toml` does not pin, so an advisory
+published after the last push matches a lockfile nobody has edited and no event
+`ci.yml` triggers on fires.
 
 `tools/scripts/advisory_issue.sh` turns the result into one write on ONE issue,
-found among the open issues labelled `security` by an exact title. A finding opens
-that issue or rewrites its body; a clean run comments the commit the check passed on
-and closes it; a clean run with no such issue open writes nothing. A finding is a
-nonzero cargo-deny status OR a `warning[unmaintained|unsound|notice|yanked]` line in
-the captured log: `tools/release/deny.toml` leaves those four classes at warn level
-and they exit 0, so the status alone sees only a denied vulnerability. The script
-refuses with exit 2 and writes nothing when `gh` is unauthenticated, when the
-repository carries no `security` label, when `gh` refuses a listing, and when two
-open issues carry the title. Its oracle is `tools/scripts/test_advisory_issue.sh`:
-nine cases against a `gh` shim that records every call, run as a step of `lint`.
+found among the open issues labelled `security` by the exact title `Dependency
+advisory audit reports a finding on the committed lockfile`. A finding opens that
+issue or rewrites its body; a clean run comments the commit the check passed on and
+closes it; a clean run with no such issue open writes nothing.
 
-A `schedule` trigger fires only from the default branch, and the `workflow_dispatch`
-button appears only for a workflow already on it, so neither trigger runs on a pull
-request branch. The pre-merge proof of a scheduled workflow is actionlint, the cache
-save policy checker and the script self-test; the first run of the trigger itself is
-on `main`. GitHub also disables scheduled workflows on a repository after 60 days
-with no commit.
+A finding is a diagnostic in the captured JSON log, at error or warning severity,
+whose class is one of `vulnerability`, `unmaintained`, `unsound`, `notice` and
+`yanked`. Under `tools/release/deny.toml`'s `[advisories] version = 2`, cargo-deny
+0.20.2 reports the first four as `error[<class>]` and exits nonzero; `yanked = "warn"`
+makes the fifth `warning[yanked]` on exit 0; and an advisory accepted in that file's
+`ignore` table drops to `note`, which the default `--log-level warn` keeps out of the
+log. So the exit status alone would pass over a yanked crate, which is why the log is
+read, and the severity bound is what keeps an accepted advisory from being reported.
+The body names the crate and version behind every diagnostic beside any `RUSTSEC-` id
+on it: the yanked class carries no advisory id, so the crate name is the only handle
+on it.
+
+A nonzero exit carrying no such diagnostic is a tool failure rather than a finding:
+`cargo metadata` failed, the advisory database would not fetch, the index cache would
+not load. The script then writes nothing, leaves an open issue exactly as it stands,
+and exits 3 with the run URL in its message, so the Actions run goes red instead of
+the lockfile being named for a check that never completed. It refuses with exit 2 and
+writes nothing when `jq` is absent or cannot read the log, when `gh` is
+unauthenticated, when the repository carries no `security` label, when `gh` refuses a
+listing, and when two open issues carry the title. Its oracle is
+`tools/scripts/test_advisory_issue.sh`: twelve cases over JSON log fixtures against a
+`gh` shim that records every call, run as a step of `lint`.
+
+A `schedule` trigger fires only from the default branch, so a pull request branch's
+copy of one of these workflows never runs on the clock. `workflow_dispatch` is not
+the same: the button appears only once the file is on the default branch, and from
+there a dispatch runs the copy on whichever ref it names, a pull request branch
+included. Until the file lands, the pre-merge proof of a scheduled workflow is
+actionlint, the cache save policy checker and the script self-test; the first run on
+the clock is on `main`. GitHub also disables scheduled workflows on a repository
+after 60 days with no commit.
 
 ## The cache save policy (`CACHE_SAVE_*` in `ci.yml`)
 

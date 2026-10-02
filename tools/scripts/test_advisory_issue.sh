@@ -8,11 +8,20 @@
 # behaviour; the first failing assertion prints one `FAIL:` line and exits 1.
 # The case count is asserted against CASES_EXPECTED at the end: a case deleted
 # or never reached fails the run rather than passing quietly.
-# Portable: bash 3.2+, GNU and BSD userland. No network.
+#
+# Every log fixture is cargo-deny 0.20.2 `--format json` output: one JSON object
+# per line, keys in the order serde_json writes them. The yanked diagnostic is
+# the line a real run printed against the committed lockfile; the rest are built
+# to the same serializer's shape, and each says what in it is not from a run.
+# Portable: bash 3.2+, GNU and BSD userland. Needs `jq`. No network.
+#
+# The fixtures below, and the strings asserted against them, quote cargo-deny
+# output that carries backticks. None of it is a shell expansion.
+# shellcheck disable=SC2016
 
 set -euo pipefail
 
-CASES_EXPECTED=9
+CASES_EXPECTED=12
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-advisory-issue-test.XXXXXX")
@@ -38,6 +47,8 @@ fail() {
     fi
     exit 1
 }
+
+command -v jq >/dev/null 2>&1 || fail 'jq is not on PATH: advisory_issue.sh reads the JSON log with it'
 
 shim_bin="$workdir/bin"
 mkdir -p "$shim_bin"
@@ -83,7 +94,7 @@ chmod 0755 "$shim_bin/gh"
 printf '%s\n' bug documentation security pinned > "$workdir/labels_with_security"
 printf '%s\n' bug documentation pinned > "$workdir/labels_without_security"
 
-TITLE='Dependency advisory audit fails on the committed lockfile'
+TITLE='Dependency advisory audit reports a finding on the committed lockfile'
 : > "$workdir/issues_none"
 # The matching row is NOT last: the title loop must select it wherever it sits.
 {
@@ -95,21 +106,50 @@ TITLE='Dependency advisory audit fails on the committed lockfile'
     printf '%s\t%s\n' 91 "$TITLE"
 } > "$workdir/issues_two"
 
-# A clean advisories run: the trailing summary and no diagnostic.
-printf '%s\n' 'advisories ok' > "$workdir/log_clean"
-# A denied vulnerability: nonzero exit, two ids, one of them twice.
+# A clean run: the trailing summary, no diagnostic, exit 0.
+printf '%s\n' '{"fields":{"advisories":{"errors":0,"helps":0,"notes":0,"warnings":0}},"type":"summary"}' > "$workdir/log_clean"
+
+# A yanked crate. The diagnostic line is what a run of
+# `cargo deny --format json --config tools/release/deny.toml check advisories`
+# printed against the committed lockfile, with the `graphs[0].parents` chain
+# dropped so the line fits here; a crate reached directly carries this shape.
+# `yanked = "warn"` is why it is `warning` and why the run still exited 0.
 {
-    printf '%s\n' 'error[vulnerability]: a crate in the lockfile is vulnerable'
-    printf '%s\n' '    = ID: RUSTSEC-2026-0101'
-    printf '%s\n' '    = ID: RUSTSEC-2026-0101'
-    printf '%s\n' '    = ID: RUSTSEC-2026-0007'
-    printf '%s\n' 'advisories FAILED'
-} > "$workdir/log_vulnerability"
-# A warn-only class: exit 0, and no id on the line cargo-deny prints for it.
+    printf '%s\n' '{"fields":{"code":"yanked","graphs":[{"Krate":{"name":"chacha20","version":"0.10.1"}}],"labels":[{"column":1,"line":128,"message":"yanked version","span":"chacha20 0.10.1 registry+https://github.com/rust-lang/crates.io-index"}],"message":"detected yanked crate (try `cargo update -p chacha20`)","severity":"warning"},"type":"diagnostic"}'
+    printf '%s\n' '{"fields":{"advisories":{"errors":0,"helps":0,"notes":6,"warnings":1}},"type":"summary"}'
+} > "$workdir/log_yanked"
+
+# Two advisories that failed the check: `error[<class>]` under `version = 2`,
+# and a nonzero exit. The ids here are not real RustSec ids, and the `advisory`
+# object a run also attaches to such a diagnostic is left out: the rule reads
+# severity, class, crate and id, and `notes[0]` carries the id on every one.
 {
-    printf '%s\n' 'warning[yanked]: detected yanked crate (try cargo update -p chacha20)'
-    printf '%s\n' 'advisories ok'
-} > "$workdir/log_warning_only"
+    printf '%s\n' '{"fields":{"code":"vulnerability","graphs":[{"Krate":{"name":"mio","version":"0.6.23"}}],"labels":[{"column":1,"line":512,"message":"security vulnerability detected","span":"mio 0.6.23 registry+https://github.com/rust-lang/crates.io-index"}],"message":"a fixture vulnerability title","notes":["ID: RUSTSEC-2026-0101","Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0101","A fixture description.","Solution: No safe upgrade is available!"],"severity":"error"},"type":"diagnostic"}'
+    printf '%s\n' '{"fields":{"code":"unmaintained","graphs":[{"Krate":{"name":"mio-extras","version":"2.0.6"}}],"labels":[{"column":1,"line":517,"message":"unmaintained advisory detected","span":"mio-extras 2.0.6 registry+https://github.com/rust-lang/crates.io-index"}],"message":"a fixture unmaintained title","notes":["ID: RUSTSEC-2026-0007","Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0007","A fixture description.","Solution: No safe upgrade is available!"],"severity":"error"},"type":"diagnostic"}'
+    printf '%s\n' '{"fields":{"advisories":{"errors":2,"helps":0,"notes":0,"warnings":0}},"type":"summary"}'
+} > "$workdir/log_errors"
+
+# An advisory accepted in deny.toml's `ignore` table. Its own diagnostic drops
+# to `note` severity and a second `note` records the ignore, which is why the
+# default `--log-level warn` prints neither; both are here so the severity bound
+# is exercised rather than assumed. Synthetic id, exit 0.
+{
+    printf '%s\n' '{"fields":{"code":"advisory-ignored","graphs":[{"Krate":{"name":"paste","version":"1.0.15"}}],"labels":[{"column":7,"line":36,"message":"advisory ignored here","span":"RUSTSEC-2026-0042"},{"column":48,"line":36,"message":"ignore reason","span":"a fixture reason"}],"message":"advisory ignored","severity":"note"},"type":"diagnostic"}'
+    printf '%s\n' '{"fields":{"code":"unmaintained","graphs":[{"Krate":{"name":"paste","version":"1.0.15"}}],"labels":[{"column":1,"line":1104,"message":"unmaintained advisory detected","span":"paste 1.0.15 registry+https://github.com/rust-lang/crates.io-index"}],"message":"a fixture unmaintained title","notes":["ID: RUSTSEC-2026-0042","Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0042","A fixture description.","Solution: No safe upgrade is available!"],"severity":"note"},"type":"diagnostic"}'
+    printf '%s\n' '{"fields":{"advisories":{"errors":0,"helps":0,"notes":2,"warnings":0}},"type":"summary"}'
+} > "$workdir/log_ignored"
+
+# cargo-deny could not run at all. Under `--format json` its own log goes out as
+# JSON too, with an upper-case level, and a run that died before the check
+# prints no diagnostic and no summary.
+printf '%s\n' '{"fields":{"level":"ERROR","message":"failed to fetch advisory database: Could not resolve host: github.com","timestamp":"2026-10-02T04:37:11.481293Z"},"type":"log"}' > "$workdir/log_tool_failure"
+
+# A nonzero exit whose only error is cargo-deny's own: it counts against the
+# advisories check, so the status is nonzero, and its class is not an advisory.
+{
+    printf '%s\n' '{"fields":{"code":"index-cache-load-failure","graphs":[],"message":"failed to load index cache","notes":["No such file or directory (os error 2)"],"severity":"error"},"type":"diagnostic"}'
+    printf '%s\n' '{"fields":{"advisories":{"errors":1,"helps":0,"notes":0,"warnings":0}},"type":"summary"}'
+} > "$workdir/log_index_failure"
 
 # run_case <name> <status> <log>; FAKE_GH_* may be set on the call to override a
 # fixture. Leaves $output, $status and the recorded calls and bodies in $case_dir.
@@ -172,25 +212,34 @@ expect_no_writes() {
     return 0
 }
 
-# --- a denied vulnerability with no issue open opens one -------------------
-run_case create 1 "$workdir/log_vulnerability"
+expect_no_gh_at_all() {
+    [ -s "$case_dir/calls" ] &&
+        fail "$case_name: gh was called and must not be"
+    return 0
+}
+
+# --- advisories that failed the check, with no issue open, open one ---------
+run_case create 1 "$workdir/log_errors"
 expect_status 0
 expect_output 'opened the issue carrying the advisory result'
 expect_call "issue create --title $TITLE --label security --body-file"
 expect_no_call 'issue edit'
-expect_body "reports a finding against the lockfile committed at \`0123456789abcdef0123456789abcdef01234567\`"
-expect_body 'Advisory ids in the run log: RUSTSEC-2026-0007, RUSTSEC-2026-0101'
+expect_body "reports a finding against the lockfile committed at \`0123456789abcdef0123456789abcdef01234567\`, and exited 1."
+expect_body '2 advisory diagnostic(s) failed the check (`error[...]`).'
+expect_body '* `error[vulnerability]` mio 0.6.23, RUSTSEC-2026-0101: a fixture vulnerability title'
+expect_body '* `error[unmaintained]` mio-extras 2.0.6, RUSTSEC-2026-0007: a fixture unmaintained title'
 expect_body 'Run: https://github.invalid/owner/repo/actions/runs/5150'
+expect_body 'a vulnerability, unmaintained, unsound or notice advisory fails the check'
 expect_body "A vulnerability in Cerulion itself goes to the address in \`.github/SECURITY.md\`"
-printf '%s\n' 'a finding with no issue open creates one: passed'
+printf '%s\n' 'advisories that failed the check open the issue: passed'
 
 # --- the same finding with the issue already open rewrites its body --------
-FAKE_GH_ISSUES="$workdir/issues_one" run_case update 1 "$workdir/log_vulnerability"
+FAKE_GH_ISSUES="$workdir/issues_one" run_case update 1 "$workdir/log_errors"
 expect_status 0
 expect_output 'rewrote the body of issue 42'
 expect_call 'issue edit 42 --body-file'
 expect_no_call 'issue create'
-expect_body 'Advisory ids in the run log: RUSTSEC-2026-0007, RUSTSEC-2026-0101'
+expect_body '* `error[vulnerability]` mio 0.6.23, RUSTSEC-2026-0101'
 printf '%s\n' 'a finding with the issue open rewrites its body: passed'
 
 # --- a clean run with the issue open comments the commit and closes it -----
@@ -199,7 +248,8 @@ expect_status 0
 expect_output 'closed issue 42'
 expect_call 'issue comment 42 --body-file'
 expect_call 'issue close 42'
-expect_body "passes on the lockfile committed at \`0123456789abcdef0123456789abcdef01234567\`"
+expect_body "exited 0 on the lockfile committed at \`0123456789abcdef0123456789abcdef01234567\`"
+expect_body 'carries no `warning[yanked]` and no `error[...]` advisory diagnostic'
 expect_body 'Run: https://github.invalid/owner/repo/actions/runs/5150'
 printf '%s\n' 'a clean run closes the open issue: passed'
 
@@ -211,17 +261,44 @@ expect_no_writes
 expect_call 'issue list --state open --label security'
 printf '%s\n' 'a clean run with no issue open writes nothing: passed'
 
-# --- a warn-only class on exit 0 is still a finding ------------------------
-# This is the whole reason the status alone is not the rule: `yanked` warns.
-run_case warning_only 0 "$workdir/log_warning_only"
+# --- a yanked crate on exit 0 is still a finding, and is named -------------
+# This is the whole reason the exit status alone is not the rule: yanked warns.
+run_case yanked 0 "$workdir/log_yanked"
 expect_status 0
 expect_output 'opened the issue carrying the advisory result'
 expect_call "issue create --title $TITLE --label security --body-file"
-expect_body 'The run log names no advisory id'
-printf '%s\n' 'a warning-only log on exit 0 opens the issue: passed'
+expect_body "reports a finding against the lockfile committed at \`0123456789abcdef0123456789abcdef01234567\`, and exited 0."
+expect_body '1 yanked crate(s) warned (`warning[yanked]`, which does not fail the check).'
+expect_body '* `warning[yanked]` chacha20 0.10.1: detected yanked crate'
+printf '%s\n' 'a yanked crate on exit 0 opens the issue and is named: passed'
+
+# --- an advisory accepted in the ignore table is not a finding -------------
+# Both of its diagnostics sit below warn level, so neither can carry a verdict.
+run_case accepted 0 "$workdir/log_ignored"
+expect_status 0
+expect_output 'nothing to write'
+expect_no_writes
+printf '%s\n' 'an accepted advisory is not a finding: passed'
+
+# --- a nonzero exit with no advisory diagnostic writes nothing -------------
+# The open issue stays exactly as it is, and the message names the run.
+FAKE_GH_ISSUES="$workdir/issues_one" run_case tool_failure 1 "$workdir/log_tool_failure"
+expect_status 3
+expect_output 'cargo deny exited 1 and its log carries no advisory diagnostic'
+expect_output 'no issue was written'
+expect_output 'Run: https://github.invalid/owner/repo/actions/runs/5150'
+expect_no_gh_at_all
+printf '%s\n' 'a nonzero exit with no advisory diagnostic writes nothing: passed'
+
+# --- a nonzero exit carrying only cargo-deny's own error does the same -----
+FAKE_GH_ISSUES="$workdir/issues_one" run_case index_failure 1 "$workdir/log_index_failure"
+expect_status 3
+expect_output 'the check did not complete'
+expect_no_gh_at_all
+printf '%s\n' "cargo-deny's own error is not an advisory finding: passed"
 
 # --- a repository without the label refuses before any issue call ----------
-FAKE_GH_LABELS="$workdir/labels_without_security" run_case missing_label 1 "$workdir/log_vulnerability"
+FAKE_GH_LABELS="$workdir/labels_without_security" run_case missing_label 1 "$workdir/log_errors"
 expect_status 2
 expect_output "the repository carries no \`security\` label"
 expect_no_call 'issue list'
@@ -229,7 +306,7 @@ expect_no_writes
 printf '%s\n' 'a missing label refuses before any issue call: passed'
 
 # --- an unauthenticated gh refuses before the label listing ----------------
-FAKE_GH_AUTH=1 run_case unauthenticated 1 "$workdir/log_vulnerability"
+FAKE_GH_AUTH=1 run_case unauthenticated 1 "$workdir/log_errors"
 expect_status 2
 expect_output 'gh is not authenticated'
 expect_no_call 'label list'
@@ -238,7 +315,7 @@ printf '%s\n' 'an unauthenticated gh refuses before the label listing: passed'
 
 # --- a refused label listing is NOT reported as a missing label ------------
 # Under `pipefail` a listing piped into `grep` would report both the same way.
-FAKE_GH_LABEL_REFUSED=1 run_case label_list_refused 1 "$workdir/log_vulnerability"
+FAKE_GH_LABEL_REFUSED=1 run_case label_list_refused 1 "$workdir/log_errors"
 expect_status 2
 expect_output 'gh refused the label listing'
 expect_output 'HTTP 403'
@@ -246,7 +323,7 @@ expect_no_call 'issue list'
 printf '%s\n' 'a refused label listing is told apart from a missing label: passed'
 
 # --- two issues carrying the title refuse rather than pick one -------------
-FAKE_GH_ISSUES="$workdir/issues_two" run_case duplicate_titles 1 "$workdir/log_vulnerability"
+FAKE_GH_ISSUES="$workdir/issues_two" run_case duplicate_titles 1 "$workdir/log_errors"
 expect_status 2
 expect_output 'issues 42 91 all carry the title'
 expect_no_writes

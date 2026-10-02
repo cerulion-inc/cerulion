@@ -6,8 +6,8 @@
 #
 # CI runs the same four checks in the `deps` job of
 # .github/workflows/ci.yml (blocking), from a checksummed cargo-deny release
-# archive installed by that job. .github/workflows/advisories.yml runs the
-# advisories check alone on a schedule, against this same policy file.
+# archive that job installs, while .github/workflows/advisories.yml runs the
+# advisories check alone on a schedule against this same policy file.
 #
 # Schema: cargo-deny 0.16+ (`version = 2` for [advisories] and [licenses]).
 
@@ -16,9 +16,9 @@
 # -----------------------------------------------------------------------------
 [advisories]
 version = 2
-# With version = 2, vulnerabilities are always "deny" and
-# unmaintained/unsound/notice advisories are always "warn" - those knobs
-# are no longer configurable.
+# With version = 2, the vulnerability, unmaintained, unsound and notice
+# classes are all "deny" and those knobs are no longer configurable:
+# cargo-deny reports each one as error[<class>] and the check exits nonzero.
 #
 # yanked = "warn" (not "deny"): a maintainer yanking a release we already
 # lock would otherwise break every open PR with no action on our side.
