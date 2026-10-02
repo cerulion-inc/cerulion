@@ -84,9 +84,13 @@ asks the forge's repository endpoint (`api.github.com/repos/<owner>/<repo>`, a `
 to three of them) whether the credential the question carries is served that repository.
 The question carries `GITHUB_TOKEN` when the environment holds one, which raises the
 budget the forge prices it under from 60 an hour to 5,000; the token is sent on that
-request and is never printed, written or passed as an argument. The page endpoint answers
-the same 200 and 404 but publishes no budget header, so a throttle there cannot be told
-from a server fault.
+request and is never printed, written or passed as an argument. The credential goes to the
+API host and to no other host: a redirect is followed only while its `Location` stays on
+that host, and at most two hops deep, which is how a repository renamed away still
+resolves, while a redirect naming any other host is not followed at all, so nothing
+reaches that host and the reference is NOT QUERIED with `(status 301 foreign redirect)` as
+its cause. The page endpoint answers the same 200 and 404 but publishes no budget header,
+so a throttle there cannot be told from a server fault.
 
 WHO ASKS DECIDES THE ANSWER. The Actions job token is scoped to the repository the
 workflow runs in, so for every other repository it is a stranger and a 404 there is the

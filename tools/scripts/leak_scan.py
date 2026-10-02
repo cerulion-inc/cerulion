@@ -653,6 +653,14 @@ CLASS_FLOOR = 15
 # host. A tracker link needs no question: a tracker is closed to a stranger by
 # construction.
 #
+# THE CREDENTIAL GOES TO THE API HOST AND TO NO OTHER HOST. urllib's own redirect
+# handler copies the Authorization header onto a hop to any host that answers, so
+# a 3xx is followed here only while its Location is https on that one host, and
+# only REF_REDIRECT_HOPS hops deep: a renamed repository answers 301 at the old
+# name and the verdict comes from the new one. A redirect naming any other host is
+# not followed, no request is built for it, and the reference is NOT QUERIED with
+# 'foreign redirect' named as the cause.
+#
 # WHO ASKS DECIDES THE ANSWER. The Actions job token is scoped to the repository
 # the workflow runs in, so for every other repository it is a stranger and a 404
 # there is the not-found verdict. A personal token is not a stranger, so a local
@@ -761,6 +769,13 @@ REF_ATTEMPTS = 3
 # shortened: retrying sooner than the forge said is what earns a longer block, so
 # the reference goes unqueried and the run says so.
 REF_RETRY_AFTER_MAX = 5.0
+# How many redirect hops one question follows on the API host, and how many times
+# it follows the same URL. A renamed repository is ONE hop: the forge answers 301
+# at the old name and 200 or a not-found at the new one. Two, so a repository
+# renamed twice still resolves, and past that the 3xx is raised rather than
+# walked: urllib counts distinct hops under one bound and repeats of a single URL
+# under the other, so both carry this value.
+REF_REDIRECT_HOPS = 2
 # A ceiling on the questions one run may ask. Past it every further repository is
 # NOT QUERIED, which makes the run a NON-RUN: it slows down and says what it did
 # not get to, it never quietly scans less and it never calls the rest clean.
@@ -860,6 +875,66 @@ def _retry_wait(headers, attempt):
     return REF_BACKOFF * (2 ** attempt)
 
 
+def _api_host_url(base, url):
+    """True when `url`, read against the request it answers, is an https URL on
+    FORGE_API_HOST: the one host a question carries its credential to. The whole
+    netloc is compared, not the parsed host, so a port or a userinfo that reads as
+    the API host and connects elsewhere is not it, and a Location that carries no
+    host at all is joined onto `base` first, which keeps a path-only hop on the
+    host it came from."""
+    parts = urllib.parse.urlsplit(urllib.parse.urljoin(base, url))
+    return parts.scheme == 'https' and parts.netloc.lower() == FORGE_API_HOST
+
+
+def _foreign_redirect(base, code, headers):
+    """True when a 3xx reached the caller because its Location leaves the API
+    host. The opener follows a same-host hop itself, so a 3xx that surfaces at all
+    is one it would not follow, and this reads WHICH refusal off the response's own
+    Location: a hop the credential was not carried over is named as such, while a
+    3xx carrying no Location at all, and one REF_REDIRECT_HOPS stopped, is not."""
+    if not 300 <= code < 400:
+        return False
+    loc = _header(headers, 'Location') or _header(headers, 'URI')
+    return bool(loc) and not _api_host_url(base, loc)
+
+
+class ApiHostRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect is followed only while it stays on the API host.
+
+    urllib's own handler copies every header but the content ones onto the next
+    hop, the Authorization header included, so a 3xx naming another host hands
+    that host the credential the question carries. This one builds the next
+    request only when the Location is https on FORGE_API_HOST, and returns None
+    for every other host and scheme, which leaves the 3xx to the opener's default
+    error handler to raise as an HTTPError. Nothing is sent to that host: the
+    request for it is never built. At most REF_REDIRECT_HOPS hops, past which
+    urllib raises the 3xx the same way.
+    """
+
+    max_redirections = REF_REDIRECT_HOPS
+    max_repeats = REF_REDIRECT_HOPS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _api_host_url(req.full_url, newurl):
+            return None
+        new = urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
+        if new is not None and code != 303:
+            # urllib builds the next hop with no method of its own, which turns
+            # this HEAD into a GET and pulls a body no caller reads. 303 is the one
+            # code that asks for the method to change.
+            new.method = req.get_method()
+        return new
+
+
+# THE ONE WAY OUT OF THIS PROCESS for a reachability question, built once because
+# a handler holds no per-request state. The chain is spelled out rather than
+# urlopen's, whose redirect handler follows a hop to whatever host answers. A
+# one-item list, so the self-test can seat a canned transport under the real
+# handler and read the handler's own decision.
+FORGE_OPENER = [urllib.request.build_opener(ApiHostRedirects())]
+
+
 def forge_status(owner, repo, remaining=None, clock=time.monotonic, token=None,
                  note=None):
     """Ask the forge whether the credential this question carries is served this
@@ -872,6 +947,17 @@ def forge_status(owner, repo, remaining=None, clock=time.monotonic, token=None,
     REF_ATTEMPTS attempts with the wait REF_BACKOFF doubles per attempt, or the
     wait the forge asked for, and None goes back when the attempts run out. The
     caller records such a reference as not queried and asserts nothing about it.
+
+    THE CREDENTIAL GOES TO THE API HOST AND TO NO OTHER HOST. The request is
+    opened through `FORGE_OPENER`, whose redirect policy is `ApiHostRedirects`, so
+    a 3xx is followed only while its Location is https on FORGE_API_HOST and only
+    REF_REDIRECT_HOPS hops deep: a renamed repository answers 301 at the old name
+    and the verdict is the 200 or the not-found at the new one. A 3xx naming any
+    other host is not followed, nothing reaches that host, and the question counts
+    as no answer with the cause 'status <code> foreign redirect'. That one is NOT
+    retried: where a host routes this request is settled, and a second attempt
+    would read the same Location, where a throttle, a server error and a transport
+    error are faults that can clear and are retried.
 
     `token` lifts the budget the forge prices this question under from 60 an hour
     to the authenticated ceiling. It is sent as a bearer credential and is never
@@ -914,10 +1000,18 @@ def forge_status(owner, repo, remaining=None, clock=time.monotonic, token=None,
     for attempt in range(REF_ATTEMPTS):
         room = left()
         try:
-            with urllib.request.urlopen(req, timeout=max(0.1, room)) as resp:
+            with FORGE_OPENER[0].open(req, timeout=max(0.1, room)) as resp:
                 return resp.status
         except urllib.error.HTTPError as e:
-            say('status %d' % e.code)
+            foreign = _foreign_redirect(url, e.code, e.headers)
+            say('status %d%s' % (e.code, ' foreign redirect' if foreign else ''))
+            if foreign:
+                # The hop was refused before a request for that host existed, so
+                # the credential stayed here and the question has no answer. ONE
+                # attempt: a redirect to another host is where the forge routes
+                # this request, not a fault that clears, and the next attempt
+                # would read the same Location.
+                return None
             if not _no_answer(e.code, e.headers):
                 return e.code
             wait = _retry_wait(e.headers, attempt)
@@ -3412,7 +3506,7 @@ R_WITHDRAWN = 'qz' + 'rkv-withdrawn'     # 410: taken down, and still a not-foun
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_WITHDRAWN): 410, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 256
+EXPECTED_ARMS = 259
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
@@ -5326,14 +5420,24 @@ def self_test(out, base_env, argv0):
         # timeout the socket was actually handed, and whether a retry was
         # attempted at all. Restating the clamp would test nothing. The opener
         # and the sleep are replaced for the length of this arm only.
+        class _Seated(object):
+            """An opener whose `open` is one function, seated in FORGE_OPENER for
+            the length of one arm: the seam every question goes out through, so an
+            arm answers one without a socket. Nothing of the real chain runs here,
+            which is why the redirect arms further down build a real opener around
+            a canned transport instead of seating a function."""
+
+            def __init__(self, fn):
+                self.open = fn
+
         seen_timeouts, slept = [], []
 
         def fake_open(req, timeout=None):
             seen_timeouts.append(timeout)
             raise urllib.error.HTTPError(req.full_url, 503, 'busy', {}, None)
 
-        real_open, real_sleep = urllib.request.urlopen, time.sleep
-        urllib.request.urlopen = fake_open
+        real_open, real_sleep = FORGE_OPENER[0], time.sleep
+        FORGE_OPENER[0] = _Seated(fake_open)
         time.sleep = lambda s: slept.append(s)
         try:
             plain = forge_status(RO, R_PRIV)
@@ -5343,7 +5447,7 @@ def self_test(out, base_env, argv0):
             starved = forge_status(RO, R_PRIV, 0.05)
             tight = list(seen_timeouts), list(slept)
         finally:
-            urllib.request.urlopen, time.sleep = real_open, real_sleep
+            FORGE_OPENER[0], time.sleep = real_open, real_sleep
         arm('ref-an-exhausted-budget-caps-the-request-timeout-and-kills-the-retry',
             plain is None and full == ([REF_TIMEOUT] * REF_ATTEMPTS,
                                        [REF_BACKOFF, REF_BACKOFF * 2])
@@ -5360,14 +5464,14 @@ def self_test(out, base_env, argv0):
             spent_clock[0] += REF_TIMEOUT
             raise urllib.error.HTTPError(req.full_url, 503, 'busy', {}, None)
 
-        real_open, real_sleep = urllib.request.urlopen, time.sleep
-        urllib.request.urlopen = timed_open
+        real_open, real_sleep = FORGE_OPENER[0], time.sleep
+        FORGE_OPENER[0] = _Seated(timed_open)
         time.sleep = lambda s: (slept_t.append(s),
                                 spent_clock.__setitem__(0, spent_clock[0] + s))
         try:
             code = forge_status(RO, R_PRIV, 7.6, clock=lambda: spent_clock[0])
         finally:
-            urllib.request.urlopen, time.sleep = real_open, real_sleep
+            FORGE_OPENER[0], time.sleep = real_open, real_sleep
         arm('ref-a-budget-that-cannot-pay-for-a-retry-does-not-spend-the-backoff',
             code is None and seen_t == [REF_TIMEOUT] and slept_t == []
             and spent_clock[0] <= 7.6,
@@ -5385,15 +5489,15 @@ def self_test(out, base_env, argv0):
             slow_clock[0] += 1.0
             raise urllib.error.HTTPError(req.full_url, 503, 'busy', {}, None)
 
-        real_open, real_sleep = urllib.request.urlopen, time.sleep
-        urllib.request.urlopen = slow_open
+        real_open, real_sleep = FORGE_OPENER[0], time.sleep
+        FORGE_OPENER[0] = _Seated(slow_open)
         # the sleep is asked for REF_BACKOFF and takes thirty seconds
         time.sleep = lambda s: (slept_s.append(s),
                                 slow_clock.__setitem__(0, slow_clock[0] + 30.0))
         try:
             late = forge_status(RO, R_PRIV, 20.0, clock=lambda: slow_clock[0])
         finally:
-            urllib.request.urlopen, time.sleep = real_open, real_sleep
+            FORGE_OPENER[0], time.sleep = real_open, real_sleep
         arm('ref-a-backoff-that-overran-cancels-the-retry-it-had-earned',
             late is None and slept_s == [REF_BACKOFF] and len(seen_s) == 1,
             'seen=%s slept=%s' % (seen_s, slept_s))
@@ -5411,13 +5515,13 @@ def self_test(out, base_env, argv0):
                 timeouts.append(timeout)
                 return opener(req)
 
-            real_open, real_sleep = urllib.request.urlopen, time.sleep
-            urllib.request.urlopen = wrapped
+            real_open, real_sleep = FORGE_OPENER[0], time.sleep
+            FORGE_OPENER[0] = _Seated(wrapped)
             time.sleep = waits.append
             try:
                 return (call(), timeouts, waits)
             finally:
-                urllib.request.urlopen, time.sleep = real_open, real_sleep
+                FORGE_OPENER[0], time.sleep = real_open, real_sleep
 
         def _throttled(headers):
             def opener(req):
@@ -5516,6 +5620,151 @@ def self_test(out, base_env, argv0):
             tok_verdict == 'closed' and len(sent) == 1
             and sent[0][2].get('Authorization') == 'Bearer ' + 'tok' + 'en',
             str([sorted(h) for _, _, h in sent]))
+        # WHERE A REDIRECT TAKES THE CREDENTIAL. urllib's own redirect handler
+        # copies the Authorization header onto a hop to any host that answers, so
+        # the three arms below run the SHIPPED handler inside a real opener and
+        # answer each hop from a canned table: what they read is the handler's own
+        # decision, and the requests that did and did not leave this process.
+        tok = 'tok' + 'en'
+        api = 'https' + '://' + FORGE_API_HOST
+        # A host in the reserved domain that can never resolve, so an arm that
+        # somehow does open a socket reaches nothing.
+        foreign = 'qz' + 'rkv-mirror' + '.invalid'
+        r_old = 'qz' + 'rkv-renamed-from'     # the name a rename left behind: 301
+        r_new = 'qz' + 'rkv-renamed-to'       # the name the forge moved it to: 200
+
+        class _Hdrs(dict):
+            """Canned response headers, answering a name in whatever case the
+            reader spells it the way a live response's do."""
+
+            def __contains__(self, k):
+                return dict.__contains__(self, k.lower())
+
+            def __getitem__(self, k):
+                return dict.__getitem__(self, k.lower())
+
+            def get(self, k, default=None):
+                return dict.get(self, k.lower(), default)
+
+        class _Canned(object):
+            """One canned response: the attributes the opener's own chain reads off
+            a live one, and a body nobody looks at."""
+
+            def __init__(self, url, code, headers):
+                self.url, self.code, self.status, self.msg = url, code, code, 'canned'
+                self.hdrs = _Hdrs((k.lower(), v) for k, v in headers.items())
+
+            def info(self):
+                return self.hdrs
+
+            def read(self, *a):
+                return b''
+
+            def close(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class _CannedHost(urllib.request.HTTPSHandler):
+            """The transport UNDER the shipped redirect handler: the opener's error
+            processor, that handler and the default error handler all run, and this
+            answers each hop out of `table` instead of opening a socket. Every
+            request it is handed is recorded, so an arm reads which hosts were
+            reached and what each hop carried."""
+
+            def __init__(self, table, seen):
+                urllib.request.HTTPSHandler.__init__(self)
+                self.table, self.seen = table, seen
+
+            def https_open(self, req):
+                self.seen.append((req.full_url, req.get_method(),
+                                  dict(req.header_items())))
+                code, headers = self.table(req.full_url)
+                return _Canned(req.full_url, code, headers)
+
+        def _through(table, call):
+            """Run `call` with a real opener whose redirect policy is
+            ApiHostRedirects and whose only transport is `table`. Returns (what
+            `call` gave back, every request the transport was handed)."""
+            seen = []
+            was = FORGE_OPENER[0]
+            FORGE_OPENER[0] = urllib.request.build_opener(_CannedHost(table, seen),
+                                                          ApiHostRedirects())
+            try:
+                return call(), seen
+            finally:
+                FORGE_OPENER[0] = was
+
+        away = 'https' + '://' + foreign + '/repos/' + RO + '/' + R_PRIV
+
+        def _elsewhere(u):
+            """301 off the API host, and a SERVED answer at the host it points at:
+            a handler that follows it reads the reference clean off a host it has
+            just handed the credential to."""
+            return (301, {'Location': away}) if u.startswith(api) else (200, {})
+
+        why_f = []
+        code_f, hops_f = _through(_elsewhere, lambda: forge_status(
+            RO, R_PRIV, token=tok, note=why_f.append))
+        res_f = RefResolver(token=tok)
+        verdict_f, hops_r = _through(_elsewhere, lambda: res_f.verdict(RO, R_PRIV))
+        (rc_fr, lines_fr), hops_run = _through(_elsewhere, lambda: run(
+            ['tree', '--no-allow'] + mine, dict(refenv, GITHUB_TOKEN=tok), repo_noans,
+            fetch=None))
+        every_hop = hops_f + hops_r + hops_run
+        arm('ref-a-redirect-to-another-host-is-not-followed-and-the-credential-stays-here',
+            code_f is None and why_f == ['status 301 foreign redirect']
+            and verdict_f == 'unqueried'
+            and list(res_f.unqueried.values()) == [(RO + '/' + R_PRIV,
+                                                    'status 301 foreign redirect')]
+            and rc_fr == EXIT_NORUN and norun_head in lines_fr
+            and any(ln.startswith('NOT QUERIED ' + REF_NOANSWER + ': ')
+                    and ln.endswith(' (status 301 foreign redirect)') for ln in lines_fr)
+            # one request per drive, every one of them to the API host and carrying
+            # the credential: nothing was sent to the host the Location named, and
+            # no second request was built to carry the credential there.
+            and len(every_hop) == 3
+            and [u for u, _, h in every_hop if h.get('Authorization') == 'Bearer ' + tok]
+            == [u for u, _, _ in every_hop]
+            and all(u.startswith(api + '/repos/' + RO + '/') for u, _, _ in every_hop)
+            and not any(foreign in u for u, _, _ in every_hop),
+            'rc=%s code=%s why=%s hops=%s' % (rc_fr, code_f, why_f,
+                                              [(u, m) for u, m, _ in every_hop]))
+
+        def _renamed(u):
+            """The rename the forge answers for real: 301 at the old name, served at
+            the new one, both on the API host."""
+            return ((301, {'Location': api + '/repos/' + RO + '/' + r_new})
+                    if u.endswith('/' + r_old) else (200, {}))
+
+        res_b = RefResolver(token=tok)
+        verdict_b, hops_b = _through(_renamed, lambda: res_b.verdict(RO, r_old))
+        arm('ref-a-rename-on-the-api-host-is-followed-and-the-new-answer-is-the-verdict',
+            verdict_b == 'public' and not res_b.unqueried
+            and [u for u, _, _ in hops_b] == [api + '/repos/' + RO + '/' + r_old,
+                                              api + '/repos/' + RO + '/' + r_new]
+            and [m for _, m, _ in hops_b] == ['HEAD', 'HEAD']
+            and all(h.get('Authorization') == 'Bearer ' + tok for _, _, h in hops_b),
+            'verdict=%s hops=%s' % (verdict_b, [(u, m) for u, m, _ in hops_b]))
+
+        def _renamed_gone(u):
+            """A 302 on the API host onto a repository a stranger is given nothing
+            about: the verdict is the LAST response's, not the redirect's."""
+            return ((302, {'Location': api + '/repos/' + RO + '/' + R_GONE})
+                    if u.endswith('/' + r_old) else (404, {}))
+
+        hard_c, hops_c = _through(_renamed_gone, lambda: RefScan(
+            RefResolver(token=tok), RO, R_SELF).findings(
+                FORGE + RO + '/' + r_old + '/issues/1'))
+        arm('ref-a-same-host-redirect-that-lands-on-a-not-found-is-the-unopenable-verdict',
+            hard_c == [(REF_DEFECT, RO + '/' + r_old)]
+            and [u for u, _, _ in hops_c] == [api + '/repos/' + RO + '/' + r_old,
+                                              api + '/repos/' + RO + '/' + R_GONE],
+            'found=%s hops=%s' % (hard_c, [u for u, _, _ in hops_c]))
         # the deadline: a count alone is not a bound, so an injected clock proves
         # the run stops asking and reports unverified instead of running long
         ticks = [0.0]

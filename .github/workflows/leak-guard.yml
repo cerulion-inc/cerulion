@@ -69,10 +69,13 @@ permissions:
 # and the token prices it at 5,000 an hour instead. It is the lowest-privileged
 # credential here, read-only by the permissions block above. The scanner reads
 # it from the environment, sends it as a bearer credential on the reference
-# request, and never echoes it, writes it or passes it as an argument. Workflow
-# level, so all three jobs get it in one place; a workflow-level env reaches
-# every step of every job, and the scanner's reference probe is the only reader
-# of it under tools/.
+# request, and never echoes it, writes it or passes it as an argument. That
+# credential goes to the API host and to no other host: a redirect is followed
+# only while its Location stays on that host, and one naming any other host is
+# not followed at all, so nothing reaches that host and the reference is NOT
+# QUERIED with `foreign redirect` as its cause. Workflow level, so all three jobs
+# get it in one place; a workflow-level env reaches every step of every job, and
+# the scanner's reference probe is the only reader of it under tools/.
 #
 # What this fixed: a throttled question used to be reported as a ref-unverified
 # finding, so the same unchanged content read 0, 2, 2 and 3 findings across four
