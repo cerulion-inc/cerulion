@@ -147,6 +147,43 @@ Run from the workspace root, in order:
 - [ ] After each `cargo publish`, wait for the crates.io index to pick up
       the new version before publishing the next crate in the order.
 
+## Post-publish verification
+
+`tools/scripts/publish_preflight.sh` reads `cargo package --list`, the listing
+cargo would upload, and `release.yml` runs it on every publish through
+`tools/scripts/publish_crates.sh`. `tools/scripts/verify_published.sh` reads the
+other end: for every publishable workspace member at one version it fetches the
+sparse-index entry, the version metadata and the `.crate` archive crates.io
+serves, and checks each of them.
+
+```bash
+tools/scripts/verify_published.sh 1.0.0                 # every publishable member
+tools/scripts/verify_published.sh 1.0.0 --crate cerulion_core --skip-docs
+```
+
+Per crate it asserts that the archive's sha256 equals both the index `cksum` and
+the API `checksum`, that its byte length equals the API `crate_size`, that every
+member lies under `<name>-<version>/` with no `..` segment, that none of the
+in-repository tooling instruction files is anywhere inside (the script names
+them), that nothing ships from a `tests/`
+directory at the crate root (a `cfg(test)` module under `src/` is library source
+and does ship), that the text files the packaged `license` expression requires
+are present and that the expression matches the API `license`, that the packaged
+description carries no tracker id, that every relative link in the packaged
+README resolves inside the archive, and that `.cargo_vcs_info.json`'s git sha1
+is the commit `v<version>` points at. Each check prints one `PASS`, `FAIL` or
+`WARN` line, every crate is read before the exit status is decided, and any
+`FAIL` exits non-zero. docs.rs is a `WARN` line carrying the HTTP status: the
+crate page answers whether or not a library was built, so it never fails a run,
+and `--skip-docs` skips the request.
+
+The `verify` job of `release.yml` runs it after `publish` on the same tag push,
+with `--skip-docs`, for the tag's version. Its licence table is the one
+`crates/cerulion_hygiene/tests/crate_license_texts_test.rs` matches on; an
+expression neither knows is refused by both rather than passed with no text
+required. `tools/scripts/test_verify_published.sh` is its offline oracle table
+and runs in the `Lint` job.
+
 ## Known Caveats
 
 - **License files**: `LICENSE-APACHE` and `LICENSE-MIT` live under `docs/legal/`

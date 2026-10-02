@@ -351,7 +351,9 @@ against the type it has to parse as by a unit test in
 that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/*`, every
 `examples/*`, the fuzz workspace); `cargo clippy --workspace --all-targets -- -D warnings`;
 the hot-path alloc lint and its self-test; the agent-docs gate; the leak guard's self-test
-and generic-class tree scan; the naming gate (pull requests only); `shellcheck` over
+and generic-class tree scan; the three crates.io script self-tests (the index wait, the
+publish retry, and the post-publish archive reader `release.yml` runs after an upload);
+the naming gate (pull requests only); `shellcheck` over
 `tools/scripts/**` recursively and over the extensionless hooks in `tools/hooks` (`-type f`
 deduplicates a symlink into a scanned subdirectory); and `actionlint` over every workflow.
 
@@ -625,6 +627,7 @@ before the checker reads the real files.
 | `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
 | `tools/scripts/leak_scan.py --self-test` | every generic class on every surface, the redacted private output contract, exit codes, allowlist and pragma rules, the self-scan | n/a |
 | `tools/scripts/install_hooks.sh --self-test` | the hooks refuse a planted leak and a planted message, pass a clean commit, cover a worktree without `tools/hooks`, and uninstall cleanly | n/a |
+| `tools/scripts/test_verify_published.sh` | the oracle table for `tools/scripts/verify_published.sh`, the post-publish reader the `verify` job of `release.yml` runs: a fixture registry on PATH shims (`cargo`, `curl`, `git`, `sleep`) serves sparse-index entries, version metadata and `.crate` archives the test builds, over two crates that cover both rows of the licence table. One arm per check passing and one per check failing (a digest the archive does not have, the two registry surfaces disagreeing on it, a `crate_size` mismatch, a missing licence text on each row, a licence expression no row knows, a metadata licence the manifest does not declare, `AGENTS.md`, `CLAUDE.md`, a root `tests/` tree, a tracker id in the packaged description, a README link outside the archive, a packaging commit that is not the tag's, a member outside the archive prefix), plus docs.rs unreachable and 404 as warnings rather than failures, `--skip-docs` asking docs.rs nothing, the bounded index poll in both directions, `--crate` and `--index-url`, and every usage refusal. The clean arm asserts the exact `PASS`/`WARN`/`FAIL` counts, and the run ends on a case-count floor | n/a |
 
 A `# doc-pin:` marker is a YAML comment in `ci.yml`, of the form
 `# doc-pin: <package>::<test binary> reads <root>, <root>`, recording that the
