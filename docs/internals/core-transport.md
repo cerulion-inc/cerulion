@@ -7,10 +7,19 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 
 ## Transport model
 
-- ONE iceoryx2 node per process, owned by the `TransportManager` singleton
-  (`get_or_init()`). Tests get isolation via per-test SHM roots
+- ONE LONG-LIVED iceoryx2 node per process, owned by the `TransportManager`
+  singleton (`get_or_init()`). Tests get isolation via per-test SHM roots
   (`init_for_test` / `build_for_test` / `generate_isolated_config()`), not via a second
   node.
+- ONE EXCEPTION, and it is transient rather than long-lived: every dead-node sweep
+  mints its own node. iceoryx2 carries `try_cleanup_dead_nodes` on `&Node`, and the
+  cleaner deliberately does not hold the transport, so
+  `transport/mod.rs::cleanup_dead_nodes` builds a node from a config with the
+  implicit reaps disabled (`disable_auto_dead_node_cleanup`), which is what makes
+  the explicit call the only reaper, and drops it when the sweep returns. The sweep
+  runs every `LIVELINESS_CLEANUP_PERIOD_MS`, 2,000 ms in
+  `graph/runtime.rs`, so a running graph mints one transient node every two
+  seconds. A second LONG-LIVED node stays forbidden.
 - `AnyPublisher` / `AnySubscriber` (`src/graph/node.rs`) are single-variant enums
   (`Ipc(...)`), not type aliases. The one-arm match is the dispatch seam a second
   transport backend plugs into with zero call-site churn, and the dispatch has to keep
