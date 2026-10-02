@@ -187,8 +187,8 @@ members = [
     # so the e2e can prove the hook's won-malloc detection reports status_won=0
     # for the foreign-allocator case (the handshake-gate degrade).
     "crates/test_fixtures/heaphook_shim",
-    # ── Cerulion visualization stack (root members; the root MSRV of 1.93
-    #    is what the `rerun` 0.34 SDK needs).
+    # ── Cerulion visualization stack (root members; the `rerun` 0.34 SDK needs
+    #    1.93, under the root MSRV of 1.95).
     #    These pull the heavy rerun dep tree, so they are
     #    DELIBERATELY excluded from `default-members` below — a plain
     #    `cargo build` stays rerun-free; the viz stack builds only via
@@ -358,20 +358,20 @@ edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/cerulion-inc/cerulion"
 homepage = "https://github.com/cerulion-inc/cerulion"
-# MSRV 1.93 (set by the cerulion_viz members of the root
-# workspace). VERIFIED + ENFORCED: the `msrv` CI job in
-# .github/workflows/ci.yml runs `cargo +1.93.0 check --workspace --all-targets`
-# on every PR, so this value is a build-proven floor, not a survey.
-# Our own code needs only 1.87 (`usize::is_multiple_of`), and the non-viz
-# dependency tree floors at 1.88 (darling/time/time-core/home/instability
-# declare rust-version 1.88). The binding constraint is the `rerun` 0.34 SDK
-# (pulled by the `cerulion_viz` / `cerulion-vizd` members behind `default-members`).
-# `rerun` 0.34 declares `rust-version` 1.92, but its transitive `fixed` dep at
-# the current release (1.31.0) declares 1.93 — so 1.93 is rerun's REAL floor with
-# unpinned deps, and adopting it lets `fixed` resolve naturally to 1.31.0 (no
-# lockfile pin back to 1.30.0). 1.93 is the true minimum stable that checks the
-# WHOLE workspace clean.
-rust-version = "1.93"
+# MSRV 1.95, set by this workspace's own code: `cerulion_core` calls `try_update`
+# on the integer atomics (the same compare-exchange loop as its former name
+# `fetch_update`, stable since 1.95; Rust 1.99 deprecates the old name).
+# VERIFIED + ENFORCED: the `msrv` CI job in .github/workflows/ci.yml runs
+# `cargo +1.95.0 check --workspace --all-targets` on every push to `main` (it is
+# skipped on `pull_request`), so this value is a build-proven floor, not a survey.
+# The dependency tree floors lower: the non-viz tree at 1.91 (`iroh` 1.0.2 and
+# its companion crates declare rust-version 1.91), and the `rerun` 0.34
+# SDK pulled by the `cerulion_viz` / `cerulion-vizd` members at 1.93 (`rerun`
+# declares 1.92; its transitive `fixed` 1.31.0 declares 1.93, the highest
+# rust-version in the lockfile). The release compiler
+# (.github/workflows/release-artifacts.yml) is pinned at the same 1.95.0, so a
+# release binary and the nodes built against it share one compiler at the floor.
+rust-version = "1.95"
 
 # ───────────────────────────── Workspace lint table ────────────────────────
 # The one strict lint table (the project's strict linting rule). Every workspace

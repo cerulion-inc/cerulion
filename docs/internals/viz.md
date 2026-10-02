@@ -195,8 +195,9 @@ lockstep with the rest of the `re_*` graph).
   `set_timestamp_nanos_since_epoch`; `RecordingStreamBuilder::memory()`
   returns `(stream, storage)`; `flush_blocking() -> Result` must be handled
   under `-D warnings`.
-- rerun's MSRV exceeds the repo default: every crate whose dep graph
-  (dev-deps included) reaches rerun declares `rust-version`, so an MSRV break
+- rerun's own floor (1.93, through its `fixed` dependency) sits under the repo
+  default of 1.95; every crate whose dep graph (dev-deps included) reaches rerun
+  declares `rust-version`, so an MSRV break
   surfaces as a clean toolchain message instead of a confusing compile error.
 - Process-global scene setup (ViewCoordinates + Pinhole) uses an
   AtomicBool-swap exactly-once guard, not `std::sync::Once`; a `Once` cannot
