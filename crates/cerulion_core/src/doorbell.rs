@@ -199,8 +199,9 @@ fn doorbell_shm_name_compact(ns: &str, topic: &str) -> String {
     name
 }
 
-/// Deduplicate `topics` preserving FIRST-DECLARED order — the registry maps one
-/// doorbell per UNIQUE topic, and `primary` must remain the first-declared one.
+/// Deduplicate `topics` preserving the order given: the registry maps one
+/// doorbell per UNIQUE topic, and `primary` must remain the first entry of the
+/// list it is handed.
 ///
 /// Pure (no I/O / no SHM), so the order/dedup contract is testable without
 /// mapping anything.
@@ -693,8 +694,12 @@ mod imp {
         ///
         /// # Cost on the publish path
         ///
-        /// Two `Release` atomic increments into one cache line, a `SeqCst` fence,
-        /// and a `Relaxed` load. On the arm where the wake syscall itself fails
+        /// One `Release` increment of the ring counter, then one cached backend
+        /// read. Where the os_sync family resolved: a second `Release` increment
+        /// into the same cache line, a `SeqCst` fence, and a `Relaxed` load of
+        /// `parked`. Where it did not, the ring ends at the first increment,
+        /// since no peer on the host can block on the word.
+        /// On the arm where the wake syscall itself fails
         /// with something unexpected, add an errno read, a mutex acquisition and
         /// one log event; the errnos a healthy run produces return before any of
         /// that. The fence is a store-buffer drain (`dmb ish` on this
@@ -871,7 +876,7 @@ mod imp {
         /// [`ParkedDoorbellGuard`], so the claim is released on every exit path
         /// including an unwind, and an unpaired call cannot be written.
         ///
-        /// The `SeqCst` fence after the bit-set is the parker's half of the
+        /// The `SeqCst` fence after the claim is taken is the parker's half of the
         /// store-buffer litmus pair described on [`Doorbell::ring`].
         pub(super) fn park_enter(&self) {
             self.shared().parked.fetch_add(1, Ordering::AcqRel);
@@ -1167,7 +1172,8 @@ fn wake_word_active_from(backend_usable: bool, killed: bool) -> bool {
 /// killed by [`DOORBELL_OS_SYNC_ENV`]. On Linux this is a compile-time `false`
 /// and the whole data-wake park rung is compiled out: a Linux consumer wakes on
 /// the doorbell through the CPU monitor-wait primitive (`UMONITOR`/`WFE`) armed
-/// on the same line, which is a hardware park the kernel block must not displace.
+/// on the same line where the CPU carries one, and otherwise at the park's next
+/// recheck poll; the hardware park is what the kernel block must not displace.
 /// On every other target there is no primitive at all.
 pub fn wake_word_block_primitive_available() -> bool {
     #[cfg(target_os = "macos")]
@@ -1211,15 +1217,6 @@ fn note_wake_recovered() {
     }
 }
 
-/// Record one failing wake-word WAIT and say how the caller should log it: a
-/// loud head per regime, downgraded repeats, and a loud re-announcement each
-/// decade of the running total.
-///
-/// The crate's shared flood latch, never a hand-rolled errno compare, so this
-/// site cannot drift from the discipline every other flood site in the crate
-/// keeps. The DECISION comes back rather than a formatted line, because the
-/// message is the caller's.
-///
 /// The wait side's own regime; see [`wake_latch`] for why the two are not
 /// shared.
 #[cfg(target_os = "macos")]
@@ -1236,7 +1233,14 @@ fn wait_latch(
 #[cfg(target_os = "macos")]
 static WAIT_REGIME_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Record one failing wake-word WAIT, in the wait side's own regime.
+/// Record one failing wake-word WAIT and say how the caller should log it: a
+/// loud head per regime, downgraded repeats, and a loud re-announcement each
+/// decade of the running total.
+///
+/// The crate's shared flood latch, never a hand-rolled errno compare, so this
+/// site cannot drift from the discipline every other flood site in the crate
+/// keeps. The DECISION comes back rather than a formatted line, because the
+/// message is the caller's.
 #[cfg(target_os = "macos")]
 fn note_wait_errno() -> crate::transport::failure_regime_latch::RegimeDecision {
     use crate::transport::failure_regime_latch::lock_regime_latch;
@@ -1506,7 +1510,8 @@ impl Drop for ParkedDoorbellGuard<'_> {
 /// own + `shm_unlink` their own lines via [`Doorbell::open_owned`]). The runtime
 /// uses [`snapshot_all`](DoorbellRegistry::snapshot_all) for the record-only
 /// poll-all, [`primary_addr`](DoorbellRegistry::primary_addr) to arm the single
-/// hardware monitor on the first-declared topic's line, and
+/// hardware monitor on the FIRST topic it was handed (the graph runtime decides
+/// that order; see [`primary_addr`](DoorbellRegistry::primary_addr)), and
 /// [`reopen`](DoorbellRegistry::reopen) on a producer-reconnect `LivelinessEvent`.
 #[must_use = "the registry unmaps all its doorbells on drop — bind it to a named local for the desired scope"]
 pub struct DoorbellRegistry {
@@ -1573,8 +1578,11 @@ impl DoorbellRegistry {
     /// `true` iff ANY doorbell's ring count differs from the parallel `baseline`
     /// snapshot (a prior [`snapshot_all`](Self::snapshot_all)). The
     /// non-allocating poll-all the runtime's park loop uses to detect a ring on
-    /// a NON-primary topic (the primary line is hardware-armed; the rest wake on
-    /// this ≤100µs-recheck delta scan). RELATIVE counters ⇒ only the delta from
+    /// a NON-primary topic, and the re-derive the macOS wake-word block runs
+    /// between its claim and its kernel wait. Where the CPU carries a monitor-wait
+    /// primitive the primary line is additionally hardware-armed; every other
+    /// topic is caught only by this ≤100µs-recheck delta scan.
+    /// RELATIVE counters ⇒ only the delta from
     /// `baseline` matters, so a stale absolute value is harmless. A `baseline`
     /// shorter than the doorbell set conservatively reports any extra as advanced.
     pub fn any_advanced_since(&self, baseline: &[u64]) -> bool {
@@ -1656,6 +1664,26 @@ impl DoorbellRegistry {
                 format!("doorbell registry has no topic {topic:?}"),
             )),
         }
+    }
+
+    /// The doorbell handle for `topic`, or `None` if not registered.
+    ///
+    /// The macOS wake-word park takes its handle here rather than positionally,
+    /// so the handle it blocks on and the address the hardware plane arms come
+    /// from the same topic.
+    pub fn bell(&self, topic: &str) -> Option<&Doorbell> {
+        self.index_of(topic).map(|i| &self.doorbells[i])
+    }
+
+    /// The slot `topic` occupies in this registry's order: the index of its ring
+    /// counter in [`snapshot_all`](Self::snapshot_all), and so in any baseline
+    /// taken from it.
+    ///
+    /// A caller arming a kernel wake takes the address and this slot from the one
+    /// topic, which is what keeps the armed line and the value it is compared
+    /// against from being derived two ways.
+    pub fn slot_of(&self, topic: &str) -> Option<usize> {
+        self.index_of(topic)
     }
 
     /// Index of `topic` in the deduped topic list, or `None`.
@@ -2369,7 +2397,7 @@ mod tests {
             } else {
                 AddrParkOutcome::Unavailable
             },
-            "one nanosecond over zero is a real wait wherever the tier exists, \
+            "one microsecond over zero is a real wait wherever the tier exists, \
              so the zero-cap verdict above is about the cap"
         );
         drop(guard);
@@ -2472,8 +2500,8 @@ mod tests {
     /// The registry's PRIMARY is the FIRST-declared topic's doorbell, which is
     /// the line the kernel block watches. Proven by ringing each topic in turn
     /// and reading the primary's own counter, so a `last()` would fail: the
-    /// address comparison next door cannot catch that, because it compares two
-    /// lookups in the same registry.
+    /// `primary_addr`-against-`addr` comparison in the dedup test cannot catch
+    /// that, because it compares two lookups in the same registry.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_registry_primary_is_the_first_declared_topics_bell() {

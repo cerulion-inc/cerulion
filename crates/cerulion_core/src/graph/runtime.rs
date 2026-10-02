@@ -934,6 +934,11 @@ fn bump_expected_listener(
 /// (`CerulionSubscriber::mark_multi_publisher_edge`) and the read sites consult
 /// the bit, never the config.
 ///
+/// SECOND CALLER: the park's doorbell arming asks the same question through
+/// [`topic_is_writable_from_outside`], where the answer becomes no such bit but
+/// decides which line a kernel wake may arm, so narrowing this predicate also
+/// narrows that.
+///
 /// A SINGLE-writer external topic pays one extra staged record per read for
 /// nothing. That is deliberate and is the safe direction: the runtime cannot
 /// know at build time how many writers will attach to a producer-less topic
@@ -945,6 +950,23 @@ fn edge_needs_producer_annotation(
     provisioning: PublisherProvisioning,
 ) -> bool {
     config.is_multi_publisher(topic) || provisioning == PublisherProvisioning::External
+}
+
+/// Can a publisher this process does not own write `topic`?
+///
+/// The same question [`edge_needs_producer_annotation`] asks, under the name the
+/// park's doorbell arming asks it by, so a reader narrowing one call site sees
+/// the other. The two terms are the two provisioning states that admit a writer
+/// the graph does not own: the `multi_publisher_topics:` opt-in, and `External`,
+/// which is every topic with no in-graph producer. The opt-in ADMITS such a
+/// writer rather than guaranteeing one, so a `true` here is not proof a peer
+/// exists; a line armed with nobody writing it costs one bounded park slice.
+fn topic_is_writable_from_outside(
+    config: &GraphConfig,
+    topic: &str,
+    provisioning: PublisherProvisioning,
+) -> bool {
+    edge_needs_producer_annotation(config, topic, provisioning)
 }
 
 /// Mapping from data-trigger topic to scheduler node ID for pre-step drain bridging.
@@ -2061,13 +2083,13 @@ fn park_poll_fd_ready(raw: std::os::unix::io::RawFd) -> bool {
 ///
 /// Every term is a separate reason for the rung to decline, and the caller maps
 /// a `false` here to `AddrParkOutcome::Unavailable`:
-/// - the policy did not arm the doorbell, so the producer never rings;
+/// - the policy did not arm the doorbell, so this runtime maps no page to block
+///   on (a producer outside it, an rmw publisher, may still ring the name);
 /// - this host has no wake word a consumer can kernel-block on;
 /// - the graph has no doorbell registry, so no page is mapped;
 /// - no baseline snapshot was taken, so a ring cannot be re-derived;
-/// - the registry is empty, so there is no primary line to watch;
-/// - no declared topic of this runtime is writable from outside it, so there is
-///   nothing a kernel wake could be rung by (see [`rung_topics`]).
+/// - no line is ARMED: no declared topic of this runtime is writable from
+///   outside it, which an empty registry also gives (see [`rung_topics`]).
 ///
 /// Pure and compiled unconditionally: the rung itself is macOS-only, so a term
 /// deleted here would otherwise be invisible to every test on every other
@@ -2078,9 +2100,9 @@ fn doorbell_rung_applies(
     wake_word_available: bool,
     has_registry: bool,
     has_baseline: bool,
-    has_primary: bool,
+    has_armed_line: bool,
 ) -> bool {
-    policy_doorbell && wake_word_available && has_registry && has_baseline && has_primary
+    policy_doorbell && wake_word_available && has_registry && has_baseline && has_armed_line
 }
 
 /// A park's doorbell topic list plus the one line a kernel wake may arm.
@@ -2099,11 +2121,14 @@ struct RungTopics {
 /// Order a park's doorbell topics so the first is one `armable` holds, and name
 /// that topic.
 ///
-/// A kernel wake is armed on ONE address. While this runtime's live-loop thread
-/// is blocked on it, that thread runs no step, and every publish by a node of
-/// this runtime happens inside a step it drives, so no ring reaches a line whose
-/// only writers are this runtime's own nodes. Hence `armable`: a line is armed
-/// only when a publisher this process does not own can write it.
+/// A kernel wake is armed on ONE address, and the park runs BETWEEN steps: the
+/// live-loop thread reaches `monitor_wait_block` only after `step()` has
+/// returned, and every in-graph publish happens inside `step()`/`drain_level`,
+/// including the within-level fires, which run on the fire pool that `step()`
+/// joins before returning. So while that thread is blocked, no node of this
+/// runtime can ring. Hence `armable`: a line is armed only when a publisher this
+/// process does not own can write it, which
+/// [`edge_needs_producer_annotation`] answers over the resolved provisioning.
 ///
 /// The non-armable topics STAY in the list, after the others, because the
 /// poll-all scan reads every topic's ring counter and only the armed line has to
@@ -3211,18 +3236,22 @@ pub struct GraphRuntime {
     /// input topics, built only when `policy.doorbell`. Ordered by
     /// [`rung_topics`]: the topics a publisher this process does not own can
     /// write come first in declared order, then the rest.
-    /// `monitor_wait_block` arms the hardware monitor on its `primary_addr` and
-    /// poll-all-scans it for non-primary rings. `None` when the doorbell path is
-    /// off. (The registry is NOT re-mapped via `DoorbellRegistry::reopen` on a
+    /// `monitor_wait_block` arms the hardware monitor on the armed line's address,
+    /// taken by topic, and poll-all-scans the registry for non-primary rings.
+    /// `None` when the doorbell path is off. (The registry is NOT re-mapped via `DoorbellRegistry::reopen` on a
     /// producer-reconnect LivelinessEvent; the ≤100µs timer backstop
     /// keeps correctness in that case.)
     doorbell_registry: Option<crate::doorbell::DoorbellRegistry>,
     /// The registry's first topic when a kernel wake may arm on it, `None`
-    /// otherwise. `None` covers a graph every one of whose declared trigger
-    /// topics is written only by this runtime's own nodes, which is the
-    /// single-process shape and any rank whose own trigger topic is produced
-    /// in-rank, and it covers a registry that failed to open. Recorded once at
-    /// build, on the open's success arm only, from [`rung_topics`].
+    /// otherwise. The registry spans data-trigger AND sync-input topics, so a
+    /// sync input can hold the armed line. `None` covers a graph every one of
+    /// whose declared topics is written only by this runtime's own nodes, which is
+    /// the single-process shape and any rank whose own trigger topic is produced
+    /// in-rank, and it covers a registry that failed to open. A topic in the
+    /// `multi_publisher_topics:` opt-in is armable even where this runtime
+    /// publishes it, because the opt-in ADMITS a writer the graph does not own
+    /// rather than guaranteeing one. Recorded once at build, on the open's
+    /// success arm only, from [`rung_topics`].
     doorbell_armed_topic: Option<String>,
     /// Count of [`Self::monitor_wait_block`] ENTRIES — incremented once
     /// per call, BEFORE its park loop. The observable test seam pinning the
@@ -8474,8 +8503,9 @@ impl GraphRuntime {
         // Under an active doorbell policy, build the CONSUMER-side
         // doorbell registry over this graph's data-trigger + sync input topics,
         // ordered by `rung_topics` so the armed slot holds a topic a publisher
-        // this process does not own can write. `monitor_wait_block` arms the hardware monitor
-        // on its `primary_addr` and poll-all-scans it for non-primary rings. A
+        // this process does not own can write. `monitor_wait_block` arms the
+        // hardware monitor on the armed line's address, taken by topic, and
+        // poll-all-scans the registry for non-primary rings. A
         // failed open is non-fatal: the live loop then falls back to the
         // timer-only park (the ≤100µs recheck still bounds wake latency). Built
         // BEFORE `config` is moved into `Self` so the warn can read the identity.
@@ -8491,14 +8521,14 @@ impl GraphRuntime {
                 .map(|b| b.topic.to_string())
                 .collect();
             topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
-            // Which of them a publisher this process does not own can write,
-            // read off the provisioning this build already RESOLVED per topic
-            // rather than re-derived from the node list: `owned_topic_configs`
-            // holds every topic whose provisioning is not `External`, so a topic
-            // absent from it has no in-graph producer, and one present with
-            // `Multi` is in the graph's `multi_publisher_topics` opt-in and so
-            // carries writers the graph does not own. `edge_needs_producer_annotation`
-            // is the one predicate that answers this question in this crate.
+            // Which of them a publisher this process does not own can write, read
+            // off the provisioning this build already RESOLVED per topic rather
+            // than re-derived from the node list. `topic_is_writable_from_outside`
+            // is true for a topic in the graph's `multi_publisher_topics` opt-in,
+            // asked of the config directly whatever its provisioning, and for a
+            // topic whose provisioning is `External`, which is every topic absent
+            // from `owned_topic_configs` since that map holds exactly the topics
+            // with an in-graph producer.
             let armable: std::collections::BTreeSet<String> = topics
                 .iter()
                 .filter(|t| {
@@ -8506,7 +8536,7 @@ impl GraphRuntime {
                         .get(t.as_str())
                         .map(|c| c.publisher_provisioning)
                         .unwrap_or(PublisherProvisioning::External);
-                    edge_needs_producer_annotation(&config, t, provisioning)
+                    topic_is_writable_from_outside(&config, t, provisioning)
                 })
                 .cloned()
                 .collect();
@@ -12492,8 +12522,9 @@ impl GraphRuntime {
     ///
     /// # Which line, and what that costs
     ///
-    /// The registry's PRIMARY (first-declared) topic - exactly the line the CPU
-    /// monitor-wait primitive arms on Linux. A consumer of several topics is NOT
+    /// The registry's PRIMARY: the first declared topic a publisher this process
+    /// does not own can write ([`rung_topics`]) - exactly the line the CPU
+    /// monitor-wait primitive arms on Linux where the CPU carries one. A consumer of several topics is NOT
     /// kernel-woken by a ring on a non-primary line; it observes that ring at the
     /// next pacing chunk through the record-only poll-all, which is what it does
     /// today and what a host whose hardware monitor watches one line does. So
@@ -12541,7 +12572,9 @@ impl GraphRuntime {
         let (Some(reg), Some(base)) = (reg, baseline) else {
             return AddrParkOutcome::Unavailable;
         };
-        let Some(bell) = reg.primary() else {
+        // By the armed topic, the same way the hardware plane takes its address,
+        // so one derivation serves both planes.
+        let Some(bell) = self.armed_primary_topic().and_then(|t| reg.bell(t)) else {
             return AddrParkOutcome::Unavailable;
         };
         // The parked claim is scoped to THIS block sequence: taken BEFORE the
@@ -12744,19 +12777,14 @@ impl GraphRuntime {
         // target with no CPU monitor-wait primitive never reaches the arm this
         // feeds, so no test on such a host can observe a dropped gate; this shape
         // makes one unwritable instead.
-        let doorbell_addr: Option<*const u64> = self
-            .armed_primary_topic()
-            .and_then(|t| self.doorbell_registry.as_ref().and_then(|r| r.addr(t)))
-            .map(|p| p as *const u64);
-        debug_assert_eq!(
-            self.armed_primary_topic(),
-            self.doorbell_registry
-                .as_ref()
-                .and_then(|r| r.primary_topic())
-                .filter(|_| self.has_armed_line()),
-            "the armed topic is the registry's first, so `primary_expected` below \
-             pairs with this address by index 0"
-        );
+        // The address AND the baseline slot come from the one `slot_of`/`addr`
+        // pair on the one topic, so the line armed and the value it is compared
+        // against cannot name different topics.
+        let armed_line: Option<(*const u64, usize)> = self.armed_primary_topic().and_then(|t| {
+            let reg = self.doorbell_registry.as_ref()?;
+            Some((reg.addr(t)? as *const u64, reg.slot_of(t)?))
+        });
+        let doorbell_addr: Option<*const u64> = armed_line.map(|(addr, _)| addr);
         // The lost-wakeup `expected` snapshot, taken ONCE before the loop and
         // held FIXED: the doorbell counters are RELATIVE, so only deltas from
         // this baseline matter. NEVER re-snapshot inside the loop — that would
@@ -12766,9 +12794,10 @@ impl GraphRuntime {
         } else {
             None
         };
-        // The primary line's pre-park value — the `expected` the hardware monitor
-        // re-checks against (the registry's first topic == `primary_addr`).
-        let primary_expected: Option<u64> = baseline.as_ref().and_then(|b| b.first().copied());
+        // The armed line's pre-park value: the `expected` the hardware monitor
+        // re-checks against, read at the slot taken with the address above.
+        let primary_expected: Option<u64> =
+            armed_line.and_then(|(_, slot)| baseline.as_ref().and_then(|b| b.get(slot).copied()));
 
         // The direction-B park baseline — for each MAPPED
         // `block` edge this process produces on, was it AT OR OVER threshold as
@@ -13201,10 +13230,11 @@ impl GraphRuntime {
                 // Compiled out entirely off macOS:
                 // `crate::doorbell::wake_word_block_primitive_available` (not the
                 // barrier's function of the same name, which answers the opposite
-                // on Linux) is a compile-time `false` there, and a Linux consumer wakes on
-                // this very same doorbell line through the CPU monitor-wait
-                // primitive armed above - a hardware park reached on the
-                // `performed == true` path this arm never sees.
+                // on Linux) is a compile-time `false` there, and a Linux consumer
+                // whose CPU carries a monitor-wait primitive wakes on this very same
+                // doorbell line through the primitive armed above, a hardware park
+                // reached on the `performed == true` path this arm never sees; a
+                // Linux host without one reaches this arm and naps.
                 //
                 // Snapshot, re-derive, block: the same lost-wake protocol as its
                 // two siblings. Any ring landing after the snapshot fails the
@@ -13521,6 +13551,10 @@ impl GraphRuntime {
             graph = %self.config.identity(),
             park_active = self.park_active(),
             doorbell = self.doorbell_registry.is_some(),
+            doorbell_topics = self
+                .doorbell_registry
+                .as_ref()
+                .map_or(0, crate::doorbell::DoorbellRegistry::len),
             data_wake = self.data_wake_rung(),
             barrier = self.barrier_participant.is_some(),
             credit_edges = self.credit_park_edges.len(),
@@ -17545,9 +17579,10 @@ mod tests {
     /// The doorbell rung's decision table, over injected facts. Pinned on every
     /// OS, because on a target where the rung is compiled out a term deleted
     /// from the conjunction is invisible to every test that could catch it, and
-    /// three of the five terms are redundant at today's call site (an armed
-    /// policy doorbell implies a registry implies a baseline), so deleting one
-    /// changes nothing observable until the day it does.
+    /// three of the five terms are redundant at today's call site (an armed line
+    /// implies a registry, which implies a baseline, and is recorded only under an
+    /// armed policy), so deleting one changes nothing observable until the day it
+    /// does.
     #[test]
     fn the_doorbell_rung_applies_only_when_every_term_holds() {
         assert!(

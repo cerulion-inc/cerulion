@@ -667,6 +667,10 @@ fn mixed_rank_graph(
 /// the recheck it was going to make anyway. The decision is read from the
 /// runtime's own resolved state, the one site the wait policy line also reads,
 /// never from that line's text.
+///
+/// The data-wake term below is host-gated: off macOS it is false for every graph,
+/// so what carries this arm there is the armed-topic assertion and the registry
+/// assertion beside it, rather than the rung's own verdict.
 #[test]
 #[serial]
 fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
@@ -686,7 +690,7 @@ fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
         runtime.doorbell_primary_topic_for_test(),
         None,
         "every trigger topic of this graph is produced by a node this runtime \
-         owns, so no peer can ring one and the park must arm none"
+         owns, so nothing outside it can ring one and the park must arm none"
     );
     // A declined arm and a registry that never opened both leave the armed topic
     // at `None`, so the registry is asserted present and holding exactly the
@@ -708,7 +712,7 @@ fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
 
 /// The positive control for the arm above, and the shape a declared two-group
 /// split gives its second group: the trigger topic has NO producer in this
-/// runtime, so a peer process rings it and the rung is right to arm.
+/// runtime, so a writer outside it rings the line and the rung is right to arm.
 ///
 /// Judged in BOTH directions against the host fact the rung is gated on, so a
 /// host without the Apple os_sync family is a judged arm rather than a skipped
@@ -732,7 +736,7 @@ fn a_trigger_with_no_in_graph_producer_resolves_a_primary_and_arms_the_rung() {
         runtime.doorbell_primary_topic_for_test(),
         Some(EXT_TOPIC),
         "the trigger topic has no producer in this runtime, so it is exactly the \
-         line a peer rings and the park must arm it"
+         line a writer outside it rings and the park must arm it"
     );
     let armed = runtime.data_wake_rung_for_test();
     if cerulion_core::doorbell::wake_word_block_primitive_available() {
@@ -830,10 +834,14 @@ fn a_multi_publisher_topic_this_runtime_also_writes_is_armable() {
 ///
 /// The counter this reads is the same one
 /// `doorbell_ring_during_park_is_attributed_to_doorbell_counter` asserts moves
-/// when a peer rings, and this graph carries no barrier participant and no
+/// when an outside writer rings, and this graph carries no barrier participant
+/// and no
 /// credit edge, so the shared counter is attributable to the doorbell rung
-/// alone. Judged in BOTH directions against the host fact, so a host without the
-/// Apple os_sync family is a judged arm rather than a skipped one.
+/// alone. Zero on its own would not say much: it is also what a host with no wake
+/// word and a removed rung produce. So the same drive runs twice, once on the
+/// chain and once on a graph whose trigger has an outside writer that really
+/// rings, and the chain's zero is read against that graph's nonzero. The pair is
+/// skipped, loudly, only where the host carries no wake word at all.
 #[test]
 #[serial]
 fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
@@ -858,6 +866,15 @@ fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
          counter below is zero for the wrong reason"
     );
     #[cfg(target_os = "macos")]
+    if !cerulion_core::doorbell::wake_word_block_primitive_available() {
+        eprintln!(
+            "SKIP: no usable os_sync backend on this host, so a zero block count \
+             says nothing about the producer term"
+        );
+        runtime.shutdown();
+        return;
+    }
+    #[cfg(target_os = "macos")]
     assert_eq!(
         runtime.park_wake_word_block_count_for_test(),
         0,
@@ -866,6 +883,60 @@ fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
          bump the shared counter"
     );
     runtime.shutdown();
+
+    // The positive half, same host, same run: a consumer whose trigger has an
+    // outside writer, with that writer ringing. Its nonzero count is what makes
+    // the zero above a decision rather than an absent capability.
+    #[cfg(target_os = "macos")]
+    {
+        let ns = mwp_ns("chainctl");
+        let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+        let fires = Arc::new(AtomicU64::new(0));
+        let (config, factories) = consumer_graph(Arc::clone(&observed), Arc::clone(&fires));
+        let clock = Arc::new(VirtualClock::new());
+        let mut runtime = GraphRuntime::build_for_test_with_policy(
+            config,
+            factories,
+            clock,
+            8,
+            MonitorWaitPolicy::new(true, true, ns.clone()),
+        )
+        .expect("build the external-producer consumer graph");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ringing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ringer = {
+            let stop = Arc::clone(&stop);
+            let ringing = Arc::clone(&ringing);
+            std::thread::spawn(move || {
+                let db = cerulion_core::doorbell::Doorbell::open_owned(&ns, EXT_TOPIC)
+                    .expect("open the producer-side ringer doorbell");
+                while !stop.load(Ordering::Relaxed) {
+                    db.ring();
+                    ringing.store(true, Ordering::Release);
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            })
+        };
+        let spun_up = std::time::Instant::now();
+        while !ringing.load(Ordering::Acquire) {
+            assert!(
+                spun_up.elapsed() < Duration::from_secs(10),
+                "the ringer never rang, so the control below would judge nothing"
+            );
+            std::thread::yield_now();
+        }
+        for _ in 0..4 {
+            runtime.run_live_step_once_for_test(PERIOD_PARK_TIMEOUT);
+        }
+        stop.store(true, Ordering::Relaxed);
+        ringer.join().expect("ringer thread panicked");
+        assert!(
+            runtime.park_wake_word_block_count_for_test() > 0,
+            "the control must kernel-block on its armed line, or the zero above \
+             could equally mean the rung is gone"
+        );
+        runtime.shutdown();
+    }
 }
 
 /// A doorbell RING landing inside a park window is attributed to the DOORBELL
@@ -954,20 +1025,21 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
     // park happens to end. A block that timed out at its slice would satisfy
     // `doorbell >= 1` just as well, because the loop-top poll then attributes the
     // ring it finds. The ringer is known to be ringing before the first window
-    // opens (above) and its cadence is 200 microseconds against a 50 millisecond
+    // opens, by the `ringing` handshake after its spawn, and its cadence is 200
+    // microseconds against a 50 millisecond
     // window, so a ring lands inside every window this drives.
     //
-    // Stated as "the ring ends more windows than the timer does" rather than as
-    // zero timeouts: a ringer starved for one whole window on a loaded runner is
-    // a scheduling fact about the host, and an absolute wall on it is the class
-    // that inverts under load. A rung that never woke on a ring still fails,
-    // because then the timer ends every window.
+    // Stated as a ONE-window timeout budget: a ringer starved for one whole
+    // window on a loaded runner is a scheduling fact about the host, so one such
+    // window is allowed and a second is not. The ring half is asserted separately
+    // below by `doorbell + 1 >= entries`; this bound on its own would also be
+    // satisfied by a listener wake.
     assert!(
         timeout <= 1,
-        "a park window with a ring every 200 microseconds inside it must be ended \
-         by a ring, not by its own 50 millisecond timeout; one starved window on a \
-         loaded runner is a host fact and is the whole budget - got {timeout} \
-         timeouts across {entries} park entries"
+        "a park window with a ring every 200 microseconds inside it must not be \
+         ended by its own 50 millisecond timeout; one starved window on a loaded \
+         runner is a host fact and is the whole budget - got {timeout} timeouts \
+         across {entries} park entries"
     );
     assert!(
         doorbell + 1 >= entries,
@@ -1335,10 +1407,12 @@ fn degraded_default_policy_parks_fires_and_delivers() {
             );
         }
     }
-    // The NEGATIVE control for the doorbell rung, and the premise every other
-    // pin of this shared counter rests on: this policy has the doorbell OFF, so
-    // the rung must decline and the counter must stay at zero. Without it, a
-    // rung that ignored `policy.doorbell()` would be caught by nothing.
+    // The NEGATIVE control for this shared counter: with the doorbell OFF no page
+    // is mapped, so no wake-word block may run and the counter must stay at zero.
+    // The `policy_doorbell` TERM itself is pinned by
+    // `the_doorbell_rung_applies_only_when_every_term_holds`, not here: with the
+    // doorbell off the registry, baseline and armed-line terms are all false too,
+    // so dropping that one term alone would leave this assertion green.
     assert_eq!(
         runtime.park_wake_word_block_count_for_test(),
         0,
