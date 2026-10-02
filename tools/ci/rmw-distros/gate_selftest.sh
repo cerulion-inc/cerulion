@@ -82,6 +82,12 @@ rclpy_timed_out 137 selftest "rclpy exchange" 600 > /dev/null || { echo "SELFTES
 rclpy_timed_out 0   selftest "rclpy exchange" 600 > /dev/null && { echo "SELFTEST FAIL: rc 0 read as a timeout"; fail=1; }
 rclpy_timed_out 101 selftest "rclpy exchange" 600 > /dev/null && { echo "SELFTEST FAIL: a normal non-zero rc (101) read as a timeout"; fail=1; }
 case "$(rclpy_timed_out 124 selftest 'rclpy exchange' 600 2>&1)" in *"GATE FAIL"*"timed out"*) : ;; *) echo "SELFTEST FAIL: rclpy_timed_out did not name the timeout reason"; fail=1 ;; esac
+# 11. The serial-suite skip decision (serial_suite_runs, harvest.sh): a skip request is honoured
+#     ONLY off x86_64, so the x86_64 lanes run the suite no matter the variable (by construction).
+( RMW_GATE_SKIP_SERIAL_SUITE=1; serial_suite_runs aarch64 ) && { echo "SELFTEST FAIL: skip=1 on aarch64 still ran the suite"; fail=1; }
+( RMW_GATE_SKIP_SERIAL_SUITE=1; serial_suite_runs x86_64 ) || { echo "SELFTEST FAIL: skip=1 on x86_64 did not run the suite (the by-construction guard failed)"; fail=1; }
+( RMW_GATE_SKIP_SERIAL_SUITE=0; serial_suite_runs aarch64 ) || { echo "SELFTEST FAIL: skip=0 on aarch64 did not run the suite"; fail=1; }
+( unset RMW_GATE_SKIP_SERIAL_SUITE; serial_suite_runs aarch64 ) || { echo "SELFTEST FAIL: unset skip on aarch64 did not run the suite"; fail=1; }
 rm -f "$plain" "$plain.c" "$plain.s" "$plain.n"
-[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, the refuse-row pin guard, and the rclpy red paths (missing .so, absent import probe, timeout rc) each named"
+[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, the refuse-row pin guard, and the rclpy red paths (missing .so, absent import probe, timeout rc) each named, and the serial-suite skip decision pinned on both arches"
 exit "$fail"
