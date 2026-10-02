@@ -12553,7 +12553,7 @@ fn run_rank_pass(
     // refill hook for the next FIFO frame and got nothing. The fire happens
     // anyway (the plan is authoritative for the SCHEDULE), so the node
     // publishes from its held head and the frame diff sees an ordinary byte
-    // mismatch — blaming the candidate for a frame the HARNESS did not supply.
+    // mismatch: blaming the candidate for a frame the HARNESS did not supply.
     // Reported per node so the real cause is nameable; never a verdict.
     // ── what the READ GATE observed ──────────────────────────────────────
     // `not_applicable` is a POSITIVE claim: no graph-produced input edge runs
