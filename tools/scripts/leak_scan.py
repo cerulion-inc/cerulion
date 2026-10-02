@@ -63,19 +63,26 @@ Entry forms, one per line, '#' comments:
 
 References a stranger cannot open are their own pair of classes. The scanner
 holds no list of repositories: it resolves what a link or a `#` shorthand
-points at and asks the forge, anonymously and once per distinct repository per
-run, whether a stranger is served a page. 404 is a defect whether the target is
-private or absent; a tracker link is a defect with no question asked; anything
-else is unverified, which is HARD under --require-private and a warning
-otherwise, so CI fails closed and a laptop with no network still runs.
+points at and asks the forge's repository endpoint, once per distinct repository
+per run, whether the credential the question carries is served that repository.
+WHO ASKS DECIDES THE ANSWER: the Actions job token is scoped to the repository
+the workflow runs in, so for every other repository it is a stranger and a 404
+there is the not-found verdict, while a personal token used locally is not a
+stranger, so a local online run with a personal token can read clean where the
+job reads a leak. 404 and 410 are a defect whether the target is private or
+absent; a tracker link is a defect with no question asked. NO ANSWER AT ALL is a
+failure of this tool and not a verdict: the reference is retried, then recorded
+as NOT QUERIED, and it carries no row.
 
 Exit codes:
   0  ran, controls passed, zero HARD hits
-  1  ran, at least one HARD hit (or a stale allowlist entry in full-tree mode)
+  1  ran, at least one HARD hit (or a stale allowlist entry in full-tree mode),
+     a reference nobody answered about beside it or not
   2  malformed invocation
   3  COULD NOT RUN (bad ref, git failure, zero units, a private pattern that
-     does not compile, a dead built-in control, or --require-private with no
-     private pattern loaded)
+     does not compile, a dead built-in control, --require-private with no
+     private pattern loaded, or a reference nobody answered about on a run that
+     otherwise reads OK)
 
 Stdlib only. Python 3.8 or newer.
 """
@@ -639,27 +646,44 @@ CLASS_FLOOR = 15
 # the text just published.
 #
 # Nothing here names a repository. The classes resolve what the text points at
-# and then ASK the forge's repository endpoint whether a stranger is served the
-# repository: 200 is public, 404 and 410 are private or absent and a defect
-# either way. One question per distinct repository per run, cached, to the host
-# the reference names and to no other host. A tracker link needs no question: a
-# tracker is closed to a stranger by construction.
+# and then ASK the forge's repository endpoint whether the credential the
+# question carries is served the repository: 200 is served, 404 and 410 are
+# private or absent and a defect either way. One question per distinct
+# repository per run, cached, to the host the reference names and to no other
+# host. A tracker link needs no question: a tracker is closed to a stranger by
+# construction.
+#
+# WHO ASKS DECIDES THE ANSWER. The Actions job token is scoped to the repository
+# the workflow runs in, so for every other repository it is a stranger and a 404
+# there is the not-found verdict. A personal token is not a stranger, so a local
+# online run carrying one can read clean what the job reads as a leak, and a
+# disagreement between the two is the two identities, not a flake.
 #
 # AN ANSWER IS A VERDICT; NO ANSWER IS A TOOL FAILURE. A throttle (429, or 403
 # carrying a rate limit signal), a server error, a transport error and a timeout
 # say nothing about the reference, so they are retried with a growing backoff
 # inside the run's time budget and, failing that, the reference is recorded as
-# NOT QUERIED: the run prints the class and the count, asserts no leak, and exits
-# EXIT_NORUN. That is the whole reason this file reads status codes in two
-# groups. Reporting no answer as a finding is what made the guard red four times
-# out of four on content that was already on main.
+# NOT QUERIED: the run names it, names the status or the error kind the last
+# attempt saw, and asserts no leak about it. That is the whole reason this file
+# reads status codes in two groups. Reporting no answer as a finding is what made
+# the guard red four times out of four on content that was already on main.
+#
+# What no answer DOES NOT do is silence the rest of the run. The hits and the
+# verdict summary are printed first, so a run that reads FAIL on its own evidence
+# (a HARD hit, or a waiver that matched nothing or excused nothing) keeps that
+# summary and EXIT_HIT and prints the NOT QUERIED lines beside it; a run that
+# otherwise reads OK is the one that turns into the NON-RUN at EXIT_NORUN.
+# Printing "no leak is asserted" over an asserted leak, and dropping the FAIL
+# summary with it, is the shape this ordering exists to stop.
 #
 # OFFLINE (--offline, and every hook) is the operator's own choice not to ask, so
 # it keeps reporting each candidate as a scoped ref-unverified note instead, and
 # that is where --require-private, and --hard ref-unverified, still make the class
-# a finding. On an online run the only ref-unverified left is a bare shorthand
-# with no owner to resolve it against, which is a reference the text did not write
-# down rather than a question the forge refused.
+# a finding; the shipped hooks pass neither flag, so an offline run that passes
+# one is where they bind. On an online run the one ref-unverified left is a bare
+# shorthand with no owner to resolve it against, which is a reference the text did
+# not write down rather than a question the forge refused, and the escalation
+# flags do raise that row.
 # ---------------------------------------------------------------------------
 REF_DEFECT = 'ref-unopenable'
 REF_UNVERIFIED = 'ref-unverified'
@@ -682,16 +706,15 @@ REF_CLASSES = (
     (REF_UNVERIFIED, 'scoped',
      'a candidate the scan did not resolve: --offline, or no owner to resolve a bare '
      'shorthand against (HARD with --require-private or --hard; a reference the forge '
-     'did not answer about is a NON-RUN instead, and carries no row at all)'),
+     'did not answer about is NOT QUERIED instead, and carries no row at all)'),
 )
 FORGE_HOST = 'github' + '.com'
 # The probe goes to the API, not to the repository's HTML page. Both answer 200
-# for a repository a stranger is served and 404 for one that is private, renamed
+# for a repository the asker is served and 404 for one that is private, renamed
 # away or absent, and only the API prices the question: it returns
 # X-RateLimit-Limit and X-RateLimit-Remaining (60 an hour anonymous, 5,000 with a
-# token; the forge's own job token is held to 1,000 an hour per repository) and a
-# Retry-After when it throttles, where the HTML page returns no budget header at
-# all and a throttle there cannot be told from a server fault.
+# token) and a Retry-After when it throttles, where the HTML page returns no
+# budget header at all and a throttle there cannot be told from a server fault.
 FORGE_API_HOST = 'api.' + FORGE_HOST
 # A tracker is unreadable to a stranger whoever they are, so a link to one is a
 # defect on its face. This tuple is a PRODUCT host, not a private name; a
@@ -816,7 +839,7 @@ def _no_answer(code, headers):
     answered it: a throttle (429, or 403 carrying a rate limit signal) or a server
     error. Such an attempt is retried. The verdict map is wider than this: it
     reads every status that is neither 200 nor a not-found as no answer, retried
-    or not, because only those two codes say what a stranger is served."""
+    or not, because only those two codes say what the asker is served."""
     if code == 429 or 500 <= code < 600:
         return True
     if code != 403:
@@ -837,11 +860,12 @@ def _retry_wait(headers, attempt):
     return REF_BACKOFF * (2 ** attempt)
 
 
-def forge_status(owner, repo, remaining=None, clock=time.monotonic, token=None):
-    """Ask the forge whether a stranger is served this repository. A HEAD for the
-    repository's own API resource: no body, no credentials beyond `token`, and to
-    the host the reference names and to no other host. Returns the status code, or
-    None when no attempt got an ANSWER.
+def forge_status(owner, repo, remaining=None, clock=time.monotonic, token=None,
+                 note=None):
+    """Ask the forge whether the credential this question carries is served this
+    repository. A HEAD for the repository's own API resource: no body, no
+    credentials beyond `token`, and to the host the reference names and to no
+    other host. Returns the status code, or None when no attempt got an ANSWER.
 
     200 and a not-found are answers and return at once. A throttle, a server
     error, a transport error and a timeout are not: each is retried up to
@@ -851,7 +875,16 @@ def forge_status(owner, repo, remaining=None, clock=time.monotonic, token=None):
 
     `token` lifts the budget the forge prices this question under from 60 an hour
     to the authenticated ceiling. It is sent as a bearer credential and is never
-    logged, echoed or passed as an argument to anything.
+    logged, echoed or passed as an argument to anything. It also changes WHO IS
+    ASKING: the Actions job token is scoped to the repository the workflow runs
+    in, so for every other repository it is a stranger and a 404 is the not-found
+    verdict, while a personal token is not a stranger and reads repositories its
+    owner is a member of as served.
+
+    `note`, when given, is called with what each attempt last saw, as
+    'status <code>' or 'transport <error kind>'. The caller prints the last of
+    them beside a reference it records as not queried, so a stale credential
+    (401) reads as one rather than as a bare count.
 
     `remaining` is what is left of the run's whole time budget. It caps this
     request's own timeout and it decides whether there is room for another
@@ -874,18 +907,26 @@ def forge_status(owner, repo, remaining=None, clock=time.monotonic, token=None):
             return REF_TIMEOUT
         return min(REF_TIMEOUT, max(0.0, remaining - (clock() - started)))
 
+    def say(what):
+        if note is not None:
+            note(what)
+
     for attempt in range(REF_ATTEMPTS):
         room = left()
         try:
             with urllib.request.urlopen(req, timeout=max(0.1, room)) as resp:
                 return resp.status
         except urllib.error.HTTPError as e:
+            say('status %d' % e.code)
             if not _no_answer(e.code, e.headers):
                 return e.code
             wait = _retry_wait(e.headers, attempt)
-        except Exception:
+        except Exception as e:
             # A transport error and a timeout carry no headers and no status at
-            # all, which is the plainest case of no answer there is.
+            # all, which is the plainest case of no answer there is. The TYPE is
+            # what the caller prints: it separates a refused connection from a
+            # name that does not resolve and from a socket that went quiet.
+            say('transport %s' % type(e).__name__)
             wait = REF_BACKOFF * (2 ** attempt)
         if wait is None or attempt + 1 >= REF_ATTEMPTS:
             return None
@@ -902,9 +943,11 @@ def forge_status(owner, repo, remaining=None, clock=time.monotonic, token=None):
 
 
 class RefResolver(object):
-    """Is a repository openable by a stranger? One question per distinct
-    repository per run, answered by the forge itself and cached in memory, so no
-    list of repositories lives in the tree and none can go stale.
+    """Is a repository openable by the identity this run asks with? One question
+    per distinct repository per run, answered by the forge itself and cached in
+    memory, so no list of repositories lives in the tree and none can go stale.
+    A job token is a stranger to every repository but the one its workflow runs
+    in, which is why CI reads the verdict a stranger gets.
 
       public      the forge served the repository (200)
       closed      the forge answered 404 or 410: private, renamed away, taken
@@ -912,13 +955,15 @@ class RefResolver(object):
                   one of those cases
       unqueried   no answer came back (a throttle, a server error, a transport
                   error, a timeout, or this run had spent its asking budget).
-                  Nothing is asserted about such a reference and the run is a
-                  NON-RUN: see `unqueried`
+                  Nothing is asserted about such a reference: see `unqueried`
       unverified  the scanner was told not to ask at all (--offline, every hook)
 
-    `unqueried` maps each unanswered repository to the `owner/repo` the summary
-    prints, in the order the scan met them, so the caller names every one of them
-    rather than a bare count.
+    `unqueried` maps each unanswered repository to (the `owner/repo` the summary
+    prints, why nobody answered), in the order the scan met them, so the caller
+    names every one of them and what it last saw rather than a bare count. The
+    why is 'status <code>' or 'transport <error kind>' from the last attempt, or
+    'budget spent' for a repository no question was put about at all; a stale
+    credential answers 401 and reads as such instead of hiding in a count.
     """
 
     def __init__(self, fetch=None, offline=False, budget=REF_BUDGET, deadline=REF_DEADLINE,
@@ -948,11 +993,11 @@ class RefResolver(object):
             return False
         return self.clock() - self.started >= self.deadline
 
-    def _unqueried(self, key, owner, repo):
+    def _unqueried(self, key, owner, repo, why):
         """Record one repository nobody got an answer about, under the name the
-        summary prints, and cache the verdict so the same repository is neither
-        asked about nor counted twice."""
-        self.unqueried[key] = owner + '/' + repo
+        summary prints and with what the asking last saw, and cache the verdict so
+        the same repository is neither asked about nor counted twice."""
+        self.unqueried[key] = (owner + '/' + repo, why)
         self.cache[key] = 'unqueried'
         return 'unqueried'
 
@@ -967,22 +1012,33 @@ class RefResolver(object):
             # answering: a reference the scan never put a question about cannot be
             # cleared or condemned, so it goes in with the throttled ones.
             self.spent = True
-            return self._unqueried(key, owner, repo)
+            return self._unqueried(key, owner, repo, 'budget spent')
         if self.started is None:
             self.started = self.clock()
         self.asked += 1
         remaining = max(0.0, self.deadline - (self.clock() - self.started))
+        # What the asking last saw, for a reference that ends up unqueried. The
+        # default probe reports every attempt through `note`; an injected fetch
+        # reports nothing, so a status it hands back, or the exception it raised,
+        # is what names the cause.
+        seen = []
         try:
-            code = (forge_status(owner, repo, remaining, token=self.token)
+            code = (forge_status(owner, repo, remaining, token=self.token,
+                                 note=seen.append)
                     if self.fetch is None else self.fetch(owner, repo, remaining))
-        except Exception:
+        except Exception as e:
             code = None
+            seen.append('transport %s' % type(e).__name__)
         if code == 200:
             verdict = 'public'
         elif code in (404, 410):
             verdict = 'closed'
         else:
-            return self._unqueried(key, owner, repo)
+            if code is not None:
+                why = 'status %d' % code
+            else:
+                why = seen[-1] if seen else 'no answer'
+            return self._unqueried(key, owner, repo, why)
         self.cache[key] = verdict
         return verdict
 
@@ -1018,9 +1074,9 @@ class RefScan(object):
                 for cid, _, s, e in self._scan(text, dedupe=False)]
 
     def _repo(self, owner, repo):
-        """(class, token) for one resolved repository, or None when a stranger
-        can open it, when it is the repository being scanned, or when the first
-        segment is a forge word and names no owner at all."""
+        """(class, token) for one resolved repository, or None when the forge
+        served it to this run, when it is the repository being scanned, or when
+        the first segment is a forge word and names no owner at all."""
         if repo.lower().endswith('.git'):
             repo = repo[:-4]
         if not owner or not repo or owner.lower() in FORGE_RESERVED:
@@ -3163,22 +3219,14 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
     if refs.res.spent and not args.quiet:
         out('REFERENCE BUDGET SPENT: this run stopped asking the forge, so every reference '
             'after that point is NOT QUERIED and this run asserts nothing about it.')
-    if refs.res.unqueried:
-        # No answer is no verdict. Each one is named the way a finding's value is
-        # named, so a log publishes no more here than a row would, and then the run
-        # exits NON-RUN: a reference the forge would not answer about is a failure
-        # of this tool, and calling it a leak reds a guard on content nobody
-        # changed.
-        for token in refs.res.unqueried.values():
-            out('NOT QUERIED %s: %s' % (REF_UNVERIFIED, _ref_value(sc, token)))
-        out('leak_scan %s: NON-RUN: %s=%d reference(s) could not be queried (rate limit or '
-            'transport); no leak is asserted' % (args.mode, REF_UNVERIFIED,
-                                                 len(refs.res.unqueried)))
-        return EXIT_NORUN
     by_class = {}
     for h in sc.hits:
         by_class[h.cls] = by_class.get(h.cls, 0) + 1
     status = 'OK' if hard == 0 and not problems else 'FAIL'
+    # The hits and this summary come FIRST, and they print whatever the forge did
+    # or did not answer: a run that reads FAIL has asserted something on its own
+    # evidence, and exiting NON-RUN over an unanswered reference would print "no
+    # leak is asserted" across the top of it and drop the FAIL count with it.
     if not (args.quiet and status == 'OK'):
         if by_class:
             out('by-class: ' + ' '.join('%s=%d' % (k, by_class[k]) for k in sorted(by_class)))
@@ -3192,13 +3240,31 @@ def run_mode(args, root, env, out, neuter=None, home=None, fetch=None):
                 'NOT-LOADED(generic classes only)',
                 len(allow), st.pragmas, time.time() - t0,
                 _extras(sc)))
+    if refs.res.unqueried:
+        # No answer is no verdict. Each reference is named the way a finding's
+        # value is named, so a log publishes no more here than a row would, and
+        # each line carries the status or the error kind the asking last saw, so a
+        # stale credential (401) reads as one and a throttle (429) as another.
+        for token, why in refs.res.unqueried.values():
+            out('NOT QUERIED %s: %s (%s)' % (REF_NOANSWER, _ref_value(sc, token), why))
+        tail = ('unqueried=%d reference(s) got no answer (status or transport named per '
+                'line)' % len(refs.res.unqueried))
+        if status == 'FAIL':
+            # This run has already failed on its own evidence, a HARD hit or a
+            # waiver that excused nothing, so the exit code stays that failure's.
+            # These references are the one thing it does not speak to.
+            out('leak_scan %s: %s; nothing is asserted about them, and the FAIL above '
+                'stands' % (args.mode, tail))
+        else:
+            out('leak_scan %s: NON-RUN: %s; no leak is asserted' % (args.mode, tail))
+            return EXIT_NORUN
     return EXIT_OK if status == 'OK' else EXIT_HIT
 
 
 def _ref_value(sc, token):
     """One unqueried reference as it may be PRINTED: the masking an
-    identity-bearing finding's value gets, so a NON-RUN line publishes no more of
-    a slug than a row for it would have."""
+    identity-bearing finding's value gets, so a NOT QUERIED line publishes no
+    more of a slug than a row for it would have."""
     if sc.masks_values():
         return mask_shape(token)
     return clean(sc.redact(token))[:80]
@@ -3338,7 +3404,7 @@ RED1 = '<private#1@host>'
 # here rather than a page that can change under it.
 RO = REF_SAMPLE_OWNER                    # the stand-in owner
 R_SELF = 'qz' + 'rkv-here'               # the repository being scanned
-R_PUB = 'qz' + 'rkv-open'                # 200: a stranger gets a page
+R_PUB = 'qz' + 'rkv-open'                # 200: the forge serves it
 R_PRIV = REF_SAMPLE_REPO                 # 404: private
 R_GONE = 'qz' + 'rkv-absent'             # 404: never there
 R_SLOW = 'qz' + 'rkv-throttled'          # 429: the forge did not answer
@@ -3346,7 +3412,7 @@ R_WITHDRAWN = 'qz' + 'rkv-withdrawn'     # 410: taken down, and still a not-foun
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_WITHDRAWN): 410, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 254
+EXPECTED_ARMS = 256
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
@@ -4777,16 +4843,16 @@ def self_test(out, base_env, argv0):
         gitn.run(['symbolic-ref', 'HEAD', 'refs/heads/main'])
         gitn.run(['add', '-A'])
         gitn.run(['commit', '-q', '-m', 'throttle'])
-        norun_head = ('leak_scan tree: NON-RUN: ' + REF_UNVERIFIED + '=1 reference(s) '
-                      'could not be queried (rate limit or transport); no leak is asserted')
+        norun_head = ('leak_scan tree: NON-RUN: unqueried=1 reference(s) got no answer '
+                      '(status or transport named per line); no leak is asserted')
         rc, lines = run(['tree', '--no-allow'] + mine, refenv, repo_noans)
         ref_rows = [ln for ln in lines if ln.startswith(('HIT ' + REF_UNVERIFIED,
                                                          'REPORT ' + REF_UNVERIFIED,
                                                          'HIT ' + REF_DEFECT))]
         arm('ref-a-throttled-reference-is-a-non-run-and-not-a-finding',
             rc == EXIT_NORUN and norun_head in lines and not ref_rows
-            and any(ln.startswith('NOT QUERIED ' + REF_UNVERIFIED + ': ') and R_SLOW in ln
-                    for ln in lines),
+            and any(ln.startswith('NOT QUERIED ' + REF_NOANSWER + ': ') and R_SLOW in ln
+                    and ln.endswith(' (status 429)') for ln in lines),
             'rc=%d rows=%s %s' % (rc, ref_rows, [ln for ln in lines if 'QUERIED' in ln
                                                  or 'NON-RUN' in ln]))
         # A forge that answers nothing at all, which is what a transport error and
@@ -4822,8 +4888,8 @@ def self_test(out, base_env, argv0):
         notq = [ln for ln in lines_g if ln.startswith('NOT QUERIED ')]
         arm('ref-a-ci-log-carries-a-masked-shape-for-a-reference-nobody-answered-about',
             rc_g == EXIT_NORUN and len(notq) == 1 and R_SLOW not in notq[0]
-            and notq[0] == 'NOT QUERIED ' + REF_UNVERIFIED + ': '
-            + mask_shape(RO + '/' + R_SLOW),
+            and notq[0] == 'NOT QUERIED ' + REF_NOANSWER + ': '
+            + mask_shape(RO + '/' + R_SLOW) + ' (status 429)',
             'rc=%d %s' % (rc_g, notq))
         # OFFLINE over the same tree is the operator's choice not to ask: a scoped
         # note, no question, and no NON-RUN.
@@ -4835,6 +4901,57 @@ def self_test(out, base_env, argv0):
                     for ln in lines_o)
             and not any('NON-RUN' in ln for ln in lines_o),
             'rc=%d asked=%s' % (rc_o, asked))
+        # A LEAK AND A LOST QUESTION AT ONCE. A hard hit is an assertion this run
+        # made and the unanswered reference is the one thing it does not speak to,
+        # so the FAIL summary and the exit code stay the hit's and the NOT QUERIED
+        # lines print beside them. Exiting NON-RUN here would print "no leak is
+        # asserted" over an asserted leak and drop the count with it.
+        repo_both = os.path.join(tmp, 'repo-both')
+        os.makedirs(repo_both)
+        _write_files(repo_both, {'both.md': (
+            'tracked at ' + HTTPS + TRACKER_HOSTS[0] + '/team/ENG/issue/E-2\n'
+            + 'see ' + FORGE + RO + '/' + R_SLOW + '/issues/1\n').encode('utf-8')})
+        gitb = Git(repo_both, env)
+        gitb.run(['init', '-q'])
+        gitb.run(['symbolic-ref', 'HEAD', 'refs/heads/main'])
+        gitb.run(['add', '-A'])
+        gitb.run(['commit', '-q', '-m', 'both'])
+        rc_bo, lines_bo = run(['tree', '--no-allow'] + mine, refenv, repo_both)
+        unq_tail = ('leak_scan tree: unqueried=1 reference(s) got no answer (status or '
+                    'transport named per line); nothing is asserted about them, and the '
+                    'FAIL above stands')
+        arm('ref-a-hard-hit-beside-an-unanswered-reference-fails-and-reports-both',
+            rc_bo == EXIT_HIT
+            and any(ln.startswith('HIT ' + REF_DEFECT + ' both.md:1') for ln in lines_bo)
+            and any(ln.startswith('leak_scan tree: FAIL hard=1 ') for ln in lines_bo)
+            and any(ln.startswith('NOT QUERIED ' + REF_NOANSWER + ': ')
+                    and ln.endswith(' (status 429)') for ln in lines_bo)
+            and unq_tail in lines_bo
+            and not any('NON-RUN' in ln for ln in lines_bo),
+            'rc=%d %s' % (rc_bo, [ln for ln in lines_bo
+                                  if ln.startswith(('leak_scan', 'NOT QUERIED'))]))
+        # The same rule over the OTHER thing that reads FAIL: a waiver that
+        # matched no file. It is not a leak, but it is this run's own verdict on
+        # its own evidence, and a NON-RUN over an unanswered reference would
+        # replace it with "no leak is asserted" and take the FAIL line with it.
+        # The throttled tree from above, so hard is 0 and the stale row alone
+        # carries the failure.
+        stale_allow = os.path.join(tmp, 'noans-allow')
+        with open(stale_allow, 'w') as fh:
+            fh.write('gone/*.md | mdns-local | a test fixture host name\n')
+        rc_st, lines_st = run(['tree', '--allow', stale_allow] + mine, refenv, repo_noans)
+        arm('ref-a-stale-waiver-beside-an-unanswered-reference-fails-and-reports-both',
+            rc_st == EXIT_HIT
+            and any(ln == 'ALLOWLIST: allowlist line 1 matches no file in the tree (stale)'
+                    for ln in lines_st)
+            and any(ln.startswith('leak_scan tree: FAIL hard=0 ') for ln in lines_st)
+            and any(ln.startswith('NOT QUERIED ' + REF_NOANSWER + ': ')
+                    and ln.endswith(' (status 429)') for ln in lines_st)
+            and unq_tail in lines_st
+            and not any('NON-RUN' in ln for ln in lines_st),
+            'rc=%d %s' % (rc_st, [ln for ln in lines_st
+                                  if ln.startswith(('leak_scan', 'NOT QUERIED',
+                                                    'ALLOWLIST'))]))
         # the private tier keys: a tracker host and a repository slug the shape
         # cannot see. Neither value is in the tree and neither ever prints.
         tracker = 'tickets.' + SH + '.example'
@@ -5284,10 +5401,10 @@ def self_test(out, base_env, argv0):
         # costs, how the waits between them grow, and that a retry can succeed. A
         # bounded retry nobody counted is one attempt again the next time somebody
         # edits the loop, and that is the shape that read a rate limit as a leak.
-        def _patched(opener, sleeper=None):
-            """Run `opener` as the only way out of this process for one call, with
-            every wait recorded instead of taken. Returns (result, timeouts,
-            waits)."""
+        def _patched(opener, call):
+            """Run `call` with `opener` as the only way out of this process, and
+            with every wait recorded instead of taken. Returns (what `call`
+            returned, the timeouts the socket was handed, the waits asked for)."""
             timeouts, waits = [], []
 
             def wrapped(req, timeout=None):
@@ -5298,7 +5415,7 @@ def self_test(out, base_env, argv0):
             urllib.request.urlopen = wrapped
             time.sleep = waits.append
             try:
-                return (sleeper(), timeouts, waits)
+                return (call(), timeouts, waits)
             finally:
                 urllib.request.urlopen, time.sleep = real_open, real_sleep
 
@@ -5410,13 +5527,35 @@ def self_test(out, base_env, argv0):
             and slow.asked == 1 and slow.spent
             and slow.verdict(RO, R_PRIV) == 'closed',
             'asked=%d spent=%s' % (slow.asked, slow.spent))
-        sc_b = Scanner('tree', build_classes(), None, [], lambda s: None,
-                       refs=RefScan(RefResolver(fetch=lambda o, r, *_: 200, budget=0),
-                                    RO, R_SELF))
-        sc_b.refs.findings(FORGE + RO + '/' + R_PUB)
+        # A SPENT BUDGET IS READ OFF A RUN, not off the stats object: the marker
+        # rides the verdict summary, which a run that stops asking must still
+        # print. One more repository than the budget allows, every answer served,
+        # and a tracker link for the hard hit that keeps the summary from being
+        # the NON-RUN's.
+        repo_bulk = os.path.join(tmp, 'repo-bulk')
+        os.makedirs(repo_bulk)
+        bulk = ['tracked at ' + HTTPS + TRACKER_HOSTS[0] + '/team/ENG/issue/E-3']
+        bulk += [FORGE + RO + '/qz' + 'rkv-bulk-%04d/issues/1' % i
+                 for i in range(REF_BUDGET + 1)]
+        _write_files(repo_bulk, {'bulk.md': ('\n'.join(bulk) + '\n').encode('utf-8')})
+        gitk = Git(repo_bulk, env)
+        gitk.run(['init', '-q'])
+        gitk.run(['symbolic-ref', 'HEAD', 'refs/heads/main'])
+        gitk.run(['add', '-A'])
+        gitk.run(['commit', '-q', '-m', 'bulk'])
+        rc_k, lines_k = run(['tree', '--no-allow'] + mine, refenv, repo_bulk,
+                            fetch=lambda o, r, *_: 200)
         arm('ref-a-spent-budget-is-reported-not-hidden',
-            sc_b.refs.res.spent and 'refs_budget_spent' in _extras(sc_b),
-            _extras(sc_b))
+            rc_k == EXIT_HIT
+            and any(ln.startswith('REFERENCE BUDGET SPENT: ') for ln in lines_k)
+            and any(ln.startswith('leak_scan tree: FAIL hard=1 ')
+                    and ('refs=%d' % REF_BUDGET) in ln and 'refs_budget_spent' in ln
+                    for ln in lines_k)
+            and [ln for ln in lines_k if ln.startswith('NOT QUERIED ')]
+            == ['NOT QUERIED ' + REF_NOANSWER + ': ' + RO + '/qz' + 'rkv-bulk-%04d'
+                % REF_BUDGET + ' (budget spent)'],
+            'rc=%d %s' % (rc_k, [ln for ln in lines_k
+                                 if ln.startswith(('leak_scan tree:', 'NOT QUERIED'))]))
         res = RefResolver(fetch=lambda o, r, *_: {R_PUB: 200, R_PRIV: 404, R_SLOW: 429,
                                                   R_WITHDRAWN: 410}.get(r))
         arm('ref-resolver-oracles',
@@ -5425,7 +5564,8 @@ def self_test(out, base_env, argv0):
             and res.verdict(RO, R_SLOW) == 'unqueried'
             and res.verdict(RO, 'nothing-known') == 'unqueried' and res.asked == 5
             and res.verdict(RO, R_PUB.upper()) == 'public' and res.asked == 5
-            and list(res.unqueried.values()) == [RO + '/' + R_SLOW, RO + '/nothing-known'],
+            and list(res.unqueried.values()) == [(RO + '/' + R_SLOW, 'status 429'),
+                                                 (RO + '/nothing-known', 'no answer')],
             str(list(res.unqueried.values())))
         off = RefScan(RefResolver(offline=True), RO, R_SELF)
         arm('ref-shape-oracles',

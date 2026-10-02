@@ -80,12 +80,20 @@ the secret the text just published. An internal ticket quoted in a public issue 
 `#` shorthand is how this class came to exist.
 
 Nothing in the tree lists a repository. The scanner RESOLVES what the text points at and
-asks the forge's repository endpoint (`api.github.com/repos/<owner>/<repo>`, one `HEAD`)
-whether a stranger is served that repository. The question carries `GITHUB_TOKEN` when the
-environment holds one, which raises the budget the forge prices it under from 60 an hour
-to the authenticated ceiling; the token is sent on that request and is never printed,
-written or passed as an argument. The page endpoint answers the same 200 and 404 but
-publishes no budget header, so a throttle there cannot be told from a server fault.
+asks the forge's repository endpoint (`api.github.com/repos/<owner>/<repo>`, a `HEAD`, up
+to three of them) whether the credential the question carries is served that repository.
+The question carries `GITHUB_TOKEN` when the environment holds one, which raises the
+budget the forge prices it under from 60 an hour to 5,000; the token is sent on that
+request and is never printed, written or passed as an argument. The page endpoint answers
+the same 200 and 404 but publishes no budget header, so a throttle there cannot be told
+from a server fault.
+
+WHO ASKS DECIDES THE ANSWER. The Actions job token is scoped to the repository the
+workflow runs in, so for every other repository it is a stranger and a 404 there is the
+not-found verdict. A personal token is not a stranger: a local online run carrying one
+reads a repository its owner is a member of as served, so it can read clean exactly where
+the job reads `ref-unopenable`. A disagreement between a local run and the job is those
+two identities, and the job's reading is the one a stranger gets.
 
 One forge is resolved, the one this repository lives on (`github.com`). A link to any other
 forge is not a candidate and is not checked; a reference there is a reviewer's job.
@@ -103,20 +111,31 @@ are one finding, `ref-unopenable`.
 
 AN ANSWER IS A VERDICT; NO ANSWER IS A TOOL FAILURE. A throttle (`429`, or a `403`
 carrying a rate limit header), a server error, a transport error and a timeout say nothing
-about the reference, so each one is retried: three attempts per reference, the wait
-doubling between them, or the wait a short `Retry-After` asked for, all inside the run's
-own time budget. A reference still unanswered after that is recorded as NOT QUERIED. The
-run then prints one line per such reference, masked the way a finding's value is masked,
-one summary line naming the class and the count, and exits `3` (NON-RUN) having asserted
-no leak about any of them. It carries no finding row, so `--require-private` and `--hard
-ref-unverified` have nothing to raise and are inert for the class on an online run; the
-same unchanged content used to read 0, 2, 2 and 3 `ref-unverified` findings across four
-runs, which is the defect this split closes. `--offline` is the operator's own choice not
-to ask, so it keeps reporting every candidate as a scoped `ref-unverified` note, and there
-`--require-private` and `--hard ref-unverified` still make it a finding; the hooks always
-run that way. The one `ref-unverified` left on an online run is a bare `<repo>#<n>` with
-no owner known to resolve it against, which is a reference the text did not finish
-writing.
+about the reference, so each one is retried: three attempts per reference, the two waits
+between them 1.5 s then 3.0 s, or the wait a short `Retry-After` asked for, all inside the
+run's own time budget. A reference still unanswered after that is recorded as NOT QUERIED,
+and so is one the run never got to inside its bounds. Such a reference carries no row at
+all.
+
+The hits and the verdict summary print first, whatever the forge answered. Then comes one
+`NOT QUERIED ref-unqueried:` line per unanswered reference, masked the way a finding's
+value is masked and carrying the status or the error kind the last attempt saw, so a stale
+credential reads as `(status 401)` and a throttle as `(status 429)`. The run then says
+`unqueried=N reference(s) got no answer`: a run that otherwise reads OK exits `3`
+(NON-RUN) and asserts no leak at all, and a run that already reads `FAIL` on its own
+evidence, a HARD hit or a waiver that matched or excused nothing, keeps that `FAIL`
+summary and exit `1` and asserts nothing about these references alone. The same unchanged
+content used
+to read 0, 2, 2 and 3 `ref-unverified` findings across four runs, which is the defect this
+split closes.
+
+`--require-private` and `--hard ref-unverified` raise nothing for a reference nobody
+answered about, which has no row for them to raise. They do raise the one
+`ref-unverified` row an online run still carries: a bare `<repo>#<n>` with no owner known
+to resolve it against, which is a reference the text did not finish writing. And they
+raise the whole class under `--offline`, which is the operator's own choice not to ask and
+keeps reporting every candidate as a scoped `ref-unverified` note. The hooks always run
+offline and name neither flag, so there the class reports and no more.
 
 The asking is bounded twice over: at most 300 distinct repositories per run, and at most
 two minutes of asking in total from the first question. Past either bound no further
@@ -324,8 +343,9 @@ can start a workflow command in a CI log. `REPORT` lines count and do not block;
 
 Exit codes keep "found something" apart from "could not run": `0` clean, `1` at least
 one HARD hit, `2` a malformed invocation, `3` the scan could not run (a bad ref, zero
-units, a private pattern that does not compile, a dead built-in control, or
-`--require-private` with nothing loaded). The last line is always a summary; the
+units, a private pattern that does not compile, a dead built-in control,
+`--require-private` with nothing loaded, or a reference nobody answered about on a run
+that otherwise reads OK). The last line is always a summary; the
 `private=` field says whether the private tier ran, and when it did not a loud line
 above it says what was not checked.
 
@@ -336,7 +356,8 @@ Two mechanisms, both reviewed like code. A line pragma inside that language's co
 accepts a private class and is ignored in `messages` mode. `ref-unopenable` and
 `ref-unverified` are one name for this purpose: they are two verdicts on the same
 reference, and a pragma judges the reference, so a line excused as one is excused as the
-other the first time the forge is slow. A path entry in
+other, which is what keeps a pragma written against an online `404` from going hard the
+moment the same line is scanned with `--offline`. A path entry in
 `tools/scripts/leak_scan_allow.txt`: `glob | class | reason`, where the class is a
 generic class or a private CATEGORY such as `private@person` (a bare private waiver is
 refused, so a waiver for a person's name can never excuse a machine name in the same

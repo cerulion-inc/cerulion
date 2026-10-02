@@ -306,13 +306,22 @@ matchable literal from fragments and scans itself to zero with no allowlist entr
 arm pinned both ways. "Found something" and "could not run" never share an exit code, a
 built-in control per class must hit before any scan, and an allowlist entry that matches no
 file or excused nothing fails a full-tree run. The reference classes carry that separation
-onto the network: the one `HEAD` they send to the forge's repository endpoint is a verdict
-only when it is answered (200 clean, 404 or 410 a `ref-unopenable` finding), and a throttle,
-a server error, a transport error or a timeout is retried three times with a doubling wait
-and then recorded as NOT QUERIED, which exits `3` with the class and the count and asserts
-no leak. `leak-guard.yml` passes `GITHUB_TOKEN` at workflow level for that request alone,
-which lifts its hourly budget off the 60 an anonymous runner address shares.
-Contributor-facing detail: `docs/leak_guard.md`.
+onto the network: the `HEAD` they send to the forge's repository endpoint, up to three per
+reference, is a verdict only when it is answered (200 clean, 404 or 410 a `ref-unopenable`
+finding), and a throttle, a server error, a transport error or a timeout is retried, three
+attempts with waits of 1.5 s then 3.0 s between them, and then recorded as NOT QUERIED
+with the status or the error kind the last attempt saw. The hits and the summary print
+first either way: a run that otherwise reads OK exits `3` and asserts no leak, and a run
+already reading `FAIL` on its own evidence keeps that exit beside those lines.
+`leak-guard.yml` and
+`leak-guard-conversation.yml` each set `GITHUB_TOKEN` as a workflow-level env, which
+reaches every step of every job in them and lifts the probe's hourly budget off the 60 an
+anonymous runner address shares; the scanner's reference probe is the only reader of that
+variable under `tools/`. WHO ASKS DECIDES THE ANSWER: a job token is scoped to the
+repository the workflow runs in, so for every other repository it is a stranger and a 404
+there is the not-found verdict, while a personal token used locally is not a stranger and
+can read clean what the job reads as a leak. Contributor-facing detail:
+`docs/leak_guard.md`.
 
 ## The docs gate
 
