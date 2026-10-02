@@ -323,6 +323,12 @@ and we'll help.
   editable; a branch name is permanent and quoted in every merge commit.
 - In your PR description, tell us **what** changed, **why**, and **how to test**
   it.
+- **Commit messages carry no attribution trailer.** The leak guard's message
+  scan refuses a line that starts with `Co-authored-by:` (or `Coauthored-by:`)
+  followed by a name, on every commit in the pull request: the repository
+  publishes under one identity, and a squash concatenates every message it
+  folds. Amend such trailers out before you push (`git commit --amend`, or
+  `git rebase -i` for older commits).
 - Add tests for new behavior.
 - Reference related issues with `Fixes #123` or `Closes #123`.
 - Run the Quality Contract checks before requesting review.
