@@ -1239,9 +1239,11 @@ fn run_cargo_streaming(
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
                 Err(error) => {
-                    // Cargo may still be running: end its group and reap it
-                    // before reporting, so no build outlives the failure.
-                    kill_process_group(pid);
+                    // No signal here: after this error the pid may no longer
+                    // be ours (an ignored SIGCHLD reaps it for us, and the id
+                    // can be reused), and a group kill could hit an unrelated
+                    // process. Reaping waits for cargo to end by itself, so
+                    // the failure is reported after the build, not during it.
                     let _ = child.wait();
                     break Err(error);
                 }
