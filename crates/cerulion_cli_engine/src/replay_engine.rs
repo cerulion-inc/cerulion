@@ -2294,81 +2294,6 @@ impl ReadLogEnforcement {
     }
 }
 
-#[cfg(test)]
-mod read_log_enforcement_fold_tests {
-    use super::*;
-
-    /// An enforced pass with a DISTINCT value in every count, so an arm that
-    /// rebuilt the variable instead of carrying it cannot pass by coincidence.
-    fn enforced() -> ReadLogEnforcement {
-        ReadLogEnforcement::Enforced {
-            stages: 3,
-            steps: 5,
-            frames_admitted: 7,
-            consults_refused: 11,
-            unplanned_consults: 13,
-            enforced_empty_refills: 17,
-            steps_not_reached: 19,
-            stages_not_gateable: 0,
-        }
-    }
-
-    /// **A rank that gated NOTHING keeps its stage count when folded with a rank
-    /// that gated.**
-    ///
-    /// The run's answer is `Enforced`, so the stages the other rank could not
-    /// gate have exactly one place to go: `stages_not_gateable`. While the fold
-    /// returned the enforced pass unchanged, a two rank run reported `enforced`
-    /// with that count at zero over stages no gate held, which the field's doc
-    /// states cannot happen. BOTH ORDERS, because a fold's argument order is the
-    /// rank order and neither is privileged.
-    #[test]
-    fn a_not_gateable_rank_keeps_its_stage_count_when_folded_with_an_enforced_one() {
-        let ungated = ReadLogEnforcement::NotGateable {
-            stages: 2,
-            reasons: vec!["relay[0]/body: the core refuses to gate this stage".to_string()],
-        };
-        for (label, folded) in [
-            ("enforced first", enforced().fold(ungated.clone())),
-            ("not gateable first", ungated.clone().fold(enforced())),
-        ] {
-            match folded {
-                ReadLogEnforcement::Enforced {
-                    stages,
-                    steps,
-                    frames_admitted,
-                    consults_refused,
-                    unplanned_consults,
-                    enforced_empty_refills,
-                    steps_not_reached,
-                    stages_not_gateable,
-                } => {
-                    assert_eq!(
-                        stages_not_gateable, 2,
-                        "{label}: the ungated rank's stages are counted, not dropped"
-                    );
-                    // Every other count is the enforced pass's own, untouched: a
-                    // fold that summed the wrong field would show up here.
-                    assert_eq!(
-                        (
-                            stages,
-                            steps,
-                            frames_admitted,
-                            consults_refused,
-                            unplanned_consults,
-                            enforced_empty_refills,
-                            steps_not_reached
-                        ),
-                        (3, 5, 7, 11, 13, 17, 19),
-                        "{label}: only the ungated count moves"
-                    );
-                }
-                other => panic!("{label}: a pass that gated makes the run enforced: {other:?}"),
-            }
-        }
-    }
-}
-
 /// One topic whose frame comparison was DECLINED because the
 /// read log that steered its producer's input stream was refused.
 ///
@@ -29383,5 +29308,80 @@ mod trigger_input_capacity_tests {
             u32::MAX,
             "saturates"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_log_enforcement_fold_tests {
+    use super::*;
+
+    /// An enforced pass with a DISTINCT value in every count, so an arm that
+    /// rebuilt the variable instead of carrying it cannot pass by coincidence.
+    fn enforced() -> ReadLogEnforcement {
+        ReadLogEnforcement::Enforced {
+            stages: 3,
+            steps: 5,
+            frames_admitted: 7,
+            consults_refused: 11,
+            unplanned_consults: 13,
+            enforced_empty_refills: 17,
+            steps_not_reached: 19,
+            stages_not_gateable: 0,
+        }
+    }
+
+    /// **A rank that gated NOTHING keeps its stage count when folded with a rank
+    /// that gated.**
+    ///
+    /// The run's answer is `Enforced`, so the stages the other rank could not
+    /// gate have exactly one place to go: `stages_not_gateable`. While the fold
+    /// returned the enforced pass unchanged, a two rank run reported `enforced`
+    /// with that count at zero over stages no gate held, which the field's doc
+    /// states cannot happen. BOTH ORDERS, because a fold's argument order is the
+    /// rank order and neither is privileged.
+    #[test]
+    fn a_not_gateable_rank_keeps_its_stage_count_when_folded_with_an_enforced_one() {
+        let ungated = ReadLogEnforcement::NotGateable {
+            stages: 2,
+            reasons: vec!["relay[0]/body: the core refuses to gate this stage".to_string()],
+        };
+        for (label, folded) in [
+            ("enforced first", enforced().fold(ungated.clone())),
+            ("not gateable first", ungated.clone().fold(enforced())),
+        ] {
+            match folded {
+                ReadLogEnforcement::Enforced {
+                    stages,
+                    steps,
+                    frames_admitted,
+                    consults_refused,
+                    unplanned_consults,
+                    enforced_empty_refills,
+                    steps_not_reached,
+                    stages_not_gateable,
+                } => {
+                    assert_eq!(
+                        stages_not_gateable, 2,
+                        "{label}: the ungated rank's stages are counted, not dropped"
+                    );
+                    // Every other count is the enforced pass's own, untouched: a
+                    // fold that summed the wrong field would show up here.
+                    assert_eq!(
+                        (
+                            stages,
+                            steps,
+                            frames_admitted,
+                            consults_refused,
+                            unplanned_consults,
+                            enforced_empty_refills,
+                            steps_not_reached
+                        ),
+                        (3, 5, 7, 11, 13, 17, 19),
+                        "{label}: only the ungated count moves"
+                    );
+                }
+                other => panic!("{label}: a pass that gated makes the run enforced: {other:?}"),
+            }
+        }
     }
 }
