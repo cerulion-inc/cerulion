@@ -3300,6 +3300,10 @@ fn missing_and_stale(
 /// reason [`HAND_SCANNED_DOC_PINS`] gives: a row written twice makes a length
 /// add up while hiding a derived edge nobody wrote down.
 const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
+    // upstream_waivers_test declares the waived arms as literal paths from the
+    // workspace root, and three of them name a `cerulion_cli` test file, so the
+    // walk derives this edge from the literals alone.
+    ("cerulion_core", "cerulion_cli", "crate-path"),
     // mp_supervisor_box_test loads three node libraries whose file names it
     // builds at run time: `debug_dir.join(format!("lib{id}.so"))`. The walk
     // cannot say which package builds them.

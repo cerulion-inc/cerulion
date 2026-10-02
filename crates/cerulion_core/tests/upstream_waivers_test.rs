@@ -26,10 +26,14 @@
 //! # The 2034 inventory is the set that fails under the harness CI uses
 //!
 //! `cargo nextest` gives every test its own PROCESS, and 2034 is a per-process
-//! defect: it bites the SECOND plugin graph in a process. So under nextest only
-//! the arms that build more than one plugin graph inside themselves fail, and
-//! that set, twenty six arms across thirteen binaries, is what is waived here. CI shards `cerulion_core`
-//! under nextest, so CI is green.
+//! defect: it bites the SECOND iceoryx2 resource creation in a process that has
+//! already loaded a plugin node library. The waived arms reach that second
+//! creation two different ways, which is the mechanism they share rather than a
+//! shape they all have: most build more than one plugin graph inside the test
+//! process, and the multi-process arms spawn a supervisor that loads a node
+//! library and then pre-creates the graph-owned services from a second node of
+//! its own. That set, thirty two arms across fifteen binaries in three crates, is
+//! what is waived here. CI shards `cerulion_core` under nextest, so CI is green.
 //!
 //! `cargo test --test <binary>` runs a whole binary in ONE process, so on macOS
 //! it will additionally fail arms that nextest proves pass, because the second
@@ -63,13 +67,14 @@ use std::path::{Path, PathBuf};
 /// It exists ONLY on macOS. Every occurrence in a waived source is inside
 /// `#[cfg_attr(target_os = "macos", ignore = ...)]`, which does not expand
 /// off-target, so a Linux binary never carries it and the check that reads it is
-/// gated to macOS. Reading it unconditionally made all thirteen stems look
+/// gated to macOS. Reading it unconditionally made every waived stem look
 /// unaskable on Linux and the arm passed having asked nothing.
 const WAIVER_2034_MARKER: &str = "upstream iceoryx2 0.10.0 defect 2034";
 
 /// Every arm carrying the 2034 macOS waiver, as `(path from the workspace root,
-/// test name)`. Twenty six arms across thirteen binaries; the counts are
-/// checked, not just written down, by the both-directions inventory below.
+/// test name)`. Thirty two arms across fifteen binaries in three crates; the
+/// counts are checked, not just written down, by the both-directions inventory
+/// below.
 ///
 /// Workspace rooted for the same reason the 2035 list is: a waiver inventory
 /// scoped to the crate where a defect was first seen is incomplete by
@@ -197,6 +202,25 @@ const WAIVED_2034: &[(&str, &str)] = &[
     (
         "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
         "c7_a_producer_that_dies_after_being_named_gets_retracted",
+    ),
+    // The flashback multi-process arms. Same shape, measured differently: the
+    // spawned supervisor loads a node library (its own cdylib tracing breadcrumb
+    // appears in its output) and then pre-creates the graph-owned services from a
+    // SECOND node in that process, which fails with the same `InternalFailure`.
+    // These three carry no file-handle line, where the credit-death arms do, and
+    // all three pass on the 0.9.1 base, which is what ties them to this defect
+    // rather than to a limit.
+    (
+        "crates/cerulion_cli/tests/flashback_argv_e2e_test.rs",
+        "a_plain_multi_process_run_hands_its_recorder_the_rings_it_created",
+    ),
+    (
+        "crates/cerulion_cli/tests/flashback_argv_e2e_test.rs",
+        "no_rings_declines_both_the_rings_and_the_window_recorder",
+    ),
+    (
+        "crates/cerulion_cli/tests/flashback_argv_e2e_test.rs",
+        "a_rank_whose_ring_create_fails_is_declared_unavailable_and_handed_to_no_recorder",
     ),
 ];
 
@@ -1045,8 +1069,8 @@ fn libtests_own_list_agrees_with_the_2034_waiver_on_this_platform() {
     // `unbuilt` was reported and never asserted, which was the remaining way for
     // this arm to pass having checked less than it says.
     //
-    // Per CRATE and not across the inventory, because the inventory spans two and
-    // no single `-p` can build both: `cargo test -p cerulion_core` cannot build a
+    // Per CRATE and not across the inventory, because the inventory spans three and
+    // no single `-p` can build them all: `cargo test -p cerulion_core` cannot build a
     // `cerulion_cli_engine` target, so an inventory-wide rule would make the
     // ordinary per-crate command unpassable while offering a remedy that does not
     // exist. Per crate, that run reads one crate fully asked and the other fully

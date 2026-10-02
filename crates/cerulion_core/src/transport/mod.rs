@@ -1918,8 +1918,8 @@ pub struct LivelinessCleaner {
 /// reported loudly once per process and at `debug` afterwards. Process global
 /// rather than per cleaner: one line about a broken sweep is the useful number,
 /// and a cleaner is rebuilt per transport.
-static SWEEP_NODE_FAILURE_WARNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SWEEP_NODE_FAILURE: std::sync::Mutex<failure_regime_latch::FailureRegimeLatch> =
+    std::sync::Mutex::new(failure_regime_latch::FailureRegimeLatch::new());
 
 impl LivelinessCleaner {
     /// Reclaim the stale system resources of all dead iceoryx2 nodes (a
@@ -1955,22 +1955,47 @@ impl LivelinessCleaner {
                 // it skips every sweep for the life of the process with nothing
                 // to read. So the cause is always carried, and the first
                 // occurrence is loud enough to find.
-                if !SWEEP_NODE_FAILURE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    tracing::warn!(
+                // The shared flood-suppression latch, never a hand-rolled flag: a
+                // `swap(true)` never resets, so a sweep that recovers and fails
+                // again months later says nothing. The latch reopens its regime
+                // after a success, re-announces at each decade, and carries the
+                // suppressed count.
+                match failure_regime_latch::lock_regime_latch(&SWEEP_NODE_FAILURE).on_failure() {
+                    failure_regime_latch::RegimeDecision::Loud => tracing::warn!(
                         error = ?e,
                         "liveliness sweep: could not create the node the dead-node cleanup runs \
-                         from, so no dead node will be reclaimed by this process until it can \
-                         (reported once; later attempts are at debug)"
-                    );
-                } else {
-                    tracing::debug!(
-                        error = ?e,
-                        "liveliness sweep: dead-node cleanup skipped (no node)"
-                    );
+                         from, so no dead node will be reclaimed by this process until it can"
+                    ),
+                    failure_regime_latch::RegimeDecision::StillFailing { total, suppressed } => {
+                        tracing::warn!(
+                            error = ?e,
+                            total,
+                            suppressed,
+                            "liveliness sweep: still cannot create the node the dead-node cleanup \
+                             runs from, so no dead node has been reclaimed by this process"
+                        )
+                    }
+                    failure_regime_latch::RegimeDecision::Suppressed { suppressed } => {
+                        tracing::debug!(
+                            error = ?e,
+                            suppressed,
+                            "liveliness sweep: dead-node cleanup skipped (no node)"
+                        )
+                    }
                 }
                 return;
             }
         };
+        // A created node CLOSES the regime, which is what makes the next failure
+        // loud again instead of permanently silent.
+        if let Some(suppressed) =
+            failure_regime_latch::lock_regime_latch(&SWEEP_NODE_FAILURE).on_success()
+        {
+            tracing::info!(
+                suppressed,
+                "liveliness sweep: the dead-node cleanup node can be created again"
+            );
+        }
         let state = node.try_cleanup_dead_nodes();
         tracing::trace!(
             cleanups = state.cleanups,

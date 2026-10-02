@@ -462,6 +462,10 @@ fn spawn_run_with_env(
 /// one worker), which is also the smallest deployment there is and the one the
 /// capture judge used to refuse `AmbiguousNodeMap` for counting the departure
 /// ring.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn a_plain_multi_process_run_hands_its_recorder_the_rings_it_created() {
@@ -565,6 +569,10 @@ fn a_plain_multi_process_run_hands_its_recorder_the_rings_it_created() {
 /// The ANTI-TAUTOLOGY half is the arm above, on the same workspace and the same
 /// harness: without it, "no recorder child" is satisfied by a build whose
 /// always-on spawn is broken outright.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn no_rings_declines_both_the_rings_and_the_window_recorder() {
@@ -743,6 +751,10 @@ fn no_rings_with_record_is_refused_and_the_graph_file_is_untouched() {
 /// handed no `--ring` for it. Tags are spelled BEFORE the rings exist, so
 /// handing one over on the strength of the stamp points `shm_open` at a name
 /// nothing created.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn a_rank_whose_ring_create_fails_is_declared_unavailable_and_handed_to_no_recorder() {

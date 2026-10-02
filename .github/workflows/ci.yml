@@ -1995,7 +1995,7 @@ jobs:
               | sed 's#.*/##; s#\.rs"##' | sort -u || true)
             n=$(printf '%s\n' "$names" | grep -c . || true)
             # Per crate the floor is ONE, because the split between the two is
-            # the inventory's to decide and today it is 12 and 1. The total is
+            # the inventory's to decide and today it is 12, 1 and 2. The total is
             # floored below, which is what catches a parse that stopped reaching
             # the file.
             if [ "$n" -lt 1 ]; then
@@ -3033,7 +3033,7 @@ jobs:
               | sed 's#.*/##; s#\.rs"##' | sort -u || true)
             n=$(printf '%s\n' "$names" | grep -c . || true)
             # Per crate the floor is ONE, because the split between the two is
-            # the inventory's to decide and today it is 12 and 1. The total is
+            # the inventory's to decide and today it is 12, 1 and 2. The total is
             # floored below, which is what catches a parse that stopped reaching
             # the file.
             if [ "$n" -lt 1 ]; then
