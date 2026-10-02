@@ -213,18 +213,21 @@ fn pick_run(
     };
     match select_run(records, &RunTarget::Named(target.to_string())) {
         RunSelection::Attach(record) => {
-            if record.state == RunState::Ending {
-                return Err(RunControlError::NotRunning(format!(
-                    "run 0x{:032x} ({}) is shutting down, so it cannot be {}d",
-                    record.run_id, record.graph_name, verb
-                )));
-            }
+            // An unsettled gather decides first: a name it resolved to one run may have
+            // an unheard live run behind it, so a shutting-down match is no proof the
+            // name is not running (exit 4 would tell a script to stop looking).
             if let Some(why) = unsettled {
                 if !target_is_run_id(&record, target) {
                     return Err(RunControlError::Failed(format!(
                         "{why}: another live run may share the name `{target}`"
                     )));
                 }
+            }
+            if record.state == RunState::Ending {
+                return Err(RunControlError::NotRunning(format!(
+                    "run 0x{:032x} ({}) is shutting down, so it cannot be {}d",
+                    record.run_id, record.graph_name, verb
+                )));
             }
             Ok(*record)
         }
@@ -345,18 +348,53 @@ mod tests {
         }
     }
 
-    /// A run directory under a fresh run directory root, holding a `run.json` that
-    /// names `run_id` and one key the verb does not own.
-    fn run_dir_under_root(run_id: u128) -> (tempfile::TempDir, std::path::PathBuf) {
-        let root = tempfile::tempdir().expect("root");
-        let dir = root.path().join(format!("nav-{run_id:032x}"));
-        std::fs::create_dir(&dir).expect("run dir");
-        std::fs::write(
-            dir.join(crate::run_dir::RUN_MANIFEST_FILE),
-            format!(r#"{{"version":1,"run_id":"0x{run_id:032x}","keep":"me"}}"#),
-        )
-        .expect("seed run.json");
-        (root, dir)
+    /// A `CERULION_HOME` redirected to a fresh directory for one test, so the run
+    /// directory root is one the test owns. Holds the crate-wide environment lock
+    /// (the variable is process-global) and restores the variable on drop.
+    struct Home {
+        _tmp: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+        runs: std::path::PathBuf,
+    }
+
+    impl Home {
+        fn new() -> Self {
+            let lock = crate::test_env::env_lock();
+            let tmp = tempfile::tempdir().expect("home");
+            let runs = tmp.path().join("runs");
+            std::fs::create_dir(&runs).expect("runs root");
+            let prev = std::env::var_os("CERULION_HOME");
+            std::env::set_var("CERULION_HOME", tmp.path());
+            Self {
+                _tmp: tmp,
+                _lock: lock,
+                prev,
+                runs,
+            }
+        }
+
+        /// A run directory directly under the run root, holding a `run.json` that
+        /// names `run_id` and one key the verb does not own.
+        fn run_dir(&self, run_id: u128) -> std::path::PathBuf {
+            let dir = self.runs.join(format!("nav-{run_id:032x}"));
+            std::fs::create_dir(&dir).expect("run dir");
+            std::fs::write(
+                dir.join(crate::run_dir::RUN_MANIFEST_FILE),
+                format!(r#"{{"version":1,"run_id":"0x{run_id:032x}","keep":"me"}}"#),
+            )
+            .expect("seed run.json");
+            dir
+        }
+    }
+
+    impl Drop for Home {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("CERULION_HOME", v),
+                None => std::env::remove_var("CERULION_HOME"),
+            }
+        }
     }
 
     fn manifest(dir: &Path) -> serde_json::Value {
@@ -461,6 +499,27 @@ mod tests {
         assert_eq!(got.run_id, 0x2a);
     }
 
+    /// A shutting-down run heard under a name does not make the name "not running" while
+    /// the gather is unsettled: a live twin may be unheard, so the name is refused as
+    /// unsettled (exit 1), while the exact run id of the shutting-down run is still
+    /// reported as not running (exit 4).
+    #[test]
+    fn an_unsettled_gather_never_calls_a_name_not_running_for_a_shutting_down_match() {
+        let runs = [rec(0x2a, "nav", RunState::Ending)];
+        let err = pick_run(&runs, "nav", RunControlOp::Pause, UNSETTLED).expect_err("name");
+        assert!(matches!(err, RunControlError::Failed(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 1);
+        let err = pick_run(
+            &runs,
+            "0x0000000000000000000000000000002a",
+            RunControlOp::Pause,
+            UNSETTLED,
+        )
+        .expect_err("exact id");
+        assert!(matches!(err, RunControlError::NotRunning(_)), "{err:?}");
+        assert_eq!(err.exit_code(), EXIT_NOT_RUNNING);
+    }
+
     #[test]
     fn a_run_with_no_pause_page_is_not_pausable_and_says_what_to_do() {
         // A run id nothing created a page for: the open fails NotFound.
@@ -479,7 +538,8 @@ mod tests {
         let run_id: u128 =
             0x5eed_0000_0000_0000_0000_0000_0000_0000 | u128::from(std::process::id());
         let owner = MappedPausePage::create_owned(&pause_tag_for_run(run_id)).expect("page");
-        let (_root, dir) = run_dir_under_root(run_id);
+        let home = Home::new();
+        let dir = home.run_dir(run_id);
         let mut record = rec(run_id, "nav", RunState::Live);
         record.run_dir = dir.display().to_string();
 
@@ -518,7 +578,8 @@ mod tests {
         let run_id: u128 =
             0x5eee_0000_0000_0000_0000_0000_0000_0000 | u128::from(std::process::id());
         let owner = MappedPausePage::create_owned(&pause_tag_for_run(run_id)).expect("page");
-        let (_root, dir) = run_dir_under_root(run_id);
+        let home = Home::new();
+        let dir = home.run_dir(run_id);
         std::fs::remove_file(dir.join(crate::run_dir::RUN_MANIFEST_FILE)).expect("remove");
         let mut record = rec(run_id, "nav", RunState::Live);
         record.run_dir = dir.display().to_string();
@@ -545,8 +606,10 @@ mod tests {
         let owner = MappedPausePage::create_owned(&pause_tag_for_run(run_id)).expect("page");
         let mut record = rec(run_id, "nav", RunState::Live);
 
+        let home = Home::new();
+
         // A directory that is not named for this run (another run's, say).
-        let (_a, other) = run_dir_under_root(run_id ^ 1);
+        let other = home.run_dir(run_id ^ 1);
         record.run_dir = other.display().to_string();
         let err = apply(&record, RunControlOp::Pause).expect_err("not named for the run");
         assert!(
@@ -557,7 +620,7 @@ mod tests {
         assert!(manifest(&other).get("paused").is_none());
 
         // Named for the run, but its manifest belongs to another run.
-        let (_b, dir) = run_dir_under_root(run_id);
+        let dir = home.run_dir(run_id);
         std::fs::write(
             dir.join(crate::run_dir::RUN_MANIFEST_FILE),
             format!(r#"{{"version":1,"run_id":"0x{:032x}"}}"#, run_id ^ 1),
@@ -568,6 +631,25 @@ mod tests {
         assert!(err.to_string().contains("different run"), "{err}");
         assert!(!owner.is_paused());
         assert!(manifest(&dir).get("paused").is_none());
+
+        // Named for the run and owned by the user, but not a direct child of the run
+        // directory root: a forged registry record can point anywhere.
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let outside = elsewhere.path().join(format!("nav-{run_id:032x}"));
+        std::fs::create_dir(&outside).expect("outside dir");
+        std::fs::write(
+            outside.join(crate::run_dir::RUN_MANIFEST_FILE),
+            format!(r#"{{"version":1,"run_id":"0x{run_id:032x}"}}"#),
+        )
+        .expect("outside run.json");
+        record.run_dir = outside.display().to_string();
+        let err = apply(&record, RunControlOp::Pause).expect_err("outside the root");
+        assert!(
+            err.to_string().contains("not under the run directory root"),
+            "{err}"
+        );
+        assert!(!owner.is_paused());
+        assert!(manifest(&outside).get("paused").is_none());
 
         // A regular FILE with the run id suffix is not a run directory.
         let file_root = tempfile::tempdir().expect("root");
@@ -593,7 +675,8 @@ mod tests {
         let run_id: u128 =
             0x5ef0_0000_0000_0000_0000_0000_0000_0000 | u128::from(std::process::id());
         let owner = MappedPausePage::create_owned(&pause_tag_for_run(run_id)).expect("page");
-        let (_root, dir) = run_dir_under_root(run_id);
+        let home = Home::new();
+        let dir = home.run_dir(run_id);
         let mut record = rec(run_id, "nav", RunState::Live);
         record.run_dir = dir.display().to_string();
         for round in 0..20 {

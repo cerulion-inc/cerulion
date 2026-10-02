@@ -970,12 +970,11 @@ fn lock_run_dir(run_dir: &Path) -> Option<std::fs::File> {
 ///
 /// `transition` runs ONLY once `run_dir` is established as the directory of run
 /// `run_id`: named for it (a run directory is `<graph>-<run id as 32 hex digits>`),
-/// owned by the invoking user, and, when its `run.json` can be read, naming the same
-/// run. The run registry is a shared-memory service any local process can publish
+/// a direct child of the run directory root, owned by the invoking user, and, when its
+/// `run.json` can be read, naming the same run. The run registry is a shared-memory service any local process can publish
 /// into, so a record's `run_dir` is a claim, not a fact, and this verb must not
-/// rewrite a file on the strength of one. (The check does not need the run directory
-/// root, so a verb run from a shell with another `CERULION_HOME` than the run's still
-/// finds the run's directory.)
+/// rewrite a file on the strength of one. The root is the one `CERULION_HOME` selects, so
+/// the verb is run with the same `CERULION_HOME` as the run.
 ///
 /// Returns the transition's value, the paused state `transition` reported (read under
 /// the lock, so it is the state this command left the page in and the one it mirrored),
@@ -1012,6 +1011,19 @@ pub fn transition_run_paused<T>(
         .is_some_and(|n| n.ends_with(&format!("-{run_id:032x}")));
     if !named_for_run {
         return Err(refuse("its name does not carry the run id"));
+    }
+    // A direct child of the run directory root, as every other reader of a registry
+    // record's `run_dir` requires: the record is a claim any local process can publish.
+    let root = run_dir_root()
+        .ok()
+        .and_then(|r| r.canonicalize().ok())
+        .ok_or_else(|| refuse("the run directory root cannot be resolved"))?;
+    if canon.parent() != Some(root.as_path()) {
+        return Err(refuse(&format!(
+            "it is not under the run directory root `{}`; run the verb with the same \
+             CERULION_HOME as the run",
+            root.display()
+        )));
     }
     use std::os::unix::fs::MetadataExt as _;
     let owner = std::fs::metadata(&canon)
