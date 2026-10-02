@@ -239,24 +239,34 @@ probe_api() {
     [ -s "$workdir/api-version" ]
 }
 
-# wait_for <deadline epoch> <probe>: one attempt, then another after a nap for
-# as long as the deadline allows. The deadline is tested before every probe past
-# the first and again after every nap, so no probe STARTS past it and no sleep
-# reaches past it; a probe already running is bounded by its own request caps.
+# wait_for <deadline epoch> <probe>: attempts until the probe answers or the
+# deadline passes, with a nap between attempts. The deadline is tested before
+# EVERY probe, a crate's first included, so no probe starts past it; a probe that
+# started is bounded by its own request caps. Each nap is cut to what the
+# deadline has left, so no sleep reaches past it either.
+#
+# Exit 0 when the probe answered, 2 when the deadline had already passed and no
+# probe ran, 1 when a probe ran and the deadline passed before one answered. The
+# caller tells those two apart: a crate reached with the budget spent reports
+# that budget rather than a registry surface it never read.
 wait_for() {
-    local deadline=$1 probe=$2 now remaining nap
+    local deadline=$1 probe=$2 now remaining nap probes=0
     while :; do
+        now=$(date +%s)
+        if [ "$now" -ge "$deadline" ]; then
+            [ "$probes" -gt 0 ] || return 2
+            return 1
+        fi
+        probes=$((probes + 1))
         if "$probe"; then
             return 0
         fi
         now=$(date +%s)
-        [ "$now" -lt "$deadline" ] || return 1
         remaining=$((deadline - now))
+        [ "$remaining" -gt 0 ] || return 1
         nap=$POLL_SECONDS
         [ "$nap" -lt "$remaining" ] || nap=$remaining
         sleep "$nap"
-        now=$(date +%s)
-        [ "$now" -lt "$deadline" ] || return 1
     done
 }
 
@@ -280,10 +290,17 @@ readme_targets() {
 }
 
 # manifest_string <key> <manifest>: the value of a top-level single-line string
-# key. Cargo writes the packaged manifest itself with every workspace
-# inheritance already resolved, so these keys are present and flat.
+# key, the first line sed matches. Cargo writes the packaged manifest itself with
+# every workspace inheritance already resolved, so these keys are present and
+# flat.
+#
+# The matches land in a variable and the first line is cut from it. `sed ... |
+# head -n 1` reads the same but races: head exits on that line, sed takes SIGPIPE
+# on what it writes next, and `pipefail` carries that status out of this function.
 manifest_string() {
-    sed -n "s/^$1 *= *\"\(.*\)\"[[:space:]]*\$/\1/p" "$2" | head -n 1
+    local matched nl=$'\n'
+    matched=$(sed -n "s/^$1 *= *\"\(.*\)\"[[:space:]]*\$/\1/p" "$2")
+    printf '%s' "${matched%%"$nl"*}"
 }
 
 # verify_crate <name>: every check for one crate. It returns 0 always; a failing
@@ -292,7 +309,7 @@ verify_crate() {
     local name=$1
     local lower crate_dir archive entry meta deadline root prefix
     local index_cksum api_checksum api_size api_license
-    local got_digest got_size listing rel base remaining
+    local got_digest got_size listing rel base remaining waited described
     local declared want_text missing targets target tag want_sha got_sha code
     local bad_path bad_agent bad_test
 
@@ -307,14 +324,24 @@ verify_crate() {
     probe_api_url="$API_URL/$name/$version"
     deadline=$((run_start + WAIT_SECONDS))
 
-    if ! wait_for "$deadline" probe_index; then
+    waited=0
+    wait_for "$deadline" probe_index || waited=$?
+    if [ "$waited" -eq 2 ]; then
+        report FAIL "$name" index "the ${WAIT_SECONDS}s budget was spent before this crate, so the sparse index was not read"
+        return 0
+    elif [ "$waited" -ne 0 ]; then
         report FAIL "$name" index "the sparse index did not carry this version within ${WAIT_SECONDS}s"
         return 0
     fi
     entry=$(cat "$workdir/index-entry")
     report PASS "$name" index "the sparse index carries this version"
 
-    if ! wait_for "$deadline" probe_api; then
+    waited=0
+    wait_for "$deadline" probe_api || waited=$?
+    if [ "$waited" -eq 2 ]; then
+        report FAIL "$name" metadata "the ${WAIT_SECONDS}s budget was spent, so the version metadata was not read"
+        return 0
+    elif [ "$waited" -ne 0 ]; then
         report FAIL "$name" metadata "the version metadata did not answer within ${WAIT_SECONDS}s"
         return 0
     fi
@@ -450,7 +477,12 @@ verify_crate() {
         report PASS "$name" licence-field "'$api_license' on the manifest and the metadata"
     fi
 
-    if manifest_string description "$root/Cargo.toml" | grep -Eq "$TRACKER_RE"; then
+    # The description is read into a variable, then written to the match by one
+    # `printf`: a single write of one line completes before `grep -Eq` can exit
+    # on a hit and close the pipe. A producer that streams its output into the
+    # same reader is the SIGPIPE shape above.
+    described=$(manifest_string description "$root/Cargo.toml")
+    if printf '%s' "$described" | grep -Eq "$TRACKER_RE"; then
         report FAIL "$name" description "the packaged description carries a tracker id"
     else
         report PASS "$name" description "no tracker id in the packaged description"

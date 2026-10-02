@@ -158,8 +158,10 @@ jobs:
       contents: read
     # Two ceilings, not one. The 900 s budget bounds the WAIT for both registry
     # surfaces to carry the version: wall clock from the start of the run, shared
-    # across all crates rather than spent again per crate, no poll starting past
-    # it, and the archive download's retry chain held to whatever it has left.
+    # across all crates rather than spent again per crate, tested before every
+    # probe including a crate's first, so a crate the run reaches with the budget
+    # spent reports that budget instead of issuing a request, and the archive
+    # download's retry chain held to whatever it has left.
     # Each request carries its own caps, which the budget does not cover: 120 s
     # for one transfer and 120 s for a retry chain, so a host that accepts a
     # connection and then stalls ends that request instead of the run. The job

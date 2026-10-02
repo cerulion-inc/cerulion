@@ -6,9 +6,10 @@
 # registry out of a directory tree (sparse-index entries, version metadata, the
 # `.crate` archives and a docs.rs status), the fake git answers `rev-parse` for
 # exactly the ref the provenance check must ask for and records every ref it was
-# asked, and the fake sleep records its argument instead of sleeping. jq, tar,
-# date and the sha256 tool are real, so the digest and size arms compare numbers
-# this file did not write by hand.
+# asked, and the fake sleep records its argument and returns, except in the two
+# arms that hand it the real sleep so the wait budget runs out. jq, tar, date and
+# the sha256 tool are real, so the digest and size arms compare numbers this file
+# did not write by hand.
 #
 # Two fixture crates, so the licence table is exercised on both of its rows:
 # `demo_core` declares `AGPL-3.0-only` and carries `LICENSE`, `demo_link`
@@ -48,12 +49,19 @@ WANT_TAG_REF="refs/tags/v$VERSION^{commit}"
 # this budget's WALL CLOCK alone and the script's own 900 s default would spin
 # for a quarter of an hour inside the `Lint` job.
 DEFAULT_WAIT_SECONDS=30
+# The budget an arm gives a fixture that never answers. The script cuts each nap
+# to what the budget has left and `FAKE_SLEEP_REAL` makes the shim take that nap
+# for real, so the budget runs out after one probe and one nap instead of through
+# a spin of re-probes. Two seconds, so the run's own start-up lands inside the
+# budget on a loaded host and the first probe is one the deadline admits.
+SPENT_WAIT_SECONDS=2
 # The arms below; the floor is this count, so a run that stops early reds.
-CASE_FLOOR=44
+CASE_FLOOR=45
 
 cases=0
 case_name=
 case_dir=
+sleep_for_real=
 output=
 status=0
 
@@ -88,6 +96,9 @@ byte_size_of() {
 
 shim_bin="$workdir/bin"
 mkdir -p "$shim_bin"
+# Read off PATH here, where PATH is still the host's: the shim below answers to
+# the name `sleep` for everything the script under test runs.
+real_sleep=$(command -v sleep)
 
 cat >"$shim_bin/cargo" <<'SHIM'
 #!/bin/sh
@@ -198,9 +209,19 @@ fi
 cat "$FAKE_TAG_SHA"
 SHIM
 
+# The nap. It records its argument and returns at once, so an arm whose fixture
+# never answers is bounded by the budget's WALL CLOCK alone. An arm that needs
+# the budget to actually run out sets FAKE_SLEEP_REAL to the real sleep, which
+# this runs instead: the script cuts each nap to what the budget has left, so one
+# real nap of that length carries the clock to the deadline in one step rather
+# than through hundreds of re-probes.
 cat >"$shim_bin/sleep" <<'SHIM'
 #!/bin/sh
 printf '%s\n' "$1" >> "$FAKE_SLEEPS"
+if [ -n "${FAKE_SLEEP_REAL:-}" ]; then
+    exec "$FAKE_SLEEP_REAL" "$1"
+fi
+exit 0
 SHIM
 
 chmod 0755 "$shim_bin/cargo" "$shim_bin/curl" "$shim_bin/git" "$shim_bin/sleep"
@@ -302,6 +323,21 @@ tar_renaming() {
     esac
 }
 
+# archive_lists <archive> <member>: 0 when the archive's member list carries
+# <member> whole. The listing lands in a variable and `case` matches it over the
+# newline-delimited string. `tar -tzf ... | grep -Fqx` reads the same and races:
+# grep exits on the match, tar takes SIGPIPE on the rest of the listing, and
+# `pipefail` turns that into a false "no such member" -- GNU tar 1.35 reds a
+# guard written that way on about half its runs, bsdtar on none of them.
+archive_lists() {
+    local listing nl=$'\n'
+    listing=$(tar -tzf "$1" 2>/dev/null) || return 1
+    case "$nl$listing$nl" in
+        *"$nl$2$nl"*) return 0 ;;
+    esac
+    return 1
+}
+
 template="$workdir/template"
 mkdir -p "$template/src" "$template/www/index" "$template/www/api"
 printf '200' >"$template/www/docs_status"
@@ -356,6 +392,8 @@ new_case() {
     : >"$case_dir/urls"
     : >"$case_dir/sleeps"
     : >"$case_dir/git_refs"
+    # Empty unless the arm sets it: naps are recorded, not taken.
+    sleep_for_real=
     output=
     status=0
 }
@@ -374,6 +412,7 @@ run_script() {
                 FAKE_URLS="$case_dir/urls" \
                 FAKE_SLEEPS="$case_dir/sleeps" \
                 FAKE_TAG_SHA="$case_dir/tag_sha" \
+                FAKE_SLEEP_REAL="$sleep_for_real" \
                 FAKE_GIT_REF="$WANT_TAG_REF" \
                 FAKE_GIT_REFS="$case_dir/git_refs" \
                 "$script_dir/verify_published.sh" \
@@ -463,17 +502,19 @@ passed 'a docs 404 warns and does not fail'
 # ---------------------------------------------------------------------------
 # A registry surface that answers nothing
 # ---------------------------------------------------------------------------
-# The index carries the version and the version metadata does not. A spent
-# budget reaches one probe of each, so this is the metadata check failing rather
-# than the index one.
+# The index carries the version and the version metadata does not, so this is the
+# metadata check failing rather than the index one. One crate, because a budget
+# spent inside it stops every crate after it: the arm below is where that is
+# asserted.
 new_case metadata_silent
 rm -f "$case_dir/www/api/demo_core.json"
-run_script "$VERSION" --wait-seconds 0
+sleep_for_real=$real_sleep
+run_script "$VERSION" --crate demo_core --wait-seconds "$SPENT_WAIT_SECONDS"
 expect_status 1
 expect_output 'PASS demo_core 1.2.3 index: the sparse index carries this version'
-expect_output 'FAIL demo_core 1.2.3 metadata: the version metadata did not answer within 0s'
+expect_output "FAIL demo_core 1.2.3 metadata: the version metadata did not answer within ${SPENT_WAIT_SECONDS}s"
 expect_absent 'demo_core 1.2.3 digest'
-expect_output '15 PASS, 1 WARN, 1 FAIL'
+expect_output '1 crate(s) at 1.2.3: 1 PASS, 0 WARN, 1 FAIL'
 passed 'version metadata that answers nothing fails that crate'
 
 # Both surfaces answer and the archive host serves no bytes.
@@ -669,8 +710,7 @@ new_case dotdot_member
 refresh_www "$case_dir" demo_core
 # The fixture must carry the shape it tests: a tar that normalized the name away
 # would leave this arm passing over an archive with nothing wrong in it.
-tar -tzf "$case_dir/www/demo_core.crate" 2>/dev/null |
-    grep -Fqx "demo_core-$VERSION/src/.." ||
+archive_lists "$case_dir/www/demo_core.crate" "demo_core-$VERSION/src/.." ||
     fail 'dotdot_member: the fixture archive carries no member ending in a parent segment'
 run_script "$VERSION"
 expect_status 1
@@ -704,15 +744,41 @@ expect_output '0 FAIL'
 15' ] || fail "index_lag: recorded sleeps $(cat "$case_dir/sleeps"), expected two 15s waits"
 passed 'the index wait polls until the version appears'
 
+# The budget is wall clock over the whole run, so a crate that spends it stops
+# the ones after it BEFORE their first request: the index fixture 404s for
+# demo_core until the budget runs out, and demo_link is reported with no url
+# fetched for it at all.
 new_case index_timeout
 printf '99' >"$case_dir/www/index/demo_core.delay"
+sleep_for_real=$real_sleep
+run_script "$VERSION" --wait-seconds "$SPENT_WAIT_SECONDS"
+expect_status 1
+expect_output "FAIL demo_core 1.2.3 index: the sparse index did not carry this version within ${SPENT_WAIT_SECONDS}s"
+expect_output "FAIL demo_link 1.2.3 index: the ${SPENT_WAIT_SECONDS}s budget was spent before this crate, so the sparse index was not read"
+expect_output '2 crate(s) at 1.2.3: 0 PASS, 0 WARN, 2 FAIL'
+expect_file_absent "$case_dir/urls" demo_link
+# Every nap the poll took was cut to what the budget had left: an uncut one is
+# the 15 s poll interval, which reaches well past a two-second deadline.
+[ -s "$case_dir/sleeps" ] || fail 'index_timeout: the index poll recorded no nap'
+while IFS= read -r nap; do
+    [ -n "$nap" ] || continue
+    [ "$nap" -le "$SPENT_WAIT_SECONDS" ] ||
+        fail "index_timeout: a ${nap}s nap reaches past a ${SPENT_WAIT_SECONDS}s budget"
+done <"$case_dir/sleeps"
+passed 'a budget spent on one crate reads nothing for the next'
+
+# A budget already spent when the run reaches its first crate: no probe starts,
+# no nap is taken, and the registry is asked nothing.
+new_case budget_spent_at_once
 run_script "$VERSION" --wait-seconds 0
 expect_status 1
-expect_output 'FAIL demo_core 1.2.3 index: the sparse index did not carry this version within 0s'
-# The run still reaches the next crate rather than stopping at the first defect.
-expect_output 'PASS demo_link 1.2.3 digest:'
-[ ! -s "$case_dir/sleeps" ] || fail 'index_timeout: a spent budget still slept'
-passed 'a spent index budget fails that crate and the run continues'
+expect_output 'FAIL demo_core 1.2.3 index: the 0s budget was spent before this crate, so the sparse index was not read'
+expect_output 'FAIL demo_link 1.2.3 index: the 0s budget was spent before this crate, so the sparse index was not read'
+expect_output '2 crate(s) at 1.2.3: 0 PASS, 0 WARN, 2 FAIL'
+[ ! -s "$case_dir/urls" ] ||
+    fail "budget_spent_at_once: the run fetched $(tr '\n' ' ' <"$case_dir/urls")"
+[ ! -s "$case_dir/sleeps" ] || fail 'budget_spent_at_once: a spent budget still slept'
+passed 'a budget spent before the first crate asks the registry nothing'
 
 # ---------------------------------------------------------------------------
 # Crate selection and the index url
