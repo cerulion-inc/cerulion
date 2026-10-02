@@ -837,7 +837,11 @@ impl DrainSource {
 /// - `"separate"` ⇒ `true`
 /// - any other value ⇒ a loud [`tracing::warn!`] naming the knob + `false` (a
 ///   typo defaults to unified, never silently to separate)
-fn drain_discipline_forces_separate() -> bool {
+///
+/// `pub` because the replay engine's enforcement planner asks the SAME question
+/// before it builds a runtime, and a second parser of this knob would be a second
+/// answer to it.
+pub fn drain_discipline_forces_separate() -> bool {
     match std::env::var("CERULION_DRAIN_DISCIPLINE").as_deref() {
         Ok("separate") => true,
         Ok("") | Err(_) => false,
@@ -850,6 +854,28 @@ fn drain_discipline_forces_separate() -> bool {
             false
         }
     }
+}
+
+/// The PER-SET capability predicate, in ONE place.
+///
+/// Three terms and all three are load bearing: the node must carry the sync
+/// head-op symbols, it must unify its trigger drain onto the body subscriber, and
+/// the drain discipline must not have been forced SEPARATE, because a separate
+/// binding gives the trigger input its own drain stage and the matcher's ops are
+/// then not the path its reads take. Capability alone is not the per-set `Sync`
+/// predicate either; the POLICY is the other half, at each caller.
+///
+/// `pub` because the replay engine's enforcement planner reaches the same verdict
+/// about a node before any runtime exists, from the node's own entry and this
+/// knob. A restatement of these three terms there would be a second authority on
+/// which stages the gate may hold frames back on.
+#[must_use]
+pub fn node_per_set_capable(
+    supports_sync_head_ops: bool,
+    unifies_trigger_drain: bool,
+    force_separate_discipline: bool,
+) -> bool {
+    supports_sync_head_ops && unifies_trigger_drain && !force_separate_discipline
 }
 
 /// The notify-elision kill switch. Elision skips the
@@ -5368,9 +5394,11 @@ impl GraphRuntime {
                 // `MULTI_SUBSCRIBER_LOOSE_MAX`, so a high-fanout graph whose
                 // real body-subscriber count fits is rejected at build with a
                 // slot-exhaustion error naming ports it never asked for.
-                let per_set_capable = supports_sync_head_ops.get(&node_def.id) == Some(&true)
-                    && unifies_trigger_drain.get(&node_def.id) == Some(&true)
-                    && !force_separate_discipline;
+                let per_set_capable = node_per_set_capable(
+                    supports_sync_head_ops.get(&node_def.id) == Some(&true),
+                    unifies_trigger_drain.get(&node_def.id) == Some(&true),
+                    force_separate_discipline,
+                );
                 for input in node_def
                     .inputs
                     .iter()
@@ -6532,9 +6560,11 @@ impl GraphRuntime {
             // ones they replace — this is a move, not a change — and hoisting
             // also deletes one of the duplicate `per_set_capable` spellings.
             let node_trigger_names = trigger_marked_input_names(&entry_info.input_meta);
-            let node_per_set_capable = supports_sync_head_ops.get(&node_def.id) == Some(&true)
-                && unifies_trigger_drain.get(&node_def.id) == Some(&true)
-                && !force_separate_discipline;
+            let node_per_set_capable = node_per_set_capable(
+                supports_sync_head_ops.get(&node_def.id) == Some(&true),
+                unifies_trigger_drain.get(&node_def.id) == Some(&true),
+                force_separate_discipline,
+            );
             // A PER-SET `Sync` trigger input is the shape whose reads
             // cost a PEEK record and a PROMOTION record per consumed frame.
             // Capability alone is NOT the predicate — a `DataTrigger` node

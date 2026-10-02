@@ -32538,6 +32538,134 @@ fn co_assert_premise(rec: &Recording) {
     );
 }
 
+/// The `sy` producers and Sync consumer plus a RELAY on `prod_a/out`: that topic
+/// is then read by a per-set Sync TRIGGER input and by an ordinary one, inside one
+/// rank, which is the shape the enforcement has to cover whole.
+fn sync_and_relay_yaml() -> &'static str {
+    "name: syncmp\nprefix: sy\nnodes:\n\
+     \x20 - id: prod_a\n    type: sync_prod_a\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: prod_b\n    type: sync_prod_b\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: fusion\n    type: sum_fusion\n    inputs:\n      - name: a\n        source: prod_a/out\n      - name: b\n        source: prod_b/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: relay_node\n    inputs:\n      - name: inp\n        source: prod_a/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn sync_and_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "prod_a",
+            Box::new(SyncProdAEntry::new()) as Box<dyn NodeEntry>,
+        ),
+        (
+            "prod_b",
+            Box::new(SyncProdBEntry::new()) as Box<dyn NodeEntry>,
+        ),
+        (
+            "fusion",
+            Box::new(SumFusionNodeEntry::new()) as Box<dyn NodeEntry>,
+        ),
+        (
+            "relay",
+            Box::new(RelayNodeEntry::new()) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+/// **EVERY stage this build's wiring gates is ARMED, and the status counts them:
+/// a Sync TRIGGER and an ordinary input on one locally produced topic, under the
+/// separate drain discipline.**
+///
+/// Under `CERULION_DRAIN_DISCIPLINE=separate` the core does NOT block a per-set
+/// Sync trigger input (its per-set capability term requires the unified
+/// discipline), so every stage of both consumers is gateable. The plan made before
+/// the first step is built from the recording's rows with a CONSERVATIVE wiring
+/// answer, and while that answer lacked the core's capability predicate it excluded
+/// the Sync consumer's trigger input on the topic it shares with the relay: FOUR of
+/// the six stages were armed, and the report still read `enforced` over them, with
+/// `stages_not_gateable` zero and the two missing stages named nowhere, over reads
+/// that ran on queue timing.
+///
+/// THE ORACLE IS THE STAGE COUNT, written here rather than read back: three gated
+/// inputs (the Sync consumer's `a` and `b`, the relay's `inp`), each with a body
+/// and a drain stage under this discipline, is six armed stages, and
+/// `stages_not_gateable` is zero because the wiring blocks none of them. The
+/// recording and the replay both run under the knob, so the recorded stage set and
+/// the wired one agree and nothing is refused for a skew.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn every_wiring_gated_stage_is_armed_under_the_separate_discipline() {
+    let steps = 8;
+    // BOTH halves read the knob at graph build, so it is set around the recording
+    // and around the replay and removed after each: a recording made under one
+    // discipline and replayed under the other is the SKEW refusal, not this arm.
+    let rec = {
+        std::env::set_var("CERULION_DRAIN_DISCIPLINE", "separate");
+        let rec = record_uniform_with_read_log(
+            sync_and_relay_yaml(),
+            sync_and_relay_factories,
+            &[],
+            steps,
+        );
+        std::env::remove_var("CERULION_DRAIN_DISCIPLINE");
+        rec
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sync_and_relay_separate.mcap");
+    // The rows a separate-discipline recorder stamps: a body and a drain stage per
+    // gated input, at the ordinary rim.
+    write_bag_coordinated_with_capacities(
+        &rec,
+        &bag,
+        replay_engine::CoordinationMode::FreeRun,
+        serde_json::json!({
+            "fusion": [[0, 0, 64], [0, 1, 64], [1, 0, 64], [1, 1, 64]],
+            "relay": [[0, 0, 64], [0, 1, 64]],
+        }),
+    );
+
+    let outcome = {
+        // The REPLAY reads the knob at graph build, so it is set around the call
+        // and removed after, exactly as the other discipline arm in this file does.
+        std::env::set_var("CERULION_DRAIN_DISCIPLINE", "separate");
+        let outcome = replay(&bag, sync_and_relay_factories, None, None);
+        std::env::remove_var("CERULION_DRAIN_DISCIPLINE");
+        outcome.expect("the replay runs")
+    };
+
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            stages,
+            frames_admitted,
+            stages_not_gateable,
+            ..
+        } => {
+            assert_eq!(
+                stages, 6,
+                "every gateable stage of BOTH consumers is armed and counted, the Sync consumer's two inputs and the relay's one with a body and a drain stage each: {:?}",
+                outcome.read_log_enforcement
+            );
+            assert_eq!(
+                stages_not_gateable, 0,
+                "this build's wiring blocks none of them, so the status may not report a stage it left ungated: {:?}",
+                outcome.read_log_enforcement
+            );
+            assert!(
+                frames_admitted > 0,
+                "an armed gate that admitted NOTHING gated nothing: {:?}",
+                outcome.read_log_enforcement
+            );
+        }
+        other => panic!("both consumers are gated on this bag: {other:?}"),
+    }
+    // The status count above is that same list's LENGTH, and this warn NAMES each
+    // of its entries, so this pins the named form of the same fact: a stage of this
+    // shape reported ungated would appear here under its own stage label.
+    assert!(
+        !logs_contain("cannot be GATED on its recorded reads"),
+        "no stage of either consumer may be reported ungated in this shape"
+    );
+}
+
 /// **A topic whose only consuming stages the WIRING cannot gate, carrying NO
 /// recorded read, replays with the report-only note: the pre-pass must never
 /// refuse what the pass runs.**

@@ -2152,6 +2152,11 @@ pub enum ReadLogEnforcement {
         /// Stages of a gated topic the core refuses to gate, which took today's
         /// drain. Serialized only when nonzero, so a fully gated rank's report
         /// is unchanged by the field's existence.
+        ///
+        /// ZERO therefore means every stage of every gated edge was ARMED: a
+        /// stage this build's census gates and the pass did not arm refuses the
+        /// pass rather than reaching this status, so `enforced` with this field
+        /// at zero cannot stand over an ungated recorded read.
         #[serde(skip_serializing_if = "is_zero")]
         stages_not_gateable: usize,
     },
@@ -7419,8 +7424,8 @@ struct PassInputs<'a> {
     /// comparison, and the source of each input's consume mode + depth.
     node_infos: &'a IndexMap<String, cerulion_core::graph::NodeInfo>,
     /// What the PRE-PASS planned for every rank's BAG SIDE before pass 0: the
-    /// plan this pass CONSUMES rather than re-planning from its census (see
-    /// [`plan_bag_side_admissions`]).
+    /// plan this pass CONSUMES, completing it with any stage its own census gates
+    /// that the plan lacks (see [`plan_bag_side_admissions`]).
     bag_side: &'a BTreeMap<u32, RankBagSide>,
     /// The stand-down notes `collect_pass_node_infos` produced —
     /// one per member whose declared metadata could not be read, so the
@@ -10019,20 +10024,33 @@ fn topic_admission_for(
 ///   `input_meta[].trigger`, read out of the factory map before the runtime takes
 ///   the entries).
 ///
-/// CONSERVATIVE on the per-set term: the core also requires the node's per-set
-/// CAPABILITY (its sync head-op symbols, a unified trigger drain, and no
-/// `CERULION_DRAIN_DISCIPLINE=separate`), which lives in the loaded entry and not
-/// in its declared metadata. Dropping those terms can only answer "blocked" where
-/// the core would gate, and that direction is safe: such a stage is judged by the
-/// PASS against the real census, so its refusal lands before that rank's first
-/// step instead of before the first. The other direction would refuse a replay the
-/// pass would run, which is the bug this answer exists to prevent.
+/// The CAPABILITY half is the core's own predicate, REUSED:
+/// `cerulion_core::graph::runtime::node_per_set_capable` over the node's entry
+/// (its sync head-op symbols and whether it unifies its trigger drain) and the
+/// drain-discipline knob read through the core's own reader. Without it this answer
+/// excluded a stage the census gates: a topic read by a per-set Sync trigger input
+/// beside an ordinary one, replayed under `CERULION_DRAIN_DISCIPLINE=separate`, had
+/// the Sync input's stages missing from the plan while the report still said
+/// enforced over the rest, with a zero not-gateable count.
+/// Restating the three terms here instead would be a second authority on the same
+/// question.
+///
+/// The POLICY half is the node's macro-declared trigger policy, the other half of
+/// the core's own `node_per_set_sync`. Both halves together make this the verdict
+/// the graph build reaches, so the plan made before the first step and the census
+/// agree on this class at the source; and where any imprecision remains, the pass
+/// completes its plan with every stage its own census gates, so the residual is
+/// which side judges coverage, never a gateable stage left ungated.
 fn wiring_may_block_the_gate(
     config: &GraphConfig,
     node_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
     topic: &str,
     node: &str,
     input: &str,
+    // The CORE's own per-set capability verdict for this node
+    // (`cerulion_core::graph::runtime::node_per_set_capable` over the node's entry
+    // and the drain-discipline knob), never a restatement of its three terms here.
+    per_set_capable: bool,
 ) -> bool {
     if config.is_multi_publisher(topic) {
         return true;
@@ -10049,6 +10067,7 @@ fn wiring_may_block_the_gate(
             | Some(cerulion_core::graph::node::MacroPolicy::UnboundedSync)
     );
     per_set_policy
+        && per_set_capable
         && info
             .input_meta()
             .iter()
@@ -10058,7 +10077,9 @@ fn wiring_may_block_the_gate(
 /// What the PRE-PASS planned for ONE rank from the recording alone.
 struct RankBagSide {
     /// Topic to the stages the RECORDING staged, with their per-step
-    /// admissions. Consumed by that rank's pass, which re-plans nothing.
+    /// admissions. Consumed by that rank's pass, which plans ONLY what this plan
+    /// lacks: a stage its own census gates and this plan does not carry, because
+    /// the wiring answer here is conservative and may exclude one.
     admission: BTreeMap<String, Vec<replay_inject::StageAdmission>>,
 }
 
@@ -10073,7 +10094,10 @@ struct RankBagSide {
 /// built here from the rows and the trace. What stays per rank is the pair that
 /// needs this build's wiring: which stages the core will let the gate hold frames
 /// back on, and whether the stage set this replay wires is the one the recording
-/// staged.
+/// staged. This plan is therefore not the WHOLE plan by itself: the wiring answer
+/// it is built with is conservative, so the pass completes it with any stage its
+/// own census gates that this one excluded, and the pass is what decides which
+/// stages are armed.
 ///
 /// A rank with no entry here is one this function had nothing to plan from: its
 /// manifest could not be used, its census was declined, its bag carries no read
@@ -10111,6 +10135,10 @@ fn plan_bag_side_admissions(
     let Some(rows) = rims.per_edge else {
         return Ok(BTreeMap::new());
     };
+    // ONE read of the drain-discipline knob for the whole pre-pass, through the
+    // core's own reader, as the graph build takes one per build.
+    let force_separate_discipline =
+        cerulion_core::graph::runtime::drain_discipline_forces_separate();
     let mut out: BTreeMap<u32, RankBagSide> = BTreeMap::new();
     for plan in plans {
         let enforce_topics = rank_enforce_topics(plan, classes);
@@ -10165,10 +10193,28 @@ fn plan_bag_side_admissions(
             .map(|(topic, node, input)| ((node.clone(), input.clone()), topic.clone()))
             .collect();
         let blocked = |node: &str, input: &str| {
+            // The CORE's capability verdict for this node, from its own entry and
+            // its own reader of the drain-discipline knob. A member with no entry
+            // is not per-set capable here, the conservative answer in the direction
+            // that costs nothing: the pass arms such a stage anyway.
+            let per_set_capable = factories.get(node).is_some_and(|entry| {
+                cerulion_core::graph::runtime::node_per_set_capable(
+                    entry.supports_sync_head_ops(),
+                    entry.unifies_trigger_drain(),
+                    force_separate_discipline,
+                )
+            });
             topic_of
                 .get(&(node.to_string(), input.to_string()))
                 .is_some_and(|topic| {
-                    wiring_may_block_the_gate(config, &node_infos, topic, node, input)
+                    wiring_may_block_the_gate(
+                        config,
+                        &node_infos,
+                        topic,
+                        node,
+                        input,
+                        per_set_capable,
+                    )
                 })
         };
         let stages = replay_inject::StageTable::from_recorded_stages(
@@ -11133,9 +11179,12 @@ fn prepare_pass_verification(
     if !enforce_topics.is_empty() && !reads.is_empty() {
         // THE CENSUS HALF. The bag side was planned ONCE, before pass 0, from the
         // recording's own staging rows (`plan_bag_side_admissions`), and is
-        // CONSUMED here: this pass re-plans nothing from its census, so there is
-        // no second table to disagree with the one the refusals were decided on.
-        // What is left are the two answers that need this build's wiring.
+        // CONSUMED here, and COMPLETED where this build's census gates a stage the
+        // plan does not carry: the plan's own wiring answer is conservative, so the
+        // pass is the authority on which stages are gated and may not leave one of
+        // them ungated. A stage both tables carry is never re-planned, and a
+        // difference between the two over one stage is an engine fault, refused as
+        // one below rather than armed.
         let stages = replay_inject::StageTable::new(&recorded_inputs, census).with_recorded_stages(
             recorded_rims
                 .per_edge
@@ -11199,7 +11248,8 @@ fn prepare_pass_verification(
                     });
                 }
             }
-            // (2) The PRE-PASS plan for this topic, CONSUMED. The `None` arm is
+            // (2) The PRE-PASS plan for this topic, CONSUMED as it stands here and
+            //     COMPLETED at (4). The `None` arm is
             //     reachable two ways and neither is a second plan: a bag that
             //     states NO staging rows (there was nothing to plan from before
             //     pass 0, so this is the FIRST plan), and a topic with no
@@ -11294,6 +11344,118 @@ fn prepare_pass_verification(
                 );
             }
             admission_ungateable.extend(render_ungateable(&ungateable));
+            // (4) COMPLETE the plan. A stage THIS census gates that the consumed
+            //     plan lacks is planned here, from the same records through the
+            //     same planner, so a pre-pass answer that excluded a stage for
+            //     any reason can never leave a gateable recorded read ungated.
+            //     The shared stages must come out identical (one decode, one
+            //     placement rule, and the stage sets agree past the comparison
+            //     above); a difference is the two tables disagreeing, which is an
+            //     engine fault and is refused as one rather than armed.
+            let missing: Vec<cerulion_core::read_outcome::StageKey> = consumed
+                .iter()
+                .filter(|(t, _, _)| t == topic)
+                .filter_map(|(_, node, input)| {
+                    stages.resolve(node, input).ok().map(|(input_idx, roles)| {
+                        roles
+                            .wired()
+                            .into_iter()
+                            .map(move |role| cerulion_core::read_outcome::StageKey {
+                                node: node.clone(),
+                                input_idx,
+                                role,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .flatten()
+                .filter(|key| stages.stage_gateable(key) == Some(true))
+                .filter(|key| !armed.iter().any(|s| s.key == *key))
+                .collect();
+            if !missing.is_empty() {
+                let planned = topic_admission_for(topic, &consumed, node_infos, &per_input, config);
+                match replay_inject::plan_edge_admission(&planned, &stages) {
+                    replay_inject::AdmissionPlan::Enforced { stages: full, .. } => {
+                        for stage in full {
+                            if missing.contains(&stage.key) {
+                                tracing::debug!(
+                                    rank = plan.rank(),
+                                    topic = %topic,
+                                    stage = %stage.key.label(),
+                                    "replay: this stage is gated by this build's wiring and the \
+                                     plan made before the first step did not carry it, so it is \
+                                     planned here from the same records"
+                                );
+                                armed.push(stage);
+                            } else if let Some(have) = armed.iter().find(|a| a.key == stage.key) {
+                                if *have != stage {
+                                    return Err(ReplayError::Internal {
+                                        reason: format!(
+                                            "rank {}: the admission plan made before the first \
+                                             step and the one this pass derives disagree about \
+                                             stage {} of topic {topic}, over the same records. \
+                                             This is a bug in the replay engine, please report",
+                                            plan.rank(),
+                                            stage.key.label()
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // Nothing to complete: no stage of this topic can be gated.
+                    replay_inject::AdmissionPlan::NotGateable(_) => {}
+                    replay_inject::AdmissionPlan::Refused(refusal) => {
+                        let detail = refusal.reason.to_string();
+                        tracing::warn!(
+                            rank = plan.rank(),
+                            topic = %topic,
+                            cause = refusal.reason.code(),
+                            detail = %detail,
+                            "replay: this recording's read log cannot be ENFORCED on a \
+                             graph-produced input edge, so the replay is REFUSED rather than run \
+                             against whatever the consumer's queue happened to hold"
+                        );
+                        return Err(ReplayError::ReadLogNotEnforceable {
+                            edge: refusal.reason.edge_label(),
+                            cause: refusal.reason.code().to_string(),
+                            detail,
+                        });
+                    }
+                }
+            }
+            // (5) THE STATUS INVARIANT. The report may not say enforced over a
+            //     stage this census gates and this pass did not arm: that is the
+            //     partial coverage the enforcement exists to delete, and it would
+            //     render as `enforced` with `stages_not_gateable` zero. Past (4)
+            //     this is a guard and not a path.
+            for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
+                let Ok((input_idx, roles)) = stages.resolve(node, input) else {
+                    continue;
+                };
+                for role in roles.wired() {
+                    let key = cerulion_core::read_outcome::StageKey {
+                        node: node.clone(),
+                        input_idx,
+                        role,
+                    };
+                    if stages.stage_gateable(&key) != Some(true)
+                        || armed.iter().any(|s| s.key == key)
+                    {
+                        continue;
+                    }
+                    return Err(ReplayError::Internal {
+                        reason: format!(
+                            "rank {}: stage {} of topic {topic} is gated by this build's wiring \
+                             and no admission was armed on it, so the enforcement would report \
+                             coverage it does not have. This is a bug in the replay engine, \
+                             please report",
+                            plan.rank(),
+                            key.label()
+                        ),
+                    });
+                }
+            }
             if armed.is_empty() {
                 continue;
             }
