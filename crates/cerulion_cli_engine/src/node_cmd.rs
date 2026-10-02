@@ -1238,7 +1238,13 @@ fn run_cargo_streaming(
                     }
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-                Err(error) => break Err(error),
+                Err(error) => {
+                    // Cargo may still be running: end its group and reap it
+                    // before reporting, so no build outlives the failure.
+                    kill_process_group(pid);
+                    let _ = child.wait();
+                    break Err(error);
+                }
             }
         };
         (status, stderr_reader.join().unwrap_or_default())
