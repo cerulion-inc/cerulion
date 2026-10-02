@@ -518,10 +518,20 @@ pub const DEPARTURE_RING_RANK: u32 = u32::MAX;
 /// The value has a SECOND kind of reader: the RECORDER, which must measure the
 /// last boundary target its capture carries so the bag can state the range a
 /// resume covers. A recorder-side literal `0` and a replay-side literal `0` are
-/// two derivations of one fact, and the covered range is only meaningful if the
-/// two sides answer identically IN BOTH MODES: `cerulion_bagd`'s
-/// `TrimmedTrace::last_boundary_target_ns` writes it and the replay engine's
-/// `last_recorded_boundary_target` reads it back, neither of them mode-gated. So
+/// two derivations of one fact, and both must spell the rank the same way.
+/// The fact itself is a fold OVER the ranks: `cerulion_bagd`'s
+/// `TrimmedTrace::last_boundary_target_ns` writes the MINIMUM over the ranks
+/// that kept a boundary of each rank's last kept target, and the replay
+/// engine's `earliest_last_boundary_target` folds the bag's own trace the same
+/// way, so the two sides answer identically IN BOTH MODES for the value a
+/// CAPTURE declares. THIS rank's own last target, which the replay engine's
+/// `last_recorded_boundary_target` reads, is one term of that fold: it is the
+/// whole answer on a single-rank capture and wherever no rank ended shorter than
+/// rank 0, and it is also the endpoint the replay engine DERIVES for a
+/// continuous multi-rank LOCKSTEP recording, which declares no value for either
+/// side to agree with; under the FREE-RUN default that derivation is mode-gated
+/// off and such a bag reports no covered range at all. The two FOLDS are not
+/// mode-gated, which is the property this constant has to keep. So
 /// the constant lives in the crate both already depend on, beside the wire form
 /// it describes.
 pub const AUTHORITATIVE_TRACE_RANK: u32 = 0;
@@ -530,8 +540,9 @@ pub const AUTHORITATIVE_TRACE_RANK: u32 = 0;
 /// record — the SHARED condition, so a capture's verdict cannot drift from the
 /// gate.**
 ///
-/// `run_replay` walks the trace channel once and refuses on four things
-/// (`replay_cmd.rs`, the loop at 628-722). A Flashback capture decides whether it
+/// `run_replay` walks the trace channel once and refuses on four things, through
+/// `classify_trace_record` (`replay_cmd.rs:1553-1605`). A Flashback capture
+/// decides whether it
 /// may claim `resimmable` by asking the SAME questions, and the whole point of
 /// putting them here is that there is one copy: a refusal added to the replay
 /// gate without a matching arm in the judge is exactly how a bag comes to be

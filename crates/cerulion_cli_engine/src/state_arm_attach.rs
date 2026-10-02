@@ -388,8 +388,9 @@ impl PlaneRole {
 ///
 /// # A worker's refusal is its OWN, and its peers keep running
 ///
-/// A refused rank creates no state ring, so a graph-wide anchor is partial
-/// and the recorder reports the hole through `missing_state_ring_ranks` — which is
+/// A refused rank creates no state ring, so every anchor of the run LACKS that
+/// rank's records and the recorder reports the hole through
+/// `missing_state_ring_ranks`, which is
 /// the accurate outcome and already has machinery. The alternative, tearing down the
 /// whole run's plane because one rank is fat, would throw away every other rank's
 /// anchors for no gain; and the ranks cannot vote, since each learns its own size
@@ -527,8 +528,14 @@ fn report_arm_refusal(
              it carries NO node-state anchors and is NOT resimmable"
             .to_string(),
         PlaneRole::Worker { rank } => format!(
-            "rank {rank} captures NOTHING while its peers carry on, so every anchor of this \
-             run will be reported PARTIAL"
+            "rank {rank} captures NOTHING while its peers carry on, so every anchor of this run \
+             LACKS rank {rank}'s records. A resim of a capture from this run whose window reaches \
+             step 0 reads no anchor at all and reaches a verdict whatever the ring count. One \
+             whose window starts mid run exits 2 with no verdict in two ways: with more than one \
+             state ring left it refuses the recording outright as ambiguous, and with one ring \
+             left it resumes from that ring and refuses by name every node of the missing rank the \
+             replay executes, none of which has an anchor. It reaches a verdict of its own only \
+             when no node of that rank runs in that window"
         ),
         // UNREACHABLE today: a supervisor never reaches the memory gate
         // (`pays_the_fork_cost` is false for it), so nothing calls this with that
@@ -605,8 +612,8 @@ fn report_arm_refusal(
 /// # A failure here is LOUD, and it is not fatal
 ///
 /// A rank that cannot create its ring contributes no anchor parts, and a
-/// graph-wide anchor is all-or-nothing across ranks — so this rank alone
-/// voids every anchor of the run. That is worth an `error!`, not a `warn!`, and it
+/// graph-wide anchor is all-or-nothing across ranks, so every anchor of the run
+/// LACKS that rank's records. That is worth an `error!`, not a `warn!`, and it
 /// is deliberately NOT fatal: refusing to run the graph because a checkpoint ring
 /// could not be created would turn an observability feature into an outage. The
 /// recorder half of the same statement is `missing_state_ring_ranks`, which turns
@@ -667,10 +674,16 @@ fn create_state_ring(
                 tag = %tag,
                 rank,
                 error = %e,
-                "this run is ARMED for checkpoints but its state-ring name cannot be \
-                 derived, so this rank captures NOTHING — and because a graph-wide anchor is \
-                 all-or-nothing across ranks, every anchor of this run will be reported partial. \
-                 The graph continues running"
+                "this run is ARMED for checkpoints but its state-ring name cannot be derived, so \
+                 this rank captures NOTHING, and because a graph-wide anchor is all-or-nothing \
+                 across ranks, every anchor of this run LACKS the records of the rank this event \
+                 names. A resim of a capture from this run whose window reaches step 0 reads no \
+                 anchor at all and reaches a verdict whatever the ring count. One whose window \
+                 starts mid run exits 2 with no verdict in two ways: with more than one state ring \
+                 left it refuses the recording outright as ambiguous, and with one ring left it \
+                 resumes from that ring and refuses by name every node of the missing rank the \
+                 replay executes, none of which has an anchor. It reaches a verdict of its own \
+                 only when no node of that rank runs in that window. The graph continues running"
             );
             return None;
         }
@@ -702,10 +715,16 @@ fn create_state_ring(
                 rank,
                 ring_tag = %ring_tag,
                 error = %e,
-                "this run is ARMED for checkpoints but its state ring could not be \
-                 created, so this rank captures NOTHING — and because a graph-wide anchor is \
-                 all-or-nothing across ranks, every anchor of this run will be reported partial. \
-                 The graph continues running"
+                "this run is ARMED for checkpoints but its state ring could not be created, so \
+                 this rank captures NOTHING, and because a graph-wide anchor is all-or-nothing \
+                 across ranks, every anchor of this run LACKS the records of the rank this event \
+                 names. A resim of a capture from this run whose window reaches step 0 reads no \
+                 anchor at all and reaches a verdict whatever the ring count. One whose window \
+                 starts mid run exits 2 with no verdict in two ways: with more than one state ring \
+                 left it refuses the recording outright as ambiguous, and with one ring left it \
+                 resumes from that ring and refuses by name every node of the missing rank the \
+                 replay executes, none of which has an anchor. It reaches a verdict of its own \
+                 only when no node of that rank runs in that window. The graph continues running"
             );
             return None;
         }
@@ -739,6 +758,82 @@ fn create_state_ring(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The WORKER scope sentence names the rank, and rank 7 is written here by
+    /// hand.
+    ///
+    /// A refusal on a twelve-rank deployment is unattributable without it: every
+    /// rank would log the same sentence and an operator reading one line could
+    /// not say which process lost its plane. The sentence is built inside
+    /// `report_arm_refusal` and reaches a reader only through `tracing`, so this
+    /// arm drives the refusal and reads the log.
+    ///
+    /// Measured before it existed: a mutant that dropped the rank from the
+    /// sentence survived the whole suite, because the literal appears at its
+    /// definition site and nowhere else in the tree.
+    ///
+    /// The MONOLITH sentence is the control. It carries no rank by design, so an
+    /// implementation that interpolated one everywhere would fail here too, and
+    /// the arm states a rule rather than a coincidence.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_workers_refusal_names_the_rank_that_lost_its_plane() {
+        use cerulion_core::flashback::{ArmProjection, ArmRefusal};
+
+        let projection = ArmProjection {
+            state_bytes: Some(64 * 1024 * 1024),
+            mem_available: Some(32 * 1024 * 1024 * 1024),
+            max_state_bytes: 8 * 1024 * 1024,
+            ring_bytes: 1024 * 1024,
+            cadence_steps: 100,
+            cadence_ms: 1_000,
+        };
+
+        report_arm_refusal(
+            PlaneRole::Worker { rank: 7 },
+            "cer_run_7",
+            &projection,
+            ArmRefusal::StateTooLarge,
+            8 * 1024 * 1024,
+        );
+        assert!(
+            logs_contain("rank 7 captures NOTHING while its peers carry on"),
+            "the worker scope sentence must name the rank"
+        );
+        assert!(
+            logs_contain("every anchor of this run LACKS rank 7's records"),
+            "and name it again where it states what every anchor of the run lacks"
+        );
+
+        // The same refusal on the other end of the same ceiling, so the sentence
+        // is carried by BOTH refusal arms rather than by one of them.
+        report_arm_refusal(
+            PlaneRole::Worker { rank: 3 },
+            "cer_run_3",
+            &projection,
+            ArmRefusal::NoHeadroom,
+            8 * 1024 * 1024,
+        );
+        assert!(
+            logs_contain("rank 3 captures NOTHING while its peers carry on"),
+            "the no-headroom refusal carries the same named sentence"
+        );
+
+        // THE CONTROL: a monolith has no rank, and its sentence says so without
+        // borrowing one.
+        report_arm_refusal(
+            PlaneRole::Monolith,
+            "cer_run_mono",
+            &projection,
+            ArmRefusal::StateTooLarge,
+            8 * 1024 * 1024,
+        );
+        assert!(
+            logs_contain("this run has NO capture plane at all"),
+            "the monolith sentence is the one with no rank in it"
+        );
+    }
 
     /// The normalisation table, hand-written. The three "nothing to attach"
     /// rows are the load-bearing ones: an env var that exists but says nothing
