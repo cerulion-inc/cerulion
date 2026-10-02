@@ -2471,7 +2471,7 @@ mod tests {
         assert_eq!(
             reason,
             "`cargo` was not found on PATH. `cerulion node build` compiles the node with \
-             the Rust toolchain: install Rust 1.93+ from https://rustup.rs (plus a C \
+             the Rust toolchain: install Rust 1.95+ from https://rustup.rs (plus a C \
              linker: build-essential on Ubuntu/Debian, Xcode Command Line Tools on macOS) \
              and retry"
         );

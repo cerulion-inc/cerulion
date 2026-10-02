@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `cerulion graph pause <RUN>` and `cerulion graph resume <RUN>` hold a live run at its next step boundary and stop its clock, so timers neither skip ticks nor burst on resume and a recording shows no gap across the pause. A run's `run.json` records `"paused"`, and the viz daemon's `runs` rows carry `"paused": true` while a run is held. A run that is never paused is unchanged.
 
+### Changed
+- The minimum supported Rust version is 1.95 (it was 1.93), and the release workflow builds with Rust 1.95.0. `cerulion_core` calls `try_update` on its atomics, the name Rust 1.95 stabilised and Rust 1.99 uses in place of the deprecated `fetch_update`; a workspace that denies warnings builds again under the current stable.
+
 ## [1.0.0] - 2026-09-21
 
 The first release of Cerulion. Its crates, binaries and Debian packages come from this tree.

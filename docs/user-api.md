@@ -342,7 +342,7 @@ count declared in the same `node create` invocation.
 
 Before any of this, `cerulion node build` needs **your own** Rust toolchain: it
 compiles the node with `cargo`, which the CLI does not ship, so `cargo` must be
-on `PATH` (Rust **1.93+**, the MSRV, via [rustup](https://rustup.rs)) alongside a
+on `PATH` (Rust **1.95+**, the MSRV, via [rustup](https://rustup.rs)) alongside a
 **C linker** (`build-essential` on Ubuntu/Debian, the Xcode Command Line Tools on
 macOS). If `cargo` is missing the build fails with a message naming rustup and
 the linker, rather than a raw "No such file or directory" that reads like a lost

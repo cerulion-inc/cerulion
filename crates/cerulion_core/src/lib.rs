@@ -133,7 +133,7 @@ pub mod message;
 // engine. It lived in `cerulion_viz` while its only consumer was the desk
 // daemon; the Flashback monitors-verdict trigger gave it a SECOND consumer —
 // `cerulion_bagd`, robot-side — and `cerulion_viz` cannot be a dependency of a
-// robot-side crate (rerun, openh264, ureq, `rust-version = 1.93`, excluded from
+// robot-side crate (rerun, openh264, ureq, `rust-version = 1.95`, excluded from
 // `default-members`), while a `cerulion_core → cerulion_viz` edge would be a
 // cycle. It moves here rather than into a new leaf crate because there is no
 // cyclic package edge to break — both consumers already depend on this crate —

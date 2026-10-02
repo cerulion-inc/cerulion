@@ -156,14 +156,14 @@ Run from the workspace root, in order:
   crates.io requires; per-crate license file copies can be added later if
   desired (cargo only auto-copies `readme`/`license-file`, and `license-file`
   is mutually exclusive with `license`).
-- **MSRV** (`rust-version = "1.93"`, workspace-inherited): Cerulion's own code needs
-  only 1.87 (`usize::is_multiple_of` in `crates/cerulion_core/src/wire.rs` and in
-  codegen-emitted code), and the tree without the viz members floors at 1.88
-  (darling/time/time-core/home/instability declare rust-version 1.88).
-  The binding constraint is the `rerun` 0.34 SDK pulled by the
-  `cerulion_viz` / `cerulion-vizd` members: it declares 1.92, but its transitive
-  `fixed` 1.31.0 declares 1.93. ENFORCED: the `msrv` CI job runs
-  `cargo +1.93.0 check --workspace --all-targets` on every push to `main`
+- **MSRV** (`rust-version = "1.95"`, workspace-inherited): set by Cerulion's own
+  code, `try_update` on the integer atomics in `crates/cerulion_core` (stable since
+  1.95; Rust 1.99 deprecates its former name `fetch_update`). The dependency tree
+  floors lower: the tree without the viz members at 1.91
+  (`iroh` 1.0.2 and its companion crates declare rust-version 1.91), and the
+  `rerun` 0.34 SDK pulled by the `cerulion_viz` / `cerulion-vizd` members at 1.93
+  through its transitive `fixed` 1.31.0. ENFORCED: the `msrv` CI job runs
+  `cargo +1.95.0 check --workspace --all-targets` on every push to `main`
   (and on `workflow_dispatch`; it is skipped on
   `pull_request`; see `docs/internals/ci-and-gates.md` § "CI job map"), so
   this floor is build-proven, not a survey.
