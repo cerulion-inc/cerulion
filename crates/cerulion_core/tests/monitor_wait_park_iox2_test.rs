@@ -709,6 +709,20 @@ fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
         "the graph must have created no named shared memory object for {topic}: \
          the registry is skipped, not opened and discarded"
     );
+    // The NONZERO control for that zero: the probe must say yes for a page this
+    // process does create, or a name derivation that disagreed with `open_owned`
+    // would make the assertion above vacuously green for ever.
+    {
+        let control_topic = "/mwp/probe/control";
+        let held = cerulion_core::doorbell::Doorbell::open_owned(&ns, control_topic)
+            .expect("open a control page in the same namespace");
+        assert!(
+            cerulion_core::doorbell::shm_object_exists_for_test(&ns, control_topic),
+            "the probe must find a page this test just created, or its negative \
+             answer above says nothing"
+        );
+        drop(held);
+    }
     assert!(
         !runtime.data_wake_rung_for_test(),
         "with no ringable line the data-wake rung must decline, so the park keeps \

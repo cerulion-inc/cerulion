@@ -323,11 +323,11 @@ impl<'a> CrossProcessWiring<'a> {
         }
     }
 
-    /// Name the topics a SIBLING group produces for this worker. Chained onto
-    /// one of the constructors above rather than added to their signatures:
-    /// it changes which warnings a build emits, never how it is wired.
-    /// The topics this worker produces that a sibling consumes, which is what
-    /// gates its producer-side doorbells.
+    /// Name the topics THIS worker produces that a sibling group CONSUMES, the
+    /// outbound direction. Chained onto one of the constructors above rather than
+    /// added to their signatures: unlike its inbound mirror it changes how the
+    /// build is WIRED, because it decides which of this worker's publishers arm a
+    /// doorbell at all.
     pub fn with_sibling_consumed_topics(
         mut self,
         topics: &'a std::collections::BTreeSet<String>,
@@ -336,6 +336,10 @@ impl<'a> CrossProcessWiring<'a> {
         self
     }
 
+    /// Name the topics a SIBLING group PRODUCES for this worker, the inbound
+    /// direction. Chained onto one of the constructors above rather than added to
+    /// their signatures: it changes which warnings a build emits, never how it is
+    /// wired.
     pub fn with_sibling_topics(mut self, topics: &'a std::collections::BTreeSet<String>) -> Self {
         self.sibling_topics = Some(topics);
         self
@@ -13608,7 +13612,7 @@ impl GraphRuntime {
         tracing::info!(
             graph = %self.config.identity(),
             park_active = self.park_active(),
-            doorbell = self.doorbell_registry.is_some(),
+            doorbell = self.monitor_wait_policy.doorbell(),
             registry = tracing::field::display(
                 self.doorbell_registry
                     .as_ref()
