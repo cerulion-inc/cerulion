@@ -1112,9 +1112,15 @@ jobs:
           # keyed on the pair, so a fork pushing a grandfathered name gets no
           # exemption.
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The AUTHOR's login, which the script compares to its bot list to
+          # accept a head branch the forge minted (`dependabot/<ecosystem>/<name>`,
+          # configured in .github/dependabot.yml). `user.login` is set when the
+          # pull request opens; `github.actor` is whoever pushed the run, so a
+          # maintainer push to a bot branch would change it.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           ./tools/scripts/check_pr_title.sh --self-test
-          ./tools/scripts/check_pr_title.sh --title "$PR_TITLE" --branch "$PR_BRANCH" --pr "$PR_NUMBER"
+          ./tools/scripts/check_pr_title.sh --title "$PR_TITLE" --branch "$PR_BRANCH" --pr "$PR_NUMBER" --author "$PR_AUTHOR"
 
   # Cross-target type-check for aarch64-unknown-linux-gnu (the
   # Jetson/Orin robotics deployment target). The monitor-wait/doorbell cfg-matrix
