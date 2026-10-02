@@ -551,8 +551,7 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # re_grpc_server, prune this rev + the `deny.toml [sources]` entry) if upstream
 # re_grpc_server ever ships BOTH a statics-only / drop-temporal history mode
 # and a bounded, non-blocking live queue, AND moves the `spawn_with_recv`
-# forwarder's send off its runtime workers (or the vizd test harnesses drain that
-# receiver themselves). The first two alone are not enough: either capability
+# forwarder's send off its runtime workers. The first two alone are not enough: either capability
 # alone leaves one of the two buffers on that path unbounded, and without the
 # third an undrained receiver fills the forwarder's channel and its push parks a
 # runtime worker again. `deny.toml [sources]` carries the same three; the fork's
