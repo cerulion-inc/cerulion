@@ -156,10 +156,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # verify_published.sh waits at most 900 s of wall clock for both registry
-    # surfaces to carry the version, shared across all crates rather than spent
-    # again per crate, then downloads and extracts each archive. The limit covers
-    # that budget plus the checkout and the toolchain install.
+    # Two ceilings, not one. The 900 s budget bounds the WAIT for both registry
+    # surfaces to carry the version: wall clock from the start of the run, shared
+    # across all crates rather than spent again per crate, no poll starting past
+    # it, and the archive download's retry chain held to whatever it has left.
+    # Each request carries its own caps, which the budget does not cover: 120 s
+    # for one transfer and 120 s for a retry chain, so a host that accepts a
+    # connection and then stalls ends that request instead of the run. The job
+    # limit covers the budget, the per-crate download and extraction that follow
+    # it, the checkout and the toolchain install.
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always

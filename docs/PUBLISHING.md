@@ -169,8 +169,10 @@ them), that nothing ships from a `tests/`
 directory at the crate root (a `cfg(test)` module under `src/` is library source
 and does ship), that the text files the packaged `license` expression requires
 are present and that the expression matches the API `license`, that the packaged
-description carries no tracker id, that every relative link in the packaged
-README resolves inside the archive, and that `.cargo_vcs_info.json`'s git sha1
+description carries no tracker id, that every relative target of an inline
+`](...)` link or image in the packaged README resolves inside the archive (that
+is the whole README scope: reference-style definitions, autolinks and HTML
+`href` attributes are not read), and that `.cargo_vcs_info.json`'s git sha1
 is the commit `v<version>` points at. Each check prints one `PASS`, `FAIL` or
 `WARN` line, every crate is read before the exit status is decided, and any
 `FAIL` exits non-zero. docs.rs is a `WARN` line carrying the HTTP status: the
@@ -186,13 +188,21 @@ and runs in the `Lint` job.
 
 ## Known Caveats
 
-- **License files**: `LICENSE-APACHE` and `LICENSE-MIT` live under `docs/legal/`
-  and are not copied into each crate package. The SPDX `license` field
-  (`AGPL-3.0-only`, workspace-inherited; `cerulion_link` and `cerulion_pairing`
-  override it with `MIT OR Apache-2.0`) is what
-  crates.io requires; per-crate license file copies can be added later if
-  desired (cargo only auto-copies `readme`/`license-file`, and `license-file`
-  is mutually exclusive with `license`).
+- **License files**: every publishable crate carries, in its own directory and
+  in its `include` list, the text its SPDX `license` field obliges it to ship.
+  The field is `AGPL-3.0-only` workspace-inherited for most members, which
+  obliges the root `LICENSE`; `cerulion_link` and `cerulion_pairing` override it
+  with `MIT OR Apache-2.0`, which obliges both `LICENSE-MIT` and
+  `LICENSE-APACHE`, and both crates carry both files.
+  The copies the per-crate ones are compared against are
+  `docs/legal/LICENSE-MIT` and `docs/legal/LICENSE-APACHE` for the permissive
+  pair, and the repository-root `LICENSE` for the AGPL text.
+  Two gates assert it: `crates/cerulion_hygiene/tests/crate_license_texts_test.rs`
+  over the working tree, byte for byte against the canonical text, and the
+  `licence` check of `tools/scripts/verify_published.sh` over the archive
+  crates.io serves. Cargo copies no license text on its own: it auto-copies only
+  `readme`/`license-file`, and `license-file` is mutually exclusive with
+  `license`, so the `include` entry is what puts the file in the package.
 - **MSRV** (`rust-version = "1.95"`, workspace-inherited): set by Cerulion's own
   code, `try_update` on the integer atomics in `crates/cerulion_core` (stable since
   1.95; Rust 1.99 deprecates its former name `fetch_update`). The dependency tree

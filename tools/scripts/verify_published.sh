@@ -20,8 +20,11 @@
 #   licence      the text files the packaged `license` expression requires are
 #                in the archive, and that expression equals the API `license`
 #   description  the packaged description carries no tracker id
-#   readme       every relative link in the packaged README resolves to a file
-#                inside the archive
+#   readme       every relative target of an inline `](...)` markdown link or
+#                image in the packaged README resolves to a file inside the
+#                archive. That is the whole scope: reference-style definitions
+#                (`[label]: target`), autolinks and HTML `href` attributes are
+#                not read
 #   provenance   `.cargo_vcs_info.json`'s git sha1 is the commit `v<version>`
 #                points at; a checkout without that tag gets a warning
 #
@@ -62,6 +65,13 @@ TRACKER_RE='[C]ER-[0-9]+'
 # the start of the run and is shared by every crate, not spent again per crate.
 WAIT_SECONDS=900
 POLL_SECONDS=15
+# What one request may take, which the wait budget does not cover: `--max-time`
+# bounds a single transfer and `--retry-max-time` bounds the whole retry chain,
+# so a host that accepts a connection and then stalls ends that request instead
+# of the run. The archive download's chain gets the smaller of this cap and what
+# the budget has left.
+MAX_TIME_SECONDS=120
+RETRY_MAX_SECONDS=120
 
 say() { printf 'verify_published: %s\n' "$*"; }
 die() {
@@ -203,9 +213,12 @@ index_path() {
     esac
 }
 
+# fetch <url> <dest> [retry-chain seconds]: one bounded GET. The longest it can
+# take is one transfer past the retry chain's ceiling.
 fetch() {
     curl -fsSL --user-agent "$USER_AGENT" --retry 3 --retry-delay 5 \
-        --max-time 120 -o "$2" "$1"
+        --max-time "$MAX_TIME_SECONDS" \
+        --retry-max-time "${3:-$RETRY_MAX_SECONDS}" -o "$2" "$1"
 }
 
 # Set per crate by verify_crate, read by the two probes below.
@@ -226,8 +239,10 @@ probe_api() {
     [ -s "$workdir/api-version" ]
 }
 
-# wait_for <deadline epoch> <probe>: run the probe until it succeeds or the
-# deadline passes. No sleep reaches past the deadline.
+# wait_for <deadline epoch> <probe>: one attempt, then another after a nap for
+# as long as the deadline allows. The deadline is tested before every probe past
+# the first and again after every nap, so no probe STARTS past it and no sleep
+# reaches past it; a probe already running is bounded by its own request caps.
 wait_for() {
     local deadline=$1 probe=$2 now remaining nap
     while :; do
@@ -240,6 +255,8 @@ wait_for() {
         nap=$POLL_SECONDS
         [ "$nap" -lt "$remaining" ] || nap=$remaining
         sleep "$nap"
+        now=$(date +%s)
+        [ "$now" -lt "$deadline" ] || return 1
     done
 }
 
@@ -251,9 +268,11 @@ docs_status() {
     printf '%s' "$code"
 }
 
-# readme_targets <readme>: the target of every relative markdown link, one per
-# line. Absolute schemes, root-relative paths and bare anchors are dropped; an
-# `#anchor` and a quoted title after the target are cut.
+# readme_targets <readme>: the relative target of every INLINE `](...)` markdown
+# link or image, one per line. Absolute schemes, root-relative paths and bare
+# anchors are dropped; an `#anchor` and a quoted title after the target are cut.
+# Reference-style definitions, autolinks and HTML `href` attributes carry no
+# `](` and are not read.
 readme_targets() {
     grep -oE '\]\([^)]+\)' "$1" |
         sed -e 's/^](//' -e 's/)$//' -e 's/[[:space:]].*$//' -e 's/#.*$//' |
@@ -273,7 +292,7 @@ verify_crate() {
     local name=$1
     local lower crate_dir archive entry meta deadline root prefix
     local index_cksum api_checksum api_size api_license
-    local got_digest got_size listing rel base
+    local got_digest got_size listing rel base remaining
     local declared want_text missing targets target tag want_sha got_sha code
     local bad_path bad_agent bad_test
 
@@ -307,7 +326,13 @@ verify_crate() {
     api_size=$(printf '%s' "$meta" | jq -r '.crate_size // ""')
     api_license=$(printf '%s' "$meta" | jq -r '.license // ""')
 
-    if ! fetch "$API_URL/$name/$version/download" "$archive"; then
+    # The download sits inside the same budget: its retry chain gets whatever
+    # the budget has left, capped at RETRY_MAX_SECONDS and floored at 1 because
+    # curl reads `--retry-max-time 0` as no limit at all.
+    remaining=$((deadline - $(date +%s)))
+    [ "$remaining" -lt "$RETRY_MAX_SECONDS" ] || remaining=$RETRY_MAX_SECONDS
+    [ "$remaining" -ge 1 ] || remaining=1
+    if ! fetch "$API_URL/$name/$version/download" "$archive" "$remaining"; then
         report FAIL "$name" download "the archive did not download"
         return 0
     fi
@@ -350,8 +375,11 @@ verify_crate() {
                 ;;
         esac
         rel=${rel#"$prefix"}
+        # Both shapes a `..` segment takes: between two others and at the end
+        # of the member name. A directory entry carries a trailing slash, so
+        # `*/../*` already covers `sub/../`, and `*/..` covers the file entry.
         case "/$rel" in
-            */../*) [ -n "$bad_path" ] || bad_path="$prefix$rel" ;;
+            */../* | */..) [ -n "$bad_path" ] || bad_path="$prefix$rel" ;;
         esac
         # The directory entries carry no content; the checks below name the file
         # that ships rather than the directory it sits in.

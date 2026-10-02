@@ -4,8 +4,9 @@
 # Offline. `cargo`, `curl`, `git` and `sleep` are PATH shims: the fake cargo
 # answers `metadata` with a fixed workspace, the fake curl serves a fixture
 # registry out of a directory tree (sparse-index entries, version metadata, the
-# `.crate` archives and a docs.rs status), the fake git answers the one tag
-# lookup, and the fake sleep records its argument instead of sleeping. jq, tar,
+# `.crate` archives and a docs.rs status), the fake git answers `rev-parse` for
+# exactly the ref the provenance check must ask for and records every ref it was
+# asked, and the fake sleep records its argument instead of sleeping. jq, tar,
 # date and the sha256 tool are real, so the digest and size arms compare numbers
 # this file did not write by hand.
 #
@@ -38,8 +39,17 @@ WRONG_DIGEST=00000000000000000000000000000000000000000000000000000000000000bb
 # Assembled from two fragments so this file does not carry the shape the gate
 # refuses, the spelling tools/scripts/check_public_surface.py:27-29 uses.
 TRACKER=$(printf '%s%s' C 'ER-4242')
+# The one ref the provenance check may ask git for. The shim answers this
+# spelling and refuses every other, and one arm asserts what it recorded, so a
+# ref the tag cannot resolve reds instead of reading as an untagged checkout.
+WANT_TAG_REF="refs/tags/v$VERSION^{commit}"
+# The wait budget every arm gets unless it names its own. The `sleep` shim
+# records instead of sleeping, so a fixture that stops answering is bounded by
+# this budget's WALL CLOCK alone and the script's own 900 s default would spin
+# for a quarter of an hour inside the `Lint` job.
+DEFAULT_WAIT_SECONDS=30
 # The arms below; the floor is this count, so a run that stops early reds.
-CASE_FLOOR=37
+CASE_FLOOR=44
 
 cases=0
 case_name=
@@ -104,6 +114,7 @@ while [ "$#" -gt 0 ]; do
         -o) out=$2; shift 2 ;;
         -w) write_out=1; shift 2 ;;
         --user-agent | --max-time | --retry | --retry-delay) shift 2 ;;
+        --retry-max-time) shift 2 ;;
         http://* | https://*) url=$1; shift ;;
         *) shift ;;
     esac
@@ -153,15 +164,38 @@ if [ "$write_out" -eq 1 ]; then printf '200'; fi
 exit 0
 SHIM
 
-# The one git call is the tag lookup: a non-empty fixture is the tagged commit,
-# an empty one is a checkout with no such tag.
+# The one git call is the provenance tag lookup. The shim walks past the
+# `-C <dir>` prefix the script passes, answers `rev-parse` and nothing else,
+# records every ref it was asked in FAKE_GIT_REFS, and exits 128 -- the status
+# git gives a call it will not serve -- for a subcommand or a ref it was not
+# built for. A non-empty FAKE_TAG_SHA is the tagged commit, an empty one is a
+# checkout with no such tag.
 cat >"$shim_bin/git" <<'SHIM'
 #!/bin/sh
-if [ -s "${FAKE_TAG_SHA:-}" ]; then
-    cat "$FAKE_TAG_SHA"
-    exit 0
+while [ "$1" = -C ]; do
+    [ "$#" -ge 2 ] || break
+    shift 2
+done
+if [ "${1:-}" != rev-parse ]; then
+    printf 'fake git: not a rev-parse call: %s\n' "$*" >&2
+    exit 128
 fi
-exit 1
+shift
+ref=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        -q | --verify) ;;
+        *) ref=$1 ;;
+    esac
+    shift
+done
+printf '%s\n' "$ref" >> "$FAKE_GIT_REFS"
+if [ "$ref" != "$FAKE_GIT_REF" ]; then
+    printf 'fake git: not the ref this shim serves: %s\n' "$ref" >&2
+    exit 128
+fi
+[ -s "${FAKE_TAG_SHA:-}" ] || exit 1
+cat "$FAKE_TAG_SHA"
 SHIM
 
 cat >"$shim_bin/sleep" <<'SHIM'
@@ -251,6 +285,23 @@ repack() {
     refresh_www "$dir" "$name"
 }
 
+# tar_renaming <archive> <member> <stored name> <top dir>: tar <top dir> from the
+# current directory with one member stored under another name. GNU tar spells the
+# rename `--transform` and BSD tar spells it `-s`; the bytes that land in the
+# archive are the same. The member name is matched whole, with its dots escaped.
+tar_renaming() {
+    local out=$1 from=$2 to=$3 top=$4 pattern banner
+    pattern=$(printf '%s' "$from" | sed 's/\./\\./g')
+    # Read the banner into a variable and match it with `case`. A pipeline into
+    # `grep -q` would race: grep exits on the match, the writer takes SIGPIPE,
+    # and `pipefail` turns that into a false "not GNU tar".
+    banner=$(tar --version 2>/dev/null) || banner=
+    case $banner in
+        *'GNU tar'*) tar -czf "$out" --transform="s|^$pattern\$|$to|" "$top" ;;
+        *) tar -czf "$out" -s "|^$pattern\$|$to|" "$top" ;;
+    esac
+}
+
 template="$workdir/template"
 mkdir -p "$template/src" "$template/www/index" "$template/www/api"
 printf '200' >"$template/www/docs_status"
@@ -304,10 +355,15 @@ new_case() {
     printf '%s\n' "$TAG_SHA" >"$case_dir/tag_sha"
     : >"$case_dir/urls"
     : >"$case_dir/sleeps"
+    : >"$case_dir/git_refs"
     output=
     status=0
 }
 
+# run_script [args...]: the script under test, in the case directory, over the
+# fixture registry. The default wait budget goes FIRST, so an arm that measures
+# the wait path passes its own `--wait-seconds` after it and the parser keeps the
+# later value.
 run_script() {
     set +e
     output=$(
@@ -318,7 +374,10 @@ run_script() {
                 FAKE_URLS="$case_dir/urls" \
                 FAKE_SLEEPS="$case_dir/sleeps" \
                 FAKE_TAG_SHA="$case_dir/tag_sha" \
-                "$script_dir/verify_published.sh" "$@" 2>&1
+                FAKE_GIT_REF="$WANT_TAG_REF" \
+                FAKE_GIT_REFS="$case_dir/git_refs" \
+                "$script_dir/verify_published.sh" \
+                --wait-seconds "$DEFAULT_WAIT_SECONDS" "$@" 2>&1
     )
     status=$?
     set -e
@@ -400,6 +459,33 @@ expect_status 0
 expect_output 'WARN demo_link 1.2.3 docs: the crate page answered 404'
 expect_output '0 FAIL'
 passed 'a docs 404 warns and does not fail'
+
+# ---------------------------------------------------------------------------
+# A registry surface that answers nothing
+# ---------------------------------------------------------------------------
+# The index carries the version and the version metadata does not. A spent
+# budget reaches one probe of each, so this is the metadata check failing rather
+# than the index one.
+new_case metadata_silent
+rm -f "$case_dir/www/api/demo_core.json"
+run_script "$VERSION" --wait-seconds 0
+expect_status 1
+expect_output 'PASS demo_core 1.2.3 index: the sparse index carries this version'
+expect_output 'FAIL demo_core 1.2.3 metadata: the version metadata did not answer within 0s'
+expect_absent 'demo_core 1.2.3 digest'
+expect_output '15 PASS, 1 WARN, 1 FAIL'
+passed 'version metadata that answers nothing fails that crate'
+
+# Both surfaces answer and the archive host serves no bytes.
+new_case archive_missing
+rm -f "$case_dir/www/demo_core.crate"
+run_script "$VERSION"
+expect_status 1
+expect_output 'PASS demo_core 1.2.3 metadata: the version metadata answers'
+expect_output 'FAIL demo_core 1.2.3 download: the archive did not download'
+expect_absent 'demo_core 1.2.3 digest'
+expect_output '16 PASS, 1 WARN, 1 FAIL'
+passed 'an archive the registry does not serve fails that crate'
 
 # ---------------------------------------------------------------------------
 # The digest, in both directions
@@ -544,9 +630,55 @@ expect_output 'WARN demo_core 1.2.3 provenance: this checkout carries no v1.2.3,
 expect_output '26 PASS, 4 WARN, 0 FAIL'
 passed 'a checkout without the tag warns instead of failing'
 
+# The ref the provenance check asks for, read off what the shim recorded. The
+# shim serves that one spelling and exits 128 for any other, so a ref the tag
+# cannot resolve reaches this assert instead of reading as an untagged checkout.
+new_case provenance_ref
+run_script "$VERSION" --skip-docs
+expect_status 0
+expect_output "PASS demo_core 1.2.3 provenance: packaged at $TAG_SHA, the commit v1.2.3 points at"
+[ "$(cat "$case_dir/git_refs")" = "$WANT_TAG_REF
+$WANT_TAG_REF" ] ||
+    fail "provenance_ref: git was asked for $(cat "$case_dir/git_refs"), expected '$WANT_TAG_REF' once per crate"
+passed 'the provenance check asks git for the tag commit ref and nothing else'
+
 # ---------------------------------------------------------------------------
-# A member outside the archive prefix stops that crate before extraction
+# An archive the reader cannot open, and the member shapes it refuses
 # ---------------------------------------------------------------------------
+# Half an archive. Both registry surfaces agree with the bytes served, so the
+# digest and the size pass and the listing is the first check that can see it.
+new_case truncated_archive
+head -c 64 "$template/www/demo_core.crate" >"$case_dir/truncated"
+mv "$case_dir/truncated" "$case_dir/www/demo_core.crate"
+refresh_www "$case_dir" demo_core
+run_script "$VERSION"
+expect_status 1
+expect_output 'PASS demo_core 1.2.3 size:'
+expect_output 'FAIL demo_core 1.2.3 paths: the archive is not a readable gzip tar'
+expect_absent 'demo_core 1.2.3 extract'
+expect_output '19 PASS, 1 WARN, 1 FAIL'
+passed 'an archive that is not a readable gzip tar fails before extraction'
+
+# A `..` segment at the END of a member name. Directory entries carry a trailing
+# slash, so the only member that can take this shape is a file stored under it.
+new_case dotdot_member
+(cd "$case_dir/src" &&
+    tar_renaming "$case_dir/www/demo_core.crate" \
+        "demo_core-$VERSION/src/lib.rs" "demo_core-$VERSION/src/.." \
+        "demo_core-$VERSION")
+refresh_www "$case_dir" demo_core
+# The fixture must carry the shape it tests: a tar that normalized the name away
+# would leave this arm passing over an archive with nothing wrong in it.
+tar -tzf "$case_dir/www/demo_core.crate" 2>/dev/null |
+    grep -Fqx "demo_core-$VERSION/src/.." ||
+    fail 'dotdot_member: the fixture archive carries no member ending in a parent segment'
+run_script "$VERSION"
+expect_status 1
+expect_output "FAIL demo_core 1.2.3 paths: 'demo_core-1.2.3/src/..' is not a plain member of demo_core-1.2.3/"
+expect_absent 'demo_core 1.2.3 extract'
+expect_output '19 PASS, 1 WARN, 1 FAIL'
+passed 'a member name ending in a parent-directory segment fails'
+
 new_case path_escape
 mkdir -p "$case_dir/src/stray"
 printf 'loose\n' >"$case_dir/src/stray/loose.txt"
@@ -661,6 +793,19 @@ run_script "$VERSION" --crate ''
 expect_status 2
 expect_output '--crate needs a crate name'
 passed 'a flag with an empty value is refused'
+
+new_case missing_index_url_value
+run_script "$VERSION" --index-url
+expect_status 2
+expect_output '--index-url needs a url'
+expect_output 'usage: verify_published.sh <version>'
+passed '--index-url with no value is refused'
+
+new_case missing_wait_seconds_value
+run_script "$VERSION" --wait-seconds
+expect_status 2
+expect_output '--wait-seconds needs a count'
+passed '--wait-seconds with no value is refused'
 
 new_case bad_wait_seconds
 run_script "$VERSION" --wait-seconds soon
