@@ -577,6 +577,88 @@ fn doorbell_data_graph_builds_registry_and_flows_data() {
     );
 }
 
+/// The MIXED shape, and the one a declared split actually produces: a rank that
+/// holds `ticker` and a consumer of its output, plus a second consumer whose
+/// trigger has no producer here. The locally written topic is declared FIRST, so
+/// only the ordering can put the writable one in the armed slot.
+///
+/// `multi` lists resolved topics for the graph's `multi_publisher_topics:`
+/// opt-in, which is what makes a topic this runtime also publishes writable from
+/// outside it.
+fn mixed_rank_graph(
+    observed: Arc<Mutex<Vec<f64>>>,
+    fires: Arc<AtomicU64>,
+    multi: Vec<String>,
+) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: multi,
+        name: None,
+        identity: "mwp_mixed".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![
+            NodeDef {
+                fuse: None,
+                ros2: None,
+                id: "ticker".to_string(),
+                node_type: "ticker".to_string(),
+                inputs: vec![],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "geometry_msgs/Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            },
+            NodeDef {
+                fuse: None,
+                ros2: None,
+                id: "local_consumer".to_string(),
+                node_type: "consumer".to_string(),
+                inputs: vec![InputDef {
+                    name: "inp".to_string(),
+                    source: "ticker/out".to_string(),
+                }],
+                outputs: vec![],
+            },
+            NodeDef {
+                fuse: None,
+                ros2: None,
+                id: "ext_consumer".to_string(),
+                node_type: "consumer".to_string(),
+                inputs: vec![InputDef {
+                    name: "inp".to_string(),
+                    source: EXT_TOPIC.to_string(),
+                }],
+                outputs: vec![],
+            },
+        ],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "ticker".to_string(),
+        Box::new(TickerEntry::with_state(Ticker {
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    for id in ["local_consumer", "ext_consumer"] {
+        factories.insert(
+            id.to_string(),
+            Box::new(ConsumerEntry::with_state(Consumer {
+                observed: Arc::clone(&observed),
+                fires: Arc::clone(&fires),
+                ..Default::default()
+            })),
+        );
+    }
+    (config, factories)
+}
+
 /// A graph whose every data-trigger topic is produced by a node THIS runtime
 /// owns must resolve no primary line and no data wake.
 ///
@@ -605,6 +687,16 @@ fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
         None,
         "every trigger topic of this graph is produced by a node this runtime \
          owns, so no peer can ring one and the park must arm none"
+    );
+    // A declined arm and a registry that never opened both leave the armed topic
+    // at `None`, so the registry is asserted present and holding exactly the
+    // declared trigger topic: without this the arm would pass on a graph with no
+    // doorbell at all.
+    assert_eq!(
+        runtime.doorbell_topics_for_test().as_deref(),
+        Some(&["/mwp/ticker/out".to_string()][..]),
+        "the registry must have opened over the one declared trigger topic, so \
+         the absent armed line is a decision and not a missing page"
     );
     assert!(
         !runtime.data_wake_rung_for_test(),
@@ -637,7 +729,7 @@ fn a_trigger_with_no_in_graph_producer_resolves_a_primary_and_arms_the_rung() {
     )
     .expect("build the external-producer consumer graph");
     assert_eq!(
-        runtime.doorbell_primary_topic_for_test().as_deref(),
+        runtime.doorbell_primary_topic_for_test(),
         Some(EXT_TOPIC),
         "the trigger topic has no producer in this runtime, so it is exactly the \
          line a peer rings and the park must arm it"
@@ -656,6 +748,123 @@ fn a_trigger_with_no_in_graph_producer_resolves_a_primary_and_arms_the_rung() {
              line is ringable, and no sibling term may arm it"
         );
     }
+    runtime.shutdown();
+}
+
+/// The armed slot is decided by DECLARED order among the writable topics, not by
+/// which topic was declared first overall.
+///
+/// This rank writes `/mwp/ticker/out` itself and declares a consumer of it
+/// BEFORE the consumer of `/mwp/ext`, which nothing here writes. The armed line
+/// must be `/mwp/ext`, and both topics must stay in the registry so the
+/// poll-all scan still reads the local one's rings.
+#[test]
+#[serial]
+fn the_armed_line_is_the_writable_topic_even_when_a_local_one_is_declared_first() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = mixed_rank_graph(Arc::clone(&observed), Arc::clone(&fires), vec![]);
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("mixedprim")),
+    )
+    .expect("build the mixed rank graph");
+    assert_eq!(
+        runtime.doorbell_primary_topic_for_test(),
+        Some(EXT_TOPIC),
+        "the writable topic takes the armed slot although the locally written \
+         one is declared first"
+    );
+    let topics = runtime
+        .doorbell_topics_for_test()
+        .expect("the registry opened");
+    assert!(
+        topics.contains(&"/mwp/ticker/out".to_string()),
+        "the locally written topic stays in the registry for the poll-all scan - \
+         got {topics:?}"
+    );
+    runtime.shutdown();
+}
+
+/// A topic this runtime publishes is writable from outside it when the graph
+/// opts it into `multi_publisher_topics:`, because the opt-in is what admits
+/// publishers the graph does not own.
+///
+/// Same graph as the arm above with `/mwp/ticker/out` listed, and the consumer
+/// of it declared first, so the listing alone decides the armed line.
+#[test]
+#[serial]
+fn a_multi_publisher_topic_this_runtime_also_writes_is_armable() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = mixed_rank_graph(
+        Arc::clone(&observed),
+        Arc::clone(&fires),
+        vec!["/mwp/ticker/out".to_string()],
+    );
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("multiprim")),
+    )
+    .expect("build the multi-publisher rank graph");
+    assert_eq!(
+        runtime.doorbell_primary_topic_for_test(),
+        Some("/mwp/ticker/out"),
+        "the opt-in admits writers this graph does not own, so the topic it \
+         publishes is armable and, declared first, takes the armed slot"
+    );
+    runtime.shutdown();
+}
+
+/// The park must take NO kernel block on a graph whose declared trigger topics
+/// are all written only by its own nodes: the block is the behaviour, and the
+/// resolved decision above is only its input.
+///
+/// The counter this reads is the same one
+/// `doorbell_ring_during_park_is_attributed_to_doorbell_counter` asserts moves
+/// when a peer rings, and this graph carries no barrier participant and no
+/// credit edge, so the shared counter is attributable to the doorbell rung
+/// alone. Judged in BOTH directions against the host fact, so a host without the
+/// Apple os_sync family is a judged arm rather than a skipped one.
+#[test]
+#[serial]
+fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = in_process_chain_graph(Arc::clone(&observed), Arc::clone(&fires));
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("chainblock")),
+    )
+    .expect("build the in-process chain graph");
+    for _ in 0..4 {
+        runtime.run_live_step_once_for_test(PERIOD_PARK_TIMEOUT);
+    }
+    assert!(
+        runtime.park_entry_count_for_test() > 0,
+        "the parked live drive must route its idle through the park, or the \
+         counter below is zero for the wrong reason"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        runtime.park_wake_word_block_count_for_test(),
+        0,
+        "no declared topic of this graph is writable from outside it, so the \
+         doorbell rung must take no kernel block; no sibling rung exists here to \
+         bump the shared counter"
+    );
     runtime.shutdown();
 }
 

@@ -1597,13 +1597,20 @@ impl DoorbellRegistry {
             .any(|(i, db)| baseline.get(i).is_none_or(|&b| db.seq() != b))
     }
 
-    /// The first-declared topic's doorbell line — the single line the hardware
-    /// monitor (`UMONITOR`/`WFE`) is armed on. `None` when the registry is empty.
+    /// The FIRST topic as handed to [`open`](Self::open), and its doorbell line:
+    /// the single line the hardware monitor (`UMONITOR`/`WFE`) is armed on.
+    /// `None` when the registry is empty.
+    ///
+    /// The registry preserves the order it is given and knows nothing about who
+    /// publishes a topic; the graph runtime hands it an order whose first entry
+    /// is a topic a publisher outside that process can write
+    /// (`graph::runtime::rung_topics`), so "first" here is not "first declared in
+    /// the graph file".
     pub fn primary_addr(&self) -> Option<*const AtomicU64> {
         self.doorbells.first().map(Doorbell::addr)
     }
 
-    /// The first-declared topic's DOORBELL: the handle whose wake word the
+    /// The FIRST topic as handed to [`open`](Self::open) and its DOORBELL: the handle whose wake word the
     /// macOS data-wake park blocks on (the same line
     /// [`primary_addr`](Self::primary_addr) hands the hardware monitor). `None`
     /// when the registry is empty.
@@ -1616,7 +1623,7 @@ impl DoorbellRegistry {
         self.doorbells.first()
     }
 
-    /// The first-declared topic NAME — the one hardware-armed on
+    /// The FIRST topic NAME as handed to [`open`](Self::open), the one hardware-armed on
     /// [`primary_addr`](Self::primary_addr). Surfaced in the `run_live` wait-policy
     /// telemetry line so a worker's chosen doorbell primary is observable (the
     /// CLI monolith arm never runs in a worker). `None` when the registry is empty.
