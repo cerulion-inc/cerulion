@@ -704,6 +704,9 @@ jobs:
       - name: Crates.io publish retry self-test
         run: ./tools/scripts/test_publish_crates.sh
 
+      - name: Advisory issue bookkeeping self-test
+        run: ./tools/scripts/test_advisory_issue.sh
+
       # NO ADDED LINE CARRIES A TYPOGRAPHIC DASH. Diff-scoped, not tree-wide:
       # the cut tree carries an em or en dash in over a thousand files, almost
       # all of it in comments, so a tree scan would red `main` and say nothing
