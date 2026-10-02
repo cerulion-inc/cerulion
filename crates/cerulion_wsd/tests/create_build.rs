@@ -321,6 +321,33 @@ async fn node_create_applies_the_cli_defaulting_and_refusals() {
     assert_eq!(error_code(&zero_period), "invalid_request", "{zero_period}");
     assert!(!fixture.root.join("nodes/spin").exists());
 
+    // node.modify holds the same line: a zero duration is refused and the
+    // node's policy is as it was.
+    for (offset, policy) in [
+        json!({"kind": "period", "period_ms": 0}),
+        json!({"kind": "sync", "window_ms": 0}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let zero = call(
+            &fixture.socket,
+            json!({"id": 20 + offset, "verb": "node.modify", "root": root,
+                   "node_type": "sink", "op": {"op": "set_policy", "policy": policy}}),
+        )
+        .await;
+        assert_eq!(error_code(&zero), "invalid_request", "{zero}");
+    }
+    let after = call(
+        &fixture.socket,
+        json!({"id": 22, "verb": "node.info", "root": root, "node_type": "sink"}),
+    )
+    .await;
+    assert_eq!(
+        after["result"]["policy"],
+        json!({"kind": "data_trigger", "input_name": "scan"})
+    );
+
     let duplicate = call(
         &fixture.socket,
         json!({"id": 5, "verb": "node.create", "root": root, "spec": {
@@ -384,8 +411,9 @@ async fn schema_create_returns_the_version_and_the_schema_is_listed() {
     .await;
     assert_eq!(error_code(&escaping), "bad_request", "{escaping}");
     assert!(!fixture.root.join("escape.yaml").exists());
-    // A name that is not an identifier would write a YAML key that cannot be read.
-    for (offset, name) in ["foo: bar", "foo\nbar", "1scan", "", "scan-2"]
+    // A name with a colon, a newline or no characters would write a YAML key
+    // that cannot be read.
+    for (offset, name) in ["foo: bar", "foo\nbar", "", "a b", "scan#1"]
         .into_iter()
         .enumerate()
     {
@@ -396,6 +424,24 @@ async fn schema_create_returns_the_version_and_the_schema_is_listed() {
         )
         .await;
         assert_eq!(error_code(&refused), "bad_request", "{name:?}: {refused}");
+    }
+    // Names the CLI takes are taken here too.
+    for (offset, name) in ["1scan", "scan-2"].into_iter().enumerate() {
+        let created = call(
+            &fixture.socket,
+            json!({"id": 30 + offset, "verb": "schema.create", "root": root,
+                   "spec": {"name": name}}),
+        )
+        .await;
+        assert!(
+            created["result"]["version"].is_string(),
+            "{name:?}: {created}"
+        );
+        assert!(fixture
+            .root
+            .join("schemas")
+            .join(format!("{name}.yaml"))
+            .exists());
     }
     fixture.stop().await;
 }

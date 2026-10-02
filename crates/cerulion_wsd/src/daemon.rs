@@ -390,14 +390,33 @@ async fn handle_connection(
             tokio::select! {
                 encoded = produced.recv() => match encoded {
                     Some(encoded) => {
-                        if !client_gone
-                            && writer
-                                .write_all(format!("{encoded}\n").as_bytes())
-                                .await
-                                .is_err()
-                        {
-                            client_gone = true;
-                            cancelled.store(true, Ordering::Release);
+                        if client_gone {
+                            continue;
+                        }
+                        // The write can block on a client that is not reading,
+                        // so the hangup watch runs beside it: a half-close
+                        // cannot leave the build running behind a full socket.
+                        let line = format!("{encoded}\n");
+                        let write = writer.write_all(line.as_bytes());
+                        tokio::pin!(write);
+                        loop {
+                            tokio::select! {
+                                written = &mut write => {
+                                    if written.is_err() {
+                                        client_gone = true;
+                                        cancelled.store(true, Ordering::Release);
+                                    }
+                                    break;
+                                }
+                                gone = watch_for_hangup(&mut reader, &mut pending), if watching_for_eof => {
+                                    if gone {
+                                        watching_for_eof = false;
+                                        client_gone = true;
+                                        cancelled.store(true, Ordering::Release);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     None => break,
@@ -408,24 +427,13 @@ async fn handle_connection(
                 // keeps answering a client that has closed its write side.
                 // Bytes (a pipelined next request) are set aside, not lost,
                 // and watching goes on behind them.
-                ready = reader.fill_buf(), if watching_for_eof => match ready {
-                    Ok(bytes) if !bytes.is_empty() => {
-                        let taken = bytes.len();
-                        if queue_overflows(&pending, bytes) {
-                            watching_for_eof = false;
-                            client_gone = true;
-                            cancelled.store(true, Ordering::Release);
-                        } else {
-                            pending.extend_from_slice(bytes);
-                            reader.consume(taken);
-                        }
-                    }
-                    _ => {
+                gone = watch_for_hangup(&mut reader, &mut pending), if watching_for_eof => {
+                    if gone {
                         watching_for_eof = false;
                         client_gone = true;
                         cancelled.store(true, Ordering::Release);
                     }
-                },
+                }
             }
         }
         if let Err(error) = handler.await {
@@ -477,6 +485,28 @@ fn queue_overflows(pending: &[u8], incoming: &[u8]) -> bool {
     false
 }
 
+/// One step of watching a connection during a `node.build`: wait for the
+/// client's next bytes and set them aside in `pending`. Returns true when the
+/// client has hung up, or has queued more than the limits allow, so the build
+/// is to be cancelled; false when bytes were taken and watching goes on.
+async fn watch_for_hangup<R>(reader: &mut R, pending: &mut Vec<u8>) -> bool
+where
+    R: AsyncBufRead + Unpin,
+{
+    match reader.fill_buf().await {
+        Ok(bytes) if !bytes.is_empty() => {
+            if queue_overflows(pending, bytes) {
+                return true;
+            }
+            let taken = bytes.len();
+            pending.extend_from_slice(bytes);
+            reader.consume(taken);
+            false
+        }
+        _ => true,
+    }
+}
+
 /// Read one request line. `pending` holds bytes already taken off the socket
 /// but not yet consumed as a request (a client that pipelined a request behind
 /// a `node.build`), and keeps whatever follows the returned line.
@@ -514,9 +544,13 @@ where
                     .map_err(invalid)
             };
         }
-        pending.extend_from_slice(buffer);
-        let consumed = buffer.len();
-        reader.consume(consumed);
+        // Take only what keeps the unfinished line inside the limit (plus the
+        // one byte that shows it is too long), so an over-long line without a
+        // newline is refused after a bounded read, not a whole reader chunk.
+        let room = (MAX_REQUEST_LINE_BYTES + 1).saturating_sub(pending.len());
+        let take = buffer.len().min(room.max(1));
+        pending.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
     }
 }
 
@@ -559,6 +593,19 @@ mod tests {
         // Nor is the total unbounded.
         let full = vec![b'\n'; MAX_QUEUED_BYTES];
         assert!(queue_overflows(&full, b"\n"));
+    }
+
+    #[tokio::test]
+    async fn an_over_long_line_without_a_newline_is_refused_after_a_bounded_read() {
+        let input = vec![b'x'; 3 * MAX_REQUEST_LINE_BYTES];
+        // A reader chunk far larger than the limit.
+        let mut reader = BufReader::with_capacity(2 * MAX_REQUEST_LINE_BYTES, &input[..]);
+        let mut pending = Vec::new();
+        let error = read_bounded_line(&mut reader, &mut pending)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(pending.len(), MAX_REQUEST_LINE_BYTES + 1);
     }
 
     #[tokio::test]

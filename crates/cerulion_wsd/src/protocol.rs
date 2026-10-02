@@ -663,14 +663,15 @@ fn request_node_type(request: &Request) -> Option<&str> {
     }
 }
 
-/// A schema name is written into the new file as a YAML key, so it is an ASCII
-/// identifier: a letter first, then letters, digits and underscores.
+/// A schema name is the file stem and, PascalCased, the YAML key of the new
+/// file. It takes what `cerulion schema create` takes in practice: ASCII
+/// letters, digits, `_` and `-`, in any order. Anything else (a colon, a
+/// newline, a path separator) would write a key that cannot be read back.
 fn is_schema_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn is_safe_component(value: &str) -> bool {
@@ -835,6 +836,9 @@ fn node_modify(
         .join("src")
         .join("lib.rs");
     check_expected_version(&path, expect_version)?;
+    if let ModifyOperation::SetPolicy { policy } = &operation {
+        check_positive_durations(Some(policy))?;
+    }
     match operation {
         ModifyOperation::AddPort {
             port_name,
@@ -891,6 +895,23 @@ fn schema_create(workspace: &CerulionWorkspace, name: &str) -> Result<Value, Ope
     Ok(json!({"version": version}))
 }
 
+/// The CLI's `--policy` parser refuses a zero duration (it would spin-loop the
+/// scheduler); the wire form must not be a way around that, on `node.create`
+/// or `node.modify`.
+fn check_positive_durations(policy: Option<&PolicyRequest>) -> Result<(), OperationError> {
+    match policy {
+        Some(PolicyRequest::Period { period_ms: 0 }) => Err(engine_failure(CliError::Validation(
+            "`period_ms` must be > 0 (a zero-duration period would spin-loop the scheduler)"
+                .to_string(),
+        ))),
+        Some(PolicyRequest::Sync { window_ms: 0 }) => Err(engine_failure(CliError::Validation(
+            "`window_ms` must be > 0 (a zero-duration window would spin-loop the scheduler)"
+                .to_string(),
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// `cerulion node create` with its flags as data. The policy defaulting and
 /// the refusals are the engine's (`resolve_create_policy`,
 /// `node_create_with_options`), the same functions the CLI calls.
@@ -898,23 +919,7 @@ fn node_create(
     workspace: &CerulionWorkspace,
     spec: NodeCreateSpec,
 ) -> Result<Value, OperationError> {
-    // The CLI's `--policy` parser refuses a zero duration (it would spin-loop
-    // the scheduler); the wire form must not be a way around that.
-    match &spec.policy {
-        Some(PolicyRequest::Period { period_ms: 0 }) => {
-            return Err(engine_failure(CliError::Validation(
-                "`period_ms` must be > 0 (a zero-duration period would spin-loop the scheduler)"
-                    .to_string(),
-            )))
-        }
-        Some(PolicyRequest::Sync { window_ms: 0 }) => {
-            return Err(engine_failure(CliError::Validation(
-                "`window_ms` must be > 0 (a zero-duration window would spin-loop the scheduler)"
-                    .to_string(),
-            )))
-        }
-        _ => {}
-    }
+    check_positive_durations(spec.policy.as_ref())?;
     let pair = |port: PortSpec| (port.schema, port.name);
     let trigger_input = spec.trigger_input.map(pair);
     let regular_inputs: Vec<(String, String)> = spec.inputs.into_iter().map(pair).collect();
@@ -1438,6 +1443,15 @@ mod tests {
         assert_eq!(lines[0]["id"], 4);
         assert_eq!(lines[0]["ok"], false);
         assert_eq!(lines[0]["error"]["code"], "workspace_not_found");
+    }
+
+    #[test]
+    fn the_stand_in_for_an_over_long_cargo_line_reaches_the_client_as_a_diagnostic() {
+        let event = compiler_message_event(3, node_cmd::DROPPED_MESSAGE_LINE).unwrap();
+        assert_eq!(event["event"], "diagnostic");
+        assert_eq!(event["level"], "warning");
+        assert!(event["message"].as_str().unwrap().contains("1 MiB"));
+        assert_eq!(event["file"], Value::Null);
     }
 
     #[test]

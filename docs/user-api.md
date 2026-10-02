@@ -2684,7 +2684,7 @@ did not change the protocol version: a daemon that lacks one answers
 |---|---|
 | `{"id":1,"verb":"graph.create","root":R,"name":"main","prefix":"bot"}` | `{"version":"<sha256>"}` of the new `graphs/main.yaml`. `prefix` is optional, as `graph create -n`. |
 | `{"id":1,"verb":"node.create","root":R,"spec":{"node_type":"camera","outputs":[{"schema":"sensor_msgs::Image","name":"image"}],"policy":{"kind":"period","period_ms":50}}}` | `{"version":"<sha256>"}` of the new `nodes/camera/src/lib.rs`. `spec` takes the flags of `node create` as data: `inputs` (`-i`), `trigger_input` (`-T`), `outputs` (`-o`), `policy` (`--policy`, the `kind` vocabulary of `node.info`) and `raw_ffi`; every field but `node_type` is optional. The CLI's own defaulting and refusals apply, so a node with no input and no `policy` is `invalid_request`. |
-| `{"id":1,"verb":"schema.create","root":R,"spec":{"name":"lidar_scan"}}` | `{"version":"<sha256>"}` of the new `schemas/lidar_scan.yaml`. The name is an identifier (a letter, then letters, digits and underscores); any other is `bad_request`. |
+| `{"id":1,"verb":"schema.create","root":R,"spec":{"name":"lidar_scan"}}` | `{"version":"<sha256>"}` of the new `schemas/lidar_scan.yaml`. The name takes ASCII letters, digits, `_` and `-`; any other is `bad_request`. |
 | `{"id":1,"verb":"node.build","root":R,"node_type":"camera","release":false}` | A stream, below. `release` is optional. |
 
 Every request carries a numeric `id`, which the reply echoes. Creating a graph,
@@ -2706,6 +2706,8 @@ the message. The "aborting due to" and "N warnings emitted" summaries are not
 sent. Cargo output that is not a compiler message (a resolver error, a missing
 toolchain) arrives as one `error` diagnostic with `null` positions, and a
 node's optional-system-dependency notice as a `note`, both before `done`.
+A compiler message over 1 MiB is not sent; one `warning` diagnostic with `null`
+positions says it was left out, and `cerulion node build` shows the full text.
 A `node.build` refused before cargo starts (`bad_request`, `workspace_not_found`,
 `not_found` for an unknown node type) is the ordinary one-line error response
 with no `done`, so a client reads lines for its `id` until one has `error` or
