@@ -399,6 +399,12 @@ self_test() {
     # whole-line and fixed-string.
     _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'              '' "x$_bot"
     _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'              '' "$_bot"x
+    # ...and neither is a login the listed one contains. These two are what pin
+    # the WHOLE-LINE property: a substring match reads both out of the listed
+    # login and would accept them, while the two rows above are refused by a
+    # substring match as well, so they pin only the fixed-string property.
+    _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'              '' 'dependabot'
+    _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'              '' 'bot'
     # The bot author grants the bot NAMESPACE and nothing else: an ordinary
     # offender keeps its verdict whoever the author is.
     _expect_branch bad 'zz/wake-set'                                '' "$_bot"

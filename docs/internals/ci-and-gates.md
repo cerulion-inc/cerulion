@@ -187,7 +187,13 @@ script does not check. The script can exempt a head branch that cannot be rename
 branch closes it, so a listed branch is accepted verbatim until it merges (the list is
 empty); the pair is required because a head ref is fork-controlled text
 while the PR number is minted here once, so the same name on any other PR, or with no
-`--pr` at all, still fails.
+`--pr` at all, still fails. The second exemption is the forge's own update namespace: a
+head branch of the shape `dependabot/<ecosystem>/<name>` is accepted when the pull
+request author login is exactly `dependabot[bot]`, which `ci.yml` passes from the event
+payload as `github.event.pull_request.user.login` (set when the pull request opens;
+`github.actor` is whoever pushed the run). The script's author list is matched whole-line
+and fixed-string, so a login containing it or contained by it grants nothing, and the branch
+name is what the exemption covers: the title is still checked.
 
 ## The agent-docs gate
 

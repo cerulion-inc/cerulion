@@ -3,9 +3,12 @@
 # cargo workspace resolves. Each group opens at most one pull request at a time,
 # so a week with twenty upstream releases produces two pull requests.
 #
-# SHA PINS SURVIVE. Every `uses:` in .github/workflows names a 40 character
-# commit with its version in a trailing comment. The updater rewrites the sha
-# and that comment together, so a pinned step stays pinned to a commit.
+# SHA PINS SURVIVE. All 110 `uses:` entries in .github/workflows name a 40
+# character commit. The trailing comment is the version on 88 of them; on the
+# other 22, every one of them
+# `dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master`,
+# it is a branch name. The updater rewrites a sha and its version comment
+# together, so a step pinned to a release stays pinned to a commit.
 #
 # THE TITLE PREFIX IS WHAT LETS THE PULL REQUEST MERGE.
 # tools/scripts/check_pr_title.sh runs in the Lint job and accepts
@@ -41,6 +44,11 @@ updates:
       prefix: build
       include: scope
     labels: ["dependencies"]
+    ignore:
+      # The 22 `dtolnay/rust-toolchain` entries pin a commit of a BRANCH, not of
+      # a release, so a proposal here moves the pin to another commit of that
+      # branch and carries no release name to write in the trailing comment.
+      - dependency-name: dtolnay/rust-toolchain
 
   - package-ecosystem: cargo
     directory: "/"
@@ -58,15 +66,20 @@ updates:
       include: scope
     labels: ["dependencies"]
     ignore:
-      # Families whose every requirement in this workspace is exact (`=`). A
-      # patch reaches the lockfile, which is where an upstream fix arrives; a
-      # major or minor move rewrites the requirement in the manifest, and these
-      # versions are chosen together, so that move is made as its own change.
+      # Three families carried as exact (`=`) requirements, every requirement in
+      # the root workspace manifests: 24 `iceoryx2*` at `=0.9.1`, 7 `re_*` at
+      # `=0.34.1`, 3 `iroh` at `=1.0.2`. An exact requirement names one version,
+      # so a patch move rewrites those pins in the manifests and arrives in the
+      # weekly group. A major or minor move is left out because these versions
+      # are chosen together as one change.
       - dependency-name: "iceoryx2*"
         # =0.9.1
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "re_*"
         # =0.34.1
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: rerun
+        # 0.34, a caret: rerun's own re_* crates resolve against the pins above.
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: iroh
         # =1.0.2

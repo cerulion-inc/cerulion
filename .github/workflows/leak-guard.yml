@@ -191,6 +191,11 @@ jobs:
           AFTER_SHA: ${{ github.event.after }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          # The AUTHOR's login, not `github.actor`: `user.login` is set when the
+          # pull request opens, while `github.actor` is whoever pushed the run,
+          # so a maintainer push to an updater branch would change it. Empty on
+          # the merge queue and on a push, where the key below is never taken.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           # Two scans, and both always run. The COMMIT RANGE and the TITLE keep
           # the full hard set: a commit message and a title are the author's own
@@ -207,8 +212,21 @@ jobs:
           # `set -e` would stop at the first scan, so both are run with their
           # status captured and the results combined: a finding in a commit
           # message must not hide one in the body until the next event.
+          #
+          # `ref-unverified` is escalated by name for every author but one. The
+          # updater's body names one forge link per bumped crate, each link costs
+          # the resolver one anonymous question, and a throttle or a timeout
+          # answers unverified: under the escalation that reds a REQUIRED context
+          # on a pull request whose body no hand here writes. For that author the
+          # class REPORTS instead, and every other hard class, `ref-unopenable`
+          # among them, stays hard, so a reference the forge answers 404 for is
+          # still a finding. On the merge queue PR_AUTHOR is empty and the
+          # escalation holds; that scan reads the commit range only, and the
+          # squash message there is PR_TITLE alone by repository setting, so no
+          # body text reaches it.
           set -uo pipefail
-          flags=(--hard ref-unverified)
+          flags=()
+          if [ "$PR_AUTHOR" != 'dependabot[bot]' ]; then flags+=(--hard ref-unverified); fi
           if [ "$REQUIRE" = yes ]; then flags+=(--require-private); fi
           case "$EVENT_NAME" in
             pull_request)
@@ -263,7 +281,8 @@ jobs:
             ${flags[@]+"${flags[@]}"} || rc_msg=$?
           rc_body=0
           if [ "$body" = yes ]; then
-            bflags=(--conversation --skip-code --pr-body-env PR_BODY --hard ref-unverified)
+            bflags=(--conversation --skip-code --pr-body-env PR_BODY)
+            if [ "$PR_AUTHOR" != 'dependabot[bot]' ]; then bflags+=(--hard ref-unverified); fi
             if [ "$REQUIRE" = yes ]; then bflags+=(--require-private); fi
             python3 -B tools/scripts/leak_scan.py messages --format github "${bflags[@]}" \
               || rc_body=$?
