@@ -56,6 +56,18 @@
 //! per topic; `/dev/shm/cer_db_*` on Linux, and macOS exposes no such path).
 //! This is self-healing: the next producer's `O_CREAT` REUSES the
 //! orphan, and because the counter is RELATIVE (consumers snapshot on attach and
+//! WHO A RING SERVES, and the two gates that follow from it. A kernel wake
+//! reaches a consumer only while that consumer is blocked, and a consumer can be
+//! blocked while a publish happens only when the two are in different processes:
+//! inside one process the publish runs in a step the parking thread itself drives.
+//! So a producer arms a doorbell only for an output topic a sibling process was
+//! planned to read (`WorkerPlan::sibling_consumed_topics`), and a consumer opens a
+//! page only when one of its declared trigger topics has a writer outside the
+//! process (`graph::runtime::rung_topics`). A subscriber outside that plan, a tool
+//! attaching to a topic or an `rmw_cerulion` consumer in another process, is woken
+//! by neither and observes the frame at its wait period, which is what every
+//! subscriber does on a release without the doorbell at all.
+//!
 //! read deltas) a stale absolute value is harmless. If a producer restarts and
 //! re-creates a FRESH object (new inode) the consumer's old mapping points at
 //! the orphan; [`DoorbellRegistry::reopen`] is the re-map seam for that case,
@@ -153,6 +165,39 @@ fn doorbell_shm_name(ns: &str, topic: &str) -> String {
     #[cfg(not(target_os = "linux"))]
     {
         doorbell_shm_name_compact(ns, topic)
+    }
+}
+
+/// Test seam: does the named shared memory object for `(ns, topic)` EXIST, without
+/// creating one?
+///
+/// `shm_open` with neither `O_CREAT` nor a mode, so a miss leaves the namespace as
+/// it found it and reports `ENOENT`. This is the oracle for "this graph mapped no
+/// doorbell page": the registry object count cannot tell an absent page from a
+/// page some other process created, and this can.
+///
+/// `false` on a target with no real page, where nothing is ever created.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn shm_object_exists_for_test(ns: &str, topic: &str) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let name = doorbell_shm_name(ns, topic);
+        let c = std::ffi::CString::new(name).expect("a derived name holds no NUL");
+        // SAFETY: `c` is a NUL-terminated C string that outlives the call; the
+        // flags carry no `O_CREAT`, so the call creates nothing and the only
+        // outcomes are a descriptor or an errno.
+        let fd = unsafe { libc::shm_open(c.as_ptr(), libc::O_RDONLY) };
+        if fd >= 0 {
+            // SAFETY: `fd` is a descriptor this call just obtained.
+            unsafe { libc::close(fd) };
+            return true;
+        }
+        false
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (ns, topic);
+        false
     }
 }
 

@@ -6763,7 +6763,8 @@ pub fn graph_run_worker(
         Some(&plan.topic_requirements),
         &credit_bindings,
     )
-    .with_sibling_topics(&plan.sibling_topics);
+    .with_sibling_topics(&plan.sibling_topics)
+    .with_sibling_consumed_topics(&plan.sibling_consumed_topics);
 
     // (6) resolve the subgraph's node cdylibs. The plan's subgraph already holds
     // ONLY this worker's nodes, so this shares `graph_run`'s loader filtered to
@@ -38118,6 +38119,7 @@ mod worker_tests {
             // the build reaches topic pre-create).
             topic_requirements: std::collections::BTreeMap::new(),
             sibling_topics: std::collections::BTreeSet::new(),
+            sibling_consumed_topics: std::collections::BTreeSet::new(),
             // No credit-backed cross-process `block` edge.
             credit_edges: Vec::new(),
             // Not recording (every case fails before the ring seam).
@@ -39267,6 +39269,7 @@ mod supervisor_tests {
             execution_mode: crate::multiprocess::ExecutionMode::Lockstep,
             topic_requirements: std::collections::BTreeMap::new(),
             sibling_topics: std::collections::BTreeSet::new(),
+            sibling_consumed_topics: std::collections::BTreeSet::new(),
             credit_edges: Vec::new(),
             // Not recording (the stamping tests never touch the ring).
             recording_ring: None,

@@ -678,12 +678,13 @@ fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
     let fires = Arc::new(AtomicU64::new(0));
     let (config, factories) = in_process_chain_graph(Arc::clone(&observed), Arc::clone(&fires));
     let clock = Arc::new(VirtualClock::new());
+    let ns = mwp_ns("chainprim");
     let runtime = GraphRuntime::build_for_test_with_policy(
         config,
         factories,
         clock,
         8,
-        MonitorWaitPolicy::new(true, true, mwp_ns("chainprim")),
+        MonitorWaitPolicy::new(true, true, ns.clone()),
     )
     .expect("build the in-process chain graph");
     assert_eq!(
@@ -692,15 +693,21 @@ fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
         "every trigger topic of this graph is produced by a node this runtime \
          owns, so nothing outside it can ring one and the park must arm none"
     );
-    // A declined arm and a registry that never opened both leave the armed topic
-    // at `None`, so the registry is asserted present and holding exactly the
-    // declared trigger topic: without this the arm would pass on a graph with no
-    // doorbell at all.
+    // No armable topic means no registry AT ALL, so the publishes on this graph's
+    // topics cost what they cost on a target with no page. The proof that this is
+    // a decision rather than a failure is the page itself: nothing named for these
+    // topics exists, checked without creating one.
     assert_eq!(
-        runtime.doorbell_topics_for_test().as_deref(),
-        Some(&["/mwp/ticker/out".to_string()][..]),
-        "the registry must have opened over the one declared trigger topic, so \
-         the absent armed line is a decision and not a missing page"
+        runtime.doorbell_topics_for_test(),
+        None,
+        "no declared topic is writable from outside this process, so the graph \
+         must map no doorbell page and open no registry"
+    );
+    let topic = "/mwp/ticker/out";
+    assert!(
+        !cerulion_core::doorbell::shm_object_exists_for_test(&ns, topic),
+        "the graph must have created no named shared memory object for {topic}: \
+         the registry is skipped, not opened and discarded"
     );
     assert!(
         !runtime.data_wake_rung_for_test(),

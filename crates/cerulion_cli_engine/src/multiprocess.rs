@@ -856,6 +856,20 @@ pub struct WorkerPlan {
     /// restores the warning, which is the loud direction.
     #[serde(default)]
     pub sibling_topics: std::collections::BTreeSet<String>,
+    /// The topics this worker PRODUCES that a sibling group CONSUMES, the mirror
+    /// of [`WorkerPlan::sibling_topics`].
+    ///
+    /// A publish reaches a consumer in another process only for a topic in this
+    /// set, and a doorbell ring wakes only such a consumer, so this is what gates
+    /// the producer-side doorbell. Empty on a single-process run, which has no
+    /// siblings.
+    ///
+    /// Planned by the PURE planner (it needs only the config). `#[serde(default)]`
+    /// so a plan file without the field still parses; the empty set it yields arms
+    /// no producer doorbell, so an old plan loses a wake rather than ringing a
+    /// line nothing watches.
+    #[serde(default)]
+    pub sibling_consumed_topics: std::collections::BTreeSet<String>,
     /// The cross-process `block` edges this deployment
     /// backs with a `MappedCredit` word — see [`CreditEdgePlan`]. EMPTY on
     /// every plan until the credit-wiring commit teaches the supervisor to
@@ -2149,6 +2163,7 @@ pub fn plan_deployment(
             // no cross-group union (a no-op) — the single-process-view behavior.
             topic_requirements: std::collections::BTreeMap::new(),
             sibling_topics: sibling_topics_for(config, members),
+            sibling_consumed_topics: sibling_consumed_topics_for(config, members),
             // Minted by the supervisor from the LOADED planning
             // topology in the credit-wiring commit; the pure planner holds no
             // `NodeInfo`s and cannot see a `block` policy, so it mints none.
@@ -2339,6 +2354,49 @@ fn sibling_topics_for(
             }
         })
         .filter(|topic| sibling_produced.contains(topic))
+        .collect()
+}
+
+/// The topics this worker PRODUCES that a sibling group CONSUMES, resolved as
+/// [`subgraph_for`] resolves them.
+///
+/// The mirror of [`sibling_topics_for`]: the same two resolvers in the other
+/// order, non-member inputs against member outputs. It is what tells a worker
+/// whether a publish of its own can reach a consumer in another process, which is
+/// the only consumer a doorbell ring can wake. A worker whose outputs no sibling
+/// reads arms no producer doorbell, and a single-process run has no siblings at
+/// all, so it arms none.
+///
+/// Pure: it needs only the config, like its mirror.
+fn sibling_consumed_topics_for(
+    config: &GraphConfig,
+    members: &[String],
+) -> std::collections::BTreeSet<String> {
+    let member_set: HashSet<&str> = members.iter().map(String::as_str).collect();
+    let is_member = |n: &&cerulion_core::graph::config::NodeDef| member_set.contains(n.id.as_str());
+    let sibling_consumed: HashSet<String> = config
+        .nodes
+        .iter()
+        .filter(|n| !is_member(n))
+        .flat_map(|n| &n.inputs)
+        .map(|input| {
+            if input.source.starts_with('/') {
+                input.source.clone()
+            } else {
+                resolve_source(&config.prefix, &input.source)
+            }
+        })
+        .collect();
+    config
+        .nodes
+        .iter()
+        .filter(is_member)
+        .flat_map(|n| {
+            n.outputs
+                .iter()
+                .map(move |o| resolve_output_topic(&config.prefix, &n.id, o))
+        })
+        .filter(|topic| sibling_consumed.contains(topic))
         .collect()
 }
 
@@ -4069,6 +4127,83 @@ mod tests {
             "the cross-group producer n1 must be FOREIGN to P1's subgraph"
         );
         assert_eq!(sub1.prefix, "p");
+    }
+
+    /// The producer-side gate's input, over a DECLARED two-group split: a rank's
+    /// outbound set holds exactly the outputs a sibling reads.
+    ///
+    /// This is what decides whether a publish arms a doorbell. P0 produces `n1/out`
+    /// which P1 reads, so P0 arms that one line; P1's own outputs are read only
+    /// inside P1, so P1 arms none. The mirror set is asserted beside it, because the
+    /// two answer opposite questions and reading one for the other is the mistake
+    /// this pair exists to catch.
+    #[test]
+    fn a_declared_split_names_the_outputs_a_sibling_reads() {
+        let config = chain_config(groups(&[
+            ("P0", &["n0", "n1"]),
+            ("P1", &["n2", "n3", "n4"]),
+        ]));
+        let p0 = vec!["n0".to_string(), "n1".to_string()];
+        let p1 = vec!["n2".to_string(), "n3".to_string(), "n4".to_string()];
+
+        let out0 = sibling_consumed_topics_for(&config, &p0);
+        assert_eq!(
+            out0.iter().cloned().collect::<Vec<_>>(),
+            vec!["/p/n1/out".to_string()],
+            "P1 reads n1/out, so P0's publish of it can wake a consumer in another \
+             process and that is the one line P0 arms"
+        );
+        let out1 = sibling_consumed_topics_for(&config, &p1);
+        assert!(
+            out1.is_empty(),
+            "every output of P1 is read inside P1, so no publish of P1's can wake a \
+             consumer in another process - got {out1:?}"
+        );
+
+        let in0 = sibling_topics_for(&config, &p0);
+        assert!(
+            in0.is_empty(),
+            "the mirror: P0 consumes nothing a sibling produces - got {in0:?}"
+        );
+        let in1 = sibling_topics_for(&config, &p1);
+        assert_eq!(
+            in1.iter().cloned().collect::<Vec<_>>(),
+            vec!["/p/n1/out".to_string()],
+            "the mirror: P1 consumes that same topic, which is why reading one set \
+             for the other arms the wrong rank"
+        );
+    }
+
+    /// The same question over a DERIVED partition, answered by the same function.
+    ///
+    /// `plan_deployment` is the one `WorkerPlan` construction site for a declared
+    /// and a derived partition alike, so a rank whose members came from the
+    /// deriver gets the same outbound set as one whose members came from the file.
+    /// Asserted over the members a two-rank derivation produces rather than over
+    /// the groups a file declares.
+    #[test]
+    fn a_derived_partition_names_the_same_outputs_as_a_declared_one() {
+        let config = chain_config(groups(&[
+            ("g0", &["n0", "n1"]),
+            ("g1", &["n2", "n3", "n4"]),
+        ]));
+        // The members a two-rank split yields, whatever named them.
+        let derived_rank0 = vec!["n0".to_string(), "n1".to_string()];
+        let derived_rank1 = vec!["n2".to_string(), "n3".to_string(), "n4".to_string()];
+
+        assert_eq!(
+            sibling_consumed_topics_for(&config, &derived_rank0)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["/p/n1/out".to_string()],
+            "the deriver's rank 0 arms the cross-rank line, the same as a declared \
+             group with the same members"
+        );
+        assert!(
+            sibling_consumed_topics_for(&config, &derived_rank1).is_empty(),
+            "and the deriver's rank 1 arms none"
+        );
     }
 
     /// `subgraph_for` (direct): a CROSS-GROUP relative source is rewritten to its

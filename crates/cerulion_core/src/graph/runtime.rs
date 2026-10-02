@@ -273,6 +273,11 @@ pub struct CrossProcessWiring<'a> {
     /// (see `ValidationOptions::sibling_topics`). `None` on every
     /// single-process build, where the local graph is the whole graph.
     pub(crate) sibling_topics: Option<&'a std::collections::BTreeSet<String>>,
+    /// The absolute topics THIS worker produces that a SIBLING group consumes, so
+    /// the build knows which of its own publishes can reach a consumer in another
+    /// process. `None` on every single-process build, where no publish leaves the
+    /// process and so no producer doorbell is armed.
+    pub(crate) sibling_consumed_topics: Option<&'a std::collections::BTreeSet<String>>,
 }
 
 impl<'a> CrossProcessWiring<'a> {
@@ -282,6 +287,7 @@ impl<'a> CrossProcessWiring<'a> {
             topic_requirements: None,
             credit_bindings: &[],
             sibling_topics: None,
+            sibling_consumed_topics: None,
         }
     }
 
@@ -297,6 +303,7 @@ impl<'a> CrossProcessWiring<'a> {
             topic_requirements,
             credit_bindings: &[],
             sibling_topics: None,
+            sibling_consumed_topics: None,
         }
     }
 
@@ -312,12 +319,23 @@ impl<'a> CrossProcessWiring<'a> {
             topic_requirements,
             credit_bindings,
             sibling_topics: None,
+            sibling_consumed_topics: None,
         }
     }
 
     /// Name the topics a SIBLING group produces for this worker. Chained onto
     /// one of the constructors above rather than added to their signatures:
     /// it changes which warnings a build emits, never how it is wired.
+    /// The topics this worker produces that a sibling consumes, which is what
+    /// gates its producer-side doorbells.
+    pub fn with_sibling_consumed_topics(
+        mut self,
+        topics: &'a std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.sibling_consumed_topics = Some(topics);
+        self
+    }
+
     pub fn with_sibling_topics(mut self, topics: &'a std::collections::BTreeSet<String>) -> Self {
         self.sibling_topics = Some(topics);
         self
@@ -3257,6 +3275,10 @@ pub struct GraphRuntime {
     /// rather than guaranteeing one. Recorded once at build, on the open's
     /// success arm only, from [`rung_topics`].
     doorbell_armed_topic: Option<String>,
+    /// How many of this graph's own publishers armed a doorbell, which is how many
+    /// of its output topics a sibling group consumes. 0 on a single-process run,
+    /// where no publish leaves the process. Recorded once at build.
+    producer_doorbells_armed: usize,
     /// Count of [`Self::monitor_wait_block`] ENTRIES — incremented once
     /// per call, BEFORE its park loop. The observable test seam pinning the
     /// park-entry ROUTING: an empty-`sources` (pure-Period) graph under an active
@@ -6536,6 +6558,9 @@ impl GraphRuntime {
         // build breadcrumb + the test accessor).
         let mut notify_elision_armed_count: usize = 0;
 
+        // How many producer doorbells this build arms, for the wait policy line: a
+        // reader sees at a glance whether this process rings anything at all.
+        let mut producer_doorbells_armed: usize = 0;
         for node_def in &config.nodes {
             let mut entry = node_factories.swap_remove(&node_def.id).ok_or_else(|| {
                 TransportError::GraphError {
@@ -6786,7 +6811,18 @@ impl GraphRuntime {
                 // OWNED SHM doorbell so each `notify_sent_sample` rings the line a
                 // consumer parks on. Keyed by the publisher's resolved topic +
                 // `policy.ns()` so the consumer registry maps the same page.
-                if policy.doorbell() {
+                //
+                // Only for a topic a SIBLING group consumes. A doorbell ring wakes
+                // a consumer blocked on the page, and only a consumer in another
+                // process can be blocked while this one publishes, so a topic no
+                // sibling reads would pay the ring's atomic and its backend read
+                // for a wake nobody can receive. `None` wiring is the
+                // single-process build, where no publish leaves the process.
+                let topic_crosses = cross_process
+                    .sibling_consumed_topics
+                    .is_some_and(|t| t.contains(&topic));
+                if policy.doorbell() && topic_crosses {
+                    producer_doorbells_armed += 1;
                     debug_assert!(
                         !policy.ns().is_empty(),
                         "an active doorbell policy must carry a non-empty ns (the \
@@ -8545,21 +8581,37 @@ impl GraphRuntime {
                 .cloned()
                 .collect();
             let rung = rung_topics(&topics, &armable);
-            match crate::doorbell::DoorbellRegistry::open(policy.ns(), &rung.ordered) {
-                Ok(r) => {
-                    // Only here: a registry that failed to open must not leave an
-                    // armed topic recorded, and one field cannot disagree with
-                    // another that does not exist.
-                    doorbell_armed_topic = rung.armed;
-                    Some(r)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?e,
-                        graph = %config.identity(),
-                        "doorbell registry open failed; live loop falls back to the timer-only park"
-                    );
-                    None
+            if rung.armed.is_none() {
+                // No declared topic of this graph is writable from outside it, so
+                // no ring can arrive while this thread is blocked and the park has
+                // nothing to arm. Opening the registry anyway would map one named
+                // page per topic and cost every publish on them a real atomic and a
+                // backend read, which is what a single-process run paid for a wake
+                // it could not receive.
+                tracing::debug!(
+                    graph = %config.identity(),
+                    topics = topics.len(),
+                    "no declared topic is writable from outside this process; the \
+                     live loop keeps its bounded recheck and maps no doorbell page"
+                );
+                None
+            } else {
+                match crate::doorbell::DoorbellRegistry::open(policy.ns(), &rung.ordered) {
+                    Ok(r) => {
+                        // Only here: a registry that failed to open must not leave an
+                        // armed topic recorded, and one field cannot disagree with
+                        // another that does not exist.
+                        doorbell_armed_topic = rung.armed;
+                        Some(r)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            graph = %config.identity(),
+                            "doorbell registry open failed; live loop falls back to the timer-only park"
+                        );
+                        None
+                    }
                 }
             }
         } else {
@@ -8616,6 +8668,7 @@ impl GraphRuntime {
             monitor_wait_policy: policy,
             doorbell_registry,
             doorbell_armed_topic,
+            producer_doorbells_armed,
             // Park-entry routing counter (see field doc) — starts at 0.
             park_entries: std::sync::atomic::AtomicU64::new(0),
             // Park wake-cause counters (record-only) — all start at 0.
@@ -13556,10 +13609,12 @@ impl GraphRuntime {
             graph = %self.config.identity(),
             park_active = self.park_active(),
             doorbell = self.doorbell_registry.is_some(),
-            doorbell_topics = self
-                .doorbell_registry
-                .as_ref()
-                .map_or(0, crate::doorbell::DoorbellRegistry::len),
+            registry = tracing::field::display(
+                self.doorbell_registry
+                    .as_ref()
+                    .map_or_else(|| "none".to_string(), |r| r.len().to_string())
+            ),
+            producer_doorbells = self.producer_doorbells_armed,
             data_wake = self.data_wake_rung(),
             barrier = self.barrier_participant.is_some(),
             credit_edges = self.credit_park_edges.len(),
