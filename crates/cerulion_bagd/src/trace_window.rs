@@ -592,7 +592,13 @@ fn walk(
             // scalar every reader written before the map still reads.
             if anchor_step == Some(rec.step) && rec.record_type == RECORD_TYPE_STEP_BOUNDARY {
                 out.per_rank.entry(rank).or_default().anchor_target_ns = Some(rec.fire_time_ns);
-                if rank == AUTHORITATIVE_TRACE_RANK || out.anchor_target_ns.is_none() {
+                // The capture-wide scalar takes the AUTHORITATIVE rank's boundary
+                // and no other. It is `target(S-1)` for the whole capture, read by
+                // the recorder to trim external frames and by the replay to skip
+                // the same prefix, so a peer's value makes those two numbers
+                // belong to different clocks under free run. Absent rank 0's own
+                // boundary the scalar stays `None` and neither side trims.
+                if rank == AUTHORITATIVE_TRACE_RANK {
                     out.anchor_target_ns = Some(rec.fire_time_ns);
                 }
             }
@@ -1170,6 +1176,58 @@ mod tests {
         let mut r = fire(step, node_idx);
         r.reserved = rank;
         r
+    }
+
+    /// The capture wide anchor target stays EMPTY rather than borrow a peer's.
+    ///
+    /// `anchor_target_ns` is `target(S-1)` for the capture as a whole and BOTH
+    /// sides read the same number off it: the recorder trims external frames below
+    /// it, and the replay skips the same prefix at the first resumed step. Under
+    /// free run each rank advances on its own clock, so a peer's target is a
+    /// different instant; taking it would trim the bag against one clock and skip
+    /// against another.
+    ///
+    /// `None` leaves both sides at their untrimmed answer, which agree: the
+    /// recorder keeps the whole prefix and the replay reads an empty skip map.
+    ///
+    /// THE SHAPE: rank 0 is anchored at 41 and its step 41 boundary is NOT in the
+    /// records, so there is nothing of its own to recover, while rank 1 is anchored
+    /// at 44 and its step 44 boundary IS retained and discarded on the way past.
+    /// The peer's 44_100 is therefore available to be borrowed and must not be.
+    #[test]
+    fn the_capture_wide_anchor_target_never_borrows_a_peers_boundary() {
+        let out = trim_to_anchor(
+            vec![
+                // Rank 1's own anchor boundary, below its resume, so the walk reads
+                // it as that rank's floor.
+                ranked_boundary(1, 44, 44_100),
+                ranked_boundary(1, 45, 45_100),
+                // Rank 0 resumes at 42 with NO boundary at its own anchor step 41.
+                ranked_boundary(0, 42, 42_000),
+                ranked_fire(0, 42, 0),
+            ]
+            .into_iter(),
+            &BTreeMap::from([(AUTHORITATIVE_TRACE_RANK, 41u64), (1, 44u64)]),
+            &ranked_nodes(),
+        );
+        assert_eq!(
+            out.per_rank[&1].anchor_target_ns,
+            Some(44_100),
+            "PRECONDITION: the peer's own floor IS recovered, so there is a value \
+             available to be borrowed"
+        );
+        assert_eq!(
+            out.per_rank
+                .get(&AUTHORITATIVE_TRACE_RANK)
+                .and_then(|r| r.anchor_target_ns),
+            None,
+            "PRECONDITION: rank 0 has no boundary at its own anchor step"
+        );
+        assert_eq!(
+            out.anchor_target_ns, None,
+            "the capture wide floor is rank 0's own or nothing, never the peer's \
+             44100: both the trim and the replay's skip read this one number"
+        );
     }
 
     /// A PEER with no anchor does not make the capture claim a from-start resume.

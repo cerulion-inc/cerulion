@@ -21482,6 +21482,85 @@ fn the_trailing_band_leaves_the_frame_count_balanced_on_both_sides() {
     );
 }
 
+/// A peer that runs past rank 0 on a DECLARED FREE RUN range is not an extra.
+///
+/// Under free run each pass advances on its OWN rank's boundary cursor
+/// (`PassBoundaries::Rank`), so a peer legitimately emits frames above rank 0's
+/// last boundary. The covered range's replayed deduction has to be taken at the
+/// PRODUCING RANK's edge for that reason: one ceiling taken from rank 0 leaves a
+/// peer's in band frames out of `reproduced` while the recorded side has already
+/// dropped them, and the comparison then publishes `ExtraMessages` on a bag whose
+/// frames are byte identical.
+///
+/// Reachable without a resume: a capture whose first boundary is step 0 returns
+/// from `resolve_resume` before the free run multi rank refusal, so this shape is
+/// replayed rather than refused.
+///
+/// HAND ORACLE, every count its own number. The fixture's four steps carry
+/// boundary targets 5, 10, 15 and 20 ms. Rank 0's trace is trimmed to step 2, so
+/// rank 0's edge is 15 ms and rank 1's is 20 ms, and the declared range is 15 ms.
+/// Rank 1 owns `/mp2/src_b/out` and fires at steps 1 and 3, so exactly one of its
+/// frames, the 20 ms one, sits in the 15 to 20 ms band and above rank 0's edge.
+/// That frame is the one a single ceiling mishandles: it is counted beyond the
+/// range on the recorded side and, with the per rank edge, on the replayed side
+/// too, so the verdict is CLEAN.
+#[test]
+#[serial]
+fn a_free_run_peer_past_rank_zero_is_deducted_at_its_own_ceiling() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_free_run_peer_past.mcap");
+    write_multi_rank_bag_impl(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        // Rank 0 stops after step 2; rank 1 keeps its full stream and so runs past
+        // rank 0's own last boundary, which is the whole point of the shape.
+        |per_rank| per_rank[0].retain(|r| r.step <= 2),
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        Some(15_000_000),
+        &[],
+        ProducerAttributionFixture::default(),
+        None,
+        &[],
+    );
+
+    let outcome = replay(&bag, mp_slow_b_factories, None, None)
+        .expect("a declared free run range is replayed, not refused");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert_eq!(range.through_ns, 15_000_000, "the declared range");
+    // PRECONDITION: the peer's 20 ms frame really is outside the range, so the
+    // deduction below has something to act on.
+    assert_eq!(
+        range.trailing_frames.get("/mp2/src_b/out").copied(),
+        Some(1),
+        "rank 1's step 3 frame sits above the declared range: {:?}",
+        range.trailing_frames
+    );
+    // THE VERDICT: no ExtraMessages anywhere. A single rank 0 ceiling reports one
+    // on '/mp2/src_b/out', because that frame stays on the replayed side while the
+    // recorded side has lost it.
+    let extras: Vec<String> = outcome
+        .violations
+        .iter()
+        .filter(|v| matches!(v.class, ViolationClass::ExtraMessages { .. }))
+        .map(|v| v.detail.clone())
+        .collect();
+    assert!(
+        extras.is_empty(),
+        "a peer running past rank 0 under free run is not an extra: {extras:?}"
+    );
+    assert_clean_verdict(&outcome, "a free run peer past rank 0");
+}
+
 /// A manifest ABOVE the fold's minimum but AT OR BELOW rank 0's last target is
 /// REFUSED BY NAME.
 ///

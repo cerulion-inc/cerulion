@@ -3436,6 +3436,17 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         } else {
             BTreeSet::new()
         };
+    // Under LOCKSTEP this map is never built (an empty map, so
+    // check 3 resolves every topic against rank 0 exactly as it always has);
+    // under FREE-RUN it resolves each produced topic to its PRODUCING rank,
+    // whose boundary stream is the only one that describes its stamps.
+    //
+    // Built HERE rather than below its other consumer because the covered range
+    // needs it too: a declared range's replay ceiling is per producing rank.
+    let producing_rank = match coordination {
+        CoordinationMode::Lockstep => BTreeMap::new(),
+        CoordinationMode::FreeRun => produced_topic_ranks(&config, &rank_tables),
+    };
     let covered_range = resolve_covered_range(
         &recorded_messages,
         &trace,
@@ -3443,19 +3454,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         coordination,
         rank_count,
         &derived_tail_topics,
+        &producing_rank,
     )?;
     let trailing_frames = covered_range
         .as_ref()
         .map(|c| c.trailing.clone())
         .unwrap_or_default();
-    // Under LOCKSTEP this map is never built (an empty map, so
-    // check 3 resolves every topic against rank 0 exactly as it always has);
-    // under FREE-RUN it resolves each produced topic to its PRODUCING rank,
-    // whose boundary stream is the only one that describes its stamps.
-    let producing_rank = match coordination {
-        CoordinationMode::Lockstep => BTreeMap::new(),
-        CoordinationMode::FreeRun => produced_topic_ranks(&config, &rank_tables),
-    };
     validate_recording_consistency(
         &trace,
         rank_count,
@@ -4716,8 +4720,9 @@ fn seed_rung_name(rung: SeedRung) -> &'static str {
 /// side only is a difference of the band's width reported as a divergence. The
 /// two deductions are NOT the same number: this side loses every frame beyond
 /// `through_ns`, that side loses only the ones the replay can re-produce
-/// ([`CoveredRange::reproduced`]), which is those at or below rank 0's own last
-/// boundary.
+/// ([`CoveredRange::reproduced`]), which is those at or below the PRODUCING
+/// RANK's own last boundary, rank 0's under lockstep where every pass is driven
+/// from that one stream.
 fn replayed_frame_count(
     recorded_messages: &RecordedMessages,
     topic: &str,
@@ -5077,19 +5082,19 @@ struct CoveredRange {
     /// Per GRAPH-PRODUCED topic, recorded frames stamped beyond `through_ns`.
     trailing: BTreeMap<String, usize>,
     /// Per GRAPH-PRODUCED topic, the subset of [`Self::trailing`] the REPLAY
-    /// re-produces: frames stamped above `through_ns` and at or below rank 0's
-    /// own last recorded boundary.
+    /// re-produces: frames stamped above `through_ns` and at or below the
+    /// PRODUCING RANK's own last recorded boundary.
     ///
-    /// The replay window ends at rank 0's last boundary, so a frame stamped above
-    /// that is one the replay cannot emit and this count excludes it. EMPTY
-    /// whenever `through_ns` is rank 0's last boundary, which is every derived
-    /// range and every declaration clamped up to it; non-empty only when a
-    /// DECLARED range ends below it, the capture whose peer ended shorter.
+    /// Each pass stops at its own rank's last boundary, so a frame stamped above
+    /// that rank's edge is one no pass emits and this count excludes it. Under
+    /// lockstep every pass is driven from rank 0's stream and that edge is rank
+    /// 0's for every topic; under free run each pass advances on its own, so a
+    /// peer's edge sits above rank 0's and its frames in the band ARE re-emitted.
     ///
     /// It exists because the two sides of the frame count must have the same band
     /// removed, and [`Self::trailing`] is the wrong number for this side in one
-    /// direction: on a tail-race bag the trailing frames sit ABOVE rank 0's last
-    /// boundary and the replay never emits them, so deducting them here reports
+    /// direction: on a tail-race bag the trailing frames sit above every rank's
+    /// edge and no pass emits them, so deducting them here reports
     /// `MissingMessages` on a clean bag.
     reproduced: BTreeMap<String, usize>,
     /// `true` when the READER derived this range (a multi-rank
@@ -5132,10 +5137,11 @@ struct CoveredRange {
 /// [`earliest_last_boundary_target`]), so frames past it are outside what a
 /// resim can re-execute
 /// whatever else is true: un-judgeable by check 3, which has nothing for them to
-/// match. They are NOT un-comparable: a DECLARED range can end below rank 0's own
-/// last boundary, and the replay runs rank 0's stream, so it re-produces frames
-/// inside the band. The comparator excludes them from BOTH sides of the frame
-/// count rather than from the recorded side alone. They are classified
+/// match. They are NOT un-comparable: a DECLARED range can end below a producing
+/// rank's own last boundary, and that rank's pass runs to it, so the replay
+/// re-produces frames inside the band. The comparator excludes them from BOTH
+/// sides of the frame count rather than from the recorded side alone. They are
+/// classified
 /// TRAILING: in the bag, readable, reported (never silent — see
 /// [`CoveredRangeReport::derived`] and the render note), excluded from the
 /// verdict. Everything the boundary stream can still judge reaches check 3 at
@@ -5262,6 +5268,10 @@ fn resolve_covered_range(
     coordination: CoordinationMode,
     rank_count: usize,
     derived_tail_topics: &BTreeSet<String>,
+    // Per produced topic, the rank whose boundary stream describes its stamps.
+    // EMPTY under lockstep, where every pass is driven from rank 0's stream and
+    // rank 0's last boundary is the ceiling for all of them.
+    producing_rank: &BTreeMap<String, ProducingRank>,
 ) -> Result<Option<CoveredRange>, ReplayError> {
     let (declared, derived) = match capture_resim_covered_through_ns(&recorded_messages.reader) {
         // A DECLARED range always wins (the declared-range contract, clamp/refusal
@@ -5353,10 +5363,42 @@ fn resolve_covered_range(
     // would count the remainder as trailing and skip it, which is check 4's
     // own evidence being discarded before check 4 runs.
     let mut trailing: BTreeMap<String, usize> = BTreeMap::new();
-    // The upper edge of what the REPLAY can emit: its window is rank 0's boundary
-    // stream, so a frame above this is beyond re-production whatever the declared
-    // range says. `None` is the no-boundary bag the refusals above already own.
-    let replay_ceiling_ns = last_recorded_boundary_target(trace)?.unwrap_or(through_ns);
+    // The upper edge of what the REPLAY can emit, PER TOPIC, because that edge is
+    // the producing rank's own last boundary and not one number for the bag.
+    //
+    // Under LOCKSTEP every pass is driven from rank 0's stream
+    // (`PassBoundaries::Lockstep`), so rank 0's last boundary is the edge for all
+    // of them and `producing_rank` is empty. Under FREE RUN each pass advances on
+    // its OWN cursor (`PassBoundaries::Rank`), so a peer emits frames above rank
+    // 0's last by design; taking rank 0's number for those topics leaves their
+    // frames outside `reproduced` while the recorded side has already dropped
+    // them, which is an `ExtraMessages` on a byte-identical bag.
+    //
+    // A topic whose producer no manifest names, and a multi-publisher topic split
+    // across ranks, keep rank 0's edge: there is no single stream to read an edge
+    // off, and the conservative direction is to deduct LESS from this side, which
+    // can only leave a difference visible rather than hide one.
+    let rank_zero_ceiling_ns = last_recorded_boundary_target(trace)?.unwrap_or(through_ns);
+    let mut ceiling_for_rank: BTreeMap<u32, u64> = BTreeMap::new();
+    for topic_rank in producing_rank.values() {
+        if let ProducingRank::Rank(rank) = topic_rank {
+            if let std::collections::btree_map::Entry::Vacant(slot) = ceiling_for_rank.entry(*rank)
+            {
+                slot.insert(
+                    last_boundary_target_for_rank(trace, *rank)?.unwrap_or(rank_zero_ceiling_ns),
+                );
+            }
+        }
+    }
+    let ceiling_of = |topic: &str| -> u64 {
+        match producing_rank.get(topic) {
+            Some(ProducingRank::Rank(rank)) => ceiling_for_rank
+                .get(rank)
+                .copied()
+                .unwrap_or(rank_zero_ceiling_ns),
+            _ => rank_zero_ceiling_ns,
+        }
+    };
     let mut reproduced: BTreeMap<String, usize> = BTreeMap::new();
     let produced_set: BTreeSet<&str> = produced.iter().map(|s| s.as_str()).collect();
     recorded_messages.for_each_frame(&mut |topic, frame| {
@@ -5376,9 +5418,9 @@ fn resolve_covered_range(
         if let Some(header) = WireHeader::read_from_buf(frame) {
             if is_beyond_covered(header.timestamp_ns, through_ns) {
                 *trailing.entry(topic.to_string()).or_default() += 1;
-                // Inside the band the replay still runs, so this frame has a
+                // Inside the band its OWN pass still runs, so this frame has a
                 // replayed twin that must come off that side too.
-                if header.timestamp_ns <= replay_ceiling_ns {
+                if header.timestamp_ns <= ceiling_of(topic) {
                     *reproduced.entry(topic.to_string()).or_default() += 1;
                 }
             }

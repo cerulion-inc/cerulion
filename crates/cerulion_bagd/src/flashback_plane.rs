@@ -626,12 +626,21 @@ impl FlashbackPlane {
                         cerulion_core::trace_ring::AUTHORITATIVE_TRACE_RANK,
                         *step,
                     )
-                })
-                .or_else(|| {
-                    anchor_steps
-                        .iter()
-                        .find_map(|(rank, step)| held.boundary_target_ns_for(*rank, *step))
                 });
+            // NO fallback to another rank. This field is `target(S-1)` for the
+            // capture as a whole, and both sides read it off the SAME number: the
+            // recorder trims external frames below it, and the replay skips the
+            // same prefix at the first resumed step
+            // (`external_prefix_below_capture_anchor`). Under free run each rank
+            // advances on its own clock, so a peer's target is a different
+            // instant; trimming or skipping to it drops or injects the wrong
+            // external frames, and the bag's own trim would already be wrong
+            // before any replay reads it.
+            //
+            // `None` leaves BOTH sides at their untrimmed answer, which agrees:
+            // the recorder keeps the whole prefix and the replay reads an empty
+            // skip map. Per rank values above are untouched; a reader that wants
+            // one rank's floor asks for that rank.
         }
         trimmed
     }
