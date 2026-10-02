@@ -251,6 +251,12 @@ the arms are additionally #[serial] within the binary because the parse tally is
 process-global static two concurrent arms would both bump",
     ),
     (
+        "listener_drain_count_test",
+        "default-namespace manager: creates a publisher and subscriber on the shared root; \
+the arms are additionally #[serial] within the binary because the drain tally is a \
+process-global static two concurrent arms would both bump",
+    ),
+    (
         "non_trigger_hold_iox2_test",
         "mixed: mostly isolated roots, three arms on the default namespace",
     ),

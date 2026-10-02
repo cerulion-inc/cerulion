@@ -16161,7 +16161,8 @@ impl GraphRuntime {
                     // `ListenerOnly`'s NOTIFICATION queue here, INSIDE the step —
                     // exact parity with the Separate arm, whose
                     // `try_receive_timestamps` → `CerulionSubscriber::try_receive`
-                    // runs `drain_stale_events()` on ITS listener every drain.
+                    // runs the listener policy on ITS listener after a drain that
+                    // removed frames.
                     // Without this, each publish's `SentSample` event SURVIVES the
                     // step (the FFI/body drain below clears only the BODY
                     // subscriber's own listener), and the next `live_step`'s idle
