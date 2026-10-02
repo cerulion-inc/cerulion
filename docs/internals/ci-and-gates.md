@@ -230,7 +230,12 @@ tree, no cargo, no network), and each names the document it is the machine half 
 The fourth doc-versus-code property, that every `cerulion <verb>` spelled in `README.md` and
 `docs/user-api.md` exists in the CLI, is enforced by the public-surface gate's `docs-refs` class,
 which walks the verb tree out of the clap definitions; its self-test carries a markdown TABLE row,
-because a table cell is where those two pages spell their verbs. That gate's `agent-file-ref`
+because a table cell is where those two pages spell their verbs. The same class resolves every
+relative link before it judges it: a target that resolves to nothing is a finding whatever its
+spelling, and one of the `ALL_CAPS_WITH_UNDERSCORE` placeholder shape says in its own message
+that no file in the tree resolves the token. A target held by a maintainer ruling is named line
+by line in `tools/scripts/public_surface_allow.txt`, and its row is deleted by the change that
+replaces the token, because a row that excuses nothing fails the run. That gate's `agent-file-ref`
 class refuses `AGENTS.md` and `CLAUDE.md` on a user-facing page, excepting files so named.
 
 ## The dependency-architecture rules
@@ -421,19 +426,31 @@ only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `exa
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
 
-Six Linux jobs run on push / `workflow_dispatch` only and never
-on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `msrv`, `fuzz`, `miri` and
+Five Linux jobs run on push / `workflow_dispatch` only and never
+on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `fuzz`, `miri` and
 `machete` each carry a job-level `if: github.event_name != 'pull_request' && github.event_name
 != 'merge_group'`; `deb-smoke` carries one exception, below; the second
 conjunct is required because a bare `!= 'pull_request'` ADMITS a merge-queue batch,
 which would run the same work a second time over the same commits (`main`'s push run is the
 control), with their `needs: [lint]` (`fuzz`, `miri`) and
-`continue-on-error: true` (`fuzz`, `machete`) untouched. None of the six is a required
+`continue-on-error: true` (`fuzz`, `machete`) untouched. None of the five is a required
 status context on `main`, so a skipped one is simply absent from a pull request's checks.
 They run on every merge to `main` (the push run is where their breakage
 surfaces, revert-on-red), and the coverage walk drops any job behind a job-level `if:`
-from its PR-blocking view, so none of the six can credit pull-request coverage it does not
+from its PR-blocking view, so none of the five can credit pull-request coverage it does not
 provide.
+
+The MSRV check (`msrv`) runs on every pull request and every push to `main`, and carries
+`if: github.event_name != 'merge_group'` alone: a compiler-floor break found after the merge
+costs a revert on a branch that already landed, and a queue run would do the same check a
+second time over the same commits. It is not a required status context, and its job-level
+`if:` keeps the coverage walk dropping it from the PR-blocking view, which is correct: it
+type-checks the workspace on the floor and runs no test. Its cache key carries the
+`-main-`/`-pr-` scope segment, so a prune reached from a pull request deletes only `-pr-`
+entries of that namespace; the namespace token `msrv-1.95` is absent from the
+`CACHE_SAVE_NAMESPACES` default, so nothing fills it and the check compiles the workspace from
+scratch on every run. It lists no `needs:`, so a pull request starts it beside `lint` rather
+than after it.
 
 The `changes` job classifies a pull request's changed paths (rules and a
 `--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) into four
