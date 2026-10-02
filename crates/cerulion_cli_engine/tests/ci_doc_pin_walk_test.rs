@@ -3300,6 +3300,11 @@ fn missing_and_stale(
 /// reason [`HAND_SCANNED_DOC_PINS`] gives: a row written twice makes a length
 /// add up while hiding a derived edge nobody wrote down.
 const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
+    // state_anchor_partial_scan_test's REGION table names sources of two other
+    // crates by their paths under the crates tree: the cli engine's graph
+    // command, replay state and state arm attach, and the core's state ring.
+    ("cerulion_bagd", "cerulion_cli_engine", "crate-path"),
+    ("cerulion_bagd", "cerulion_core", "crate-path"),
     // upstream_waivers_test declares the waived arms as literal paths from the
     // workspace root, and three of them name a `cerulion_cli` test file, so the
     // walk derives this edge from the literals alone.

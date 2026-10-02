@@ -456,14 +456,19 @@ pub struct StateNodeCoverage {
     ///
     /// RESIDUAL, relevant to the restore engine and deliberately NOT closed
     /// here: with `rings_declared > 1` the `node_idx → node` mapping is still
-    /// ambiguous BAG-SIDE, because a record carries no rank. Two workers' rings
+    /// ambiguous to the RESTORE READER, whose index table is keyed by `node_idx`
+    /// alone; from state record format version 1 the record itself carries its
+    /// producer's rank. Two workers' rings
     /// both number their nodes from 0, so a record with `node_idx = 0` could be
-    /// either ring's first node and nothing in the bag disambiguates it — the
+    /// either ring's first node and the reader's keys do not disambiguate it:
+    /// the
     /// [`ring`](Self::ring) field answers "which ring is this NODE in", not
     /// "which ring did this RECORD come from". The restore engine REFUSES a
-    /// multi-ring bag for now; this field makes the single-ring case — every
-    /// shipping shape today — exact. Closing it needs a rank on the record or on
-    /// the channel, which is a wire change and belongs with the restore work.
+    /// multi-ring bag for now; this field makes the single-ring case, every
+    /// shipping shape today, exact. Closing it needs the restore reader to carry
+    /// the record's rank through its own keys, which is a read-side change and
+    /// belongs with the restore work; the wire half landed at state record
+    /// format version 1.
     ///
     /// A node id declared by TWO rings at DIFFERENT indices serves `None`: the
     /// index is then not a fact this bag can state, and the alternative is
@@ -577,8 +582,8 @@ pub struct StateCoverage {
     /// Ranks that provably EXIST and published no ring.
     ///
     /// Ranks are dense, so a hole below the highest discovered rank is evidence,
-    /// not absence of it — and a graph-wide anchor is all-or-nothing across ranks
-    /// so a single missing rank makes every anchor of the run partial.
+    /// not absence of it, and a graph-wide anchor is all-or-nothing across ranks
+    /// so every anchor of the run LACKS a missing rank's records.
     /// Non-empty makes the recording INCOMPLETE.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ranks_missing: Vec<u32>,
@@ -689,8 +694,10 @@ impl StateCoverage {
     ///   Claiming a mid-run attach would make it DISCARD the head of the very
     ///   anchor the capture exists to carry.
     /// * `rings_declared` — the number of DISTINCT rings the embedded anchors
-    ///   came from. A restore engine refuses `> 1` because `node_idx` carries no
-    ///   rank, so this is an explicit refusal rather than an ambiguous read.
+    ///   came from. A restore engine refuses `> 1` because its OWN keys carry no
+    ///   rank, `node_idx` alone in the index table and `(run_id, step,
+    ///   node_idx)` in the assembler, so this is an explicit refusal rather than
+    ///   an ambiguous read.
     /// * `armed` — the graph's cadence, carried through so a capture says what
     ///   plane produced it.
     ///
@@ -843,9 +850,9 @@ impl StateCoverage {
         if self.armed.is_some() && self.nodes_without_anchor() > 0 {
             out.push(IncompleteReason::NodesWithoutAnchor);
         }
-        // A rank that exists and published no ring voids every
-        // graph-wide anchor of the run (all-or-nothing), so this cannot
-        // be a note beside a bag that otherwise reads complete.
+        // A rank that exists and published no ring leaves every
+        // graph-wide anchor of the run LACKING its records (all-or-nothing), so
+        // this cannot be a note beside a bag that otherwise reads complete.
         if !self.ranks_missing.is_empty() {
             out.push(IncompleteReason::RanksMissing);
         }
@@ -946,9 +953,15 @@ pub fn log_state_coverage_terminal(sc: &StateCoverage) {
                 ranks_discovered = ?sc.ranks_discovered,
                 records = sc.records,
                 "bagd checkpoint coverage INCOMPLETE: a rank BELOW the highest one discovered \
-                 published no state ring, and a graph-wide anchor is all-or-nothing across \
-                 ranks — so every anchor of this run is partial (see state_coverage.json's \
-                 ranks_missing)"
+                 published no state ring, and a graph-wide anchor is all-or-nothing across ranks, \
+                 so every anchor of this run LACKS that rank's records (see state_coverage.json's \
+                 ranks_missing). A resim of a capture from this run whose window reaches step 0 \
+                 reads no anchor at all and reaches a verdict whatever the ring count. One whose \
+                 window starts mid run exits 2 with no verdict in two ways: with more than one \
+                 state ring left it refuses the recording outright as ambiguous, and with one ring \
+                 left it resumes from that ring and refuses by name every node of the missing rank \
+                 the replay executes, none of which has an anchor. It reaches a verdict of its own \
+                 only when no node of that rank runs in that window"
             ),
         }
     }
