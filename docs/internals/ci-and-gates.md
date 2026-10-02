@@ -531,28 +531,51 @@ advisory audit reports a finding on the committed lockfile`. A finding opens tha
 issue or rewrites its body; a clean run comments the commit the check passed on and
 closes it; a clean run with no such issue open writes nothing.
 
-A finding is a diagnostic in the captured JSON log, at error or warning severity,
-whose class is one of `vulnerability`, `unmaintained`, `unsound`, `notice` and
-`yanked`. Under `tools/release/deny.toml`'s `[advisories] version = 2`, cargo-deny
-0.20.2 reports the first four as `error[<class>]` and exits nonzero; `yanked = "warn"`
-makes the fifth `warning[yanked]` on exit 0; and an advisory accepted in that file's
-`ignore` table drops to `note`, which the default `--log-level warn` keeps out of the
-log. So the exit status alone would pass over a yanked crate, which is why the log is
-read, and the severity bound is what keeps an accepted advisory from being reported.
-The body names the crate and version behind every diagnostic beside any `RUSTSEC-` id
-on it: the yanked class carries no advisory id, so the crate name is the only handle
-on it.
+The script acts on a diagnostic in the captured JSON log, at error or warning
+severity, whose class is one of `vulnerability`, `unmaintained`, `unsound`, `notice`
+and `yanked`. cargo-deny 0.20.2 checks each of those classes over a different set of
+crates, and `tools/release/deny.toml` is what fixes which:
 
-A nonzero exit carrying no such diagnostic is a tool failure rather than a finding:
-`cargo metadata` failed, the advisory database would not fetch, the index cache would
-not load. The script then writes nothing, leaves an open issue exactly as it stands,
-and exits 3 with the run URL in its message, so the Actions run goes red instead of
-the lockfile being named for a check that never completed. It refuses with exit 2 and
-writes nothing when `jq` is absent or cannot read the log, when `gh` is
-unauthenticated, when the repository carries no `security` label, when `gh` refuses a
-listing, and when two open issues carry the title. Its oracle is
-`tools/scripts/test_advisory_issue.sh`: twelve cases over JSON log fixtures against a
-`gh` shim that records every call, run as a step of `lint`.
+* `vulnerability` and `notice`, over every crate in the resolved graph, as
+  `error[<class>]` on a nonzero exit.
+* `unmaintained`, a scope key the file leaves at the default `all`, so over every
+  crate, as `error[unmaintained]` on a nonzero exit.
+* `unsound`, the same kind of scope key, which the file leaves at the default
+  `workspace`: a crate is checked only when at least one of its DIRECT dependents is
+  a workspace member. An unsound advisory on a crate reached only through
+  third-party edges emits no diagnostic and the check exits 0, so it reaches neither
+  this run nor the per-change job. Measured 2026-10-02 against the committed
+  lockfile: the same run with `unsound = "all"` exits 1 on seven such advisories, on
+  `anyhow` 1.0.102, `event-listener` 5.4.1, `lru` 0.12.5, `lru` 0.18.1, `rand` 0.8.5
+  and `scc` 2.4.0, every one of them silent at `workspace` scope.
+* `yanked`, which `yanked = "warn"` renders as `warning[yanked]` on exit 0.
+
+`unmaintained` and `unsound` are the two live keys there, each taking `all`,
+`workspace`, `transitive` or `none`. `version = 2` drives none of the above:
+cargo-deny 0.20.2 parses that key and discards the value, as it does the lint level
+on the removed `vulnerability` and `notice` keys.
+
+An advisory accepted in that file's `ignore` table drops to `note`, which the default
+`--log-level warn` keeps out of the log. So the exit status alone would overlook a
+yanked crate, which is why the log is read, and the severity bound is what keeps an
+accepted advisory from being reported. The body names the crate and version behind
+every diagnostic beside any `RUSTSEC-` id on it: the yanked class carries no advisory
+id, so the crate name is the only handle on it.
+
+Two shapes route to exit 3, each writing nothing, each leaving an open issue exactly
+as it stands, each naming the run URL so the Actions run goes red rather than a
+verdict on the lockfile resting on a check that did not fully run. One is
+`warning[index-failure]`
+in the log at any exit status: cargo-deny emits it per crate whose registry index
+query failed, while `yanked` is not `allow`, at warning severity and exit 0, so the
+registry query failed and the yanked half of the check did not run for the crates it
+names. The other is a nonzero exit carrying no advisory diagnostic: `cargo metadata`
+failed, the advisory database would not fetch, the index cache would not load. The
+script refuses with exit 2 and writes nothing when `jq` is absent or cannot read the
+log, when `gh` is unauthenticated, when the repository carries no `security` label,
+when `gh` refuses a listing, and when two open issues carry the title. Its oracle is
+`tools/scripts/test_advisory_issue.sh`: thirteen cases over JSON log fixtures against
+a `gh` shim that records every call, run as a step of `lint`.
 
 A `schedule` trigger fires only from the default branch, so a pull request branch's
 copy of one of these workflows never runs on the clock. `workflow_dispatch` is not

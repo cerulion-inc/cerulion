@@ -12,27 +12,41 @@
 # lines it can parse and skips the rest, so a plain-text line in the log never
 # ends the scan.
 #
-# WHAT COUNTS AS A FINDING. cargo-deny 0.20.2 under `tools/release/deny.toml`'s
-# `[advisories] version = 2`:
+# WHAT THIS REPORTS, and what it leaves silent. Under `tools/release/deny.toml`,
+# cargo-deny 0.20.2 checks each class over a different set of crates:
 #
-#   vulnerability, unmaintained, unsound, notice   `error[<class>]`, and the
-#                                                  check exits nonzero
-#   yanked, which `yanked = "warn"` holds at       `warning[yanked]`, and the
-#   warn level                                     check exits 0
-#   an id in the `ignore` table                    a `note`, which the default
-#                                                  `--log-level warn` keeps out
-#                                                  of the log altogether
+#   vulnerability   every crate in the resolved graph. `error[vulnerability]`,
+#                   and the check exits nonzero.
+#   notice          every crate in the resolved graph. `error[notice]`, nonzero.
+#   unmaintained    the `unmaintained` scope key, which that file leaves at its
+#                   default `all`: every crate. `error[unmaintained]`, nonzero.
+#   unsound         the `unsound` scope key, which that file leaves at its
+#                   default `workspace`: only a crate at least one of whose
+#                   DIRECT dependents is a workspace member. `error[unsound]`,
+#                   nonzero. An unsound advisory on a crate reached only through
+#                   third-party edges emits no diagnostic at all and the check
+#                   exits 0, so nothing below sees it and this script reports
+#                   nothing about it.
+#   yanked          `yanked = "warn"` in that file: `warning[yanked]`, exit 0.
+#   an `ignore` id  a `note`, which the default `--log-level warn` keeps out of
+#                   the log altogether.
 #
-# A FINDING IS A DIAGNOSTIC AT ERROR OR WARNING SEVERITY whose class is one of
-# those five. Reading the log rather than the exit status alone is what catches
-# a yanked crate, which exits 0; the severity bound is what keeps an advisory
-# accepted in the `ignore` table out.
+# WHAT THIS SCRIPT ACTS ON IS A DIAGNOSTIC AT ERROR OR WARNING SEVERITY whose
+# class is one of the five in CLASSES below. Reading the log rather than the exit
+# status alone is what catches a yanked crate, which exits 0; the severity bound
+# is what keeps an advisory accepted in the `ignore` table out.
 #
-# A NONZERO EXIT CARRYING NO SUCH DIAGNOSTIC IS A TOOL FAILURE, not a finding:
-# `cargo metadata` failed, the advisory database would not fetch, the index
-# cache would not load (`error[index-cache-load-failure]`). The script then
-# writes nothing, leaves an open issue exactly as it stands, and exits 3 with a
-# message naming the run URL, so the run that carries it goes red.
+# TWO SHAPES ROUTE TO EXIT 3 INSTEAD, each writing nothing, each leaving an open
+# issue exactly as it stands, each naming the run URL so the run goes red:
+#
+#   * `warning[index-failure]` in the log, at any exit status. cargo-deny emits
+#     it per crate whose registry index query failed, while `yanked` is not
+#     `allow`, at WARNING severity and exit 0. The registry query failed, so the
+#     yanked half of the check did not run for the crates it names, and a clean
+#     verdict on that log would close the issue over an unrun check.
+#   * a nonzero exit carrying no advisory diagnostic: `cargo metadata` failed,
+#     the advisory database would not fetch, the index cache would not load
+#     (`error[index-cache-load-failure]`).
 #
 # WHAT IT WRITES. One issue carries the result. It is found among the open
 # issues labelled `security` by the exact title in TITLE below.
@@ -67,8 +81,11 @@ LABEL=security
 POLICY='tools/release/deny.toml'
 CHECK="cargo deny --format json --config ${POLICY} check advisories"
 # The five advisory classes this check reports. `yanked` is the one deny.toml
-# holds at warn level; the other four are errors under `version = 2`.
+# holds at warn level; the other four render at error level.
 CLASSES='["vulnerability","unmaintained","unsound","notice","yanked"]'
+# cargo-deny's own class for a registry index query that failed. The same scan
+# picks it up, and it routes to exit 3 rather than into an issue body.
+TOOL_CLASS=index-failure
 # One body row per reported diagnostic, bounded: a pathological log must not
 # push the body past what `gh issue create` accepts.
 MAX_ROWS=50
@@ -107,14 +124,15 @@ trap 'rm -f "$rows_file" "$jq_err_file" "$body_file"' EXIT
 # message. `fromjson?` drops a line that is not JSON instead of ending the scan.
 # The id scan reads the whole diagnostic, which is where cargo-deny puts the id:
 # `notes[0]` is `ID: RUSTSEC-...` on every advisory diagnostic, and the
-# `advisory` object `--format json` attaches repeats it.
+# `advisory` object `--format json` attaches repeats it. TOOL_CLASS rows are
+# admitted here and partitioned out below, before any row reaches a body.
 # shellcheck disable=SC2016  # a jq program, not a shell expansion
 jq_rows='
 fromjson?
 | select(.type == "diagnostic")
 | .fields as $f
 | select($f.severity == "error" or $f.severity == "warning")
-| select($f.code != null and ($classes | index($f.code)) != null)
+| select($f.code != null and (($classes | index($f.code)) != null or $f.code == $toolclass))
 | [ $f.severity,
     $f.code,
     ([$f.graphs[]? | .Krate | "\(.name) \(.version)"] | unique | join(", ")),
@@ -123,10 +141,27 @@ fromjson?
   ]
 | @tsv
 '
-if ! jq -R -r --argjson classes "$CLASSES" "$jq_rows" "$log" \
-    > "$rows_file" 2> "$jq_err_file"; then
+if ! jq -R -r --argjson classes "$CLASSES" --arg toolclass "$TOOL_CLASS" \
+    "$jq_rows" "$log" > "$rows_file" 2> "$jq_err_file"; then
     die "jq could not read ${log}: $(tr '\n' ' ' < "$jq_err_file")" 2
 fi
+
+# A failed registry index query comes at WARNING severity and exit 0, so neither
+# the exit status nor the severity bound tells it apart from a clean run: without
+# this the clean path would comment and close the issue over a yanked check that
+# did not run for the crates named here. Checked FIRST of the two exit-3 shapes,
+# because it says which half of the check went unrun, and before any `gh` call.
+index_count=$(awk -F'\t' -v c="$TOOL_CLASS" '$2 == c { n++ } END { print n + 0 }' "$rows_file")
+if [ "$index_count" -gt 0 ]; then
+    # Named under the same bound the body rows use: a registry outage reports
+    # every crate in the lockfile, and the message has to stay readable.
+    index_crates=$(awk -F'\t' -v c="$TOOL_CLASS" -v max="$MAX_ROWS" '
+        $2 == c { n++; if (n <= max) { s = s (s == "" ? "" : "; ") $3 } }
+        END { if (n > max) { s = s "; and " (n - max) " more" } print s }
+    ' "$rows_file")
+    die "cargo deny exited ${status} carrying ${index_count} \`warning[${TOOL_CLASS}]\` diagnostic(s), on ${index_crates}: the registry query failed, so the yanked half of the check did not run for those crates and no issue was written. Run: ${run_url}" 3
+fi
+
 row_count=$(awk 'END { print NR + 0 }' "$rows_file")
 
 # A verdict needs at least one advisory diagnostic to rest on. Checked before
@@ -195,7 +230,7 @@ if [ "$row_count" -gt 0 ]; then
         ' "$rows_file"
         printf '\n'
         printf 'Run: %s\n\n' "$run_url"
-        printf '%s\n\n' "\`${POLICY}\` is the policy this check and the per-change dependency audit both read: a vulnerability, unmaintained, unsound or notice advisory fails the check, and a yanked crate warns and is reported here as well. An advisory accepted in the \`ignore\` table of that file renders below warn level and is not reported here."
+        printf '%s\n\n' "\`${POLICY}\` is the policy this check and the per-change dependency audit both read. A vulnerability or notice advisory on any crate in the resolved graph fails the check, and so does an unmaintained advisory, which that file leaves at scope \`all\`. An unsound advisory is checked at scope \`workspace\`: it is reported only when at least one direct dependent of the crate is a workspace member, so an unsound advisory on a crate reached only through third-party edges is neither reported here nor failing the check. A yanked crate warns and is reported here as well. An advisory accepted in the \`ignore\` table of that file renders below warn level and is not reported here."
         printf '%s\n' "Every crate named above is a third-party dependency of this workspace, and every \`RUSTSEC-\` id above is already public in the RustSec database. A vulnerability in Cerulion itself goes to the address in \`.github/SECURITY.md\`, not here."
     } > "$body_file"
     if [ "$count" -eq 0 ]; then
@@ -214,7 +249,7 @@ if [ "$count" -eq 0 ]; then
 fi
 
 {
-    printf '%s\n\n' "\`${CHECK}\` exited 0 on the lockfile committed at \`${commit}\`, and its log carries no \`warning[yanked]\` and no \`error[...]\` advisory diagnostic."
+    printf '%s\n\n' "\`${CHECK}\` exited 0 on the lockfile committed at \`${commit}\`, and its log carries no \`error[...]\` advisory diagnostic, no \`warning[yanked]\`, and no \`warning[index-failure]\`: every crate's registry index query answered."
     printf 'Run: %s\n' "$run_url"
 } > "$body_file"
 gh issue comment "$matches" --body-file "$body_file"

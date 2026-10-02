@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=12
+CASES_EXPECTED=13
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-advisory-issue-test.XXXXXX")
@@ -144,6 +144,19 @@ printf '%s\n' '{"fields":{"advisories":{"errors":0,"helps":0,"notes":0,"warnings
 # prints no diagnostic and no summary.
 printf '%s\n' '{"fields":{"level":"ERROR","message":"failed to fetch advisory database: Could not resolve host: github.com","timestamp":"2026-10-02T04:37:11.481293Z"},"type":"log"}' > "$workdir/log_tool_failure"
 
+# A registry index query that failed. cargo-deny emits one of these per crate it
+# could not query, at WARNING severity, while `yanked` is not "allow", and the
+# run exits 0: the message, the class, the two labels and the `notes[0]` error
+# string are the shape it builds, with the `graphs[0].parents` chain dropped as
+# above. The crate here is the one the committed lockfile yanks, so the fixture
+# stands for the run whose yanked half went unrun. Exit 0 and a summary object
+# are both present, which is exactly why neither the exit status nor the severity
+# bound can route this.
+{
+    printf '%s\n' '{"fields":{"code":"index-failure","graphs":[{"Krate":{"name":"chacha20","version":"0.10.1"}}],"labels":[{"column":1,"line":128,"message":"crate whose registry we failed to query","span":"chacha20 0.10.1 registry+https://github.com/rust-lang/crates.io-index"},{"column":10,"line":59,"message":"lint level defined here","span":"\"warn\""}],"message":"unable to check for yanked crates","notes":["failed to query crate chacha20: error sending request"],"severity":"warning"},"type":"diagnostic"}'
+    printf '%s\n' '{"fields":{"advisories":{"errors":0,"helps":0,"notes":6,"warnings":1}},"type":"summary"}'
+} > "$workdir/log_index_query_failed"
+
 # A nonzero exit whose only error is cargo-deny's own: it counts against the
 # advisories check, so the status is nonzero, and its class is not an advisory.
 {
@@ -229,7 +242,8 @@ expect_body '2 advisory diagnostic(s) failed the check (`error[...]`).'
 expect_body '* `error[vulnerability]` mio 0.6.23, RUSTSEC-2026-0101: a fixture vulnerability title'
 expect_body '* `error[unmaintained]` mio-extras 2.0.6, RUSTSEC-2026-0007: a fixture unmaintained title'
 expect_body 'Run: https://github.invalid/owner/repo/actions/runs/5150'
-expect_body 'a vulnerability, unmaintained, unsound or notice advisory fails the check'
+expect_body 'A vulnerability or notice advisory on any crate in the resolved graph fails the check'
+expect_body 'An unsound advisory is checked at scope `workspace`'
 expect_body "A vulnerability in Cerulion itself goes to the address in \`.github/SECURITY.md\`"
 printf '%s\n' 'advisories that failed the check open the issue: passed'
 
@@ -249,7 +263,7 @@ expect_output 'closed issue 42'
 expect_call 'issue comment 42 --body-file'
 expect_call 'issue close 42'
 expect_body "exited 0 on the lockfile committed at \`0123456789abcdef0123456789abcdef01234567\`"
-expect_body 'carries no `warning[yanked]` and no `error[...]` advisory diagnostic'
+expect_body 'carries no `error[...]` advisory diagnostic, no `warning[yanked]`, and no `warning[index-failure]`'
 expect_body 'Run: https://github.invalid/owner/repo/actions/runs/5150'
 printf '%s\n' 'a clean run closes the open issue: passed'
 
@@ -296,6 +310,18 @@ expect_status 3
 expect_output 'the check did not complete'
 expect_no_gh_at_all
 printf '%s\n' "cargo-deny's own error is not an advisory finding: passed"
+
+# --- a failed registry index query routes to exit 3 on exit 0 --------------
+# `warning[index-failure]` arrives at warn level and exit 0, so the clean path
+# would otherwise comment and close the issue over a yanked check that did not
+# run for the crate it names.
+FAKE_GH_ISSUES="$workdir/issues_one" run_case index_query_failed 0 "$workdir/log_index_query_failed"
+expect_status 3
+expect_output 'carrying 1 `warning[index-failure]` diagnostic(s), on chacha20 0.10.1'
+expect_output 'the registry query failed, so the yanked half of the check did not run'
+expect_output 'Run: https://github.invalid/owner/repo/actions/runs/5150'
+expect_no_gh_at_all
+printf '%s\n' 'a failed registry index query routes to exit 3 on exit 0: passed'
 
 # --- a repository without the label refuses before any issue call ----------
 FAKE_GH_LABELS="$workdir/labels_without_security" run_case missing_label 1 "$workdir/log_errors"

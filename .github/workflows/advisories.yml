@@ -14,11 +14,25 @@ name: Advisory audit (cargo-deny, scheduled)
 # So the advisories check runs here on a schedule against the default branch,
 # and `tools/scripts/advisory_issue.sh` records the result on ONE issue carrying
 # the `security` label that `.github/labels.yml` declares. That script reads the
-# log as well as the exit status, because the classes do not all land the same
-# way: a vulnerability, unmaintained, unsound or notice advisory is
-# `error[<class>]` and exits nonzero, while the yanked class
-# `tools/release/deny.toml` holds at warn level is `warning[yanked]` and exits 0,
-# so the exit status alone would pass over a yanked crate.
+# log as well as the exit status, because the classes do not all land the same way
+# under `tools/release/deny.toml`: a vulnerability or notice advisory on any crate
+# in the resolved graph, and an unmaintained advisory, which that file leaves at
+# scope `all`, each render as `error[<class>]` and exit nonzero; the yanked class
+# that file holds at warn level renders as `warning[yanked]` and exits 0, so the
+# exit status alone would overlook a yanked crate.
+#
+# WHAT STAYS SILENT. `unsound` is a scope key, and that file leaves it at the
+# cargo-deny 0.20.2 default `workspace`: an unsound advisory is reported only when
+# at least one DIRECT dependent of the crate is a workspace member. An unsound
+# advisory on a crate reached only through third-party edges emits no diagnostic
+# and the check exits 0, so neither this run nor the per-change `Dependency Audit
+# (cargo-deny)` job reading the same file sees it.
+#
+# A `warning[index-failure]` is cargo-deny's own, one per crate whose registry
+# index query failed, at warn level and exit 0: the registry query failed, so the
+# yanked half of the check did not run for those crates. The script routes it to
+# exit 3, which writes nothing and turns this run red, rather than reading that
+# log as a clean result and closing the issue.
 #
 # Licences, bans and sources stay out of this run: every path into `main`
 # already checks them, and they move only when a file in the checkout moves.
