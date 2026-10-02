@@ -39,8 +39,15 @@
 //! the second creation first, so a per-arm list cannot converge: two runs of the
 //! same tree with the same fixtures on one macOS host disagreed on six arms out of
 //! thirty nine in each direction while the failing BINARIES stayed the same. Those
-//! binaries are gated whole, 3 of them in `cerulion_cli`. CI shards
+//! binaries are gated whole: 20, all of them in `cerulion_cli`. CI shards
 //! `cerulion_core` under nextest, so CI is green.
+//!
+//! A process-per-arm runner shortens that list, it does not empty it. The process
+//! that meets the defect is whichever process LOADS the plugin, the test process
+//! included: an arm that loads a node cdylib into itself and then builds a second
+//! in-process graph meets the defect on its own, with no `cerulion` child in the
+//! picture. `replay_cli_test` is that case, 8 of 28 arms at the in-process
+//! `GraphRuntime` build, which is why the derivation below walks TWO routes.
 //!
 //! `cargo test --test <binary>` runs a whole binary in ONE process, so on macOS
 //! it will additionally fail arms that nextest proves pass, because the second
@@ -195,32 +202,83 @@ const WAIVED_2034: &[(&str, &str)] = &[
     ),
 ];
 
-/// The three function-name families that spawn a `cerulion` SUPERVISOR child. This
-/// is the waiver's DECLARED INPUT: the set of whole-binary waivers below is derived
-/// from it by `the_whole_binary_inventory_equals_the_spawn_family_walk`, so the list
-/// cannot drift from the code it describes, and a new suite that spawns a supervisor
-/// fails that arm until it is declared.
-const SUPERVISOR_SPAWN_FAMILIES: &[&str] = &["spawn_graph_run", "spawn_mp_record", "spawn_run"];
+/// THE DECLARED INPUT, and it is the MECHANISM rather than a list of helper names.
+///
+/// A binary meets this defect when one of its arms gets a plugin linking iceoryx2
+/// loaded into some process and then asks that process for another event resource.
+/// There are two routes from a test to such a load, declared one per constant below
+/// and walked by `the_whole_binary_inventory_equals_the_two_route_walk`, so the
+/// inventory cannot drift from the code it describes.
+///
+/// Keying on helper NAMES was tried and is what this replaces. It named three
+/// `spawn_*` families, missed `spawn_supervisor` and `spawn_group_leader`, and left
+/// two binaries spawning supervisors ungated; widening it by name would have pulled
+/// in a test OF those helpers that spawns nothing. And no name list could have
+/// selected `replay_cli_test`, whose load happens in the test process with no child
+/// anywhere in it.
+///
+/// ROUTE 1, IN THIS PROCESS: an arm, or a helper it calls, loads a node cdylib into
+/// the test process. The load is the mechanism, so this is keyed on the load.
+const IN_PROCESS_CDYLIB_LOAD: &str = "DylibNodeEntry::load";
+
+/// ROUTE 2, IN A CHILD: an arm, or a helper it calls, spawns the `cerulion` binary to
+/// run or record a graph. Keyed on BOTH halves of such a spawn, the binary and the
+/// verb, because either alone selects the wrong files: the binary alone takes every
+/// `cerulion topic list` smoke test, and the verb alone takes `completions_cli_test`,
+/// which holds `["cerulion", "graph", "run"]` as a completion WORD LIST and launches
+/// nothing. The verb half therefore asks for an argv whose LEADING pair is `graph`
+/// then `run`, which is how every real spawn here is written and how that word list
+/// is not.
+const CHILD_SPAWN_BINARY: &str = "CARGO_BIN_EXE_cerulion";
+
+/// The shared harness module, and the launchers in it that reach a `graph run` spawn.
+/// A file that spawns only through these never names the binary itself, so the walk
+/// resolves them: this is the transitive step, declared rather than inferred.
+const SUPPORT_MODULE: &str = "crates/cerulion_cli/tests/mp_support/mod.rs";
+const SUPPORT_SPAWN_HELPERS: &[&str] = &["spawn_mp_record", "spawn_graph_run_graph"];
+
+/// Reached by the derivation and deliberately NOT waived, as `(path, why)`.
+///
+/// The derivation selects every binary that can reach a plugin load, which is wider
+/// than the set that fails: these two spawn a `--single-process` child, which loads
+/// the plugins and creates its resources once, and both are observed PASSING on the
+/// hosted macOS runner. Naming them here, rather than narrowing the rule until it
+/// excluded them, is what keeps the next such suite a decision instead of a silent
+/// omission: a file reached by the walk must appear in one list or the other.
+const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
+    (
+        "crates/cerulion_cli/tests/graph_record_e2e_test.rs",
+        "spawns `graph run --record --single-process`; its 8 macOS arms passed at 4166b190",
+    ),
+    (
+        "crates/cerulion_cli/tests/flashback_resim_e2e_test.rs",
+        "spawns `graph run --record --single-process`; its one arm passed at 4166b190",
+    ),
+];
 
 /// Binaries waived WHOLE on macOS, as `(path from the workspace root, the upstream
 /// issue)`.
 ///
-/// THE MECHANISM, and it is the same one for every row: each of these spawns a
-/// `cerulion` supervisor child that loads plugin nodes, and on macOS a process that
-/// has loaded a plugin linking iceoryx2 cannot create any further event resource.
-/// The child is the process that loaded the plugin, so no runner arrangement on this
-/// side helps: a per-arm list cannot converge either, because under plain
-/// `cargo test` many arms share one process and the victim is whichever reaches the
-/// second creation first. Two runs of one macOS host disagreed on six arms out of
-/// thirty nine in each direction while the failing BINARIES stayed the same.
+/// THE MECHANISM, and it is the same one for every row: an arm of each of these gets
+/// a plugin linking iceoryx2 loaded into some process and then asks that process for
+/// another event resource, which on macOS fails. The loading process is whichever
+/// process loads the plugin: a `cerulion` child the arm spawns, or the TEST process
+/// itself where the arm loads a node cdylib and builds the graph in-process. A
+/// per-arm list cannot converge under plain `cargo test`, where many arms share one
+/// process and the victim is whichever reaches the second creation first: two runs of
+/// one macOS host disagreed on six arms out of thirty nine in each direction while
+/// the failing BINARIES stayed the same, and `replay_cli_test` failed 8 of its 28
+/// arms with the one survivor decided by which arm reached the in-process load first.
 ///
-/// THE COVERAGE THIS COSTS, stated once: 16 binaries of `cerulion_cli` do not run on
-/// macOS at all. They run on Linux, where the defect does not arise. Two of the 16,
-/// `ros2_graph_e2e_test` and `network_gateway_e2e_test`, are in the set BY THE RULE
-/// rather than by measurement: they were not observed failing, because their own
-/// environment checks already skip them on macOS. The cure is an upstream release
-/// carrying the fix, or the pinned fork carrying a patch for it; nothing in this
-/// repository can shorten the list.
+/// THE COVERAGE THIS COSTS, stated once: 20 binaries of `cerulion_cli` do not run on
+/// macOS at all. They run on Linux, where the defect does not arise. Three of the 20,
+/// `ros2_graph_e2e_test`, `network_gateway_e2e_test` and `mp_supervisor_box_test`,
+/// are in the set BY THE RULE rather than by measurement: no run has observed them
+/// failing. Of those three, every arm of `mp_supervisor_box_test` is `#[ignore]`d, so
+/// it runs nothing under `cargo test` on any platform; the other two carry no
+/// platform `cfg` and no `ignore`, so why they have not been observed failing is not
+/// established here. The cure is an upstream release carrying the fix, or the pinned
+/// fork carrying a patch for it; nothing in this repository can shorten the list.
 const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
     (
         "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
@@ -263,11 +321,27 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
+        "crates/cerulion_cli/tests/mp_split_pair_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/mp_supervisor_box_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
         "crates/cerulion_cli/tests/network_gateway_e2e_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
+        "crates/cerulion_cli/tests/network_gateway_mp_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
         "crates/cerulion_cli/tests/plain_run_resim_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/replay_cli_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
@@ -571,16 +645,50 @@ fn both_waivers_are_pinned_to_the_iceoryx2_release_they_describe() {
     );
 }
 
-/// Every declared 2034 arm carries its own macOS scoped ignore, in its own
-/// contiguous attribute run, naming the defect.
+/// True when the source holds an argv literal whose first two elements are `"graph"`
+/// then `"run"`: the shape every `graph run` spawn in these suites is written in,
+/// whether the argv is passed inline to `args` or built in a `vec!` the spawn then
+/// passes. The LEADING position is the discriminator against a word list that merely
+/// contains the pair (see `CHILD_SPAWN_BINARY`).
+fn leads_an_argv_with_graph_run(src: &str) -> bool {
+    const GRAPH: &str = "\"graph\"";
+    let mut at = 0usize;
+    while let Some(off) = src[at..].find(GRAPH) {
+        let i = at + off;
+        // The element must OPEN the list: the nearest non-whitespace byte before it
+        // is the `[` of `args([`, `&[` or `vec![`.
+        if src[..i].trim_end().ends_with('[') {
+            let rest = src[i + GRAPH.len()..].trim_start();
+            let rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+            if rest.starts_with("\"run\"") {
+                return true;
+            }
+        }
+        at = i + GRAPH.len();
+    }
+    false
+}
+
+/// The inventory IS the walk: every binary either route reaches is declared, waived
+/// or named as deliberately not waived, and every declared binary is still reached.
 #[test]
-fn the_whole_binary_inventory_equals_the_spawn_family_walk() {
+fn the_whole_binary_inventory_equals_the_two_route_walk() {
     if skip_out_of_workspace() {
         return;
     }
-    // DECLARED INPUT, PARSED OUTPUT: the families are declared above, the set is
+    // DECLARED INPUT, PARSED OUTPUT: the two routes are declared above, the set is
     // walked out of the sources here, and the two must agree. Writing the list by
-    // hand is what let the earlier per-arm waiver crawl across three heads.
+    // hand is what let the earlier waiver crawl across three heads; keying it on
+    // helper names is what left two spawning binaries ungated and could not see the
+    // in-process route at all.
+    let support = read_at(SUPPORT_MODULE);
+    let support_spawns = leads_an_argv_with_graph_run(&support);
+    assert!(
+        support_spawns,
+        "{SUPPORT_MODULE} no longer holds a `graph run` spawn, so the transitive step \
+         below resolves nothing and every file that spawns only through it would walk \
+         out of the inventory. Re-derive the helper list."
+    );
     let mut found: Vec<String> = Vec::new();
     for crate_dir in ["cerulion_cli", "cerulion_cli_engine"] {
         let dir = workspace_root()
@@ -605,10 +713,10 @@ fn the_whole_binary_inventory_equals_the_spawn_family_walk() {
                     .expect("a test file name")
             );
             let src = read_at(&rel);
-            if SUPERVISOR_SPAWN_FAMILIES
-                .iter()
-                .any(|fam| src.contains(&format!("{fam}(")) || src.contains(&format!("{fam}_")))
-            {
+            let in_process = src.contains(IN_PROCESS_CDYLIB_LOAD);
+            let own_child = src.contains(CHILD_SPAWN_BINARY) && leads_an_argv_with_graph_run(&src);
+            let via_support = SUPPORT_SPAWN_HELPERS.iter().any(|h| src.contains(h));
+            if in_process || own_child || via_support {
                 found.push(rel);
             }
         }
@@ -616,28 +724,41 @@ fn the_whole_binary_inventory_equals_the_spawn_family_walk() {
     found.sort();
     let mut declared: Vec<String> = WAIVED_2034_BINARIES
         .iter()
+        .chain(REACHED_BUT_NOT_WAIVED_2034.iter())
         .map(|(f, _)| (*f).to_string())
         .collect();
     declared.sort();
+    let both: Vec<&str> = WAIVED_2034_BINARIES
+        .iter()
+        .filter(|(f, _)| REACHED_BUT_NOT_WAIVED_2034.iter().any(|(g, _)| g == f))
+        .map(|(f, _)| *f)
+        .collect();
+    assert!(
+        both.is_empty(),
+        "these binaries are declared BOTH waived whole and deliberately not waived: \
+         {both:?}. One list each, or the inventory says two things about one binary."
+    );
     let missing: Vec<&String> = found.iter().filter(|f| !declared.contains(f)).collect();
     let stale: Vec<&String> = declared.iter().filter(|f| !found.contains(f)).collect();
     assert!(
         missing.is_empty(),
-        "these test binaries call a supervisor-spawn family and are NOT declared \
-         waived whole: {missing:?}. On macOS they will run and fail on the upstream \
-         defect. Declare them, or stop spawning a supervisor from them."
+        "these test binaries reach a plugin load (in this process or in a `cerulion` \
+         child) and are in NEITHER list: {missing:?}. On macOS they run, and whether \
+         they survive depends on which arm reaches the second resource creation \
+         first. Waive each whole, or name it in REACHED_BUT_NOT_WAIVED_2034 with what \
+         was observed."
     );
     assert!(
         stale.is_empty(),
-        "these binaries are declared waived whole but no longer call any \
-         supervisor-spawn family: {stale:?}. The waiver outlived its reason, which is \
-         the failure mode this file exists to prevent."
+        "these binaries are declared but no longer reach a plugin load by either \
+         route: {stale:?}. The waiver outlived its reason, which is the failure mode \
+         this file exists to prevent."
     );
     assert!(
-        found.len() >= 10,
-        "the walk found only {} supervisor-spawning binaries, which is fewer than the \
-         suites known to exist: the families are not matching, so this arm would pass \
-         having derived almost nothing",
+        found.len() >= 18,
+        "the walk found only {} binaries that can reach a plugin load, which is fewer \
+         than the suites known to do it: a route is not matching, so this arm would \
+         pass having derived almost nothing",
         found.len()
     );
 }
