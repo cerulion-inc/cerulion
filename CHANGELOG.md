@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The minimum supported Rust version is 1.95 (it was 1.93), and the release workflow builds with Rust 1.95.0. `cerulion_core` calls `try_update` on its atomics, the name Rust 1.95 stabilised and Rust 1.99 uses in place of the deprecated `fetch_update`; a workspace that denies warnings builds again under the current stable.
 - The shared memory transport moves to iceoryx2 0.10.0. Every event service is sized to the event
   ids the transport actually mints rather than the library default, so a listener no longer walks
   256 shared memory counters on every wait.

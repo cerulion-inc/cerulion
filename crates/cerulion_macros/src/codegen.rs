@@ -2553,7 +2553,7 @@ fn gen_cdylib(
                     // Same code, because it is the same caller mistake — the
                     // name argument is not a readable slice — and the message
                     // says which half it was.
-                    if name_len > (::std::isize::MAX as usize) {
+                    if name_len > (::core::primitive::isize::MAX as usize) {
                         __cer_set_last_error(::std::format!(
                             "cerulion_node_sync_head_op: name_len {} exceeds isize::MAX",
                             name_len,
