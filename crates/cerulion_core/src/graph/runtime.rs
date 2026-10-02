@@ -15754,7 +15754,15 @@ impl GraphRuntime {
         self.replay_read_plans
             .iter()
             .filter(|(_node, plan)| plan.is_unusable())
+            // hot-path-alloc-ok: the CLONE is the report's own copy of a poisoned
+            // stage's name. The sole caller in the tree is the replay engine's
+            // verdict phase (`replay_engine.rs`, after that rank's step loop has
+            // ended), so this runs once per rank pass; no publish, receive or
+            // per-step path reads it.
             .map(|(_node, plan)| plan.key().clone())
+            // hot-path-alloc-ok: the VECTOR is that same once-per-rank-pass report,
+            // sized by the poisoned stages (none on a run with no panic), built
+            // after the step loop and never during one.
             .collect()
     }
 
