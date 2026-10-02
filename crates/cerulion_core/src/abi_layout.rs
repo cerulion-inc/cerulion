@@ -147,8 +147,8 @@
 //! ## Toolchain dependence
 //!
 //! `repr(Rust)` field order is not guaranteed stable across rustc releases.
-//! Local rustc is 1.96; CI's test jobs track auto-updated `stable` (the MSRV
-//! 1.93 job only `cargo check`s). No drift has been observed, and a future
+//! CI's test jobs track auto-updated `stable` (the MSRV 1.95 job only
+//! `cargo check`s). No drift has been observed, and a future
 //! rustc that reorders fields would fail this pin with an offset diff on an
 //! unchanged tree — which is a *correct* signal to re-snapshot, not a false
 //! alarm.

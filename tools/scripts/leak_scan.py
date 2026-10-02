@@ -210,7 +210,8 @@ LAN_EXAMPLES = frozenset((
 
 GUARD_FILES = frozenset((
     'tools/scripts/leak_scan.py', 'tools/scripts/leak_scan_allow.txt',
-    'tools/scripts/install_hooks.sh', '.github/workflows/leak-guard.yml', 'docs/leak_guard.md'))
+    'tools/scripts/install_hooks.sh', '.github/workflows/leak-guard.yml',
+    '.github/workflows/leak-guard-conversation.yml', 'docs/leak_guard.md'))
 GUARD_PREFIXES = ('tools/hooks/',)
 
 OCT = r'(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)'
@@ -3184,6 +3185,8 @@ EXPECTED_ARMS = 238
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
+ON_RX = re.compile(r'^on:\n((?:[ ].*\n|\n)*)', re.M)
+TRIGGER_RX = re.compile(r'^  ([a-z_]+):', re.M)
 
 
 def _conversation_condition(path):
@@ -3196,6 +3199,18 @@ def _conversation_condition(path):
     except OSError:
         return None
     return ' '.join(m.group(1).split()) if m else None
+
+
+def _workflow_triggers(path):
+    """The event names in that workflow's `on:` block, as a set. None when the
+    file or the block cannot be read: the caller fails the arm rather than
+    comparing against an empty set."""
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            m = ON_RX.search(fh.read())
+    except OSError:
+        return None
+    return set(TRIGGER_RX.findall(m.group(1))) if m else None
 
 
 def _eval_condition(cond, event, login, body):
@@ -4849,8 +4864,13 @@ def self_test(out, base_env, argv0):
         # and evaluated, rather than restated here where it could drift.
         wf = os.path.join(os.path.normpath(os.path.join(
             os.path.dirname(os.path.abspath(argv0)), '..', '..')),
-            '.github', 'workflows', 'leak-guard.yml')
+            '.github', 'workflows', 'leak-guard-conversation.yml')
         cond = _conversation_condition(wf) if os.path.isfile(wf) else None
+        # The events reach the job through the workflow's TRIGGERS, so the set
+        # is read beside the condition and compared whole: an event added here
+        # runs the job, and an event dropped stops it.
+        triggers = _workflow_triggers(wf) if os.path.isfile(wf) else None
+        want_triggers = {'issues', 'issue_comment', 'pull_request_review_comment'}
         cases = [
             ('the guard reading its own ask', 'issue_comment', 'github-actions[bot]',
              'please edit\n<!--leak-guard:issue_comment:1:abc-->', False),
@@ -4863,7 +4883,6 @@ def self_test(out, base_env, argv0):
             ('a person quoting the marker', 'issue_comment', 'someone',
              'why did it say <!--leak-guard:issue_comment:1:abc-->', True),
             ('an issue body', 'issues', '', '', True),
-            ('a push', 'push', '', '', False),
         ]
         try:
             got = [(n, _eval_condition(cond, ev, lg, b)) for n, ev, lg, b, _ in cases]
@@ -4873,10 +4892,16 @@ def self_test(out, base_env, argv0):
             # arm cannot vouch for, so it fails and says which, rather than
             # passing on a reading it did not make or killing the whole suite.
             got, why = [], 'the condition uses something this arm cannot evaluate: %s' % exc
+        if triggers is None:
+            detail = 'the `on:` block of %s could not be read' % os.path.basename(wf)
+        elif triggers != want_triggers:
+            detail = 'triggers %s' % sorted(triggers)
+        else:
+            detail = why or str(got)
         arm('conversation-the-workflow-reads-every-author-but-never-its-own-ask',
-            cond is not None and not why
+            cond is not None and not why and triggers == want_triggers
             and got == [(n, want) for n, ev, lg, b, want in cases],
-            why or str(got))
+            detail)
         # The code-span exemption is the REFERENCE classes' alone. A host, a
         # login, an address or a private-tier name is as visible to a reader in
         # backticks as in prose, so every other class still reads the body whole.

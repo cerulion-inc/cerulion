@@ -62,6 +62,26 @@ refuse_row_pinned 0 "cannot find type" > /dev/null && { echo "SELFTEST FAIL: a r
 refuse_row_pinned 21 "" > /dev/null && { echo "SELFTEST FAIL: a refuse row with an empty marker passed"; fail=1; }
 refuse_row_pinned "" "cannot find type" > /dev/null && { echo "SELFTEST FAIL: a refuse row with no error count passed"; fail=1; }
 refuse_row_pinned "many" "cannot find type" > /dev/null && { echo "SELFTEST FAIL: a refuse row with a non-decimal error count passed"; fail=1; }
+# 10. The rclpy exchange red paths (harvest.sh predicates), driven on crafted
+#     inputs so the gate's reasoning is proven on the self-test step (which runs
+#     before any build - no real .so, no python invocation, no cargo/timeout):
+#     (a) a missing .so, (b) a non-"ok" python import probe, and (c) a timeout
+#     return code each red with a NAMED reason; each clean input passes.
+no_so="$(mktemp -u)"   # a name mktemp guarantees is unused (nothing is created)
+# (a) missing .so
+staged_so_present "$no_so" selftest > /dev/null && { echo "SELFTEST FAIL: a missing .so passed staged_so_present"; fail=1; }
+staged_so_present "$here/harvest.sh" selftest > /dev/null || { echo "SELFTEST FAIL: an existing file failed staged_so_present"; fail=1; }
+case "$(staged_so_present "$no_so" selftest 2>&1)" in *"GATE FAIL"*"is missing"*) : ;; *) echo "SELFTEST FAIL: staged_so_present did not name the missing-.so reason"; fail=1 ;; esac
+# (b) absent python/rclpy import
+rclpy_probe_ok ok selftest > /dev/null || { echo "SELFTEST FAIL: an 'ok' probe failed rclpy_probe_ok"; fail=1; }
+rclpy_probe_ok "ModuleNotFoundError: No module named 'rclpy'" selftest > /dev/null && { echo "SELFTEST FAIL: a non-ok probe passed rclpy_probe_ok"; fail=1; }
+case "$(rclpy_probe_ok "ModuleNotFoundError: No module named 'rclpy'" selftest 2>&1)" in *"GATE FAIL"*"unavailable"*) : ;; *) echo "SELFTEST FAIL: rclpy_probe_ok did not name the import-absent reason"; fail=1 ;; esac
+# (c) timeout return codes (124 TERM-at-deadline, 137 escalated to KILL); a normal rc is NOT a timeout
+rclpy_timed_out 124 selftest "rclpy exchange" 600 > /dev/null || { echo "SELFTEST FAIL: rc 124 not read as a timeout"; fail=1; }
+rclpy_timed_out 137 selftest "rclpy exchange" 600 > /dev/null || { echo "SELFTEST FAIL: rc 137 not read as a timeout"; fail=1; }
+rclpy_timed_out 0   selftest "rclpy exchange" 600 > /dev/null && { echo "SELFTEST FAIL: rc 0 read as a timeout"; fail=1; }
+rclpy_timed_out 101 selftest "rclpy exchange" 600 > /dev/null && { echo "SELFTEST FAIL: a normal non-zero rc (101) read as a timeout"; fail=1; }
+case "$(rclpy_timed_out 124 selftest 'rclpy exchange' 600 2>&1)" in *"GATE FAIL"*"timed out"*) : ;; *) echo "SELFTEST FAIL: rclpy_timed_out did not name the timeout reason"; fail=1 ;; esac
 rm -f "$plain" "$plain.c" "$plain.s" "$plain.n"
-[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, and the refuse-row pin guard"
+[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, the refuse-row pin guard, and the rclpy red paths (missing .so, absent import probe, timeout rc) each named"
 exit "$fail"
