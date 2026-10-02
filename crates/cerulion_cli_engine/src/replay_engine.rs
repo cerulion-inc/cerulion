@@ -10682,11 +10682,11 @@ fn prepare_pass_verification(
     // for itself is a bag that states no rows at all.
     bag_side: Option<&RankBagSide>,
     // May this bag's kind-6 role bits be read as roles? The
-    // steering and the re-derivation feed both branch on it — see
+    // steering and the re-derivation feed both branch on it, see
     // `ROLE_STAMPED_MIN_TRACE_FORMAT`.
     roles_stamped: bool,
     // And, separately, how wide its kind field is
-    // ([`KindFieldWidth`] — absent is NOT the archived arm).
+    // ([`KindFieldWidth`]: absent is NOT the archived arm).
     kind_width: KindFieldWidth,
     // The armed capture plane the recording ran under, handed to the
     // Period rule so its per-step clamp mirrors the scheduler's.
@@ -17312,7 +17312,7 @@ impl IntraStepSeamCounters {
 /// A steered topic's schedule, plus the cursor that walks it.
 ///
 /// The schedule is ASCENDING in step and each entry's frames are in FILE order,
-/// which is the same order the [`FrameFeed`] serves them — so driving it is a
+/// which is the same order the [`FrameFeed`] serves them, so driving it is a
 /// COUNT (`pop this many now`), never a seek. That is not an optimisation: the
 /// feed has no seek, and a plan that named frames out of file order could not be
 /// driven at all, so the planner's file-order guarantee is what makes this
@@ -17324,7 +17324,7 @@ struct SteeredCursor {
 }
 
 impl SteeredCursor {
-    /// How many frames are due BEFORE `step` — every entry whose
+    /// How many frames are due BEFORE `step`: every entry whose
     /// `before_step <= step` and has not been spent yet.
     ///
     /// `<=` rather than `==` deliberately: a pass starts at its rank's own
@@ -17334,7 +17334,7 @@ impl SteeredCursor {
     fn due_before(&mut self, step: u64) -> DueBatch {
         // The FRAMES, not a count. `DueFrame` carries the wire `sequence` the
         // planner expects at that position expressly "so the caller can
-        // cross-check the frame it pulled off the feed" — collapsing the answer
+        // cross-check the frame it pulled off the feed": collapsing the answer
         // to a bare count would throw that away, leaving the plan's own
         // cross-check unarmed.
         let mut batch = DueBatch::default();
@@ -17349,7 +17349,7 @@ impl SteeredCursor {
         batch
     }
 
-    /// Frames the schedule still holds — entries the pass never reached, because
+    /// Frames the schedule still holds: entries the pass never reached, because
     /// their `before_step` is past the last step it executed.
     ///
     /// These are SCHEDULED but not due, which is a different thing from a frame
@@ -17365,7 +17365,7 @@ impl SteeredCursor {
                     .map(|e| {
                         // A slot's frames are as scheduled as a
                         // before-step one's, so the residue arithmetic has to
-                        // see BOTH — counting only the before-step half would
+                        // see BOTH: counting only the before-step half would
                         // report a steered co-located topic as under-named by
                         // exactly its intra-step frames.
                         e.frames.len() + e.slots.iter().map(|s| s.frames.len()).sum::<usize>()
